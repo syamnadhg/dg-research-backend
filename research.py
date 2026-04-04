@@ -306,15 +306,6 @@ SCRAPE_FNS = {
 }
 
 
-def get_clipboard():
-    try:
-        r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
-                           capture_output=True, text=True, timeout=10)
-        return r.stdout.strip()
-    except Exception:
-        return ""
-
-
 # ── Firecrawler API ───────────────────────────────────────────────────────────
 
 FIRECRAWL_API_KEY = get_env("FIRECRAWL_API_KEY")
