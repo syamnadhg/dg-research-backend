@@ -2457,14 +2457,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     log(f"Queue: {queue_dir}")
     tracks_dir = init_tracks(queue_dir.name)  # Same name as queue — one research = one tracks folder
 
-    # ── Pipeline config: skip phases, disable agents, toggle video/email ──
-    skip_phases = set(pipeline_config.get("skipPhases", []))
-    agents_cfg = pipeline_config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
-    video_enabled = pipeline_config.get("videoEnabled", True)
-    email_enabled = pipeline_config.get("emailEnabled", True)
-    # Enforce dependencies (6-phase model 0-5): Phase 3 (NLM) skipped → Phase 4 (YouTube) off
-    if 3 in skip_phases:
-        skip_phases.add(4)
+    # ── Pipeline config: reload from config.json before each phase (supports mid-pipeline changes) ──
+    def reload_config():
+        nonlocal pipeline_config
+        config_path = queue_dir / "config.json"
+        if config_path.exists():
+            try:
+                pipeline_config = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        sp = set(pipeline_config.get("skipPhases", []))
+        ac = pipeline_config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
+        ve = pipeline_config.get("videoEnabled", True)
+        ee = pipeline_config.get("emailEnabled", True)
+        if 3 in sp:
+            sp.add(4)
+        return sp, ac, ve, ee
+
+    skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
 
     # ── Preload data from previous phases (for resume) ──
     brief_text, brief_url = "", cp.get("brief_url", "")
@@ -2565,6 +2575,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("pipeline_stopped", phase=1)
             return
 
+        skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 2: Deep Research ══════════════════════
         results = {}
         if 2 in skip_phases:
@@ -2684,6 +2695,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log("No research output — skipping Phases 3-5", "WARN")
             return
 
+        skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 3: NotebookLM Processing (upload + audio) ══════════════════════
         audio_path = None
         if 3 in skip_phases:
@@ -2730,6 +2742,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("pipeline_stopped", phase=3)
             return
 
+        skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 4: YouTube Upload ══════════════════════
         if 4 in skip_phases or not video_enabled:
             log(f"Phase 4: SKIPPED {'by config' if 4 in skip_phases else '(video disabled)'}")
@@ -2754,6 +2767,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("pipeline_stopped", phase=4)
             return
 
+        skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 5: Report & Notification ══════════════════════
         if 5 in skip_phases or not email_enabled:
             log(f"Phase 5: SKIPPED {'by config' if 5 in skip_phases else '(email disabled)'}")
@@ -3037,16 +3051,52 @@ async def run_server(port=8000):
         """Get queue status: current job + pending count."""
         return {"running": _queue_running, "pending": _job_queue.qsize()}
 
+    @app.get("/api/health")
+    async def health_check():
+        """Server health check."""
+        return {"status": "ok", "running": _queue_running, "pending": _job_queue.qsize()}
+
+    @app.patch("/api/runs/{run_id}/config")
+    async def update_config(run_id: str, request_data: dict):
+        """Update pipeline config mid-run. Pipeline checks config.json before each phase."""
+        queue = queues_root / run_id
+        if not queue.exists():
+            return JSONResponse({"error": "not found"}, 404)
+        config_path = queue / "config.json"
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        except Exception:
+            existing = {}
+        existing.update(request_data)
+        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        return {"status": "config_updated", "id": run_id, "config": existing}
+
+    @app.delete("/api/runs/{run_id}")
+    async def delete_run(run_id: str):
+        """Delete a completed/stopped run's queue and tracks."""
+        import shutil
+        queue = queues_root / run_id
+        tracks = tracks_root / run_id
+        if not queue.exists() and not tracks.exists():
+            return JSONResponse({"error": "not found"}, 404)
+        try:
+            if queue.exists(): shutil.rmtree(queue)
+            if tracks.exists(): shutil.rmtree(tracks)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, 500)
+        return {"status": "deleted", "id": run_id}
+
     @app.post("/api/runs")
     async def start_run(request_data: dict):
         """Start a new pipeline run. Queued if another is already running.
         Body: {topic, email?, config?: {agents, skipPhases, videoEnabled, emailEnabled}}"""
         topic = request_data.get("topic")
-        if not topic:
+        if not topic or not topic.strip():
             return JSONResponse({"error": "topic is required"}, 400)
+        topic = topic.strip()
         email = request_data.get("email", "")
         config = request_data.get("config", {})
-        # Validate: at least one agent must be enabled
+        # Validate config
         agents_cfg = config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
         if not any(agents_cfg.values()):
             return JSONResponse({"error": "at least one agent must be enabled"}, 400)
@@ -3054,7 +3104,8 @@ async def run_server(port=8000):
         run_id = f"{safe_name(topic)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
         await _job_queue.put({"topic": topic, "email": email, "config": config, "run_id": run_id})
         position = _job_queue.qsize()
-        status = "running" if position == 1 and not _queue_running else f"queued (position {position})"
+        is_running = _queue_running
+        status = "running" if position <= 1 and not is_running else f"queued (position {position})"
         return {"status": status, "topic": topic, "queue_position": position, "id": run_id}
 
     @app.get("/api/runs/{run_id}/documents/{doc_type}")
