@@ -110,18 +110,29 @@ def init_tracks(run_name):
     return _tracks_dir
 
 
-# Track routing: platform name → phase/subfolder
+# Track routing: platform name → phase/subfolder (6-phase model: 0-5)
 _TRACK_ROUTES = {
     "phase1": "phase1/brief",
     "chatgpt": "phase2/chatgpt",
     "gemini": "phase2/gemini",
     "claude": "phase2/claude",
-    "phase3": "phase3/links",
+    "phase3": "phase3/notebooklm",
     "notebooklm": "phase3/notebooklm",
-    "phase4": "phase4/audio",
-    "phase5": "phase5/video",
-    "phase6": "phase6/delivery",
+    "phase4": "phase4/youtube",
+    "phase5": "phase5/delivery",
 }
+
+
+def get_clipboard():
+    """Read clipboard text via PowerShell (Windows). Returns empty string on failure."""
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
 
 
 def save_track(platform, data):
@@ -799,6 +810,17 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             try:
                 progress = await scrape_fn(page)
                 save_track(label, progress)
+                # Emit structured agent_progress event for frontend streaming
+                emit_event("agent_progress", phase=2, agent=label.lower().replace(" ", ""),
+                    status=progress.get("status", ""),
+                    progress=progress.get("progress", ""),
+                    sources=progress.get("sources", 0),
+                    sourceUrls=progress.get("source_urls", []),
+                    sections=progress.get("sections", []),
+                    partialTextLen=progress.get("partial_text_len", 0),
+                    model=progress.get("model", ""),
+                    thinking=progress.get("thinking", ""),
+                )
             except Exception:
                 pass
 
@@ -2429,9 +2451,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     agents_cfg = pipeline_config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
     video_enabled = pipeline_config.get("videoEnabled", True)
     email_enabled = pipeline_config.get("emailEnabled", True)
-    # Enforce dependencies: Phase 3 skipped → skip 4 and 5
+    # Enforce dependencies (6-phase model 0-5): Phase 3 (NLM) skipped → Phase 4 (YouTube) off
     if 3 in skip_phases:
-        skip_phases.update([4, 5])
+        skip_phases.add(4)
 
     # ── Preload data from previous phases (for resume) ──
     brief_text, brief_url = "", cp.get("brief_url", "")
@@ -2483,7 +2505,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
     browser = Browser(PROFILE_DIR, headless=False)
     try:
+        # ══════════════════════ PHASE 0: Init ══════════════════════
+        emit_event("phase_start", phase=0)
+        _p0_start = time.time()
         await browser.start()
+        emit_event("phase_complete", phase=0, durationSec=int(time.time() - _p0_start))
 
         # ══════════════════════ PHASE 1: Brief ══════════════════════
         p1 = None
@@ -2512,7 +2538,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             save_checkpoint(queue_dir, 1, topic=topic, brief_url=brief_url)
             update_delivery(brief_url=brief_url)
             save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
-            emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start))
+            _p1_links = [{"label": "Research Brief", "url": brief_url}] if brief_url else []
+            emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start), links=_p1_links)
         else:
             # Load brief from documents/ (new location) or root (old location)
             for bp in [queue_dir / "documents" / "brief.md", queue_dir / "brief.md"]:
@@ -2523,7 +2550,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Phase 1: Loaded existing brief ({len(brief_text)} chars)")
 
         if stop_requested():
-            log("Stop requested after Phase 1", "WARN"); clear_stop(); return
+            log("Stop requested after Phase 1", "WARN"); clear_stop()
+            emit_event("pipeline_stopped", phase=1)
+            return
 
         # ══════════════════════ PHASE 2: Deep Research ══════════════════════
         results = {}
@@ -2623,22 +2652,26 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     data["sourceRefs"] = refs
                 meta["agents"] = agents
                 meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start))
+            _p2_links = [{"label": f"{n} Research", "url": r.get("url", "")} for n, r in results.items() if r.get("url")]
+            emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links)
         else:
             log("Phase 2: Loading existing research files")
 
         if stop_requested():
-            log("Stop requested after Phase 2", "WARN"); clear_stop(); return
+            log("Stop requested after Phase 2", "WARN"); clear_stop()
+            emit_event("pipeline_stopped", phase=2)
+            return
 
         # ── Check we have research output to continue ──
         doc_dir = queue_dir / "documents"
         md_files = [f for f in doc_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
         has_results = md_files or any(r.get("text") for r in results.values())
         if not has_results:
-            log("No research output — skipping Phases 3-6", "WARN")
+            log("No research output — skipping Phases 3-5", "WARN")
             return
 
-        # ══════════════════════ PHASE 3: Links + NotebookLM ══════════════════════
+        # ══════════════════════ PHASE 3: NotebookLM Processing (upload + audio) ══════════════════════
+        audio_path = None
         if 3 in skip_phases:
             log("Phase 3: SKIPPED by config")
         elif start_phase <= 3:
@@ -2650,6 +2683,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     name = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}.get(stem, stem)
                     results[name] = {"status": "done", "text": md_file.read_text(encoding="utf-8"),
                                      "url": "", "page": None}
+            # Sub-step 3a: Upload to NotebookLM
             p3 = await run_phase3(browser, cua_client, results, topic, queue_dir, verbose)
             links = p3.get("links", {})
             notebook_url = p3.get("notebook_url", "")
@@ -2657,71 +2691,61 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
                             notebook_url=notebook_url)
             update_delivery(research_links=links, notebook_url=notebook_url)
+            # Sub-step 3b: Generate audio overview
+            if notebook_url:
+                p4 = await run_phase4(browser, cua_client, notebook_url, queue_dir, verbose)
+                audio_path = p4.get("audio_path")
+                save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
+                                notebook_url=notebook_url,
+                                audio_path=str(audio_path) if audio_path else "")
+                update_delivery(audio_url=notebook_url)
             save_meta(queue_dir, topic, 3)
-            emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start))
+            _p3_links = [{"label": "NotebookLM Notebook", "url": notebook_url}] if notebook_url else []
+            emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links)
         else:
             links_file = queue_dir / "links.json"
             if links_file.exists():
                 links = json.loads(links_file.read_text(encoding="utf-8"))
-            log(f"Phase 3: Loaded existing links ({len(links)} platforms)")
-
-        if stop_requested():
-            log("Stop requested after Phase 3", "WARN"); clear_stop(); return
-
-        # ══════════════════════ PHASE 4: Audio ══════════════════════
-        audio_path = None
-        if 4 in skip_phases:
-            log("Phase 4: SKIPPED by config")
-        elif start_phase <= 4:
-            emit_event("phase_start", phase=4)
-            _p4_start = time.time()
-            if notebook_url:
-                p4 = await run_phase4(browser, cua_client, notebook_url, queue_dir, verbose)
-                audio_path = p4.get("audio_path")
-                save_checkpoint(queue_dir, 4, topic=topic, brief_url=brief_url,
-                                notebook_url=notebook_url,
-                                audio_path=str(audio_path) if audio_path else "")
-                update_delivery(audio_url=notebook_url)
-                save_meta(queue_dir, topic, 4)
-                emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start))
-            else:
-                log("Skipping Phase 4 — no NotebookLM notebook", "WARN")
-        else:
             audio_str = cp.get("audio_path", "")
             if audio_str and Path(audio_str).exists():
                 audio_path = Path(audio_str)
-                log(f"Phase 4: Using existing audio ({audio_path.name})")
+            log(f"Phase 3: Loaded existing (links={len(links)}, audio={'yes' if audio_path else 'no'})")
 
         if stop_requested():
-            log("Stop requested after Phase 4", "WARN"); clear_stop(); return
+            log("Stop requested after Phase 3", "WARN"); clear_stop()
+            emit_event("pipeline_stopped", phase=3)
+            return
 
-        # ══════════════════════ PHASE 5: Video + YouTube ══════════════════════
-        if 5 in skip_phases or not video_enabled:
-            log(f"Phase 5: SKIPPED {'by config' if 5 in skip_phases else '(video disabled)'}")
-        elif start_phase <= 5:
-            emit_event("phase_start", phase=5)
-            _p5_start = time.time()
+        # ══════════════════════ PHASE 4: YouTube Upload ══════════════════════
+        if 4 in skip_phases or not video_enabled:
+            log(f"Phase 4: SKIPPED {'by config' if 4 in skip_phases else '(video disabled)'}")
+        elif start_phase <= 4:
+            emit_event("phase_start", phase=4)
+            _p4_start = time.time()
             if audio_path:
                 p5 = await run_phase5(browser, cua_client, audio_path, topic, queue_dir,
                                        links=links, notebook_url=notebook_url, verbose=verbose)
                 youtube_url = p5.get("youtube_url", "")
-                save_checkpoint(queue_dir, 5, topic=topic, brief_url=brief_url,
+                save_checkpoint(queue_dir, 4, topic=topic, brief_url=brief_url,
                                 notebook_url=notebook_url, youtube_url=youtube_url)
                 update_delivery(youtube_url=youtube_url)
-                save_meta(queue_dir, topic, 5)
-                emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start))
+                save_meta(queue_dir, topic, 4)
+                _p4_links = [{"label": "YouTube Video", "url": youtube_url}] if youtube_url else []
+                emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links)
             else:
-                log("Skipping Phase 5 — no audio", "WARN")
+                log("Skipping Phase 4 — no audio", "WARN")
 
         if stop_requested():
-            log("Stop requested after Phase 5", "WARN"); clear_stop(); return
+            log("Stop requested after Phase 4", "WARN"); clear_stop()
+            emit_event("pipeline_stopped", phase=4)
+            return
 
-        # ══════════════════════ PHASE 6: Google Doc + Email ══════════════════════
-        if 6 in skip_phases or not email_enabled:
-            log(f"Phase 6: SKIPPED {'by config' if 6 in skip_phases else '(email disabled)'}")
+        # ══════════════════════ PHASE 5: Report & Notification ══════════════════════
+        if 5 in skip_phases or not email_enabled:
+            log(f"Phase 5: SKIPPED {'by config' if 5 in skip_phases else '(email disabled)'}")
         else:
-            emit_event("phase_start", phase=6)
-            _p6_start = time.time()
+            emit_event("phase_start", phase=5)
+            _p5_start = time.time()
             audio_url = notebook_url
             p6 = await run_phase6(browser, cua_client, topic, links, notebook_url, youtube_url,
                                   brief_url=brief_url, audio_url=audio_url,
@@ -2729,10 +2753,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
             update_delivery(doc_url=p6.get("doc_url", ""), email_sent=p6.get("email_sent", False),
                             status="completed")
-            save_checkpoint(queue_dir, 6, topic=topic, brief_url=brief_url, notebook_url=notebook_url,
+            save_checkpoint(queue_dir, 5, topic=topic, brief_url=brief_url, notebook_url=notebook_url,
                             youtube_url=youtube_url, doc_url=p6.get("doc_url", ""))
-            save_meta(queue_dir, topic, 6, status="completed")
-            emit_event("phase_complete", phase=6, durationSec=int(time.time() - _p6_start))
+            save_meta(queue_dir, topic, 5, status="completed")
+            _p5_links = [{"label": "Google Doc", "url": p6.get("doc_url", "")}]
+            if p6.get("email_sent"):
+                _p5_links.append({"label": "Email Sent", "url": ""})
+            emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start), links=_p5_links)
 
         emit_event("pipeline_complete", summary=f"Pipeline finished for: {topic[:100]}")
         log(f"\n{'='*60}")
@@ -2831,38 +2858,34 @@ async def run_server(port=8000):
         events_file = _find_events_file(run_id)
         if not events_file:
             return {"events": [], "offset": 0, "total": 0}
-        lines = events_file.read_text(encoding="utf-8").strip().split("\n")
+        lines = [l for l in events_file.read_text(encoding="utf-8").strip().split("\n") if l.strip()]
         events = []
         for line in lines[offset:]:
-            if line.strip():
-                try:
-                    events.append(json.loads(line))
-                except Exception:
-                    pass
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                log(f"Events API: Failed to parse line at offset {offset}: {line[:80]}", "WARN")
         return {"events": events, "offset": len(lines), "total": len(lines)}
 
     @app.websocket("/ws/{run_id}")
     async def ws_stream(websocket: WebSocket, run_id: str):
-        """WebSocket: push new progress events in real-time."""
+        """WebSocket: push new progress events in real-time (tracks by line count, not byte offset)."""
         await websocket.accept()
         events_file = _find_events_file(run_id)
-        last_pos = 0
+        last_line = 0
         try:
             while True:
-                # Re-discover file if not found yet (pipeline may not have started)
                 if not events_file or not events_file.exists():
                     events_file = _find_events_file(run_id)
                 if events_file and events_file.exists():
-                    content = events_file.read_text(encoding="utf-8")
-                    if len(content) > last_pos:
-                        new_data = content[last_pos:]
-                        last_pos = len(content)
-                        for line in new_data.strip().split("\n"):
-                            if line.strip():
-                                try:
-                                    await websocket.send_json(json.loads(line))
-                                except Exception:
-                                    pass
+                    lines = [l for l in events_file.read_text(encoding="utf-8").strip().split("\n") if l.strip()]
+                    if len(lines) > last_line:
+                        for line in lines[last_line:]:
+                            try:
+                                await websocket.send_json(json.loads(line))
+                            except Exception:
+                                log(f"WS: Failed to parse event line: {line[:80]}", "WARN")
+                        last_line = len(lines)
                 await asyncio.sleep(2)
         except WebSocketDisconnect:
             pass
