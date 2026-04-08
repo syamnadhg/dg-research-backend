@@ -37,15 +37,16 @@ if sys.platform == "win32":
 
 PROFILE_DIR = Path.home() / ".openclaw" / "browser-profile"
 BETA_FLAG = "computer-use-2025-11-24"
-CUA_MODEL = "claude-opus-4-6"
-API_WIDTH = 1280
-API_HEIGHT = 800
+# All configurable via env vars (defaults are production-tuned)
+CUA_MODEL = os.environ.get("CUA_MODEL", "claude-opus-4-6")
+API_WIDTH = int(os.environ.get("CUA_SCREEN_WIDTH", "1280"))
+API_HEIGHT = int(os.environ.get("CUA_SCREEN_HEIGHT", "800"))
 
-# Polling intervals
-POLL_PRO = 30           # seconds — for Pro/Extended Thinking
-POLL_DEEP_RESEARCH = 30 # seconds — for deep research agents
-MAX_WAIT_PRO = 45       # minutes — Phase 1 brief generation
-MAX_WAIT_DEEP = 90      # minutes — Phase 2 per research agent
+# Polling intervals (override via env for testing with shorter waits)
+POLL_PRO = int(os.environ.get("POLL_PRO", "30"))                 # seconds
+POLL_DEEP_RESEARCH = int(os.environ.get("POLL_DEEP_RESEARCH", "30"))  # seconds
+MAX_WAIT_PRO = int(os.environ.get("MAX_WAIT_PRO", "45"))         # minutes — Phase 1
+MAX_WAIT_DEEP = int(os.environ.get("MAX_WAIT_DEEP", "90"))       # minutes — Phase 2
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -183,7 +184,8 @@ def emit_event(event_type, phase=None, agent=None, **data):
 
 async def scrape_progress_chatgpt(page):
     """Scrape ChatGPT's current research progress (Playwright JS — zero CUA cost).
-    Returns rich data for web app: status, thinking steps, sources, sections, text length."""
+    Returns rich data for web app: status, thinking steps, sources, sections, text length.
+    Selectors use multiple fallbacks per field — if ChatGPT UI changes, values degrade gracefully."""
     try:
         return await page.evaluate("""() => {
             const r = {
@@ -223,12 +225,14 @@ async def scrape_progress_chatgpt(page):
             else { r.status = 'idle'; r.phase = 'waiting'; }
             return r;
         }""")
-    except Exception:
-        return {"status": "error", "phase": "error", "progress": "", "sources": 0, "partial_text_len": 0}
+    except Exception as e:
+        log(f"ChatGPT scrape failed (selectors may need update): {e}", "WARN")
+        return {"status": "scrape_error", "progress": "Selector mismatch — ChatGPT UI may have changed", "sources": 0, "partial_text_len": 0}
 
 
 async def scrape_progress_gemini(page):
-    """Scrape Gemini's current research progress — rich data for web app."""
+    """Scrape Gemini's current research progress — rich data for web app.
+    Selectors use multiple fallbacks — degrades gracefully on UI changes."""
     try:
         return await page.evaluate("""() => {
             const r = {
@@ -261,12 +265,14 @@ async def scrape_progress_gemini(page):
             r.phase = r.steps.length > 0 ? 'researching' : (r.plan ? 'planning' : (r.partial_text_len > 0 ? 'done' : 'waiting'));
             return r;
         }""")
-    except Exception:
-        return {"status": "error", "phase": "error", "progress": "", "sources": 0, "partial_text_len": 0}
+    except Exception as e:
+        log(f"Gemini scrape failed (selectors may need update): {e}", "WARN")
+        return {"status": "scrape_error", "progress": "Selector mismatch — Gemini UI may have changed", "sources": 0, "partial_text_len": 0}
 
 
 async def scrape_progress_claude(page):
-    """Scrape Claude's current research progress — rich data for web app."""
+    """Scrape Claude's current research progress — rich data for web app.
+    Selectors use multiple fallbacks — degrades gracefully on UI changes."""
     try:
         return await page.evaluate("""() => {
             const r = {
@@ -305,8 +311,9 @@ async def scrape_progress_claude(page):
             r.phase = r.thinking ? 'thinking' : (r.tool_uses.length > 0 ? 'researching' : (hasStop ? 'generating' : (r.partial_text_len > 0 ? 'done' : 'waiting')));
             return r;
         }""")
-    except Exception:
-        return {"status": "error", "phase": "error", "progress": "", "sources": 0, "partial_text_len": 0}
+    except Exception as e:
+        log(f"Claude scrape failed (selectors may need update): {e}", "WARN")
+        return {"status": "scrape_error", "progress": "Selector mismatch — Claude UI may have changed", "sources": 0, "partial_text_len": 0}
 
 
 SCRAPE_FNS = {
@@ -915,7 +922,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     }
     # CUA completion check: first at 20 min, then every 5 min
     # Firecrawl scraping: every 5 min (staggered — starts at 2.5 min to avoid collision)
-    MIN_WAIT = {"ChatGPT": 20 * 60, "Gemini": 20 * 60, "Claude": 20 * 60}
+    _min_agent_wait = int(os.environ.get("MIN_AGENT_WAIT_MIN", "20")) * 60
+    MIN_WAIT = {"ChatGPT": _min_agent_wait, "Gemini": _min_agent_wait, "Claude": _min_agent_wait}
     CUA_CHECK_INTERVAL = 300   # 5 min between CUA checks
     FIRECRAWL_INTERVAL = 300   # 5 min between Firecrawl scrapes
 
