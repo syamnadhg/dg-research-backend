@@ -827,6 +827,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     partialTextLen=progress.get("partial_text_len", 0),
                     model=progress.get("model", ""),
                     thinking=progress.get("thinking", ""),
+                    steps=progress.get("steps", []),
+                    plan=progress.get("plan", ""),
+                    toolUses=progress.get("tool_uses", []),
+                    title=progress.get("title", ""),
                 )
             except Exception:
                 pass
