@@ -1611,6 +1611,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False):
         log("[2A] ChatGPT Deep Research is running ✓")
     else:
         log("[2A] ChatGPT failed after 2 attempts", "ERROR")
+        emit_event("pipeline_error", phase=2, agent="chatgpt", error="Failed to start after 2 attempts")
 
     # ── Step 2: Gemini (submit brief, let it generate research plan — don't wait for Start yet) ──
     log("\n--- 2B: Gemini Deep Research (submit + let it plan) ---")
@@ -1642,6 +1643,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False):
         log("[2C] Claude is running ✓")
     else:
         log("[2C] Claude failed after 2 attempts", "ERROR")
+        emit_event("pipeline_error", phase=2, agent="claude", error="Failed to start after 2 attempts")
 
     # ── Step 4: Go back to Gemini — wait for plan + click "Start research" ──
     log("\n--- 2B: Gemini — waiting for research plan + clicking 'Start research' ---")
@@ -2373,32 +2375,41 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
 
 def detect_resume_phase(queue_dir):
     """Detect which phase to resume from based on existing output files.
-    Returns (phase_number, description)."""
+    Returns (phase_number, description). Uses 6-phase model (0-5)."""
     queue_dir = Path(queue_dir)
     if (queue_dir / "delivery.json").exists():
-        delivery = json.loads((queue_dir / "delivery.json").read_text(encoding="utf-8"))
-        if delivery.get("status") == "completed":
-            return 6, "Pipeline already complete"
-    # Check checkpoint for audio — if audio exists, skip to Phase 5
+        try:
+            delivery = json.loads((queue_dir / "delivery.json").read_text(encoding="utf-8"))
+            if delivery.get("status") == "completed":
+                return 6, "Pipeline already complete"
+        except Exception:
+            pass
     cp = load_checkpoint(queue_dir)
+    # Phase 5 (Report): check if YouTube done but no delivery
+    if cp and cp.get("youtube_url"):
+        return 5, "YouTube done — resuming from Phase 5 (Report & Notification)"
+    # Phase 4 (YouTube): check if audio exists
     if cp and cp.get("audio_path") and Path(cp["audio_path"]).exists():
-        return 5, "Audio exists — resuming from Phase 5 (video + YouTube)"
+        return 4, "Audio exists — resuming from Phase 4 (YouTube Upload)"
     audio_dir = queue_dir / "podcasts"
     if audio_dir.exists() and any(audio_dir.glob("*.*")):
-        return 5, "Audio exists — resuming from Phase 5 (video + YouTube)"
+        return 4, "Audio exists — resuming from Phase 4 (YouTube Upload)"
+    # Phase 3 (NLM+Audio): check if links/notebook exist
     if (queue_dir / "links.json").exists():
-        return 4, "Links exist — resuming from Phase 4 (audio)"
+        return 3, "Links exist — resuming from Phase 3 (NotebookLM Processing)"
+    # Phase 2 (Research): check if research MDs exist
     research_dir = queue_dir / "documents"
     has_research = research_dir.exists() and any(
         f for f in research_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief")
     if has_research:
-        return 3, "Research MDs exist — resuming from Phase 3 (links + NotebookLM)"
+        return 2, "Research MDs exist — resuming from Phase 2 (Deep Research)"
+    # Phase 1 (Brief): check if brief exists
     brief = queue_dir / "documents" / "brief.md"
     if not brief.exists():
-        brief = queue_dir / "brief.md"  # Legacy location
+        brief = queue_dir / "brief.md"
     if brief.exists() and brief.stat().st_size > 100:
-        return 2, "Brief exists — resuming from Phase 2 (deep research)"
-    return 1, "Starting from Phase 1"
+        return 1, "Brief exists — resuming from Phase 1 (Research Brief)"
+    return 0, "Starting from Phase 0 (Init)"
 
 
 # ── Main Pipeline ─────────────────────────────────────────────────────────────
@@ -2424,7 +2435,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         (queue_dir / "documents").mkdir(exist_ok=True)
         start_phase, reason = detect_resume_phase(queue_dir)
         log(f"RESUME: {reason}")
-        if start_phase >= 6:
+        if start_phase > 5:
             log("Pipeline already complete — nothing to resume")
             return
         cp = load_checkpoint(queue_dir) or {}
@@ -2564,7 +2575,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 emit_event("pipeline_error", phase=2, error="no brief text")
                 return
             enabled_agents = [a for a, on in agents_cfg.items() if on]
+            disabled_agents = [a for a, on in agents_cfg.items() if not on]
             emit_event("phase_start", phase=2, agents=enabled_agents)
+            for da in disabled_agents:
+                emit_event("agent_skipped", phase=2, agent=da)
             _p2_start = time.time()
             fb2 = get_feedback(2)
             research_brief = brief_text
@@ -2780,15 +2794,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     finally:
         await browser.close()
 
-    # Auto-retry from checkpoint if pipeline failed mid-way (not if completed or interrupted)
-    if not resume_dir and queue_dir and not (queue_dir / "delivery.json").exists():
-        phase, _ = detect_resume_phase(queue_dir)
-        if 1 < phase < 7:
-            log(f"Pipeline failed at phase {phase} — auto-retrying from checkpoint...", "WARN")
-            await asyncio.sleep(5)
-            await run_pipeline(topic=topic, email=email, verbose=verbose,
-                               api_key=api_key, resume_dir=str(queue_dir),
-                               config=config)
+    # Auto-retry from checkpoint if pipeline failed mid-way (not if completed or stopped)
+    if not resume_dir and queue_dir:
+        try:
+            d_path = queue_dir / "delivery.json"
+            d_status = json.loads(d_path.read_text(encoding="utf-8")).get("status") if d_path.exists() else ""
+        except Exception:
+            d_status = ""
+        if d_status != "completed" and not (queue_dir / ".stop").exists():
+            phase, _ = detect_resume_phase(queue_dir)
+            if 1 < phase <= 5:
+                log(f"Pipeline failed at phase {phase} — auto-retrying from checkpoint...", "WARN")
+                await asyncio.sleep(5)
+                await run_pipeline(topic=topic, email=email, verbose=verbose,
+                                   api_key=api_key, resume_dir=str(queue_dir),
+                                   config=config)
 
 
 # ── Server Mode (Web App API) ────────────────────────────────────────────────
@@ -2959,11 +2979,22 @@ async def run_server(port=8000):
                 # Remove outputs from that phase onwards so they get regenerated
                 if earliest_phase <= 1:
                     for f in (queue / "documents").glob("brief.md"):
-                        f.unlink()
+                        try: f.unlink()
+                        except Exception: pass
                 if earliest_phase <= 2:
                     for f in (queue / "documents").glob("*.md"):
                         if f.stem != "brief":
-                            f.unlink()
+                            try: f.unlink()
+                            except Exception: pass
+                if earliest_phase <= 3:
+                    for p in [queue / "links.json"]:
+                        try: p.unlink(missing_ok=True)
+                        except Exception: pass
+                    podcasts_dir = queue / "podcasts"
+                    if podcasts_dir.exists():
+                        for f in podcasts_dir.glob("*.*"):
+                            try: f.unlink()
+                            except Exception: pass
         # If request has config, merge with existing config.json
         if request_data and request_data.get("config"):
             config_path = queue / "config.json"
