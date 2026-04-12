@@ -156,12 +156,8 @@ def save_track(platform, data):
         **data,
     }
     (platform_dir / f"{count:03d}_{ts}.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
-    # Append to events.jsonl — single streamable file
-    try:
-        with open(_tracks_dir / "events.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+    # NOTE: do NOT append to events.jsonl here — only emit_event() writes typed events
+    # Raw scrape data stays in per-platform JSON files only
 
 
 def emit_event(event_type, phase=None, agent=None, **data):
@@ -806,7 +802,7 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
 # ── DOM Polling (zero CUA cost) ───────────────────────────────────────────────
 
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
-                          browser=None, cua_client=None, verbose=False):
+                          browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
     wait_start = time.time()
     max_wait = max_wait_min * 60
@@ -821,7 +817,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 progress = await scrape_fn(page)
                 save_track(label, progress)
                 # Emit structured agent_progress event for frontend streaming
-                emit_event("agent_progress", phase=2, agent=label.lower().replace(" ", ""),
+                emit_event("agent_progress", phase=phase, agent=label.lower().replace(" ", ""),
                     status=progress.get("status", ""),
                     progress=progress.get("progress", ""),
                     sources=progress.get("sources", 0),
@@ -1489,7 +1485,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # Wait for response
     log(f"Polling for response (every {POLL_PRO}s, max {MAX_WAIT_PRO}min)...")
     completed = await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1", POLL_PRO, MAX_WAIT_PRO,
-        browser=browser, cua_client=cua_client, verbose=verbose)
+        browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
 
     # Extract
     brief_text = await extract_chatgpt_response(browser.page)
@@ -2200,7 +2196,7 @@ async def run_phase6(browser, cua_client, topic, links, notebook_url, youtube_ur
 
         doc_url = await browser.current_url()
         log(f"Google Doc: {doc_url}")
-        save_track("Phase6", {"status": "doc_created", "doc_url": doc_url})
+        save_track("Phase5", {"status": "doc_created", "doc_url": doc_url})
     except Exception as e:
         log(f"Google Doc error: {e}", "ERROR")
 
@@ -2232,7 +2228,7 @@ async def run_phase6(browser, cua_client, topic, links, notebook_url, youtube_ur
 
             email_sent = True
             log("Email sent ✓")
-            save_track("Phase6", {"status": "email_sent", "email": email})
+            save_track("Phase5", {"status": "email_sent", "email": email})
         except Exception as e:
             log(f"Email error: {e}", "ERROR")
     else:
