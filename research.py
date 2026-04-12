@@ -801,6 +801,8 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
 
 # ── DOM Polling (zero CUA cost) ───────────────────────────────────────────────
 
+_last_progress: dict = {}  # Deduplication cache for agent_progress events
+
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                           browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
@@ -808,29 +810,50 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     max_wait = max_wait_min * 60
     consecutive_not_generating = 0
     cua_checked = False
+    last_heartbeat = time.time()
 
     while (time.time() - wait_start) < max_wait:
+        # ── Stop check: abort polling if .stop file exists ──
+        if _tracks_dir:
+            stop_file = Path(__file__).parent / "queues" / _tracks_dir.name / ".stop"
+            if stop_file.exists():
+                log(f"[{label}] Stop requested — aborting poll")
+                return False
+
+        # ── Heartbeat every 60s so frontend knows we're alive ──
+        if time.time() - last_heartbeat >= 60:
+            emit_event("heartbeat", phase=phase, agent=label.lower().replace(" ", ""))
+            last_heartbeat = time.time()
+
         # Scrape progress FIRST — every cycle, regardless of state
         scrape_fn = SCRAPE_FNS.get(label)
         if scrape_fn:
             try:
                 progress = await scrape_fn(page)
                 save_track(label, progress)
-                # Emit structured agent_progress event for frontend streaming
-                emit_event("agent_progress", phase=phase, agent=label.lower().replace(" ", ""),
-                    status=progress.get("status", ""),
-                    progress=progress.get("progress", ""),
-                    sources=progress.get("sources", 0),
-                    sourceUrls=progress.get("source_urls", []),
-                    sections=progress.get("sections", []),
-                    partialTextLen=progress.get("partial_text_len", 0),
-                    model=progress.get("model", ""),
-                    thinking=progress.get("thinking", ""),
-                    steps=progress.get("steps", []),
-                    plan=progress.get("plan", ""),
-                    toolUses=progress.get("tool_uses", []),
-                    title=progress.get("title", ""),
-                )
+                # Deduplicate: only emit if data actually changed
+                progress_key = json.dumps({
+                    "status": progress.get("status", ""),
+                    "sources": progress.get("sources", 0),
+                    "partialTextLen": progress.get("partial_text_len", 0),
+                    "sections_len": len(progress.get("sections", [])),
+                }, sort_keys=True)
+                if _last_progress.get(label) != progress_key:
+                    _last_progress[label] = progress_key
+                    emit_event("agent_progress", phase=phase, agent=label.lower().replace(" ", ""),
+                        status=progress.get("status", ""),
+                        progress=progress.get("progress", ""),
+                        sources=progress.get("sources", 0),
+                        sourceUrls=progress.get("source_urls", []),
+                        sections=progress.get("sections", []),
+                        partialTextLen=progress.get("partial_text_len", 0),
+                        model=progress.get("model", ""),
+                        thinking=progress.get("thinking", ""),
+                        steps=progress.get("steps", []),
+                        plan=progress.get("plan", ""),
+                        toolUses=progress.get("tool_uses", []),
+                        title=progress.get("title", ""),
+                    )
             except Exception:
                 pass
 
