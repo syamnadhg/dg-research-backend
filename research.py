@@ -98,21 +98,23 @@ def init_tracks(run_name):
     global _tracks_dir
     _tracks_dir = Path(__file__).parent / "tracks" / run_name
     # Create full phase structure (idempotent — safe for resumes)
+    # Phases 0-5 only. Directory names match _TRACK_ROUTES below.
     for phase_dir in [
+        "phase0/init",
         "phase1/brief",
         "phase2/chatgpt", "phase2/gemini", "phase2/claude",
-        "phase3/links", "phase3/notebooklm",
-        "phase4/audio",
-        "phase5/video",
-        "phase6/delivery",
+        "phase3/notebooklm",
+        "phase4/youtube",
+        "phase5/delivery",
     ]:
         (_tracks_dir / phase_dir).mkdir(parents=True, exist_ok=True)
     log(f"Tracks: {_tracks_dir}")
     return _tracks_dir
 
 
-# Track routing: platform name → phase/subfolder (6-phase model: 0-5)
+# Track routing: platform name → phase/subfolder (phases 0-5)
 _TRACK_ROUTES = {
+    "phase0": "phase0/init",
     "phase1": "phase1/brief",
     "chatgpt": "phase2/chatgpt",
     "gemini": "phase2/gemini",
@@ -120,6 +122,7 @@ _TRACK_ROUTES = {
     "phase3": "phase3/notebooklm",
     "notebooklm": "phase3/notebooklm",
     "phase4": "phase4/youtube",
+    "youtube": "phase4/youtube",
     "phase5": "phase5/delivery",
 }
 

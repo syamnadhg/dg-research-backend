@@ -1,4 +1,4 @@
-# DG Research — Pipeline Specification
+# Super Research — Pipeline Specification
 
 Frontend ↔ Backend contract for the Multi-Agent Deep Research Pipeline.
 
@@ -81,4 +81,4 @@ Stored in `{queue_dir}/config.json`:
 
 ---
 
-*Updated: 2026-04-07 — aligned to 6-phase model (0-5)*
+*Updated: 2026-04-11 — renamed to Super Research, aligned to 6-phase model (0-5)*
