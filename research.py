@@ -2666,6 +2666,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         p1 = None
         if 1 in skip_phases:
             log("Phase 1: SKIPPED by config")
+            emit_event("phase_skipped", phase=1, reason="Disabled in pipeline config")
         elif start_phase <= 1:
             emit_event("phase_start", phase=1)
             _p1_start = time.time()
@@ -2720,6 +2721,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         results = {}
         if 2 in skip_phases:
             log("Phase 2: SKIPPED by config")
+            emit_event("phase_skipped", phase=2, reason="Disabled in pipeline config")
         elif start_phase <= 2:
             if not brief_text:
                 log("No brief text available — cannot run Phase 2", "ERROR")
@@ -2860,6 +2862,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         audio_path = None
         if 3 in skip_phases:
             log("Phase 3: SKIPPED by config")
+            emit_event("phase_skipped", phase=3, reason="Disabled in pipeline config")
         elif start_phase <= 3:
             emit_event("phase_start", phase=3)
             _p3_start = time.time()
@@ -2915,7 +2918,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 4: YouTube Upload ══════════════════════
         if 4 in skip_phases or not video_enabled:
-            log(f"Phase 4: SKIPPED {'by config' if 4 in skip_phases else '(video disabled)'}")
+            _reason = "Disabled in pipeline config" if 4 in skip_phases else "Video disabled"
+            log(f"Phase 4: SKIPPED ({_reason})")
+            emit_event("phase_skipped", phase=4, reason=_reason)
         elif start_phase <= 4:
             emit_event("phase_start", phase=4)
             _p4_start = time.time()
@@ -2930,7 +2935,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _p4_links = [{"label": "YouTube Video", "url": youtube_url}] if youtube_url else []
                 emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links)
             else:
-                log("Skipping Phase 4 — no audio", "WARN")
+                log("Skipping Phase 4 — no audio from Phase 3", "WARN")
+                emit_event("phase_skipped", phase=4, reason="No audio produced in Phase 3")
 
         if stop_or_pause_requested():
             is_stop = stop_requested()
@@ -2950,7 +2956,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 5: Report & Notification ══════════════════════
         if 5 in skip_phases or not email_enabled:
-            log(f"Phase 5: SKIPPED {'by config' if 5 in skip_phases else '(email disabled)'}")
+            _reason = "Disabled in pipeline config" if 5 in skip_phases else "Email disabled"
+            log(f"Phase 5: SKIPPED ({_reason})")
+            emit_event("phase_skipped", phase=5, reason=_reason)
         else:
             emit_event("phase_start", phase=5)
             _p5_start = time.time()
