@@ -3367,6 +3367,20 @@ async def run_server(port=8000):
             "content": content,
         }
 
+    @app.get("/api/runs/{run_id}/audio/{filename}")
+    async def get_audio(run_id: str, filename: str):
+        """Serve audio file from podcasts directory."""
+        from fastapi.responses import FileResponse as _FileResponse
+        # Sanitize filename to prevent path traversal
+        safe = Path(filename).name
+        path = queues_root / run_id / "podcasts" / safe
+        if not path.exists():
+            return JSONResponse({"error": "audio not found"}, 404)
+        mime_map = {".m4a": "audio/mp4", ".mp3": "audio/mpeg",
+                    ".wav": "audio/wav", ".webm": "audio/webm"}
+        media_type = mime_map.get(path.suffix.lower(), "application/octet-stream")
+        return _FileResponse(str(path), media_type=media_type, filename=safe)
+
     log(f"Starting API server on http://0.0.0.0:{port}")
     log(f"  GET  /api/runs                     — List all runs")
     log(f"  POST /api/runs                     — Start new run {{topic, email}}")
