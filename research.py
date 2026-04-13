@@ -567,7 +567,8 @@ async def execute_action(browser, action, params):
 # ── Agent Loop ─────────────────────────────────────────────────────────────────
 
 async def agent_loop(client, browser, system_prompt, user_message,
-                     model=CUA_MODEL, max_iterations=30, verbose=False):
+                     model=CUA_MODEL, max_iterations=30, verbose=False,
+                     phase=None, agent_name=None):
     """CUA agent loop — proven from original research.py."""
     initial_ss = await browser.screenshot()
     if not initial_ss:
@@ -640,6 +641,11 @@ async def agent_loop(client, browser, system_prompt, user_message,
                     {"type": "text", "text": f"Action '{act}' executed."},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}},
                 ]})
+            # Emit CUA action event for frontend visibility
+            if agent_name and act != "screenshot":
+                emit_event("cua_action", phase=phase, agent=agent_name,
+                    action=act, description=last_text[:200] if last_text else f"Action: {act}",
+                    iteration=iteration)
         messages.append({"role": "user", "content": tool_results})
 
     return {"status": "max_iterations", "text": last_text}
@@ -738,7 +744,7 @@ async def verify_claude_generating(page) -> bool:
 
 
 async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=None,
-                              max_retries=20, interval=3, verbose=False):
+                              max_retries=20, interval=3, verbose=False, phase=None):
     """Smart verification: DOM check first, then CUA diagnosis if failing.
 
     Phase 1 (retries 1-5): Quick DOM checks — maybe it just needs a moment.
@@ -749,6 +755,11 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
     for i in range(max_retries):
         if await verify_fn(page):
             log(f"[{label}] ✓ Verified — actively generating")
+            agent_key = {"Phase1": "brief", "ChatGPT": "chatgpt", "Gemini": "gemini", "Claude": "claude"}.get(label, label.lower().replace(" ", ""))
+            emit_event("agent_verified", phase=phase, agent=agent_key,
+                verified=True, method="dom",
+                message=f"{label} confirmed actively generating",
+                attempts=i + 1)
             return True
 
         # Phase 1: Quick DOM checks
@@ -841,7 +852,17 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 }, sort_keys=True)
                 if _last_progress.get(label) != progress_key:
                     _last_progress[label] = progress_key
-                    emit_event("agent_progress", phase=phase, agent=label.lower().replace(" ", ""),
+                    # Context-aware progress: detect Extended Thinking (no visible output is NORMAL)
+                    elapsed_sec = int(time.time() - wait_start)
+                    expected_min = MAX_WAIT_PRO if phase == 1 else MAX_WAIT_DEEP
+                    is_et = (progress.get("status") == "generating"
+                             and progress.get("sources", 0) == 0
+                             and progress.get("partial_text_len", 0) < 500)
+                    if is_et:
+                        progress["status"] = "extended_thinking"
+                        progress["progress"] = f"Extended Thinking active ({elapsed_sec // 60}min elapsed, typical {expected_min}min)"
+                    agent_key = {"Phase1": "brief", "ChatGPT": "chatgpt", "Gemini": "gemini", "Claude": "claude"}.get(label, label.lower().replace(" ", ""))
+                    emit_event("agent_progress", phase=phase, agent=agent_key,
                         status=progress.get("status", ""),
                         progress=progress.get("progress", ""),
                         sources=progress.get("sources", 0),
@@ -854,6 +875,9 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         plan=progress.get("plan", ""),
                         toolUses=progress.get("tool_uses", []),
                         title=progress.get("title", ""),
+                        scrapeHealth="limited" if is_et else "full",
+                        elapsedSec=elapsed_sec,
+                        expectedMinutes=expected_min,
                     )
             except Exception:
                 pass
@@ -868,8 +892,15 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 await asyncio.sleep(5)
                 continue
 
-            # After 3 consecutive "not generating" — ask CUA to verify before declaring done
+            # After 3 consecutive "not generating" — warn user + ask CUA to verify
             if not cua_checked and browser and cua_client:
+                agent_key = {"Phase1": "brief", "ChatGPT": "chatgpt", "Gemini": "gemini", "Claude": "claude"}.get(label, label.lower().replace(" ", ""))
+                emit_event("agent_warning", phase=phase, agent=agent_key,
+                    severity="stuck",
+                    message=f"DOM indicates not generating after {int(time.time() - wait_start)}s — CUA checking visually",
+                    elapsedSec=int(time.time() - wait_start),
+                    suggestion="CUA will verify the actual page state",
+                    actions=["skip", "stop"])
                 log(f"[{label}] DOM says not generating — asking CUA to confirm...")
                 await browser.switch_to_page(page)
                 diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
@@ -2523,6 +2554,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         (queue_dir / "documents").mkdir(exist_ok=True)
         start_phase, reason = detect_resume_phase(queue_dir)
         log(f"RESUME: {reason}")
+        # Emit resume marker so frontend knows to ignore events before this point
+        emit_event("pipeline_resumed", phase=start_phase, resumeReason=reason)
         if start_phase > 5:
             log("Pipeline already complete — nothing to resume")
             return
@@ -2953,7 +2986,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         import traceback
         traceback.print_exc()
     finally:
-        await browser.close()
+        # Only close browser on terminal stop or completion — keep alive on pause for resume
+        if pause_requested() and not stop_requested():
+            log("Browser kept alive for resume — paused at checkpoint")
+        else:
+            await browser.close()
 
     # Auto-retry from checkpoint if pipeline failed mid-way
     # Skip if: completed, stopped (terminal), or paused (intentional freeze)
