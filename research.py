@@ -813,11 +813,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     last_heartbeat = time.time()
 
     while (time.time() - wait_start) < max_wait:
-        # ── Stop check: abort polling if .stop file exists ──
+        # ── Stop/Pause check: abort polling if .stop or .pause file exists ──
         if _tracks_dir:
-            stop_file = Path(__file__).parent / "queues" / _tracks_dir.name / ".stop"
-            if stop_file.exists():
-                log(f"[{label}] Stop requested — aborting poll")
+            q_dir = Path(__file__).parent / "queues" / _tracks_dir.name
+            if (q_dir / ".stop").exists() or (q_dir / ".pause").exists():
+                signal = "stop" if (q_dir / ".stop").exists() else "pause"
+                log(f"[{label}] {signal.upper()} requested — aborting poll")
                 return False
 
         # ── Heartbeat every 60s so frontend knows we're alive ──
@@ -975,6 +976,41 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     log(f"\n--- Round-robin polling {len(pending)} agents (max {max_wait_min}min each) ---")
 
     while pending:
+        # ── Stop/Pause check: collect partial results from completed agents and exit ──
+        if _tracks_dir:
+            q_dir = Path(__file__).parent / "queues" / _tracks_dir.name
+            is_stop = (q_dir / ".stop").exists()
+            is_pause = (q_dir / ".pause").exists()
+            if is_stop or is_pause:
+                signal = "STOP" if is_stop else "PAUSE"
+                log(f"[Round-robin] {signal} requested — collecting partial results from completed agents")
+                # On STOP: try to extract from agents that are done or have partial text
+                if is_stop:
+                    for name in list(pending.keys()):
+                        p = pending[name]
+                        try:
+                            await browser.switch_to_page(p["page"])
+                            text = await extract_fns[name](p["page"], browser=browser,
+                                cua_client=cua_client, label=name, verbose=verbose)
+                            elapsed = time.time() - p["start_time"]
+                            status = "partial" if text and len(text) > 100 else "interrupted"
+                            results[name] = {"status": status, "text": text or "",
+                                             "url": p["page"].url, "page": p["page"],
+                                             "elapsed_sec": int(elapsed)}
+                            log(f"  [{name}] {status} — {len(text or '')} chars")
+                        except Exception as e:
+                            results[name] = {"status": "interrupted", "text": "",
+                                             "url": p.get("url", ""), "page": p["page"]}
+                            log(f"  [{name}] extraction failed: {e}", "WARN")
+                else:
+                    # On PAUSE: just mark pending agents as interrupted (don't try extraction)
+                    for name in list(pending.keys()):
+                        p = pending[name]
+                        results[name] = {"status": "paused", "text": "",
+                                         "url": p.get("url", ""), "page": p["page"],
+                                         "elapsed_sec": int(time.time() - p["start_time"])}
+                return results
+
         for name in list(pending.keys()):
             p = pending[name]
             elapsed = time.time() - p["start_time"]
@@ -1615,130 +1651,148 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     return page
 
 
-async def run_phase2(browser, cua_client, brief_text, verbose=False):
-    """Phase 2: ChatGPT (already in GPT from Phase 1) → Gemini (submit+plan) → Claude → Gemini (Start) → Poll all."""
+async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_agents=None):
+    """Phase 2: ChatGPT (already in GPT from Phase 1) → Gemini (submit+plan) → Claude → Gemini (Start) → Poll all.
+    enabled_agents: list of agent keys to run (e.g. ["chatgpt", "gemini"]). None = all."""
     log("=" * 60)
     log("PHASE 2: Deep Research")
+    if enabled_agents:
+        log(f"  Enabled agents: {enabled_agents}")
     log("  Sequence: ChatGPT → Gemini (submit+plan) → Claude → Gemini (click Start) → Poll all")
     log("=" * 60)
 
     agents = {}
 
     # ── Step 1: ChatGPT (we're already in ChatGPT from Phase 1 — just open Deep Research) ──
-    log("\n--- 2A: ChatGPT Deep Research (already in ChatGPT) ---")
-    for attempt in range(2):
-        if attempt > 0:
-            log("[2A] Retrying ChatGPT (fresh tab)...", "WARN")
-            try: await chatgpt_page.close()
-            except Exception: pass
-        chatgpt_page = await start_agent_no_gemini_wait(
-            browser, cua_client, "https://chatgpt.com",
-            PROMPT_CHATGPT_DEEP_RESEARCH,
-            "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2A", "ChatGPT", verbose)
-        verified_a = await wait_until_verified(verify_chatgpt_generating, chatgpt_page, "2A",
-            browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
+    if enabled_agents is None or "chatgpt" in enabled_agents:
+        log("\n--- 2A: ChatGPT Deep Research (already in ChatGPT) ---")
+        for attempt in range(2):
+            if attempt > 0:
+                log("[2A] Retrying ChatGPT (fresh tab)...", "WARN")
+                try: await chatgpt_page.close()
+                except Exception: pass
+            chatgpt_page = await start_agent_no_gemini_wait(
+                browser, cua_client, "https://chatgpt.com",
+                PROMPT_CHATGPT_DEEP_RESEARCH,
+                "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+                brief_text, "2A", "ChatGPT", verbose)
+            verified_a = await wait_until_verified(verify_chatgpt_generating, chatgpt_page, "2A",
+                browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
+            if verified_a:
+                break
+        agents["ChatGPT"] = {"page": chatgpt_page, "verified": verified_a, "url": chatgpt_page.url}
         if verified_a:
-            break
-    agents["ChatGPT"] = {"page": chatgpt_page, "verified": verified_a, "url": chatgpt_page.url}
-    if verified_a:
-        log("[2A] ChatGPT Deep Research is running ✓")
+            log("[2A] ChatGPT Deep Research is running ✓")
+        else:
+            log("[2A] ChatGPT failed after 2 attempts", "ERROR")
+            emit_event("pipeline_error", phase=2, agent="chatgpt", error="Failed to start after 2 attempts")
     else:
-        log("[2A] ChatGPT failed after 2 attempts", "ERROR")
-        emit_event("pipeline_error", phase=2, agent="chatgpt", error="Failed to start after 2 attempts")
+        log("\n--- 2A: ChatGPT SKIPPED (disabled in config) ---")
 
     # ── Step 2: Gemini (submit brief, let it generate research plan — don't wait for Start yet) ──
-    log("\n--- 2B: Gemini Deep Research (submit + let it plan) ---")
-    gemini_page = await start_agent_no_gemini_wait(
-        browser, cua_client, "https://gemini.google.com",
-        PROMPT_GEMINI_DEEP_RESEARCH,
-        "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-        brief_text, "2B", "Gemini", verbose)
-    log("[2B] Gemini brief submitted — letting it generate research plan")
+    gemini_page = None
+    if enabled_agents is None or "gemini" in enabled_agents:
+        log("\n--- 2B: Gemini Deep Research (submit + let it plan) ---")
+        gemini_page = await start_agent_no_gemini_wait(
+            browser, cua_client, "https://gemini.google.com",
+            PROMPT_GEMINI_DEEP_RESEARCH,
+            "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+            brief_text, "2B", "Gemini", verbose)
+        log("[2B] Gemini brief submitted — letting it generate research plan")
+    else:
+        log("\n--- 2B: Gemini SKIPPED (disabled in config) ---")
 
     # ── Step 3: Claude (starts instantly after submission) ──
-    log("\n--- 2C: Claude Deep Research ---")
-    for attempt in range(2):
-        if attempt > 0:
-            log("[2C] Retrying Claude (fresh tab)...", "WARN")
-            try: await claude_page.close()
-            except Exception: pass
-        claude_page = await start_agent_no_gemini_wait(
-            browser, cua_client, "https://claude.ai/new",
-            PROMPT_CLAUDE_DEEP_RESEARCH,
-            "Select Opus 4.6 + Extended Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2C", "Claude", verbose)
-        verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2C",
-            browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
+    if enabled_agents is None or "claude" in enabled_agents:
+        log("\n--- 2C: Claude Deep Research ---")
+        for attempt in range(2):
+            if attempt > 0:
+                log("[2C] Retrying Claude (fresh tab)...", "WARN")
+                try: await claude_page.close()
+                except Exception: pass
+            claude_page = await start_agent_no_gemini_wait(
+                browser, cua_client, "https://claude.ai/new",
+                PROMPT_CLAUDE_DEEP_RESEARCH,
+                "Select Opus 4.6 + Extended Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+                brief_text, "2C", "Claude", verbose)
+            verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2C",
+                browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
+            if verified_c:
+                break
+        agents["Claude"] = {"page": claude_page, "verified": verified_c, "url": claude_page.url}
         if verified_c:
-            break
-    agents["Claude"] = {"page": claude_page, "verified": verified_c, "url": claude_page.url}
-    if verified_c:
-        log("[2C] Claude is running ✓")
+            log("[2C] Claude is running ✓")
+        else:
+            log("[2C] Claude failed after 2 attempts", "ERROR")
+            emit_event("pipeline_error", phase=2, agent="claude", error="Failed to start after 2 attempts")
     else:
-        log("[2C] Claude failed after 2 attempts", "ERROR")
-        emit_event("pipeline_error", phase=2, agent="claude", error="Failed to start after 2 attempts")
+        log("\n--- 2C: Claude SKIPPED (disabled in config) ---")
 
     # ── Step 4: Go back to Gemini — wait for plan + click "Start research" ──
-    log("\n--- 2B: Gemini — waiting for research plan + clicking 'Start research' ---")
-    await browser.switch_to_page(gemini_page)
-    await asyncio.sleep(2)
-
-    # Wait up to 90s for "Start research" button (Gemini needs time to generate plan)
-    start_clicked = False
-    for attempt in range(45):
-        try:
-            clicked = await gemini_page.evaluate("""() => {
-                const btns = document.querySelectorAll('button');
-                for (const b of btns) {
-                    const txt = b.textContent.trim().toLowerCase();
-                    if (txt.includes('start research')) { b.click(); return true; }
-                }
-                return false;
-            }""")
-            if clicked:
-                log("[2B] Clicked 'Start research' via JS ✓")
-                start_clicked = True
-                await asyncio.sleep(5)
-                break
-        except Exception:
-            pass
-        if attempt % 10 == 9:
-            log(f"[2B] Still waiting for research plan... ({(attempt+1)*2}s)")
+    if gemini_page is not None:
+        log("\n--- 2B: Gemini — waiting for research plan + clicking 'Start research' ---")
+        await browser.switch_to_page(gemini_page)
         await asyncio.sleep(2)
 
-    # CUA fallback for Start research
-    if not start_clicked:
-        log("[2B] JS couldn't find button — CUA clicking 'Start research'")
-        await browser.switch_to_page(gemini_page)
-        fix = await agent_loop(cua_client, browser,
-            PROMPT_GEMINI_START_RESEARCH,
-            "Click the 'Start research' button to begin the deep research.",
-            model=CUA_MODEL, max_iterations=10, verbose=verbose)
-        fix_text = (fix.get("text") or "").lower()
-        if "click" in fix_text:
-            start_clicked = True
-            log("[2B] CUA clicked 'Start research' ✓")
-            await asyncio.sleep(5)
+        # Wait up to 90s for "Start research" button (Gemini needs time to generate plan)
+        start_clicked = False
+        for attempt in range(45):
+            try:
+                clicked = await gemini_page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        const txt = b.textContent.trim().toLowerCase();
+                        if (txt.includes('start research')) { b.click(); return true; }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    log("[2B] Clicked 'Start research' via JS ✓")
+                    start_clicked = True
+                    await asyncio.sleep(5)
+                    break
+            except Exception:
+                pass
+            if attempt % 10 == 9:
+                log(f"[2B] Still waiting for research plan... ({(attempt+1)*2}s)")
+            await asyncio.sleep(2)
 
-    # Verify Gemini is actually researching
-    verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2B",
-        browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
-    agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url}
-    if verified_b:
-        log("[2B] Gemini is researching ✓")
-    else:
-        log("[2B] Gemini may not be running", "WARN")
+        # CUA fallback for Start research
+        if not start_clicked:
+            log("[2B] JS couldn't find button — CUA clicking 'Start research'")
+            await browser.switch_to_page(gemini_page)
+            fix = await agent_loop(cua_client, browser,
+                PROMPT_GEMINI_START_RESEARCH,
+                "Click the 'Start research' button to begin the deep research.",
+                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+            fix_text = (fix.get("text") or "").lower()
+            if "click" in fix_text:
+                start_clicked = True
+                log("[2B] CUA clicked 'Start research' ✓")
+                await asyncio.sleep(5)
 
-    # ── Verify all 3 are running ──
+        # Verify Gemini is actually researching
+        verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2B",
+            browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
+        agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url}
+        if verified_b:
+            log("[2B] Gemini is researching ✓")
+        else:
+            log("[2B] Gemini may not be running", "WARN")
+
+    # ── Verify all launched agents are running ──
+    total = len(agents)
     verified_count = sum(1 for a in agents.values() if a["verified"])
     log(f"\n{'='*60}")
-    log(f"All agents started. {verified_count}/3 verified as running.")
+    log(f"Agents started. {verified_count}/{total} verified as running.")
     for name, a in agents.items():
         log(f"  {name:10s} {'✓ running' if a['verified'] else '✗ not verified'}  {a['url'][:60]}")
     log(f"{'='*60}")
 
     # Round-robin poll all agents — checks each agent every cycle instead of blocking per-agent
+    if not agents:
+        log("No agents to poll — all were disabled or skipped")
+        return {}
     results = await poll_all_agents_round_robin(
         agents, browser, cua_client,
         max_wait_min=MAX_WAIT_DEEP, poll_interval=POLL_DEEP_RESEARCH, verbose=verbose)
@@ -2419,30 +2473,30 @@ def detect_resume_phase(queue_dir):
         except Exception:
             pass
     cp = load_checkpoint(queue_dir)
-    # Phase 5 (Report): check if YouTube done but no delivery
+    # Phase 4 done → resume from Phase 5: check if YouTube done but no delivery
     if cp and cp.get("youtube_url"):
-        return 5, "YouTube done — resuming from Phase 5 (Report & Notification)"
-    # Phase 4 (YouTube): check if audio exists
+        return 5, "YouTube done — Phase 4 done, resuming from Phase 5 (Report)"
+    # Phase 3 done → resume from Phase 4: check if audio exists
     if cp and cp.get("audio_path") and Path(cp["audio_path"]).exists():
-        return 4, "Audio exists — resuming from Phase 4 (YouTube Upload)"
+        return 4, "Audio exists — Phase 3 done, resuming from Phase 4 (YouTube)"
     audio_dir = queue_dir / "podcasts"
     if audio_dir.exists() and any(audio_dir.glob("*.*")):
-        return 4, "Audio exists — resuming from Phase 4 (YouTube Upload)"
-    # Phase 3 (NLM+Audio): check if links/notebook exist
+        return 4, "Audio exists — Phase 3 done, resuming from Phase 4 (YouTube)"
+    # Phase 2 done but no audio → resume from Phase 3: check if links/notebook exist
     if (queue_dir / "links.json").exists():
-        return 3, "Links exist — resuming from Phase 3 (NotebookLM Processing)"
-    # Phase 2 (Research): check if research MDs exist
+        return 3, "Links exist — resuming from Phase 3 (NotebookLM)"
+    # Phase 2 done → resume from Phase 3: check if research MDs exist
     research_dir = queue_dir / "documents"
     has_research = research_dir.exists() and any(
         f for f in research_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief")
     if has_research:
-        return 2, "Research MDs exist — resuming from Phase 2 (Deep Research)"
-    # Phase 1 (Brief): check if brief exists
+        return 3, "Research MDs exist — Phase 2 done, resuming from Phase 3"
+    # Phase 1 done → resume from Phase 2: check if brief exists
     brief = queue_dir / "documents" / "brief.md"
     if not brief.exists():
         brief = queue_dir / "brief.md"
     if brief.exists() and brief.stat().st_size > 100:
-        return 1, "Brief exists — resuming from Phase 1 (Research Brief)"
+        return 2, "Brief exists — Phase 1 done, resuming from Phase 2"
     return 0, "Starting from Phase 0 (Init)"
 
 
@@ -2524,14 +2578,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         d.update(new_fields)
         d_path.write_text(json.dumps(d, indent=2), encoding="utf-8")
 
-    # ── Helper: check if user requested stop ──
+    # ── Helper: check if user requested stop or pause ──
     def stop_requested():
+        """True if terminal stop requested (pipeline is DONE)."""
         return (queue_dir / ".stop").exists()
 
-    def clear_stop():
-        s = queue_dir / ".stop"
-        if s.exists():
-            s.unlink()
+    def pause_requested():
+        """True if pause requested (pipeline is FROZEN, can resume)."""
+        return (queue_dir / ".pause").exists()
+
+    def stop_or_pause_requested():
+        """True if either stop or pause — used in between-phase checks."""
+        return stop_requested() or pause_requested()
+
+    def clear_pause():
+        p = queue_dir / ".pause"
+        if p.exists():
+            p.unlink()
 
     # ── Helper: read user feedback for a phase ──
     def get_feedback(phase_num):
@@ -2604,9 +2667,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     break
             log(f"Phase 1: Loaded existing brief ({len(brief_text)} chars)")
 
-        if stop_requested():
-            log("Stop requested after Phase 1", "WARN"); clear_stop()
-            emit_event("pipeline_stopped", phase=1)
+        if stop_or_pause_requested():
+            is_stop = stop_requested()
+            if is_stop:
+                log("STOP requested after Phase 1 — pipeline terminated", "WARN")
+                save_meta(queue_dir, topic, 1, status="stopped")
+                update_delivery(status="stopped")
+                emit_event("pipeline_stopped", phase=1, reason="stop")
+            else:
+                clear_pause()
+                log("PAUSE requested after Phase 1 — checkpoint saved, awaiting resume", "WARN")
+                save_meta(queue_dir, topic, 1, status="paused")
+                update_delivery(status="paused")
+                emit_event("pipeline_paused", phase=1)
             return
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
@@ -2631,8 +2704,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 research_brief += f'\n\nUSER FEEDBACK (incorporate this into your research): {fb2}'
                 log(f"Phase 2: Injecting user feedback: {fb2[:100]}")
                 clear_feedback(2)
-            results = await run_phase2(browser, cua_client, research_brief, verbose)
-            # Filter results by enabled agents
+            results = await run_phase2(browser, cua_client, research_brief, verbose,
+                                       enabled_agents=enabled_agents)
+            # Safety filter: ensure only enabled agents appear in results
             if enabled_agents:
                 agent_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
                 enabled_names = {agent_name_map.get(a, a) for a in enabled_agents}
@@ -2716,9 +2790,28 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         else:
             log("Phase 2: Loading existing research files")
 
-        if stop_requested():
-            log("Stop requested after Phase 2", "WARN"); clear_stop()
-            emit_event("pipeline_stopped", phase=2)
+        if stop_or_pause_requested():
+            is_stop = stop_requested()
+            if is_stop:
+                log("STOP requested after Phase 2 — collecting partial results", "WARN")
+                # Partial result collection: save whatever agents completed so far
+                doc_dir = queue_dir / "documents"
+                partial_agents = []
+                for name in ["ChatGPT", "Gemini", "Claude"]:
+                    fname = name.lower().replace(" ", "") + ".md"
+                    if (doc_dir / fname).exists() and (doc_dir / fname).stat().st_size > 100:
+                        partial_agents.append(name)
+                log(f"  Partial results saved: {partial_agents or 'none'}")
+                save_meta(queue_dir, topic, 2, status="stopped")
+                update_delivery(status="stopped")
+                emit_event("pipeline_stopped", phase=2, reason="stop",
+                           partial_agents=partial_agents)
+            else:
+                clear_pause()
+                log("PAUSE requested after Phase 2 — checkpoint saved, awaiting resume", "WARN")
+                save_meta(queue_dir, topic, 2, status="paused")
+                update_delivery(status="paused")
+                emit_event("pipeline_paused", phase=2)
             return
 
         # ── Check we have research output to continue ──
@@ -2771,9 +2864,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 audio_path = Path(audio_str)
             log(f"Phase 3: Loaded existing (links={len(links)}, audio={'yes' if audio_path else 'no'})")
 
-        if stop_requested():
-            log("Stop requested after Phase 3", "WARN"); clear_stop()
-            emit_event("pipeline_stopped", phase=3)
+        if stop_or_pause_requested():
+            is_stop = stop_requested()
+            if is_stop:
+                log("STOP requested after Phase 3 — pipeline terminated", "WARN")
+                save_meta(queue_dir, topic, 3, status="stopped")
+                update_delivery(status="stopped")
+                emit_event("pipeline_stopped", phase=3, reason="stop")
+            else:
+                clear_pause()
+                log("PAUSE requested after Phase 3 — checkpoint saved, awaiting resume", "WARN")
+                save_meta(queue_dir, topic, 3, status="paused")
+                update_delivery(status="paused")
+                emit_event("pipeline_paused", phase=3)
             return
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
@@ -2796,9 +2899,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             else:
                 log("Skipping Phase 4 — no audio", "WARN")
 
-        if stop_requested():
-            log("Stop requested after Phase 4", "WARN"); clear_stop()
-            emit_event("pipeline_stopped", phase=4)
+        if stop_or_pause_requested():
+            is_stop = stop_requested()
+            if is_stop:
+                log("STOP requested after Phase 4 — pipeline terminated", "WARN")
+                save_meta(queue_dir, topic, 4, status="stopped")
+                update_delivery(status="stopped")
+                emit_event("pipeline_stopped", phase=4, reason="stop")
+            else:
+                clear_pause()
+                log("PAUSE requested after Phase 4 — checkpoint saved, awaiting resume", "WARN")
+                save_meta(queue_dir, topic, 4, status="paused")
+                update_delivery(status="paused")
+                emit_event("pipeline_paused", phase=4)
             return
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
@@ -2842,14 +2955,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     finally:
         await browser.close()
 
-    # Auto-retry from checkpoint if pipeline failed mid-way (not if completed or stopped)
+    # Auto-retry from checkpoint if pipeline failed mid-way
+    # Skip if: completed, stopped (terminal), or paused (intentional freeze)
     if not resume_dir and queue_dir:
         try:
             d_path = queue_dir / "delivery.json"
             d_status = json.loads(d_path.read_text(encoding="utf-8")).get("status") if d_path.exists() else ""
         except Exception:
             d_status = ""
-        if d_status != "completed" and not (queue_dir / ".stop").exists():
+        if d_status not in ("completed", "stopped", "paused") \
+                and not (queue_dir / ".stop").exists() \
+                and not (queue_dir / ".pause").exists():
             phase, _ = detect_resume_phase(queue_dir)
             if 1 < phase <= 5:
                 log(f"Pipeline failed at phase {phase} — auto-retrying from checkpoint...", "WARN")
@@ -2908,7 +3024,7 @@ async def run_server(port=8000):
 
     @app.get("/api/runs/{run_id}")
     async def get_run(run_id: str):
-        """Get full details — meta.json + delivery + checkpoint."""
+        """Get full details — meta.json + delivery + checkpoint + pipeline_state."""
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
@@ -2918,7 +3034,15 @@ async def run_server(port=8000):
         cp = load_checkpoint(queue)
         delivery_file = queue / "delivery.json"
         delivery = json.loads(delivery_file.read_text(encoding="utf-8")) if delivery_file.exists() else None
-        return {"meta": meta, "checkpoint": cp, "delivery": delivery}
+        # Pipeline state: stopped is terminal, paused is resumable
+        pipeline_state = "running"
+        if (queue / ".stop").exists():
+            pipeline_state = "stopped"
+        elif (queue / ".pause").exists():
+            pipeline_state = "paused"
+        elif delivery and delivery.get("status") == "completed":
+            pipeline_state = "completed"
+        return {"meta": meta, "checkpoint": cp, "delivery": delivery, "pipeline_state": pipeline_state}
 
     @app.get("/api/runs/{run_id}/events")
     async def get_events(run_id: str, offset: int = 0):
@@ -2977,12 +3101,25 @@ async def run_server(port=8000):
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str):
-        """Request pipeline to stop after current phase."""
+        """STOP: terminate pipeline, save partial results, mark as stopped (not resumable)."""
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
         (queue / ".stop").write_text("stop", encoding="utf-8")
+        # Remove any .pause if it existed — stop supersedes pause
+        p = queue / ".pause"
+        if p.exists():
+            p.unlink()
         return {"status": "stop_requested", "id": run_id}
+
+    @app.post("/api/runs/{run_id}/pause")
+    async def pause_run(run_id: str):
+        """PAUSE: freeze pipeline at next phase boundary, save checkpoint for resume."""
+        queue = queues_root / run_id
+        if not queue.exists():
+            return JSONResponse({"error": "not found"}, 404)
+        (queue / ".pause").write_text("pause", encoding="utf-8")
+        return {"status": "pause_requested", "id": run_id}
 
     @app.post("/api/runs/{run_id}/feedback")
     async def submit_feedback(run_id: str, request_data: dict):
@@ -3000,20 +3137,25 @@ async def run_server(port=8000):
         fb = json.loads(fb_path.read_text(encoding="utf-8")) if fb_path.exists() else {}
         fb[phase] = message
         fb_path.write_text(json.dumps(fb, indent=2), encoding="utf-8")
-        # Auto-stop pipeline so it picks up feedback on resume
-        (queue / ".stop").write_text("stop", encoding="utf-8")
+        # Auto-pause pipeline so it picks up feedback on resume (not terminal stop)
+        (queue / ".pause").write_text("pause", encoding="utf-8")
         return {"status": "feedback_saved", "phase": phase, "will_redo_from": phase}
 
     @app.post("/api/runs/{run_id}/resume")
     async def resume_run(run_id: str, request_data: dict = None):
-        """Resume a stopped/failed pipeline run. Queued if another is running.
-        If feedback exists, pipeline redoes that phase with feedback injected."""
+        """Resume a paused/failed pipeline run. Queued if another is running.
+        If feedback exists, pipeline redoes that phase with feedback injected.
+        NOTE: only paused runs can be resumed — stopped runs are terminal."""
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
-        s = queue / ".stop"
-        if s.exists():
-            s.unlink()
+        # Block resume of stopped (terminal) runs
+        if (queue / ".stop").exists():
+            return JSONResponse({"error": "Run was stopped (terminal). Cannot resume — start a new run."}, 409)
+        # Clear .pause signal
+        p = queue / ".pause"
+        if p.exists():
+            p.unlink()
         # If feedback targets a specific phase, reset checkpoint to redo from there
         fb_path = queue / "feedback.json"
         cp = load_checkpoint(queue)
@@ -3049,6 +3191,25 @@ async def run_server(port=8000):
             existing = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
             existing.update(request_data["config"])
             config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        # Reset delivery + meta status from "paused" back to "ongoing"
+        d_path = queue / "delivery.json"
+        if d_path.exists():
+            try:
+                d = json.loads(d_path.read_text(encoding="utf-8"))
+                if d.get("status") == "paused":
+                    d["status"] = "ongoing"
+                    d_path.write_text(json.dumps(d, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        m_path = queue / "meta.json"
+        if m_path.exists():
+            try:
+                m = json.loads(m_path.read_text(encoding="utf-8"))
+                if m.get("status") == "paused":
+                    m["status"] = "ongoing"
+                    m_path.write_text(json.dumps(m, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         topic = cp.get("topic", "") if cp else ""
         email = (request_data or {}).get("email", "")
         await _job_queue.put({"topic": topic, "email": email, "resume_dir": str(queue)})
@@ -3103,6 +3264,16 @@ async def run_server(port=8000):
             existing = {}
         existing.update(request_data)
         config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        # Emit config_updated event so frontend can confirm the change was received
+        tracks = tracks_root / run_id
+        if tracks.exists():
+            try:
+                evt = {"type": "config_updated", "timestamp": int(time.time() * 1000),
+                       "data": {"config": existing}}
+                with open(tracks / "events.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(evt) + "\n")
+            except Exception:
+                pass
         return {"status": "config_updated", "id": run_id, "config": existing}
 
     @app.delete("/api/runs/{run_id}")
