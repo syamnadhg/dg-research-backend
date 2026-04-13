@@ -3396,9 +3396,16 @@ async def run_server(port=8000):
     log(f"  GET  /api/runs/{{id}}/documents/{{type}} — Document content (brief/chatgpt/gemini/claude)")
     log(f"  GET  /api/runs/{{id}}/events         — Progress events")
     log(f"  WS   /ws/{{run_id}}                  — Real-time event stream")
+    # Start worker directly (don't rely on @app.on_event which is deprecated and
+    # sometimes doesn't fire reliably with newer FastAPI versions)
+    worker_task = asyncio.create_task(_job_worker())
+    log("Job worker started (direct)")
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
-    await server.serve()
+    try:
+        await server.serve()
+    finally:
+        worker_task.cancel()
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
