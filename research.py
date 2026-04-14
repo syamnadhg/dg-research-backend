@@ -160,8 +160,518 @@ def save_track(platform, data):
     # Raw scrape data stays in per-platform JSON files only
 
 
+# ── Firebase Bridge (Firestore real-time transport) ──────────────────────────
+
+_firebase_db = None     # Firestore client (module-level, init once)
+_fb_uid = None          # Per-run: user ID for Firestore path
+_fb_research_id = None  # Per-run: research ID for Firestore path
+_fb_seq = 0             # Per-run: monotonic event sequence number
+_fb_listener = None     # Per-run: command listener unsubscribe handle
+
+
+def init_firebase():
+    """Initialize Firebase Admin SDK from service-account JSON. Call once at server start."""
+    global _firebase_db
+    if _firebase_db:
+        return True
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore as _fs
+        sa_path = Path(__file__).parent / "firebase-service-account.json"
+        if not sa_path.exists():
+            log("Firebase: service-account.json not found — Firestore bridge disabled", "WARN")
+            return False
+        cred = credentials.Certificate(str(sa_path))
+        firebase_admin.initialize_app(cred)
+        _firebase_db = _fs.client()
+        log("Firebase Admin SDK initialized ✓")
+        return True
+    except ImportError:
+        log("Firebase: firebase-admin not installed — Firestore bridge disabled", "WARN")
+        return False
+    except Exception as e:
+        log(f"Firebase init error: {e}", "WARN")
+        return False
+
+
+def setup_firestore_run(uid, research_id, loop=None):
+    """Set per-run Firestore context. Call at pipeline start."""
+    global _fb_uid, _fb_research_id, _fb_seq, _fb_listener
+    _fb_uid = uid
+    _fb_research_id = research_id
+    _fb_seq = 0
+    # Start command listener if Firestore is available
+    if _firebase_db and uid and research_id and _controls:
+        _start_command_listener(uid, research_id, loop or asyncio.get_event_loop())
+        log(f"Firestore bridge active: users/{uid}/researches/{research_id}")
+
+
+def teardown_firestore_run():
+    """Clean up per-run Firestore state."""
+    global _fb_uid, _fb_research_id, _fb_seq, _fb_listener
+    if _fb_listener:
+        _fb_listener.unsubscribe()
+        _fb_listener = None
+    _fb_uid = None
+    _fb_research_id = None
+    _fb_seq = 0
+
+
+def _emit_to_firestore(event):
+    """Write event to Firestore pipeline_events subcollection."""
+    global _fb_seq
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    _fb_seq += 1
+    doc_data = {**event, "seq": _fb_seq}
+    try:
+        _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id) \
+            .collection("pipeline_events").add(doc_data)
+    except Exception as e:
+        log(f"Firestore emit failed: {e}", "WARN")
+
+
+def _update_firestore_research(updates):
+    """Update the research document in Firestore (status, phase, links, agents, etc.)."""
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    try:
+        _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id) \
+            .update(updates)
+    except Exception as e:
+        log(f"Firestore research update failed: {e}", "WARN")
+
+
+def _start_command_listener(uid, research_id, loop):
+    """Listen for frontend commands (stop/pause/resume/config/add_context) via Firestore."""
+    global _fb_listener
+    col_ref = _firebase_db.collection("users").document(uid) \
+        .collection("researches").document(research_id) \
+        .collection("commands")
+
+    def on_snapshot(col_snapshot, changes, read_time):
+        for change in changes:
+            if change.type.name != 'ADDED':
+                continue
+            doc = change.document
+            data = doc.to_dict() or {}
+            if data.get("processed"):
+                continue
+            action = data.get("action", "")
+            if action == "stop":
+                loop.call_soon_threadsafe(_controls.request_stop)
+                # Bridge: also create file sentinel for old phase-boundary checks
+                if _tracks_dir:
+                    try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
+                    except Exception: pass
+                log("Command received: STOP")
+            elif action == "pause":
+                loop.call_soon_threadsafe(_controls.request_pause)
+                if _tracks_dir:
+                    try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".pause").touch()
+                    except Exception: pass
+                log("Command received: PAUSE")
+            elif action == "resume":
+                loop.call_soon_threadsafe(_controls.request_resume)
+                # Clean up file sentinels on resume
+                if _tracks_dir:
+                    q = Path(__file__).parent / "queues" / _tracks_dir.name
+                    for f in [q / ".pause", q / ".stop"]:
+                        try: f.unlink(missing_ok=True)
+                        except Exception: pass
+                log("Command received: RESUME")
+            elif action == "add_context":
+                text = data.get("text", "")
+                if text:
+                    loop.call_soon_threadsafe(_controls.add_context, text)
+                    log(f"Command received: ADD_CONTEXT ({len(text)} chars)")
+            elif action == "config":
+                cfg = data.get("config", {})
+                if cfg:
+                    loop.call_soon_threadsafe(_controls.update_config, cfg)
+                    log(f"Command received: CONFIG update")
+            # Mark processed
+            try:
+                doc.reference.update({"processed": True})
+            except Exception:
+                pass
+
+    _fb_listener = col_ref.on_snapshot(on_snapshot)
+
+
+# ── Pipeline Controls (asyncio.Event based stop/pause/resume) ────────────────
+
+class PipelineControls:
+    """Replaces file-sentinel (.stop/.pause) checks with in-memory async events.
+    Set from Firestore command listener OR HTTP endpoint fallback."""
+
+    def __init__(self):
+        self.stop_event = asyncio.Event()
+        self.pause_event = asyncio.Event()
+        self.resume_event = asyncio.Event()
+        self.extra_context: list = []
+        self._config_updates: dict = {}
+
+    def request_stop(self):
+        self.stop_event.set()
+
+    def request_pause(self):
+        self.pause_event.set()
+
+    def request_resume(self):
+        self.pause_event.clear()
+        self.resume_event.set()
+
+    def add_context(self, text):
+        self.extra_context.append(text)
+
+    def pop_extra_context(self):
+        if self.extra_context:
+            ctx = "\n\n".join(self.extra_context)
+            self.extra_context.clear()
+            return ctx
+        return ""
+
+    def is_stop(self):
+        return self.stop_event.is_set()
+
+    def is_pause(self):
+        return self.pause_event.is_set()
+
+    def is_stop_or_pause(self):
+        return self.stop_event.is_set() or self.pause_event.is_set()
+
+    async def wait_if_paused(self):
+        """Block pipeline coroutine until resume or stop is received."""
+        if not self.pause_event.is_set():
+            return
+        log("Pipeline paused — waiting for resume or stop...")
+        self.resume_event.clear()
+        # Wait for either resume or stop
+        done, _ = await asyncio.wait(
+            [asyncio.create_task(self.resume_event.wait()),
+             asyncio.create_task(self.stop_event.wait())],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        if self.stop_event.is_set():
+            log("Stop received while paused")
+        else:
+            self.pause_event.clear()
+            log("Resumed from pause")
+
+    def update_config(self, updates):
+        self._config_updates.update(updates)
+
+    def pop_config_updates(self):
+        u = dict(self._config_updates)
+        self._config_updates.clear()
+        return u
+
+    def reset(self):
+        self.stop_event.clear()
+        self.pause_event.clear()
+        self.resume_event.clear()
+        self.extra_context.clear()
+        self._config_updates.clear()
+
+
+_controls = PipelineControls()  # Singleton — reset per run
+
+
+# ── Link Extraction ──────────────────────────────────────────────────────────
+
+class LinkResult:
+    """Result of a link extraction attempt."""
+    __slots__ = ("url", "label", "platform", "verified", "error")
+
+    def __init__(self, url="", label="", platform="", verified=False, error=""):
+        self.url = url
+        self.label = label
+        self.platform = platform
+        self.verified = verified
+        self.error = error
+
+    def to_dict(self):
+        return {"url": self.url, "label": self.label, "verified": self.verified}
+
+    @property
+    def success(self):
+        return bool(self.url) and not self.error
+
+
+async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief", verbose=False):
+    """Extract shareable ChatGPT link: Share button → Create link → copy URL."""
+    page = browser.page
+    url = browser.current_url() or ""
+    try:
+        # Step 1: Try Playwright — find share button
+        share_btn = None
+        for sel in ['button[aria-label="Share"]', '[data-testid="share-chat-button"]',
+                    'button:has(svg[data-testid="share-icon"])']:
+            share_btn = await page.query_selector(sel)
+            if share_btn:
+                break
+        if share_btn:
+            await share_btn.click()
+            await asyncio.sleep(2)
+            # Look for "Create link" or "Copy link" button in modal
+            link_btn = None
+            for sel in ['button:has-text("Create link")', 'button:has-text("Copy link")',
+                        'button:has-text("Share")', '[data-testid="share-link-button"]']:
+                link_btn = await page.query_selector(sel)
+                if link_btn:
+                    break
+            if link_btn:
+                await link_btn.click()
+                await asyncio.sleep(2)
+            # Try to get URL from input field in modal
+            share_input = await page.query_selector('input[readonly][value*="chatgpt.com/share"]')
+            if share_input:
+                url = await share_input.get_attribute("value") or url
+            else:
+                # Try clipboard
+                clip = get_clipboard()
+                if "chatgpt.com/share" in clip:
+                    url = clip
+            # Close modal
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+        # Step 2: CUA fallback if no share URL yet
+        if "chatgpt.com/share" not in url:
+            log(f"[{label}] CUA fallback for share link...")
+            result = await agent_loop(cua_client, browser,
+                "Share this ChatGPT conversation by clicking the Share button.",
+                "Click the Share button at the top of this conversation. If a modal appears, click 'Create link' or 'Copy link'. Tell me the full share URL.",
+                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+            text = (result.get("text") or "")
+            # Extract URL from CUA response
+            m = re.search(r'https://chatgpt\.com/share/[a-zA-Z0-9-]+', text)
+            if m:
+                url = m.group(0)
+            elif "chatgpt.com/share" not in url:
+                clip = get_clipboard()
+                if "chatgpt.com/share" in clip:
+                    url = clip
+        verified = "chatgpt.com/share" in url
+        return LinkResult(url=url, label=label, platform="chatgpt", verified=verified)
+    except Exception as e:
+        log(f"Link extraction failed (ChatGPT): {e}", "WARN")
+        return LinkResult(url=url, label=label, platform="chatgpt", error=str(e))
+
+
+async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Research", verbose=False):
+    """Extract shareable Gemini conversation link."""
+    page = browser.page
+    url = browser.current_url() or ""
+    try:
+        # Try share button
+        share_btn = await page.query_selector('[aria-label="Share"]')
+        if share_btn:
+            await share_btn.click()
+            await asyncio.sleep(2)
+            # Look for shareable link in modal
+            link_el = await page.query_selector('input[value*="g.co/gemini"]')
+            if not link_el:
+                link_el = await page.query_selector('input[value*="gemini.google.com/share"]')
+            if link_el:
+                url = await link_el.get_attribute("value") or url
+            else:
+                clip = get_clipboard()
+                if "gemini" in clip and "share" in clip:
+                    url = clip
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+        if "share" not in url.lower():
+            # CUA fallback
+            result = await agent_loop(cua_client, browser,
+                "Share this Gemini conversation.",
+                "Click the Share button for this Gemini conversation. Create a shareable link and tell me the URL.",
+                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+            m = re.search(r'https://[^\s]+gemini[^\s]*share[^\s]*', (result.get("text") or ""))
+            if m:
+                url = m.group(0)
+        verified = "share" in url.lower() and "gemini" in url.lower()
+        return LinkResult(url=url, label=label, platform="gemini", verified=verified)
+    except Exception as e:
+        return LinkResult(url=url, label=label, platform="gemini", error=str(e))
+
+
+async def extract_share_link_claude(browser, cua_client, label="Claude Deep Research", verbose=False):
+    """Extract shareable Claude conversation link (publish artifact)."""
+    page = browser.page
+    url = browser.current_url() or ""
+    try:
+        # CUA is most reliable for Claude's publish flow
+        result = await agent_loop(cua_client, browser,
+            "Publish this Claude conversation as a shared artifact.",
+            "Click the Publish button or Share button. Make the conversation publicly accessible. Tell me the published URL.",
+            model=CUA_MODEL, max_iterations=12, verbose=verbose)
+        text = (result.get("text") or "")
+        m = re.search(r'https://claude\.ai/[^\s]+', text)
+        if m:
+            url = m.group(0)
+        else:
+            clip = get_clipboard()
+            if "claude.ai" in clip:
+                url = clip
+        verified = "claude.ai" in url and url != browser.current_url()
+        return LinkResult(url=url, label=label, platform="claude", verified=verified)
+    except Exception as e:
+        return LinkResult(url=url, label=label, platform="claude", error=str(e))
+
+
+async def extract_notebooklm_url(browser, **_):
+    """Extract NotebookLM notebook URL (tab URL is inherently shareable)."""
+    url = browser.current_url() or ""
+    verified = "notebooklm.google.com/notebook" in url
+    return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm", verified=verified)
+
+
+async def extract_youtube_url(browser, cua_client, verbose=False, **_):
+    """Extract YouTube video URL after upload."""
+    page = browser.page
+    url = ""
+    try:
+        # Look for video URL in Studio
+        for sel in ['a[href*="youtu.be"]', 'a[href*="youtube.com/watch"]',
+                    'span:has-text("youtu.be/")', '.video-url-container a']:
+            el = await page.query_selector(sel)
+            if el:
+                url = await el.get_attribute("href") or await el.inner_text()
+                if url and ("youtu" in url):
+                    break
+        if not url:
+            clip = get_clipboard()
+            if "youtu" in clip:
+                url = clip
+        if not url:
+            result = await agent_loop(cua_client, browser,
+                "Find the YouTube video URL.",
+                "The video was just uploaded. Find and tell me the full YouTube video URL (youtu.be or youtube.com/watch link).",
+                model=CUA_MODEL, max_iterations=8, verbose=verbose)
+            m = re.search(r'https?://(?:youtu\.be|(?:www\.)?youtube\.com/watch\?v=)[^\s]+', (result.get("text") or ""))
+            if m:
+                url = m.group(0)
+        verified = "youtu" in url
+        return LinkResult(url=url, label="YouTube Video", platform="youtube", verified=verified)
+    except Exception as e:
+        return LinkResult(url=url, label="YouTube Video", platform="youtube", error=str(e))
+
+
+async def extract_gdoc_url(browser, **_):
+    """Extract Google Doc URL (tab URL is the doc)."""
+    url = browser.current_url() or ""
+    verified = "docs.google.com/document" in url
+    return LinkResult(url=url, label="Google Doc", platform="gdoc", verified=verified)
+
+
+# Phase → list of (extractor_func, kwargs_override) mappings
+PHASE_LINK_EXTRACTORS = {
+    1: [("chatgpt", extract_share_link_chatgpt, {"label": "Research Brief"})],
+    2: [("chatgpt", extract_share_link_chatgpt, {"label": "ChatGPT Deep Research"}),
+        ("gemini", extract_share_link_gemini, {}),
+        ("claude", extract_share_link_claude, {})],
+    3: [("notebooklm", extract_notebooklm_url, {})],
+    4: [("youtube", extract_youtube_url, {})],
+    5: [("gdoc", extract_gdoc_url, {})],
+}
+
+
+async def extract_phase_links(phase, browser, cua_client, enabled_agents=None, verbose=False):
+    """Run all link extractors for a phase. Returns list of LinkResult."""
+    extractors = PHASE_LINK_EXTRACTORS.get(phase, [])
+    results = []
+    for platform, extractor, kwargs in extractors:
+        if enabled_agents and platform in ("chatgpt", "gemini", "claude"):
+            if not enabled_agents.get(platform, True):
+                continue  # Skip disabled agents
+        emit_event("link_extracting", phase=phase, platform=platform)
+        log(f"Extracting link: phase={phase} platform={platform}...")
+        result = await extractor(browser, cua_client=cua_client, verbose=verbose, **kwargs)
+        if result.success:
+            emit_event("link_extracted", phase=phase, platform=platform, url=result.url, verified=result.verified)
+            log(f"Link extracted: {result.url} (verified={result.verified})")
+        else:
+            emit_event("link_extraction_failed", phase=phase, platform=platform, error=result.error or "URL not found")
+            log(f"Link extraction failed: {platform} — {result.error}", "WARN")
+        results.append(result)
+    return results
+
+
+# ── Brief Artifact (first-class research brief with verified paste) ──────────
+
+class BriefArtifact:
+    """Holds the complete research brief text + metadata for reliable Phase 2 paste."""
+    __slots__ = ("text", "url", "chars", "sections", "extracted_at")
+
+    def __init__(self, text, url="", extracted_at=None):
+        self.text = text
+        self.url = url
+        self.chars = len(text)
+        self.sections = re.findall(r'^#{1,3}\s+(.+)$', text, re.MULTILINE)
+        self.extracted_at = extracted_at or int(time.time() * 1000)
+
+
+async def verified_paste_brief(page, brief_text, platform, label, max_retries=3):
+    """Paste brief into the active textarea and verify it was pasted completely.
+    Returns True on success. Does NOT use the 'already_sent' heuristic — always pastes."""
+    for attempt in range(1, max_retries + 1):
+        pasted = False
+        selectors = ['#prompt-textarea', 'div[contenteditable="true"]', 'textarea', '.ProseMirror',
+                     'div[contenteditable="true"][data-placeholder]', 'rich-textarea div[contenteditable="true"]',
+                     '[aria-label*="message"]', '[aria-label*="Message"]']
+        for sel in selectors:
+            try:
+                ta = await page.wait_for_selector(sel, timeout=3000)
+                if not ta:
+                    continue
+                await ta.click()
+                await asyncio.sleep(0.3)
+                await page.keyboard.press("Control+a")
+                await asyncio.sleep(0.1)
+                # Use clipboard paste for reliability (not insert_text which is char-by-char)
+                await page.evaluate("text => navigator.clipboard.writeText(text)", brief_text)
+                await asyncio.sleep(0.2)
+                await page.keyboard.press("Control+v")
+                await asyncio.sleep(2)
+                pasted = True
+                break
+            except Exception:
+                continue
+
+        if not pasted:
+            log(f"[{label}] Paste attempt {attempt}/{max_retries}: no textarea found", "WARN")
+            await asyncio.sleep(1)
+            continue
+
+        # Verify: scrape textarea and check length
+        try:
+            content_len = await page.evaluate("""() => {
+                const ta = document.querySelector('#prompt-textarea, div[contenteditable="true"], textarea, .ProseMirror');
+                return ta ? (ta.innerText || ta.value || ta.textContent || '').length : 0;
+            }""")
+            expected = len(brief_text)
+            ratio = content_len / expected if expected > 0 else 0
+            if ratio >= 0.90:
+                log(f"[{label}] Brief pasted ✓ ({content_len}/{expected} chars, {ratio:.0%})")
+                return True
+            else:
+                log(f"[{label}] Paste attempt {attempt}: only {content_len}/{expected} chars ({ratio:.0%})", "WARN")
+        except Exception as e:
+            log(f"[{label}] Paste verify failed: {e}", "WARN")
+
+        await asyncio.sleep(1)
+
+    log(f"[{label}] Brief paste failed after {max_retries} retries", "ERROR")
+    return False
+
+
+# ── Event Emission (dual-write: disk + Firestore) ────────────────────────────
+
 def emit_event(event_type, phase=None, agent=None, **data):
-    """Emit a typed event to events.jsonl (matches PIPELINE_SPEC event types)."""
+    """Emit a typed event to events.jsonl AND Firestore pipeline_events."""
     if not _tracks_dir:
         return
     event = {
@@ -174,11 +684,14 @@ def emit_event(event_type, phase=None, agent=None, **data):
         event["agent"] = agent
     if data:
         event["data"] = data
+    # Write to disk (local debugging + resume)
     try:
         with open(_tracks_dir / "events.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
     except Exception:
         pass
+    # Write to Firestore (frontend real-time transport)
+    _emit_to_firestore(event)
 
 
 async def scrape_progress_chatgpt(page):
@@ -585,6 +1098,14 @@ async def agent_loop(client, browser, system_prompt, user_message,
     recent_actions = []
 
     for iteration in range(1, max_iterations + 1):
+        # ── Check stop/pause before each CUA API call ──
+        if _controls.is_stop():
+            return {"status": "stopped", "text": last_text}
+        if _controls.is_pause():
+            await _controls.wait_if_paused()
+            if _controls.is_stop():
+                return {"status": "stopped", "text": last_text}
+
         if verbose: log(f"Iteration {iteration}/{max_iterations}")
         try:
             response = client.beta.messages.create(
@@ -824,12 +1345,15 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     last_heartbeat = time.time()
 
     while (time.time() - wait_start) < max_wait:
-        # ── Stop/Pause check: abort polling if .stop or .pause file exists ──
-        if _tracks_dir:
-            q_dir = Path(__file__).parent / "queues" / _tracks_dir.name
-            if (q_dir / ".stop").exists() or (q_dir / ".pause").exists():
-                signal = "stop" if (q_dir / ".stop").exists() else "pause"
-                log(f"[{label}] {signal.upper()} requested — aborting poll")
+        # ── Stop/Pause check ──
+        if _controls.is_stop():
+            log(f"[{label}] STOP requested — aborting poll")
+            return False
+        if _controls.is_pause():
+            emit_event("pipeline_paused", phase=phase)
+            await _controls.wait_if_paused()
+            if _controls.is_stop():
+                log(f"[{label}] STOP after pause — aborting poll")
                 return False
 
         # ── Heartbeat every 60s so frontend knows we're alive ──
@@ -1007,40 +1531,50 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     log(f"\n--- Round-robin polling {len(pending)} agents (max {max_wait_min}min each) ---")
 
     while pending:
-        # ── Stop/Pause check: collect partial results from completed agents and exit ──
-        if _tracks_dir:
-            q_dir = Path(__file__).parent / "queues" / _tracks_dir.name
-            is_stop = (q_dir / ".stop").exists()
-            is_pause = (q_dir / ".pause").exists()
-            if is_stop or is_pause:
-                signal = "STOP" if is_stop else "PAUSE"
-                log(f"[Round-robin] {signal} requested — collecting partial results from completed agents")
-                # On STOP: try to extract from agents that are done or have partial text
-                if is_stop:
-                    for name in list(pending.keys()):
-                        p = pending[name]
-                        try:
-                            await browser.switch_to_page(p["page"])
-                            text = await extract_fns[name](p["page"], browser=browser,
-                                cua_client=cua_client, label=name, verbose=verbose)
-                            elapsed = time.time() - p["start_time"]
-                            status = "partial" if text and len(text) > 100 else "interrupted"
-                            results[name] = {"status": status, "text": text or "",
-                                             "url": p["page"].url, "page": p["page"],
-                                             "elapsed_sec": int(elapsed)}
-                            log(f"  [{name}] {status} — {len(text or '')} chars")
-                        except Exception as e:
-                            results[name] = {"status": "interrupted", "text": "",
-                                             "url": p.get("url", ""), "page": p["page"]}
-                            log(f"  [{name}] extraction failed: {e}", "WARN")
-                else:
-                    # On PAUSE: just mark pending agents as interrupted (don't try extraction)
-                    for name in list(pending.keys()):
-                        p = pending[name]
-                        results[name] = {"status": "paused", "text": "",
-                                         "url": p.get("url", ""), "page": p["page"],
-                                         "elapsed_sec": int(time.time() - p["start_time"])}
-                return results
+        # ── Stop/Pause check via asyncio Events ──
+        if _controls.is_stop() or _controls.is_pause():
+            is_stop = _controls.is_stop()
+            signal = "STOP" if is_stop else "PAUSE"
+            log(f"[Round-robin] {signal} requested — collecting partial results from completed agents")
+            if is_stop:
+                for name in list(pending.keys()):
+                    p = pending[name]
+                    try:
+                        await browser.switch_to_page(p["page"])
+                        text = await extract_fns[name](p["page"], browser=browser,
+                            cua_client=cua_client, label=name, verbose=verbose)
+                        elapsed = time.time() - p["start_time"]
+                        status = "partial" if text and len(text) > 100 else "interrupted"
+                        results[name] = {"status": status, "text": text or "",
+                                         "url": p["page"].url, "page": p["page"],
+                                         "elapsed_sec": int(elapsed)}
+                        log(f"  [{name}] {status} — {len(text or '')} chars")
+                    except Exception as e:
+                        results[name] = {"status": "interrupted", "text": "",
+                                         "url": p.get("url", ""), "page": p["page"]}
+                        log(f"  [{name}] extraction failed: {e}", "WARN")
+            else:
+                # On PAUSE: mark pending agents as paused, wait for resume
+                for name in list(pending.keys()):
+                    p = pending[name]
+                    results[name] = {"status": "paused", "text": "",
+                                     "url": p.get("url", ""), "page": p["page"],
+                                     "elapsed_sec": int(time.time() - p["start_time"])}
+                emit_event("pipeline_paused", phase=2)
+                await _controls.wait_if_paused()
+                if _controls.is_stop():
+                    return results
+                # Resumed — restore pending agents and continue polling
+                for name in list(results.keys()):
+                    if results[name]["status"] == "paused":
+                        pending[name] = {"page": results[name]["page"], "url": results[name]["url"],
+                                         "start_time": time.time() - results[name]["elapsed_sec"],
+                                         "done_count": 0, "cua_confirmed": False,
+                                         "last_firecrawl": time.time() - 150}
+                        del results[name]
+                emit_event("pipeline_resumed", phase=2)
+                continue
+            return results
 
         for name in list(pending.keys()):
             p = pending[name]
@@ -1603,37 +2137,19 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     result = await agent_loop(cua_client, browser, prompt_system, prompt_user,
         model=CUA_MODEL, max_iterations=20, verbose=verbose)
 
-    # Playwright pastes full brief
-    cua_text = (result.get("text") or "").lower()
-    already_sent = any(w in cua_text for w in ["sent", "submitted", "message sent"])
-
-    if not already_sent:
-        log(f"[{label}] Playwright: Pasting full brief ({len(brief)} chars)...")
-        pasted = False
-        for sel in ['#prompt-textarea', 'div[contenteditable="true"]', 'textarea', '.ProseMirror',
-                    'div[contenteditable="true"][data-placeholder]', 'rich-textarea div[contenteditable="true"]',
-                    '[aria-label*="message"]', '[aria-label*="Message"]']:
-            try:
-                ta = await page.wait_for_selector(sel, timeout=3000)
-                if ta:
-                    await ta.click()
-                    await asyncio.sleep(0.3)
-                    await page.keyboard.press("Control+a")
-                    await asyncio.sleep(0.1)
-                    if platform == "ChatGPT":
-                        await page.keyboard.insert_text(brief)
-                    else:
-                        await page.evaluate("text => navigator.clipboard.writeText(text)", brief)
-                        await asyncio.sleep(0.2)
-                        await page.keyboard.press("Control+v")
-                    await asyncio.sleep(2)
-                    log(f"[{label}] Full brief pasted ✓ ({len(brief)} chars)")
-                    pasted = True
-                    break
-            except Exception:
-                continue
-        if not pasted:
-            log(f"[{label}] Could not find input to paste brief", "WARN")
+    # ALWAYS paste full brief via verified_paste_brief — never trust CUA's "already sent" heuristic.
+    # The CUA setup step above ONLY sets the mode (Deep Research, Extended Thinking, etc.)
+    # and MUST NOT type or submit any text — the system prompt should explicitly forbid this.
+    log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
+    paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
+    if not paste_ok:
+        log(f"[{label}] Brief paste failed — attempting CUA fallback", "WARN")
+        # CUA fallback: ask it to paste the brief from clipboard
+        await page.evaluate("text => navigator.clipboard.writeText(text)", brief)
+        await agent_loop(cua_client, browser,
+            f"Paste the text from clipboard into the {platform} input and submit it.",
+            "Press Ctrl+V to paste the research brief from clipboard, then click Send.",
+            model=CUA_MODEL, max_iterations=5, verbose=verbose)
 
         # Click Send — try Playwright selectors first, then CUA fallback
         await asyncio.sleep(2)
@@ -2534,7 +3050,8 @@ def detect_resume_phase(queue_dir):
 # ── Main Pipeline ─────────────────────────────────────────────────────────────
 
 async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
-                       api_key=None, email=None, resume_dir=None, config=None, run_id=None):
+                       api_key=None, email=None, resume_dir=None, config=None,
+                       run_id=None, uid=None):
     """Run the full pipeline. Supports resume from a previous queue directory."""
     pdf_paths = pdf_paths or []
     api_key = resolve_api_key(api_key)
@@ -2544,6 +3061,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
     import anthropic
     cua_client = anthropic.Anthropic(api_key=api_key)
+
+    # ── Initialize pipeline controls + Firestore bridge ──
+    _controls.reset()
+    brief_artifact = None  # Set after Phase 1 completes
+    if uid:
+        setup_firestore_run(uid, run_id, asyncio.get_running_loop())
 
     # ── Determine queue directory + start phase ──
     if resume_dir:
@@ -2684,14 +3207,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     return
                 brief_text = p1["text"]
                 brief_url = p1.get("url", "")
-            # Save brief in documents/ (consistent with frontend document types)
+            # Save brief in documents/
             (queue_dir / "documents" / "brief.md").write_text(
                 f"# Research Brief\n\n{brief_text}", encoding="utf-8")
+            # Create BriefArtifact for reliable Phase 2 paste
+            brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
+            log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
+            # ── Link-before-advance: extract shareable ChatGPT link ──
+            log("Phase 1: Extracting shareable link before advancing...")
+            _p1_link_results = await extract_phase_links(1, browser, cua_client, verbose=verbose)
+            _p1_links = [r.to_dict() for r in _p1_link_results if r.success]
+            if _p1_links:
+                brief_url = _p1_links[0]["url"]
+                brief_artifact.url = brief_url
             save_checkpoint(queue_dir, 1, topic=topic, brief_url=brief_url)
             update_delivery(brief_url=brief_url)
             save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
-            _p1_links = [{"label": "Research Brief", "url": brief_url}] if brief_url else []
             emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start), links=_p1_links)
+            _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
         else:
             # Load brief from documents/ (new location) or root (old location)
             for bp in [queue_dir / "documents" / "brief.md", queue_dir / "brief.md"]:
@@ -2701,20 +3234,29 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     break
             log(f"Phase 1: Loaded existing brief ({len(brief_text)} chars)")
 
-        if stop_or_pause_requested():
-            is_stop = stop_requested()
-            if is_stop:
+        if _controls.is_stop_or_pause():
+            if _controls.is_stop():
                 log("STOP requested after Phase 1 — pipeline terminated", "WARN")
                 save_meta(queue_dir, topic, 1, status="stopped")
                 update_delivery(status="stopped")
                 emit_event("pipeline_stopped", phase=1, reason="stop")
+                _update_firestore_research({"status": "stopped", "phase": 1})
             else:
-                clear_pause()
                 log("PAUSE requested after Phase 1 — checkpoint saved, awaiting resume", "WARN")
                 save_meta(queue_dir, topic, 1, status="paused")
                 update_delivery(status="paused")
                 emit_event("pipeline_paused", phase=1)
-            return
+                _update_firestore_research({"status": "paused", "phase": 1})
+                await _controls.wait_if_paused()
+                if _controls.is_stop():
+                    save_meta(queue_dir, topic, 1, status="stopped")
+                    emit_event("pipeline_stopped", phase=1, reason="stop_after_pause")
+                    return
+                emit_event("pipeline_resumed", phase=1)
+                _update_firestore_research({"status": "ongoing"})
+                # Continue to Phase 2 after resume
+            if _controls.is_stop():
+                return
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 2: Deep Research ══════════════════════
@@ -2730,11 +3272,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             enabled_agents = [a for a, on in agents_cfg.items() if on]
             disabled_agents = [a for a, on in agents_cfg.items() if not on]
             emit_event("phase_start", phase=2, agents=enabled_agents)
+            _update_firestore_research({"phase": 2, "currentPhase": 2, "status": "ongoing"})
             for da in disabled_agents:
                 emit_event("agent_skipped", phase=2, agent=da)
             _p2_start = time.time()
             fb2 = get_feedback(2)
-            research_brief = brief_text
+            # Use BriefArtifact for full verified paste (never the "already_sent" heuristic)
+            research_brief = (brief_artifact.text if brief_artifact else brief_text)
+            # Append any extra context from user
+            extra_ctx = _controls.pop_extra_context()
+            if extra_ctx:
+                research_brief += f'\n\nADDITIONAL CONTEXT: {extra_ctx}'
+                log(f"Phase 2: Injecting extra user context ({len(extra_ctx)} chars)")
             if fb2:
                 research_brief += f'\n\nUSER FEEDBACK (incorporate this into your research): {fb2}'
                 log(f"Phase 2: Injecting user feedback: {fb2[:100]}")
@@ -2820,16 +3369,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     data["sourceRefs"] = refs
                 meta["agents"] = agents
                 meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            _p2_links = [{"label": f"{n} Research", "url": r.get("url", "")} for n, r in results.items() if r.get("url")]
+            # ── Link-before-advance: extract shareable links for all agents ──
+            log("Phase 2: Extracting shareable links before advancing...")
+            _p2_link_results = await extract_phase_links(2, browser, cua_client,
+                enabled_agents=agents_cfg, verbose=verbose)
+            _p2_links = [r.to_dict() for r in _p2_link_results if r.success]
+            # Fallback: use raw agent URLs if extraction failed
+            if not _p2_links:
+                _p2_links = [{"label": f"{n} Research", "url": r.get("url", "")}
+                             for n, r in results.items() if r.get("url")]
             emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links)
+            _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
         else:
             log("Phase 2: Loading existing research files")
 
-        if stop_or_pause_requested():
-            is_stop = stop_requested()
-            if is_stop:
+        if _controls.is_stop_or_pause():
+            if _controls.is_stop():
                 log("STOP requested after Phase 2 — collecting partial results", "WARN")
-                # Partial result collection: save whatever agents completed so far
                 doc_dir = queue_dir / "documents"
                 partial_agents = []
                 for name in ["ChatGPT", "Gemini", "Claude"]:
@@ -3151,19 +3707,21 @@ async def run_server(port=8000):
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
         (queue / ".stop").write_text("stop", encoding="utf-8")
-        # Remove any .pause if it existed — stop supersedes pause
         p = queue / ".pause"
         if p.exists():
             p.unlink()
+        # Also set asyncio event for immediate response
+        _controls.request_stop()
         return {"status": "stop_requested", "id": run_id}
 
     @app.post("/api/runs/{run_id}/pause")
     async def pause_run(run_id: str):
-        """PAUSE: freeze pipeline at next phase boundary, save checkpoint for resume."""
+        """PAUSE: freeze pipeline at next checkpoint, save state for resume."""
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
         (queue / ".pause").write_text("pause", encoding="utf-8")
+        _controls.request_pause()
         return {"status": "pause_requested", "id": run_id}
 
     @app.post("/api/runs/{run_id}/feedback")
@@ -3274,7 +3832,8 @@ async def run_server(port=8000):
             try:
                 await run_pipeline(topic=job["topic"], email=job.get("email", ""),
                                    verbose=True, resume_dir=job.get("resume_dir"),
-                                   config=job.get("config"), run_id=job.get("run_id"))
+                                   config=job.get("config"), run_id=job.get("run_id"),
+                                   uid=job.get("uid"))
             except Exception as e:
                 log(f"Pipeline job error: {e}", "ERROR")
             finally:
@@ -3345,6 +3904,7 @@ async def run_server(port=8000):
             return JSONResponse({"error": "topic is required"}, 400)
         topic = topic.strip()
         email = request_data.get("email", "")
+        uid = request_data.get("uid", "")  # Firebase user ID for Firestore bridge
         config = request_data.get("config", {})
         # Validate config
         agents_cfg = config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
@@ -3352,7 +3912,7 @@ async def run_server(port=8000):
             return JSONResponse({"error": "at least one agent must be enabled"}, 400)
         from datetime import datetime as _dt
         run_id = f"{safe_name(topic)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
-        await _job_queue.put({"topic": topic, "email": email, "config": config, "run_id": run_id})
+        await _job_queue.put({"topic": topic, "email": email, "config": config, "run_id": run_id, "uid": uid})
         position = _job_queue.qsize()
         is_running = _queue_running
         status = "running" if position <= 1 and not is_running else f"queued (position {position})"
@@ -3398,6 +3958,8 @@ async def run_server(port=8000):
     log(f"  WS   /ws/{{run_id}}                  — Real-time event stream")
     # Start worker directly (don't rely on @app.on_event which is deprecated and
     # sometimes doesn't fire reliably with newer FastAPI versions)
+    # Initialize Firebase Admin SDK for Firestore bridge
+    init_firebase()
     worker_task = asyncio.create_task(_job_worker())
     log("Job worker started (direct)")
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
