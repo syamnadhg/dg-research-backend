@@ -1,51 +1,113 @@
 # Super Research — Backend Pipeline
 
-Python + FastAPI + Playwright backend that automates multi-agent deep research via Claude Computer Use API.
+Automates multi-agent deep research across 6 platforms using Claude Computer Use API.
 
-## What It Does
+## Quick Start
 
-Orchestrates browser automation across 6 platforms (ChatGPT, Gemini, Claude, NotebookLM, YouTube, Gmail) to produce a complete research package from a single topic.
+```bash
+# 1. Install
+git clone <repo-url>
+cd research-automate
+pip install -r requirements.txt
 
-## Pipeline (6 Phases)
+# 2. Setup (one-time: generates PipeToken + opens browser for logins)
+python research.py --setup
 
-| Phase | What Happens | Platform | Time |
-|-------|-------------|----------|------|
-| 0. Init | Launch browser, verify logins | System | ~10s |
-| 1. Brief | Extended Thinking generates research plan | ChatGPT | 10-25 min |
-| 2. Research | 3 agents research in parallel | ChatGPT + Gemini + Claude | 15-45 min |
-| 3. NLM | Upload reports + generate podcast audio | NotebookLM | 10-20 min |
-| 4. YouTube | Convert to video, upload unlisted | YouTube | 5-10 min |
-| 5. Report | Google Doc hub + email notification | GDocs + Gmail | 2-5 min |
+# 3. Start the server
+python research.py --serve
+```
 
-## Stack
+That's it. Three commands to a running backend.
 
-- **Python 3.11+**
-- **FastAPI** — REST API + WebSocket server
-- **Playwright** — Browser automation (persistent Chrome profile)
-- **Claude CUA API** — Computer Use for complex UI interactions
-- **Pillow** — Image processing for screenshots
-- **markdownify** — HTML to Markdown extraction
+## Setup Details
 
-## Setup
+### Step 1: Install Dependencies
 
 ```bash
 pip install -r requirements.txt
+```
 
-# First-time: open browser to log into all services
+Requires **Python 3.11+** and a working Chrome/Chromium installation.
+
+### Step 2: Environment
+
+Set your Anthropic API key (required for browser automation):
+
+```bash
+# Windows (PowerShell)
+[System.Environment]::SetEnvironmentVariable("CUA_API_KEY", "sk-ant-...", "User")
+
+# macOS/Linux
+export CUA_API_KEY="sk-ant-..."
+```
+
+### Step 3: Run Setup
+
+```bash
 python research.py --setup
 ```
 
-This opens a Chromium browser. Log into: ChatGPT, Gemini, Claude, NotebookLM, YouTube, Gmail, Google Docs. Close the browser when done.
+This does two things:
 
-## Running
+1. **Generates your PipeToken** — a unique ID that links the Super Research web app to this machine. You'll see:
+   ```
+   ----------------------------------------------------------
+     Your PipeToken: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+   ----------------------------------------------------------
+     Enter this token in Super Research app:
+     Account > Pipeline Connection > Paste token > Link
+   ----------------------------------------------------------
+   ```
 
-### API Server (for web app)
+2. **Opens browser tabs** for all required platforms. Log into each one:
+   - ChatGPT (chatgpt.com)
+   - Gemini (gemini.google.com)
+   - Claude (claude.ai)
+   - NotebookLM (notebooklm.google.com)
+   - YouTube Studio (studio.youtube.com)
+   - Gmail (mail.google.com)
+   - Google Docs (docs.google.com)
+
+   You have 5 minutes to log into all tabs. Sessions are saved in a persistent browser profile.
+
+### Step 4: Link to Web App
+
+1. Open the Super Research web app
+2. Go to **Account** (sidebar bottom)
+3. Find **Pipeline Connection** section
+4. Paste your PipeToken and click **Link**
+5. You should see a green **Online** indicator
+
+### Step 5: Start the Server
 
 ```bash
-python research.py --serve --port 8000
+python research.py --serve
 ```
 
-### CLI (standalone)
+The server starts on port 8000 with:
+- A heartbeat that tells the web app this backend is online
+- A job queue that receives research requests from linked users
+
+Now fire a research topic in the web app — this machine runs the pipeline.
+
+## Multiple Users
+
+Multiple people can use the same backend. Share your PipeToken with them — they paste it in their own Account settings. Each user's research is scoped to their own account; the backend just processes the queue.
+
+## Pipeline Phases
+
+| Phase | Platform | Time |
+|-------|----------|------|
+| 0. Init | System (browser launch + login check) | ~10s |
+| 1. Brief | ChatGPT Pro + Extended Thinking | 10-25 min |
+| 2. Research | ChatGPT + Gemini + Claude (parallel) | 15-45 min |
+| 3. Podcast | NotebookLM (audio generation) | 10-20 min |
+| 4. YouTube | YouTube Studio (video upload) | 5-10 min |
+| 5. Report | Google Docs + Gmail (delivery) | 2-5 min |
+
+## CLI Mode
+
+Run research directly from the terminal (no web app):
 
 ```bash
 python research.py "Your research topic"
@@ -58,41 +120,36 @@ python research.py --resume queue_name                 # Resume stopped run
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CUA_API_KEY` | — | Anthropic API key (required) |
-| `CUA_MODEL` | `claude-opus-4-6` | Claude model |
+| `CUA_API_KEY` | (required) | Anthropic API key |
+| `PIPE_TOKEN` | (from setup) | Override PipeToken (for Docker/CI) |
+| `CUA_MODEL` | `claude-opus-4-6` | Claude model for CUA |
 | `CUA_SCREEN_WIDTH` | `1280` | Browser viewport width |
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |
-| `POLL_PRO` | `30` | Phase 1 poll interval (seconds) |
-| `POLL_DEEP_RESEARCH` | `30` | Phase 2 poll interval (seconds) |
-| `MAX_WAIT_PRO` | `45` | Phase 1 max wait (minutes) |
-| `MAX_WAIT_DEEP` | `90` | Phase 2 max wait (minutes) |
 
 ## File Structure
 
 ```
 research-automate/
-├── research.py          # Main pipeline + FastAPI server (~3200 lines)
-├── prompts.py           # All CUA prompts for each phase
-├── requirements.txt     # Python dependencies
-├── PIPELINE_SPEC.md     # Frontend ↔ Backend API contract
-├── queues/              # Runtime: active/completed pipeline runs
-└── tracks/              # Runtime: extracted research documents
+├── research.py                 # Pipeline + FastAPI server
+├── prompts.py                  # CUA prompts for each phase
+├── requirements.txt            # Python dependencies
+├── firebase-service-account.json  # Firebase connection (included)
+├── pipe_config.json            # Your PipeToken (generated by --setup, gitignored)
+├── PIPELINE_SPEC.md            # API contract
+├── queues/                     # Active/completed pipeline runs
+└── tracks/                     # Extracted research documents
 ```
 
-## API
+## Troubleshooting
 
-See [PIPELINE_SPEC.md](./PIPELINE_SPEC.md) for the full API contract (endpoints, event types, config schema).
+**"No PipeToken found"** — Run `python research.py --setup` first.
 
-## Integration with Frontend
+**Backend shows "Offline" in the web app** — Make sure `python research.py --serve` is running. The heartbeat updates every 30 seconds.
 
-The web app (`research-app/web`) proxies requests through its Next.js API routes to this backend. For local dev:
+**"Backend did not respond within 15s"** — The backend may be busy with another research. Check the queue: `GET http://localhost:8000/api/queue`.
 
-```
-Frontend (localhost:3000) → /api/pipeline → Backend (localhost:8000)
-```
-
-For Vercel deployment, expose this server via ngrok and set `PIPELINE_BACKEND_URL` in Vercel env vars.
+**Browser sessions expired** — Re-run `python research.py --setup` to log in again.
 
 ---
 
-Built by Sammy for Distributed Global (Herve Bizira).
+Built by Sammy for Distributed Global.

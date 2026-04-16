@@ -7,5 +7,6 @@ dist/
 build/
 .env
 firebase-service-account.json
+pipe_config.json
 queues/
 tracks/

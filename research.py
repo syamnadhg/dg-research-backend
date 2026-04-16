@@ -139,6 +139,34 @@ def get_clipboard():
         return ""
 
 
+# Canonical agent/platform key the frontend uses in details[<key>]. Matches the
+# keys set when agent_progress events are emitted (lowercase, whitespace-stripped).
+_AGENT_KEY_ALIASES = {
+    # Phase 1 is ChatGPT Pro + Extended Thinking — surface it as "chatgpt"
+    # (the platform) rather than "brief" (the output artifact) so the UI
+    # shows a single ChatGPT card, not two cards labelled "Brief" and "ChatGPT".
+    "phase1": "chatgpt",
+    "brief": "chatgpt",
+    "chatgpt": "chatgpt",
+    "gemini": "gemini",
+    "claude": "claude",
+    "notebooklm": "notebooklm",
+    "youtube": "youtube",
+    "gdocs": "gdocs",
+    "gdoc": "gdocs",
+    "gmail": "gmail",
+    "system": "system",
+}
+
+def normalize_agent_key(name):
+    """Normalize any agent/platform name (capitalized, spaced, aliased) to the
+    canonical key the frontend expects in pipelineData.details. Safe for event emits."""
+    if not name:
+        return "system"
+    k = str(name).lower().replace(" ", "")
+    return _AGENT_KEY_ALIASES.get(k, k)
+
+
 def save_track(platform, data):
     """Save a timestamped progress entry — individual JSON + events.jsonl for streaming."""
     if not _tracks_dir:
@@ -167,10 +195,19 @@ _fb_uid = None          # Per-run: user ID for Firestore path
 _fb_research_id = None  # Per-run: research ID for Firestore path
 _fb_seq = 0             # Per-run: monotonic event sequence number
 _fb_listener = None     # Per-run: command listener unsubscribe handle
+_pipe_token = None      # PipeToken: this backend instance's unique ID
 
 
 def init_firebase():
-    """Initialize Firebase Admin SDK from service-account JSON. Call once at server start."""
+    """Initialize Firebase Admin SDK from service-account JSON. Call once at server start.
+
+    Also configures the Storage bucket so Phase 3 can upload NotebookLM audio
+    to Firebase Storage (which then streams to the Vercel Podcasts page). The
+    bucket name comes from env var `FIREBASE_STORAGE_BUCKET` if set,
+    otherwise defaults to the new `<project>.firebasestorage.app` convention
+    (used for projects created Oct 2024+). If your project is older and uses
+    `<project>.appspot.com`, set the env var explicitly.
+    """
     global _firebase_db
     if _firebase_db:
         return True
@@ -182,9 +219,23 @@ def init_firebase():
             log("Firebase: service-account.json not found — Firestore bridge disabled", "WARN")
             return False
         cred = credentials.Certificate(str(sa_path))
-        firebase_admin.initialize_app(cred)
+        # Derive project id from service account for the default bucket name.
+        import json as _json
+        try:
+            _sa = _json.loads(sa_path.read_text(encoding="utf-8"))
+            _project_id = _sa.get("project_id", "")
+        except Exception:
+            _project_id = ""
+        bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET") or (
+            f"{_project_id}.firebasestorage.app" if _project_id else None
+        )
+        init_opts = {"storageBucket": bucket_name} if bucket_name else None
+        firebase_admin.initialize_app(cred, init_opts)
         _firebase_db = _fs.client()
-        log("Firebase Admin SDK initialized ✓")
+        if bucket_name:
+            log(f"Firebase Admin SDK initialized ✓ (storage bucket: {bucket_name})")
+        else:
+            log("Firebase Admin SDK initialized ✓ (no storage bucket configured)")
         return True
     except ImportError:
         log("Firebase: firebase-admin not installed — Firestore bridge disabled", "WARN")
@@ -192,6 +243,249 @@ def init_firebase():
     except Exception as e:
         log(f"Firebase init error: {e}", "WARN")
         return False
+
+
+_start_listener = None  # Global start-command listener
+_heartbeat_task = None  # Async task: writes lastHeartbeat every 30s
+
+PIPE_CONFIG_PATH = Path(__file__).parent / "pipe_config.json"
+
+
+def load_pipe_token():
+    """Load PipeToken from local pipe_config.json (or PIPE_TOKEN env var).
+    Returns the token string or None if not set up yet."""
+    global _pipe_token
+    # Env var takes precedence (for Docker/CI deployments)
+    env_token = os.environ.get("PIPE_TOKEN", "").strip()
+    if env_token:
+        _pipe_token = env_token
+        return _pipe_token
+    # Local config file
+    if PIPE_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(PIPE_CONFIG_PATH.read_text(encoding="utf-8"))
+            _pipe_token = cfg.get("pipeToken", "").strip() or None
+            return _pipe_token
+        except Exception:
+            pass
+    return None
+
+
+def generate_pipe_token():
+    """Generate a new PipeToken, store it in Firestore + local config.
+    Called during --setup. Returns the token string."""
+    import uuid
+    import socket
+    global _pipe_token
+    token = str(uuid.uuid4())
+    machine_name = socket.gethostname()
+
+    # Store in Firestore
+    if _firebase_db:
+        try:
+            from google.cloud.firestore import SERVER_TIMESTAMP
+            _firebase_db.collection("pipe_tokens").document(token).set({
+                "status": "active",
+                "machineName": machine_name,
+                "createdAt": SERVER_TIMESTAMP,
+                "lastHeartbeat": SERVER_TIMESTAMP,
+            })
+            log(f"PipeToken registered in Firestore: {token[:8]}...")
+        except Exception as e:
+            log(f"Failed to register PipeToken in Firestore: {e}", "WARN")
+
+    # Store locally
+    local_cfg = {}
+    if PIPE_CONFIG_PATH.exists():
+        try:
+            local_cfg = json.loads(PIPE_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    local_cfg["pipeToken"] = token
+    local_cfg["machineName"] = machine_name
+    PIPE_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
+    log(f"PipeToken saved to {PIPE_CONFIG_PATH.name}")
+
+    _pipe_token = token
+    return token
+
+
+async def _heartbeat_loop():
+    """Write lastHeartbeat to pipe_tokens/{token} every 30s so the frontend
+    can show Online/Offline status."""
+    from google.cloud.firestore import SERVER_TIMESTAMP
+    while True:
+        try:
+            if _firebase_db and _pipe_token:
+                _firebase_db.collection("pipe_tokens").document(_pipe_token).update({
+                    "lastHeartbeat": SERVER_TIMESTAMP,
+                    "status": "active",
+                })
+        except Exception as e:
+            log(f"Heartbeat write failed: {e}", "WARN")
+        await asyncio.sleep(30)
+
+
+def upload_audio_to_storage(local_path: "Path") -> str | None:
+    """Upload the NotebookLM audio file to Firebase Storage and return a
+    public download URL. Path is scoped under the user's uid + researchId so
+    users can only access their own files (see storage.rules).
+    Returns None if upload fails or Firebase Storage isn't configured.
+    """
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return None
+    if not local_path or not local_path.exists():
+        return None
+    try:
+        from firebase_admin import storage as _fb_storage
+        # Object path mirrors the Firestore layout for easy reasoning.
+        blob_name = f"audio/{_fb_uid}/{_fb_research_id}/{local_path.name}"
+        bucket = _fb_storage.bucket()
+        blob = bucket.blob(blob_name)
+        # Content-Type matters so the browser's <audio> tag plays it inline.
+        content_type = "audio/mpeg" if local_path.suffix.lower() == ".mp3" else (
+            "audio/mp4" if local_path.suffix.lower() in (".m4a", ".mp4") else "audio/*"
+        )
+        blob.upload_from_filename(str(local_path), content_type=content_type)
+        # Make the object publicly readable by URL. Auth is enforced at the
+        # Firestore documents level — a user can only see the `audioUrl`
+        # field if they read their own audios subcollection. Making the
+        # blob itself public-with-unguessable-URL avoids needing signed URL
+        # refresh for long-playing sessions.
+        blob.make_public()
+        log(f"Audio uploaded to Storage: gs://{bucket.name}/{blob_name}")
+        return blob.public_url
+    except Exception as e:
+        log(f"Audio upload to Firebase Storage failed: {e}", "WARN")
+        return None
+
+
+def save_audio_to_firestore(audio_id: str, name: str, duration_sec: int, audio_url: str | None):
+    """Upsert an audio entry into users/{uid}/researches/{id}/audios/{audio_id}
+    so the Podcasts page on Vercel can list + stream it without needing the
+    local backend. audio_url is the public Storage URL from upload_audio_to_storage.
+    """
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    try:
+        mins, secs = divmod(max(0, int(duration_sec)), 60)
+        _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id) \
+            .collection("audios").document(audio_id) \
+            .set({
+                "id": audio_id,
+                "name": name,
+                "duration": f"{mins}:{secs:02d}" if duration_sec else "",
+                "durationSec": int(duration_sec or 0),
+                "createdAt": int(time.time() * 1000),
+                **({"audioUrl": audio_url} if audio_url else {}),
+            })
+    except Exception as e:
+        log(f"Failed to sync audio to Firestore: {e}", "WARN")
+
+
+def save_document_to_firestore(doc_type: str, content: str, name: str | None = None):
+    """Upsert a research document (brief/chatgpt/gemini/claude/consolidated)
+    into the user's Firestore documents subcollection so the Documents page
+    on Vercel can render it without direct access to this local backend.
+    Phase 3 (NotebookLM) still reads MDs from queue_dir/documents/ on local
+    disk — this sync is strictly for the frontend Documents UI.
+
+    Upsert semantics: doc_type is used as the Firestore doc ID, so re-runs
+    or re-extractions for the same research overwrite in place instead of
+    creating duplicates.
+    """
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    if not content or not content.strip():
+        return
+    try:
+        _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id) \
+            .collection("documents").document(doc_type) \
+            .set({
+                "id": doc_type,
+                "name": name or f"{doc_type}.md",
+                "type": doc_type,
+                "content": content,
+                "size": f"{len(content) / 1024:.0f} KB",
+                "createdAt": int(time.time() * 1000),
+            })
+    except Exception as e:
+        log(f"Failed to sync {doc_type}.md to Firestore: {e}", "WARN")
+
+
+def start_firestore_start_listener(job_queue, loop):
+    """Listen for pipeline start requests via this backend's PipeToken queue.
+    Frontend writes to: pipe_tokens/{token}/queue/{auto-id}
+    Backend picks it up, queues the job, writes run_id back.
+    Falls back to global pipeline_requests/ if no PipeToken is set (legacy)."""
+    global _start_listener
+    if not _firebase_db:
+        return
+
+    # Token-scoped queue (preferred) vs legacy global collection
+    if _pipe_token:
+        col_ref = _firebase_db.collection("pipe_tokens").document(_pipe_token).collection("queue")
+        listener_label = f"pipe_tokens/{_pipe_token[:8]}…/queue/"
+    else:
+        col_ref = _firebase_db.collection("pipeline_requests")
+        listener_label = "pipeline_requests/ (legacy — run --setup to get a PipeToken)"
+
+    def on_snapshot(col_snapshot, changes, read_time):
+        for change in changes:
+            if change.type.name != 'ADDED':
+                continue
+            doc = change.document
+            data = doc.to_dict() or {}
+            if data.get("processed"):
+                continue
+            action = data.get("action", "start")
+            if action != "start":
+                continue
+            uid = data.get("uid", "")
+            research_id = data.get("researchId", "")
+            topic = data.get("topic", "").strip()
+            email = data.get("email", "")
+            config = data.get("config", {})
+            if not topic or not uid or not research_id:
+                log(f"Firestore start request missing fields: uid={uid}, rid={research_id}, topic={topic[:30]}", "WARN")
+                try:
+                    doc.reference.update({"processed": True, "error": "missing fields"})
+                except Exception:
+                    pass
+                continue
+            # Generate run_id
+            run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            log(f"Firestore start: uid={uid[:8]}... topic={topic[:40]} run_id={run_id}")
+            # Write run_id back to the research doc so frontend can read it
+            try:
+                _firebase_db.collection("users").document(uid) \
+                    .collection("researches").document(research_id) \
+                    .update({"backendRunId": run_id, "status": "ongoing"})
+            except Exception as e:
+                log(f"Failed to write backendRunId: {e}", "WARN")
+                try:
+                    _firebase_db.collection("users").document(uid) \
+                        .collection("researches").document(research_id) \
+                        .set({"backendRunId": run_id, "status": "ongoing"}, merge=True)
+                except Exception:
+                    pass
+            # Mark processed
+            try:
+                doc.reference.update({"processed": True, "run_id": run_id})
+            except Exception:
+                pass
+            # Queue the job (default-arg capture avoids lambda-in-loop closure bug)
+            loop.call_soon_threadsafe(
+                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id:
+                    job_queue.put_nowait(
+                        {"topic": t, "email": e, "config": c, "run_id": r, "uid": u, "research_id": ri}
+                    )
+            )
+
+    _start_listener = col_ref.on_snapshot(on_snapshot)
+    log(f"Firestore start listener active on {listener_label}")
 
 
 def setup_firestore_run(uid, research_id, loop=None):
@@ -244,6 +538,20 @@ def _update_firestore_research(updates):
         log(f"Firestore research update failed: {e}", "WARN")
 
 
+def _write_config_to_disk(cfg_updates):
+    """Write config updates to config.json on disk (so reload_config() picks them up).
+    Merges with existing config — does not overwrite."""
+    if not _tracks_dir:
+        return
+    config_path = Path(__file__).parent / "queues" / _tracks_dir.name / "config.json"
+    try:
+        existing = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        existing.update(cfg_updates)
+        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"Failed to write config to disk: {e}", "WARN")
+
+
 def _start_command_listener(uid, research_id, loop):
     """Listen for frontend commands (stop/pause/resume/config/add_context) via Firestore."""
     global _fb_listener
@@ -266,7 +574,15 @@ def _start_command_listener(uid, research_id, loop):
                 if _tracks_dir:
                     try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
                     except Exception: pass
-                log("Command received: STOP")
+                log("Command received: STOP — server will exit after cleanup")
+                # Schedule a delayed server exit so pipeline can close browser + emit final events
+                import threading
+                def _exit_after_stop():
+                    import time as _t, os as _os
+                    _t.sleep(10)
+                    log("Exiting server after Stop", "WARN")
+                    _os._exit(0)
+                threading.Thread(target=_exit_after_stop, daemon=True).start()
             elif action == "pause":
                 loop.call_soon_threadsafe(_controls.request_pause)
                 if _tracks_dir:
@@ -274,6 +590,14 @@ def _start_command_listener(uid, research_id, loop):
                     except Exception: pass
                 log("Command received: PAUSE")
             elif action == "resume":
+                # Process config payload sent with resume (if any)
+                resume_cfg = data.get("config", {})
+                if resume_cfg:
+                    loop.call_soon_threadsafe(_controls.update_config, resume_cfg)
+                    _write_config_to_disk(resume_cfg)
+                    log(f"Command received: RESUME (with config update)")
+                else:
+                    log("Command received: RESUME")
                 loop.call_soon_threadsafe(_controls.request_resume)
                 # Clean up file sentinels on resume
                 if _tracks_dir:
@@ -281,7 +605,6 @@ def _start_command_listener(uid, research_id, loop):
                     for f in [q / ".pause", q / ".stop"]:
                         try: f.unlink(missing_ok=True)
                         except Exception: pass
-                log("Command received: RESUME")
             elif action == "add_context":
                 text = data.get("text", "")
                 if text:
@@ -291,7 +614,8 @@ def _start_command_listener(uid, research_id, loop):
                 cfg = data.get("config", {})
                 if cfg:
                     loop.call_soon_threadsafe(_controls.update_config, cfg)
-                    log(f"Command received: CONFIG update")
+                    _write_config_to_disk(cfg)
+                    log(f"Command received: CONFIG update (written to disk)")
             # Mark processed
             try:
                 doc.reference.update({"processed": True})
@@ -324,14 +648,32 @@ class PipelineControls:
         self.pause_event.clear()
         self.resume_event.set()
 
+    # Size cap for accumulated context (prevents runaway growth across pause cycles)
+    MAX_EXTRA_CONTEXT_CHARS = 50_000
+
     def add_context(self, text):
+        if not text:
+            return
+        # Cap individual entry + cumulative size
+        text = text[:self.MAX_EXTRA_CONTEXT_CHARS]
         self.extra_context.append(text)
+        total = sum(len(t) for t in self.extra_context)
+        while total > self.MAX_EXTRA_CONTEXT_CHARS and len(self.extra_context) > 1:
+            dropped = self.extra_context.pop(0)
+            total -= len(dropped)
+            log(f"[extra_context] Dropped oldest entry ({len(dropped)} chars) — cap {self.MAX_EXTRA_CONTEXT_CHARS}", "WARN")
 
     def pop_extra_context(self):
         if self.extra_context:
             ctx = "\n\n".join(self.extra_context)
             self.extra_context.clear()
             return ctx
+        return ""
+
+    def peek_extra_context(self):
+        """Non-destructive read of buffered context (for dispatcher to check before dispatch)."""
+        if self.extra_context:
+            return "\n\n".join(self.extra_context)
         return ""
 
     def is_stop(self):
@@ -376,8 +718,433 @@ class PipelineControls:
         self.extra_context.clear()
         self._config_updates.clear()
 
+    async def interruptible_sleep(self, seconds, check_interval=10):
+        """Sleep in small increments, checking stop/pause every check_interval seconds.
+        Returns 'stop' if stopped, 'pause' if paused, None if sleep completed normally."""
+        elapsed = 0
+        while elapsed < seconds:
+            chunk = min(check_interval, seconds - elapsed)
+            await asyncio.sleep(chunk)
+            elapsed += chunk
+            if self.stop_event.is_set():
+                return "stop"
+            if self.pause_event.is_set():
+                return "pause"
+        return None
+
 
 _controls = PipelineControls()  # Singleton — reset per run
+
+
+# ── Pipeline Runtime State (shared across coroutines, reset per run) ────────
+
+class PipelineRuntime:
+    """Shared mutable state for pause/resume/dispatcher to coordinate.
+    Pages are registered here by each phase when they go active; dispatcher
+    reads this to decide where mid-run user input should be pasted."""
+    def __init__(self):
+        self.phase = 0
+        self.sub_state = ""
+        self.active_pages: dict = {}  # platform → page object
+        self.agent_statuses: dict = {}  # platform → 'generating'|'done'|'failed'
+        self.agent_chat_urls: dict = {}  # platform → URL
+        self.partial_text_lens: dict = {}
+        self.original_inputs: dict = {}  # {'topic': str, 'brief': str, 'pdf_paths': []}
+        self.queue_dir = None
+        self.browser = None
+        self.cua_client = None
+        self.dispatcher_task = None
+
+    def reset(self):
+        self.__init__()
+
+    def register_page(self, platform, page, url=None):
+        self.active_pages[platform] = page
+        if url:
+            self.agent_chat_urls[platform] = url
+        elif page is not None:
+            try:
+                self.agent_chat_urls[platform] = page.url
+            except Exception:
+                pass
+        self.agent_statuses[platform] = "generating"
+
+    def unregister_page(self, platform, final_status="done"):
+        self.agent_statuses[platform] = final_status
+        # Keep URL in agent_chat_urls for checkpoint/link display
+        self.active_pages.pop(platform, None)
+
+    def snapshot(self):
+        """Snapshot current state for checkpoint.json."""
+        return {
+            "phase": self.phase,
+            "sub_state": self.sub_state,
+            "agent_chat_urls": dict(self.agent_chat_urls),
+            "agent_statuses": dict(self.agent_statuses),
+            "partial_text_lens": dict(self.partial_text_lens),
+            "original_inputs": dict(self.original_inputs),
+        }
+
+
+_runtime = PipelineRuntime()  # Singleton — reset per run
+
+
+def save_pause_checkpoint(queue_dir, extra=None):
+    """Write a full pause checkpoint combining runtime snapshot + extra fields."""
+    if not queue_dir:
+        return
+    cp = _runtime.snapshot()
+    cp["timestamp"] = datetime.now().isoformat()
+    cp["paused"] = True
+    if extra:
+        cp.update(extra)
+    try:
+        (Path(queue_dir) / "checkpoint_pause.json").write_text(
+            json.dumps(cp, indent=2), encoding="utf-8")
+        log(f"[pause] Checkpoint written — phase={cp['phase']} sub_state={cp['sub_state']} "
+            f"agents={list(cp['agent_statuses'].keys())}")
+    except Exception as e:
+        log(f"[pause] Checkpoint write failed: {e}", "WARN")
+
+
+def load_pause_checkpoint(queue_dir):
+    """Load pause checkpoint if present. Returns dict or None."""
+    if not queue_dir:
+        return None
+    cp_file = Path(queue_dir) / "checkpoint_pause.json"
+    if not cp_file.exists():
+        return None
+    try:
+        return json.loads(cp_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def clear_pause_checkpoint(queue_dir):
+    if not queue_dir:
+        return
+    f = Path(queue_dir) / "checkpoint_pause.json"
+    if f.exists():
+        try: f.unlink()
+        except Exception: pass
+
+
+# ── Email validation ────────────────────────────────────────────────────────
+
+_EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$")
+
+def validate_email(email):
+    """Return (ok: bool, reason: str). Empty string not allowed."""
+    if not email or not isinstance(email, str):
+        return False, "empty or non-string email"
+    email = email.strip()
+    if len(email) > 320:
+        return False, "email too long"
+    if not _EMAIL_RE.match(email):
+        return False, f"email format invalid: {email[:60]}"
+    return True, ""
+
+
+class SessionExpiredError(Exception):
+    """Raised when a platform's chat URL redirects to login after resume."""
+    pass
+
+
+# ── Auth check after resume navigation ───────────────────────────────────
+
+async def check_auth(page, platform):
+    """Verify page isn't a login wall after navigating to a saved chat URL.
+    Returns True if authenticated, raises SessionExpiredError if login detected."""
+    try:
+        url = page.url.lower()
+        # Platform-specific login URL patterns
+        login_patterns = {
+            "chatgpt": ["auth.openai.com", "/login", "chat.openai.com/auth"],
+            "gemini": ["accounts.google.com", "/signin"],
+            "claude": ["claude.ai/login", "claude.ai/signup", "/auth"],
+            "notebooklm": ["accounts.google.com"],
+        }
+        patterns = login_patterns.get(platform.lower(), ["/login", "/signin", "/auth"])
+        for p in patterns:
+            if p in url:
+                raise SessionExpiredError(
+                    f"{platform} session expired — page redirected to {url[:80]}")
+        # Additional DOM check: look for login form / sign-in button
+        try:
+            has_login = await page.evaluate("""() => {
+                const text = document.body.innerText.toLowerCase();
+                return (text.includes('sign in') || text.includes('log in')) &&
+                       (document.querySelector('input[type="password"]') !== null);
+            }""")
+            if has_login:
+                raise SessionExpiredError(f"{platform} session expired — login form detected")
+        except SessionExpiredError:
+            raise
+        except Exception:
+            pass
+        return True
+    except SessionExpiredError:
+        raise
+    except Exception as e:
+        log(f"[auth-check] {platform}: {e}", "WARN")
+        return True  # On generic errors, assume OK to avoid false positives
+
+
+# ── Paste-as-followup primitive ─────────────────────────────────────────
+
+async def paste_followup(page, text, platform, label="followup"):
+    """Paste text into the page's input field and send as a follow-up message.
+    Reuses verified_paste_brief's strategies but without brief-level verification."""
+    try:
+        # Scroll to bottom + focus input
+        try:
+            await page.keyboard.press("End")
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+        # Use verified_paste_brief with a lower retry count — it clicks and pastes
+        ok = await verified_paste_brief(page, text, platform, label, max_retries=2)
+        if not ok:
+            return False
+        # Click send button
+        for sel in ['button[data-testid="send-button"]',
+                    'button[aria-label="Send prompt"]',
+                    'button[aria-label="Send"]',
+                    'button[aria-label="Send message"]',
+                    'button[aria-label="Submit"]']:
+            try:
+                btn = await page.query_selector(sel)
+                if btn and await btn.is_enabled():
+                    await btn.click()
+                    await asyncio.sleep(1)
+                    return True
+            except Exception:
+                continue
+        # JS fallback
+        try:
+            sent = await page.evaluate("""() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                    if ((a.includes('send') || a.includes('submit')) && !b.disabled) {
+                        b.click(); return true;
+                    }
+                }
+                return false;
+            }""")
+            return bool(sent)
+        except Exception:
+            return False
+    except Exception as e:
+        log(f"[paste_followup] {platform}: {e}", "WARN")
+        return False
+
+
+# ── Check if agent is still generating (cheap DOM) ───────────────────────
+
+async def is_agent_generating(page, platform):
+    """Cheap DOM check: is the page showing a stop/loading indicator?"""
+    try:
+        sel_map = {
+            "chatgpt": 'button[data-testid="stop-button"], button[aria-label*="Stop"], [data-testid*="loading"]',
+            "gemini": 'button[aria-label*="Stop"], [jsname] [role="progressbar"]',
+            "claude": 'button[aria-label*="Stop"], [data-testid*="stop"]',
+        }
+        sel = sel_map.get(platform.lower(), 'button[aria-label*="Stop"]')
+        el = await page.query_selector(sel)
+        return el is not None
+    except Exception:
+        return False  # On error assume not generating
+
+
+# ── Mid-run Input Dispatcher ──────────────────────────────────────────────
+
+async def run_input_dispatcher(poll_interval=2.0):
+    """Background task that watches _controls.extra_context and, if pipeline is
+    actively running with live pages, dispatches user input immediately to the
+    respective active agent chats as follow-up messages.
+
+    If paused, does nothing — pause/resume flow handles buffered context.
+    If between phases (no active pages for that phase), input stays buffered
+    for the next phase to consume."""
+    log("[dispatcher] Mid-run input dispatcher started")
+    try:
+        while True:
+            await asyncio.sleep(poll_interval)
+            # Skip if stopped, paused, or nothing to dispatch
+            if _controls.is_stop():
+                return
+            if _controls.is_pause():
+                continue
+            if not _controls.peek_extra_context():
+                continue
+            # Only dispatch to live agent pages
+            if not _runtime.active_pages:
+                continue  # No active agents — buffer stays for next phase
+            text = _controls.pop_extra_context()
+            if not text:
+                continue
+            log(f"[dispatcher] Dispatching {len(text)} chars to {list(_runtime.active_pages.keys())}")
+            # Snapshot active pages (avoid mutation during iteration)
+            targets = list(_runtime.active_pages.items())
+            for platform, page in targets:
+                try:
+                    # Race guard: re-check status just before paste
+                    status_before = _runtime.agent_statuses.get(platform, "generating")
+                    if status_before != "generating":
+                        continue
+                    is_gen = await is_agent_generating(page, platform)
+                    if not is_gen and status_before == "generating":
+                        # Status flipped to done between registration and now — mark for restart
+                        log(f"[dispatcher] {platform} finished before dispatch — skipping (will be handled on next pause/resume)", "WARN")
+                        continue
+                    ok = await paste_followup(page, text, platform, label=f"dispatcher-{platform}")
+                    if ok:
+                        emit_event("user_input_dispatched", phase=_runtime.phase,
+                                   agent=platform, chars=len(text))
+                        log(f"[dispatcher] Sent follow-up to {platform}")
+                    else:
+                        log(f"[dispatcher] Failed to send follow-up to {platform}", "WARN")
+                        # Re-buffer so user input isn't lost
+                        _controls.add_context(text)
+                        break
+                except Exception as e:
+                    log(f"[dispatcher] Error dispatching to {platform}: {e}", "WARN")
+    except asyncio.CancelledError:
+        log("[dispatcher] Cancelled")
+        raise
+
+
+# ── NotebookLM addendum source upload ───────────────────────────────────
+
+async def upload_source_to_notebook(browser, page, file_path, label="addendum"):
+    """Upload an extra source document to an existing NotebookLM notebook.
+    Returns True on success."""
+    try:
+        await browser.switch_to_page(page)
+        await asyncio.sleep(1)
+        # Click "Add source" button
+        clicked = False
+        for sel in ['button[aria-label*="Add source"]',
+                    'button[aria-label*="Add"]',
+                    'button:has-text("Add source")',
+                    '[data-test*="add-source"]']:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            try:
+                clicked = await page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if ((b.textContent || '').toLowerCase().includes('add source')) {
+                            b.click(); return true;
+                        }
+                    }
+                    return false;
+                }""")
+            except Exception:
+                pass
+        if not clicked:
+            log(f"[notebook-addendum] 'Add source' button not found", "WARN")
+            return False
+        await asyncio.sleep(2)
+        # File chooser should appear — queue the upload
+        browser.set_upload_file(file_path)
+        # Try clicking a file-upload entry if modal shows tabs
+        for sel in ['input[type="file"]']:
+            try:
+                inp = await page.query_selector(sel)
+                if inp:
+                    await inp.set_input_files(str(file_path))
+                    break
+            except Exception:
+                continue
+        # Wait for ingestion
+        await asyncio.sleep(10)
+        log(f"[notebook-addendum] Uploaded {label}")
+        return True
+    except Exception as e:
+        log(f"[notebook-addendum] Upload failed: {e}", "WARN")
+        return False
+
+
+# ── Pause/Resume: Close browser + relaunch ──────────────────────────────
+
+async def pause_and_close_browser(browser, queue_dir, phase, extra_kwargs=None):
+    """Save pause checkpoint → close browser → block until resume or stop."""
+    _runtime.phase = phase
+    # Write checkpoint snapshot
+    save_pause_checkpoint(queue_dir, extra=extra_kwargs)
+    # Emit paused event with snapshot payload (frontend already shows links)
+    try:
+        emit_event("pipeline_paused", phase=phase,
+                   snapshot=_runtime.snapshot())
+    except Exception:
+        pass
+    # Close browser if active (Phase 0 guard: may be None)
+    if browser is not None:
+        try:
+            if browser.context is not None:
+                log(f"[pause] Closing browser for resource-efficient pause...")
+                await browser.close()
+        except Exception as e:
+            log(f"[pause] Browser close error: {e}", "WARN")
+    # Clear active pages — they're dead page refs now
+    _runtime.active_pages.clear()
+    # Block on pause event
+    await _controls.wait_if_paused()
+    # On resume, caller handles relaunch
+    return _controls.is_stop()  # True if stopped during pause
+
+
+async def resume_browser_from_checkpoint(browser, queue_dir):
+    """Relaunch browser, navigate to saved agent chat URLs, verify auth.
+    Returns dict of {platform: page} for recovered agents."""
+    cp = load_pause_checkpoint(queue_dir) or {}
+    # Restore runtime state from checkpoint
+    if cp:
+        _runtime.phase = cp.get("phase", _runtime.phase)
+        _runtime.sub_state = cp.get("sub_state", "")
+        _runtime.agent_chat_urls = dict(cp.get("agent_chat_urls", {}))
+        _runtime.agent_statuses = dict(cp.get("agent_statuses", {}))
+        _runtime.original_inputs = dict(cp.get("original_inputs", {}))
+    log(f"[resume] Relaunching browser for phase {_runtime.phase} ({_runtime.sub_state or 'idle'})")
+    await browser.start()
+    restored = {}
+    for platform, url in list(_runtime.agent_chat_urls.items()):
+        status = _runtime.agent_statuses.get(platform, "done")
+        if status == "done":
+            continue  # Don't reopen completed agents
+        if not url:
+            continue
+        try:
+            page = await browser.new_tab(url)
+            await asyncio.sleep(3)
+            try:
+                await check_auth(page, platform)
+            except SessionExpiredError as e:
+                log(f"[resume] {e}", "ERROR")
+                emit_event("pipeline_error", phase=_runtime.phase,
+                           agent=platform, error=str(e))
+                continue
+            restored[platform] = page
+            _runtime.register_page(platform, page, url)
+            log(f"[resume] {platform} restored at {url[:80]}")
+        except Exception as e:
+            log(f"[resume] {platform} reopen failed: {e}", "WARN")
+    # Reset dedup cache
+    global _last_progress
+    _last_progress = {}
+    emit_event("pipeline_resumed", phase=_runtime.phase,
+               restored=list(restored.keys()))
+    clear_pause_checkpoint(queue_dir)
+    return restored
 
 
 # ── Link Extraction ──────────────────────────────────────────────────────────
@@ -404,7 +1171,7 @@ class LinkResult:
 async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief", verbose=False):
     """Extract shareable ChatGPT link: Share button → Create link → copy URL."""
     page = browser.page
-    url = browser.current_url() or ""
+    url = await browser.current_url() or ""
     try:
         # Step 1: Try Playwright — find share button
         share_btn = None
@@ -426,12 +1193,24 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
             if link_btn:
                 await link_btn.click()
                 await asyncio.sleep(2)
-            # Try to get URL from input field in modal
+            # PRIMARY — try to get URL from input field in modal
             share_input = await page.query_selector('input[readonly][value*="chatgpt.com/share"]')
             if share_input:
                 url = await share_input.get_attribute("value") or url
-            else:
-                # Try clipboard
+            # SECONDARY — read the browser's clipboard directly (the "Copy link"
+            # button wrote the public /share/ URL into it). This is far more
+            # reliable than asking CUA to recover it via screenshots.
+            if "chatgpt.com/share" not in url:
+                try:
+                    clip_js = await page.evaluate("navigator.clipboard.readText()")
+                    if clip_js and "chatgpt.com/share" in clip_js:
+                        url = clip_js.strip()
+                        log(f"[{label}] Share URL recovered from browser clipboard: {url}")
+                except Exception as _e:
+                    # clipboard-read permission may be denied; fall through
+                    pass
+            # TERTIARY — Windows OS clipboard via PowerShell
+            if "chatgpt.com/share" not in url:
                 clip = get_clipboard()
                 if "chatgpt.com/share" in clip:
                     url = clip
@@ -443,14 +1222,23 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
             log(f"[{label}] CUA fallback for share link...")
             result = await agent_loop(cua_client, browser,
                 "Share this ChatGPT conversation by clicking the Share button.",
-                "Click the Share button at the top of this conversation. If a modal appears, click 'Create link' or 'Copy link'. Tell me the full share URL.",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                "Click the Share button at the top of this conversation. If a modal appears, click 'Create link' or 'Copy link'. After clicking Copy link, just STOP — don't try to extract the URL yourself, the code will read it from the clipboard.",
+                model=CUA_MODEL, max_iterations=6, verbose=verbose)
             text = (result.get("text") or "")
-            # Extract URL from CUA response
+            # Extract URL from CUA response (if it happened to observe one)
             m = re.search(r'https://chatgpt\.com/share/[a-zA-Z0-9-]+', text)
             if m:
                 url = m.group(0)
-            elif "chatgpt.com/share" not in url:
+            # After CUA clicked "Copy link", read the browser clipboard directly
+            if "chatgpt.com/share" not in url:
+                try:
+                    clip_js = await page.evaluate("navigator.clipboard.readText()")
+                    if clip_js and "chatgpt.com/share" in clip_js:
+                        url = clip_js.strip()
+                        log(f"[{label}] Share URL recovered from clipboard after CUA share click: {url}")
+                except Exception:
+                    pass
+            if "chatgpt.com/share" not in url:
                 clip = get_clipboard()
                 if "chatgpt.com/share" in clip:
                     url = clip
@@ -464,7 +1252,7 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
 async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Research", verbose=False):
     """Extract shareable Gemini conversation link."""
     page = browser.page
-    url = browser.current_url() or ""
+    url = await browser.current_url() or ""
     try:
         # Try share button
         share_btn = await page.query_selector('[aria-label="Share"]')
@@ -501,12 +1289,15 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
 async def extract_share_link_claude(browser, cua_client, label="Claude Deep Research", verbose=False):
     """Extract shareable Claude conversation link (publish artifact)."""
     page = browser.page
-    url = browser.current_url() or ""
+    url = await browser.current_url() or ""
     try:
-        # CUA is most reliable for Claude's publish flow
+        # CUA is most reliable for Claude's publish flow — USE the PROMPT_PUBLISH_CLAUDE system prompt
+        # which correctly targets the ARTIFACT panel (right side), not the conversation itself.
         result = await agent_loop(cua_client, browser,
-            "Publish this Claude conversation as a shared artifact.",
-            "Click the Publish button or Share button. Make the conversation publicly accessible. Tell me the published URL.",
+            PROMPT_PUBLISH_CLAUDE,
+            "Publish the research ARTIFACT in the right panel (not the conversation). "
+            "If two artifacts exist, open the SECOND/bottom one first. Click the Publish/Share icon on the artifact. "
+            "Get the published URL (claude.site/artifacts/... or claude.ai/...). Tell me the URL.",
             model=CUA_MODEL, max_iterations=12, verbose=verbose)
         text = (result.get("text") or "")
         m = re.search(r'https://claude\.ai/[^\s]+', text)
@@ -516,7 +1307,8 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
             clip = get_clipboard()
             if "claude.ai" in clip:
                 url = clip
-        verified = "claude.ai" in url and url != browser.current_url()
+        original_url = await browser.current_url()
+        verified = "claude.ai" in url and url != original_url
         return LinkResult(url=url, label=label, platform="claude", verified=verified)
     except Exception as e:
         return LinkResult(url=url, label=label, platform="claude", error=str(e))
@@ -524,7 +1316,7 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
 
 async def extract_notebooklm_url(browser, **_):
     """Extract NotebookLM notebook URL (tab URL is inherently shareable)."""
-    url = browser.current_url() or ""
+    url = await browser.current_url() or ""
     verified = "notebooklm.google.com/notebook" in url
     return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm", verified=verified)
 
@@ -562,7 +1354,7 @@ async def extract_youtube_url(browser, cua_client, verbose=False, **_):
 
 async def extract_gdoc_url(browser, **_):
     """Extract Google Doc URL (tab URL is the doc)."""
-    url = browser.current_url() or ""
+    url = await browser.current_url() or ""
     verified = "docs.google.com/document" in url
     return LinkResult(url=url, label="Google Doc", platform="gdoc", verified=verified)
 
@@ -575,26 +1367,29 @@ PHASE_LINK_EXTRACTORS = {
         ("claude", extract_share_link_claude, {})],
     3: [("notebooklm", extract_notebooklm_url, {})],
     4: [("youtube", extract_youtube_url, {})],
-    5: [("gdoc", extract_gdoc_url, {})],
+    5: [("gdocs", extract_gdoc_url, {})],
 }
 
 
 async def extract_phase_links(phase, browser, cua_client, enabled_agents=None, verbose=False):
-    """Run all link extractors for a phase. Returns list of LinkResult."""
+    """Run all link extractors for a phase. Returns list of LinkResult.
+    Emits link events with agent= (not platform=) so frontend details[agent] lookup works."""
     extractors = PHASE_LINK_EXTRACTORS.get(phase, [])
     results = []
     for platform, extractor, kwargs in extractors:
         if enabled_agents and platform in ("chatgpt", "gemini", "claude"):
             if not enabled_agents.get(platform, True):
                 continue  # Skip disabled agents
-        emit_event("link_extracting", phase=phase, platform=platform)
-        log(f"Extracting link: phase={phase} platform={platform}...")
+        emit_event("link_extracting", phase=phase, agent=platform)
+        log(f"Extracting link: phase={phase} agent={platform}...")
         result = await extractor(browser, cua_client=cua_client, verbose=verbose, **kwargs)
         if result.success:
-            emit_event("link_extracted", phase=phase, platform=platform, url=result.url, verified=result.verified)
+            emit_event("link_extracted", phase=phase, agent=platform,
+                       url=result.url, label=result.label, verified=result.verified)
             log(f"Link extracted: {result.url} (verified={result.verified})")
         else:
-            emit_event("link_extraction_failed", phase=phase, platform=platform, error=result.error or "URL not found")
+            emit_event("link_extraction_failed", phase=phase, agent=platform,
+                       error=result.error or "URL not found")
             log(f"Link extraction failed: {platform} — {result.error}", "WARN")
         results.append(result)
     return results
@@ -616,12 +1411,44 @@ class BriefArtifact:
 
 async def verified_paste_brief(page, brief_text, platform, label, max_retries=3):
     """Paste brief into the active textarea and verify it was pasted completely.
-    Returns True on success. Does NOT use the 'already_sent' heuristic — always pastes."""
+    Returns True on success. Uses multiple strategies: CDP clipboard, JS injection,
+    keyboard insert_text, and navigator.clipboard API.
+
+    For Claude (which auto-converts large pastes to file attachments), also accepts
+    attachment presence as a valid paste signal and clears any duplicates before retry."""
+    selectors = ['#prompt-textarea', 'div[contenteditable="true"]', 'textarea', '.ProseMirror',
+                 'div[contenteditable="true"][data-placeholder]', 'rich-textarea div[contenteditable="true"]',
+                 '[aria-label*="message"]', '[aria-label*="Message"]']
+    is_claude = platform.lower() == "claude"
+
     for attempt in range(1, max_retries + 1):
         pasted = False
-        selectors = ['#prompt-textarea', 'div[contenteditable="true"]', 'textarea', '.ProseMirror',
-                     'div[contenteditable="true"][data-placeholder]', 'rich-textarea div[contenteditable="true"]',
-                     '[aria-label*="message"]', '[aria-label*="Message"]']
+        # Claude: before retry, delete any existing attachments to prevent duplicates
+        if is_claude and attempt > 1:
+            try:
+                removed = await page.evaluate("""() => {
+                    // Find attachment tiles and click their X/remove buttons
+                    const removeBtns = document.querySelectorAll(
+                        'button[aria-label*="Remove"], button[aria-label*="Delete"], button[data-testid*="remove"]'
+                    );
+                    let count = 0;
+                    for (const b of removeBtns) {
+                        if (b.offsetParent !== null) { b.click(); count++; }
+                    }
+                    return count;
+                }""")
+                if removed:
+                    log(f"[{label}] Cleared {removed} stale attachment(s) before retry")
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
+        # Ensure page has focus (critical for clipboard access in new tabs)
+        try:
+            await page.bring_to_front()
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
         for sel in selectors:
             try:
                 ta = await page.wait_for_selector(sel, timeout=3000)
@@ -631,22 +1458,73 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=3)
                 await asyncio.sleep(0.3)
                 await page.keyboard.press("Control+a")
                 await asyncio.sleep(0.1)
-                # Use clipboard paste for reliability (not insert_text which is char-by-char)
-                await page.evaluate("text => navigator.clipboard.writeText(text)", brief_text)
-                await asyncio.sleep(0.2)
-                await page.keyboard.press("Control+v")
-                await asyncio.sleep(2)
-                pasted = True
-                break
+
+                # Strategy 1: CDP clipboard (bypasses permissions, most reliable)
+                try:
+                    cdp = await page.context.new_cdp_session(page)
+                    await cdp.send("Browser.grantPermissions", {"permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]})
+                    await cdp.detach()
+                except Exception:
+                    pass
+                try:
+                    await page.evaluate("text => navigator.clipboard.writeText(text)", brief_text)
+                    await asyncio.sleep(0.3)
+                    await page.keyboard.press("Control+v")
+                    await asyncio.sleep(2)
+                    pasted = True
+                    break
+                except Exception:
+                    pass
+
+                # Strategy 2: Direct JS injection into contenteditable/textarea
+                if not pasted:
+                    try:
+                        injected = await page.evaluate("""(text) => {
+                            const ta = document.querySelector('#prompt-textarea, div[contenteditable="true"], textarea, .ProseMirror');
+                            if (!ta) return false;
+                            if (ta.tagName === 'TEXTAREA' || ta.tagName === 'INPUT') {
+                                const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                                nativeSet.call(ta, text);
+                                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                                return true;
+                            } else {
+                                ta.focus();
+                                ta.innerHTML = '';
+                                // Use insertText to trigger React/framework state updates
+                                document.execCommand('selectAll', false, null);
+                                document.execCommand('insertText', false, text);
+                                return true;
+                            }
+                        }""", brief_text)
+                        if injected:
+                            await asyncio.sleep(1)
+                            pasted = True
+                            break
+                    except Exception:
+                        pass
+
+                # Strategy 3: Playwright keyboard.insert_text (no clipboard needed)
+                if not pasted:
+                    try:
+                        await ta.click()
+                        await page.keyboard.press("Control+a")
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.insert_text(brief_text)
+                        await asyncio.sleep(1.5)
+                        pasted = True
+                        break
+                    except Exception:
+                        pass
+
             except Exception:
                 continue
 
         if not pasted:
-            log(f"[{label}] Paste attempt {attempt}/{max_retries}: no textarea found", "WARN")
+            log(f"[{label}] Paste attempt {attempt}/{max_retries}: no textarea found or all strategies failed", "WARN")
             await asyncio.sleep(1)
             continue
 
-        # Verify: scrape textarea and check length
+        # Verify: scrape textarea and check length. Claude: also accept attachment tile as success.
         try:
             content_len = await page.evaluate("""() => {
                 const ta = document.querySelector('#prompt-textarea, div[contenteditable="true"], textarea, .ProseMirror');
@@ -654,6 +1532,26 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=3)
             }""")
             expected = len(brief_text)
             ratio = content_len / expected if expected > 0 else 0
+            # Claude: if text is small but an attachment exists, that's a successful paste (auto-converted)
+            if is_claude and ratio < 0.90:
+                try:
+                    attach_count = await page.evaluate("""() => {
+                        // Claude pasted-as-attachment tiles have file-like preview elements
+                        const tiles = document.querySelectorAll('[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i]');
+                        let count = 0;
+                        for (const t of tiles) {
+                            if (t.offsetParent !== null) count++;
+                        }
+                        return count;
+                    }""")
+                    if attach_count == 1:
+                        log(f"[{label}] Brief pasted ✓ (1 attachment tile, Claude auto-convert)")
+                        return True
+                    if attach_count > 1:
+                        log(f"[{label}] Claude shows {attach_count} attachments (duplicate) — retry will clear", "WARN")
+                        continue
+                except Exception:
+                    pass
             if ratio >= 0.90:
                 log(f"[{label}] Brief pasted ✓ ({content_len}/{expected} chars, {ratio:.0%})")
                 return True
@@ -750,8 +1648,12 @@ async def scrape_progress_gemini(page):
             const r = {
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], steps: [],
-                partial_text_len: 0, plan: ''
+                partial_text_len: 0, plan: '', title: '', model: ''
             };
+            // Conversation title (Gemini sets it once the chat has a topic)
+            const gtitle = document.querySelector('[data-conversation-title], .conversation-title, bard-sidenav-mini-content [aria-current="true"]');
+            if (gtitle) r.title = gtitle.innerText.substring(0, 100);
+            else if (document.title) r.title = document.title.replace(/ - Gemini$/, '').substring(0, 100);
             // Research steps (Gemini shows a progress panel during Deep Research)
             const steps = document.querySelectorAll('.research-step, .step-content, [data-research-step], .activity-item');
             r.steps = Array.from(steps).map(s => s.innerText.substring(0, 150));
@@ -790,8 +1692,12 @@ async def scrape_progress_claude(page):
             const r = {
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], tool_uses: [],
-                partial_text_len: 0, model: ''
+                partial_text_len: 0, model: '', title: ''
             };
+            // Conversation title (Claude shows it in sidebar / window title)
+            const ctitle = document.querySelector('[data-conversation-title], .conversation-title, header h1, h1.truncate, [data-testid="conversation-title"]');
+            if (ctitle) r.title = ctitle.innerText.substring(0, 100);
+            else if (document.title) r.title = document.title.replace(/ - Claude$/, '').replace(/^Claude$/, '').substring(0, 100);
             // Model info
             const modelEl = document.querySelector('.model-selector, [data-testid="model-name"]');
             if (modelEl) r.model = modelEl.innerText.substring(0, 50);
@@ -841,26 +1747,53 @@ SCRAPE_FNS = {
 FIRECRAWL_API_KEY = get_env("FIRECRAWL_API_KEY")
 
 
-def firecrawl_scrape(url, formats=None):
+def firecrawl_scrape(url, formats=None, max_retries=2):
     """Scrape a page via Firecrawler API — returns markdown content.
-    Use for rich progress tracking when DOM selectors fail."""
+    Use for rich progress tracking when DOM selectors fail.
+    One failed request loses 5 min of enrichment, so retry with backoff on 429/5xx."""
     if not FIRECRAWL_API_KEY:
         return ""
-    try:
-        import requests
-        payload = {"url": url, "formats": formats or ["markdown"]}
-        resp = requests.post(
-            "https://api.firecrawl.dev/v1/scrape",
-            json=payload,
-            headers={"Authorization": f"Bearer {FIRECRAWL_API_KEY}"},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            data = resp.json().get("data", {})
-            return data.get("markdown", "") or data.get("content", "")
-        log(f"Firecrawl {resp.status_code}: {resp.text[:200]}", "WARN")
-    except Exception as e:
-        log(f"Firecrawl error: {e}", "WARN")
+    import requests
+    payload = {"url": url, "formats": formats or ["markdown"]}
+    headers = {"Authorization": f"Bearer {FIRECRAWL_API_KEY}"}
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                "https://api.firecrawl.dev/v1/scrape",
+                json=payload, headers=headers, timeout=30,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                return data.get("markdown", "") or data.get("content", "")
+            # Retry on rate-limit / transient server errors
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                # Honor Retry-After header if present
+                wait_s = 5 * (attempt + 1)
+                try:
+                    ra = resp.headers.get("Retry-After")
+                    if ra and ra.isdigit():
+                        wait_s = max(wait_s, int(ra))
+                except Exception:
+                    pass
+                log(f"Firecrawl {resp.status_code}, retry in {wait_s}s (attempt {attempt + 1}/{max_retries})", "WARN")
+                time.sleep(wait_s)
+                continue
+            # Non-retryable error
+            log(f"Firecrawl {resp.status_code}: {resp.text[:200]}", "WARN")
+            return ""
+        except requests.Timeout as e:
+            last_err = e
+            if attempt < max_retries:
+                log(f"Firecrawl timeout, retry (attempt {attempt + 1}/{max_retries})", "WARN")
+                time.sleep(5 * (attempt + 1))
+                continue
+        except Exception as e:
+            last_err = e
+            log(f"Firecrawl error: {e}", "WARN")
+            return ""
+    if last_err:
+        log(f"Firecrawl exhausted retries: {last_err}", "WARN")
     return ""
 
 
@@ -1188,12 +2121,28 @@ async def verify_chatgpt_generating(page) -> bool:
         }""")
         await asyncio.sleep(0.3)
         return await page.evaluate("""() => {
-            // Check standard stop buttons
+            // Check standard composer stop buttons
             const stop = document.querySelector('button[aria-label="Stop generating"]')
                 || document.querySelector('button[data-testid="stop-button"]')
                 || document.querySelector('button[aria-label="Stop streaming"]')
                 || document.querySelector('button[aria-label="Stop"]');
             if (stop) return true;
+            // ChatGPT Deep Research: stop button lives INSIDE the research card/dialog
+            // (not in the composer). Look for buttons inside research/canvas containers.
+            const cards = document.querySelectorAll(
+                '[data-testid*="research"], [data-testid*="canvas"], [class*="research"], ' +
+                '[aria-label*="Deep research"], [aria-label*="deep research"]'
+            );
+            for (const c of cards) {
+                const cBtns = c.querySelectorAll('button');
+                for (const b of cBtns) {
+                    const lbl = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    if (lbl.includes('stop') || lbl.includes('cancel') || t === 'stop') return true;
+                }
+                // Progress/loading indicator inside the card
+                if (c.querySelector('[role="progressbar"], [class*="progress"], [class*="spinner"]')) return true;
+            }
             // Check by button content (square icon = stop)
             const btns = document.querySelectorAll('button');
             for (const b of btns) {
@@ -1276,7 +2225,7 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
     for i in range(max_retries):
         if await verify_fn(page):
             log(f"[{label}] ✓ Verified — actively generating")
-            agent_key = {"Phase1": "brief", "ChatGPT": "chatgpt", "Gemini": "gemini", "Claude": "claude"}.get(label, label.lower().replace(" ", ""))
+            agent_key = normalize_agent_key(label)
             emit_event("agent_verified", phase=phase, agent=agent_key,
                 verified=True, method="dom",
                 message=f"{label} confirmed actively generating",
@@ -1291,10 +2240,20 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
 
         # Phase 2: CUA diagnosis (once, at retry 6)
         if i == 5 and browser and cua_client:
-            log(f"[{label}] DOM checks failed 5x — asking CUA to diagnose...")
+            log(f"[{label}] DOM checks failed 5x — scrolling to bottom, asking CUA to diagnose...")
             await browser.switch_to_page(page)
+            try:
+                await page.evaluate("""() => {
+                    window.scrollTo(0, document.body.scrollHeight);
+                    document.querySelectorAll('[class*="react-scroll"], [class*="chat-messages"], main, [role="presentation"]')
+                        .forEach(c => { try { c.scrollTop = c.scrollHeight; } catch(e){} });
+                }""")
+                await asyncio.sleep(0.4)
+            except Exception:
+                pass
             diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
-                "Check: Is there a Stop button? Is there a loading animation? Is the AI actively generating?",
+                "Look at the BOTTOM of the chat. Is there a Stop button visible? "
+                "Is there a loading animation or spinner? Is the AI actively generating?",
                 model=CUA_MODEL, max_iterations=3, verbose=verbose)
             diag_text = (diag.get("text") or "").lower()
             log(f"[{label}] CUA diagnosis: {diag.get('text', '')[:200]}")
@@ -1358,7 +2317,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
 
         # ── Heartbeat every 60s so frontend knows we're alive ──
         if time.time() - last_heartbeat >= 60:
-            emit_event("heartbeat", phase=phase, agent=label.lower().replace(" ", ""))
+            emit_event("heartbeat", phase=phase, agent=normalize_agent_key(label))
             last_heartbeat = time.time()
 
         # Scrape progress FIRST — every cycle, regardless of state
@@ -1385,7 +2344,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     if is_et:
                         progress["status"] = "extended_thinking"
                         progress["progress"] = f"Extended Thinking active ({elapsed_sec // 60}min elapsed, typical {expected_min}min)"
-                    agent_key = {"Phase1": "brief", "ChatGPT": "chatgpt", "Gemini": "gemini", "Claude": "claude"}.get(label, label.lower().replace(" ", ""))
+                    agent_key = normalize_agent_key(label)
                     emit_event("agent_progress", phase=phase, agent=agent_key,
                         status=progress.get("status", ""),
                         progress=progress.get("progress", ""),
@@ -1418,17 +2377,29 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
 
             # After 3 consecutive "not generating" — warn user + ask CUA to verify
             if not cua_checked and browser and cua_client:
-                agent_key = {"Phase1": "brief", "ChatGPT": "chatgpt", "Gemini": "gemini", "Claude": "claude"}.get(label, label.lower().replace(" ", ""))
+                agent_key = normalize_agent_key(label)
                 emit_event("agent_warning", phase=phase, agent=agent_key,
                     severity="stuck",
                     message=f"DOM indicates not generating after {int(time.time() - wait_start)}s — CUA checking visually",
                     elapsedSec=int(time.time() - wait_start),
                     suggestion="CUA will verify the actual page state",
                     actions=["skip", "stop"])
-                log(f"[{label}] DOM says not generating — asking CUA to confirm...")
+                log(f"[{label}] DOM says not generating — scrolling to bottom + asking CUA to confirm...")
                 await browser.switch_to_page(page)
+                try:
+                    await page.evaluate("""() => {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        document.querySelectorAll('[class*="react-scroll"], [class*="chat-messages"], main, [role="presentation"]')
+                            .forEach(c => { try { c.scrollTop = c.scrollHeight; } catch(e){} });
+                    }""")
+                    await asyncio.sleep(0.4)
+                except Exception:
+                    pass
                 diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
-                    "Check the screen. Is there a Stop button visible? Is there a loading animation? Answer with 'response complete' or 'still generating'.",
+                    "Look at the BOTTOM of the chat (composer / end of response). "
+                    "Is there a Stop button visible? Is there a loading animation or 'Researching...' indicator? "
+                    "If a Stop button is visible anywhere, say 'still generating'. "
+                    "Only say 'response complete' if there is NO stop button AND the final paragraph of the response is visible.",
                     model=CUA_MODEL, max_iterations=3, verbose=verbose)
                 diag_text = (diag.get("text") or "").lower()
                 cua_checked = True
@@ -1523,11 +2494,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "done_count": 0,
             "cua_confirmed": False,
             "last_firecrawl": time.time() - 150,  # Stagger: first Firecrawl at 2.5 min
+            "last_heartbeat": time.time(),       # Avoid heartbeat burst on first cycle
+            "last_cua_check": time.time(),       # Ditto — CUA check gate
         }
+        # Register for mid-run input dispatcher
+        platform_key = name.lower().replace(" ", "")
+        _runtime.register_page(platform_key, agent["page"], agent["url"])
 
     if not pending:
         return results
 
+    _runtime.phase = 2
+    _runtime.sub_state = "2_parallel_polling"
     log(f"\n--- Round-robin polling {len(pending)} agents (max {max_wait_min}min each) ---")
 
     while pending:
@@ -1554,24 +2532,78 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                          "url": p.get("url", ""), "page": p["page"]}
                         log(f"  [{name}] extraction failed: {e}", "WARN")
             else:
-                # On PAUSE: mark pending agents as paused, wait for resume
+                # On PAUSE: snapshot current agent URLs, close browser, block, then relaunch+reopen
                 for name in list(pending.keys()):
                     p = pending[name]
+                    plat = name.lower().replace(" ", "")
+                    url = ""
+                    try:
+                        url = p["page"].url
+                    except Exception:
+                        url = p.get("url", "")
+                    _runtime.agent_chat_urls[plat] = url
+                    _runtime.agent_statuses[plat] = "generating"
                     results[name] = {"status": "paused", "text": "",
-                                     "url": p.get("url", ""), "page": p["page"],
+                                     "url": url, "page": None,  # Page dies on close
                                      "elapsed_sec": int(time.time() - p["start_time"])}
-                emit_event("pipeline_paused", phase=2)
-                await _controls.wait_if_paused()
-                if _controls.is_stop():
+                _runtime.phase = 2
+                _runtime.sub_state = "2_parallel_polling"
+                stopped = await pause_and_close_browser(browser, _tracks_dir if _tracks_dir else None, phase=2)
+                if stopped:
                     return results
-                # Resumed — restore pending agents and continue polling
+                # Relaunch browser + reopen agent tabs
+                await browser.start()
+                restored = await resume_browser_from_checkpoint(browser, _tracks_dir if _tracks_dir else None)
+                # Reconstruct pending from restored pages
+                for name in list(results.keys()):
+                    if results[name]["status"] != "paused":
+                        continue
+                    plat = name.lower().replace(" ", "")
+                    if plat in restored:
+                        results[name]["page"] = restored[plat]
+                        results[name]["url"] = restored[plat].url
+                # Resumed — re-read config and only restore agents that are still enabled
+                updated_cfg = _controls.pop_config_updates()
+                # Also check disk config
+                _cfg_path = Path(__file__).parent / "queues"
+                if _tracks_dir:
+                    _cfg_disk = _cfg_path / _tracks_dir.name / "config.json"
+                    if _cfg_disk.exists():
+                        try:
+                            _disk_cfg = json.loads(_cfg_disk.read_text(encoding="utf-8"))
+                            updated_cfg = {**_disk_cfg, **updated_cfg}  # in-memory overrides disk
+                        except Exception:
+                            pass
+                _resume_agents = updated_cfg.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
+                _agent_name_map = {"ChatGPT": "chatgpt", "Gemini": "gemini", "Claude": "claude"}
                 for name in list(results.keys()):
                     if results[name]["status"] == "paused":
-                        pending[name] = {"page": results[name]["page"], "url": results[name]["url"],
-                                         "start_time": time.time() - results[name]["elapsed_sec"],
-                                         "done_count": 0, "cua_confirmed": False,
-                                         "last_firecrawl": time.time() - 150}
-                        del results[name]
+                        agent_key = _agent_name_map.get(name, name.lower())
+                        if _resume_agents.get(agent_key, True):
+                            # Agent still enabled — restore to polling
+                            pending[name] = {"page": results[name]["page"], "url": results[name]["url"],
+                                             "start_time": time.time() - results[name]["elapsed_sec"],
+                                             "done_count": 0, "cua_confirmed": False,
+                                             "last_firecrawl": time.time() - 150,
+                                             "last_heartbeat": time.time(),
+                                             "last_cua_check": time.time()}
+                            del results[name]
+                            log(f"  [{name}] Restored to polling")
+                        else:
+                            # Agent disabled during pause — extract what we have and skip
+                            log(f"  [{name}] Disabled during pause — extracting partial results")
+                            try:
+                                await browser.switch_to_page(results[name]["page"])
+                                text = await extract_fns[name](results[name]["page"], browser=browser,
+                                    cua_client=cua_client, label=name, verbose=verbose)
+                                results[name] = {"status": "disabled_during_pause", "text": text or "",
+                                                 "url": results[name]["url"], "page": results[name]["page"],
+                                                 "elapsed_sec": results[name]["elapsed_sec"]}
+                            except Exception:
+                                results[name] = {"status": "disabled_during_pause", "text": "",
+                                                 "url": results[name]["url"], "page": results[name]["page"],
+                                                 "elapsed_sec": results[name]["elapsed_sec"]}
+                            emit_event("agent_skipped", phase=2, agent=agent_key)
                 emit_event("pipeline_resumed", phase=2)
                 continue
             return results
@@ -1608,16 +2640,78 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             "full_text": fc_md,
                         })
                         p["last_firecrawl"] = time.time()
+                        # Remember Firecrawl's content_len so the next agent_progress
+                        # can report it (more accurate than DOM scraping, which only
+                        # sees on-screen partial text).
+                        p["firecrawl_len"] = len(fc_md)
                 except Exception:
                     pass
             # DOM scrape as supplement (free, best-effort)
             scrape_fn = SCRAPE_FNS.get(name)
+            progress = {}
+            scrape_ok = False
             if scrape_fn:
                 try:
-                    progress = await scrape_fn(p["page"])
+                    progress = await scrape_fn(p["page"]) or {}
+                    scrape_ok = True
                     save_track(name, progress)
-                except Exception:
-                    pass
+                except Exception as _scrape_err:
+                    # Don't mask scrape failures — tell frontend the scrape degraded
+                    log(f"[{name}] DOM scrape failed: {_scrape_err}", "WARN")
+
+            # Emit agent_progress to frontend (critical for real-time UI)
+            agent_key = normalize_agent_key(name)
+            # If scrape failed we don't know the agent's real status — keep
+            # elapsed-time progress text but omit stale/fake fields
+            _status_val = progress.get("status") if scrape_ok else "generating"
+            _progress_val = progress.get("progress") if scrape_ok else None
+            if not _progress_val:
+                _progress_val = f"Researching... ({int(time.time() - p['start_time']) // 60}m elapsed)"
+            elapsed_sec = int(time.time() - p["start_time"])
+
+            # Prefer Firecrawl's content length over DOM partial text — the DOM scrape
+            # only sees what's rendered on-screen, while Firecrawl's markdown fetches the
+            # full page. Use whichever is larger so the frontend progress bar climbs
+            # monotonically.
+            _fc_len = p.get("firecrawl_len", 0)
+            _partial_text_len = max(progress.get("partial_text_len", 0) or 0, _fc_len)
+
+            # Dedup: only emit when something meaningful changed (status / sources /
+            # partialTextLen / sections-count). Otherwise we spam Firestore ~180 writes
+            # per agent per run with identical payloads. Heartbeat still covers liveness.
+            progress_key = json.dumps({
+                "status": _status_val or "",
+                "sources": progress.get("sources", 0),
+                "partialTextLen": _partial_text_len,
+                "sections_len": len(progress.get("sections", []) or []),
+                "steps_len": len(progress.get("steps", []) or []),
+                # Coarse elapsed bucket so slow-moving scrapes still re-emit occasionally
+                "elapsed_bucket": elapsed_sec // 30,
+            }, sort_keys=True)
+            if _last_progress.get(agent_key) != progress_key:
+                _last_progress[agent_key] = progress_key
+                emit_event("agent_progress", phase=2, agent=agent_key,
+                    status=_status_val or "generating",
+                    progress=_progress_val,
+                    sources=progress.get("sources", 0),
+                    sourceUrls=progress.get("source_urls", [])[:10],
+                    sections=progress.get("sections", []),
+                    partialTextLen=_partial_text_len,
+                    firecrawlLen=_fc_len,
+                    model=progress.get("model", ""),
+                    thinking=progress.get("thinking", ""),
+                    steps=progress.get("steps", []),
+                    plan=progress.get("plan", ""),
+                    toolUses=progress.get("tool_uses", []),
+                    title=progress.get("title", ""),
+                    elapsedSec=elapsed_sec,
+                    expectedMinutes=max_wait_min,
+                    scrapeOk=scrape_ok)
+
+            # Heartbeat every 60s per agent
+            if time.time() - p.get("last_heartbeat", 0) >= 60:
+                emit_event("heartbeat", phase=2, agent=agent_key)
+                p["last_heartbeat"] = time.time()
 
             # Check completion — CUA-primary (DOM selectors unreliable across all 3 platforms)
             # CUA checks every 3 min per agent (cost-effective, actually works)
@@ -1630,19 +2724,95 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if elapsed < min_wait:
                 continue
 
-            # CUA visual check — screenshot + ask
+            # CUA visual check — SCROLL TO BOTTOM first (stop button + loading indicator live near composer/end)
             await browser.switch_to_page(p["page"])
-            log(f"[{name}] CUA checking completion ({int(elapsed/60)}m)...")
+            try:
+                await p["page"].evaluate("""() => {
+                    window.scrollTo(0, document.body.scrollHeight);
+                    // Also scroll common chat containers (ChatGPT DR has internal scroll)
+                    const containers = document.querySelectorAll(
+                        '[class*="react-scroll"], [class*="chat-messages"], main, [role="presentation"], [data-testid*="conversation"]');
+                    containers.forEach(c => { try { c.scrollTop = c.scrollHeight; } catch(e){} });
+                }""")
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+            log(f"[{name}] CUA checking completion ({int(elapsed/60)}m) — scrolled to bottom")
+            # Platform-specific instruction for where to look for the stop signal
+            platform_hint = {
+                "ChatGPT": ("ChatGPT Deep Research renders the research output inside a RESEARCH CARD / DIALOG "
+                            "(embedded in the chat, looks like a document panel). The stop button and progress "
+                            "indicator live ON THAT CARD, not in the composer. Scroll down to find the card and "
+                            "check if it still shows 'Researching...', a progress bar, or a stop button on the card."),
+                "Gemini": ("Gemini Deep Research shows a stop button in the composer/input area and a progress "
+                            "indicator in the message. Check the composer + the latest message area."),
+                "Claude": ("Claude shows a stop button in the composer/input area while generating. After completion, "
+                            "two document artifact buttons/cards may appear. Check composer for stop button; absence "
+                            "means done."),
+            }.get(name, "")
             diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
-                "Look at the screen. Is the AI still generating (stop button, loading animation, spinner)? "
-                "Or is the response complete (finished document, no loading)? "
-                "Answer 'still generating' or 'response complete'.",
+                f"{platform_hint}\n\n"
+                "Is the AI still generating (stop button visible, loading animation, spinner, 'Researching...' indicator)? "
+                "Or is the response FULLY complete (no stop button anywhere, no loading, the final paragraph visible)? "
+                "Answer 'still generating' or 'response complete'. "
+                "If you see a Stop button ANYWHERE on the page (composer OR research card), answer 'still generating'.",
                 model=CUA_MODEL, max_iterations=3, verbose=verbose)
-            diag_text = (diag.get("text") or "").lower()
+            diag_text_raw = (diag.get("text") or "")
+            diag_text = diag_text_raw.lower()
             p["last_cua_check"] = time.time()
 
-            is_done = "response complete" in diag_text or "complete" in diag_text
-            is_generating = "still generating" in diag_text or "generating" in diag_text
+            # ── Parse CUA diagnosis ──────────────────────────────────────
+            # Old logic used bare substring matches — vulnerable to false
+            # positives (e.g. "is NOT complete" contained "complete" →
+            # is_done=True while agent was still running, causing premature
+            # 0-char extractions at 23m). New logic:
+            #   1. Prefer the structured "CONCLUSION: <verdict>" line that
+            #      PROMPT_DIAGNOSE now mandates.
+            #   2. If missing, use negation-aware heuristics.
+            #   3. Stop-button-visible always vetos (per prompt decision rule).
+            #   4. Default to still-generating on ambiguity (one extra CUA
+            #      check is far cheaper than a zero-char extraction).
+            verdict_match = re.search(
+                r'conclusion\s*:\s*(generating|done|needs_click|error)',
+                diag_text,
+            )
+
+            if verdict_match:
+                verdict = verdict_match.group(1)
+                is_done = verdict == "done"
+                is_generating = verdict == "generating"
+            else:
+                still_running_phrases = (
+                    "still in progress", "still running", "still researching",
+                    "still being generated", "still working", "still generating",
+                    "not complete", "not yet complete", "hasn't completed",
+                    "has not completed", "not finished", "not yet done",
+                    "not done yet", "isn't done", "is not done", "incomplete",
+                )
+                done_phrases = (
+                    "response complete", "fully complete", "is complete",
+                    "has completed", "appears complete", "finished generating",
+                    "done generating", "no stop button", "no progress indicator",
+                )
+                stop_button_visible = bool(
+                    re.search(r'stop button[^.]*\byes\b', diag_text) or
+                    re.search(r'\bstop button\b[^.]{0,60}\b(visible|present|displayed|showing)\b', diag_text)
+                )
+                has_still_running = any(ph in diag_text for ph in still_running_phrases)
+                has_done = any(ph in diag_text for ph in done_phrases)
+
+                if stop_button_visible or has_still_running:
+                    is_generating = True
+                    is_done = False
+                elif has_done:
+                    is_done = True
+                    is_generating = False
+                else:
+                    # Ambiguous — safer default
+                    is_generating = True
+                    is_done = False
+                log(f"[{name}] CUA diag missing CONCLUSION line — heuristic verdict: "
+                    f"{'generating' if is_generating else 'done' if is_done else 'unknown'}", "WARN")
 
             if is_generating and not is_done:
                 log(f"[{name}] CUA: still generating ({int(elapsed/60)}m)")
@@ -1667,11 +2837,77 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] Extraction failed: {e}", "ERROR")
                     text = ""
 
+                # ── Revert on empty extraction ────────────────────────────
+                # If CUA confirmed "complete" but extraction yields
+                # little/nothing, the CUA verdict was likely premature — the
+                # agent is actually still researching. Instead of marking the
+                # agent empty and skipping it (the old behavior — gave up at
+                # 23m on ChatGPT while the research was still at 397
+                # searches), revert to polling so the agent gets a proper
+                # chance to finish within its time budget.
+                #
+                # Bounds:
+                #   • Only revert if we're still well within max_wait_min
+                #     (don't keep looping forever).
+                #   • Cap retries (empty_retries < 3) so we eventually give
+                #     up if extraction truly can't recover the content.
+                if (not text or len(text) < 100) and elapsed < (max_wait_min * 60 * 0.95):
+                    p.setdefault("empty_retries", 0)
+                    p["empty_retries"] += 1
+                    if p["empty_retries"] < 3:
+                        log(f"[{name}] Extraction came back empty at {int(elapsed/60)}m "
+                            f"but budget still available — CUA likely misread completion. "
+                            f"Reverting to polling (empty retry {p['empty_retries']}/3).", "WARN")
+                        p["done_count"] = 0
+                        p["cua_confirmed"] = False
+                        p["last_cua_check"] = time.time() + 60  # back off 1m before next CUA check
+                        emit_event("agent_progress", phase=2,
+                                   agent=name.lower().replace(" ", ""),
+                                   status="still_researching",
+                                   progress=f"Still working — CUA thought it was done but extraction came back empty. Retrying.",
+                                   elapsedSec=int(elapsed),
+                                   expectedMinutes=max_wait_min)
+                        continue
+                    log(f"[{name}] 3 empty extractions — giving up at {int(elapsed/60)}m", "ERROR")
+
                 status = "done" if text and len(text) > 100 else "empty"
+                agent_url = p["page"].url
+
+                # Extract shareable link NOW (before moving to next agent)
+                try:
+                    await browser.switch_to_page(p["page"])
+                    extractor_map = {"chatgpt": extract_share_link_chatgpt,
+                                     "gemini": extract_share_link_gemini,
+                                     "claude": extract_share_link_claude}
+                    agent_key_lc = name.lower().replace(" ", "")
+                    if agent_key_lc in extractor_map:
+                        link_result = await extractor_map[agent_key_lc](browser, cua_client=cua_client, verbose=verbose)
+                        if link_result.success:
+                            agent_url = link_result.url
+                            emit_event("link_extracted", phase=2, agent=agent_key_lc,
+                                       url=agent_url, label=f"{name} Research",
+                                       verified=link_result.verified)
+                            log(f"[{name}] Shareable link: {agent_url}")
+                        else:
+                            log(f"[{name}] Share link extraction failed, using page URL", "WARN")
+                except Exception as e:
+                    log(f"[{name}] Share link extraction error: {e}", "WARN")
+
                 results[name] = {"status": status, "text": text or "",
-                                 "url": p["page"].url, "page": p["page"],
+                                 "url": agent_url, "page": p["page"],
                                  "elapsed_sec": int(elapsed)}
+                # Unregister from dispatcher — this agent is done
+                _runtime.unregister_page(name.lower().replace(" ", ""),
+                                          final_status="done" if status == "done" else status)
+                _runtime.agent_chat_urls[name.lower().replace(" ", "")] = agent_url
                 log(f"[{name}] {status.upper()} — {len(text or '')} chars ({int(elapsed)}s)")
+                # Emit completion event for this agent
+                agent_key = name.lower().replace(" ", "")
+                emit_event("agent_progress", phase=2, agent=agent_key,
+                    status="complete" if status == "done" else status,
+                    progress=f"Content extracted: {len(text or '')} chars ({int(elapsed)}s)",
+                    partialTextLen=len(text or ''), elapsedSec=int(elapsed),
+                    links=[{"label": f"{name} Research", "url": agent_url}] if agent_url else [])
                 del pending[name]
             else:
                 p["done_count"] = 0
@@ -2106,10 +3342,50 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         log("Phase 1: Could not verify ChatGPT is generating", "ERROR")
         return None
 
+    # Register brief page with dispatcher for mid-run user input
+    _runtime.phase = 1
+    _runtime.sub_state = "1_brief_generating"
+    _runtime.register_page("chatgpt", browser.page, browser.page.url)
+
     # Wait for response
     log(f"Polling for response (every {POLL_PRO}s, max {MAX_WAIT_PRO}min)...")
     completed = await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1", POLL_PRO, MAX_WAIT_PRO,
         browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
+    # Unregister once brief is done
+    _runtime.unregister_page("chatgpt", final_status="done" if completed else "timeout")
+
+    # ── Mid-Phase-1 injection: if user sent context while brief was generating,
+    #    submit it as a follow-up to ChatGPT and wait for the updated brief ──
+    # Only pop the buffer if we're going to use it — otherwise leave it for
+    # Phase 2 / NotebookLM to consume (pop is destructive, so peek first).
+    extra_ctx = None
+    if completed and _controls.peek_extra_context():
+        extra_ctx = _controls.pop_extra_context()
+    if extra_ctx and completed:
+        log(f"Phase 1: Injecting user context as follow-up ({len(extra_ctx)} chars)")
+        emit_event("agent_progress", phase=1, agent="chatgpt",
+                   status="refining", progress=f"Incorporating user input: {extra_ctx[:80]}...")
+        followup = (
+            f"Please update and improve the research brief above to also incorporate "
+            f"the following additional context from the user:\n\n{extra_ctx}\n\n"
+            f"Output the complete updated research brief. No preamble."
+        )
+        submitted_fu = await submit_chatgpt_direct(browser, followup)
+        if not submitted_fu and cua_client:
+            await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
+                f"Submit this follow-up prompt to ChatGPT:\n\n{followup[:500]}",
+                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+        # Wait for the updated response
+        await asyncio.sleep(5)
+        verified_fu = await wait_until_verified(verify_chatgpt_generating, browser.page, "Phase1-followup",
+            browser=browser, cua_client=cua_client, max_retries=10, interval=3, verbose=verbose)
+        if verified_fu:
+            log("Phase 1: Waiting for updated brief...")
+            await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1-followup",
+                POLL_PRO, 15,  # 15 min max for follow-up (shorter than initial)
+                browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
+        else:
+            log("Phase 1: Follow-up may not have triggered generation — using original brief", "WARN")
 
     # Extract
     brief_text = await extract_chatgpt_response(browser.page)
@@ -2125,74 +3401,505 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
 
 # ── Phase 2: Parallel Deep Research (Sequential Start + Verify) ──────────────
 
+# ── Playwright-direct platform setup (replaces vision-based CUA setup) ────────
+
+async def setup_chatgpt_dr(page) -> bool:
+    """Enable ChatGPT Deep Research mode via direct selectors. Returns True on success."""
+    try:
+        await asyncio.sleep(2)
+        # Click the "+" / tools menu in composer
+        for sel in ['button[aria-label*="Use a tool"]',
+                    'button[aria-label*="Attach"]',
+                    'button[data-testid="composer-plus-btn"]',
+                    'button[aria-label*="More"]']:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    await asyncio.sleep(0.8)
+                    break
+            except Exception:
+                continue
+        # Click "Deep research" option in menu
+        clicked = await page.evaluate("""() => {
+            const items = document.querySelectorAll('[role="menuitem"], button, div[role="option"]');
+            for (const el of items) {
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t === 'deep research' || t.startsWith('deep research')) {
+                    el.click(); return true;
+                }
+            }
+            return false;
+        }""")
+        if not clicked:
+            return False
+        await asyncio.sleep(1.5)
+        # Verify Deep Research pill/label present in composer area
+        active = await page.evaluate("""() => {
+            const text = document.body.innerText.toLowerCase();
+            return text.includes('deep research');
+        }""")
+        return bool(active)
+    except Exception as e:
+        log(f"[setup_chatgpt_dr] {e}", "WARN")
+        return False
+
+
+async def setup_gemini_dr(page) -> bool:
+    """Enable Gemini Deep Research pill via direct selectors. Returns True on success."""
+    try:
+        await asyncio.sleep(2)
+        # Look for the "Deep research" button/pill — various UI layouts
+        clicked = await page.evaluate("""() => {
+            // Direct button with aria or text "Deep research"
+            const candidates = document.querySelectorAll('button, [role="button"], [role="menuitem"]');
+            for (const b of candidates) {
+                const t = (b.textContent || '').trim().toLowerCase();
+                const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (t === 'deep research' || a === 'deep research' || t.startsWith('deep research')) {
+                    // Check it's not already active (pill with active class)
+                    b.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if not clicked:
+            # Try the model/mode dropdown first
+            for sel in ['button[aria-label*="model"]', 'button[data-test-id*="model"]']:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        await asyncio.sleep(0.8)
+                        clicked = await page.evaluate("""() => {
+                            const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
+                            for (const el of items) {
+                                const t = (el.textContent || '').trim().toLowerCase();
+                                if (t.includes('deep research')) { el.click(); return true; }
+                            }
+                            return false;
+                        }""")
+                        break
+                except Exception:
+                    continue
+        if not clicked:
+            return False
+        await asyncio.sleep(1.5)
+        # Verify pill is visible
+        active = await page.evaluate("""() => {
+            const pills = document.querySelectorAll('button, [role="button"], span');
+            for (const p of pills) {
+                const t = (p.textContent || '').trim().toLowerCase();
+                if (t === 'deep research' && p.offsetParent !== null) return true;
+            }
+            return false;
+        }""")
+        return bool(active)
+    except Exception as e:
+        log(f"[setup_gemini_dr] {e}", "WARN")
+        return False
+
+
+async def setup_claude_dr(page) -> bool:
+    """Enable Claude Extended Thinking + Research tool via direct selectors.
+    Claude.ai: model dropdown shows 'Opus 4.6 Extended' variant; Research is in tools menu."""
+    try:
+        await asyncio.sleep(2)
+        # Step 1: Model selector — pick "Opus 4.6 Extended" (or Sonnet 4.6 Extended if Opus unavailable)
+        model_picked = await page.evaluate("""() => {
+            const btns = document.querySelectorAll('button');
+            let dropdown = null;
+            for (const b of btns) {
+                const t = (b.textContent || '').toLowerCase();
+                if ((t.includes('opus') || t.includes('sonnet') || t.includes('claude')) && b.offsetParent !== null) {
+                    dropdown = b; break;
+                }
+            }
+            if (dropdown) { dropdown.click(); return true; }
+            return false;
+        }""")
+        if model_picked:
+            await asyncio.sleep(1.0)
+            # Pick Extended variant from dropdown
+            await page.evaluate("""() => {
+                const items = document.querySelectorAll('[role="menuitem"], [role="option"], button, a');
+                for (const el of items) {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    if ((t.includes('opus') && t.includes('extended')) ||
+                        (t.includes('4.6') && t.includes('extended')) ||
+                        t === 'extended thinking') {
+                        el.click(); return true;
+                    }
+                }
+                return false;
+            }""")
+            await asyncio.sleep(0.8)
+
+        # Step 2: Open tools menu ("+" button) — enable "Research" tool
+        tools_opened = False
+        for sel in ['button[aria-label*="tools"]', 'button[aria-label*="attach"]',
+                    'button[aria-label="Open tools menu"]', 'button[aria-label*="+"]']:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    await asyncio.sleep(0.8)
+                    tools_opened = True
+                    break
+            except Exception:
+                continue
+        if tools_opened:
+            await page.evaluate("""() => {
+                const items = document.querySelectorAll('[role="menuitem"], button, [role="switch"], [role="checkbox"]');
+                for (const el of items) {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                    if (t === 'research' || a === 'research' || t.includes('research tool')) {
+                        el.click(); return true;
+                    }
+                }
+                return false;
+            }""")
+            await asyncio.sleep(0.8)
+            # Close menu by clicking body or pressing Escape
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+        # Focus input
+        for sel in ['div[contenteditable="true"]', '[aria-label*="message"]', '.ProseMirror']:
+            try:
+                inp = await page.query_selector(sel)
+                if inp:
+                    await inp.click()
+                    break
+            except Exception:
+                continue
+        return True
+    except Exception as e:
+        log(f"[setup_claude_dr] {e}", "WARN")
+        return False
+
+
+async def validate_setup_with_cua(browser, cua_client, page, platform, label, verbose=False):
+    """Extra validation layer: CUA looks at the screen and confirms the intended
+    options (Deep Research / Extended / Research tool) are actually active. If not,
+    CUA tries to fix. Returns True if 'verified' or 'fixed', False otherwise."""
+    validator_map = {
+        "chatgpt": PROMPT_VALIDATE_CHATGPT_SETUP,
+        "gemini": PROMPT_VALIDATE_GEMINI_SETUP,
+        "claude": PROMPT_VALIDATE_CLAUDE_SETUP,
+    }
+    user_msg_map = {
+        "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
+        "gemini": "Verify the Deep Research pill is ACTIVE in Gemini composer. Fix if not. Do not type.",
+        "claude": "Verify Opus 4.6 Extended + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
+    }
+    sys_prompt = validator_map.get(platform.lower())
+    user_prompt = user_msg_map.get(platform.lower())
+    if not sys_prompt:
+        return True  # Unknown platform — skip
+    try:
+        await browser.switch_to_page(page)
+        result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
+            model=CUA_MODEL, max_iterations=6, verbose=verbose)
+        text = (result.get("text") or "").lower()
+        if "verified" in text or "fixed" in text:
+            log(f"[{label}] CUA validation: {text[:120]}")
+            return True
+        if "failed" in text:
+            log(f"[{label}] CUA validation FAILED: {text[:160]}", "WARN")
+            return False
+        # Ambiguous — treat as pass but log
+        log(f"[{label}] CUA validation ambiguous: {text[:120]}", "WARN")
+        return True
+    except Exception as e:
+        log(f"[{label}] CUA validation error: {e}", "WARN")
+        return True  # Don't block pipeline on validator error
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase-2 brief delivery via file attachment (Option A)
+# ─────────────────────────────────────────────────────────────────────
+# The research brief is ~30 KB. Inline pastes get silently converted
+# to attachments by both ChatGPT and Claude, and the resulting state
+# is inconsistent (duplicate attachments, empty textareas). We now
+# attach the brief as brief.md directly and type a short inline prompt
+# that references it. This matches how the platforms actually want to
+# receive long input and dodges all the paste-verification issues.
+# ═════════════════════════════════════════════════════════════════════
+
+async def attach_brief_file(browser, page, brief_path, platform, label):
+    """Attach brief.md to the composer via the hidden file input.
+    Returns True if exactly one attachment was confirmed visible."""
+    try:
+        # Clear any residual attachments from a previous attempt
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll(
+                    'button[aria-label*="Remove"], button[aria-label*="Delete"], ' +
+                    'button[data-testid*="remove-attachment"], button[data-testid*="delete-attachment"]'
+                ).forEach(b => { try { b.click(); } catch(e){} });
+            }""")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
+        # PRIMARY — hidden file input (most reliable across all platforms)
+        file_input = await page.query_selector('input[type="file"]')
+        if file_input:
+            await file_input.set_input_files(str(brief_path))
+            await asyncio.sleep(3)  # Wait for UI to acknowledge
+            log(f"[{label}] Brief attached via hidden file input")
+            return True
+
+        # FALLBACK — queue file for OS-level chooser then click attach
+        browser.set_upload_file(str(brief_path))
+        for sel in ['button[aria-label*="Attach"]', 'button[aria-label*="Upload"]',
+                    'button[data-testid*="upload"]', 'button[data-testid*="file"]']:
+            try:
+                btn = await page.query_selector(sel)
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    await asyncio.sleep(3)
+                    browser.clear_upload_file()
+                    log(f"[{label}] Brief attached via button click")
+                    return True
+            except Exception:
+                continue
+        browser.clear_upload_file()
+        log(f"[{label}] Could not find file input or attach button", "WARN")
+        return False
+    except Exception as e:
+        try: browser.clear_upload_file()
+        except Exception: pass
+        log(f"[{label}] Brief attach failed: {e}", "WARN")
+        return False
+
+
+async def type_short_inline_prompt(page, platform, label):
+    """Type a short inline prompt instructing the agent to research the
+    attached brief. Keeps the platform's 'Deep Research' mode as the
+    operative instruction; the full brief content lives in the file."""
+    # One message, short enough that no platform converts it to an attachment.
+    prompt = (
+        "Please perform deep research on the topic described in the attached brief. "
+        "Use the brief as the complete context — objectives, scope, sections, sources to target. "
+        "Produce a comprehensive research report with citations. "
+        "Stay in Deep Research mode for this entire response."
+    )
+    try:
+        # Find the composer input (contenteditable or textarea) and type
+        for sel in ['div[contenteditable="true"]', 'textarea', '.ProseMirror',
+                    '[role="textbox"]', '[aria-label*="message"]']:
+            try:
+                inp = await page.query_selector(sel)
+                if inp:
+                    await inp.click()
+                    await asyncio.sleep(0.3)
+                    await page.keyboard.type(prompt, delay=5)
+                    await asyncio.sleep(0.5)
+                    log(f"[{label}] Inline prompt typed ({len(prompt)} chars)")
+                    return True
+            except Exception:
+                continue
+        log(f"[{label}] Could not find composer input for inline prompt", "WARN")
+        return False
+    except Exception as e:
+        log(f"[{label}] Inline prompt type failed: {e}", "WARN")
+        return False
+
+
+async def ensure_deep_mode_active(page, platform, label):
+    """Just-before-send check: is the platform still in its required mode?
+    Re-activates if it has been toggled off. Returns the final state."""
+    platform_l = platform.lower()
+    try:
+        if platform_l == "chatgpt":
+            # Verify "Deep research" pill/badge is still on
+            active = await page.evaluate("""() => {
+                const txt = (document.body.innerText || '').toLowerCase();
+                // Look for the Deep Research pill shown near composer
+                const pills = document.querySelectorAll('[aria-pressed="true"], [data-state="on"], .pill, [role="button"]');
+                for (const p of pills) {
+                    const t = (p.textContent || '').trim().toLowerCase();
+                    if (t === 'deep research' || t.startsWith('deep research')) return true;
+                }
+                // Heuristic: composer area mentions Deep research
+                return txt.includes('deep research');
+            }""")
+            if not active:
+                log(f"[{label}] Deep Research OFF before send — re-activating", "WARN")
+                await setup_chatgpt_dr(page)
+            return True
+        if platform_l == "gemini":
+            active = await page.evaluate("""() => {
+                const pills = document.querySelectorAll('button, [role="button"], span');
+                for (const p of pills) {
+                    const t = (p.textContent || '').trim().toLowerCase();
+                    if (t === 'deep research' && p.offsetParent !== null) return true;
+                }
+                return false;
+            }""")
+            if not active:
+                log(f"[{label}] Gemini Deep Research chip OFF before send — re-activating", "WARN")
+                await setup_gemini_dr(page)
+            return True
+        if platform_l == "claude":
+            # Check BOTH: Opus Extended model AND Research tool are on
+            state = await page.evaluate("""() => {
+                const txt = (document.body.innerText || '').toLowerCase();
+                const hasExtended = txt.includes('opus') && txt.includes('extended');
+                // Research tool shows as a magnifying-glass icon / label near composer
+                const researchOn = Array.from(document.querySelectorAll('button, [role="button"]'))
+                    .some(b => {
+                        const t = (b.textContent || '').toLowerCase();
+                        const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                        return (t.includes('research') || a.includes('research')) &&
+                               (b.getAttribute('aria-pressed') === 'true' ||
+                                b.getAttribute('data-state') === 'on' ||
+                                b.classList.contains('active') ||
+                                b.classList.contains('selected'));
+                    });
+                return { hasExtended, researchOn };
+            }""")
+            if not state.get("hasExtended") or not state.get("researchOn"):
+                log(f"[{label}] Claude mode regressed before send "
+                    f"(extended={state.get('hasExtended')}, research={state.get('researchOn')}) — re-activating", "WARN")
+                await setup_claude_dr(page)
+            return True
+    except Exception as e:
+        log(f"[{label}] ensure_deep_mode_active error: {e}", "WARN")
+    return True
+
+
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
-                                     brief, label, platform, verbose=False):
-    """Start agent: open tab → CUA setup → paste brief → submit. Returns page (no verify yet)."""
+                                     brief, label, platform, verbose=False,
+                                     brief_path=None):
+    """Start agent: open tab → Playwright-direct setup → CUA validation → paste brief → submit.
+
+    Two-layer setup for reliability:
+    1. Playwright clicks known selectors (fast, deterministic when UI is stable)
+    2. CUA visually validates the intended state and fixes discrepancies
+    """
     log(f"[{label}] Opening {url}...")
     page = await browser.new_tab(url)
     await asyncio.sleep(4)
 
-    # CUA sets up mode
-    log(f"[{label}] CUA: Setting up {platform} mode...")
-    result = await agent_loop(cua_client, browser, prompt_system, prompt_user,
-        model=CUA_MODEL, max_iterations=20, verbose=verbose)
+    # LAYER 1: Playwright-direct setup first
+    platform_l = platform.lower()
+    setup_ok = False
+    if platform_l == "chatgpt":
+        setup_ok = await setup_chatgpt_dr(page)
+    elif platform_l == "gemini":
+        setup_ok = await setup_gemini_dr(page)
+    elif platform_l == "claude":
+        setup_ok = await setup_claude_dr(page)
 
-    # ALWAYS paste full brief via verified_paste_brief — never trust CUA's "already sent" heuristic.
-    # The CUA setup step above ONLY sets the mode (Deep Research, Extended Thinking, etc.)
-    # and MUST NOT type or submit any text — the system prompt should explicitly forbid this.
-    log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
-    paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
-    if not paste_ok:
-        log(f"[{label}] Brief paste failed — attempting CUA fallback", "WARN")
-        # CUA fallback: ask it to paste the brief from clipboard
-        await page.evaluate("text => navigator.clipboard.writeText(text)", brief)
-        await agent_loop(cua_client, browser,
-            f"Paste the text from clipboard into the {platform} input and submit it.",
-            "Press Ctrl+V to paste the research brief from clipboard, then click Send.",
-            model=CUA_MODEL, max_iterations=5, verbose=verbose)
+    if setup_ok:
+        log(f"[{label}] Playwright-direct setup OK")
+    else:
+        # Playwright failed — try original CUA setup as a first fallback (tight iterations)
+        log(f"[{label}] Playwright setup failed — CUA fallback setup (tight)...")
+        result = await agent_loop(cua_client, browser, prompt_system, prompt_user,
+            model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
-        # Click Send — try Playwright selectors first, then CUA fallback
-        await asyncio.sleep(2)
-        sent = False
-        for sel in ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]',
-                    'button[aria-label="Send"]', 'button[aria-label="Send message"]',
-                    'button[aria-label="Send Message"]', 'button[aria-label="Submit"]']:
+    # LAYER 2: CUA visual validation — confirms options are ACTUALLY active
+    log(f"[{label}] CUA validating setup state...")
+    cua_ok = await validate_setup_with_cua(browser, cua_client, page, platform, label, verbose)
+    if not cua_ok:
+        log(f"[{label}] CUA validation failed — proceeding anyway but agent may misbehave", "WARN")
+        emit_event("pipeline_warning", phase=2, agent=platform_l,
+                   message=f"{platform} setup validation failed — agent may not be fully configured")
+
+    # ── Brief delivery: prefer file-attachment path (Option A) ──
+    # The 30KB brief is too large for inline paste — both ChatGPT and Claude
+    # auto-convert to attachments and the paste verification then fails.
+    # Attaching the file directly + a short inline prompt is the reliable flow.
+    if brief_path and Path(brief_path).exists():
+        log(f"[{label}] Attaching brief file: {Path(brief_path).name}")
+        attached = await attach_brief_file(browser, page, brief_path, platform, label)
+        if attached:
+            typed = await type_short_inline_prompt(page, platform, label)
+            if not typed:
+                log(f"[{label}] Inline prompt type failed — trying CUA fallback", "WARN")
+                await browser.switch_to_page(page)
+                await agent_loop(cua_client, browser,
+                    "Type a short research prompt referring to the attached brief — then stop (do NOT send).",
+                    "Click the message input, type: 'Please perform deep research on the topic described in the attached brief. Use Deep Research mode and produce a comprehensive report with citations.' Then STOP — do not click Send.",
+                    model=CUA_MODEL, max_iterations=6, verbose=verbose)
+        else:
+            log(f"[{label}] Brief attachment failed — falling back to inline paste", "WARN")
+            paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
+            if not paste_ok:
+                log(f"[{label}] CRITICAL: Both attach and paste failed — skipping this agent", "ERROR")
+                emit_event("pipeline_error", phase=2, agent=platform, error="Brief delivery failed (attach + paste)")
+                return page
+    else:
+        # Legacy path (Phase 1 follow-ups, no brief file yet)
+        log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
+        paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
+        if not paste_ok:
+            log(f"[{label}] All paste strategies failed — retrying with page reload", "WARN")
             try:
-                btn = await page.query_selector(sel)
-                if btn and await btn.is_enabled():
-                    await btn.click()
-                    log(f"[{label}] Send clicked ✓")
-                    sent = True
-                    break
-            except Exception:
-                continue
-        if not sent:
-            # Try broader JS: find any enabled send-like button
-            try:
-                sent = await page.evaluate("""() => {
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        const a = (b.getAttribute('aria-label') || '').toLowerCase();
-                        const t = b.textContent.trim().toLowerCase();
-                        if ((a.includes('send') || t === 'send' || t === 'submit' || a.includes('submit'))
-                            && !b.disabled) {
-                            b.click(); return true;
-                        }
+                await page.reload(wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(3)
+                paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=2)
+            except Exception as e:
+                log(f"[{label}] Reload+retry failed: {e}", "WARN")
+        if not paste_ok:
+            log(f"[{label}] CRITICAL: Brief paste completely failed — skipping this agent", "ERROR")
+            emit_event("pipeline_error", phase=2, agent=platform, error="Brief paste failed — could not inject research text")
+            return page
+
+    # ── Just-before-send: ensure the required mode is STILL active ──
+    # Claude especially can silently drop Research tool / Extended model
+    # between setup and send. Re-activate if needed.
+    await ensure_deep_mode_active(page, platform, label)
+
+    # Brief ready — now click Send
+    await asyncio.sleep(1)
+    sent = False
+    for sel in ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]',
+                'button[aria-label="Send"]', 'button[aria-label="Send message"]',
+                'button[aria-label="Send Message"]', 'button[aria-label="Submit"]']:
+        try:
+            btn = await page.query_selector(sel)
+            if btn and await btn.is_enabled():
+                await btn.click()
+                log(f"[{label}] Send clicked ✓")
+                sent = True
+                break
+        except Exception:
+            continue
+    if not sent:
+        try:
+            sent = await page.evaluate("""() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const t = b.textContent.trim().toLowerCase();
+                    if ((a.includes('send') || t === 'send' || t === 'submit' || a.includes('submit'))
+                        && !b.disabled) {
+                        b.click(); return true;
                     }
-                    return false;
-                }""")
-                if sent:
-                    log(f"[{label}] Send clicked via JS ✓")
-            except Exception:
-                pass
-        if not sent:
-            # CUA fallback: visually find and click Send
-            log(f"[{label}] Playwright can't find Send — CUA clicking...")
-            await browser.switch_to_page(page)
-            await agent_loop(cua_client, browser, PROMPT_CLICK_SEND,
-                "Click the Send button to submit the message.",
-                model=CUA_MODEL, max_iterations=5, verbose=verbose)
-            log(f"[{label}] CUA send attempted")
+                }
+                return false;
+            }""")
+            if sent:
+                log(f"[{label}] Send clicked via JS ✓")
+        except Exception:
+            pass
+    if not sent:
+        log(f"[{label}] Playwright can't find Send — CUA clicking...")
+        await browser.switch_to_page(page)
+        await agent_loop(cua_client, browser, PROMPT_CLICK_SEND,
+            "Click the Send button to submit the message.",
+            model=CUA_MODEL, max_iterations=5, verbose=verbose)
+        log(f"[{label}] CUA send attempted")
 
     await asyncio.sleep(3)
     return page
@@ -2208,11 +3915,28 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     log("  Sequence: ChatGPT → Gemini (submit+plan) → Claude → Gemini (click Start) → Poll all")
     log("=" * 60)
 
+    # Ensure brief.md is on disk for file-attachment delivery (Option A).
+    brief_path = None
+    if _tracks_dir:
+        brief_path = Path(__file__).parent / "queues" / _tracks_dir.name / "documents" / "brief.md"
+        try:
+            brief_path.parent.mkdir(parents=True, exist_ok=True)
+            if not brief_path.exists() or brief_path.stat().st_size < 100:
+                brief_path.write_text(
+                    f"# Research Brief\n\n{brief_text}", encoding="utf-8")
+                log(f"Wrote brief to disk for attachment: {brief_path.name} ({len(brief_text)} chars)")
+            else:
+                log(f"Using existing brief.md ({brief_path.stat().st_size} bytes)")
+        except Exception as e:
+            log(f"Could not prepare brief.md for attachment: {e}", "WARN")
+            brief_path = None
+
     agents = {}
 
     # ── Step 1: ChatGPT (we're already in ChatGPT from Phase 1 — just open Deep Research) ──
     if enabled_agents is None or "chatgpt" in enabled_agents:
         log("\n--- 2A: ChatGPT Deep Research (already in ChatGPT) ---")
+        emit_event("agent_progress", phase=2, agent="chatgpt", status="starting", progress="Opening ChatGPT Deep Research mode...")
         for attempt in range(2):
             if attempt > 0:
                 log("[2A] Retrying ChatGPT (fresh tab)...", "WARN")
@@ -2222,13 +3946,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 browser, cua_client, "https://chatgpt.com",
                 PROMPT_CHATGPT_DEEP_RESEARCH,
                 "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-                brief_text, "2A", "ChatGPT", verbose)
+                brief_text, "2A", "ChatGPT", verbose, brief_path=brief_path)
             verified_a = await wait_until_verified(verify_chatgpt_generating, chatgpt_page, "2A",
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
             if verified_a:
                 break
         agents["ChatGPT"] = {"page": chatgpt_page, "verified": verified_a, "url": chatgpt_page.url}
         if verified_a:
+            emit_event("agent_progress", phase=2, agent="chatgpt", status="generating", progress="ChatGPT Deep Research started and verified")
             log("[2A] ChatGPT Deep Research is running ✓")
         else:
             log("[2A] ChatGPT failed after 2 attempts", "ERROR")
@@ -2240,11 +3965,12 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     gemini_page = None
     if enabled_agents is None or "gemini" in enabled_agents:
         log("\n--- 2B: Gemini Deep Research (submit + let it plan) ---")
+        emit_event("agent_progress", phase=2, agent="gemini", status="starting", progress="Opening Gemini and submitting research brief...")
         gemini_page = await start_agent_no_gemini_wait(
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
             "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2B", "Gemini", verbose)
+            brief_text, "2B", "Gemini", verbose, brief_path=brief_path)
         log("[2B] Gemini brief submitted — letting it generate research plan")
     else:
         log("\n--- 2B: Gemini SKIPPED (disabled in config) ---")
@@ -2252,6 +3978,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     # ── Step 3: Claude (starts instantly after submission) ──
     if enabled_agents is None or "claude" in enabled_agents:
         log("\n--- 2C: Claude Deep Research ---")
+        emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Extended Thinking + Research tools...")
         for attempt in range(2):
             if attempt > 0:
                 log("[2C] Retrying Claude (fresh tab)...", "WARN")
@@ -2261,13 +3988,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 browser, cua_client, "https://claude.ai/new",
                 PROMPT_CLAUDE_DEEP_RESEARCH,
                 "Select Opus 4.6 + Extended Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-                brief_text, "2C", "Claude", verbose)
+                brief_text, "2C", "Claude", verbose, brief_path=brief_path)
             verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2C",
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
             if verified_c:
                 break
         agents["Claude"] = {"page": claude_page, "verified": verified_c, "url": claude_page.url}
         if verified_c:
+            emit_event("agent_progress", phase=2, agent="claude", status="generating", progress="Claude Extended Thinking started and verified")
             log("[2C] Claude is running ✓")
         else:
             log("[2C] Claude failed after 2 attempts", "ERROR")
@@ -2323,6 +4051,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
         agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url}
         if verified_b:
+            emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini Deep Research plan created and started")
             log("[2B] Gemini is researching ✓")
         else:
             log("[2B] Gemini may not be running", "WARN")
@@ -2365,19 +4094,41 @@ async def run_phase3(browser, cua_client, results, topic, queue_dir, verbose=Fal
         "Claude": PROMPT_PUBLISH_CLAUDE,
     }
 
+    # Markers for URLs that are already published/shared (extracted in Phase 2 round-robin)
+    _share_url_markers = {
+        "ChatGPT": ["chatgpt.com/share/", "/share/"],
+        "Gemini": ["gemini.google.com/share/", "/share/"],
+        "Claude": ["claude.site/artifacts/", "claude.site/", "/share/"],
+    }
+
     for name, r in results.items():
-        if r["status"] not in ("done", "timeout") or not r.get("text"):
-            # Still save the chat URL even for failed agents (user can check what happened)
+        # Include timeout agents with .md on disk (Phase 2 partial results count)
+        md_name = name.lower().replace(" ", "") + ".md"
+        md_path = Path(queue_dir) / "documents" / md_name
+        has_md = md_path.exists() and md_path.stat().st_size > 100
+        if r["status"] not in ("done", "timeout") and not has_md:
             if r.get("url"):
                 links[name] = r["url"]
                 log(f"[{name}] Failed — saving chat URL: {r['url'][:60]}")
             else:
-                log(f"[{name}] Skipping — no content, no URL")
+                log(f"[{name}] Skipping — no content, no URL, no .md on disk")
+            continue
+        if not r.get("text") and not has_md:
+            if r.get("url"):
+                links[name] = r["url"]
             continue
 
         page = r.get("page")
         if not page:
             links[name] = r.get("url", "")
+            continue
+
+        # Skip re-extraction if Phase 2 already captured a verified share link
+        existing_url = r.get("url", "")
+        markers = _share_url_markers.get(name, [])
+        if existing_url and any(m in existing_url for m in markers):
+            links[name] = existing_url
+            log(f"[{name}] Using Phase-2 share link: {existing_url[:80]}")
             continue
 
         # Get shareable link via CUA
@@ -2500,7 +4251,15 @@ async def run_phase4(browser, cua_client, notebook_url, queue_dir, verbose=False
 
     # Minimum 5 minute wait — audio generation takes at least 5-10 minutes
     log("Waiting 5 minutes before first audio check (generation takes ~10-20 min)...")
-    await asyncio.sleep(5 * 60)
+    interrupt = await _controls.interruptible_sleep(5 * 60, check_interval=10)
+    if interrupt == "stop":
+        log("[Phase4] STOP during initial wait — aborting", "WARN")
+        return {"audio_path": None}
+    if interrupt == "pause":
+        emit_event("pipeline_paused", phase=4)
+        await _controls.wait_if_paused()
+        if _controls.is_stop():
+            return {"audio_path": None}
 
     # Poll for completion — refresh + CUA check every 3 min, 45 min total timeout
     log("Polling for audio completion (every 3 min with refresh, max 45 min total)...")
@@ -2509,6 +4268,16 @@ async def run_phase4(browser, cua_client, notebook_url, queue_dir, verbose=False
     max_poll = 40 * 60  # 40 more min (45 total including initial 5 min wait)
 
     while (time.time() - poll_start) < max_poll:
+        # ── Stop/Pause check per cycle ──
+        if _controls.is_stop():
+            log("[Phase4] STOP requested — aborting audio poll")
+            break
+        if _controls.is_pause():
+            emit_event("pipeline_paused", phase=4)
+            await _controls.wait_if_paused()
+            if _controls.is_stop():
+                break
+
         # Refresh page every cycle (NotebookLM doesn't always auto-update)
         try:
             await browser.page.reload(wait_until="domcontentloaded", timeout=15000)
@@ -2531,7 +4300,15 @@ async def run_phase4(browser, cua_client, notebook_url, queue_dir, verbose=False
         elapsed_min = 5 + int((time.time() - poll_start) / 60)
         log(f"[Phase4] Audio still generating... ({elapsed_min}m total)")
         save_track("Phase4", {"status": "generating", "elapsed_min": elapsed_min})
-        await asyncio.sleep(175)  # ~3 min between checks
+        interrupt = await _controls.interruptible_sleep(175, check_interval=10)
+        if interrupt == "stop":
+            log("[Phase4] STOP during poll wait — aborting")
+            break
+        if interrupt == "pause":
+            emit_event("pipeline_paused", phase=4)
+            await _controls.wait_if_paused()
+            if _controls.is_stop():
+                break
 
     # Download audio
     audio_path = None
@@ -2586,6 +4363,29 @@ async def run_phase4(browser, cua_client, notebook_url, queue_dir, verbose=False
             browser.page.remove_listener("download", _on_download)
         except Exception:
             pass
+
+    # ── Sync to Firebase Storage + Firestore audios subcollection ──
+    # Upload the audio file so the Vercel Podcasts page can stream it
+    # without needing the local backend to be reachable. Duration via
+    # ffprobe for nice display (M:SS). Best-effort — pipeline continues
+    # even if sync fails.
+    if audio_path and audio_path.exists():
+        try:
+            dur_sec = 0
+            try:
+                _probe = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries",
+                     "format=duration", "-of", "csv=p=0", str(audio_path)],
+                    capture_output=True, text=True, timeout=5)
+                dur_sec = int(float(_probe.stdout.strip()))
+            except Exception:
+                pass
+            audio_url = upload_audio_to_storage(audio_path)
+            # Use the filename stem as doc id so re-runs upsert in place
+            # instead of stacking duplicates.
+            save_audio_to_firestore(audio_path.stem, audio_path.name, dur_sec, audio_url)
+        except Exception as e:
+            log(f"Audio Firestore/Storage sync failed: {e}", "WARN")
 
     return {"audio_path": audio_path}
 
@@ -3007,6 +4807,21 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     })
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
+    # ── Propagate structured agents/phases to Firestore research doc ──
+    # Without this, the frontend Analytics page never sees per-agent stats or
+    # phase timelines for live runs — they live only on disk. Uses a shallow
+    # update so we don't clobber other fields (like pipelineConfig).
+    try:
+        _update_firestore_research({
+            "agents": agents,
+            "phases": phases,
+            "status": status,
+            "phase": phase,
+            "updatedAt": now_ms,
+        })
+    except Exception as _e:
+        log(f"save_meta: firestore propagation failed: {_e}", "WARN")
+
 
 def detect_resume_phase(queue_dir):
     """Detect which phase to resume from based on existing output files.
@@ -3051,7 +4866,7 @@ def detect_resume_phase(queue_dir):
 
 async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        api_key=None, email=None, resume_dir=None, config=None,
-                       run_id=None, uid=None):
+                       run_id=None, uid=None, research_id=None):
     """Run the full pipeline. Supports resume from a previous queue directory."""
     pdf_paths = pdf_paths or []
     api_key = resolve_api_key(api_key)
@@ -3064,9 +4879,25 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
     # ── Initialize pipeline controls + Firestore bridge ──
     _controls.reset()
+    _runtime.reset()
+    # Clear dedup cache — stale keys from a prior run in the same process
+    # would otherwise suppress early events in this run.
+    _last_progress.clear()
     brief_artifact = None  # Set after Phase 1 completes
+    # Validate email early (email is the user's Google account email from frontend)
+    if email:
+        ok, reason = validate_email(email)
+        if not ok:
+            log(f"[email] Invalid email received: {reason} — Phase 5 email will be skipped", "WARN")
+            email = None
     if uid:
-        setup_firestore_run(uid, run_id, asyncio.get_running_loop())
+        # Use frontend research_id for Firestore paths (not run_id which is the backend dir name)
+        setup_firestore_run(uid, research_id or run_id, asyncio.get_running_loop())
+    # Start mid-run input dispatcher (watches _controls.extra_context, pastes to active pages)
+    try:
+        _runtime.dispatcher_task = asyncio.create_task(run_input_dispatcher())
+    except Exception as e:
+        log(f"[dispatcher] Failed to start: {e}", "WARN")
 
     # ── Determine queue directory + start phase ──
     if resume_dir:
@@ -3108,6 +4939,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         if config_path.exists():
             try:
                 pipeline_config = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        # Merge any in-memory config updates from Firestore commands
+        # (in case Firestore config arrived but HTTP PATCH didn't)
+        ctrl_updates = _controls.pop_config_updates()
+        if ctrl_updates:
+            pipeline_config.update(ctrl_updates)
+            # Persist merged config back to disk for next reload
+            try:
+                config_path.write_text(json.dumps(pipeline_config, indent=2), encoding="utf-8")
             except Exception:
                 pass
         sp = set(pipeline_config.get("skipPhases", []))
@@ -3180,10 +5021,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     browser = Browser(PROFILE_DIR, headless=False)
     try:
         # ══════════════════════ PHASE 0: Init ══════════════════════
-        emit_event("phase_start", phase=0)
+        emit_event("phase_start", phase=0, description="Initializing pipeline")
         _p0_start = time.time()
+        emit_event("agent_progress", phase=0, agent="system", status="Preparing", progress="Loading configuration and API keys...")
+        emit_event("agent_progress", phase=0, agent="system", status="Launching", progress="Starting Chromium browser with automation profile...")
         await browser.start()
-        emit_event("phase_complete", phase=0, durationSec=int(time.time() - _p0_start))
+        emit_event("agent_progress", phase=0, agent="system", status="Verifying", progress="Browser launched — verifying connectivity to AI platforms...")
+        emit_event("agent_progress", phase=0, agent="system", status="Ready", progress="All services verified — pipeline ready to begin")
+        emit_event("phase_complete", phase=0, durationSec=int(time.time() - _p0_start), summary="Browser launched, all services verified")
 
         # ══════════════════════ PHASE 1: Brief ══════════════════════
         p1 = None
@@ -3191,7 +5036,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log("Phase 1: SKIPPED by config")
             emit_event("phase_skipped", phase=1, reason="Disabled in pipeline config")
         elif start_phase <= 1:
-            emit_event("phase_start", phase=1)
+            emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
             _p1_start = time.time()
             if brief_file:
                 brief_text = Path(brief_file).read_text(encoding="utf-8")
@@ -3208,8 +5053,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 brief_text = p1["text"]
                 brief_url = p1.get("url", "")
             # Save brief in documents/
-            (queue_dir / "documents" / "brief.md").write_text(
-                f"# Research Brief\n\n{brief_text}", encoding="utf-8")
+            _brief_md = f"# Research Brief\n\n{brief_text}"
+            (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
+            # Sync to Firestore documents subcollection for Vercel Documents page
+            save_document_to_firestore("brief", _brief_md, "Research Brief")
             # Create BriefArtifact for reliable Phase 2 paste
             brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
             log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
@@ -3220,10 +5067,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if _p1_links:
                 brief_url = _p1_links[0]["url"]
                 brief_artifact.url = brief_url
+                # Real-time link emission for frontend PhaseDropdown
+                emit_event("link_extracted", phase=1, agent="chatgpt",
+                           url=brief_url, label="ChatGPT Brief", verified=True)
             save_checkpoint(queue_dir, 1, topic=topic, brief_url=brief_url)
             update_delivery(brief_url=brief_url)
             save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
-            emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start), links=_p1_links)
+            emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start), links=_p1_links,
+                summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
             _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
         else:
             # Load brief from documents/ (new location) or root (old location)
@@ -3242,19 +5093,41 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 emit_event("pipeline_stopped", phase=1, reason="stop")
                 _update_firestore_research({"status": "stopped", "phase": 1})
             else:
-                log("PAUSE requested after Phase 1 — checkpoint saved, awaiting resume", "WARN")
+                log("PAUSE requested after Phase 1 — closing browser, awaiting resume", "WARN")
                 save_meta(queue_dir, topic, 1, status="paused")
                 update_delivery(status="paused")
-                emit_event("pipeline_paused", phase=1)
                 _update_firestore_research({"status": "paused", "phase": 1})
-                await _controls.wait_if_paused()
-                if _controls.is_stop():
+                _runtime.original_inputs = {"topic": topic, "pdf_paths": [str(p) for p in (pdf_paths or [])]}
+                stopped = await pause_and_close_browser(browser, queue_dir, phase=1,
+                                                        extra_kwargs={"topic": topic, "brief_url": brief_url})
+                if stopped:
                     save_meta(queue_dir, topic, 1, status="stopped")
                     emit_event("pipeline_stopped", phase=1, reason="stop_after_pause")
+                    _update_firestore_research({"status": "stopped", "phase": 1})
                     return
+                # Relaunch browser on resume (no active agents to restore since Phase 1 is done)
+                browser = Browser(PROFILE_DIR, headless=False)
+                await browser.start()
                 emit_event("pipeline_resumed", phase=1)
                 _update_firestore_research({"status": "ongoing"})
-                # Continue to Phase 2 after resume
+                # Restart-phase logic: if user supplied input while paused, regenerate the brief
+                if _controls.peek_extra_context():
+                    resume_input = _controls.pop_extra_context()
+                    log(f"Phase 1: Resume-with-input — regenerating brief with {len(resume_input)} extra chars")
+                    emit_event("phase_restart", phase=1, reason="user_input_on_resume", chars=len(resume_input))
+                    combined_topic = topic + "\n\nADDITIONAL USER CONTEXT:\n" + resume_input
+                    p1_new = await run_phase1(browser, cua_client, combined_topic, pdf_paths, verbose, feedback="")
+                    if p1_new and p1_new.get("text"):
+                        brief_text = p1_new["text"]
+                        brief_url = p1_new.get("url", brief_url)
+                        _brief_md_regen = f"# Research Brief\n\n{brief_text}"
+                        (queue_dir / "documents" / "brief.md").write_text(_brief_md_regen, encoding="utf-8")
+                        save_document_to_firestore("brief", _brief_md_regen, "Research Brief")
+                        brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
+                        emit_event("phase_complete", phase=1,
+                                   summary=f"Brief regenerated with user input ({len(brief_text)} chars)",
+                                   links=[{"label": "ChatGPT Brief", "url": brief_url}] if brief_url else [])
+                # Phase-boundary input handling: any buffered extra_context goes into Phase 2's brief (handled below)
             if _controls.is_stop():
                 return
 
@@ -3271,7 +5144,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 return
             enabled_agents = [a for a, on in agents_cfg.items() if on]
             disabled_agents = [a for a, on in agents_cfg.items() if not on]
-            emit_event("phase_start", phase=2, agents=enabled_agents)
+            emit_event("phase_start", phase=2, agents=enabled_agents, description="Parallel deep research across AI platforms")
             _update_firestore_research({"phase": 2, "currentPhase": 2, "status": "ongoing"})
             for da in disabled_agents:
                 emit_event("agent_skipped", phase=2, agent=da)
@@ -3298,8 +5171,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             for name, r in results.items():
                 if r["text"]:
                     fname = name.lower().replace(" ", "") + ".md"
-                    (queue_dir / "documents" / fname).write_text(
-                        f"# {name} Deep Research\n\n{r['text']}", encoding="utf-8")
+                    _agent_md = f"# {name} Deep Research\n\n{r['text']}"
+                    (queue_dir / "documents" / fname).write_text(_agent_md, encoding="utf-8")
+                    # Sync to Firestore documents subcollection — doc_type is the
+                    # agent key (chatgpt / gemini / claude), consistent with the
+                    # frontend's Documents page expectation.
+                    save_document_to_firestore(name.lower().replace(" ", ""), _agent_md, f"{name} Deep Research")
             # Generate consolidated report
             consolidated_parts = [f"# Consolidated Research Report: {topic}\n"]
             for name in ["ChatGPT", "Gemini", "Claude"]:
@@ -3307,9 +5184,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if r.get("text"):
                     consolidated_parts.append(f"\n## {name} Research\n\n{r['text']}")
             if len(consolidated_parts) > 1:
-                (queue_dir / "documents" / "consolidated.md").write_text(
-                    "\n".join(consolidated_parts), encoding="utf-8")
-                log(f"Consolidated report: {len(''.join(consolidated_parts))} chars")
+                _consolidated_md = "\n".join(consolidated_parts)
+                (queue_dir / "documents" / "consolidated.md").write_text(_consolidated_md, encoding="utf-8")
+                save_document_to_firestore("consolidated", _consolidated_md, "Consolidated Report")
+                log(f"Consolidated report: {len(_consolidated_md)} chars")
             done_count = sum(1 for r in results.values() if r["status"] == "done")
             log(f"\nPHASE 2 COMPLETE: {done_count}/{len(results)} agents finished")
             for name, r in results.items():
@@ -3338,21 +5216,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             if not line.strip():
                                 continue
                             evt = json.loads(line)
-                            plat = evt.get("platform", "").lower().replace(" ", "")
+                            # Agent key is at top level on events, payload is under "data"
+                            plat = normalize_agent_key(evt.get("agent") or evt.get("data", {}).get("platform", ""))
+                            data = evt.get("data", {}) if isinstance(evt.get("data"), dict) else {}
                             if plat in agents:
-                                # Merge source URLs from scraping events
-                                urls = evt.get("source_urls", [])
+                                # Merge source URLs from scraping events (accept both sourceUrls and source_urls)
+                                urls = data.get("sourceUrls") or data.get("source_urls") or []
                                 if urls:
                                     existing = set(agents[plat].get("sourceUrls", []))
                                     existing.update(urls)
                                     agents[plat]["sourceUrls"] = list(existing)[:50]
                                     agents[plat]["sources"] = len(agents[plat]["sourceUrls"])
                                 # Merge source count if higher
-                                src_count = evt.get("sources", 0)
+                                src_count = data.get("sources", 0)
                                 if src_count > agents[plat].get("sources", 0):
                                     agents[plat]["sources"] = src_count
                                 # Merge sections
-                                secs = evt.get("sections", [])
+                                secs = data.get("sections", [])
                                 if secs and len(secs) > len(agents[plat].get("sections", [])):
                                     agents[plat]["sections"] = secs
                     except Exception:
@@ -3378,7 +5258,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if not _p2_links:
                 _p2_links = [{"label": f"{n} Research", "url": r.get("url", "")}
                              for n, r in results.items() if r.get("url")]
-            emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links)
+            done_count = sum(1 for r in results.values() if r["status"] == "done")
+            total_chars = sum(len(r.get("text", "")) for r in results.values())
+            emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
+                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars total")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
         else:
             log("Phase 2: Loading existing research files")
@@ -3397,13 +5280,48 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 update_delivery(status="stopped")
                 emit_event("pipeline_stopped", phase=2, reason="stop",
                            partial_agents=partial_agents)
+                _update_firestore_research({"status": "stopped", "phase": 2})
+                return
             else:
-                clear_pause()
-                log("PAUSE requested after Phase 2 — checkpoint saved, awaiting resume", "WARN")
+                log("PAUSE requested after Phase 2 — closing browser, awaiting resume", "WARN")
                 save_meta(queue_dir, topic, 2, status="paused")
                 update_delivery(status="paused")
-                emit_event("pipeline_paused", phase=2)
-            return
+                _update_firestore_research({"status": "paused", "phase": 2})
+                _runtime.original_inputs = {"topic": topic, "brief": brief_text}
+                stopped = await pause_and_close_browser(browser, queue_dir, phase=2,
+                                                        extra_kwargs={"topic": topic, "brief_url": brief_url})
+                if stopped:
+                    save_meta(queue_dir, topic, 2, status="stopped")
+                    emit_event("pipeline_stopped", phase=2, reason="stop_after_pause")
+                    _update_firestore_research({"status": "stopped", "phase": 2})
+                    return
+                # Relaunch — agents in Phase 2 are already complete at this boundary
+                browser = Browser(PROFILE_DIR, headless=False)
+                await browser.start()
+                emit_event("pipeline_resumed", phase=2)
+                _update_firestore_research({"status": "ongoing"})
+                # Restart-phase logic: if user supplied input while paused, re-run Phase 2 with combined input
+                if _controls.peek_extra_context():
+                    resume_input = _controls.pop_extra_context()
+                    log(f"Phase 2: Resume-with-input — rerunning 3 agents with {len(resume_input)} extra chars")
+                    emit_event("phase_restart", phase=2, reason="user_input_on_resume", chars=len(resume_input))
+                    combined_brief = (brief_artifact.text if brief_artifact else brief_text) + \
+                                      "\n\nADDITIONAL USER CONTEXT:\n" + resume_input
+                    enabled_agents_now = [a for a, on in agents_cfg.items() if on]
+                    results = await run_phase2(browser, cua_client, combined_brief, verbose,
+                                                enabled_agents=enabled_agents_now)
+                    # Rewrite documents
+                    for name, r in results.items():
+                        if r.get("text"):
+                            fname = name.lower().replace(" ", "") + ".md"
+                            _regen_md = f"# {name} Deep Research (regenerated)\n\n{r['text']}"
+                            (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
+                            save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
+                    _p2_link_results = await extract_phase_links(2, browser, cua_client,
+                        enabled_agents=agents_cfg, verbose=verbose)
+                    _p2_links = [r.to_dict() for r in _p2_link_results if r.success]
+                    emit_event("phase_complete", phase=2, links=_p2_links,
+                               summary=f"Phase 2 regenerated with user input")
 
         # ── Check we have research output to continue ──
         doc_dir = queue_dir / "documents"
@@ -3413,6 +5331,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log("No research output — skipping Phases 3-5", "WARN")
             return
 
+        # ── Consume any extra context added during/after Phase 2 ──
+        # Save it as an additional document so NotebookLM can use it as a source
+        _late_context = _controls.pop_extra_context()
+        if _late_context:
+            log(f"Consuming extra context for Phase 3+ ({len(_late_context)} chars)")
+            ctx_path = queue_dir / "documents" / "user_context.md"
+            ctx_path.write_text(f"# Additional User Context\n\n{_late_context}", encoding="utf-8")
+            emit_event("agent_progress", phase=2, agent="system",
+                       status="context_saved", progress=f"User context saved ({len(_late_context)} chars)")
+
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 3: NotebookLM Processing (upload + audio) ══════════════════════
         audio_path = None
@@ -3420,7 +5348,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log("Phase 3: SKIPPED by config")
             emit_event("phase_skipped", phase=3, reason="Disabled in pipeline config")
         elif start_phase <= 3:
-            emit_event("phase_start", phase=3)
+            emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
             _p3_start = time.time()
             if not results:
                 for md_file in md_files:
@@ -3432,6 +5360,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             p3 = await run_phase3(browser, cua_client, results, topic, queue_dir, verbose)
             links = p3.get("links", {})
             notebook_url = p3.get("notebook_url", "")
+            if notebook_url:
+                emit_event("link_extracted", phase=3, agent="notebooklm",
+                           url=notebook_url, label="NotebookLM Notebook", verified=True)
             (queue_dir / "links.json").write_text(json.dumps(links, indent=2), encoding="utf-8")
             save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
                             notebook_url=notebook_url)
@@ -3446,7 +5377,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 update_delivery(audio_url=notebook_url)
             save_meta(queue_dir, topic, 3)
             _p3_links = [{"label": "NotebookLM Notebook", "url": notebook_url}] if notebook_url else []
-            emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links)
+            emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
+                summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}")
         else:
             links_file = queue_dir / "links.json"
             if links_file.exists():
@@ -3456,20 +5388,39 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 audio_path = Path(audio_str)
             log(f"Phase 3: Loaded existing (links={len(links)}, audio={'yes' if audio_path else 'no'})")
 
-        if stop_or_pause_requested():
-            is_stop = stop_requested()
-            if is_stop:
+        if _controls.is_stop_or_pause():
+            if _controls.is_stop():
                 log("STOP requested after Phase 3 — pipeline terminated", "WARN")
                 save_meta(queue_dir, topic, 3, status="stopped")
                 update_delivery(status="stopped")
                 emit_event("pipeline_stopped", phase=3, reason="stop")
+                _update_firestore_research({"status": "stopped", "phase": 3})
+                return
             else:
-                clear_pause()
-                log("PAUSE requested after Phase 3 — checkpoint saved, awaiting resume", "WARN")
+                log("PAUSE requested after Phase 3 — closing browser, awaiting resume", "WARN")
                 save_meta(queue_dir, topic, 3, status="paused")
                 update_delivery(status="paused")
-                emit_event("pipeline_paused", phase=3)
-            return
+                _update_firestore_research({"status": "paused", "phase": 3})
+                stopped = await pause_and_close_browser(browser, queue_dir, phase=3,
+                                                        extra_kwargs={"topic": topic, "brief_url": brief_url,
+                                                                      "notebook_url": notebook_url})
+                if stopped:
+                    save_meta(queue_dir, topic, 3, status="stopped")
+                    emit_event("pipeline_stopped", phase=3, reason="stop_after_pause")
+                    _update_firestore_research({"status": "stopped", "phase": 3})
+                    return
+                browser = Browser(PROFILE_DIR, headless=False)
+                await browser.start()
+                emit_event("pipeline_resumed", phase=3)
+                _update_firestore_research({"status": "ongoing"})
+                # Restart-phase: if user supplied input while paused, save as addendum source
+                # (Phase 3 fresh notebook restart is heavy — use append-via-addendum pattern instead)
+                if _controls.peek_extra_context():
+                    resume_input = _controls.pop_extra_context()
+                    log(f"Phase 3: Resume-with-input — saved as addendum source ({len(resume_input)} chars)")
+                    emit_event("phase_restart", phase=3, reason="user_input_on_resume", chars=len(resume_input))
+                    ctx_path = queue_dir / "documents" / "user_context.md"
+                    ctx_path.write_text(f"# Additional User Context\n\n{resume_input}", encoding="utf-8")
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 4: YouTube Upload ══════════════════════
@@ -3478,36 +5429,57 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Phase 4: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=4, reason=_reason)
         elif start_phase <= 4:
-            emit_event("phase_start", phase=4)
+            emit_event("phase_start", phase=4, description="Converting audio to video + YouTube upload", agents=["youtube"])
             _p4_start = time.time()
             if audio_path:
                 p5 = await run_phase5(browser, cua_client, audio_path, topic, queue_dir,
                                        links=links, notebook_url=notebook_url, verbose=verbose)
                 youtube_url = p5.get("youtube_url", "")
+                if youtube_url:
+                    emit_event("link_extracted", phase=4, agent="youtube",
+                               url=youtube_url, label="YouTube Video", verified=True)
                 save_checkpoint(queue_dir, 4, topic=topic, brief_url=brief_url,
                                 notebook_url=notebook_url, youtube_url=youtube_url)
                 update_delivery(youtube_url=youtube_url)
                 save_meta(queue_dir, topic, 4)
                 _p4_links = [{"label": "YouTube Video", "url": youtube_url}] if youtube_url else []
-                emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links)
+                emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links,
+                    summary="Video uploaded to YouTube" if youtube_url else "YouTube upload skipped")
             else:
                 log("Skipping Phase 4 — no audio from Phase 3", "WARN")
                 emit_event("phase_skipped", phase=4, reason="No audio produced in Phase 3")
 
-        if stop_or_pause_requested():
-            is_stop = stop_requested()
-            if is_stop:
+        if _controls.is_stop_or_pause():
+            if _controls.is_stop():
                 log("STOP requested after Phase 4 — pipeline terminated", "WARN")
                 save_meta(queue_dir, topic, 4, status="stopped")
                 update_delivery(status="stopped")
                 emit_event("pipeline_stopped", phase=4, reason="stop")
+                _update_firestore_research({"status": "stopped", "phase": 4})
+                return
             else:
-                clear_pause()
-                log("PAUSE requested after Phase 4 — checkpoint saved, awaiting resume", "WARN")
+                log("PAUSE requested after Phase 4 — closing browser, awaiting resume", "WARN")
                 save_meta(queue_dir, topic, 4, status="paused")
                 update_delivery(status="paused")
-                emit_event("pipeline_paused", phase=4)
-            return
+                _update_firestore_research({"status": "paused", "phase": 4})
+                stopped = await pause_and_close_browser(browser, queue_dir, phase=4,
+                                                        extra_kwargs={"topic": topic, "brief_url": brief_url,
+                                                                      "notebook_url": notebook_url,
+                                                                      "youtube_url": youtube_url})
+                if stopped:
+                    save_meta(queue_dir, topic, 4, status="stopped")
+                    emit_event("pipeline_stopped", phase=4, reason="stop_after_pause")
+                    _update_firestore_research({"status": "stopped", "phase": 4})
+                    return
+                browser = Browser(PROFILE_DIR, headless=False)
+                await browser.start()
+                emit_event("pipeline_resumed", phase=4)
+                _update_firestore_research({"status": "ongoing"})
+                # Phase 4 is append-only: any user input goes into description appendix (saved to disk, consumed by Phase 5)
+                if _controls.peek_extra_context():
+                    resume_input = _controls.pop_extra_context()
+                    log(f"Phase 4: Resume-with-input — appending to video description ({len(resume_input)} chars)")
+                    (queue_dir / "yt_description_append.txt").write_text(resume_input, encoding="utf-8")
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 5: Report & Notification ══════════════════════
@@ -3516,13 +5488,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Phase 5: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=5, reason=_reason)
         else:
-            emit_event("phase_start", phase=5)
+            emit_event("phase_start", phase=5, description="Creating Google Doc hub + sending email notification", agents=["gdocs", "gmail"])
             _p5_start = time.time()
             audio_url = notebook_url
             p6 = await run_phase6(browser, cua_client, topic, links, notebook_url, youtube_url,
                                   brief_url=brief_url, audio_url=audio_url,
                                   email=email, verbose=verbose)
-
+            if p6.get("doc_url"):
+                emit_event("link_extracted", phase=5, agent="gdocs",
+                           url=p6["doc_url"], label="Google Doc Hub", verified=True)
             update_delivery(doc_url=p6.get("doc_url", ""), email_sent=p6.get("email_sent", False),
                             status="completed")
             save_checkpoint(queue_dir, 5, topic=topic, brief_url=brief_url, notebook_url=notebook_url,
@@ -3531,7 +5505,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _p5_links = [{"label": "Google Doc", "url": p6.get("doc_url", "")}]
             if p6.get("email_sent"):
                 _p5_links.append({"label": "Email Sent", "url": ""})
-            emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start), links=_p5_links)
+            emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start), links=_p5_links,
+                summary=f"Google Doc created{', email sent' if p6.get('email_sent') else ''}")
 
         emit_event("pipeline_complete", summary=f"Pipeline finished for: {topic[:100]}")
         log(f"\n{'='*60}")
@@ -3550,11 +5525,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         import traceback
         traceback.print_exc()
     finally:
-        # Only close browser on terminal stop or completion — keep alive on pause for resume
-        if pause_requested() and not stop_requested():
-            log("Browser kept alive for resume — paused at checkpoint")
-        else:
-            await browser.close()
+        # New pause semantics: browser is closed by pause_and_close_browser when pause fires.
+        # Here we just ensure cleanup on stop/complete/error — don't double-close if already closed.
+        try:
+            if _runtime.dispatcher_task and not _runtime.dispatcher_task.done():
+                _runtime.dispatcher_task.cancel()
+                try:
+                    await _runtime.dispatcher_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        except Exception:
+            pass
+        try:
+            if browser is not None and browser.context is not None:
+                await browser.close()
+        except Exception as e:
+            log(f"Browser final close error: {e}", "WARN")
+        _runtime.reset()
+        teardown_firestore_run()
 
     # Auto-retry from checkpoint if pipeline failed mid-way
     # Skip if: completed, stopped (terminal), or paused (intentional freeze)
@@ -3742,7 +5730,22 @@ async def run_server(port=8000):
         fb_path.write_text(json.dumps(fb, indent=2), encoding="utf-8")
         # Auto-pause pipeline so it picks up feedback on resume (not terminal stop)
         (queue / ".pause").write_text("pause", encoding="utf-8")
+        _controls.request_pause()
         return {"status": "feedback_saved", "phase": phase, "will_redo_from": phase}
+
+    @app.post("/api/runs/{run_id}/add_context")
+    async def add_context(run_id: str, request_data: dict):
+        """Add context to running pipeline WITHOUT pausing. Context is injected at next opportunity.
+        Body: {text: "Also look at biotech angle"}"""
+        queue = queues_root / run_id
+        if not queue.exists():
+            return JSONResponse({"error": "not found"}, 404)
+        text = request_data.get("text", "")
+        if not text:
+            return JSONResponse({"error": "text is required"}, 400)
+        _controls.add_context(text)
+        log(f"Context added ({len(text)} chars) — will be injected at next phase boundary")
+        return {"status": "context_added", "chars": len(text)}
 
     @app.post("/api/runs/{run_id}/resume")
     async def resume_run(run_id: str, request_data: dict = None):
@@ -3833,17 +5836,20 @@ async def run_server(port=8000):
                 await run_pipeline(topic=job["topic"], email=job.get("email", ""),
                                    verbose=True, resume_dir=job.get("resume_dir"),
                                    config=job.get("config"), run_id=job.get("run_id"),
-                                   uid=job.get("uid"))
+                                   uid=job.get("uid"), research_id=job.get("research_id"))
             except Exception as e:
                 log(f"Pipeline job error: {e}", "ERROR")
             finally:
                 _queue_running = False
                 _job_queue.task_done()
 
-    # Start the worker on server startup
+    # Start the worker + Firestore start listener on server startup
     @app.on_event("startup")
     async def _start_worker():
         asyncio.create_task(_job_worker())
+        # Start global Firestore listener for pipeline start requests
+        if _firebase_db:
+            start_firestore_start_listener(_job_queue, asyncio.get_event_loop())
 
     @app.get("/api/queue")
     async def get_queue_status():
@@ -3868,16 +5874,10 @@ async def run_server(port=8000):
             existing = {}
         existing.update(request_data)
         config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        # Emit config_updated event so frontend can confirm the change was received
-        tracks = tracks_root / run_id
-        if tracks.exists():
-            try:
-                evt = {"type": "config_updated", "timestamp": int(time.time() * 1000),
-                       "data": {"config": existing}}
-                with open(tracks / "events.jsonl", "a", encoding="utf-8") as f:
-                    f.write(json.dumps(evt) + "\n")
-            except Exception:
-                pass
+        # Forward to in-memory controls (for mid-phase config awareness)
+        _controls.update_config(existing)
+        # Emit via dual-write (events.jsonl + Firestore) so frontend gets it
+        emit_event("config_updated", config=existing)
         return {"status": "config_updated", "id": run_id, "config": existing}
 
     @app.delete("/api/runs/{run_id}")
@@ -3960,19 +5960,73 @@ async def run_server(port=8000):
     # sometimes doesn't fire reliably with newer FastAPI versions)
     # Initialize Firebase Admin SDK for Firestore bridge
     init_firebase()
+    # Load PipeToken (required for token-scoped queue + heartbeat)
+    token = load_pipe_token()
+    if token:
+        log(f"PipeToken loaded: {token[:8]}...")
+    else:
+        log("No PipeToken found — run `python research.py --setup` to generate one", "WARN")
+        log("Falling back to legacy pipeline_requests/ listener", "WARN")
     worker_task = asyncio.create_task(_job_worker())
     log("Job worker started (direct)")
+    # Start heartbeat so frontend can show Online/Offline status
+    heartbeat_task = None
+    if token and _firebase_db:
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        log("Heartbeat started (30s interval)")
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     try:
         await server.serve()
     finally:
         worker_task.cancel()
+        if heartbeat_task:
+            heartbeat_task.cancel()
+        # Mark offline on shutdown
+        if _firebase_db and _pipe_token:
+            try:
+                _firebase_db.collection("pipe_tokens").document(_pipe_token).update({"status": "offline"})
+            except Exception:
+                pass
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
 async def run_setup(profile_dir, wait_minutes=5):
+    # ── Step 1: Generate PipeToken ──
+    log("")
+    log("=" * 60)
+    log("  Super Research — Backend Setup")
+    log("=" * 60)
+    log("")
+
+    # Initialize Firebase for token registration
+    firebase_ok = init_firebase()
+    if not firebase_ok:
+        log("Firebase not available — PipeToken will be local only.", "WARN")
+
+    # Check for existing token
+    existing = load_pipe_token()
+    if existing:
+        log(f"Existing PipeToken found: {existing}")
+        log("Reusing existing token. Delete pipe_config.json to generate a new one.")
+        token = existing
+    else:
+        token = generate_pipe_token()
+
+    log("")
+    log("-" * 60)
+    log(f"  Your PipeToken: {token}")
+    log("-" * 60)
+    log("  Enter this token in Super Research app:")
+    log("  Account > Pipeline Connection > Paste token > Link")
+    log("-" * 60)
+    log("")
+
+    # ── Step 2: Browser login setup ──
+    log("Step 2: Log into all research platforms")
+    log("A browser will open. Log into each tab:")
+    log("")
     browser = Browser(profile_dir, headless=False)
     await browser.start()
     services = [
@@ -3981,9 +6035,9 @@ async def run_setup(profile_dir, wait_minutes=5):
         ("YouTube Studio", "https://studio.youtube.com"), ("Gmail", "https://mail.google.com"),
         ("Google Docs", "https://docs.google.com"),
     ]
-    log("Setup: Log into ALL services:")
     for i, (n, u) in enumerate(services, 1):
         log(f"  {i}. {n} — {u}")
+    log("")
     await browser.navigate(services[0][1])
     await asyncio.sleep(3)
     for n, u in services[1:]:
@@ -3993,11 +6047,18 @@ async def run_setup(profile_dir, wait_minutes=5):
             await asyncio.sleep(3)
         except Exception as e:
             log(f"  Failed: {n} ({e})", "WARN")
+    log("")
+    log(f"Log into all {len(services)} tabs. You have {wait_minutes} minutes.")
     for r in range(wait_minutes * 60, 0, -30):
-        log(f"Waiting... {r//60}m {r%60}s remaining.")
+        log(f"  Waiting... {r//60}m {r%60}s remaining.")
         await asyncio.sleep(30)
     await browser.close()
-    log("Setup complete.")
+    log("")
+    log("=" * 60)
+    log("  Setup complete!")
+    log(f"  PipeToken: {token}")
+    log("  Start the server:  python research.py --serve")
+    log("=" * 60)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
