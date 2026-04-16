@@ -3572,34 +3572,50 @@ async def setup_claude_dr(page) -> bool:
     Claude.ai: model dropdown shows 'Opus 4.6 Extended' variant; Research is in tools menu."""
     try:
         await asyncio.sleep(2)
-        # Step 1: Model selector — pick "Opus 4.6 Extended" (or Sonnet 4.6 Extended if Opus unavailable)
+        # Step 1: Model selector — click the model dropdown button.
+        # IMPORTANT: Prioritize Opus over Sonnet. The model selector button
+        # in Claude's UI shows the currently-selected model name. We search
+        # for "opus" first; only if not found, fall back to "sonnet"/"claude".
         model_picked = await page.evaluate("""() => {
-            const btns = document.querySelectorAll('button');
-            let dropdown = null;
-            for (const b of btns) {
+            const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
+            // Priority 1: button already showing "opus"
+            let dropdown = btns.find(b => (b.textContent || '').toLowerCase().includes('opus'));
+            // Priority 2: any model-selector button (sonnet, claude, etc.)
+            if (!dropdown) dropdown = btns.find(b => {
                 const t = (b.textContent || '').toLowerCase();
-                if ((t.includes('opus') || t.includes('sonnet') || t.includes('claude')) && b.offsetParent !== null) {
-                    dropdown = b; break;
-                }
-            }
+                return t.includes('sonnet') || t.includes('claude');
+            });
             if (dropdown) { dropdown.click(); return true; }
             return false;
         }""")
         if model_picked:
             await asyncio.sleep(1.0)
-            # Pick Extended variant from dropdown
-            await page.evaluate("""() => {
-                const items = document.querySelectorAll('[role="menuitem"], [role="option"], button, a');
-                for (const el of items) {
+            # Pick "Opus Extended Thinking" from the dropdown — prioritize Opus,
+            # never settle for Sonnet if Opus is available.
+            selected = await page.evaluate("""() => {
+                const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, a')];
+                // Priority 1: "Opus" + "Extended"
+                let pick = items.find(el => {
                     const t = (el.textContent || '').trim().toLowerCase();
-                    if ((t.includes('opus') && t.includes('extended')) ||
-                        (t.includes('4.6') && t.includes('extended')) ||
-                        t === 'extended thinking') {
-                        el.click(); return true;
-                    }
-                }
-                return false;
+                    return t.includes('opus') && (t.includes('extended') || t.includes('thinking'));
+                });
+                // Priority 2: "Opus 4" (any Opus variant)
+                if (!pick) pick = items.find(el => {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    return t.includes('opus') && t.includes('4');
+                });
+                // Priority 3: "Extended Thinking" (standalone option)
+                if (!pick) pick = items.find(el => {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    return t === 'extended thinking' || (t.includes('extended') && t.includes('thinking'));
+                });
+                if (pick) { pick.click(); return pick.textContent.trim(); }
+                return null;
             }""")
+            if selected:
+                log(f"Claude model selected: {selected}")
+            else:
+                log("Could not find Opus Extended Thinking in dropdown — may default to current model", "WARN")
             await asyncio.sleep(0.8)
 
         # Step 2: Open tools menu ("+" button) — enable "Research" tool
