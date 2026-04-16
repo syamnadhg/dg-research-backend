@@ -8,5 +8,6 @@ build/
 .env
 firebase-service-account.json
 pipe_config.json
+run_analytics.json
 queues/
 tracks/

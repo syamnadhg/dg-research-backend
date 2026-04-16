@@ -326,6 +326,67 @@ async def _heartbeat_loop():
         await asyncio.sleep(30)
 
 
+# ── Run Analytics (phase duration tracking for realistic ETAs) ────────────
+
+ANALYTICS_PATH = Path(__file__).parent / "run_analytics.json"
+_phase_averages: dict[int, float] = {}  # phase → avg duration in seconds
+
+# Reasonable defaults when no analytics exist yet. Based on observed runs
+# (2026-04-15 data + pipeline design targets). Updated as real data arrives.
+_DEFAULT_PHASE_MINUTES = {0: 0.2, 1: 27, 2: 55, 3: 15, 4: 8, 5: 4}
+
+
+def load_analytics():
+    """Load run_analytics.json and compute per-phase average durations."""
+    global _phase_averages
+    if not ANALYTICS_PATH.exists():
+        _phase_averages = {}
+        return
+    try:
+        data = json.loads(ANALYTICS_PATH.read_text(encoding="utf-8"))
+        runs = data.get("runs", [])
+        # Group by phase, compute average
+        from collections import defaultdict
+        buckets: dict[int, list[float]] = defaultdict(list)
+        for r in runs:
+            p = r.get("phase")
+            d = r.get("durationSec", 0)
+            if isinstance(p, int) and d > 0:
+                buckets[p].append(d)
+        _phase_averages = {p: sum(ds) / len(ds) for p, ds in buckets.items() if ds}
+        if _phase_averages:
+            log(f"Analytics loaded: {', '.join(f'P{p}={v/60:.0f}m' for p, v in sorted(_phase_averages.items()))}")
+    except Exception as e:
+        log(f"Failed to load analytics: {e}", "WARN")
+        _phase_averages = {}
+
+
+def record_phase_duration(phase: int, duration_sec: float, agent: str = ""):
+    """Append a phase completion record to run_analytics.json."""
+    try:
+        data = {"runs": []}
+        if ANALYTICS_PATH.exists():
+            data = json.loads(ANALYTICS_PATH.read_text(encoding="utf-8"))
+        data.setdefault("runs", []).append({
+            "phase": phase,
+            "agent": agent,
+            "durationSec": round(duration_sec),
+            "timestamp": int(time.time()),
+        })
+        ANALYTICS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Refresh in-memory averages
+        load_analytics()
+    except Exception as e:
+        log(f"Failed to record analytics: {e}", "WARN")
+
+
+def get_expected_minutes(phase: int) -> int:
+    """Return realistic ETA in minutes for a phase, using analytics if available."""
+    if phase in _phase_averages:
+        return max(1, round(_phase_averages[phase] / 60))
+    return _DEFAULT_PHASE_MINUTES.get(phase, 10)
+
+
 def upload_audio_to_storage(local_path: "Path") -> str | None:
     """Upload the NotebookLM audio file to Firebase Storage and return a
     public download URL. Path is scoped under the user's uid + researchId so
@@ -1588,6 +1649,11 @@ def emit_event(event_type, phase=None, agent=None, **data):
             f.write(json.dumps(event) + "\n")
     except Exception:
         pass
+    # Record phase durations for analytics-based ETAs
+    if event_type == "phase_complete" and phase is not None:
+        dur = data.get("durationSec", 0)
+        if dur > 0:
+            record_phase_duration(phase, dur, agent=agent or "")
     # Write to Firestore (frontend real-time transport)
     _emit_to_firestore(event)
 
@@ -2337,7 +2403,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     _last_progress[label] = progress_key
                     # Context-aware progress: detect Extended Thinking (no visible output is NORMAL)
                     elapsed_sec = int(time.time() - wait_start)
-                    expected_min = MAX_WAIT_PRO if phase == 1 else MAX_WAIT_DEEP
+                    expected_min = get_expected_minutes(phase)
                     is_et = (progress.get("status") == "generating"
                              and progress.get("sources", 0) == 0
                              and progress.get("partial_text_len", 0) < 500)
@@ -2705,7 +2771,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     toolUses=progress.get("tool_uses", []),
                     title=progress.get("title", ""),
                     elapsedSec=elapsed_sec,
-                    expectedMinutes=max_wait_min,
+                    expectedMinutes=get_expected_minutes(2),
                     scrapeOk=scrape_ok)
 
             # Heartbeat every 60s per agent
@@ -2866,7 +2932,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                    status="still_researching",
                                    progress=f"Still working — CUA thought it was done but extraction came back empty. Retrying.",
                                    elapsedSec=int(elapsed),
-                                   expectedMinutes=max_wait_min)
+                                   expectedMinutes=get_expected_minutes(2))
                         continue
                     log(f"[{name}] 3 empty extractions — giving up at {int(elapsed/60)}m", "ERROR")
 
@@ -5960,6 +6026,8 @@ async def run_server(port=8000):
     # sometimes doesn't fire reliably with newer FastAPI versions)
     # Initialize Firebase Admin SDK for Firestore bridge
     init_firebase()
+    # Load run analytics for realistic ETAs
+    load_analytics()
     # Load PipeToken (required for token-scoped queue + heartbeat)
     token = load_pipe_token()
     if token:
