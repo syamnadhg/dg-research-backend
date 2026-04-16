@@ -1210,6 +1210,63 @@ async def resume_browser_from_checkpoint(browser, queue_dir):
 
 # ── Link Extraction ──────────────────────────────────────────────────────────
 
+# ── Link Validation — single source of truth for URL correctness ─────────────
+
+# Per-platform patterns that indicate a REAL public/shareable link (not a page URL)
+_LINK_VALIDATORS = {
+    "chatgpt": lambda u: "chatgpt.com/share/" in u,
+    "gemini":  lambda u: ("gemini.google.com/share" in u or "g.co/gemini" in u),
+    "claude":  lambda u: ("claude.site/artifacts/" in u or "claude.site/" in u),
+    "notebooklm": lambda u: "notebooklm.google.com/notebook/" in u,
+    "youtube": lambda u: ("youtu.be/" in u or "youtube.com/watch?v=" in u),
+    "gdocs":   lambda u: "docs.google.com/document/" in u,
+}
+
+# Known BAD URLs that must NEVER be emitted as links
+_BAD_URL_PATTERNS = [
+    "studio.youtube.com",       # YouTube Studio (not a video link)
+    "chatgpt.com/c/",           # ChatGPT conversation (not shared)
+    "chatgpt.com/?model",       # ChatGPT home
+    "gemini.google.com/app",    # Gemini app (not shared)
+    "claude.ai/new",            # Claude new chat
+    "claude.ai/chat/",          # Claude conversation (not published artifact)
+    "mail.google.com",          # Gmail (not a doc)
+    "accounts.google.com",      # Auth page
+]
+
+
+def validate_link(platform: str, url: str) -> bool:
+    """Check if a URL is a REAL shareable link for the given platform.
+    Returns False for page URLs, studio URLs, and other non-shareable URLs."""
+    if not url or not url.startswith("http"):
+        return False
+    # Reject known bad patterns
+    for bad in _BAD_URL_PATTERNS:
+        if bad in url:
+            return False
+    # Check platform-specific validator
+    validator = _LINK_VALIDATORS.get(platform.lower().replace(" ", ""))
+    if validator:
+        return validator(url)
+    # Unknown platform — accept if it's a URL
+    return True
+
+
+def emit_validated_link(phase: int, agent: str, url: str, label: str):
+    """Emit a link_extracted event ONLY if the URL passes validation.
+    Returns True if emitted, False if rejected."""
+    verified = validate_link(agent, url)
+    if not verified:
+        log(f"[{label}] Link REJECTED — not a valid public link: {url[:80]}", "WARN")
+        emit_event("link_extraction_failed", phase=phase, agent=agent,
+                   error=f"URL is not a valid public link: {url[:60]}")
+        return False
+    emit_event("link_extracted", phase=phase, agent=agent,
+               url=url, label=label, verified=True)
+    log(f"[{label}] Link VERIFIED: {url}")
+    return True
+
+
 class LinkResult:
     """Result of a link extraction attempt."""
     __slots__ = ("url", "label", "platform", "verified", "error")
@@ -1348,28 +1405,33 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
 
 
 async def extract_share_link_claude(browser, cua_client, label="Claude Deep Research", verbose=False):
-    """Extract shareable Claude conversation link (publish artifact)."""
+    """Extract shareable Claude artifact link. Tries publish_open_claude_artifact first
+    (artifact panel may still be open from extraction), falls back to full CUA flow."""
     page = browser.page
     url = await browser.current_url() or ""
     try:
-        # CUA is most reliable for Claude's publish flow — USE the PROMPT_PUBLISH_CLAUDE system prompt
-        # which correctly targets the ARTIFACT panel (right side), not the conversation itself.
-        result = await agent_loop(cua_client, browser,
-            PROMPT_PUBLISH_CLAUDE,
-            "Publish the research ARTIFACT in the right panel (not the conversation). "
-            "If two artifacts exist, open the SECOND/bottom one first. Click the Publish/Share icon on the artifact. "
-            "Get the published URL (claude.site/artifacts/... or claude.ai/...). Tell me the URL.",
-            model=CUA_MODEL, max_iterations=12, verbose=verbose)
-        text = (result.get("text") or "")
-        m = re.search(r'https://claude\.ai/[^\s]+', text)
-        if m:
-            url = m.group(0)
+        # Primary: try publishing via the already-open artifact panel
+        published_url = await publish_open_claude_artifact(page, browser, cua_client, verbose=verbose)
+        if published_url and 'claude.' in published_url:
+            url = published_url
         else:
-            clip = get_clipboard()
-            if "claude.ai" in clip:
-                url = clip
+            # Fallback: full CUA flow with PROMPT_PUBLISH_CLAUDE
+            result = await agent_loop(cua_client, browser,
+                PROMPT_PUBLISH_CLAUDE,
+                "Publish the research ARTIFACT in the right panel (not the conversation). "
+                "If two artifacts exist, open the SECOND/bottom one first. Click the Publish/Share icon on the artifact. "
+                "Get the published URL (claude.site/artifacts/... or claude.ai/...). Tell me the URL.",
+                model=CUA_MODEL, max_iterations=12, verbose=verbose)
+            text = (result.get("text") or "")
+            m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
+            if m:
+                url = m.group(0)
+            else:
+                clip = get_clipboard()
+                if clip and "claude." in clip:
+                    url = clip
         original_url = await browser.current_url()
-        verified = "claude.ai" in url and url != original_url
+        verified = ("claude.site" in url or "claude.ai" in url) and url != original_url
         return LinkResult(url=url, label=label, platform="claude", verified=verified)
     except Exception as e:
         return LinkResult(url=url, label=label, platform="claude", error=str(e))
@@ -1806,6 +1868,191 @@ SCRAPE_FNS = {
     "Claude": scrape_progress_claude,
     "Phase1": scrape_progress_chatgpt,  # Phase 1 runs on ChatGPT
 }
+
+
+# ── Claude Artifact DOM Helpers ──────────────────────────────────────────────
+
+async def _count_claude_artifacts(page):
+    """Count artifact preview cards in Claude conversation. Returns int."""
+    try:
+        return await page.evaluate("""() => {
+            const selectors = [
+                'button[data-testid*="artifact"]',
+                '[data-testid*="artifact-preview"]',
+                '.artifact-card', '.artifact-preview',
+                'button[data-artifact-id]',
+                '[class*="artifact"][role="button"]',
+            ];
+            for (const sel of selectors) {
+                const found = document.querySelectorAll(sel);
+                if (found.length > 0) return found.length;
+            }
+            // Fallback: look for document-like inline cards in assistant messages
+            const cards = document.querySelectorAll(
+                '.font-claude-message button[class*="block"], ' +
+                '.font-claude-message [class*="artifact"], ' +
+                '[data-is-streaming] button[class*="w-full"]'
+            );
+            return cards.length;
+        }""")
+    except Exception as e:
+        log(f"Artifact count failed: {e}", "WARN")
+        return 0
+
+
+async def _click_claude_artifact(page, index=0):
+    """Click the Nth artifact card (0-indexed). Returns True if clicked."""
+    try:
+        return await page.evaluate(f"""(idx) => {{
+            const selectors = [
+                'button[data-testid*="artifact"]',
+                '[data-testid*="artifact-preview"]',
+                '.artifact-card', '.artifact-preview',
+                'button[data-artifact-id]',
+                '[class*="artifact"][role="button"]',
+            ];
+            let cards = [];
+            for (const sel of selectors) {{
+                const found = document.querySelectorAll(sel);
+                if (found.length > 0) {{ cards = Array.from(found); break; }}
+            }}
+            if (!cards.length) {{
+                const fallback = document.querySelectorAll(
+                    '.font-claude-message button[class*="block"], ' +
+                    '.font-claude-message [class*="artifact"]'
+                );
+                cards = Array.from(fallback);
+            }}
+            if (cards.length > idx) {{ cards[idx].click(); return true; }}
+            return false;
+        }}""", index)
+    except Exception as e:
+        log(f"Artifact click failed: {e}", "WARN")
+        return False
+
+
+async def _read_claude_artifact_panel(page):
+    """Read content from the currently open artifact panel (right side)."""
+    try:
+        return await page.evaluate("""() => {
+            const panelSelectors = [
+                '[data-testid="artifact-content"]',
+                '.artifact-content',
+                '.artifact-panel .contents',
+                'aside .prose', 'aside .markdown',
+                '[class*="artifact-panel"] [class*="content"]',
+                // Claude often renders artifact in a right-side panel with these
+                '[class*="artifact"] .ProseMirror',
+                '[class*="artifact"] [class*="rendered"]',
+            ];
+            for (const sel of panelSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText.length > 50) return el.innerText;
+            }
+            // Broader fallback: any right-side panel with substantial content
+            const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
+            if (aside && aside.innerText.length > 200) return aside.innerText;
+            return '';
+        }""")
+    except Exception as e:
+        log(f"Artifact panel read failed: {e}", "WARN")
+        return ""
+
+
+async def _close_claude_artifact_panel(page):
+    """Close the artifact panel by pressing Escape or clicking close."""
+    try:
+        # Try Escape first (most reliable)
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.3)
+        # Verify panel closed by checking if aside/panel shrank
+        still_open = await page.evaluate("""() => {
+            const panel = document.querySelector('aside, [class*="artifact-panel"], [class*="side-panel"]');
+            return panel && panel.offsetWidth > 100;
+        }""")
+        if still_open:
+            # Try clicking close button
+            await page.evaluate("""() => {
+                const close = document.querySelector(
+                    'aside button[aria-label="Close"], ' +
+                    '[class*="artifact-panel"] button[aria-label="Close"], ' +
+                    'aside button:has(svg[class*="close"]), ' +
+                    'button[data-testid="close-artifact"]'
+                );
+                if (close) close.click();
+            }""")
+    except Exception:
+        pass
+
+
+async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None, verbose=False):
+    """Scrape Claude's FIRST artifact for tracking/progress data during active research.
+    DOM-first with CUA fallback. Returns enriched progress dict or None."""
+    artifact_count = await _count_claude_artifacts(page)
+    if artifact_count == 0:
+        return None
+
+    content = ""
+
+    # Layer 1: DOM probe — click first artifact, read panel, close panel
+    try:
+        clicked = await _click_claude_artifact(page, index=0)
+        if clicked:
+            await asyncio.sleep(1.5)  # Wait for panel to render
+            content = await _read_claude_artifact_panel(page)
+            await _close_claude_artifact_panel(page)
+    except Exception as e:
+        log(f"[Claude] Artifact DOM tracking failed: {e}", "WARN")
+
+    # Layer 2: CUA fallback if DOM yielded nothing
+    if not content and browser and cua_client:
+        try:
+            result = await agent_loop(cua_client, browser,
+                PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING,
+                "Open the first artifact in the conversation and read its content. "
+                "Report URLs, steps, sections, and sources found. Then close the artifact panel.",
+                model=CUA_MODEL, max_iterations=6, verbose=verbose)
+            content = result.get("text", "")
+        except Exception as e:
+            log(f"[Claude] Artifact CUA tracking failed: {e}", "WARN")
+
+    if not content or len(content) < 30:
+        return None
+
+    # Parse structured data from artifact content
+    urls = re.findall(r'https?://[^\s)>\]"]+', content)
+    unique_urls = list(dict.fromkeys(urls))[:20]  # Dedup, cap at 20
+
+    # Extract steps (numbered items, bullets)
+    steps = re.findall(r'(?:^|\n)\s*(?:\d+[\.\)]\s*|[-•]\s+)(.{10,200})', content)
+
+    # Extract section headers (markdown-style or all-caps lines)
+    sections = re.findall(r'(?:^|\n)#{1,3}\s+(.{3,80})', content)
+    if not sections:
+        sections = re.findall(r'(?:^|\n)([A-Z][A-Z\s&]{5,60})(?:\n|$)', content)
+
+    # Source domain count
+    domains = set()
+    for u in unique_urls:
+        try:
+            from urllib.parse import urlparse
+            domains.add(urlparse(u).netloc)
+        except Exception:
+            pass
+
+    return {
+        "status": "generating",
+        "phase": "researching",
+        "progress": steps[-1] if steps else f"Tracking {len(unique_urls)} sources from artifact",
+        "sources": len(domains),
+        "source_urls": unique_urls,
+        "sections": sections[:15],
+        "steps": steps[:10],
+        "tool_uses": [f"Analyzing: {s[:80]}" for s in sections[:5]],
+        "partial_text_len": len(content),
+        "artifact_tracking": True,
+        "artifact_count": artifact_count,
+    }
 
 
 # ── Firecrawler API ───────────────────────────────────────────────────────────
@@ -2545,6 +2792,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     MIN_WAIT = {"ChatGPT": _min_agent_wait, "Gemini": _min_agent_wait, "Claude": _min_agent_wait}
     CUA_CHECK_INTERVAL = 300   # 5 min between CUA checks
     FIRECRAWL_INTERVAL = 300   # 5 min between Firecrawl scrapes
+    ARTIFACT_SCRAPE_INTERVAL = 180  # 3 min between Claude artifact tracking scrapes
 
     pending = {}
     results = {}
@@ -2562,6 +2810,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "last_firecrawl": time.time() - 150,  # Stagger: first Firecrawl at 2.5 min
             "last_heartbeat": time.time(),       # Avoid heartbeat burst on first cycle
             "last_cua_check": time.time(),       # Ditto — CUA check gate
+            "last_artifact_scrape": time.time(),  # Claude artifact tracking (starts after warmup)
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -2652,7 +2901,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "done_count": 0, "cua_confirmed": False,
                                              "last_firecrawl": time.time() - 150,
                                              "last_heartbeat": time.time(),
-                                             "last_cua_check": time.time()}
+                                             "last_cua_check": time.time(),
+                                             "last_artifact_scrape": time.time()}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
                         else:
@@ -2724,6 +2974,38 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as _scrape_err:
                     # Don't mask scrape failures — tell frontend the scrape degraded
                     log(f"[{name}] DOM scrape failed: {_scrape_err}", "WARN")
+
+            # Claude artifact tracking — scrape intermediate artifact periodically
+            # This enriches progress data with URLs, steps, and sections from the artifact
+            if name == "Claude" and (time.time() - p.get("last_artifact_scrape", 0)) > ARTIFACT_SCRAPE_INTERVAL:
+                if elapsed > 120:  # Warmup: artifacts may not exist in first 2 min
+                    try:
+                        artifact_data = await scrape_claude_artifact_tracking(
+                            p["page"], browser=browser, cua_client=cua_client, verbose=verbose)
+                        if artifact_data and artifact_data.get("source_urls"):
+                            # Merge artifact data into progress — artifact is richer than DOM scrape
+                            # for URLs/steps/sections since it reads the actual document content
+                            for key in ("source_urls", "steps", "sections", "tool_uses"):
+                                if artifact_data.get(key):
+                                    existing = progress.get(key, []) or []
+                                    merged = list(dict.fromkeys(existing + artifact_data[key]))
+                                    progress[key] = merged
+                            # Use artifact source count if higher
+                            if artifact_data.get("sources", 0) > progress.get("sources", 0):
+                                progress["sources"] = artifact_data["sources"]
+                            # Use artifact text len if higher
+                            if artifact_data.get("partial_text_len", 0) > progress.get("partial_text_len", 0):
+                                progress["partial_text_len"] = artifact_data["partial_text_len"]
+                            progress["artifact_count"] = artifact_data.get("artifact_count", 0)
+                            save_track("Claude", {**artifact_data, "source": "artifact_scrape"})
+                            scrape_ok = True
+                            log(f"[Claude] Artifact tracking: {len(artifact_data.get('source_urls', []))} URLs, "
+                                f"{len(artifact_data.get('steps', []))} steps, "
+                                f"{len(artifact_data.get('sections', []))} sections")
+                        p["last_artifact_scrape"] = time.time()
+                    except Exception as e:
+                        log(f"[Claude] Artifact tracking scrape failed: {e}", "WARN")
+                        p["last_artifact_scrape"] = time.time()  # Don't retry immediately
 
             # Emit agent_progress to frontend (critical for real-time UI)
             agent_key = normalize_agent_key(name)
@@ -2894,6 +3176,26 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     continue
                 log(f"[{name}] CUA confirms complete ✓ ({int(elapsed/60)}m)")
 
+                # Claude-specific: validate completion via artifact count
+                # If only 1 artifact exists early in the run, the "done" verdict is
+                # likely from the planning phase ending — real completion produces 2 artifacts
+                if name == "Claude" and elapsed < (max_wait_min * 60 * 0.8):
+                    try:
+                        _art_count = await _count_claude_artifacts(p["page"])
+                        if _art_count < 2:
+                            log(f"[Claude] CUA says done but only {_art_count} artifact(s) at "
+                                f"{int(elapsed/60)}m — likely still researching. Reverting.", "WARN")
+                            p["done_count"] = 0
+                            p["cua_confirmed"] = False
+                            p["last_cua_check"] = time.time()
+                            emit_event("agent_progress", phase=2, agent="claude",
+                                       status="generating",
+                                       progress=f"Still researching — only {_art_count} artifact(s) so far",
+                                       elapsedSec=int(elapsed))
+                            continue
+                    except Exception:
+                        pass  # On failure, proceed with extraction anyway
+
                 # Extract content
                 try:
                     await browser.switch_to_page(p["page"])
@@ -2940,24 +3242,36 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 agent_url = p["page"].url
 
                 # Extract shareable link NOW (before moving to next agent)
-                try:
-                    await browser.switch_to_page(p["page"])
-                    extractor_map = {"chatgpt": extract_share_link_chatgpt,
-                                     "gemini": extract_share_link_gemini,
-                                     "claude": extract_share_link_claude}
-                    agent_key_lc = name.lower().replace(" ", "")
-                    if agent_key_lc in extractor_map:
-                        link_result = await extractor_map[agent_key_lc](browser, cua_client=cua_client, verbose=verbose)
-                        if link_result.success:
-                            agent_url = link_result.url
-                            emit_event("link_extracted", phase=2, agent=agent_key_lc,
-                                       url=agent_url, label=f"{name} Research",
-                                       verified=link_result.verified)
-                            log(f"[{name}] Shareable link: {agent_url}")
-                        else:
-                            log(f"[{name}] Share link extraction failed, using page URL", "WARN")
-                except Exception as e:
-                    log(f"[{name}] Share link extraction error: {e}", "WARN")
+                # Retry up to 2 times — link extraction is critical for frontend
+                agent_key_lc = name.lower().replace(" ", "")
+                link_verified = False
+                extractor_map = {"chatgpt": extract_share_link_chatgpt,
+                                 "gemini": extract_share_link_gemini,
+                                 "claude": extract_share_link_claude}
+                for _link_attempt in range(2):
+                    try:
+                        await browser.switch_to_page(p["page"])
+                        if agent_key_lc in extractor_map:
+                            link_result = await extractor_map[agent_key_lc](
+                                browser, cua_client=cua_client, verbose=verbose)
+                            if link_result.success:
+                                agent_url = link_result.url
+                                link_verified = link_result.verified
+                                if link_verified:
+                                    break  # Got a verified public link — done
+                                else:
+                                    log(f"[{name}] Link attempt {_link_attempt+1}: got URL but not verified, retrying...", "WARN")
+                    except Exception as e:
+                        log(f"[{name}] Link extraction attempt {_link_attempt+1} error: {e}", "WARN")
+                # Emit link — use validated helper to reject bad URLs
+                if validate_link(agent_key_lc, agent_url):
+                    emit_validated_link(2, agent_key_lc, agent_url, f"{name} Research")
+                else:
+                    # Still emit but as unverified fallback — better than nothing
+                    emit_event("link_extracted", phase=2, agent=agent_key_lc,
+                               url=agent_url, label=f"{name} Research",
+                               verified=False)
+                    log(f"[{name}] Fallback link (unverified): {agent_url}")
 
                 results[name] = {"status": status, "text": text or "",
                                  "url": agent_url, "page": p["page"],
@@ -3290,8 +3604,9 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
 
 
 async def extract_claude_response(page, browser=None, cua_client=None, label="Claude", verbose=False):
-    """Extract Claude response — CUA artifact copy (primary) → JS fallback.
-    Claude Deep Research outputs an artifact panel, not regular chat text."""
+    """Extract Claude response — artifact-aware extraction.
+    Claude Deep Research produces 2 artifacts: first = intermediate tracking, second = final report.
+    Targets the LAST artifact for extraction, with multiple fallback methods."""
     # Clear clipboard first so stale brief text doesn't get returned
     try:
         subprocess.run(["powershell.exe", "-NoProfile", "-Command", "Set-Clipboard ''"],
@@ -3302,12 +3617,51 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
-    # Method 1 (PRIMARY): CUA opens the artifact and copies it
+    # Step 1: Count artifacts and target the LAST one
+    artifact_count = await _count_claude_artifacts(page)
+    log(f"[{label}] Found {artifact_count} artifact(s)")
+
+    # Method 1 (PRIMARY): DOM-click the last artifact + read panel content
+    if artifact_count > 0:
+        target_idx = max(0, artifact_count - 1)  # Last artifact
+        clicked = await _click_claude_artifact(page, index=target_idx)
+        if clicked:
+            await asyncio.sleep(2)  # Wait for panel render
+            panel_text = await _read_claude_artifact_panel(page)
+            if panel_text and len(panel_text) > 500:
+                log(f"[{label}] Extracted via DOM artifact panel ({target_idx}): {len(panel_text)} chars")
+                # Try to also get clipboard copy for higher fidelity
+                try:
+                    await page.evaluate("""() => {
+                        const copyBtn = document.querySelector(
+                            'aside button[aria-label*="Copy"], ' +
+                            '[class*="artifact-panel"] button[aria-label*="Copy"], ' +
+                            'button[data-testid="copy-artifact"]'
+                        );
+                        if (copyBtn) copyBtn.click();
+                    }""")
+                    await asyncio.sleep(1)
+                    clipboard = get_clipboard()
+                    if clipboard and len(clipboard) > len(panel_text) * 0.8:
+                        log(f"[{label}] Upgraded to clipboard copy: {len(clipboard)} chars")
+                        return clipboard
+                except Exception:
+                    pass
+                return panel_text
+
+    # Method 2: CUA opens the correct artifact and copies it
     if browser and cua_client:
-        log(f"[{label}] CUA: Opening and copying Claude artifact...")
+        log(f"[{label}] CUA: Navigating to final artifact...")
         await browser.switch_to_page(page)
+        # Use the new targeted prompt if 2+ artifacts, else original
+        if artifact_count >= 2:
+            await agent_loop(cua_client, browser, PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                f"There are {artifact_count} artifacts in this conversation. "
+                "Open the LAST (bottom) artifact — that's the final research report.",
+                model=CUA_MODEL, max_iterations=8, verbose=verbose)
+            await asyncio.sleep(1)
         await agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
-            "Open the research artifact/document and copy its full content to clipboard.",
+            "Copy the full content of the artifact currently open in the right panel to clipboard.",
             model=CUA_MODEL, max_iterations=12, verbose=verbose)
         await asyncio.sleep(1)
         clipboard = get_clipboard()
@@ -3316,14 +3670,14 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             return clipboard
         log(f"[{label}] CUA copy got {len(clipboard or '')} chars — trying fallbacks", "WARN")
 
-    # Method 2: HTML→MD
+    # Method 3: HTML→MD
     md = await _extract_html_to_md(page, [
         '[data-is-streaming="false"] .markdown', '.font-claude-message', '.contents .prose',
     ], label)
     if md and len(md) > 100:
         return md
 
-    # Method 3: JS fallback
+    # Method 4: JS fallback
     try:
         text = await page.evaluate("""() => {
             const r = document.querySelectorAll('[data-is-streaming="false"] .markdown, .font-claude-message');
@@ -3336,7 +3690,7 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     except Exception:
         pass
 
-    # Method 4: Firecrawl API (full page scrape — last resort)
+    # Method 5: Firecrawl API (full page scrape — last resort)
     if FIRECRAWL_API_KEY:
         try:
             fc_md = await asyncio.to_thread(firecrawl_scrape, page.url)
@@ -3347,6 +3701,65 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             pass
 
     log(f"[{label}] All extraction methods failed", "WARN")
+    return ""
+
+
+async def publish_open_claude_artifact(page, browser, cua_client, verbose=False):
+    """Publish the currently-open Claude artifact and return its public URL.
+    Call this AFTER extract_claude_response while the artifact panel is still open."""
+    try:
+        # Try DOM-first: click publish button on the artifact panel
+        published_url = await page.evaluate("""() => {
+            const publishBtn = document.querySelector(
+                'aside button[aria-label*="Publish"], ' +
+                'aside button[aria-label*="Share"], ' +
+                '[class*="artifact-panel"] button[aria-label*="Publish"], ' +
+                'button[data-testid="publish-artifact"]'
+            );
+            if (publishBtn) { publishBtn.click(); return 'clicked'; }
+            return '';
+        }""")
+        if published_url == 'clicked':
+            await asyncio.sleep(2)
+            # Look for the URL in the dialog
+            url = await page.evaluate("""() => {
+                const links = document.querySelectorAll('a[href*="claude.site/artifacts"], input[value*="claude.site"]');
+                for (const el of links) {
+                    const href = el.href || el.value || '';
+                    if (href.includes('claude.site/artifacts')) return href;
+                }
+                // Also check for copy-link button
+                const copyBtn = document.querySelector('button[aria-label*="Copy link"], button:has-text("Copy link")');
+                if (copyBtn) { copyBtn.click(); return 'clipboard'; }
+                return '';
+            }""")
+            if url and url.startswith('http'):
+                log(f"[Claude] Published artifact via DOM: {url}")
+                return url
+            if url == 'clipboard':
+                await asyncio.sleep(0.5)
+                clip = get_clipboard()
+                if clip and 'claude.site' in clip:
+                    log(f"[Claude] Published artifact via clipboard: {clip}")
+                    return clip
+    except Exception as e:
+        log(f"[Claude] DOM publish attempt failed: {e}", "WARN")
+
+    # CUA fallback for publishing
+    if cua_client:
+        result = await agent_loop(cua_client, browser,
+            PROMPT_PUBLISH_CLAUDE_ARTIFACT,
+            "Publish the artifact that's currently open in the right panel. "
+            "Get the public URL (claude.site/artifacts/...). Tell me the URL.",
+            model=CUA_MODEL, max_iterations=10, verbose=verbose)
+        text = result.get("text", "")
+        m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
+        if m:
+            return m.group(0)
+        clip = get_clipboard()
+        if clip and 'claude.' in clip:
+            return clip
+
     return ""
 
 
@@ -4446,6 +4859,51 @@ async def run_phase4(browser, cua_client, notebook_url, queue_dir, verbose=False
         except Exception:
             pass
 
+    # ── Extract NotebookLM Audio Overview shareable link ──
+    # NotebookLM generates a shareable link for the audio overview that
+    # looks like: notebooklm.google.com/notebook/XXXXX/audio/YYYYY
+    audio_overview_url = ""
+    if audio_done:
+        try:
+            # After download, the audio player should be visible. Check for share button.
+            audio_overview_url = await browser.page.evaluate("""() => {
+                // Look for a share button near the audio player
+                const shareBtn = document.querySelector(
+                    'button[aria-label*="Share"], button[aria-label*="share"], ' +
+                    '[class*="share"] button, button[data-share]'
+                );
+                if (shareBtn) shareBtn.click();
+                return '';  // Will check clipboard/dialog after click
+            }""")
+            await asyncio.sleep(2)
+            # Check if a share dialog appeared with a link
+            share_link = await browser.page.evaluate("""() => {
+                const inputs = document.querySelectorAll('input[readonly], input[value*="notebooklm"]');
+                for (const inp of inputs) {
+                    const val = inp.value || '';
+                    if (val.includes('notebooklm.google.com')) return val;
+                }
+                // Also check any visible text with the notebook audio URL pattern
+                const text = document.body.innerText;
+                const m = text.match(/https:\\/\\/notebooklm\\.google\\.com\\/notebook\\/[^\\s]+/);
+                return m ? m[0] : '';
+            }""")
+            if share_link and "notebooklm.google.com" in share_link:
+                audio_overview_url = share_link
+            else:
+                # Use current URL as audio overview URL (NotebookLM URLs are inherently shareable)
+                current_url = await browser.current_url()
+                if "notebooklm.google.com/notebook" in current_url:
+                    audio_overview_url = current_url
+            await browser.page.keyboard.press("Escape")  # Close any share dialog
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            log(f"Audio overview link extraction failed: {e}", "WARN")
+        if audio_overview_url:
+            log(f"Audio overview link: {audio_overview_url}")
+        else:
+            log("Audio overview link not found — using notebook URL as fallback", "WARN")
+
     # ── Sync to Firebase Storage + Firestore audios subcollection ──
     # Upload the audio file so the Vercel Podcasts page can stream it
     # without needing the local backend to be reachable. Duration via
@@ -4469,7 +4927,7 @@ async def run_phase4(browser, cua_client, notebook_url, queue_dir, verbose=False
         except Exception as e:
             log(f"Audio Firestore/Storage sync failed: {e}", "WARN")
 
-    return {"audio_path": audio_path}
+    return {"audio_path": audio_path, "audio_overview_url": audio_overview_url}
 
 
 async def _check_audio_generating(page):
@@ -4614,35 +5072,94 @@ async def run_phase5(browser, cua_client, audio_path, topic, queue_dir,
 
     browser.clear_upload_file()
 
-    # Try to get YouTube URL — check CUA response, DOM, then clipboard
+    # Extract REAL YouTube video URL — NEVER fall back to studio.youtube.com
     await asyncio.sleep(3)
     youtube_url = ""
+
+    # Helper: validate a candidate URL
+    def _is_yt_video(u):
+        return u and ("youtu.be/" in u or "youtube.com/watch?v=" in u)
+
     # 1. Check CUA response text for URL
     cua_text = result.get("text", "")
-    yt_match = re.search(r'(https?://(?:youtu\.be|youtube\.com/watch\?v=)[a-zA-Z0-9_-]+)', cua_text)
-    if yt_match:
+    yt_match = re.search(r'(https?://(?:youtu\.be/|(?:www\.)?youtube\.com/watch\?v=)[a-zA-Z0-9_-]+)', cua_text)
+    if yt_match and _is_yt_video(yt_match.group(1)):
         youtube_url = yt_match.group(1)
-    # 2. Check DOM for link
+
+    # 2. Check DOM for video link in the upload-complete dialog
     if not youtube_url:
         try:
             url = await page.evaluate("""() => {
-                const a = document.querySelector('a[href*="youtu.be"], a[href*="youtube.com/watch"]');
-                return a ? a.href : '';
+                // YouTube Studio shows the video link in the publish dialog
+                // Check multiple selectors for the video URL
+                const selectors = [
+                    'a[href*="youtu.be"]',
+                    'a[href*="youtube.com/watch"]',
+                    'span.video-url-text',
+                    '.share-url input',
+                    '[class*="video-url"] a',
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const href = el.href || el.value || el.innerText || '';
+                        if (href.includes('youtu.be/') || href.includes('youtube.com/watch'))
+                            return href.trim();
+                    }
+                }
+                // Also check all visible text for youtu.be links
+                const text = document.body.innerText;
+                const m = text.match(/https?:\\/\\/(?:youtu\\.be\\/|(?:www\\.)?youtube\\.com\\/watch\\?v=)[a-zA-Z0-9_-]+/);
+                return m ? m[0] : '';
             }""")
-            youtube_url = url
+            if _is_yt_video(url):
+                youtube_url = url
         except Exception:
             pass
+
     # 3. Check clipboard
     if not youtube_url:
         clip = get_clipboard()
-        if "youtu" in clip:
+        if _is_yt_video(clip):
             youtube_url = clip
-    # 4. Fallback to page URL
-    if not youtube_url:
-        youtube_url = await browser.current_url()
 
-    log(f"YouTube: {youtube_url}")
-    save_track("Phase5", {"status": "youtube_uploaded", "youtube_url": youtube_url})
+    # 4. CUA retry — ask it to find and copy the video URL from the dialog
+    if not youtube_url:
+        log("[YouTube] URL not found in first pass — CUA retry to find video link")
+        retry = await agent_loop(cua_client, browser, SYSTEM_BASE + """
+Your task: Find the YouTube video URL from the upload completion dialog.
+
+Look for:
+1. A video link that starts with youtu.be/ or youtube.com/watch?v=
+2. It's usually shown in a dialog after the video is published/saved
+3. There might be a "Copy" button next to it — click it
+4. If you see a share link or video link, read it and tell me the EXACT URL
+
+ONLY report URLs that start with https://youtu.be/ or https://youtube.com/watch?v=
+Do NOT report studio.youtube.com URLs — those are NOT video links.""",
+            "Find and tell me the exact YouTube video URL (youtu.be/... or youtube.com/watch?v=...). Click Copy if available.",
+            model=CUA_MODEL, max_iterations=8, verbose=verbose)
+        retry_text = retry.get("text", "")
+        m = re.search(r'(https?://(?:youtu\.be/|(?:www\.)?youtube\.com/watch\?v=)[a-zA-Z0-9_-]+)', retry_text)
+        if m and _is_yt_video(m.group(1)):
+            youtube_url = m.group(1)
+        # Also re-check clipboard after CUA clicked copy
+        if not youtube_url:
+            clip = get_clipboard()
+            if _is_yt_video(clip):
+                youtube_url = clip
+
+    # STRICT: Never emit studio.youtube.com or other non-video URLs
+    if youtube_url and not _is_yt_video(youtube_url):
+        log(f"[YouTube] REJECTED non-video URL: {youtube_url}", "WARN")
+        youtube_url = ""
+
+    if youtube_url:
+        log(f"YouTube video URL: {youtube_url}")
+    else:
+        log("[YouTube] Could not extract video URL — no link will be emitted", "WARN")
+    save_track("Phase5", {"status": "youtube_uploaded" if youtube_url else "youtube_url_failed",
+                          "youtube_url": youtube_url})
 
     # Keep all generated files (audio, video, thumbnail) — used by web app
     # Keep all generated files (audio, video, thumbnail) — used by web app
@@ -5331,19 +5848,66 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     data["sourceRefs"] = refs
                 meta["agents"] = agents
                 meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            # ── Link-before-advance: extract shareable links for all agents ──
-            log("Phase 2: Extracting shareable links before advancing...")
-            _p2_link_results = await extract_phase_links(2, browser, cua_client,
-                enabled_agents=agents_cfg, verbose=verbose)
-            _p2_links = [r.to_dict() for r in _p2_link_results if r.success]
-            # Fallback: use raw agent URLs if extraction failed
-            if not _p2_links:
-                _p2_links = [{"label": f"{n} Research", "url": r.get("url", "")}
-                             for n, r in results.items() if r.get("url")]
+            # ── Link-before-advance: build links from round-robin results ──
+            # The round-robin already extracted shareable links per-agent (with
+            # proper page switching). Do NOT call extract_phase_links(2,...) which
+            # operates on browser.page (the last active tab) and would extract
+            # all 3 agents' links from Claude's page — causing ChatGPT and
+            # Gemini link extraction to fail.
+            #
+            # Instead: collect links from results. If any agent is missing a
+            # verified link, retry on their specific page.
+            _share_markers = {
+                "ChatGPT": ["chatgpt.com/share"],
+                "Gemini": ["gemini.google.com/share", "g.co/gemini"],
+                "Claude": ["claude.site/artifacts", "claude.site/"],
+            }
+            _p2_links = []
+            _retry_agents = []  # Agents that need a link retry
+            for name, r in results.items():
+                agent_key = name.lower().replace(" ", "")
+                agent_url = r.get("url", "")
+                markers = _share_markers.get(name, [])
+                is_verified = agent_url and any(m in agent_url for m in markers)
+                if agent_url:
+                    _p2_links.append({"label": f"{name} Research", "url": agent_url, "verified": is_verified})
+                if not is_verified and r.get("page"):
+                    _retry_agents.append((name, r))
+            # Retry link extraction for agents missing verified public links
+            extractor_map = {"chatgpt": extract_share_link_chatgpt,
+                             "gemini": extract_share_link_gemini,
+                             "claude": extract_share_link_claude}
+            for name, r in _retry_agents:
+                agent_key = name.lower().replace(" ", "")
+                if agent_key not in extractor_map:
+                    continue
+                log(f"[{name}] Retrying link extraction on correct page...")
+                try:
+                    await browser.switch_to_page(r["page"])
+                    await asyncio.sleep(1)
+                    link_result = await extractor_map[agent_key](
+                        browser, cua_client=cua_client, verbose=verbose)
+                    if link_result.success and link_result.verified:
+                        # Update the link in _p2_links
+                        for link in _p2_links:
+                            if link["label"] == f"{name} Research":
+                                link["url"] = link_result.url
+                                link["verified"] = True
+                        # Re-emit with verified URL
+                        emit_event("link_extracted", phase=2, agent=agent_key,
+                                   url=link_result.url, label=f"{name} Research",
+                                   verified=True)
+                        log(f"[{name}] Retry succeeded: {link_result.url}")
+                    else:
+                        log(f"[{name}] Retry also unverified — keeping page URL", "WARN")
+                except Exception as e:
+                    log(f"[{name}] Retry link extraction failed: {e}", "WARN")
             done_count = sum(1 for r in results.values() if r["status"] == "done")
             total_chars = sum(len(r.get("text", "")) for r in results.values())
+            verified_count = sum(1 for l in _p2_links if l.get("verified"))
+            log(f"Phase 2 links: {verified_count}/{len(_p2_links)} verified")
             emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
-                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars total")
+                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars total — {verified_count} verified links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
         else:
             log("Phase 2: Loading existing research files")
@@ -5399,9 +5963,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             _regen_md = f"# {name} Deep Research (regenerated)\n\n{r['text']}"
                             (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
                             save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
-                    _p2_link_results = await extract_phase_links(2, browser, cua_client,
-                        enabled_agents=agents_cfg, verbose=verbose)
-                    _p2_links = [r.to_dict() for r in _p2_link_results if r.success]
+                    # Build links from round-robin results (per-agent pages, not browser.page)
+                    _p2_links = [{"label": f"{n} Research", "url": r.get("url", ""), "verified": True}
+                                 for n, r in results.items() if r.get("url")]
                     emit_event("phase_complete", phase=2, links=_p2_links,
                                summary=f"Phase 2 regenerated with user input")
 
@@ -5442,25 +6006,39 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             p3 = await run_phase3(browser, cua_client, results, topic, queue_dir, verbose)
             links = p3.get("links", {})
             notebook_url = p3.get("notebook_url", "")
-            if notebook_url:
-                emit_event("link_extracted", phase=3, agent="notebooklm",
-                           url=notebook_url, label="NotebookLM Notebook", verified=True)
+            # Validate notebook URL before emitting
+            if notebook_url and validate_link("notebooklm", notebook_url):
+                emit_validated_link(3, "notebooklm", notebook_url, "NotebookLM Notebook")
+            elif notebook_url:
+                log(f"[NotebookLM] URL doesn't look right: {notebook_url}", "WARN")
             (queue_dir / "links.json").write_text(json.dumps(links, indent=2), encoding="utf-8")
             save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
                             notebook_url=notebook_url)
             update_delivery(research_links=links, notebook_url=notebook_url)
             # Sub-step 3b: Generate audio overview
+            audio_overview_url = ""
             if notebook_url:
                 p4 = await run_phase4(browser, cua_client, notebook_url, queue_dir, verbose)
                 audio_path = p4.get("audio_path")
+                audio_overview_url = p4.get("audio_overview_url", "")
                 save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
                                 notebook_url=notebook_url,
-                                audio_path=str(audio_path) if audio_path else "")
-                update_delivery(audio_url=notebook_url)
+                                audio_path=str(audio_path) if audio_path else "",
+                                audio_overview_url=audio_overview_url)
+                # Use audio overview URL if available, else notebook URL for audio reference
+                _audio_link = audio_overview_url or notebook_url
+                update_delivery(audio_url=_audio_link)
+                if audio_overview_url:
+                    emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview")
             save_meta(queue_dir, topic, 3)
-            _p3_links = [{"label": "NotebookLM Notebook", "url": notebook_url}] if notebook_url else []
+            # Build Phase 3 links — include both notebook and audio overview
+            _p3_links = []
+            if notebook_url:
+                _p3_links.append({"label": "NotebookLM Notebook", "url": notebook_url, "verified": validate_link("notebooklm", notebook_url)})
+            if audio_overview_url and audio_overview_url != notebook_url:
+                _p3_links.append({"label": "Audio Overview", "url": audio_overview_url, "verified": True})
             emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
-                summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}")
+                summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}{', audio link extracted' if audio_overview_url else ''}")
         else:
             links_file = queue_dir / "links.json"
             if links_file.exists():
@@ -5517,16 +6095,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 p5 = await run_phase5(browser, cua_client, audio_path, topic, queue_dir,
                                        links=links, notebook_url=notebook_url, verbose=verbose)
                 youtube_url = p5.get("youtube_url", "")
-                if youtube_url:
-                    emit_event("link_extracted", phase=4, agent="youtube",
-                               url=youtube_url, label="YouTube Video", verified=True)
+                # STRICT validation — only emit real video URLs, never studio URLs
+                _yt_valid = youtube_url and validate_link("youtube", youtube_url)
+                if _yt_valid:
+                    emit_validated_link(4, "youtube", youtube_url, "YouTube Video")
+                elif youtube_url:
+                    log(f"[YouTube] REJECTED invalid URL: {youtube_url}", "WARN")
+                    youtube_url = ""  # Don't propagate bad URLs
                 save_checkpoint(queue_dir, 4, topic=topic, brief_url=brief_url,
                                 notebook_url=notebook_url, youtube_url=youtube_url)
                 update_delivery(youtube_url=youtube_url)
                 save_meta(queue_dir, topic, 4)
-                _p4_links = [{"label": "YouTube Video", "url": youtube_url}] if youtube_url else []
+                _p4_links = [{"label": "YouTube Video", "url": youtube_url, "verified": True}] if youtube_url else []
                 emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links,
-                    summary="Video uploaded to YouTube" if youtube_url else "YouTube upload skipped")
+                    summary=f"Video uploaded: {youtube_url}" if youtube_url else "YouTube upload failed — no video URL extracted")
             else:
                 log("Skipping Phase 4 — no audio from Phase 3", "WARN")
                 emit_event("phase_skipped", phase=4, reason="No audio produced in Phase 3")
@@ -5572,19 +6154,25 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         else:
             emit_event("phase_start", phase=5, description="Creating Google Doc hub + sending email notification", agents=["gdocs", "gmail"])
             _p5_start = time.time()
-            audio_url = notebook_url
+            # Use audio overview URL if extracted, else notebook URL as fallback
+            _effective_audio_url = audio_overview_url if audio_overview_url else notebook_url
             p6 = await run_phase6(browser, cua_client, topic, links, notebook_url, youtube_url,
-                                  brief_url=brief_url, audio_url=audio_url,
+                                  brief_url=brief_url, audio_url=_effective_audio_url,
                                   email=email, verbose=verbose)
-            if p6.get("doc_url"):
-                emit_event("link_extracted", phase=5, agent="gdocs",
-                           url=p6["doc_url"], label="Google Doc Hub", verified=True)
-            update_delivery(doc_url=p6.get("doc_url", ""), email_sent=p6.get("email_sent", False),
+            doc_url = p6.get("doc_url", "")
+            # Validate Google Doc URL
+            if doc_url and validate_link("gdocs", doc_url):
+                emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
+            elif doc_url:
+                log(f"[Google Doc] URL doesn't look right: {doc_url}", "WARN")
+            update_delivery(doc_url=doc_url, email_sent=p6.get("email_sent", False),
                             status="completed")
             save_checkpoint(queue_dir, 5, topic=topic, brief_url=brief_url, notebook_url=notebook_url,
-                            youtube_url=youtube_url, doc_url=p6.get("doc_url", ""))
+                            youtube_url=youtube_url, doc_url=doc_url)
             save_meta(queue_dir, topic, 5, status="completed")
-            _p5_links = [{"label": "Google Doc", "url": p6.get("doc_url", "")}]
+            _p5_links = []
+            if doc_url and validate_link("gdocs", doc_url):
+                _p5_links.append({"label": "Google Doc Hub", "url": doc_url, "verified": True})
             if p6.get("email_sent"):
                 _p5_links.append({"label": "Email Sent", "url": ""})
             emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start), links=_p5_links,

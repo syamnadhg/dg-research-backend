@@ -55,68 +55,220 @@ Steps:
 
 PROMPT_CHATGPT_DEEP_RESEARCH = SYSTEM_BASE + """
 
-Your task: Enable Deep Research mode in ChatGPT. Do NOT type anything — the brief will be pasted automatically.
+Your task: Enable Deep Research mode in ChatGPT. Nothing else.
 
 Steps:
-1. Look at the current ChatGPT page.
-2. Find "Deep research" — it may be in the sidebar, model selector, or as a toggle/button.
-3. Click to enable/switch to Deep Research mode.
-4. Once Deep Research mode is active, click the message input area to focus it.
-5. Say "ready for paste" when the input is focused and Deep Research mode is active.
+1. Look at the ChatGPT page.
+2. Find "Deep research" — in the "+" menu, sidebar, or model selector.
+3. Click to activate Deep Research mode.
+4. Click the message input area to focus it.
+5. Say "ready for paste" and STOP.
 
-IMPORTANT: Do NOT type or paste any text. Just enable the mode and focus the input."""
+ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
+- DO NOT type any text anywhere.
+- DO NOT paste any text.
+- DO NOT compose prompts or messages.
+- DO NOT send anything.
+- DO NOT click Send / Submit.
+- If Deep Research mode is already on: say "ready for paste" immediately and STOP.
+- If you cannot find Deep Research: say "deep research unavailable" and STOP.
+
+Once Deep Research is on and input is focused, your job is DONE. Do not take any more actions. The brief will be pasted by code."""
 
 PROMPT_GEMINI_DEEP_RESEARCH = SYSTEM_BASE + """
 
-Your task: Enable Deep Research mode in Gemini. Do NOT type anything — the brief will be pasted automatically.
+Your task: Enable Deep Research mode in Gemini. Nothing else.
 
 Steps:
-1. Look at the Gemini page.
-2. Find the model/mode selector — look for "Deep research" option in dropdowns or toggles.
-3. Enable Deep Research mode (with Pro model if available).
-4. Once Deep Research is active, click the message input area to focus it.
-5. Say "ready for paste" when the input is focused and Deep Research mode is active.
+1. Look at the Gemini page (gemini.google.com).
+2. In the composer (bottom input area), click the "Deep research" chip/pill to activate it.
+3. If Deep research chip is not visible directly, click "Sources" or the tools menu to find it.
+4. Ensure the Deep research pill shows as ACTIVE (highlighted/selected) before stopping.
+5. Click the message input area to focus it.
+6. Say "ready for paste" and STOP.
 
-IMPORTANT: Do NOT type or paste any text. Just enable the mode and focus the input."""
+ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
+- DO NOT type any text anywhere.
+- DO NOT paste any text.
+- DO NOT compose prompts or messages.
+- DO NOT send anything.
+- DO NOT click Send / Submit.
+- If Deep Research is already on: say "ready for paste" immediately and STOP.
+- If you cannot find Deep Research: say "deep research unavailable" and STOP.
+
+Once Deep Research pill is active and input is focused, your job is DONE."""
 
 PROMPT_CLAUDE_DEEP_RESEARCH = SYSTEM_BASE + """
 
-Your task: Configure Claude for research. Do NOT type anything — the brief will be pasted automatically.
+Your task: Configure Claude for research. Nothing else.
 
 Steps:
 1. Look at the Claude.ai page.
-2. Select Opus 4.6 model if not already selected (click model dropdown).
-3. Enable Extended Thinking if there's a toggle for it.
-4. Click the "+" or tools menu and enable the "Research" tool if available.
-5. Once configured, click the message input area to focus it.
-6. Say "ready for paste" when the input is focused and all options are set.
+2. Click the model selector; pick "Opus 4.6 Extended" (the Extended variant — this IS extended thinking).
+3. Click the "+" or tools menu near the input; enable the "Research" tool.
+4. Close the menu (Escape) and click the message input area to focus it.
+5. Say "ready for paste" and STOP.
 
-IMPORTANT: Do NOT type or paste any text. Just configure the model/tools and focus the input."""
+ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
+- DO NOT type any text anywhere.
+- DO NOT paste any text.
+- DO NOT compose prompts or messages.
+- DO NOT send anything.
+- DO NOT click Send / Submit.
+- DO NOT attach any files.
+- If the Extended variant is already selected: say "ready for paste" immediately and STOP.
+- If Research tool toggle is already on: leave it alone.
+- If options are unavailable: say "partial setup" and STOP.
+
+Once model + Research tool are set and input is focused, your job is DONE. No exploration."""
 
 # ── Verification & Diagnosis ──────────────────────────────────────────────────
 
+PROMPT_VALIDATE_CHATGPT_SETUP = SYSTEM_BASE + """
+
+Your task: Verify ChatGPT is correctly configured for Deep Research, and fix it if not.
+
+Check visually (screenshot):
+1. Is "Deep Research" mode ACTIVE? Look for a "Deep research" pill/badge/label near the composer, or the deep-research indicator.
+2. Is the input area focused / ready for pasting?
+
+If Deep Research is ACTIVE + input is focused:
+  → Say "setup verified" and STOP immediately.
+
+If Deep Research is NOT active:
+  → Click the "+" / tools menu, find "Deep research" and click to enable it.
+  → Click the input area to focus.
+  → Say "setup fixed" and STOP.
+
+If you cannot enable Deep Research:
+  → Say "setup failed: <specific reason>" and STOP.
+
+ABSOLUTELY FORBIDDEN:
+- DO NOT type any text.
+- DO NOT paste any text.
+- DO NOT send any message.
+- DO NOT compose prompts."""
+
+
+PROMPT_VALIDATE_GEMINI_SETUP = SYSTEM_BASE + """
+
+Your task: Verify Gemini is correctly configured for Deep Research, and fix it if not.
+
+Check visually (screenshot):
+1. Is the "Deep research" chip/pill highlighted/active in the composer (bottom input area)?
+2. Is the input area focused / ready for pasting?
+3. Is Pro model preferred (if visible)?
+
+If Deep research pill is ACTIVE + input is focused:
+  → Say "setup verified" and STOP immediately.
+
+If Deep research is NOT active:
+  → Click the "Deep research" chip/pill in the composer to activate it.
+  → Click the input area to focus.
+  → Say "setup fixed" and STOP.
+
+If you cannot enable Deep Research:
+  → Say "setup failed: <specific reason>" and STOP.
+
+ABSOLUTELY FORBIDDEN:
+- DO NOT type any text.
+- DO NOT paste any text.
+- DO NOT send any message.
+- DO NOT compose prompts."""
+
+
+PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + """
+
+Your task: Verify Claude is correctly configured for Research (Opus 4.6 Extended + Research tool), and fix it if not.
+
+Check visually (screenshot):
+1. Does the model selector show "Opus 4.6 Extended" (or the Extended variant)?
+2. Is the "Research" tool enabled (usually indicated by a highlighted icon/badge near input)?
+3. Is the input area focused / ready for pasting?
+4. Are there any attachments already visible? If YES, that's a leftover — click the X to remove them.
+
+If model is Extended + Research tool is on + input is focused + NO stale attachments:
+  → Say "setup verified" and STOP immediately.
+
+Otherwise:
+  → If model is wrong: click model selector → pick "Opus 4.6 Extended" or the Extended variant.
+  → If Research tool is off: click "+" or tools menu → enable "Research".
+  → If stale attachments exist: click the X/remove button on each to clear them.
+  → Click input area to focus.
+  → Say "setup fixed" and STOP.
+
+If unavailable:
+  → Say "setup failed: <specific reason>" and STOP.
+
+ABSOLUTELY FORBIDDEN:
+- DO NOT type any text.
+- DO NOT paste any text.
+- DO NOT send any message.
+- DO NOT compose prompts.
+- DO NOT attach any new files."""
+
+
+PROMPT_CLICK_SEND = SYSTEM_BASE + """
+
+Your task: Find the Send button and click it — nothing else.
+
+CRITICAL RULES:
+- DO NOT type any text into any input field.
+- DO NOT paste any text.
+- DO NOT modify existing content in the input.
+- ONLY locate and click the Send / Submit / Go button.
+- If you cannot find a Send button, describe what you see instead."""
+
+
 PROMPT_DIAGNOSE = SYSTEM_BASE + """
 
-Your task: Answer these YES/NO questions about what you see on screen:
+Your task: Answer these YES/NO questions about what you see on screen.
 
-1. Is there a STOP button visible? (A square icon or a button labeled "Stop generating" / "Stop") — YES or NO?
-2. Is there a loading/spinning/pulsing animation visible? — YES or NO?
-3. Is there a completed AI response visible (text output from the AI)? — YES or NO?
+FIRST: Focus on the BOTTOM of the chat — the area near the composer/input box and the END of the AI's response. Stop buttons and loading indicators live there, NOT at the top. If the page seems to show middle content, the report may still be generating at the bottom out of view.
+
+Questions:
+1. Is there a STOP button visible anywhere on the page?
+   - YES = a SQUARE icon (like ⬛ solid square), OR a button with visible text "Stop generating" / "Stop" / "Cancel".
+   - NO = anything else.
+   CRITICAL — the following are NOT stop buttons, answer NO for these:
+     • Audio/microphone icons (mic symbol 🎤)
+     • Voice-input equalizer/waveform animations — vertical bars like ||| or |l|l| with varying heights. These indicate voice input mode, NOT generation.
+     • Volume meters, sound-wave indicators, VU meters
+     • Send arrow / paper-plane icons
+     • Model selector buttons / dropdowns
+     • Attach / plus "+" buttons
+   In Claude specifically, the composer at the bottom often shows a small animated audio/waveform icon even when idle — this is VOICE INPUT UI and has nothing to do with whether Claude is still generating.
+2. Is there a loading/spinning/pulsing animation near the AI response (a true "thinking" spinner or progress bar), OR explicit "Researching..." / "Thinking..." / "Generating..." / "..." text visible? — YES or NO?
+3. Is there a completed AI response visible with a clear FINAL paragraph (not cut off, no trailing cursor)? — YES or NO?
 4. Is there a "Start research" button that needs clicking? — YES or NO?
 5. Is there any error message or popup? — YES or NO?
 
-CRITICAL: If there is NO stop button AND NO loading animation AND there IS a completed response, say "response complete".
-If there IS a stop button or loading animation, say "still generating".
-If there's a button that needs clicking, say "needs click"."""
+CLAUDE-SPECIFIC completion hint: when Claude's Research tool finishes, a RESEARCH ARTIFACT appears (often in a right-side panel OR as an inline artifact card in the conversation). If you see a fully-rendered artifact/document card with a title and content, research is done.
+
+DECISION RULES (strict):
+- If Q1=YES or Q2=YES → still generating. A visible stop button OVERRIDES any appearance of completeness, BUT remember an audio equalizer is NOT a stop button (Q1=NO for that).
+- If Q1=NO and Q2=NO and Q3=YES → response complete.
+- If Q4=YES → needs click.
+- If none of the above clearly apply → still generating (safer default).
+
+MANDATORY OUTPUT FORMAT — the LAST line of your response must be exactly ONE of:
+CONCLUSION: GENERATING
+CONCLUSION: DONE
+CONCLUSION: NEEDS_CLICK
+CONCLUSION: ERROR
+
+Do not add any other text after this line. Do not wrap it in quotes. No punctuation after DONE/GENERATING/NEEDS_CLICK/ERROR. This structured line is parsed programmatically — your answer is ignored if this line is missing or malformed."""
 
 PROMPT_FIX_ISSUE = SYSTEM_BASE + """
 
 Your task: Fix the issue on screen so the research can proceed.
 - If there's a "Start research" or "Start" button — click it.
 - If there's a confirmation dialog — confirm it.
-- If the message wasn't sent — find the input, click Send.
+- If the message wasn't sent — find the Send button and click it.
 - If there's an error — describe it.
-After taking action, say what you did."""
+After taking action, say what you did.
+
+CRITICAL: DO NOT type any text, DO NOT paste any text, DO NOT enter messages into chat inputs. Your job is ONLY to click buttons and dismiss dialogs. If the input area is empty, DO NOT invent a prompt — describe what you see instead."""
 
 # ── Response Extraction ───────────────────────────────────────────────────────
 
@@ -139,13 +291,16 @@ Your task: Open and copy the Claude research document.
 
 Steps:
 1. If there's a "Claude Code" tab open, close it (click X on that tab).
-2. Scroll DOWN in the chat (left panel) to find a button/card that says "document" or shows the document title.
-3. Click that "document" button/card — this opens the full research document in the right panel.
-4. Once the document is open in the right panel, look for a "Copy" button at the top of the artifact. Click it.
+2. Scroll DOWN in the chat (left panel) to find document buttons/cards with the document title.
+3. CRITICAL — pick the correct artifact:
+   - If TWO document buttons/cards are visible, click the SECOND (bottom) one — the first may be a thinking trace, plan, or intermediate artifact. The final research report is the SECOND/LAST one.
+   - If only ONE document exists, click it.
+   - If THREE or more, click the LAST (bottom-most) one.
+4. The document opens in the right panel. Look for a "Copy" button at the top of the artifact panel. Click it.
 5. If no Copy button, click inside the document text in the right panel, press Ctrl+A (select all), then Ctrl+C (copy).
 6. Say "copied" when done.
 
-IMPORTANT: Scroll DOWN in the chat first. The "document" button is at the BOTTOM of the chat, below all the research output."""
+IMPORTANT: Always prefer the LAST/BOTTOM-most artifact — that's the final research output. Earlier artifacts are often drafts or thinking traces."""
 
 PROMPT_COPY_RESPONSE = SYSTEM_BASE + """
 
@@ -185,19 +340,25 @@ Steps:
 
 PROMPT_PUBLISH_CLAUDE = SYSTEM_BASE + """
 
-Your task: Publish the Claude research artifact to get a public URL.
+Your task: Publish the Claude research ARTIFACT to get a public URL. Claude's Research tool often produces TWO artifacts — typically a SHORT intermediate one first, then a LARGER final report below it. You want the SECOND/BOTTOM one (the full report), NOT the first.
 
 Steps:
-1. Look at the right panel — there should be an artifact/document panel with the research output.
-2. If the artifact panel is collapsed/hidden, click on the artifact preview in the chat to open it.
-3. On the artifact panel, look for a "Publish" icon/button (often a share or globe icon at the top of the artifact).
-4. Click "Publish" to make the artifact publicly accessible.
-5. If a confirmation dialog appears, confirm the publish.
-6. A published URL will be shown — copy it to clipboard using the Copy button.
-7. Say "published" with the URL if visible.
+1. Scan the conversation for artifact preview cards (usually rectangular cards inline in the chat with a preview of document content). Count them.
+2. If you see MULTIPLE artifact cards: click the LAST/BOTTOM one (the final full report). Scroll down in the chat if needed to find the latest artifact — it's the one at the END of the conversation.
+3. If you see only ONE artifact card: click it.
+4. Clicking opens the artifact in the right-side panel.
+5. In the artifact panel, locate the PUBLISH / SHARE button. It's usually at the top-right of the artifact panel and looks like a globe icon, a share icon, or text "Publish".
+6. Click Publish.
+7. A dialog or inline panel appears with options — click the "Publish" or "Create public link" button to confirm. If asked to confirm making public, confirm.
+8. Once published, the dialog shows a URL like `https://claude.site/artifacts/...`. Click the "Copy link" button to copy it to clipboard.
+9. State the URL in your response.
 
-IMPORTANT: Publish the ARTIFACT (right panel document), not just share the conversation.
-The published URL typically looks like: https://claude.site/artifacts/..."""
+IMPORTANT RULES:
+- Publish the ARTIFACT (the document in the right panel), NOT the conversation (Share conversation does something different).
+- If TWO artifacts exist, the SECOND/BOTTOM one is the full report — that's the one to publish.
+- Don't close the artifact panel — keep it open so the URL stays visible.
+- The published URL format is: `https://claude.site/artifacts/{id}` — tell me THAT URL, not the conversation URL.
+- If you cannot find the Publish button after opening the correct artifact, state exactly what UI you see — don't click arbitrary buttons."""
 
 PROMPT_NOTEBOOKLM_UPLOAD = SYSTEM_BASE + """
 
@@ -260,7 +421,7 @@ Download the generated audio overview.
 
 PROMPT_YOUTUBE_UPLOAD = SYSTEM_BASE + """
 
-Your task: Upload a video to YouTube Studio as UNLISTED and PUBLISH it.
+Your task: Upload a video to YouTube Studio as UNLISTED and SAVE/PUBLISH it.
 
 Steps:
 1. Click "Create" button (camera icon with + at top right).
@@ -285,13 +446,25 @@ CHECKS PAGE:
 
 VISIBILITY PAGE:
 11. Select "Unlisted" (not Public, not Private).
-12. Click "SAVE" or "Publish" to finalize.
+12. CRITICAL — YOU MUST CLICK "SAVE" OR "PUBLISH":
+    - Look for a blue "SAVE" button at the bottom-right of the dialog
+    - Or a "Publish" button
+    - Click it! Do NOT stop without clicking Save/Publish
+    - Wait 2-3 seconds after clicking for the confirmation dialog to appear
 
-AFTER SAVE:
-13. A dialog shows the video link — copy it or read the URL.
-14. Say "uploaded" with the video URL (e.g. youtu.be/xxxxx).
+AFTER SAVE — EXTRACT THE VIDEO LINK:
+13. A confirmation dialog appears showing "Video published" with a video link
+14. The link looks like: https://youtu.be/XXXXXXXXXXX
+15. Click the "COPY" button next to the link if available
+16. Read the EXACT video URL and include it in your response
+17. Say "uploaded: https://youtu.be/XXXXXXXXXXX" with the REAL URL
 
-IMPORTANT: File dialog is auto-handled. You MUST select "No, it's not made for kids" and "Unlisted" before saving."""
+CRITICAL RULES:
+- You MUST click SAVE/PUBLISH — do not stop before saving
+- You MUST report the actual youtu.be/xxx link, NOT the studio.youtube.com URL
+- File dialog is auto-handled
+- Select "No, it's not made for kids" and "Unlisted" before saving
+- If you cannot find the Save button, scroll down or look at the bottom-right of the dialog"""
 
 # ── Phase 6: Google Doc + Email ───────────────────────────────────────────────
 
@@ -321,10 +494,76 @@ Steps:
 
 # ── Inline CUA Prompts (used as one-off fallbacks) ────────────────────────────
 
-PROMPT_CLICK_SEND = SYSTEM_BASE + """
-
-Click the Send button to submit the message. Look for a send/arrow/submit button near the input area. Click it. Say 'sent' when done."""
+# PROMPT_CLICK_SEND is defined earlier at top of this file (hardened with no-type guardrail)
 
 PROMPT_GEMINI_START_RESEARCH = SYSTEM_BASE + """
 
 Look at the Gemini page. If you see a 'Start research' button (blue button), click it. If the research plan is still being generated, wait a moment and check again. Click 'Start research' and say 'clicked'."""
+
+
+# ── Claude Artifact Tracking & Extraction ────────────────────────────────────
+
+PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING = SYSTEM_BASE + """
+
+Your task: Open the FIRST artifact in the Claude conversation to read its tracking/progress content. Do NOT interfere with the ongoing research.
+
+Steps:
+1. Look at the Claude conversation in the LEFT panel. Scroll down to find artifact preview cards — these are rectangular inline cards with a document icon and title.
+2. Count how many artifact cards you see. If ZERO artifacts exist, say "no artifacts" and STOP.
+3. Click the FIRST (top-most) artifact card. It opens in the RIGHT panel.
+4. Read the content in the right panel. Report ALL of the following:
+   - Any URLs or links mentioned (full URLs starting with http)
+   - Any numbered steps or bullet points describing analysis/research activity
+   - Any section headers or topic areas being researched
+   - Any source counts or progress indicators
+   - The approximate length of the content (short/medium/long)
+5. After reading, close the artifact panel by pressing Escape or clicking the X button to return to the conversation view.
+6. Report what you found in a structured format:
+   URLS: [list any URLs found]
+   STEPS: [list any research steps/activity]
+   SECTIONS: [list any section headers/topics]
+   SOURCES: [approximate count of sources mentioned]
+
+CRITICAL RULES:
+- Do NOT click Send or type anything in the input area
+- Do NOT interact with any Stop button
+- Do NOT modify the research in any way
+- If the artifact panel is ALREADY open, just read its content — don't click a card
+- If you cannot find any artifacts, say "no artifacts" and STOP
+- Close the artifact panel when done reading"""
+
+PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT = SYSTEM_BASE + """
+
+Your task: Navigate to and open the FINAL (last/bottom) artifact in the Claude conversation.
+
+Steps:
+1. Scroll to the BOTTOM of the Claude conversation (left panel) to find all artifact preview cards.
+2. Count the artifact cards. There should be 2 or more.
+3. Click the LAST (bottom-most) artifact card — this is the final research report.
+   - If only ONE artifact exists, click that one.
+   - If TWO exist, click the SECOND/bottom one.
+   - If THREE or more, click the LAST one.
+4. The artifact opens in the right panel. Verify it looks like a complete research document (has headers, paragraphs, citations).
+5. Say "final artifact open" and describe its title and approximate length.
+
+CRITICAL: Click the LAST artifact, not the first. The first is often an intermediate tracking document."""
+
+PROMPT_PUBLISH_CLAUDE_ARTIFACT = SYSTEM_BASE + """
+
+Your task: Publish the currently-open Claude artifact to get a public URL.
+
+PREREQUISITE: The artifact should ALREADY be open in the right panel. If no artifact panel is visible, say "no artifact open" and STOP.
+
+Steps:
+1. Look at the right-side artifact panel. Verify content is visible.
+2. Find the Publish/Share button — usually at the top-right of the artifact panel. It may look like a globe icon, share icon, or say "Publish".
+3. Click Publish.
+4. A dialog appears — click "Publish" or "Create public link" to confirm.
+5. Once published, the dialog shows a URL like `https://claude.site/artifacts/...`. Click "Copy link" to copy it to clipboard.
+6. Report the EXACT URL in your response.
+
+IMPORTANT:
+- Publish the ARTIFACT (right panel), NOT the conversation
+- The URL format is: `https://claude.site/artifacts/{id}`
+- Don't close the artifact panel
+- If you cannot find the Publish button, describe what UI you see"""
