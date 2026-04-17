@@ -386,9 +386,129 @@ def generate_research_token():
     return token
 
 
+# ── Device registry (multi-device support) ─────────────────────────────────
+# A "device" is a paired backend PC. One doc per device lives at
+# users/{uid}/devices/{deviceId}. Multiple devices let a user run concurrent
+# research on different machines. The deviceId is stable across --setup runs
+# on the same machine (stored in research_config.json) so re-pairing preserves
+# the user's rename + indestructible toggle.
+
+_device_id: str | None = None
+_device_paired_uid: str | None = None
+
+
+def load_device_id():
+    """Return the deviceId persisted in research_config.json, or None."""
+    global _device_id
+    if _device_id:
+        return _device_id
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+            _device_id = (cfg.get("deviceId") or "").strip() or None
+            return _device_id
+        except Exception:
+            pass
+    return None
+
+
+def load_paired_uid():
+    """Return the Firebase uid this device is paired to (from config file),
+    or None if --setup hasn't completed yet."""
+    global _device_paired_uid
+    if _device_paired_uid:
+        return _device_paired_uid
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+            _device_paired_uid = (cfg.get("pairedUid") or "").strip() or None
+            return _device_paired_uid
+        except Exception:
+            pass
+    return None
+
+
+def save_device_config(device_id: str | None = None, paired_uid: str | None = None):
+    """Merge-write device_id / paired_uid into research_config.json."""
+    global _device_id, _device_paired_uid
+    local_cfg = {}
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            local_cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    if device_id:
+        local_cfg["deviceId"] = device_id
+        _device_id = device_id
+    if paired_uid:
+        local_cfg["pairedUid"] = paired_uid
+        _device_paired_uid = paired_uid
+    RESEARCH_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
+
+
+def generate_device_id():
+    """Mint a new stable deviceId shaped '<sanitized-hostname>-<6-char-hex>'.
+    Called once per machine — subsequent --setup runs reuse the persisted id."""
+    import uuid
+    import socket
+    import re as _re
+    hostname = socket.gethostname()
+    sanitized = _re.sub(r'[^a-z0-9-]', '-', hostname.lower()).strip('-')
+    if not sanitized:
+        sanitized = "device"
+    new_id = f"{sanitized[:30]}-{uuid.uuid4().hex[:6]}"
+    save_device_config(device_id=new_id)
+    return new_id
+
+
+def write_device_doc(uid: str, token: str, device_name: str | None = None):
+    """Upsert users/{uid}/devices/{deviceId}. Preserves user-editable `name`
+    and `indestructible` fields from any prior doc. Call once from --setup
+    after pairing succeeds, and again from --serve startup to refresh
+    token + heartbeat if the token changed."""
+    if not _firebase_db or not uid or not token:
+        return
+    import socket as _socket
+    import platform as _platform
+    from google.cloud.firestore import SERVER_TIMESTAMP
+    device_id = load_device_id() or generate_device_id()
+    hostname = _socket.gethostname()
+    try:
+        os_str = f"{_platform.system()} {_platform.release()}"
+    except Exception:
+        os_str = _platform.system() or ""
+    doc_ref = _firebase_db.collection("users").document(uid) \
+        .collection("devices").document(device_id)
+    existing = {}
+    try:
+        snap = doc_ref.get()
+        if snap.exists:
+            existing = snap.to_dict() or {}
+    except Exception:
+        pass
+    payload = {
+        "id": device_id,
+        "hostname": hostname,
+        "os": os_str,
+        "token": token,
+        "lastHeartbeat": SERVER_TIMESTAMP,
+    }
+    # First-write-only fields. User rename flows through the Account page,
+    # so we must not clobber it on subsequent setup or heartbeat writes.
+    if "name" not in existing:
+        payload["name"] = device_name or hostname
+    if "registeredAt" not in existing:
+        payload["registeredAt"] = int(time.time() * 1000)
+    try:
+        doc_ref.set(payload, merge=True)
+        log(f"Device doc updated: users/{uid}/devices/{device_id}")
+    except Exception as e:
+        log(f"Failed to write device doc: {e}", "WARN")
+
+
 async def _heartbeat_loop():
-    """Write lastHeartbeat to research_tokens/{token} every 30s so the frontend
-    can show Online/Offline status."""
+    """Write lastHeartbeat to research_tokens/{token} AND the paired device
+    doc every 30s so the frontend can show Online/Offline status per device."""
     from google.cloud.firestore import SERVER_TIMESTAMP
     while True:
         try:
@@ -397,6 +517,20 @@ async def _heartbeat_loop():
                     "lastHeartbeat": SERVER_TIMESTAMP,
                     "status": "active",
                 })
+                # Mirror to device doc for the per-device status indicator.
+                # Skip silently when setup hasn't pinned a paired uid yet.
+                paired_uid = load_paired_uid()
+                device_id = load_device_id()
+                if paired_uid and device_id:
+                    try:
+                        _firebase_db.collection("users").document(paired_uid) \
+                            .collection("devices").document(device_id).update({
+                                "lastHeartbeat": SERVER_TIMESTAMP,
+                            })
+                    except Exception:
+                        # Device doc may have been deleted from the app — that's
+                        # fine, don't crash the heartbeat.
+                        pass
         except Exception as e:
             log(f"Heartbeat write failed: {e}", "WARN")
         await asyncio.sleep(30)
@@ -8536,6 +8670,21 @@ async def run_server(port=8000):
     if token and _firebase_db:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
         log("Heartbeat started (30s interval)")
+        # Refresh the paired device doc so the Account page sees this PC
+        # online immediately on server start. If pairedUid isn't pinned yet
+        # (pre-multi-device config), resolve it from the token's linkedUid.
+        paired_uid = load_paired_uid()
+        if not paired_uid:
+            try:
+                snap = _firebase_db.collection("research_tokens").document(token).get()
+                if snap.exists:
+                    paired_uid = (snap.to_dict() or {}).get("linkedUid") or ""
+                    if paired_uid:
+                        save_device_config(paired_uid=paired_uid)
+            except Exception as e:
+                log(f"Could not resolve paired uid from token doc: {e}", "WARN")
+        if paired_uid:
+            write_device_doc(paired_uid, token)
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     try:
@@ -8544,12 +8693,27 @@ async def run_server(port=8000):
         worker_task.cancel()
         if heartbeat_task:
             heartbeat_task.cancel()
-        # Mark offline on shutdown
+        # Mark offline on shutdown. Stale heartbeat alone would tip the UI
+        # over to "offline" after ~20 min; touching status here lets the
+        # Account page reflect a clean shutdown immediately.
         if _firebase_db and _research_token:
             try:
                 _firebase_db.collection("research_tokens").document(_research_token).update({"status": "offline"})
             except Exception:
                 pass
+            paired_uid = load_paired_uid()
+            device_id = load_device_id()
+            if paired_uid and device_id:
+                try:
+                    # Stamp a stale heartbeat (1 hour ago) so the UI treats
+                    # the device as offline instantly. Frontend status is
+                    # derived from heartbeat age, not a status field.
+                    _firebase_db.collection("users").document(paired_uid) \
+                        .collection("devices").document(device_id).update({
+                            "lastHeartbeat": int((time.time() - 3600) * 1000),
+                        })
+                except Exception:
+                    pass
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -8721,6 +8885,12 @@ async def run_setup(profile_dir, wait_minutes=10):
         except Exception:
             linked_email = linked_uid[:8]
 
+    # Pin the paired uid locally so --serve's heartbeat can mirror into the
+    # device doc without re-reading Firestore. Also upsert the device doc so
+    # the app's Account page + sidebar see this PC immediately.
+    save_device_config(paired_uid=linked_uid)
+    write_device_doc(linked_uid, token)
+
     print()
     print(f"  {_c(_OK, '[ok]')}  Linked to {_c(_BOLD, linked_email or '—')}")
     print()
@@ -8891,6 +9061,166 @@ async def run_setup(profile_dir, wait_minutes=10):
         print("")
 
 
+# ── Indestructible mode (--resurrect / --exorcise) ───────────────────────────
+#
+# Installs a Windows Scheduled Task that auto-starts `python research.py
+# --serve` at user logon, so a reboot (Windows Update, power blip, crash)
+# doesn't need manual re-launch. Paired with the backend's existing startup
+# auto-retry (research.py:8099 detects an incomplete checkpoint and resumes),
+# this makes the pipeline survive unexpected downtime end-to-end.
+#
+# Task is scoped to the CURRENT USER — never elevated to SYSTEM — so it
+# retains access to the user's Chrome profile / cookies, which Playwright
+# needs for the logged-in agents.
+
+_INDESTRUCTIBLE_TASK_NAME = "SuperResearchBackend"
+
+
+def _write_indestructible_flag(enabled: bool):
+    """Push the Indestructible flag to the device doc so the frontend can
+    branch watchdog copy. Best-effort — if Firebase isn't reachable we still
+    succeed because the scheduled task is the actual source of truth."""
+    if not _firebase_db:
+        return
+    paired_uid = load_paired_uid()
+    device_id = load_device_id()
+    if not (paired_uid and device_id):
+        log("Device not paired — skipping Firestore flag update.", "WARN")
+        return
+    try:
+        _firebase_db.collection("users").document(paired_uid) \
+            .collection("devices").document(device_id).update({
+                "indestructible": bool(enabled),
+            })
+        log(f"Indestructible flag = {enabled} written to device doc.")
+    except Exception as e:
+        log(f"Could not update indestructible flag: {e}", "WARN")
+
+
+def run_resurrect():
+    """Install a Windows Scheduled Task that launches `python research.py
+    --serve` at user logon. Idempotent — re-running overwrites the existing
+    task. Prints actionable output on success/failure."""
+    import sys as _sys
+    import subprocess as _subprocess
+    import platform as _platform
+
+    _setup_logo()
+    print(f"  {_c(_BOLD, 'Indestructible mode — install')}")
+    print(f"  {_c(_DIM, '─' * 62)}")
+    print()
+
+    if _platform.system() != "Windows":
+        print(f"  {_c(_WARN, 'Only supported on Windows today.')}")
+        print(f"  {_c(_DIM, 'macOS/Linux users: roll your own launchd / systemd unit.')}")
+        return
+
+    python_exe = _sys.executable
+    script_path = str(Path(__file__).resolve())
+    # Use the full path to python.exe so the task runs even if PATH isn't set
+    # up for the scheduler's session. Quote both to tolerate spaces.
+    task_run = f'"{python_exe}" "{script_path}" --serve'
+
+    # Initialize Firebase so the flag write later succeeds. Cheap no-op if
+    # the sa file is missing — we just skip the flag.
+    init_firebase()
+
+    # Ensure the device has a paired uid before we go further. Otherwise
+    # auto-start would launch a server with no linked user, which is useless.
+    if not load_paired_uid():
+        print(f"  {_c(_WARN, 'Device not paired yet.')}")
+        print(f"  {_c(_DIM, 'Run')} {_c(_BOLD, 'python research.py --setup')} {_c(_DIM, 'first, then retry --resurrect.')}")
+        return
+
+    cmd = [
+        "schtasks", "/Create",
+        "/TN", _INDESTRUCTIBLE_TASK_NAME,
+        "/TR", task_run,
+        "/SC", "ONLOGON",
+        "/RL", "LIMITED",       # keep user privileges (Chrome profile access)
+        "/IT",                  # interactive — required for Playwright headed mode
+        "/F",                   # overwrite existing
+    ]
+    try:
+        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        print(f"  {_c(_WARN, 'Failed to run schtasks:')} {e}")
+        return
+
+    if result.returncode != 0:
+        print(f"  {_c(_WARN, 'schtasks returned non-zero status.')}")
+        if result.stderr.strip():
+            print(f"  {_c(_DIM, 'stderr:')}")
+            for line in result.stderr.strip().splitlines():
+                print(f"     {line}")
+        return
+
+    print(f"  {_c(_OK, '[ok]')} Scheduled Task installed ({_INDESTRUCTIBLE_TASK_NAME})")
+    print(f"  {_c(_OK, '[ok]')} Runs at every user logon")
+    print(f"  {_c(_DIM, 'Executes:')} {task_run}")
+    print()
+    _write_indestructible_flag(True)
+    print(f"  {_c(_OK, '[ok]')} Synced to the Super Research app")
+    print()
+    print(f"  {_c(_DIM, 'From now on, `--serve` auto-starts when you log in. The')}")
+    print(f"  {_c(_DIM, 'startup auto-retry (for crashed/incomplete runs) is already')}")
+    print(f"  {_c(_DIM, 'built in — Indestructible mode completes the loop.')}")
+    print()
+    print(f"  {_c(_DIM, 'To undo:')} {_c(_BOLD, 'python research.py --exorcise')}")
+
+
+def run_exorcise():
+    """Remove the Indestructible Scheduled Task. Idempotent — succeeds even
+    if the task wasn't installed."""
+    import subprocess as _subprocess
+    import platform as _platform
+
+    _setup_logo()
+    print(f"  {_c(_BOLD, 'Indestructible mode — remove')}")
+    print(f"  {_c(_DIM, '─' * 62)}")
+    print()
+
+    if _platform.system() != "Windows":
+        print(f"  {_c(_WARN, 'Only supported on Windows today.')}")
+        return
+
+    init_firebase()
+
+    cmd = [
+        "schtasks", "/Delete",
+        "/TN", _INDESTRUCTIBLE_TASK_NAME,
+        "/F",
+    ]
+    try:
+        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        print(f"  {_c(_WARN, 'Failed to run schtasks:')} {e}")
+        return
+
+    # Exit code 1 with a "does not exist" message means the task wasn't
+    # installed to begin with — that's fine, we still clear the flag.
+    not_installed = (
+        result.returncode != 0
+        and "ERROR: The system cannot find the file specified." in (result.stdout + result.stderr)
+    )
+    if result.returncode == 0:
+        print(f"  {_c(_OK, '[ok]')} Scheduled Task removed ({_INDESTRUCTIBLE_TASK_NAME})")
+    elif not_installed:
+        print(f"  {_c(_DIM, 'Task was not installed — nothing to remove.')}")
+    else:
+        print(f"  {_c(_WARN, 'schtasks returned non-zero status.')}")
+        if result.stderr.strip():
+            print(f"  {_c(_DIM, 'stderr:')}")
+            for line in result.stderr.strip().splitlines():
+                print(f"     {line}")
+
+    _write_indestructible_flag(False)
+    print(f"  {_c(_OK, '[ok]')} Synced to the Super Research app")
+    print()
+    print(f"  {_c(_DIM, 'The backend no longer auto-starts at logon. You can still')}")
+    print(f"  {_c(_DIM, 'run it manually with')} {_c(_BOLD, 'python research.py --serve')}.")
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -8905,7 +9235,19 @@ def main():
     parser.add_argument("--resume", "-r", help="Resume from a previous queue directory (name or full path)")
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
     parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
+    parser.add_argument("--resurrect", action="store_true",
+        help="Install a Windows Scheduled Task that auto-starts `--serve` on user logon (Indestructible mode)")
+    parser.add_argument("--exorcise", action="store_true",
+        help="Remove the Indestructible Scheduled Task installed by --resurrect")
     args = parser.parse_args()
+
+    if args.resurrect:
+        run_resurrect()
+        return
+
+    if args.exorcise:
+        run_exorcise()
+        return
 
     if args.setup:
         asyncio.run(run_setup(str(PROFILE_DIR)))
