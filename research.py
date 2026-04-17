@@ -7881,52 +7881,49 @@ async def run_setup(profile_dir, wait_minutes=10):
             print(f"  {SUB}")
 
     banner("Super Research — Backend Setup")
+    print("    Three steps:  Token  →  Logins  →  Serve")
+    print("")
 
-    # ── Step 1: Firebase + ResearchToken + QR ─────────────────────────────
-    print("  [1/3] Research token")
+    # ══════════════════════════════════════════════════════════════════════
+    # [1/3] TOKEN SETUP — mint, register in Firestore, render QR, wait for
+    #       the app to claim the link. All token-side work lives here.
+    # ══════════════════════════════════════════════════════════════════════
+    print("  [1/3] Token setup")
+    divider()
+
     firebase_ok = init_firebase()
     if not firebase_ok:
-        log("    Firebase not available — token will be LOCAL ONLY (app won't find it).", "WARN")
+        log("    Firebase unavailable — the app will NOT be able to validate this token.", "ERROR")
+        log("    Check firebase-service-account.json and your network. Exiting.", "ERROR")
+        return
 
     existing = load_research_token()
     if existing:
         token = existing
-        print(f"    Reusing existing token — delete {RESEARCH_CONFIG_PATH.name} to mint a new one.")
+        print(f"    Reusing existing token — delete {RESEARCH_CONFIG_PATH.name} for a fresh one.")
     else:
         token = generate_research_token()
-        print(f"    Minted new token.")
+        print("    Minted new token.")
 
-    # ALWAYS upsert the token in Firestore at every --setup run. Without this,
-    # a reused local token can drift out of Firestore (e.g., after a project
-    # migration) and the app will reject scans/pastes with "Invalid or unknown
-    # token" even though the local config looks fine. Upserting keeps the
-    # source-of-truth in the Firestore doc the app reads.
-    firestore_ok = False
-    if firebase_ok and _firebase_db:
-        try:
-            import socket
-            from google.cloud.firestore import SERVER_TIMESTAMP
-            _firebase_db.collection("research_tokens").document(token).set({
-                "status": "active",
-                "machineName": socket.gethostname(),
-                "lastHeartbeat": SERVER_TIMESTAMP,
-                "createdAt": SERVER_TIMESTAMP,  # setDoc merge would be ideal but we preserve existing via update-below if needed
-            }, merge=True)
-            firestore_ok = True
-            print(f"    [ok] Token registered in Firestore (project={_firebase_db.project}).")
-        except Exception as e:
-            log("    FIRESTORE REGISTRATION FAILED — the app will reject this token!", "ERROR")
-            log(f"        Error: {e}", "ERROR")
-            log("        Check firebase-service-account.json and your network.", "ERROR")
-    elif not firebase_ok:
-        log("    Firebase init failed — token is LOCAL ONLY and the app cannot validate it.", "ERROR")
-        log("        Make sure firebase-service-account.json exists and is valid.", "ERROR")
+    # Upsert in Firestore on every --setup run so a reused local token can't
+    # drift out of sync with what the app reads.
+    try:
+        import socket
+        from google.cloud.firestore import SERVER_TIMESTAMP
+        _firebase_db.collection("research_tokens").document(token).set({
+            "status": "active",
+            "machineName": socket.gethostname(),
+            "lastHeartbeat": SERVER_TIMESTAMP,
+            "createdAt": SERVER_TIMESTAMP,
+        }, merge=True)
+        print(f"    [ok] Registered in Firestore (project={_firebase_db.project}).")
+    except Exception as e:
+        log("    FIRESTORE REGISTRATION FAILED — the app will reject this token.", "ERROR")
+        log(f"        {e}", "ERROR")
+        return
 
     print("")
-    print(f"    Token: {token}")
-    print("")
-    print("    Scan the QR below in the Super Research app:")
-    print("        chat → Connect  (or)  Account → Pipeline Connection")
+    print(f"    Token:  {token}")
     print("")
     try:
         import qrcode
@@ -7937,77 +7934,69 @@ async def run_setup(profile_dir, wait_minutes=10):
         qr.print_ascii(tty=True, invert=True)
     except ImportError:
         log("    qrcode lib missing — run `pip install -r requirements.txt` first.", "WARN")
-        print("    Paste the token manually in the app: Account → Pipeline Connection")
     except Exception as e:
         log(f"    QR render failed: {e}", "WARN")
     print("")
+    print("    Pair this token in the Super Research app:")
+    print("        • Scan QR   →  chat → Connect → Scan QR")
+    print("        • or Paste  →  Account → Pipeline Connection")
+    print("")
+    print("    Waiting for the app to pair this token...")
+    print("    (Ctrl+C to cancel)")
 
-    # ── Step 2: Wait for token link confirmation ──────────────────────────
-    # Gates the browser-login step behind a successful app → Firestore link
-    # so the user actually scans/pastes before we open 7 browser tabs they
-    # may not yet be ready to log into.
-    print("  [2/3] Link token to your app account")
+    # Watch the token doc directly — the app calls claimResearchToken after
+    # validating + saving, which writes {linkedUid, linkedEmail, linkedAt}
+    # here. Single-doc read per tick, no composite index required.
     linked_uid: str | None = None
     linked_email: str | None = None
+    link_deadline = time.time() + wait_minutes * 60
+    tick = 0
+    first_err_logged = False
+    while time.time() < link_deadline and linked_uid is None:
+        try:
+            doc = _firebase_db.collection("research_tokens").document(token).get()
+            if doc.exists:
+                data = doc.to_dict() or {}
+                if data.get("linkedUid"):
+                    linked_uid = data.get("linkedUid")
+                    linked_email = data.get("linkedEmail") or None
+                    break
+        except Exception as e:
+            if not first_err_logged:
+                log(f"    Link poll error (continuing): {e}", "WARN")
+                first_err_logged = True
+        tick += 1
+        if tick % 10 == 0 and linked_uid is None:
+            elapsed = wait_minutes * 60 - int(link_deadline - time.time())
+            print(f"    ...still waiting ({elapsed}s elapsed)")
+        await asyncio.sleep(3)
 
-    if not firebase_ok:
-        log("    Cannot verify link — Firebase unavailable. Skipping to logins.", "WARN")
-    else:
-        print("         Waiting for you to scan or paste the token in the app...")
-        print("         (Ctrl+C to cancel)")
+    if linked_uid is None:
         print("")
-        # Watch the token doc directly for linkedUid/linkedEmail fields that
-        # the frontend writes when the user scans or pastes. This avoids a
-        # collection_group query (which would need a composite index) — just
-        # a single-doc read on each tick.
-        link_deadline = time.time() + wait_minutes * 60
-        tick = 0
-        first_err_logged = False
-        while time.time() < link_deadline and linked_uid is None:
-            try:
-                doc = _firebase_db.collection("research_tokens").document(token).get()
-                if doc.exists:
-                    data = doc.to_dict() or {}
-                    if data.get("linkedUid"):
-                        linked_uid = data.get("linkedUid")
-                        linked_email = data.get("linkedEmail") or None
-                        break
-            except Exception as e:
-                if not first_err_logged:
-                    log(f"    Link poll error (continuing): {e}", "WARN")
-                    first_err_logged = True
-            tick += 1
-            if tick % 10 == 0:
-                elapsed = wait_minutes * 60 - int(link_deadline - time.time())
-                print(f"         ...still waiting ({elapsed}s elapsed)")
-            await asyncio.sleep(3)
+        print(f"  {BAR}")
+        print("    Timed out waiting for app pairing.")
+        print(f"  {BAR}")
+        print("    Re-run when ready:  python research.py --setup")
+        return
 
-        if linked_uid is None:
-            print("")
-            print(f"  {BAR}")
-            print("    Timed out waiting for app link.")
-            print(f"  {BAR}")
-            print("")
-            print("    Re-run when ready:  python research.py --setup")
-            print("")
-            return
+    # Prefer the email written by the scanner; fall back to Firebase Auth.
+    if not linked_email:
+        try:
+            from firebase_admin import auth as fb_auth
+            user_obj = fb_auth.get_user(linked_uid)
+            linked_email = user_obj.email or linked_uid[:8]
+        except Exception:
+            linked_email = linked_uid[:8]
 
-        # Fall back to resolving email via Auth if the scanner didn't write it
-        if not linked_email:
-            try:
-                from firebase_admin import auth as fb_auth
-                user_obj = fb_auth.get_user(linked_uid)
-                linked_email = user_obj.email or linked_uid[:8]
-            except Exception:
-                linked_email = linked_uid[:8]
+    print(f"    [ok] Linked to {linked_email}")
+    print("")
 
-        print("")
-        print(f"    [ok] Linked — {linked_email}")
-        print("")
-
-    # ── Step 3: Open platform tabs + verify logins ─────────────────────────
-    print("  [3/3] Platform logins")
-    print("         Log into each tab — we'll re-check every 30 seconds.")
+    # ══════════════════════════════════════════════════════════════════════
+    # [2/3] BROWSER LOGINS — open 7 platform tabs and wait for real auth.
+    # ══════════════════════════════════════════════════════════════════════
+    print("  [2/3] Browser logins")
+    divider()
+    print("    Log into each of the 7 tabs. We re-check every 30 seconds.")
     print("")
 
     browser = Browser(profile_dir, headless=False)
@@ -8086,24 +8075,32 @@ async def run_setup(profile_dir, wait_minutes=10):
 
     await browser.close()
 
-    # ── Final banner ──────────────────────────────────────────────────────
     print("")
     if all_ok:
-        print(f"  {BAR}")
-        print(f"    SETUP COMPLETE — all {len(services)} platforms verified.")
-        print(f"  {BAR}")
+        # ══════════════════════════════════════════════════════════════════════
+        # [3/3] START RESEARCH SERVER — clear next-action instructions.
+        # ══════════════════════════════════════════════════════════════════════
+        print(f"  [3/3] Start research server")
+        divider()
+        print(f"    [ok] Paired with {linked_email}")
+        print(f"    [ok] All {len(services)} platforms logged in")
+        print("    [ok] Browser closed")
         print("")
-        print("    What happens now:")
-        print("      · Browser has been closed.")
-        print("      · ResearchToken is saved locally AND registered with Firebase.")
-        print("      · This process will exit; setup does not stay running.")
+        print("    Setup is complete. To start accepting research jobs from the app:")
         print("")
-        print("    Next step — start the server:")
-        print("        python research.py --serve")
+        print("        1) Press  Ctrl+C   (close this --setup process)")
+        print("        2) Run    python research.py --serve")
         print("")
-        print("    Keep --serve running in a separate terminal while you use the")
-        print("    app. The app talks to this server via Firebase (no VPN/ngrok).")
-        print(f"  {BAR}")
+        print("    Then fire a topic in the Super Research app — this machine")
+        print("    will run the pipeline. Keep --serve running the whole time.")
+        print("")
+        # Stay alive so the user sees the message clearly until they Ctrl+C.
+        # A quick exit would scroll the message off-screen on some terminals.
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
     else:
         print(f"  {BAR}")
         print("    Setup timed out — some platforms are still not logged in.")
@@ -8114,11 +8111,9 @@ async def run_setup(profile_dir, wait_minutes=10):
             mark = "[ok]" if last_results.get(key) else "[  ]"
             print(f"        {mark}  {name}")
         print("")
-        print("    Your token is saved. Re-run:")
+        print("    Your token is saved. Re-run when ready:")
         print("        python research.py --setup")
         print("")
-        print(f"  {BAR}")
-    print("")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
