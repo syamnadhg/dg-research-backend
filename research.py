@@ -7894,7 +7894,33 @@ async def run_setup(profile_dir, wait_minutes=10):
         print(f"    Reusing existing token — delete {RESEARCH_CONFIG_PATH.name} to mint a new one.")
     else:
         token = generate_research_token()
-        print(f"    Minted new token, registered with Firebase.")
+        print(f"    Minted new token.")
+
+    # ALWAYS upsert the token in Firestore at every --setup run. Without this,
+    # a reused local token can drift out of Firestore (e.g., after a project
+    # migration) and the app will reject scans/pastes with "Invalid or unknown
+    # token" even though the local config looks fine. Upserting keeps the
+    # source-of-truth in the Firestore doc the app reads.
+    firestore_ok = False
+    if firebase_ok and _firebase_db:
+        try:
+            import socket
+            from google.cloud.firestore import SERVER_TIMESTAMP
+            _firebase_db.collection("research_tokens").document(token).set({
+                "status": "active",
+                "machineName": socket.gethostname(),
+                "lastHeartbeat": SERVER_TIMESTAMP,
+                "createdAt": SERVER_TIMESTAMP,  # setDoc merge would be ideal but we preserve existing via update-below if needed
+            }, merge=True)
+            firestore_ok = True
+            print(f"    [ok] Token registered in Firestore (project={_firebase_db.project}).")
+        except Exception as e:
+            log("    FIRESTORE REGISTRATION FAILED — the app will reject this token!", "ERROR")
+            log(f"        Error: {e}", "ERROR")
+            log("        Check firebase-service-account.json and your network.", "ERROR")
+    elif not firebase_ok:
+        log("    Firebase init failed — token is LOCAL ONLY and the app cannot validate it.", "ERROR")
+        log("        Make sure firebase-service-account.json exists and is valid.", "ERROR")
 
     print("")
     print(f"    Token: {token}")
