@@ -6951,6 +6951,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # platform is not logged in, emit `login_required` and pause the
         # pipeline — frontend shows a sticky banner with Retry.
         emit_event("phase_start", phase=0, description="Verifying environment + logins")
+        _update_firestore_research({"phase": 0, "currentPhase": 0, "status": "ongoing"})
         _p0_start = time.time()
 
         emit_event("agent_progress", phase=0, agent="system", status="Launching",
@@ -7115,6 +7116,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _preflight_tabs.clear()
                 emit_event("phase_start", phase=0,
                            description=f"Re-verifying environment + logins (attempt {attempt + 1})")
+                _update_firestore_research({"phase": 0, "currentPhase": 0, "status": "ongoing"})
                 _p0_start = time.time()  # Reset so the new tile shows fresh elapsed time
             log("Phase 0: resumed from login_required — re-running verification", "INFO")
             # Loop re-runs the checks — frontend's Retry button sends a
@@ -7154,6 +7156,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_skipped", phase=1, reason="Disabled in pipeline config")
         elif start_phase <= 1:
             emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
+            _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
             _p1_start = time.time()
             if brief_file:
                 brief_text = Path(brief_file).read_text(encoding="utf-8")
@@ -7568,6 +7571,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_skipped", phase=3, reason="Disabled in pipeline config")
         elif start_phase <= 3:
             emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
+            _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
             _p3_start = time.time()
             if not results:
                 for md_file in md_files:
@@ -7672,6 +7676,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_skipped", phase=4, reason=_reason)
         elif start_phase <= 4:
             emit_event("phase_start", phase=4, description="Converting audio to video + YouTube upload", agents=["youtube"])
+            _update_firestore_research({"phase": 4, "currentPhase": 4, "status": "ongoing"})
             _p4_start = time.time()
             if audio_path:
                 p5 = await run_phase4(browser, cua_client, audio_path, topic, queue_dir,
@@ -7749,6 +7754,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_skipped", phase=5, reason=_reason)
         else:
             emit_event("phase_start", phase=5, description="Creating Google Doc hub + sending email notification", agents=["gdocs", "gmail"])
+            _update_firestore_research({"phase": 5, "currentPhase": 5, "status": "ongoing"})
             _p5_start = time.time()
             # Use audio overview URL if extracted, else notebook URL as fallback
             _effective_audio_url = audio_overview_url if audio_overview_url else notebook_url
