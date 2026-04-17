@@ -5431,6 +5431,139 @@ async def ensure_deep_mode_active(page, platform, label):
     return True
 
 
+async def detect_human_verification(page, platform: str, label: str) -> tuple[bool, str]:
+    """Detect if the current page is blocked by a human-verification challenge.
+
+    Looks for the most common gates Claude / ChatGPT / Gemini use when they
+    flag the automated browser:
+      - Cloudflare Turnstile ("Just a moment..." / iframe[src*=challenges])
+      - Generic CAPTCHA iframes (reCAPTCHA, hCaptcha)
+      - Claude's own "Verify you are human" interstitial
+      - Anthropic's "Checking your browser" intermediate page
+
+    Returns (blocked, reason). `reason` is a short, user-readable string like
+    "Cloudflare challenge" or "reCAPTCHA" — safe to surface in a chat banner.
+
+    Never raises — on any detection error, returns (False, "").
+    """
+    try:
+        result = await page.evaluate("""() => {
+            const findings = [];
+            const text = (document.body?.innerText || '').toLowerCase();
+
+            // Cloudflare Turnstile / "Just a moment..."
+            if (document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile, .cf-challenge')) {
+                findings.push('Cloudflare');
+            }
+            if (text.includes('just a moment') && text.includes('cloudflare')) {
+                findings.push('Cloudflare');
+            }
+            if (text.includes('checking your browser') || text.includes('checking if the site connection is secure')) {
+                findings.push('Cloudflare');
+            }
+
+            // Google reCAPTCHA
+            if (document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, #recaptcha')) {
+                findings.push('reCAPTCHA');
+            }
+
+            // hCaptcha
+            if (document.querySelector('iframe[src*="hcaptcha"], .h-captcha')) {
+                findings.push('hCaptcha');
+            }
+
+            // Claude / Anthropic human-verification interstitials
+            if (text.includes('verify you are human') || text.includes('are you a human') ||
+                text.includes('please complete the security check') ||
+                text.includes('press and hold') || text.includes('tap and hold')) {
+                findings.push('Claude human verification');
+            }
+
+            // Generic "blocked" / access-denied pages that we should surface
+            if (text.includes('access denied') && text.length < 1000) {
+                findings.push('Access denied');
+            }
+
+            return { findings: [...new Set(findings)] };
+        }""")
+        findings = result.get("findings", []) if isinstance(result, dict) else []
+        if findings:
+            return True, findings[0]
+        return False, ""
+    except Exception as e:
+        log(f"[{label}] human-verification detect error: {e}", "WARN")
+        return False, ""
+
+
+async def wait_for_verification_clearance(browser, cua_client, page, platform: str, label: str,
+                                          verbose=False, max_wait_loops: int = 120) -> bool:
+    """Pause the pipeline and wait for the user to solve a human-verification gate.
+
+    Flow:
+      1. Emit human_verification_required event (frontend banner + Resume button)
+      2. request_pause on the asyncio controls
+      3. Wait for resume OR stop, polling the page every 5s to auto-detect clearance
+      4. On clearance (verification gone), auto-resume and return True
+      5. On stop, return False
+
+    Works for ANY platform (ChatGPT, Gemini, Claude, NotebookLM, etc.) — caller
+    passes the platform name + label for the banner copy.
+    """
+    # Detect the specific challenge so the UI can tell the user what to solve
+    _, reason = await detect_human_verification(page, platform, label)
+    log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
+    emit_event("human_verification_required", phase=2, agent=platform.lower(),
+               platform=platform.lower(),
+               platformLabel=platform.capitalize(),
+               reason=reason or "Human verification challenge",
+               message=f"{platform.capitalize()} is asking for human verification. Solve it in the browser, then tap Resume.")
+    _controls.request_pause()
+    emit_event("pipeline_paused", phase=2, reason="human_verification_required", agent=platform.lower())
+
+    # Poll every 5s — if the user solves the challenge without tapping Resume,
+    # we still notice and auto-continue. Also yields to stop/skip/resume signals.
+    platform_key = platform.lower()
+    for _ in range(max_wait_loops):
+        await asyncio.sleep(5)
+        if _controls.is_stop():
+            emit_event("pipeline_stopped", phase=2, reason="stopped during human_verification", agent=platform_key)
+            return False
+        # User tapped "Skip agent" in the banner → drop this agent cleanly
+        if platform_key in _controls.skipped_agents:
+            _controls.skipped_agents.discard(platform_key)
+            log(f"[{label}] User chose Skip agent during human verification — dropping {platform_key}", "INFO")
+            emit_event("agent_skipped", phase=2, agent=platform_key,
+                       reason="human_verification_skipped")
+            emit_event("pipeline_resumed", phase=2, reason="skip_agent_during_verification", agent=platform_key)
+            _controls.request_resume()
+            return False
+        if not _controls.is_pause():
+            # User tapped Resume — verify the challenge is actually cleared
+            blocked, _ = await detect_human_verification(page, platform, label)
+            if blocked:
+                log(f"[{label}] Resume tapped but verification still present — re-pausing", "WARN")
+                emit_event("human_verification_required", phase=2, agent=platform_key,
+                           platform=platform_key,
+                           platformLabel=platform.capitalize(),
+                           reason=reason or "Human verification challenge",
+                           message=f"{platform.capitalize()} still shows verification. Solve it first, then Resume.")
+                _controls.request_pause()
+                continue
+            log(f"[{label}] Verification cleared ✓")
+            emit_event("pipeline_resumed", phase=2, reason="human_verification_cleared", agent=platform_key)
+            return True
+        # Auto-detect clearance even without explicit resume
+        blocked, _ = await detect_human_verification(page, platform, label)
+        if not blocked:
+            log(f"[{label}] Verification auto-cleared ✓")
+            _controls.request_resume()
+            emit_event("pipeline_resumed", phase=2, reason="human_verification_cleared", agent=platform_key)
+            return True
+
+    log(f"[{label}] Human verification timed out ({max_wait_loops * 5}s) — skipping agent", "WARN")
+    return False
+
+
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
                                      brief, label, platform, verbose=False,
                                      brief_path=None):
@@ -5444,8 +5577,22 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     page = await browser.new_tab(url)
     await asyncio.sleep(4)
 
-    # LAYER 1: Playwright-direct setup first
+    # LAYER 0: Detect human-verification gates BEFORE Playwright setup tries to
+    # click selectors that don't exist under a Cloudflare / CAPTCHA overlay.
+    # If a challenge is present, pause the pipeline and let the user solve it
+    # in the browser, then auto-resume when cleared.
     platform_l = platform.lower()
+    blocked, reason = await detect_human_verification(page, platform, label)
+    if blocked:
+        cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
+        if not cleared:
+            emit_event("pipeline_error", phase=2, agent=platform,
+                       error=f"{platform.capitalize()} human verification unsolved — skipping this agent")
+            return page
+        # Settle after clearance — page often reloads to the real content
+        await asyncio.sleep(2)
+
+    # LAYER 1: Playwright-direct setup first
     setup_ok = False
     if platform_l == "chatgpt":
         setup_ok = await setup_chatgpt_dr(page)
@@ -5453,6 +5600,26 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         setup_ok = await setup_gemini_dr(page)
     elif platform_l == "claude":
         setup_ok = await setup_claude_dr(page)
+
+    # After Playwright tried to set up: if setup failed AND verification is now
+    # visible (it can appear mid-setup when Claude's automation detection trips),
+    # pause and wait before falling back to CUA.
+    if not setup_ok:
+        blocked, _ = await detect_human_verification(page, platform, label)
+        if blocked:
+            cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
+            if not cleared:
+                emit_event("pipeline_error", phase=2, agent=platform,
+                           error=f"{platform.capitalize()} human verification unsolved — skipping this agent")
+                return page
+            await asyncio.sleep(2)
+            # Retry Playwright setup once, now that the challenge is gone
+            if platform_l == "chatgpt":
+                setup_ok = await setup_chatgpt_dr(page)
+            elif platform_l == "gemini":
+                setup_ok = await setup_gemini_dr(page)
+            elif platform_l == "claude":
+                setup_ok = await setup_claude_dr(page)
 
     if setup_ok:
         log(f"[{label}] Playwright-direct setup OK")
