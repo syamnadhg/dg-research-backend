@@ -6781,6 +6781,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Loop re-runs the checks — frontend's Retry button sends a
             # standard `resume` command that lands us here.
 
+        # Close the preflight verification tabs — each phase opens its own
+        # tab on a fresh URL anyway, and carrying 7 idle tabs through the
+        # rest of the run bloats memory and clutters the window. The browser
+        # itself stays alive; only the Phase 0 verification tabs close.
+        _closed = 0
+        for _key, _tab in _preflight_tabs.items():
+            try:
+                await _tab.close()
+                _closed += 1
+            except Exception as _e:
+                log(f"Phase 0: tab close failed for {_key}: {_e}", "WARN")
+        _preflight_tabs.clear()
+        log(f"Phase 0: closed {_closed} preflight tab(s) before Phase 1")
+
         emit_event("agent_progress", phase=0, agent="system", status="ready",
                    progress=f"Environment verified. {len(preflight_platforms)} platform(s) logged in.")
         emit_event("phase_complete", phase=0,
