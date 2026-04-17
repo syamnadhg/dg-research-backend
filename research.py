@@ -648,6 +648,30 @@ def teardown_firestore_run():
     _fb_seq = 0
 
 
+_exit_scheduled = False
+
+
+def _schedule_server_exit(source: str, delay_sec: float = 3.0):
+    """Schedule a one-shot daemon thread that calls os._exit(0) after a short
+    delay, giving the pipeline time to emit pipeline_stopped + close the
+    browser cleanly. Idempotent: if the same run is stopped via BOTH the
+    Firestore command listener AND the HTTP endpoint, we only spawn one
+    exit thread. Called from whichever stop transport fires first.
+    """
+    global _exit_scheduled
+    if _exit_scheduled:
+        log(f"[{source}] Exit already scheduled — ignoring duplicate", "INFO")
+        return
+    _exit_scheduled = True
+    import threading as _threading
+    def _runner():
+        import time as _t, os as _os
+        _t.sleep(delay_sec)
+        log(f"Exiting server after Stop ({source})", "WARN")
+        _os._exit(0)
+    _threading.Thread(target=_runner, daemon=True).start()
+
+
 def _emit_to_firestore(event):
     """Write event to Firestore pipeline_events subcollection."""
     global _fb_seq
@@ -738,16 +762,7 @@ def _start_command_listener(uid, research_id, loop):
                     try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
                     except Exception: pass
                 log("Command received: STOP — server will exit after cleanup")
-                # Schedule a delayed server exit so pipeline can close browser + emit final events.
-                # 3s is enough for pipeline_stopped to emit; anything longer leaves the user
-                # staring at a "Stopped" tile while the backend is still alive.
-                import threading
-                def _exit_after_stop():
-                    import time as _t, os as _os
-                    _t.sleep(3)
-                    log("Exiting server after Stop", "WARN")
-                    _os._exit(0)
-                threading.Thread(target=_exit_after_stop, daemon=True).start()
+                _schedule_server_exit("firestore-command")
             elif action == "pause":
                 loop.call_soon_threadsafe(_controls.request_pause)
                 if _tracks_dir:
@@ -835,7 +850,15 @@ def _start_command_listener(uid, research_id, loop):
                 else:
                     loop.call_soon_threadsafe(_controls.set_agent_decision, decision)
                     if decision == "stop":
+                        # Full stop semantics — match the dedicated STOP action:
+                        # flip the asyncio event, write the sentinel, and
+                        # schedule the server exit. Previously this path set
+                        # only the event, leaving the backend alive.
                         loop.call_soon_threadsafe(_controls.request_stop)
+                        if _tracks_dir:
+                            try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
+                            except Exception: pass
+                        _schedule_server_exit("agent-decision-stop")
                     # Release the pause so the phase coroutine can consume the decision
                     loop.call_soon_threadsafe(_controls.request_resume)
                     log(f"Command received: AGENT_DECISION agent={agent} decision={decision}")
@@ -867,10 +890,12 @@ class PipelineControls:
         # Phase 0: user hit Retry on the login_required banner — triggers a
         # fresh phase_start emit so the frontend can render a new tile below.
         self.retry_init_verify: bool = False
-        # Phase 2: per-agent skip requests from the ETA-overrun banner.
-        # Lower-case agent keys (chatgpt, gemini, claude). The polling loop
-        # consumes these on its next tick — drops the agent from `pending`,
-        # extracts whatever partial output exists, and emits agent_skipped.
+        # Phase 2: per-agent skip requests. Sent by the watchdog's
+        # BackendSilentBanner (when a specific agent is picked mid-stall) and
+        # by HumanVerifyBanner's "Skip agent" button. Lower-case agent keys
+        # (chatgpt, gemini, claude). The Phase 2 polling loop consumes these
+        # on its next tick — drops the agent from `pending`, extracts whatever
+        # partial output exists, and emits agent_skipped.
         self.skipped_agents: set[str] = set()
         # Watchdog banner's "Skip phase" button queues phase numbers here.
         # Each phase's coroutine checks is_phase_skip_requested(N) at its
@@ -999,20 +1024,19 @@ class PipelineControls:
 
     def request_skip_phase(self, phase: int):
         """User picked "Skip phase" from the 45-min backend-silent banner.
-        The current phase coroutine checks is_phase_skip_requested() at each
-        yield point and exits early with a phase_skipped event, so partial
-        results survive and the pipeline advances to the next phase."""
+        Each phase calls consume_phase_skip(N) at its entry branch — if True,
+        the phase emits phase_skipped(reason=user_skip) instead of running,
+        and the pipeline advances to the next phase with whatever partial
+        results already exist."""
         try:
             self.skipped_phases.add(int(phase))
         except (TypeError, ValueError):
             pass
 
-    def is_phase_skip_requested(self, phase: int) -> bool:
-        return int(phase) in self.skipped_phases
-
     def consume_phase_skip(self, phase: int) -> bool:
-        """Called by the phase coroutine once it's acted on the skip — removes
-        the flag so the next phase doesn't inherit it."""
+        """Check + clear the skip flag for this phase. True when a skip was
+        queued; consuming it here ensures a subsequent phase doesn't inherit
+        the flag."""
         try:
             p = int(phase)
         except (TypeError, ValueError):
@@ -4042,7 +4066,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue
             return results
 
-        # ── Mid-run skip (from ETA overrun banner) ──
+        # ── Mid-run skip (from BackendSilentBanner or HumanVerifyBanner) ──
         # User hit "Skip [agent]" in the UI → _controls.skipped_agents has
         # the lowercase name. Extract whatever partial output exists from
         # that tab and drop it from `pending` so the rest of Phase 2 keeps
@@ -7147,23 +7171,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         d.update(new_fields)
         d_path.write_text(json.dumps(d, indent=2), encoding="utf-8")
 
-    # ── Helper: check if user requested stop or pause ──
-    def stop_requested():
-        """True if terminal stop requested (pipeline is DONE)."""
-        return (queue_dir / ".stop").exists()
-
-    def pause_requested():
-        """True if pause requested (pipeline is FROZEN, can resume)."""
-        return (queue_dir / ".pause").exists()
-
-    def stop_or_pause_requested():
-        """True if either stop or pause — used in between-phase checks."""
-        return stop_requested() or pause_requested()
-
-    def clear_pause():
-        p = queue_dir / ".pause"
-        if p.exists():
-            p.unlink()
+    # Stop/pause are driven through `_controls` (asyncio events) now. The
+    # .stop and .pause sentinel files are still written by the HTTP endpoints
+    # for backward-compat with the resume flow + pipeline_state reporting —
+    # no in-pipeline helper needed here.
 
     # ── Helper: read user feedback for a phase ──
     def get_feedback(phase_num):
@@ -8244,18 +8255,11 @@ async def run_server(port=8000):
         p = queue / ".pause"
         if p.exists():
             p.unlink()
-        # Also set asyncio event for immediate response
+        # Set asyncio event for immediate response, then schedule the backend
+        # exit via the shared helper. Idempotent if the Firestore-command path
+        # already fired — we won't spawn duplicate exit threads.
         _controls.request_stop()
-        # Schedule backend exit so Stop truly ends things even when the pipeline
-        # is stuck in a long Playwright wait or retry loop. Daemon thread so it
-        # doesn't block the response.
-        import threading as _threading
-        def _exit_after_http_stop():
-            import time as _t, os as _os
-            _t.sleep(3)
-            log("Exiting server after HTTP stop", "WARN")
-            _os._exit(0)
-        _threading.Thread(target=_exit_after_http_stop, daemon=True).start()
+        _schedule_server_exit("http-endpoint")
         return {"status": "stop_requested", "id": run_id}
 
     @app.post("/api/runs/{run_id}/pause")
@@ -8636,6 +8640,12 @@ async def run_setup(profile_dir, wait_minutes=10):
     print(f"       {_c(_ACCENT, '•')} Scan QR  {_c(_DIM, '→')}  chat → Connect → Scan QR")
     print(f"       {_c(_ACCENT, '•')} or Paste {_c(_DIM, '→')}  Account → Pipeline Connection")
     print()
+    # Capture the start timestamp BEFORE clearing so that an app-side claim
+    # racing with our clear (claim writes `linkedAt: serverTimestamp()`) still
+    # falls within the freshness window below. Clock-skew tolerance of 30s
+    # further absorbs server/client drift.
+    setup_started_ms = int(time.time() * 1000)
+
     # Critical: clear any stale link fields from a previous --setup run BEFORE
     # we start watching. If the user unlinked via the app but the release write
     # silently failed, `linkedUid` might still be present — we'd read it here
@@ -8654,10 +8664,10 @@ async def run_setup(profile_dir, wait_minutes=10):
     print(f"  {_c(_DIM, 'Waiting for the app to pair…')}  {_c(_DIM, '(Ctrl+C to cancel)')}")
 
     # Watch the token doc — the app calls claimResearchToken after validating
-    # + saving, which writes {linkedUid, linkedEmail, linkedAt} here. We now
+    # + saving, which writes {linkedUid, linkedEmail, linkedAt} here. We
     # require ALL THREE to be present, plus linkedAt newer than this --setup
-    # started, so a stale pre-run claim can never slip through.
-    setup_started_ms = int(time.time() * 1000)
+    # started (with 30s skew tolerance), so a stale pre-run claim can never
+    # slip through.
     linked_uid: str | None = None
     linked_email: str | None = None
     link_deadline = time.time() + wait_minutes * 60
