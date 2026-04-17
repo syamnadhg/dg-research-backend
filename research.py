@@ -1007,15 +1007,61 @@ class SessionExpiredError(Exception):
 
 LOGIN_PLATFORMS = {
     # Markers must be AUTH-SPECIFIC: profile menus, account chips, chat history
-    # lists. Never use generic input elements (textarea, rich-textarea) — those
-    # appear on logged-out landing pages too and cause false positives.
-    "chatgpt":    {"root": "https://chatgpt.com/",           "markers": ['button[data-testid="profile-button"]', 'button[aria-label="Open Profile Menu"]', 'nav[aria-label="Chat history"]']},
-    "gemini":     {"root": "https://gemini.google.com/app",  "markers": ['a[aria-label*="Google Account"]', '.gb_d[aria-label*="Google Account"]', 'div[data-test-id="app-root-side-nav"]']},
-    "claude":     {"root": "https://claude.ai/chats",        "markers": ['button[data-testid="user-menu-button"]', 'button[aria-label*="account"]', 'div[data-testid="chat-list"]']},
-    "notebooklm": {"root": "https://notebooklm.google.com/", "markers": ['a[aria-label*="Google Account"]', 'project-button', 'create-new-button']},
-    "youtube":    {"root": "https://studio.youtube.com/",    "markers": ['ytcp-navigation-drawer', 'ytcp-button[id="create-icon"]', 'tp-yt-iron-icon[icon-id="channel-icon"]']},
-    "gmail":      {"root": "https://mail.google.com/mail/",  "markers": ['div[gh="cm"]', 'a[aria-label*="Compose"]', 'div[role="main"][data-tab-id]']},
-    "gdocs":      {"root": "https://docs.google.com/document/u/0/", "markers": ['a[aria-label*="Google Account"]', '.docs-homescreen-gb-container']},
+    # lists, compose buttons. Never use generic input elements (textarea,
+    # rich-textarea) — those appear on logged-out landing pages too and cause
+    # false positives. We list MULTIPLE markers per platform to be resilient
+    # to UI drift; verify_login() matches if ANY selector is present.
+    "chatgpt":    {"root": "https://chatgpt.com/", "markers": [
+        'button[data-testid="profile-button"]',
+        'button[aria-label="Open Profile Menu"]',
+        'nav[aria-label="Chat history"]',
+        'a[href="/gpts"]',
+        'button[data-testid="create-new-chat-button"]',
+        'aside[class*="sidebar"] a[href*="/c/"]',  # existing chat links in sidebar
+    ]},
+    "gemini":     {"root": "https://gemini.google.com/app", "markers": [
+        'a[aria-label*="Google Account"]',
+        '.gb_d[aria-label*="Google Account"]',
+        'bard-sidenav',
+        'button[aria-label*="New chat"]',
+        'side-navigation-v2',
+        'button[aria-label*="Sign out"]',
+    ]},
+    "claude":     {"root": "https://claude.ai/chats", "markers": [
+        'button[data-testid="user-menu-button"]',
+        'button[aria-label*="account"]',
+        'div[data-testid="chat-list"]',
+        'a[data-testid="starter-prompt"]',
+        'button[aria-label*="New Chat"]',
+        'nav a[href*="/recents"]',
+    ]},
+    "notebooklm": {"root": "https://notebooklm.google.com/", "markers": [
+        'a[aria-label*="Google Account"]',
+        'project-button',
+        'create-new-button',
+        'button[aria-label*="Create"]',
+        '.mat-mdc-card-title',  # project cards on the home page
+    ]},
+    "youtube":    {"root": "https://studio.youtube.com/", "markers": [
+        'ytcp-navigation-drawer',
+        'ytcp-button[id="create-icon"]',
+        'tp-yt-iron-icon[icon-id="channel-icon"]',
+        'ytcp-entity-avatar',
+        'tp-yt-paper-icon-button[aria-label*="Upload"]',
+    ]},
+    "gmail":      {"root": "https://mail.google.com/mail/", "markers": [
+        'div[gh="cm"]',
+        'a[aria-label*="Compose"]',
+        'div[role="main"][data-tab-id]',
+        'div[jsname][gh="mtb"]',  # mail toolbar
+        'a[aria-label*="Gmail"][role="button"]',
+    ]},
+    "gdocs":      {"root": "https://docs.google.com/document/u/0/", "markers": [
+        'a[aria-label*="Google Account"]',
+        '.docs-homescreen-gb-container',
+        'c-wiz[data-p]',  # main content container (only post-auth)
+        'div[role="main"][aria-label*="Docs home"]',
+    ]},
 }
 
 
@@ -1053,7 +1099,7 @@ async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_tim
             if h in current:
                 return False
 
-        # DOM marker check
+        # DOM marker check — any positive match means logged in.
         for sel in info["markers"]:
             try:
                 loc = page.locator(sel)
@@ -1063,20 +1109,35 @@ async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_tim
             except Exception:
                 continue
 
-        # Fallback: visible password input → not logged in
+        # Negative signals — presence of a password input OR a prominent
+        # "Sign in / Log in" button means NOT logged in.
         try:
-            has_pw = await page.evaluate(
-                "() => !!document.querySelector('input[type=\"password\"]')"
-            )
-            if has_pw:
+            has_negative = await page.evaluate("""() => {
+                if (document.querySelector('input[type="password"]')) return true;
+                const LOGIN_RE = /^\\s*(sign\\s*in|log\\s*in|log\\s*on|continue with google)\\s*$/i;
+                const buttons = document.querySelectorAll('button, a[role="button"], a');
+                for (const b of buttons) {
+                    const t = (b.textContent || '').trim();
+                    if (!t || t.length > 40) continue;
+                    if (!LOGIN_RE.test(t)) continue;
+                    const r = b.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0 && r.top < window.innerHeight) return true;
+                }
+                return false;
+            }""")
+            if has_negative:
                 return False
         except Exception:
             pass
 
-        # No login marker AND no positive login signal — treat as unknown/false.
-        # Being conservative here prevents false "logged in" when DOM selectors
-        # drift. Callers can retry after the user completes login.
-        return False
+        # Ambiguous — no positive markers, no negative signals. Previously we
+        # defaulted to False, which trapped users in a retry loop whenever
+        # our selectors drifted. Fail OPEN here: the pipeline will surface
+        # real session errors downstream (login-wall redirects on navigation,
+        # SessionExpiredError from check_auth, etc.) but won't block on a
+        # DOM selector that hasn't been updated for the platform's latest UI.
+        log(f"[verify_login] {platform}: ambiguous (no markers + no negative signals) — assuming logged in", "WARN")
+        return True
     except Exception as e:
         log(f"[verify_login] {platform}: {e}", "WARN")
         return False
