@@ -796,6 +796,17 @@ def _start_command_listener(uid, research_id, loop):
                 # tile renders below the retry banner.
                 loop.call_soon_threadsafe(_controls.request_retry_init_verify)
                 log("Command received: RETRY_INIT_VERIFY — re-running Phase 0 with a fresh tile")
+            elif action == "skip_agent":
+                # Skip a stuck Phase 2 agent without stopping the rest of the
+                # phase. The polling loop consumes _controls.skipped_agents on
+                # its next tick: extracts partial output from that agent's
+                # page and drops it from `pending`.
+                _ag = (data.get("agent", "") or "").strip().lower()
+                if _ag in ("chatgpt", "gemini", "claude"):
+                    loop.call_soon_threadsafe(_controls.request_skip_agent, _ag)
+                    log(f"Command received: SKIP_AGENT agent={_ag}")
+                else:
+                    log(f"Command received: SKIP_AGENT rejected — unknown agent '{_ag}'", "WARN")
             elif action == "agent_decision":
                 # Frontend response to agent_link_failed modal.
                 decision = (data.get("decision", "") or "").lower()
@@ -837,6 +848,11 @@ class PipelineControls:
         # Phase 0: user hit Retry on the login_required banner — triggers a
         # fresh phase_start emit so the frontend can render a new tile below.
         self.retry_init_verify: bool = False
+        # Phase 2: per-agent skip requests from the ETA-overrun banner.
+        # Lower-case agent keys (chatgpt, gemini, claude). The polling loop
+        # consumes these on its next tick — drops the agent from `pending`,
+        # extracts whatever partial output exists, and emits agent_skipped.
+        self.skipped_agents: set[str] = set()
 
     def request_stop(self):
         self.stop_event.set()
@@ -931,6 +947,7 @@ class PipelineControls:
         self.pending_agent_decision = None
         self.skip_init_verify = False
         self.retry_init_verify = False
+        self.skipped_agents.clear()
 
     def request_skip_init_verify(self):
         """User clicked 'Skip verification' in Phase 0 dropdown — bail the
@@ -948,6 +965,14 @@ class PipelineControls:
         self.retry_init_verify = True
         self.pause_event.clear()
         self.resume_event.set()
+
+    def request_skip_agent(self, agent: str):
+        """User hit the Skip button on a stuck Phase 2 agent. The polling
+        loop checks this set on every tick and drops any listed agent from
+        `pending`, keeping the rest of the phase running."""
+        key = (agent or "").strip().lower()
+        if key:
+            self.skipped_agents.add(key)
 
     async def interruptible_sleep(self, seconds, check_interval=10):
         """Sleep in small increments, checking stop/pause every check_interval seconds.
@@ -3968,6 +3993,40 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 emit_event("pipeline_resumed", phase=2)
                 continue
             return results
+
+        # ── Mid-run skip (from ETA overrun banner) ──
+        # User hit "Skip [agent]" in the UI → _controls.skipped_agents has
+        # the lowercase name. Extract whatever partial output exists from
+        # that tab and drop it from `pending` so the rest of Phase 2 keeps
+        # going with the remaining agents.
+        _skip_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
+        for _ag_key in list(_controls.skipped_agents):
+            _agent_name = _skip_name_map.get(_ag_key)
+            if _agent_name and _agent_name in pending:
+                p = pending[_agent_name]
+                log(f"[{_agent_name}] Skipped by user — extracting partial output", "WARN")
+                try:
+                    await browser.switch_to_page(p["page"])
+                    _partial = await extract_fns[_agent_name](
+                        p["page"], browser=browser, cua_client=cua_client,
+                        label=_agent_name, verbose=verbose)
+                except Exception as _e:
+                    log(f"[{_agent_name}] Skip-extract failed: {_e}", "WARN")
+                    _partial = ""
+                results[_agent_name] = {
+                    "status": "skipped_by_user",
+                    "text": _partial or "",
+                    "url": p.get("url", ""),
+                    "page": p["page"],
+                    "elapsed_sec": int(time.time() - p["start_time"]),
+                }
+                del pending[_agent_name]
+                emit_event("agent_skipped", phase=2, agent=_ag_key,
+                           reason="user_skip",
+                           partial_chars=len(_partial or ""))
+            # Whether or not the agent was actually in pending, clear it from
+            # the skip set so we don't keep firing agent_skipped every tick.
+            _controls.skipped_agents.discard(_ag_key)
 
         for name in list(pending.keys()):
             p = pending[name]
