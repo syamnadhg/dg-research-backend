@@ -20,6 +20,7 @@ import re
 import time
 import json
 import base64
+import socket
 import asyncio
 import shutil
 import argparse
@@ -38,7 +39,7 @@ if sys.platform == "win32":
 PROFILE_DIR = Path.home() / ".openclaw" / "browser-profile"
 BETA_FLAG = "computer-use-2025-11-24"
 # All configurable via env vars (defaults are production-tuned)
-CUA_MODEL = os.environ.get("CUA_MODEL", "claude-opus-4-6")
+CUA_MODEL = os.environ.get("CUA_MODEL", "claude-opus-4-7")
 API_WIDTH = int(os.environ.get("CUA_SCREEN_WIDTH", "1280"))
 API_HEIGHT = int(os.environ.get("CUA_SCREEN_HEIGHT", "800"))
 
@@ -195,7 +196,7 @@ _fb_uid = None          # Per-run: user ID for Firestore path
 _fb_research_id = None  # Per-run: research ID for Firestore path
 _fb_seq = 0             # Per-run: monotonic event sequence number
 _fb_listener = None     # Per-run: command listener unsubscribe handle
-_pipe_token = None      # PipeToken: this backend instance's unique ID
+_research_token = None  # ResearchToken: this backend instance's unique ID
 
 
 def init_firebase():
@@ -248,35 +249,54 @@ def init_firebase():
 _start_listener = None  # Global start-command listener
 _heartbeat_task = None  # Async task: writes lastHeartbeat every 30s
 
-PIPE_CONFIG_PATH = Path(__file__).parent / "pipe_config.json"
+RESEARCH_CONFIG_PATH = Path(__file__).parent / "research_config.json"
+# Legacy path — auto-migrated on first load so existing users don't lose their token.
+_LEGACY_PIPE_CONFIG_PATH = Path(__file__).parent / "pipe_config.json"
 
 
-def load_pipe_token():
-    """Load PipeToken from local pipe_config.json (or PIPE_TOKEN env var).
-    Returns the token string or None if not set up yet."""
-    global _pipe_token
+def load_research_token():
+    """Load ResearchToken from local research_config.json (or RESEARCH_TOKEN env var).
+    Returns the token string or None if not set up yet.
+
+    Auto-migrates old pipe_config.json → research_config.json if found (one-time).
+    """
+    global _research_token
     # Env var takes precedence (for Docker/CI deployments)
-    env_token = os.environ.get("PIPE_TOKEN", "").strip()
+    env_token = os.environ.get("RESEARCH_TOKEN", "").strip() or os.environ.get("PIPE_TOKEN", "").strip()
     if env_token:
-        _pipe_token = env_token
-        return _pipe_token
-    # Local config file
-    if PIPE_CONFIG_PATH.exists():
+        _research_token = env_token
+        return _research_token
+
+    # One-time migration: pipe_config.json → research_config.json
+    if _LEGACY_PIPE_CONFIG_PATH.exists() and not RESEARCH_CONFIG_PATH.exists():
         try:
-            cfg = json.loads(PIPE_CONFIG_PATH.read_text(encoding="utf-8"))
-            _pipe_token = cfg.get("pipeToken", "").strip() or None
-            return _pipe_token
+            legacy = json.loads(_LEGACY_PIPE_CONFIG_PATH.read_text(encoding="utf-8"))
+            migrated = {
+                "researchToken": legacy.get("pipeToken", "").strip(),
+                "machineName": legacy.get("machineName", ""),
+            }
+            if migrated["researchToken"]:
+                RESEARCH_CONFIG_PATH.write_text(json.dumps(migrated, indent=2), encoding="utf-8")
+                log(f"Migrated pipe_config.json → research_config.json")
+        except Exception as e:
+            log(f"Migration of pipe_config.json failed: {e}", "WARN")
+
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+            _research_token = (cfg.get("researchToken") or cfg.get("pipeToken") or "").strip() or None
+            return _research_token
         except Exception:
             pass
     return None
 
 
-def generate_pipe_token():
-    """Generate a new PipeToken, store it in Firestore + local config.
+def generate_research_token():
+    """Generate a new ResearchToken, store it in Firestore + local config.
     Called during --setup. Returns the token string."""
     import uuid
     import socket
-    global _pipe_token
+    global _research_token
     token = str(uuid.uuid4())
     machine_name = socket.gethostname()
 
@@ -284,40 +304,40 @@ def generate_pipe_token():
     if _firebase_db:
         try:
             from google.cloud.firestore import SERVER_TIMESTAMP
-            _firebase_db.collection("pipe_tokens").document(token).set({
+            _firebase_db.collection("research_tokens").document(token).set({
                 "status": "active",
                 "machineName": machine_name,
                 "createdAt": SERVER_TIMESTAMP,
                 "lastHeartbeat": SERVER_TIMESTAMP,
             })
-            log(f"PipeToken registered in Firestore: {token[:8]}...")
+            log(f"ResearchToken registered in Firestore: {token[:8]}...")
         except Exception as e:
-            log(f"Failed to register PipeToken in Firestore: {e}", "WARN")
+            log(f"Failed to register ResearchToken in Firestore: {e}", "WARN")
 
     # Store locally
     local_cfg = {}
-    if PIPE_CONFIG_PATH.exists():
+    if RESEARCH_CONFIG_PATH.exists():
         try:
-            local_cfg = json.loads(PIPE_CONFIG_PATH.read_text(encoding="utf-8"))
+            local_cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-    local_cfg["pipeToken"] = token
+    local_cfg["researchToken"] = token
     local_cfg["machineName"] = machine_name
-    PIPE_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
-    log(f"PipeToken saved to {PIPE_CONFIG_PATH.name}")
+    RESEARCH_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
+    log(f"ResearchToken saved to {RESEARCH_CONFIG_PATH.name}")
 
-    _pipe_token = token
+    _research_token = token
     return token
 
 
 async def _heartbeat_loop():
-    """Write lastHeartbeat to pipe_tokens/{token} every 30s so the frontend
+    """Write lastHeartbeat to research_tokens/{token} every 30s so the frontend
     can show Online/Offline status."""
     from google.cloud.firestore import SERVER_TIMESTAMP
     while True:
         try:
-            if _firebase_db and _pipe_token:
-                _firebase_db.collection("pipe_tokens").document(_pipe_token).update({
+            if _firebase_db and _research_token:
+                _firebase_db.collection("research_tokens").document(_research_token).update({
                     "lastHeartbeat": SERVER_TIMESTAMP,
                     "status": "active",
                 })
@@ -477,21 +497,21 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
 
 
 def start_firestore_start_listener(job_queue, loop):
-    """Listen for pipeline start requests via this backend's PipeToken queue.
-    Frontend writes to: pipe_tokens/{token}/queue/{auto-id}
+    """Listen for pipeline start requests via this backend's ResearchToken queue.
+    Frontend writes to: research_tokens/{token}/queue/{auto-id}
     Backend picks it up, queues the job, writes run_id back.
-    Falls back to global pipeline_requests/ if no PipeToken is set (legacy)."""
+    Falls back to global pipeline_requests/ if no ResearchToken is set (legacy)."""
     global _start_listener
     if not _firebase_db:
         return
 
     # Token-scoped queue (preferred) vs legacy global collection
-    if _pipe_token:
-        col_ref = _firebase_db.collection("pipe_tokens").document(_pipe_token).collection("queue")
-        listener_label = f"pipe_tokens/{_pipe_token[:8]}…/queue/"
+    if _research_token:
+        col_ref = _firebase_db.collection("research_tokens").document(_research_token).collection("queue")
+        listener_label = f"research_tokens/{_research_token[:8]}…/queue/"
     else:
         col_ref = _firebase_db.collection("pipeline_requests")
-        listener_label = "pipeline_requests/ (legacy — run --setup to get a PipeToken)"
+        listener_label = "pipeline_requests/ (legacy — run --setup to get a ResearchToken)"
 
     def on_snapshot(col_snapshot, changes, read_time):
         for change in changes:
@@ -599,6 +619,32 @@ def _update_firestore_research(updates):
         log(f"Firestore research update failed: {e}", "WARN")
 
 
+def _read_firestore_research_title(fallback=""):
+    """Read the current `title` field from the research doc in Firestore.
+    Frontend's /api/title fills this with a smart 4–8 word title right after
+    pipeline start. Returns the fallback (typically topic[:60]) if empty."""
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return fallback
+    try:
+        snap = _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            title = (data.get("title") or "").strip()
+            if title:
+                return title
+    except Exception as e:
+        log(f"Firestore title read failed: {e}", "WARN")
+    return fallback
+
+
+def smart_title(topic: str) -> str:
+    """Return the best short title for this run. Prefers the frontend-generated
+    smart title in Firestore; falls back to topic[:60] cleaned up."""
+    clean_fallback = (topic or "").strip().split("\n", 1)[0][:60].strip()
+    return _read_firestore_research_title(fallback=clean_fallback) or clean_fallback
+
+
 def _write_config_to_disk(cfg_updates):
     """Write config updates to config.json on disk (so reload_config() picks them up).
     Merges with existing config — does not overwrite."""
@@ -668,7 +714,13 @@ def _start_command_listener(uid, research_id, loop):
                         except Exception: pass
             elif action == "add_context":
                 text = data.get("text", "")
-                if text:
+                # Only Phase 1 + Phase 2 accept add_context. Post-P2, input is
+                # a no-op so downstream artifacts (NotebookLM / YouTube / Doc)
+                # aren't disrupted mid-flight. Frontend disables the input
+                # field during P3+; this is the belt-and-suspenders guard.
+                if _runtime.phase >= 3:
+                    log(f"Command received: ADD_CONTEXT IGNORED (phase={_runtime.phase} — post-P2 input disabled)", "WARN")
+                elif text:
                     loop.call_soon_threadsafe(_controls.add_context, text)
                     log(f"Command received: ADD_CONTEXT ({len(text)} chars)")
             elif action == "config":
@@ -677,6 +729,19 @@ def _start_command_listener(uid, research_id, loop):
                     loop.call_soon_threadsafe(_controls.update_config, cfg)
                     _write_config_to_disk(cfg)
                     log(f"Command received: CONFIG update (written to disk)")
+            elif action == "agent_decision":
+                # Frontend response to agent_link_failed modal.
+                decision = (data.get("decision", "") or "").lower()
+                agent = data.get("agent", "")
+                if decision not in ("retry", "skip", "stop"):
+                    log(f"Command received: AGENT_DECISION agent={agent} INVALID decision={decision}", "WARN")
+                else:
+                    loop.call_soon_threadsafe(_controls.set_agent_decision, decision)
+                    if decision == "stop":
+                        loop.call_soon_threadsafe(_controls.request_stop)
+                    # Release the pause so the phase coroutine can consume the decision
+                    loop.call_soon_threadsafe(_controls.request_resume)
+                    log(f"Command received: AGENT_DECISION agent={agent} decision={decision}")
             # Mark processed
             try:
                 doc.reference.update({"processed": True})
@@ -698,6 +763,8 @@ class PipelineControls:
         self.resume_event = asyncio.Event()
         self.extra_context: list = []
         self._config_updates: dict = {}
+        # B1: per-agent link-fail decision ("retry" | "skip" | "stop")
+        self.pending_agent_decision: str | None = None
 
     def request_stop(self):
         self.stop_event.set()
@@ -708,6 +775,17 @@ class PipelineControls:
     def request_resume(self):
         self.pause_event.clear()
         self.resume_event.set()
+
+    def set_agent_decision(self, decision: str):
+        """Called from command listener when user chooses retry/skip/stop
+        for an agent_link_failed prompt. Also releases the pause."""
+        if decision in ("retry", "skip", "stop"):
+            self.pending_agent_decision = decision
+
+    def pop_agent_decision(self) -> str | None:
+        d = self.pending_agent_decision
+        self.pending_agent_decision = None
+        return d
 
     # Size cap for accumulated context (prevents runaway growth across pause cycles)
     MAX_EXTRA_CONTEXT_CHARS = 50_000
@@ -778,6 +856,7 @@ class PipelineControls:
         self.resume_event.clear()
         self.extra_context.clear()
         self._config_updates.clear()
+        self.pending_agent_decision = None
 
     async def interruptible_sleep(self, seconds, check_interval=10):
         """Sleep in small increments, checking stop/pause every check_interval seconds.
@@ -815,6 +894,10 @@ class PipelineRuntime:
         self.browser = None
         self.cua_client = None
         self.dispatcher_task = None
+        # Mid-phase restart signal: set when a paused phase resumes with buffered
+        # extra_context. Caller coroutines check this and bail out early so the
+        # orchestrator can re-run the phase with the combined input.
+        self.restart_requested = False
 
     def reset(self):
         self.__init__()
@@ -909,6 +992,94 @@ def validate_email(email):
 class SessionExpiredError(Exception):
     """Raised when a platform's chat URL redirects to login after resume."""
     pass
+
+
+# ── Platform login markers + root URLs (used by verify_login + setup) ────
+#
+# Each entry maps a platform key (matching the ones emitted to the frontend)
+# to the minimum set of DOM signals that confirm a logged-in session. The
+# first marker is checked via Playwright's fast `locator.count()` — a non-zero
+# count means logged in. If all markers miss, we fall back to the URL/form
+# check from `check_auth()`.
+#
+# Keep selectors LOOSE — they should survive minor UI tweaks. We care about
+# "is this user authenticated" not "is a specific button present".
+
+LOGIN_PLATFORMS = {
+    # Markers must be AUTH-SPECIFIC: profile menus, account chips, chat history
+    # lists. Never use generic input elements (textarea, rich-textarea) — those
+    # appear on logged-out landing pages too and cause false positives.
+    "chatgpt":    {"root": "https://chatgpt.com/",           "markers": ['button[data-testid="profile-button"]', 'button[aria-label="Open Profile Menu"]', 'nav[aria-label="Chat history"]']},
+    "gemini":     {"root": "https://gemini.google.com/app",  "markers": ['a[aria-label*="Google Account"]', '.gb_d[aria-label*="Google Account"]', 'div[data-test-id="app-root-side-nav"]']},
+    "claude":     {"root": "https://claude.ai/chats",        "markers": ['button[data-testid="user-menu-button"]', 'button[aria-label*="account"]', 'div[data-testid="chat-list"]']},
+    "notebooklm": {"root": "https://notebooklm.google.com/", "markers": ['a[aria-label*="Google Account"]', 'project-button', 'create-new-button']},
+    "youtube":    {"root": "https://studio.youtube.com/",    "markers": ['ytcp-navigation-drawer', 'ytcp-button[id="create-icon"]', 'tp-yt-iron-icon[icon-id="channel-icon"]']},
+    "gmail":      {"root": "https://mail.google.com/mail/",  "markers": ['div[gh="cm"]', 'a[aria-label*="Compose"]', 'div[role="main"][data-tab-id]']},
+    "gdocs":      {"root": "https://docs.google.com/document/u/0/", "markers": ['a[aria-label*="Google Account"]', '.docs-homescreen-gb-container']},
+}
+
+
+async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_timeout: int = 15000) -> bool:
+    """Verify the platform session is authenticated on the given page.
+
+    Checks (in order):
+      1. Any of the platform's DOM markers is present (fast, deterministic).
+      2. Fallback: URL/form heuristic from check_auth() — returns False only if
+         a login URL pattern matches or a password input is visible.
+
+    When `ensure_nav=True`, navigates to the platform root before checking so
+    callers don't have to set up the URL themselves.
+    """
+    info = LOGIN_PLATFORMS.get(platform.lower())
+    if not info:
+        return False  # Unknown platform — fail closed
+
+    try:
+        if ensure_nav:
+            try:
+                await page.goto(info["root"], wait_until="domcontentloaded", timeout=nav_timeout)
+            except Exception:
+                pass
+            # Small settle so SPA hydration paints the nav
+            await asyncio.sleep(1.5)
+
+        # If URL is obviously a login URL, short-circuit to False
+        try:
+            current = (page.url or "").lower()
+        except Exception:
+            current = ""
+        login_hosts = ("auth.openai.com", "accounts.google.com/signin", "login.live.com", "claude.ai/login", "claude.ai/signup")
+        for h in login_hosts:
+            if h in current:
+                return False
+
+        # DOM marker check
+        for sel in info["markers"]:
+            try:
+                loc = page.locator(sel)
+                cnt = await loc.count()
+                if cnt > 0:
+                    return True
+            except Exception:
+                continue
+
+        # Fallback: visible password input → not logged in
+        try:
+            has_pw = await page.evaluate(
+                "() => !!document.querySelector('input[type=\"password\"]')"
+            )
+            if has_pw:
+                return False
+        except Exception:
+            pass
+
+        # No login marker AND no positive login signal — treat as unknown/false.
+        # Being conservative here prevents false "logged in" when DOM selectors
+        # drift. Callers can retry after the user completes login.
+        return False
+    except Exception as e:
+        log(f"[verify_login] {platform}: {e}", "WARN")
+        return False
 
 
 # ── Auth check after resume navigation ───────────────────────────────────
@@ -1248,8 +1419,9 @@ def validate_link(platform: str, url: str) -> bool:
     validator = _LINK_VALIDATORS.get(platform.lower().replace(" ", ""))
     if validator:
         return validator(url)
-    # Unknown platform — accept if it's a URL
-    return True
+    # Unknown platform — reject to prevent bad URLs from leaking through
+    log(f"validate_link: unknown platform '{platform}' — rejecting {url[:60]}", "WARN")
+    return False
 
 
 def emit_validated_link(phase: int, agent: str, url: str, label: str):
@@ -1368,7 +1540,7 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
 
 
 async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Research", verbose=False):
-    """Extract shareable Gemini conversation link."""
+    """Extract shareable Gemini conversation link with public visibility."""
     page = browser.page
     url = await browser.current_url() or ""
     try:
@@ -1377,6 +1549,60 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
         if share_btn:
             await share_btn.click()
             await asyncio.sleep(2)
+
+            # ── Ensure public visibility ("Anyone with the link") ──
+            # Gemini share dialog may default to Restricted — click through to public
+            try:
+                visibility_set = await page.evaluate("""() => {
+                    // Strategy 1: Look for dropdown/button showing "Restricted" or "Only people"
+                    const btns = document.querySelectorAll(
+                        'button, [role="button"], [role="combobox"], [aria-haspopup]'
+                    );
+                    for (const btn of btns) {
+                        const txt = (btn.innerText || btn.textContent || '').toLowerCase();
+                        if (txt.includes('restricted') || txt.includes('only people')) {
+                            btn.click();
+                            return 'opened_dropdown';
+                        }
+                    }
+                    // Strategy 2: Look for "Enable sharing" toggle
+                    const toggles = document.querySelectorAll(
+                        'input[type="checkbox"], [role="switch"], [aria-checked]'
+                    );
+                    for (const t of toggles) {
+                        const label = (t.closest('label') || t.parentElement);
+                        const txt = (label?.innerText || '').toLowerCase();
+                        if (txt.includes('share') || txt.includes('public') || txt.includes('anyone')) {
+                            if (t.getAttribute('aria-checked') === 'false' || !t.checked) {
+                                t.click();
+                                return 'toggled_on';
+                            }
+                            return 'already_on';
+                        }
+                    }
+                    return '';
+                }""")
+                if visibility_set == 'opened_dropdown':
+                    await asyncio.sleep(1)
+                    # Select "Anyone with the link" from the dropdown
+                    await page.evaluate("""() => {
+                        const options = document.querySelectorAll(
+                            '[role="option"], [role="menuitem"], [role="menuitemradio"], li'
+                        );
+                        for (const opt of options) {
+                            const txt = (opt.innerText || opt.textContent || '').toLowerCase();
+                            if (txt.includes('anyone with the link') || txt.includes('anyone')) {
+                                opt.click();
+                                return 'selected';
+                            }
+                        }
+                        return '';
+                    }""")
+                    await asyncio.sleep(1)
+                    log(f"[{label}] Set sharing to 'Anyone with the link'")
+            except Exception as e:
+                log(f"[{label}] Visibility selection attempt: {e}", "WARN")
+
             # Look for shareable link in modal
             link_el = await page.query_selector('input[value*="g.co/gemini"]')
             if not link_el:
@@ -1384,21 +1610,45 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
             if link_el:
                 url = await link_el.get_attribute("value") or url
             else:
+                # Try clicking "Copy link" button
+                try:
+                    await page.evaluate("""() => {
+                        const btns = document.querySelectorAll('button');
+                        for (const b of btns) {
+                            const txt = (b.innerText || '').toLowerCase();
+                            if (txt.includes('copy link') || txt.includes('copy')) {
+                                b.click();
+                                return 'copied';
+                            }
+                        }
+                        return '';
+                    }""")
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
                 clip = get_clipboard()
                 if "gemini" in clip and "share" in clip:
                     url = clip
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
         if "share" not in url.lower():
-            # CUA fallback
+            # CUA fallback — explicit public sharing instructions
             result = await agent_loop(cua_client, browser,
-                "Share this Gemini conversation.",
-                "Click the Share button for this Gemini conversation. Create a shareable link and tell me the URL.",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                PROMPT_SHARE_GEMINI,
+                "Click the Share button for this Gemini conversation. "
+                "IMPORTANT: Change the access to 'Anyone with the link' (not Restricted). "
+                "Then copy the shareable link and tell me the EXACT URL (g.co/gemini/... or gemini.google.com/share/...).",
+                model=CUA_MODEL, max_iterations=12, verbose=verbose)
             m = re.search(r'https://[^\s]+gemini[^\s]*share[^\s]*', (result.get("text") or ""))
+            if not m:
+                m = re.search(r'https://g\.co/gemini/[^\s]+', (result.get("text") or ""))
             if m:
                 url = m.group(0)
-        verified = "share" in url.lower() and "gemini" in url.lower()
+            else:
+                clip = get_clipboard()
+                if clip and ("gemini" in clip or "g.co" in clip) and "share" in clip:
+                    url = clip
+        verified = "share" in url.lower() and ("gemini" in url.lower() or "g.co" in url.lower())
         return LinkResult(url=url, label=label, platform="gemini", verified=verified)
     except Exception as e:
         return LinkResult(url=url, label=label, platform="gemini", error=str(e))
@@ -1437,9 +1687,236 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
         return LinkResult(url=url, label=label, platform="claude", error=str(e))
 
 
-async def extract_notebooklm_url(browser, **_):
-    """Extract NotebookLM notebook URL (tab URL is inherently shareable)."""
+async def _set_nlm_public_and_get_link(page, label):
+    """Shared helper: inside an open NotebookLM share dialog,
+    set Notebook access → 'Anyone with the link', copy/get the link, click Save.
+    Returns the extracted URL or ''."""
+    url = ""
+    try:
+        # Step 1: Find "Notebook access" section and change to public
+        # NLM share dialog shows "Notebook access" with a dropdown (not "Restricted")
+        changed = await page.evaluate("""() => {
+            // Look for clickable elements near "Notebook access" text
+            const allText = document.body.innerText || '';
+            // Find dropdown/button that controls access level
+            const btns = document.querySelectorAll(
+                'button, [role="button"], [role="combobox"], [role="listbox"], select, [aria-haspopup]'
+            );
+            for (const btn of btns) {
+                const txt = (btn.innerText || btn.textContent || '').toLowerCase();
+                const parentTxt = (btn.closest('div')?.innerText || '').toLowerCase();
+                // NotebookLM uses "Notebook access" section; the dropdown shows current state
+                if (txt.includes('restricted') || txt.includes('only people') ||
+                    txt.includes('not shared') || txt.includes('private') ||
+                    (parentTxt.includes('notebook access') && (txt.includes('off') || txt.length < 30))) {
+                    btn.click();
+                    return 'opened';
+                }
+            }
+            // Also try: any element labeled "Notebook access" that's clickable
+            const labels = document.querySelectorAll('label, span, div, h3, h4');
+            for (const lbl of labels) {
+                const txt = (lbl.innerText || '').toLowerCase();
+                if (txt.includes('notebook access')) {
+                    // Click the next sibling or the nearest button
+                    const next = lbl.nextElementSibling || lbl.parentElement;
+                    const btn = next?.querySelector('button, [role="button"], select');
+                    if (btn) { btn.click(); return 'opened'; }
+                }
+            }
+            return '';
+        }""")
+        if changed == 'opened':
+            await asyncio.sleep(1)
+            # Select "Anyone with the link" from dropdown/options
+            await page.evaluate("""() => {
+                const options = document.querySelectorAll(
+                    '[role="option"], [role="menuitem"], [role="menuitemradio"], li, label'
+                );
+                for (const opt of options) {
+                    const txt = (opt.innerText || opt.textContent || '').toLowerCase();
+                    if (txt.includes('anyone with the link') || txt.includes('anyone')) {
+                        opt.click();
+                        return 'selected';
+                    }
+                }
+                return '';
+            }""")
+            await asyncio.sleep(1)
+            log(f"[{label}] Set Notebook access to 'Anyone with the link'")
+
+        # Step 2: Get the shareable link
+        link = await page.evaluate("""() => {
+            // Check input fields for the URL
+            const inputs = document.querySelectorAll('input[readonly], input[value*="notebooklm"]');
+            for (const inp of inputs) {
+                const val = inp.value || '';
+                if (val.includes('notebooklm.google.com')) return val;
+            }
+            // Try clicking "Copy link" button
+            const btns = document.querySelectorAll('button');
+            for (const b of btns) {
+                const txt = (b.innerText || '').toLowerCase();
+                if (txt.includes('copy link') || (txt.includes('copy') && !txt.includes('copy all'))) {
+                    b.click();
+                    return 'clipboard';
+                }
+            }
+            return '';
+        }""")
+        if link == 'clipboard':
+            await asyncio.sleep(0.5)
+            clip = get_clipboard()
+            if clip and "notebooklm.google.com" in clip:
+                url = clip
+        elif link and "notebooklm.google.com" in link:
+            url = link
+
+        # Step 3: Click Save/Done to apply the sharing change
+        await page.evaluate("""() => {
+            const btns = document.querySelectorAll('button');
+            for (const b of btns) {
+                const txt = (b.innerText || '').trim().toLowerCase();
+                if (txt === 'save' || txt === 'done' || txt === 'apply') {
+                    b.click();
+                    return 'saved';
+                }
+            }
+            return '';
+        }""")
+        await asyncio.sleep(1)
+    except Exception as e:
+        log(f"[{label}] NLM public share flow: {e}", "WARN")
+    return url
+
+
+async def _ensure_gdoc_public(page) -> bool:
+    """Open the Google Doc share dialog and set General access to
+    'Anyone with the link' (Editor). DOM-first; returns True on success.
+    Designed to be idempotent — safe to call even if already public."""
+    try:
+        # Click Share button (top-right)
+        share_clicked = await page.evaluate("""() => {
+            const selectors = [
+                'div[aria-label*="Share"][role="button"]',
+                'button[aria-label*="Share"]',
+                'div[data-tooltip*="Share"]',
+                'div[role="button"][aria-label*="Share"]',
+            ];
+            for (const s of selectors) {
+                const el = document.querySelector(s);
+                if (el && el.offsetParent !== null) { el.click(); return true; }
+            }
+            return false;
+        }""")
+        if not share_clicked:
+            return False
+        await asyncio.sleep(2)
+        # Change "General access" → "Anyone with the link"
+        await page.evaluate("""() => {
+            const buttons = document.querySelectorAll('button, [role="combobox"], [role="button"]');
+            for (const b of buttons) {
+                const txt = (b.innerText || b.textContent || '').toLowerCase();
+                if (txt.includes('restricted') ||
+                    (txt.includes('only') && txt.includes('access'))) {
+                    b.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        await asyncio.sleep(1)
+        await page.evaluate("""() => {
+            const options = document.querySelectorAll('[role="menuitem"], [role="option"], li, span, div');
+            for (const opt of options) {
+                const txt = (opt.innerText || opt.textContent || '').trim().toLowerCase();
+                if (txt === 'anyone with the link' || txt.startsWith('anyone with the link')) {
+                    opt.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        await asyncio.sleep(1)
+        # Ensure role = Editor (not Viewer/Commenter)
+        await page.evaluate("""() => {
+            const btns = document.querySelectorAll('button, [role="combobox"]');
+            for (const b of btns) {
+                const txt = (b.innerText || b.textContent || '').toLowerCase();
+                if (txt.includes('viewer') || txt.includes('commenter')) {
+                    b.click();
+                    return;
+                }
+            }
+        }""")
+        await asyncio.sleep(0.6)
+        await page.evaluate("""() => {
+            const opts = document.querySelectorAll('[role="menuitem"], [role="option"], li');
+            for (const o of opts) {
+                const txt = (o.innerText || o.textContent || '').trim().toLowerCase();
+                if (txt === 'editor' || txt.startsWith('editor')) { o.click(); return; }
+            }
+        }""")
+        await asyncio.sleep(0.6)
+        # Click Done/Copy link
+        await page.evaluate("""() => {
+            const btns = document.querySelectorAll('button, [role="button"]');
+            for (const b of btns) {
+                const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                if (txt === 'done' || txt === 'save' || txt === 'copy link') {
+                    b.click();
+                    return;
+                }
+            }
+        }""")
+        await asyncio.sleep(1)
+        return True
+    except Exception as e:
+        log(f"[gdoc] public-share DOM flow error: {e}", "WARN")
+        return False
+
+
+async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
+    """Extract NotebookLM notebook URL after ensuring public sharing is enabled.
+    Flow: Share → Notebook access → public → get link → Save."""
+    page = browser.page
     url = await browser.current_url() or ""
+    try:
+        # Click Share button to open dialog
+        share_btn = await page.query_selector(
+            'button[aria-label*="Share"], button[aria-label*="share"], '
+            '[class*="share"] button'
+        )
+        if share_btn:
+            await share_btn.click()
+            await asyncio.sleep(2)
+            link = await _set_nlm_public_and_get_link(page, "NotebookLM")
+            if link:
+                url = link
+            # Close dialog
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+        # CUA fallback if DOM didn't work
+        if not url or "notebooklm.google.com/notebook" not in url:
+            if cua_client:
+                result = await agent_loop(cua_client, browser,
+                    "Share this NotebookLM notebook publicly.",
+                    "Click the Share button. In the share dialog, change 'Notebook access' to "
+                    "'Anyone with the link'. Then click 'Copy link' to get the URL. Click Save. "
+                    "Tell me the EXACT URL.",
+                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                m = re.search(r'https://notebooklm\.google\.com/notebook/[^\s]+', (result.get("text") or ""))
+                if m:
+                    url = m.group(0)
+                else:
+                    clip = get_clipboard()
+                    if clip and "notebooklm.google.com" in clip:
+                        url = clip
+    except Exception as e:
+        log(f"[NotebookLM] Share dialog failed: {e}", "WARN")
+    # Fallback to current tab URL
+    if not url or "notebooklm.google.com/notebook" not in url:
+        url = await browser.current_url() or ""
     verified = "notebooklm.google.com/notebook" in url
     return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm", verified=verified)
 
@@ -1482,40 +1959,74 @@ async def extract_gdoc_url(browser, **_):
     return LinkResult(url=url, label="Google Doc", platform="gdoc", verified=verified)
 
 
-# Phase → list of (extractor_func, kwargs_override) mappings
-PHASE_LINK_EXTRACTORS = {
-    1: [("chatgpt", extract_share_link_chatgpt, {"label": "Research Brief"})],
-    2: [("chatgpt", extract_share_link_chatgpt, {"label": "ChatGPT Deep Research"}),
-        ("gemini", extract_share_link_gemini, {}),
-        ("claude", extract_share_link_claude, {})],
-    3: [("notebooklm", extract_notebooklm_url, {})],
-    4: [("youtube", extract_youtube_url, {})],
-    5: [("gdocs", extract_gdoc_url, {})],
-}
+# ── B1: Link-first phase_complete — retry helpers ────────────────────────────
+
+async def extract_with_retry(
+    phase: int,
+    agent: str,
+    browser,
+    cua_client,
+    extractor_fn,
+    max_retries: int = 3,
+    retry_delay: float = 3.0,
+    **kwargs,
+) -> "LinkResult":
+    """Run a link extractor up to `max_retries` times, validating each URL.
+    Emits link_extracting / link_extract_retry / link_extracted / link_extraction_failed.
+    Returns LinkResult with verified=True on success; otherwise verified=False + error."""
+    last_err = ""
+    for attempt in range(1, max_retries + 1):
+        emit_event("link_extracting", phase=phase, agent=agent,
+                   attempt=attempt, maxAttempts=max_retries)
+        log(f"[{agent}] Link extract attempt {attempt}/{max_retries}")
+        try:
+            result = await extractor_fn(browser, cua_client=cua_client, **kwargs)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            result = LinkResult(url="", label=kwargs.get("label", ""),
+                                platform=agent, verified=False, error=last_err)
+        # Validate URL against _LINK_VALIDATORS + _BAD_URL_PATTERNS
+        if result.success and validate_link(agent, result.url):
+            result.verified = True
+            label = result.label or kwargs.get("label", f"{agent} link")
+            emit_event("link_extracted", phase=phase, agent=agent,
+                       url=result.url, label=label, verified=True, attempt=attempt)
+            log(f"[{agent}] Link VERIFIED on attempt {attempt}: {result.url}")
+            return result
+        # Failed this attempt — log and retry
+        last_err = result.error or (
+            f"URL failed validation: {result.url[:80]}" if result.url else "No URL returned"
+        )
+        log(f"[{agent}] Attempt {attempt}/{max_retries} failed: {last_err}", "WARN")
+        if attempt < max_retries:
+            emit_event("link_extract_retry", phase=phase, agent=agent,
+                       attempt=attempt, maxAttempts=max_retries, error=last_err)
+            await asyncio.sleep(retry_delay)
+    # All retries exhausted
+    emit_event("link_extraction_failed", phase=phase, agent=agent,
+               error=last_err, attempts=max_retries)
+    return LinkResult(url="", label=kwargs.get("label", ""),
+                      platform=agent, verified=False, error=last_err)
 
 
-async def extract_phase_links(phase, browser, cua_client, enabled_agents=None, verbose=False):
-    """Run all link extractors for a phase. Returns list of LinkResult.
-    Emits link events with agent= (not platform=) so frontend details[agent] lookup works."""
-    extractors = PHASE_LINK_EXTRACTORS.get(phase, [])
-    results = []
-    for platform, extractor, kwargs in extractors:
-        if enabled_agents and platform in ("chatgpt", "gemini", "claude"):
-            if not enabled_agents.get(platform, True):
-                continue  # Skip disabled agents
-        emit_event("link_extracting", phase=phase, agent=platform)
-        log(f"Extracting link: phase={phase} agent={platform}...")
-        result = await extractor(browser, cua_client=cua_client, verbose=verbose, **kwargs)
-        if result.success:
-            emit_event("link_extracted", phase=phase, agent=platform,
-                       url=result.url, label=result.label, verified=result.verified)
-            log(f"Link extracted: {result.url} (verified={result.verified})")
-        else:
-            emit_event("link_extraction_failed", phase=phase, agent=platform,
-                       error=result.error or "URL not found")
-            log(f"Link extraction failed: {platform} — {result.error}", "WARN")
-        results.append(result)
-    return results
+async def wait_for_agent_decision(agent: str, reason: str, phase: int = 2,
+                                   options=("retry", "skip", "stop")) -> str:
+    """Emit agent_link_failed, pause pipeline, wait for user's decision.
+    Returns 'retry' | 'skip' | 'stop'. Defaults to 'skip' if pipeline resumes
+    without a decision set. Returns 'stop' if stop was requested."""
+    _controls.pending_agent_decision = None
+    emit_event("agent_link_failed", phase=phase, agent=agent,
+               reason=reason, options=list(options))
+    _controls.request_pause()
+    emit_event("pipeline_paused", phase=phase, reason="agent_link_failed", agent=agent)
+    log(f"[{agent}] Waiting for user decision (retry/skip/stop) — reason: {reason}")
+    await _controls.wait_if_paused()
+    if _controls.is_stop():
+        return "stop"
+    decision = _controls.pop_agent_decision() or "skip"
+    emit_event("pipeline_resumed", phase=phase, reason=f"agent_decision:{decision}", agent=agent)
+    log(f"[{agent}] User decision: {decision}")
+    return decision
 
 
 # ── Brief Artifact (first-class research brief with verified paste) ──────────
@@ -1728,8 +2239,8 @@ async def scrape_progress_chatgpt(page):
         return await page.evaluate("""() => {
             const r = {
                 status: 'unknown', phase: '', progress: '', thinking: '',
-                sources: 0, source_urls: [], sections: [],
-                partial_text_len: 0, model: '', title: ''
+                sources: 0, source_urls: [], sections: [], steps: [],
+                partial_text_len: 0, plan: '', model: '', title: ''
             };
             // Model info
             const modelEl = document.querySelector('[data-testid="model-selector"], .model-label');
@@ -1740,25 +2251,51 @@ async def scrape_progress_chatgpt(page):
             // Thinking/research progress
             const thinking = document.querySelector('.thinking-text, [data-thinking], .research-progress, .step-text');
             if (thinking) r.thinking = thinking.innerText.substring(0, 500);
-            // Sources/citations
-            const sources = document.querySelectorAll('.citation, .source-link, [data-citation], a[href*="http"]');
-            r.sources = sources.length;
-            r.source_urls = Array.from(sources).slice(0, 20).map(s => s.href || s.innerText).filter(Boolean);
+            // Sources/citations — scoped to assistant messages + canvas (skip navigation links)
+            const srcSet = new Set();
+            document.querySelectorAll(
+                '.citation, .source-link, [data-citation], ' +
+                '[data-message-author-role="assistant"] a[href*="http"], ' +
+                '[data-testid="canvas"] a[href*="http"], .canvas-container a[href*="http"]'
+            ).forEach(s => {
+                const href = s.href || '';
+                if (href.startsWith('http') && !href.includes('chatgpt.com') && !href.includes('openai.com') && !href.includes('chat.openai') && href.length < 500)
+                    srcSet.add(href);
+            });
+            r.source_urls = Array.from(srcSet).slice(0, 30);
+            r.sources = r.source_urls.length;
             // Response sections (headings found so far)
             const headings = document.querySelectorAll('[data-message-author-role="assistant"] h1, [data-message-author-role="assistant"] h2, [data-message-author-role="assistant"] h3');
             r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80));
             // Partial response length
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
             if (msgs.length > 0) r.partial_text_len = msgs[msgs.length-1].innerText.length;
+            // Also capture canvas/artifact content from DR
+            const canvas = document.querySelector('[data-testid="canvas"], .canvas-container, .canvas-content');
+            if (canvas && canvas.innerText.length > r.partial_text_len) r.partial_text_len = canvas.innerText.length;
+            // Steps — synthesize from research activity (ChatGPT lacks Gemini's step DOM)
+            // Try real step elements first, then synthesize from available data
+            const chatSteps = document.querySelectorAll('.research-step, .step-content, [data-research-step], .search-in-progress, [data-message-author-role="tool"]');
+            if (chatSteps.length > 0) {
+                r.steps = Array.from(chatSteps).map(s => s.innerText.substring(0, 150)).filter(s => s.length > 3);
+            }
+            if (r.steps.length === 0) {
+                if (r.thinking) r.steps.push('Extended Thinking: ' + r.thinking.substring(0, 100));
+                const hosts = new Set();
+                r.source_urls.forEach(u => { try { hosts.add(new URL(u).hostname.replace('www.', '')); } catch(e) {} });
+                Array.from(hosts).slice(0, 5).forEach(h => r.steps.push('Researching ' + h));
+                if (r.sections.length > 0) r.steps.push('Writing: ' + r.sections[r.sections.length - 1]);
+                if (r.partial_text_len > 3000) r.steps.push('Generating brief: ' + Math.round(r.partial_text_len / 1000) + 'k chars');
+            }
+            if (r.steps.length > 0 && !r.progress) r.progress = r.steps[r.steps.length - 1];
+            // Plan — from research outline (sections as structure)
+            if (r.sections.length >= 2) r.plan = 'Research outline: ' + r.sections.slice(0, 5).join(' \\u2192 ');
             // Status — handles both standard ChatGPT and Deep Research
             const stop = document.querySelector('button[aria-label="Stop generating"], button[data-testid="stop-button"]');
             const bodyLower = document.body.innerText.toLowerCase();
             const drActive = ['researching', 'sources found', 'searching the web', 'analyzing'].some(kw => bodyLower.includes(kw));
-            // Also capture canvas/artifact content from DR
-            const canvas = document.querySelector('[data-testid="canvas"], .canvas-container, .canvas-content');
-            if (canvas && canvas.innerText.length > r.partial_text_len) r.partial_text_len = canvas.innerText.length;
             if (stop) { r.status = 'generating'; r.phase = 'researching'; }
-            else if (drActive) { r.status = 'generating'; r.phase = 'deep_research'; r.progress = 'Deep Research in progress'; }
+            else if (drActive) { r.status = 'generating'; r.phase = 'deep_research'; r.progress = r.progress || 'Deep Research in progress'; }
             else if (r.partial_text_len > 100) { r.status = 'complete'; r.phase = 'done'; }
             else { r.status = 'idle'; r.phase = 'waiting'; }
             return r;
@@ -1789,22 +2326,60 @@ async def scrape_progress_gemini(page):
             // Research plan (shown before "Start research")
             const plan = document.querySelector('.research-plan, .plan-content');
             if (plan) r.plan = plan.innerText.substring(0, 1000);
-            // Sources
-            const sources = document.querySelectorAll('.source-card, .citation, [data-source], .web-result');
-            r.sources = sources.length;
-            r.source_urls = Array.from(sources).slice(0, 20).map(s => {
-                const a = s.querySelector('a'); return a ? a.href : s.innerText.substring(0, 100);
-            }).filter(Boolean);
+            // Sources — Gemini Deep Research shows sources in research panel + response
+            const srcSet = new Set();
+            document.querySelectorAll(
+                '.source-card, .citation, [data-source], .web-result, ' +
+                '.research-source, [class*="source"], [class*="citation"], ' +
+                'a[href*="http"]:not([href*="google.com/gemini"]):not([href*="accounts.google"])'
+            ).forEach(s => {
+                const a = s.querySelector ? s.querySelector('a') : s;
+                const href = a?.href || '';
+                if (href.startsWith('http') && href.length < 500) srcSet.add(href);
+                else if (!href && s.innerText) srcSet.add(s.innerText.substring(0, 150));
+            });
+            r.source_urls = Array.from(srcSet).slice(0, 30);
+            r.sources = r.source_urls.length;
             // Response sections
-            const headings = document.querySelectorAll('message-content h1, message-content h2, message-content h3');
-            r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80));
+            const headings = document.querySelectorAll(
+                'message-content h1, message-content h2, message-content h3, ' +
+                '.model-response-text h1, .model-response-text h2, .model-response-text h3, ' +
+                '[class*="response"] h1, [class*="response"] h2'
+            );
+            r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80)).filter(s => s.length > 1);
             // Partial text
             const responses = document.querySelectorAll('message-content, .model-response-text');
             if (responses.length > 0) r.partial_text_len = responses[responses.length-1].innerText.length;
-            // Status
-            const stop = document.querySelector('button[aria-label="Stop"]');
-            r.status = stop ? 'generating' : (r.partial_text_len > 0 ? 'complete' : 'idle');
-            r.phase = r.steps.length > 0 ? 'researching' : (r.plan ? 'planning' : (r.partial_text_len > 0 ? 'done' : 'waiting'));
+            // Status — robust stop button detection (multiple strategies)
+            let isActive = false;
+            // 1. aria-label selectors (multiple patterns)
+            const stopSels = 'button[aria-label="Stop"], button[aria-label*="stop"], button[aria-label="Cancel"], button[title*="Stop"]';
+            if (document.querySelector(stopSels)) isActive = true;
+            // 2. Text-based: any button with "Stop" text
+            if (!isActive) {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const txt = (b.textContent || '').trim().toLowerCase();
+                    if (txt === 'stop' || txt === 'stop generating' || txt === 'cancel') { isActive = true; break; }
+                }
+            }
+            // 3. Streaming attribute (Gemini marks actively streaming content)
+            if (!isActive && document.querySelector('[data-is-streaming="true"], .loading-indicator, .streaming')) isActive = true;
+            // 4. Animation detection (spinning/pulsing elements indicate active work)
+            if (!isActive) {
+                const animated = document.querySelectorAll('[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"]');
+                for (const el of animated) {
+                    const cs = window.getComputedStyle(el);
+                    if (cs.animationName && cs.animationName !== 'none' && el.offsetParent !== null) { isActive = true; break; }
+                }
+            }
+            // 5. Research progress panel still showing active steps
+            if (!isActive && r.steps.length > 0) {
+                const lastStep = r.steps[r.steps.length - 1].toLowerCase();
+                if (lastStep.includes('searching') || lastStep.includes('reading') || lastStep.includes('analyzing') || lastStep.includes('browsing')) isActive = true;
+            }
+            r.status = isActive ? 'generating' : (r.partial_text_len > 0 ? 'complete' : 'idle');
+            r.phase = isActive ? 'researching' : (r.steps.length > 0 ? 'researching' : (r.plan ? 'planning' : (r.partial_text_len > 0 ? 'done' : 'waiting')));
             return r;
         }""")
     except Exception as e:
@@ -1819,8 +2394,8 @@ async def scrape_progress_claude(page):
         return await page.evaluate("""() => {
             const r = {
                 status: 'unknown', phase: '', progress: '', thinking: '',
-                sources: 0, source_urls: [], sections: [], tool_uses: [],
-                partial_text_len: 0, model: '', title: ''
+                sources: 0, source_urls: [], sections: [], steps: [],
+                tool_uses: [], partial_text_len: 0, plan: '', model: '', title: ''
             };
             // Conversation title (Claude shows it in sidebar / window title)
             const ctitle = document.querySelector('[data-conversation-title], .conversation-title, header h1, h1.truncate, [data-testid="conversation-title"]');
@@ -1832,27 +2407,78 @@ async def scrape_progress_claude(page):
             // Thinking content (Extended Thinking shows this)
             const thinking = document.querySelector('[data-is-thinking="true"], .thinking-content, .thinking-block');
             if (thinking) r.thinking = thinking.innerText.substring(0, 500);
-            // Research/tool use activity
-            const tools = document.querySelectorAll('.tool-use-content, [data-tool-name], .tool-result');
-            r.tool_uses = Array.from(tools).map(t => t.innerText.substring(0, 200));
+            // Research/tool use activity — Claude Research shows tool_use blocks
+            const tools = document.querySelectorAll(
+                '.tool-use-content, [data-tool-name], .tool-result, ' +
+                '[class*="tool-use"], [class*="tool_use"], [data-testid*="tool"], ' +
+                '.font-claude-message [class*="border"][class*="rounded"]'
+            );
+            r.tool_uses = Array.from(tools).map(t => {
+                const name = t.getAttribute('data-tool-name') || '';
+                const txt = t.innerText.substring(0, 200);
+                return name ? `${name}: ${txt}` : txt;
+            }).filter(t => t.length > 3);
             if (r.tool_uses.length > 0) r.progress = r.tool_uses[r.tool_uses.length - 1].substring(0, 200);
-            // Sources (from research tool)
-            const sources = document.querySelectorAll('.citation, [data-source], a[href*="http"]');
-            r.sources = sources.length;
-            r.source_urls = Array.from(sources).slice(0, 20).map(s => s.href || s.innerText).filter(Boolean);
-            // Response sections
-            const headings = document.querySelectorAll('.font-claude-message h1, .font-claude-message h2, .font-claude-message h3, .contents h1, .contents h2');
-            r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80));
-            // Partial text
+            // Sources — from research tool results + citations + artifact links
+            const srcSet = new Set();
+            // Citation links in assistant messages
+            document.querySelectorAll('.font-claude-message a[href*="http"], .contents a[href*="http"]').forEach(a => {
+                const href = a.href || '';
+                if (href.startsWith('http') && !href.includes('claude.ai') && !href.includes('anthropic.com'))
+                    srcSet.add(href);
+            });
+            // Research tool search results (URLs in tool output blocks)
+            document.querySelectorAll('[class*="tool"] a[href], .tool-result a[href]').forEach(a => {
+                if (a.href?.startsWith('http')) srcSet.add(a.href);
+            });
+            // Artifact panel links (when artifact 1 is open)
+            document.querySelectorAll('aside a[href*="http"], [class*="artifact"] a[href*="http"]').forEach(a => {
+                if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
+            });
+            r.source_urls = Array.from(srcSet).slice(0, 30);
+            r.sources = r.source_urls.length;
+            // Response sections — check both conversation and artifact panel
+            const headings = document.querySelectorAll(
+                '.font-claude-message h1, .font-claude-message h2, .font-claude-message h3, ' +
+                '.contents h1, .contents h2, .contents h3, ' +
+                'aside h1, aside h2, aside h3, ' +
+                '[class*="artifact"] h1, [class*="artifact"] h2'
+            );
+            r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80)).filter(s => s.length > 1);
+            // Partial text — check conversation + artifact panel
             const msgs = document.querySelectorAll('.font-claude-message, .contents .prose');
-            if (msgs.length > 0) r.partial_text_len = msgs[msgs.length-1].innerText.length;
-            // Status
+            let textLen = 0;
+            if (msgs.length > 0) textLen = msgs[msgs.length-1].innerText.length;
+            // Also check artifact panel content (may have more text)
+            const artifact = document.querySelector('aside .prose, aside [class*="content"], [class*="artifact-panel"] .prose');
+            if (artifact) textLen = Math.max(textLen, artifact.innerText.length);
+            r.partial_text_len = textLen;
+            // Synthesize steps from tool_uses, thinking, sources, and sections
+            // (Claude lacks Gemini's native step DOM — we build equivalent data)
+            if (r.thinking) r.steps.push('Extended Thinking: ' + r.thinking.substring(0, 100));
+            r.tool_uses.slice(-5).forEach(t => {
+                const brief = t.substring(0, 120);
+                r.steps.push(brief.includes('earch') ? 'Searching: ' + brief : brief);
+            });
+            const cHosts = new Set();
+            r.source_urls.forEach(u => { try { cHosts.add(new URL(u).hostname.replace('www.', '')); } catch(e) {} });
+            Array.from(cHosts).slice(0, 5).forEach(h => r.steps.push('Browsing ' + h));
+            if (r.sections.length > 0) r.steps.push('Building: ' + r.sections[r.sections.length - 1]);
+            if (r.partial_text_len > 3000) r.steps.push('Artifact: ' + Math.round(r.partial_text_len / 1000) + 'k chars');
+            // Plan — from research structure (sections as outline)
+            if (r.sections.length >= 2) r.plan = 'Research structure: ' + r.sections.slice(0, 5).join(' \\u2192 ');
+            // Status — multi-strategy detection (like Gemini)
             const stop = document.querySelector('button[aria-label="Stop Response"]');
             let hasStop = !!stop;
             if (!hasStop) {
                 const btns = document.querySelectorAll('button');
-                for (const b of btns) { if (b.textContent.trim() === 'Stop') { hasStop = true; break; } }
+                for (const b of btns) {
+                    const txt = (b.textContent || '').trim().toLowerCase();
+                    if (txt === 'stop' || txt === 'stop generating') { hasStop = true; break; }
+                }
             }
+            // Also check for streaming indicators
+            if (!hasStop && document.querySelector('[data-is-streaming="true"], .streaming, [class*="animate-pulse"]')) hasStop = true;
             r.status = hasStop ? 'generating' : (r.partial_text_len > 0 ? 'complete' : 'idle');
             r.phase = r.thinking ? 'thinking' : (r.tool_uses.length > 0 ? 'researching' : (hasStop ? 'generating' : (r.partial_text_len > 0 ? 'done' : 'waiting')));
             return r;
@@ -2055,61 +2681,6 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None, v
     }
 
 
-# ── Firecrawler API ───────────────────────────────────────────────────────────
-
-FIRECRAWL_API_KEY = get_env("FIRECRAWL_API_KEY")
-
-
-def firecrawl_scrape(url, formats=None, max_retries=2):
-    """Scrape a page via Firecrawler API — returns markdown content.
-    Use for rich progress tracking when DOM selectors fail.
-    One failed request loses 5 min of enrichment, so retry with backoff on 429/5xx."""
-    if not FIRECRAWL_API_KEY:
-        return ""
-    import requests
-    payload = {"url": url, "formats": formats or ["markdown"]}
-    headers = {"Authorization": f"Bearer {FIRECRAWL_API_KEY}"}
-    last_err = None
-    for attempt in range(max_retries + 1):
-        try:
-            resp = requests.post(
-                "https://api.firecrawl.dev/v1/scrape",
-                json=payload, headers=headers, timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json().get("data", {})
-                return data.get("markdown", "") or data.get("content", "")
-            # Retry on rate-limit / transient server errors
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                # Honor Retry-After header if present
-                wait_s = 5 * (attempt + 1)
-                try:
-                    ra = resp.headers.get("Retry-After")
-                    if ra and ra.isdigit():
-                        wait_s = max(wait_s, int(ra))
-                except Exception:
-                    pass
-                log(f"Firecrawl {resp.status_code}, retry in {wait_s}s (attempt {attempt + 1}/{max_retries})", "WARN")
-                time.sleep(wait_s)
-                continue
-            # Non-retryable error
-            log(f"Firecrawl {resp.status_code}: {resp.text[:200]}", "WARN")
-            return ""
-        except requests.Timeout as e:
-            last_err = e
-            if attempt < max_retries:
-                log(f"Firecrawl timeout, retry (attempt {attempt + 1}/{max_retries})", "WARN")
-                time.sleep(5 * (attempt + 1))
-                continue
-        except Exception as e:
-            last_err = e
-            log(f"Firecrawl error: {e}", "WARN")
-            return ""
-    if last_err:
-        log(f"Firecrawl exhausted retries: {last_err}", "WARN")
-    return ""
-
-
 # ── Browser ────────────────────────────────────────────────────────────────────
 
 class Browser:
@@ -2124,21 +2695,74 @@ class Browser:
         self._upload_queue = []
 
     async def start(self):
-        # Kill orphaned Chrome first
+        # Kill only orphaned Playwright Chrome from OUR profile directory.
+        # NEVER kill all chrome.exe — that nukes the user's personal browser.
         try:
-            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], capture_output=True, timeout=5)
+            import psutil
+            our_profile = str(Path(self.profile_dir).resolve()).lower().replace("\\", "/")
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    if proc.info["name"] and "chrome" in proc.info["name"].lower():
+                        cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
+                        if our_profile in cmdline:
+                            log(f"Killing orphaned Chrome PID {proc.info['pid']} (our profile)")
+                            proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
             await asyncio.sleep(1)
+        except ImportError:
+            pass
         except Exception:
             pass
 
+        # Remove stale Chrome lock files from unclean shutdown — these prevent
+        # Playwright from reusing the persistent profile directory.
+        profile_path = Path(self.profile_dir)
+        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            lock_file = profile_path / lock_name
+            if lock_file.exists():
+                try:
+                    lock_file.unlink()
+                    log(f"Removed stale Chrome lock: {lock_name}")
+                except Exception:
+                    pass
+
+        # Clean version-specific cache dirs that cause downgrade errors when
+        # switching between system Chrome and Playwright's bundled Chromium.
+        # These are regeneratable caches — login sessions live in Default/.
+        import shutil
+        for cache_dir in ("ShaderCache", "GrShaderCache", "GraphiteDawnCache",
+                          "component_crx_cache", "extensions_crx_cache",
+                          "BrowserMetrics", "Crashpad"):
+            p = profile_path / cache_dir
+            if p.is_dir():
+                try:
+                    shutil.rmtree(p, ignore_errors=True)
+                except Exception:
+                    pass
+        # Also remove the downgrade sentinel that triggers cleanup attempts
+        for sentinel in profile_path.glob("*.CHROME_DELETE"):
+            try:
+                shutil.rmtree(sentinel, ignore_errors=True)
+            except Exception:
+                pass
+
         from playwright.async_api import async_playwright
         self.playwright = await async_playwright().start()
+        # Use Playwright's BUNDLED Chromium — NOT the system Chrome.
+        # channel="chrome" reuses the installed Chrome binary which on Windows
+        # shares a singleton process broker with the user's personal Chrome
+        # (26+ processes). The new instance delegates to the running Chrome and
+        # exits, killing the automation browser. Bundled Chromium is independent.
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self.profile_dir,
             headless=self.headless,
-            channel="chrome",
             viewport={"width": API_WIDTH, "height": API_HEIGHT},
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
             ignore_default_args=["--enable-automation"],
         )
         if self.context.pages:
@@ -2264,8 +2888,18 @@ class Browser:
             log("Browser closed")
         except Exception as e:
             log(f"Browser close error: {e}", "WARN")
+            # Kill only OUR profile's chromium — never nuke all chrome.exe
             try:
-                subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], capture_output=True, timeout=5)
+                import psutil
+                our_profile = str(Path(self.profile_dir).resolve()).lower().replace("\\", "/")
+                for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                    try:
+                        if proc.info["name"] and "chrom" in proc.info["name"].lower():
+                            cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
+                            if our_profile in cmdline:
+                                proc.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
             except Exception:
                 pass
 
@@ -2607,6 +3241,120 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
 
 _last_progress: dict = {}  # Deduplication cache for agent_progress events
 
+
+# ── MutationObserver streaming (real-time partial text per agent page) ───
+#
+# We inject a throttled MutationObserver into each agent page that watches
+# the assistant's response container. It fires `window.onStream({len,text})`
+# every ~500ms while the response grows. The callback here updates a shared
+# dict keyed by page id, so the poll loop (Phase 1 or Phase 2) can read the
+# latest `observer_text_len` + `observer_preview` when it emits agent_progress.
+#
+# This gives the frontend true token-level streaming while the 30s DOM poll
+# keeps structured fields (sources/sections/steps) fresh. No polling wasted
+# on just-a-few-more-chars-every-second — the observer handles that slice.
+
+_OBSERVER_SELECTORS = {
+    "chatgpt": ['[data-message-author-role="assistant"]:last-of-type',
+                'main [data-message-id]:last-of-type',
+                'article.text-token-text-primary:last-of-type'],
+    "gemini":  ['message-content:last-of-type',
+                '.model-response-text:last-of-type',
+                '.response-container:last-of-type'],
+    "claude":  ['[data-testid="assistant-message"]:last-of-type',
+                '.font-claude-message:last-of-type',
+                '[data-is-streaming]:last-of-type'],
+}
+
+# Keyed by id(page) — each page gets its own stream state
+_agent_streams: dict[int, dict] = {}
+
+
+def _make_stream_callback(page_id: int):
+    """Return a callback for page.expose_function('onStream', ...)"""
+    def cb(data):
+        try:
+            st = _agent_streams.setdefault(page_id, {})
+            st["observer_text_len"] = int(data.get("len", 0) or 0)
+            st["observer_preview"] = str(data.get("text", "") or "")[:500]
+            st["last_update"] = time.time()
+        except Exception:
+            pass
+    return cb
+
+
+async def inject_agent_observer(page, agent_key: str):
+    """Inject a throttled MutationObserver on `page` that streams the assistant
+    response's partial text length + last 500 chars to Python.
+
+    Idempotent: re-call after navigations to re-attach. The exposed function
+    `onStream` is registered once per page (Playwright will raise on
+    re-expose — we catch that).
+    """
+    page_id = id(page)
+    _agent_streams.setdefault(page_id, {
+        "observer_text_len": 0, "observer_preview": "", "last_update": 0.0,
+    })
+    try:
+        await page.expose_function("onStream", _make_stream_callback(page_id))
+    except Exception:
+        # Already exposed — safe to ignore, callback is already bound
+        pass
+
+    selectors = _OBSERVER_SELECTORS.get(agent_key, [])
+    if not selectors:
+        return False
+
+    script = """
+    (selectors) => {
+        if (window.__agentObserver) {
+            try { window.__agentObserver.disconnect(); } catch(e) {}
+        }
+        let container = null;
+        for (const sel of selectors) {
+            try { container = document.querySelector(sel); } catch(e) {}
+            if (container) break;
+        }
+        if (!container) {
+            window.__agentObserverActive = false;
+            return false;
+        }
+        let lastLen = 0;
+        let timer = null;
+        const mo = new MutationObserver(() => {
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+                const text = container.innerText || '';
+                if (text.length === lastLen) return;
+                lastLen = text.length;
+                try {
+                    window.onStream({ text: text.slice(-500), len: text.length, ts: Date.now() });
+                } catch(e) {}
+            }, 500);
+        });
+        mo.observe(container, {childList: true, subtree: true, characterData: true});
+        window.__agentObserver = mo;
+        window.__agentObserverActive = true;
+        return true;
+    }
+    """
+    try:
+        ok = await page.evaluate(script, selectors)
+        return bool(ok)
+    except Exception as e:
+        log(f"[observer-{agent_key}] inject failed: {e}", "WARN")
+        return False
+
+
+def get_observer_state(page) -> dict:
+    """Read the latest MutationObserver snapshot for this page.
+    Returns {} if observer hasn't been injected or hasn't fired yet."""
+    try:
+        return _agent_streams.get(id(page), {}) or {}
+    except Exception:
+        return {}
+
+
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                           browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
@@ -2627,6 +3375,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             if _controls.is_stop():
                 log(f"[{label}] STOP after pause — aborting poll")
                 return False
+            # Pause+input+resume = rerun the phase from the start. Bail out so
+            # the orchestrator can detect `_runtime.restart_requested` and loop.
+            if _controls.peek_extra_context():
+                _runtime.restart_requested = True
+                log(f"[{label}] Extra context during pause — signalling phase restart")
+                return False
 
         # ── Heartbeat every 60s so frontend knows we're alive ──
         if time.time() - last_heartbeat >= 60:
@@ -2639,21 +3393,28 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             try:
                 progress = await scrape_fn(page)
                 save_track(label, progress)
+                # Enrich with MutationObserver data (token-level stream)
+                _obs = get_observer_state(page)
+                _obs_len = _obs.get("observer_text_len", 0) or 0
+                _obs_preview = _obs.get("observer_preview", "") or ""
+                # partialTextLen is max of DOM scrape + observer (observer is usually fresher)
+                _merged_partial_len = max(progress.get("partial_text_len", 0) or 0, _obs_len)
                 # Deduplicate: only emit if data actually changed
                 progress_key = json.dumps({
                     "status": progress.get("status", ""),
                     "sources": progress.get("sources", 0),
-                    "partialTextLen": progress.get("partial_text_len", 0),
+                    "partialTextLen": _merged_partial_len,
                     "sections_len": len(progress.get("sections", [])),
+                    # Coarse-bucket the observer length so small bumps don't spam Firestore
+                    "obs_bucket": _merged_partial_len // 200,
                 }, sort_keys=True)
                 if _last_progress.get(label) != progress_key:
                     _last_progress[label] = progress_key
-                    # Context-aware progress: detect Extended Thinking (no visible output is NORMAL)
                     elapsed_sec = int(time.time() - wait_start)
                     expected_min = get_expected_minutes(phase)
                     is_et = (progress.get("status") == "generating"
                              and progress.get("sources", 0) == 0
-                             and progress.get("partial_text_len", 0) < 500)
+                             and _merged_partial_len < 500)
                     if is_et:
                         progress["status"] = "extended_thinking"
                         progress["progress"] = f"Extended Thinking active ({elapsed_sec // 60}min elapsed, typical {expected_min}min)"
@@ -2664,7 +3425,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         sources=progress.get("sources", 0),
                         sourceUrls=progress.get("source_urls", []),
                         sections=progress.get("sections", []),
-                        partialTextLen=progress.get("partial_text_len", 0),
+                        partialTextLen=_merged_partial_len,
+                        partialTextPreview=_obs_preview,
                         model=progress.get("model", ""),
                         thinking=progress.get("thinking", ""),
                         steps=progress.get("steps", []),
@@ -2786,12 +3548,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         "Gemini": extract_gemini_response,
         "Claude": extract_claude_response,
     }
-    # CUA completion check: first at 20 min, then every 5 min
-    # Firecrawl scraping: every 5 min (staggered — starts at 2.5 min to avoid collision)
+    # CUA completion check: first at 20 min (MIN_WAIT), then every 5 min
     _min_agent_wait = int(os.environ.get("MIN_AGENT_WAIT_MIN", "20")) * 60
     MIN_WAIT = {"ChatGPT": _min_agent_wait, "Gemini": _min_agent_wait, "Claude": _min_agent_wait}
-    CUA_CHECK_INTERVAL = 300   # 5 min between CUA checks
-    FIRECRAWL_INTERVAL = 300   # 5 min between Firecrawl scrapes
+    CUA_CHECK_INTERVAL = 300   # 5 min between CUA completion checks
     ARTIFACT_SCRAPE_INTERVAL = 180  # 3 min between Claude artifact tracking scrapes
 
     pending = {}
@@ -2801,16 +3561,19 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         if not agent["verified"]:
             results[name] = {"status": "not_verified", "text": "", "url": agent["url"]}
             continue
+        # Use research_started_at if available (e.g., Gemini waits for "Start research")
+        # so elapsed/MIN_WAIT are computed from actual research start, not submission.
+        _research_t = agent.get("research_started_at", time.time())
         pending[name] = {
             "page": agent["page"],
             "url": agent["url"],
-            "start_time": time.time(),
+            "start_time": _research_t,
             "done_count": 0,
             "cua_confirmed": False,
-            "last_firecrawl": time.time() - 150,  # Stagger: first Firecrawl at 2.5 min
-            "last_heartbeat": time.time(),       # Avoid heartbeat burst on first cycle
-            "last_cua_check": time.time(),       # Ditto — CUA check gate
-            "last_artifact_scrape": time.time(),  # Claude artifact tracking (starts after warmup)
+            "last_heartbeat": _research_t,
+            "last_cua_check": _research_t,       # CUA check gate — MIN_WAIT from research start
+            "last_artifact_scrape": _research_t,
+            "observer_text_len": 0,              # MutationObserver sets this (see B2)
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -2866,6 +3629,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 stopped = await pause_and_close_browser(browser, _tracks_dir if _tracks_dir else None, phase=2)
                 if stopped:
                     return results
+                # If user added input during the pause, bail out of the
+                # round-robin so the orchestrator can rerun Phase 2 with the
+                # combined brief (matches "pause + input + resume = rerun").
+                if _controls.peek_extra_context():
+                    _runtime.restart_requested = True
+                    log("[Round-robin] Extra context during pause — signalling Phase 2 restart")
+                    return results
                 # Relaunch browser + reopen agent tabs
                 await browser.start()
                 restored = await resume_browser_from_checkpoint(browser, _tracks_dir if _tracks_dir else None)
@@ -2899,10 +3669,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             pending[name] = {"page": results[name]["page"], "url": results[name]["url"],
                                              "start_time": time.time() - results[name]["elapsed_sec"],
                                              "done_count": 0, "cua_confirmed": False,
-                                             "last_firecrawl": time.time() - 150,
                                              "last_heartbeat": time.time(),
                                              "last_cua_check": time.time(),
-                                             "last_artifact_scrape": time.time()}
+                                             "last_artifact_scrape": time.time(),
+                                             "observer_text_len": 0}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
                         else:
@@ -2943,26 +3713,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 del pending[name]
                 continue
 
-            # Scrape progress — Firecrawl primary, DOM fallback
-            # Firecrawl every 5 min (rich data for web app), DOM every cycle (free)
-            if FIRECRAWL_API_KEY and (time.time() - p["last_firecrawl"]) > FIRECRAWL_INTERVAL:
-                try:
-                    fc_md = await asyncio.to_thread(firecrawl_scrape, p["page"].url)
-                    if fc_md:
-                        save_track(name, {
-                            "source": "firecrawl",
-                            "content_len": len(fc_md),
-                            "preview": fc_md[:3000],
-                            "full_text": fc_md,
-                        })
-                        p["last_firecrawl"] = time.time()
-                        # Remember Firecrawl's content_len so the next agent_progress
-                        # can report it (more accurate than DOM scraping, which only
-                        # sees on-screen partial text).
-                        p["firecrawl_len"] = len(fc_md)
-                except Exception:
-                    pass
-            # DOM scrape as supplement (free, best-effort)
+            # DOM scrape (primary); MutationObserver handles token-level stream separately.
             scrape_fn = SCRAPE_FNS.get(name)
             progress = {}
             scrape_ok = False
@@ -3017,12 +3768,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 _progress_val = f"Researching... ({int(time.time() - p['start_time']) // 60}m elapsed)"
             elapsed_sec = int(time.time() - p["start_time"])
 
-            # Prefer Firecrawl's content length over DOM partial text — the DOM scrape
-            # only sees what's rendered on-screen, while Firecrawl's markdown fetches the
-            # full page. Use whichever is larger so the frontend progress bar climbs
-            # monotonically.
-            _fc_len = p.get("firecrawl_len", 0)
-            _partial_text_len = max(progress.get("partial_text_len", 0) or 0, _fc_len)
+            # DOM partial text length + MutationObserver stream.
+            # Observer fires every ~500ms as tokens arrive (see inject_agent_observer);
+            # DOM scrape runs every 30s. Use whichever is larger so the progress bar
+            # climbs monotonically even between DOM scrapes.
+            _obs = get_observer_state(p["page"])
+            _obs_len = int(_obs.get("observer_text_len", 0) or 0)
+            _obs_preview = str(_obs.get("observer_preview", "") or "")
+            _partial_text_len = max(progress.get("partial_text_len", 0) or 0, _obs_len)
+            p["observer_text_len"] = _obs_len  # Keep shared-dict snapshot fresh
 
             # Dedup: only emit when something meaningful changed (status / sources /
             # partialTextLen / sections-count). Otherwise we spam Firestore ~180 writes
@@ -3042,10 +3796,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     status=_status_val or "generating",
                     progress=_progress_val,
                     sources=progress.get("sources", 0),
-                    sourceUrls=progress.get("source_urls", [])[:10],
+                    sourceUrls=progress.get("source_urls", []),
                     sections=progress.get("sections", []),
                     partialTextLen=_partial_text_len,
-                    firecrawlLen=_fc_len,
+                    partialTextPreview=_obs_preview,
                     model=progress.get("model", ""),
                     thinking=progress.get("thinking", ""),
                     steps=progress.get("steps", []),
@@ -3176,6 +3930,30 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     continue
                 log(f"[{name}] CUA confirms complete ✓ ({int(elapsed/60)}m)")
 
+                # Gemini-specific: validate completion via source count + content length
+                # Gemini Deep Research typically finds 10+ sources. If we have 0 sources
+                # and minimal text early in the run, the "done" verdict is likely false.
+                if name == "Gemini" and elapsed < (max_wait_min * 60 * 0.7):
+                    try:
+                        _gm_progress = await scrape_progress_gemini(p["page"])
+                        _gm_sources = _gm_progress.get("sources", 0)
+                        _gm_text = _gm_progress.get("partial_text_len", 0)
+                        _gm_steps = len(_gm_progress.get("steps", []))
+                        if _gm_sources < 3 and _gm_text < 2000:
+                            log(f"[Gemini] CUA says done but only {_gm_sources} sources, "
+                                f"{_gm_text} chars, {_gm_steps} steps at {int(elapsed/60)}m "
+                                f"— likely still researching. Reverting.", "WARN")
+                            p["done_count"] = 0
+                            p["cua_confirmed"] = False
+                            p["last_cua_check"] = time.time()
+                            emit_event("agent_progress", phase=2, agent="gemini",
+                                       status="generating",
+                                       progress=f"Still researching — {_gm_sources} sources so far",
+                                       elapsedSec=int(elapsed))
+                            continue
+                    except Exception:
+                        pass
+
                 # Claude-specific: validate completion via artifact count
                 # If only 1 artifact exists early in the run, the "done" verdict is
                 # likely from the planning phase ending — real completion produces 2 artifacts
@@ -3196,14 +3974,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     except Exception:
                         pass  # On failure, proceed with extraction anyway
 
-                # Extract content
-                try:
-                    await browser.switch_to_page(p["page"])
-                    text = await extract_fns[name](p["page"], browser=browser,
-                        cua_client=cua_client, label=name, verbose=verbose)
-                except Exception as e:
-                    log(f"[{name}] Extraction failed: {e}", "ERROR")
-                    text = ""
+                # Extract content (use cached text from link-retry if available)
+                text = p.pop("_cached_text", "")
+                if not text:
+                    try:
+                        await browser.switch_to_page(p["page"])
+                        text = await extract_fns[name](p["page"], browser=browser,
+                            cua_client=cua_client, label=name, verbose=verbose)
+                    except Exception as e:
+                        log(f"[{name}] Extraction failed: {e}", "ERROR")
+                        text = ""
 
                 # ── Revert on empty extraction ────────────────────────────
                 # If CUA confirmed "complete" but extraction yields
@@ -3238,17 +4018,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         continue
                     log(f"[{name}] 3 empty extractions — giving up at {int(elapsed/60)}m", "ERROR")
 
-                status = "done" if text and len(text) > 100 else "empty"
+                agent_key_lc = name.lower().replace(" ", "")
                 agent_url = p["page"].url
 
-                # Extract shareable link NOW (before moving to next agent)
-                # Retry up to 2 times — link extraction is critical for frontend
-                agent_key_lc = name.lower().replace(" ", "")
+                # Extract shareable link NOW — agents MUST have a verified public
+                # link before they can be declared "done". Without this, the
+                # frontend shows broken/private links.
                 link_verified = False
                 extractor_map = {"chatgpt": extract_share_link_chatgpt,
                                  "gemini": extract_share_link_gemini,
                                  "claude": extract_share_link_claude}
-                for _link_attempt in range(2):
+                for _link_attempt in range(3):
                     try:
                         await browser.switch_to_page(p["page"])
                         if agent_key_lc in extractor_map:
@@ -3258,16 +4038,40 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 agent_url = link_result.url
                                 link_verified = link_result.verified
                                 if link_verified:
-                                    break  # Got a verified public link — done
+                                    break
                                 else:
                                     log(f"[{name}] Link attempt {_link_attempt+1}: got URL but not verified, retrying...", "WARN")
                     except Exception as e:
                         log(f"[{name}] Link extraction attempt {_link_attempt+1} error: {e}", "WARN")
-                # Emit link — use validated helper to reject bad URLs
+                    if _link_attempt < 2:
+                        await asyncio.sleep(2)
+
+                # ── Gate: require BOTH content AND verified link to declare done ──
+                has_content = text and len(text) > 100
+                status = "done" if has_content and link_verified else (
+                    "done_no_link" if has_content else "empty")
+                if has_content and not link_verified and elapsed < (max_wait_min * 60 * 0.9):
+                    # Content extracted but no public link — revert and retry later
+                    p.setdefault("link_retries", 0)
+                    p["link_retries"] += 1
+                    if p["link_retries"] <= 2:
+                        log(f"[{name}] Content extracted ({len(text)} chars) but no verified "
+                            f"public link. Retrying link extraction ({p['link_retries']}/2).", "WARN")
+                        p["done_count"] = 0
+                        p["cua_confirmed"] = False
+                        p["last_cua_check"] = time.time() + 30
+                        # Store the text so we don't re-extract
+                        p["_cached_text"] = text
+                        emit_event("agent_progress", phase=2, agent=agent_key_lc,
+                                   status="extracting_link",
+                                   progress=f"Research complete ({len(text)} chars) — getting public share link...",
+                                   partialTextLen=len(text), elapsedSec=int(elapsed))
+                        continue
+
+                # Emit link
                 if validate_link(agent_key_lc, agent_url):
                     emit_validated_link(2, agent_key_lc, agent_url, f"{name} Research")
                 else:
-                    # Still emit but as unverified fallback — better than nothing
                     emit_event("link_extracted", phase=2, agent=agent_key_lc,
                                url=agent_url, label=f"{name} Research",
                                verified=False)
@@ -3539,16 +4343,6 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     except Exception:
         pass
 
-    # Method 4: Firecrawl API (full page scrape — last resort)
-    if FIRECRAWL_API_KEY:
-        try:
-            fc_md = await asyncio.to_thread(firecrawl_scrape, page.url)
-            if fc_md and len(fc_md) > 500:
-                log(f"[{label}] Extracted via Firecrawl: {len(fc_md)} chars")
-                return fc_md
-        except Exception:
-            pass
-
     log(f"[{label}] All extraction methods failed", "WARN")
     return ""
 
@@ -3584,17 +4378,7 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     except Exception:
         pass
 
-    # Method 4: Firecrawl API (full page scrape)
-    if FIRECRAWL_API_KEY:
-        try:
-            fc_md = await asyncio.to_thread(firecrawl_scrape, page.url)
-            if fc_md and len(fc_md) > 500:
-                log(f"[{label}] Extracted via Firecrawl: {len(fc_md)} chars")
-                return fc_md
-        except Exception:
-            pass
-
-    # Method 5: Select-all clipboard (last resort)
+    # Method 4: Select-all clipboard (last resort)
     log(f"[{label}] Trying select-all clipboard fallback", "WARN")
     await page.keyboard.press("Control+a")
     await asyncio.sleep(0.5)
@@ -3690,16 +4474,6 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     except Exception:
         pass
 
-    # Method 5: Firecrawl API (full page scrape — last resort)
-    if FIRECRAWL_API_KEY:
-        try:
-            fc_md = await asyncio.to_thread(firecrawl_scrape, page.url)
-            if fc_md and len(fc_md) > 500:
-                log(f"[{label}] Extracted via Firecrawl: {len(fc_md)} chars")
-                return fc_md
-        except Exception:
-            pass
-
     log(f"[{label}] All extraction methods failed", "WARN")
     return ""
 
@@ -3709,39 +4483,83 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
     Call this AFTER extract_claude_response while the artifact panel is still open."""
     try:
         # Try DOM-first: click publish button on the artifact panel
-        published_url = await page.evaluate("""() => {
-            const publishBtn = document.querySelector(
-                'aside button[aria-label*="Publish"], ' +
-                'aside button[aria-label*="Share"], ' +
-                '[class*="artifact-panel"] button[aria-label*="Publish"], ' +
-                'button[data-testid="publish-artifact"]'
-            );
-            if (publishBtn) { publishBtn.click(); return 'clicked'; }
+        clicked = await page.evaluate("""() => {
+            // Multiple selector strategies for the publish/share button
+            const selectors = [
+                'aside button[aria-label*="Publish"]',
+                'aside button[aria-label*="Share"]',
+                '[class*="artifact"] button[aria-label*="Publish"]',
+                '[class*="artifact"] button[aria-label*="Share"]',
+                'button[data-testid="publish-artifact"]',
+                // Icon-based: globe or share icons in the artifact panel
+                'aside button svg[class*="globe"]',
+                'aside button svg[class*="share"]',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    const btn = el.closest('button') || el;
+                    btn.click();
+                    return 'clicked';
+                }
+            }
             return '';
         }""")
-        if published_url == 'clicked':
+        if clicked == 'clicked':
             await asyncio.sleep(2)
-            # Look for the URL in the dialog
-            url = await page.evaluate("""() => {
-                const links = document.querySelectorAll('a[href*="claude.site/artifacts"], input[value*="claude.site"]');
-                for (const el of links) {
-                    const href = el.href || el.value || '';
-                    if (href.includes('claude.site/artifacts')) return href;
+            # Check if there's a "Publish" confirmation button in the dialog
+            await page.evaluate("""() => {
+                // Some versions show a confirmation dialog — click Publish/Confirm
+                const btns = document.querySelectorAll('button, [role="button"]');
+                for (const btn of btns) {
+                    const txt = (btn.innerText || btn.textContent || '').toLowerCase().trim();
+                    if (txt === 'publish' || txt === 'create public link' || txt === 'confirm') {
+                        btn.click();
+                        return 'confirmed';
+                    }
                 }
-                // Also check for copy-link button
-                const copyBtn = document.querySelector('button[aria-label*="Copy link"], button:has-text("Copy link")');
-                if (copyBtn) { copyBtn.click(); return 'clipboard'; }
                 return '';
             }""")
-            if url and url.startswith('http'):
-                log(f"[Claude] Published artifact via DOM: {url}")
-                return url
-            if url == 'clipboard':
-                await asyncio.sleep(0.5)
-                clip = get_clipboard()
-                if clip and 'claude.site' in clip:
-                    log(f"[Claude] Published artifact via clipboard: {clip}")
-                    return clip
+            await asyncio.sleep(2)
+            # Look for the URL in the dialog (try multiple times — UI may be animating)
+            for _attempt in range(3):
+                url = await page.evaluate("""() => {
+                    // Check for direct links
+                    const links = document.querySelectorAll(
+                        'a[href*="claude.site/artifacts"], input[value*="claude.site"]'
+                    );
+                    for (const el of links) {
+                        const href = el.href || el.value || '';
+                        if (href.includes('claude.site')) return href;
+                    }
+                    // Check visible text for claude.site URL
+                    const text = document.body.innerText;
+                    const m = text.match(/https:\\/\\/claude\\.site\\/artifacts\\/[a-f0-9-]+/);
+                    if (m) return m[0];
+                    return '';
+                }""")
+                if url and url.startswith('http') and 'claude.site' in url:
+                    log(f"[Claude] Published artifact via DOM: {url}")
+                    return url
+                # Try clicking "Copy link" button
+                copy_result = await page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        const txt = (b.innerText || '').toLowerCase();
+                        if (txt.includes('copy link') || txt.includes('copy url')) {
+                            b.click();
+                            return 'copied';
+                        }
+                    }
+                    return '';
+                }""")
+                if copy_result == 'copied':
+                    await asyncio.sleep(0.5)
+                    clip = get_clipboard()
+                    if clip and 'claude.site' in clip:
+                        log(f"[Claude] Published artifact via clipboard: {clip}")
+                        return clip
+                await asyncio.sleep(1)
     except Exception as e:
         log(f"[Claude] DOM publish attempt failed: {e}", "WARN")
 
@@ -3750,14 +4568,17 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
         result = await agent_loop(cua_client, browser,
             PROMPT_PUBLISH_CLAUDE_ARTIFACT,
             "Publish the artifact that's currently open in the right panel. "
-            "Get the public URL (claude.site/artifacts/...). Tell me the URL.",
+            "Click the Publish/Share button, then confirm publishing. "
+            "Get the public URL (claude.site/artifacts/...). Tell me the EXACT URL.",
             model=CUA_MODEL, max_iterations=10, verbose=verbose)
         text = result.get("text", "")
-        m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
+        m = re.search(r'https://claude\.site/artifacts/[a-f0-9-]+', text)
+        if not m:
+            m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
         if m:
             return m.group(0)
         clip = get_clipboard()
-        if clip and 'claude.' in clip:
+        if clip and 'claude.site' in clip:
             return clip
 
     return ""
@@ -3825,6 +4646,9 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     _runtime.phase = 1
     _runtime.sub_state = "1_brief_generating"
     _runtime.register_page("chatgpt", browser.page, browser.page.url)
+
+    # Inject MutationObserver for live token-level streaming to frontend
+    await inject_agent_observer(browser.page, "chatgpt")
 
     # Wait for response
     log(f"Polling for response (every {POLL_PRO}s, max {MAX_WAIT_PRO}min)...")
@@ -3981,8 +4805,8 @@ async def setup_gemini_dr(page) -> bool:
 
 
 async def setup_claude_dr(page) -> bool:
-    """Enable Claude Extended Thinking + Research tool via direct selectors.
-    Claude.ai: model dropdown shows 'Opus 4.6 Extended' variant; Research is in tools menu."""
+    """Enable Claude Adaptive Thinking + Research tool via direct selectors.
+    Claude.ai: model dropdown shows 'Opus 4.7 Adaptive' variant; Research is in tools menu."""
     try:
         await asyncio.sleep(2)
         # Step 1: Model selector — click the model dropdown button.
@@ -4003,7 +4827,7 @@ async def setup_claude_dr(page) -> bool:
         }""")
         if model_picked:
             await asyncio.sleep(1.0)
-            # Pick "Opus Extended Thinking" from the dropdown — prioritize Opus,
+            # Pick "Opus Adaptive Thinking" from the dropdown — prioritize Opus,
             # never settle for Sonnet if Opus is available.
             selected = await page.evaluate("""() => {
                 const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, a')];
@@ -4028,7 +4852,7 @@ async def setup_claude_dr(page) -> bool:
             if selected:
                 log(f"Claude model selected: {selected}")
             else:
-                log("Could not find Opus Extended Thinking in dropdown — may default to current model", "WARN")
+                log("Could not find Opus Adaptive Thinking in dropdown — may default to current model", "WARN")
             await asyncio.sleep(0.8)
 
         # Step 2: Open tools menu ("+" button) — enable "Research" tool
@@ -4091,7 +4915,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
         "gemini": "Verify the Deep Research pill is ACTIVE in Gemini composer. Fix if not. Do not type.",
-        "claude": "Verify Opus 4.6 Extended + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
+        "claude": "Verify Opus 4.7 Adaptive + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())
@@ -4310,11 +5134,15 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         emit_event("pipeline_warning", phase=2, agent=platform_l,
                    message=f"{platform} setup validation failed — agent may not be fully configured")
 
-    # ── Brief delivery: prefer file-attachment path (Option A) ──
-    # The 30KB brief is too large for inline paste — both ChatGPT and Claude
-    # auto-convert to attachments and the paste verification then fails.
-    # Attaching the file directly + a short inline prompt is the reliable flow.
-    if brief_path and Path(brief_path).exists():
+    # ── Brief delivery ──
+    # Gemini Deep Research ignores file attachments — it only processes text
+    # input to generate its research plan. Always paste the brief for Gemini.
+    # ChatGPT and Claude: prefer file-attachment (they auto-convert large pastes
+    # to attachments and the paste verification then fails).
+    is_gemini = platform.lower() == "gemini"
+    use_file_attach = brief_path and Path(brief_path).exists() and not is_gemini
+
+    if use_file_attach:
         log(f"[{label}] Attaching brief file: {Path(brief_path).name}")
         attached = await attach_brief_file(browser, page, brief_path, platform, label)
         if attached:
@@ -4334,14 +5162,21 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 emit_event("pipeline_error", phase=2, agent=platform, error="Brief delivery failed (attach + paste)")
                 return page
     else:
-        # Legacy path (Phase 1 follow-ups, no brief file yet)
-        log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
+        # Gemini always uses paste; legacy path also uses paste
+        if is_gemini:
+            log(f"[{label}] Pasting brief directly (Gemini Deep Research requires text input, not file)")
+        else:
+            log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
         paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
         if not paste_ok:
             log(f"[{label}] All paste strategies failed — retrying with page reload", "WARN")
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=15000)
                 await asyncio.sleep(3)
+                # Gemini: re-activate Deep Research after reload
+                if is_gemini:
+                    await setup_gemini_dr(page)
+                    await asyncio.sleep(1)
                 paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=2)
             except Exception as e:
                 log(f"[{label}] Reload+retry failed: {e}", "WARN")
@@ -4450,6 +5285,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         if verified_a:
             emit_event("agent_progress", phase=2, agent="chatgpt", status="generating", progress="ChatGPT Deep Research started and verified")
             log("[2A] ChatGPT Deep Research is running ✓")
+            await inject_agent_observer(chatgpt_page, "chatgpt")
         else:
             log("[2A] ChatGPT failed after 2 attempts", "ERROR")
             emit_event("pipeline_error", phase=2, agent="chatgpt", error="Failed to start after 2 attempts")
@@ -4473,7 +5309,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     # ── Step 3: Claude (starts instantly after submission) ──
     if enabled_agents is None or "claude" in enabled_agents:
         log("\n--- 2C: Claude Deep Research ---")
-        emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Extended Thinking + Research tools...")
+        emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Opus 4.7 Adaptive + Research tools...")
         for attempt in range(2):
             if attempt > 0:
                 log("[2C] Retrying Claude (fresh tab)...", "WARN")
@@ -4482,7 +5318,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             claude_page = await start_agent_no_gemini_wait(
                 browser, cua_client, "https://claude.ai/new",
                 PROMPT_CLAUDE_DEEP_RESEARCH,
-                "Select Opus 4.6 + Extended Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+                "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
                 brief_text, "2C", "Claude", verbose, brief_path=brief_path)
             verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2C",
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
@@ -4490,8 +5326,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 break
         agents["Claude"] = {"page": claude_page, "verified": verified_c, "url": claude_page.url}
         if verified_c:
-            emit_event("agent_progress", phase=2, agent="claude", status="generating", progress="Claude Extended Thinking started and verified")
+            emit_event("agent_progress", phase=2, agent="claude", status="generating", progress="Claude Adaptive Thinking started and verified")
             log("[2C] Claude is running ✓")
+            await inject_agent_observer(claude_page, "claude")
         else:
             log("[2C] Claude failed after 2 attempts", "ERROR")
             emit_event("pipeline_error", phase=2, agent="claude", error="Failed to start after 2 attempts")
@@ -4544,10 +5381,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # Verify Gemini is actually researching
         verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2B",
             browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
-        agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url}
+        # Record when research actually started (after "Start research" click)
+        # so the round-robin doesn't check for completion prematurely
+        agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url,
+                            "research_started_at": time.time()}
         if verified_b:
             emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini Deep Research plan created and started")
             log("[2B] Gemini is researching ✓")
+            await inject_agent_observer(gemini_page, "gemini")
         else:
             log("[2B] Gemini may not be running", "WARN")
 
@@ -4573,8 +5414,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
 
 # ── Phase 3: Extract MDs + Shareable Links + NotebookLM Upload ───────────────
 
-async def run_phase3(browser, cua_client, results, topic, queue_dir, verbose=False):
-    """Phase 3: Get shareable links + upload MDs to NotebookLM."""
+async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose=False):
+    """Phase 3 (step a): Get shareable links + upload MDs to NotebookLM + make public."""
     log("=" * 60)
     log("PHASE 3: Extract Links + NotebookLM Upload")
     log("=" * 60)
@@ -4628,6 +5469,7 @@ async def run_phase3(browser, cua_client, results, topic, queue_dir, verbose=Fal
 
         # Get shareable link via CUA
         log(f"[{name}] Getting shareable link...")
+        agent_key = name.lower().replace(" ", "")
         try:
             await browser.switch_to_page(page)
             await asyncio.sleep(2)
@@ -4647,9 +5489,14 @@ async def run_phase3(browser, cua_client, results, topic, queue_dir, verbose=Fal
             else:
                 links[name] = current_url
                 log(f"[{name}] Using current URL: {current_url[:80]}")
+            # Emit link immediately — don't wait for phase end
+            emit_validated_link(3, agent_key, links[name], f"{name} Research")
         except Exception as e:
             links[name] = r.get("url", "")
             log(f"[{name}] Link error: {e} — using chat URL", "WARN")
+            if links[name]:
+                emit_event("link_extracted", phase=3, agent=agent_key,
+                           url=links[name], label=f"{name} Research", verified=False)
 
         # Check MD file exists in queue
         fname = name.lower().replace(" ", "") + ".md"
@@ -4687,16 +5534,31 @@ async def run_phase3(browser, cua_client, results, topic, queue_dir, verbose=Fal
                 browser.clear_upload_file()
                 await asyncio.sleep(3)
 
-            # Rename notebook
-            short_topic = topic[:45].rsplit(' ', 1)[0] if len(topic) > 45 else topic
-            title = f"Research: {short_topic}"
+            # Rename notebook — use the smart title (Firestore-synced) so NotebookLM,
+            # YouTube, and the email subject all line up on the same short name.
+            title = smart_title(topic)
             log(f"Renaming notebook to '{title}'...")
             await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
                 f"Rename this notebook to: {title}",
                 model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
+            # C1: make notebook public (Share → "Anyone with the link" → Save)
+            # BEFORE emitting the URL, so the frontend's link is always viewable.
             notebook_url = await browser.current_url()
+            try:
+                log("NotebookLM: opening share dialog to set 'Anyone with link'...")
+                nlm_share_res = await extract_notebooklm_url(browser, cua_client=cua_client, verbose=verbose)
+                if nlm_share_res.verified and nlm_share_res.url:
+                    notebook_url = nlm_share_res.url
+                    log(f"NotebookLM public share OK: {notebook_url}")
+                else:
+                    log(f"NotebookLM public share uncertain — falling back to tab URL: {nlm_share_res.error}", "WARN")
+            except Exception as e:
+                log(f"NotebookLM public share flow error: {e} — falling back to tab URL", "WARN")
             log(f"NotebookLM: {notebook_url}")
+            # Emit notebook link immediately — frontend shows it without waiting for phase end
+            if notebook_url and "notebooklm.google.com/notebook" in notebook_url:
+                emit_validated_link(3, "notebooklm", notebook_url, "NotebookLM Notebook")
             save_track("NotebookLM", {"status": "uploaded", "notebook_url": notebook_url,
                                        "sources_count": len(md_files)})
         except Exception as e:
@@ -4709,8 +5571,8 @@ async def run_phase3(browser, cua_client, results, topic, queue_dir, verbose=Fal
 
 # ── Phase 4: Audio Overview Generation ───────────────────────────────────────
 
-async def run_phase4(browser, cua_client, notebook_url, queue_dir, verbose=False):
-    """Phase 4: Generate long-form audio overview in NotebookLM."""
+async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False):
+    """Phase 3 (step b): Generate long-form audio overview in NotebookLM + share public."""
     log("=" * 60)
     log("PHASE 4: Audio Overview Generation")
     log("=" * 60)
@@ -4860,47 +5722,82 @@ async def run_phase4(browser, cua_client, notebook_url, queue_dir, verbose=False
             pass
 
     # ── Extract NotebookLM Audio Overview shareable link ──
-    # NotebookLM generates a shareable link for the audio overview that
-    # looks like: notebooklm.google.com/notebook/XXXXX/audio/YYYYY
+    # Audio overview share: three-dots/menu → Share → Notebook access → public → get link → Save
     audio_overview_url = ""
     if audio_done:
         try:
-            # After download, the audio player should be visible. Check for share button.
-            audio_overview_url = await browser.page.evaluate("""() => {
-                // Look for a share button near the audio player
-                const shareBtn = document.querySelector(
-                    'button[aria-label*="Share"], button[aria-label*="share"], ' +
-                    '[class*="share"] button, button[data-share]'
+            page = browser.page
+            # Step 1: Open three-dots / options menu near the audio player
+            menu_opened = await page.evaluate("""() => {
+                // Look for three-dots / more options button near audio player
+                const menuBtns = document.querySelectorAll(
+                    'button[aria-label*="More"], button[aria-label*="more"], ' +
+                    'button[aria-label*="Options"], button[aria-label*="options"], ' +
+                    'button[aria-label*="Menu"], button[aria-label*="menu"], ' +
+                    '[class*="more"] button, [class*="menu"] button, ' +
+                    'button[data-testid*="more"], button[data-testid*="menu"]'
                 );
-                if (shareBtn) shareBtn.click();
-                return '';  // Will check clipboard/dialog after click
-            }""")
-            await asyncio.sleep(2)
-            # Check if a share dialog appeared with a link
-            share_link = await browser.page.evaluate("""() => {
-                const inputs = document.querySelectorAll('input[readonly], input[value*="notebooklm"]');
-                for (const inp of inputs) {
-                    const val = inp.value || '';
-                    if (val.includes('notebooklm.google.com')) return val;
+                // Also look for ⋮ (vertical dots) button
+                for (const btn of menuBtns) {
+                    if (btn.offsetParent !== null) { btn.click(); return 'menu_opened'; }
                 }
-                // Also check any visible text with the notebook audio URL pattern
-                const text = document.body.innerText;
-                const m = text.match(/https:\\/\\/notebooklm\\.google\\.com\\/notebook\\/[^\\s]+/);
-                return m ? m[0] : '';
+                // Fallback: look for button with dots icon/text
+                const allBtns = document.querySelectorAll('button');
+                for (const b of allBtns) {
+                    const txt = (b.innerText || '').trim();
+                    const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                    if (txt === '⋮' || txt === '...' || txt === '⋯' ||
+                        label.includes('action') || label.includes('overflow')) {
+                        if (b.offsetParent !== null) { b.click(); return 'dots_opened'; }
+                    }
+                }
+                return '';
             }""")
-            if share_link and "notebooklm.google.com" in share_link:
-                audio_overview_url = share_link
+            if menu_opened:
+                await asyncio.sleep(1)
+                # Step 2: Click "Share" from the menu
+                await page.evaluate("""() => {
+                    const items = document.querySelectorAll(
+                        '[role="menuitem"], [role="option"], li, button'
+                    );
+                    for (const item of items) {
+                        const txt = (item.innerText || item.textContent || '').toLowerCase().trim();
+                        if (txt === 'share' || txt === 'share notebook' || txt.startsWith('share')) {
+                            item.click();
+                            return 'share_clicked';
+                        }
+                    }
+                    return '';
+                }""")
+                await asyncio.sleep(2)
             else:
-                # Use current URL as audio overview URL (NotebookLM URLs are inherently shareable)
+                # Fallback: try direct share button
+                await page.evaluate("""() => {
+                    const shareBtn = document.querySelector(
+                        'button[aria-label*="Share"], button[aria-label*="share"]'
+                    );
+                    if (shareBtn) shareBtn.click();
+                    return '';
+                }""")
+                await asyncio.sleep(2)
+
+            # Step 3: Use shared helper for NLM public access + get link + Save
+            audio_overview_url = await _set_nlm_public_and_get_link(page, "Audio")
+
+            if not audio_overview_url:
+                # Fallback: use current URL
                 current_url = await browser.current_url()
                 if "notebooklm.google.com/notebook" in current_url:
                     audio_overview_url = current_url
-            await browser.page.keyboard.press("Escape")  # Close any share dialog
+
+            await page.keyboard.press("Escape")  # Close any remaining dialog
             await asyncio.sleep(0.5)
         except Exception as e:
             log(f"Audio overview link extraction failed: {e}", "WARN")
         if audio_overview_url:
             log(f"Audio overview link: {audio_overview_url}")
+            # Emit link immediately — route through validate_link to prevent fake URLs
+            emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview")
         else:
             log("Audio overview link not found — using notebook URL as fallback", "WARN")
 
@@ -4943,12 +5840,13 @@ async def _check_audio_generating(page):
 
 # ── Phase 5: Video Conversion + YouTube Upload ──────────────────────────────
 
-GEMINI_API_KEY = get_env("GEMINI_API_KEY")  # For thumbnail generation (Imagen)
+GEMINI_API_KEY = get_env("GEMINI_API_KEY")  # For thumbnail generation (nano-banana)
+THUMBNAIL_MODEL = os.environ.get("THUMBNAIL_MODEL", "gemini-2.5-flash-image")  # nano-banana
 
 
 def generate_thumbnail(topic, output_path):
-    """Generate a topic-relevant thumbnail via Gemini Imagen API. Falls back to Pillow text card."""
-    # Try Gemini image generation first (Imagen 3 via Gemini API)
+    """Generate a topic-relevant thumbnail via Gemini 2.5 Flash Image (nano-banana).
+    Falls back to Pillow text card if the API call fails."""
     try:
         import requests
         prompt = (
@@ -4956,11 +5854,13 @@ def generate_thumbnail(topic, output_path):
             f"{topic[:200]}. Dark futuristic theme, clean design, abstract tech visuals. "
             f"No text on the image — just visual design. 16:9 aspect ratio."
         )
-        # Use Gemini 2.0 Flash with image generation (supports Imagen 3 natively)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}"
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{THUMBNAIL_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]}
+            "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
         }
         resp = requests.post(url, json=payload, timeout=60)
         if resp.status_code == 200:
@@ -4970,11 +5870,11 @@ def generate_thumbnail(topic, output_path):
                     if "inlineData" in part:
                         img_data = base64.b64decode(part["inlineData"]["data"])
                         Path(output_path).write_bytes(img_data)
-                        log(f"Thumbnail generated via Gemini ✓ ({len(img_data)} bytes)")
+                        log(f"Thumbnail generated via {THUMBNAIL_MODEL} ✓ ({len(img_data)} bytes)")
                         return
-        log(f"Gemini image gen returned {resp.status_code} — falling back to Pillow", "WARN")
+        log(f"{THUMBNAIL_MODEL} returned {resp.status_code} — falling back to Pillow", "WARN")
     except Exception as e:
-        log(f"Gemini image gen failed: {e} — falling back to Pillow", "WARN")
+        log(f"{THUMBNAIL_MODEL} image gen failed: {e} — falling back to Pillow", "WARN")
 
     # Fallback: Pillow text card
     try:
@@ -5007,9 +5907,9 @@ def generate_thumbnail(topic, output_path):
     log(f"Thumbnail: {output_path}")
 
 
-async def run_phase5(browser, cua_client, audio_path, topic, queue_dir,
+async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                      links=None, notebook_url="", verbose=False):
-    """Phase 5: Convert audio to video + upload to YouTube with thumbnail."""
+    """Phase 4: Convert audio to video + upload to YouTube (unlisted, not-for-kids)."""
     log("=" * 60)
     log("PHASE 5: Video + YouTube Upload")
     log("=" * 60)
@@ -5053,7 +5953,8 @@ async def run_phase5(browser, cua_client, audio_path, topic, queue_dir,
     if title_card.exists():
         browser.queue_upload_file(str(title_card))
 
-    title = f"Research Overview: {topic[:80]}"
+    # Use the smart title (matches NotebookLM + email subject for consistency)
+    title = smart_title(topic)
     # Build description with research links
     desc_parts = [f"Research overview on: {topic[:200]}"]
     if links:
@@ -5072,8 +5973,81 @@ async def run_phase5(browser, cua_client, audio_path, topic, queue_dir,
 
     browser.clear_upload_file()
 
+    # ── C4: DOM safety net — ensure Unlisted + Not-for-kids before Save ──
+    # CUA sometimes misses the radio clicks or the Save button. This block:
+    #   1. Ticks "Unlisted" if visibility page is open and no radio is selected.
+    #   2. Ticks "No, it's not made for kids" if still on Details page.
+    #   3. Clicks Save/Publish if it wasn't already.
+    await asyncio.sleep(2)
+    try:
+        save_status = await page.evaluate("""() => {
+            const result = { actions: [], saved: false };
+            const text = document.body.innerText.toLowerCase();
+            // Already done?
+            if (text.includes('video published') || text.includes('video is being processed') ||
+                text.includes('processing will begin') || text.includes('your video is live')) {
+                result.saved = 'already_saved';
+                return result;
+            }
+            // Ensure "Unlisted" radio is selected (visibility page)
+            const radios = document.querySelectorAll('tp-yt-paper-radio-button, [role="radio"]');
+            let unlistedSelected = false;
+            for (const r of radios) {
+                const label = (r.innerText || r.getAttribute('aria-label') || '').toLowerCase();
+                const checked = r.getAttribute('aria-checked') === 'true' || r.hasAttribute('checked');
+                if (label.includes('unlisted') && checked) { unlistedSelected = true; break; }
+            }
+            if (!unlistedSelected) {
+                for (const r of radios) {
+                    const label = (r.innerText || r.getAttribute('aria-label') || '').toLowerCase();
+                    if (label.includes('unlisted') && r.offsetParent !== null) {
+                        r.click(); result.actions.push('clicked_unlisted'); unlistedSelected = true; break;
+                    }
+                }
+            }
+            // Ensure "Not made for kids" radio is selected (details page or MFK dialog)
+            let mfkSelected = false;
+            for (const r of radios) {
+                const label = (r.innerText || r.getAttribute('aria-label') || '').toLowerCase();
+                const checked = r.getAttribute('aria-checked') === 'true' || r.hasAttribute('checked');
+                if ((label.includes("not made for kids") || label.includes("not for kids") ||
+                     label.includes("no, it's not")) && checked) { mfkSelected = true; break; }
+            }
+            if (!mfkSelected) {
+                for (const r of radios) {
+                    const label = (r.innerText || r.getAttribute('aria-label') || '').toLowerCase();
+                    if ((label.includes("not made for kids") || label.includes("not for kids") ||
+                         label.includes("no, it's not")) && r.offsetParent !== null) {
+                        r.click(); result.actions.push('clicked_not_for_kids'); mfkSelected = true; break;
+                    }
+                }
+            }
+            // Click Save / Publish / Done
+            const btns = document.querySelectorAll('button, ytcp-button');
+            for (const b of btns) {
+                const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                if ((txt === 'save' || txt === 'publish' || txt === 'done') && !b.disabled) {
+                    b.click(); result.actions.push('clicked_save'); result.saved = 'clicked_save';
+                    return result;
+                }
+            }
+            result.saved = 'no_save_btn';
+            return result;
+        }""") or {}
+        actions = save_status.get('actions', []) if isinstance(save_status, dict) else []
+        saved = save_status.get('saved') if isinstance(save_status, dict) else save_status
+        for a in actions:
+            log(f"[YouTube] DOM safety net: {a}")
+        if saved == 'clicked_save':
+            log("[YouTube] DOM safety net: clicked Save button")
+            await asyncio.sleep(3)
+        elif saved == 'already_saved':
+            log("[YouTube] Video already saved/published")
+    except Exception as e:
+        log(f"[YouTube] Save verification: {e}", "WARN")
+
     # Extract REAL YouTube video URL — NEVER fall back to studio.youtube.com
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
     youtube_url = ""
 
     # Helper: validate a candidate URL
@@ -5156,12 +6130,13 @@ Do NOT report studio.youtube.com URLs — those are NOT video links.""",
 
     if youtube_url:
         log(f"YouTube video URL: {youtube_url}")
+        # Emit link immediately — frontend shows it without waiting for phase end
+        emit_validated_link(4, "youtube", youtube_url, "YouTube Video")
     else:
         log("[YouTube] Could not extract video URL — no link will be emitted", "WARN")
     save_track("Phase5", {"status": "youtube_uploaded" if youtube_url else "youtube_url_failed",
                           "youtube_url": youtube_url})
 
-    # Keep all generated files (audio, video, thumbnail) — used by web app
     # Keep all generated files (audio, video, thumbnail) — used by web app
     log(f"Files preserved in queue: {queue_dir}")
 
@@ -5170,11 +6145,11 @@ Do NOT report studio.youtube.com URLs — those are NOT video links.""",
 
 # ── Phase 6: Google Doc + Gmail Delivery ─────────────────────────────────────
 
-async def run_phase6(browser, cua_client, topic, links, notebook_url, youtube_url,
+async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
                      brief_url="", audio_url="", email=None, verbose=False):
-    """Phase 6: Create Google Doc hub + send email."""
+    """Phase 5: Create + fill + publicly share Google Doc, then send email with Open Gmail link."""
     log("=" * 60)
-    log("PHASE 6: Email & Delivery")
+    log("PHASE 5: Doc + Email Delivery")
     log("=" * 60)
 
     # Build doc content — structured format matching PRD
@@ -5204,7 +6179,7 @@ async def run_phase6(browser, cua_client, topic, links, notebook_url, youtube_ur
         doc_lines.append(f"Link to YouTube: {youtube_url}")
     doc_content = "\n".join(doc_lines)
 
-    # Create Google Doc
+    # Create Google Doc: create → fill → make public → emit link
     log("Creating Google Doc...")
     doc_url = ""
     try:
@@ -5212,12 +6187,25 @@ async def run_phase6(browser, cua_client, topic, links, notebook_url, youtube_ur
         await asyncio.sleep(5)
 
         await agent_loop(cua_client, browser, PROMPT_CREATE_DOC,
-            f"Type this content into the doc, then share with 'Anyone with link can edit':\n\n{doc_content}",
+            f"Type this content into the doc, then share with 'Anyone with link' as Editor:\n\n{doc_content}",
             model=CUA_MODEL, max_iterations=20, verbose=verbose)
-
         await asyncio.sleep(2)
 
+        # C5: DOM safety net — ensure the doc is public even if CUA missed the share step
+        try:
+            if await _ensure_gdoc_public(page):
+                log("Google Doc public share confirmed via DOM")
+            await asyncio.sleep(1)
+            # Close any lingering share dialog
+            await page.keyboard.press("Escape")
+        except Exception as e:
+            log(f"[gdoc] DOM safety net error: {e}", "WARN")
+
         doc_url = await browser.current_url()
+        # C5: emit link IMMEDIATELY so the frontend doc-icon dropdown renders
+        # the working URL before we move on to Gmail.
+        if doc_url and validate_link("gdocs", doc_url):
+            emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
         log(f"Google Doc: {doc_url}")
         save_track("Phase5", {"status": "doc_created", "doc_url": doc_url})
     except Exception as e:
@@ -5231,8 +6219,9 @@ async def run_phase6(browser, cua_client, topic, links, notebook_url, youtube_ur
             page = await browser.new_tab("https://mail.google.com")
             await asyncio.sleep(4)
 
-            subject = f"Research Complete: {topic[:60]}"
-            body_parts = [f"Research complete: {topic[:100]}\n"]
+            # Subject uses the smart title so it matches NotebookLM + YouTube.
+            subject = f"Research Complete: {smart_title(topic)}"
+            body_parts = [f"Research complete: {topic[:200]}\n"]
             if doc_url:
                 body_parts.append(f"Google Doc: {doc_url}")
             for pname in ["ChatGPT", "Gemini", "Claude"]:
@@ -5252,6 +6241,9 @@ async def run_phase6(browser, cua_client, topic, links, notebook_url, youtube_ur
             email_sent = True
             log("Email sent ✓")
             save_track("Phase5", {"status": "email_sent", "email": email})
+            # Emit Gmail link immediately so it shows in the dropdown
+            emit_event("link_extracted", phase=5, agent="gmail",
+                       url="https://mail.google.com", label="Open Gmail", verified=True)
         except Exception as e:
             log(f"Email error: {e}", "ERROR")
     else:
@@ -5619,15 +6611,120 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
     browser = Browser(PROFILE_DIR, headless=False)
     try:
-        # ══════════════════════ PHASE 0: Init ══════════════════════
-        emit_event("phase_start", phase=0, description="Initializing pipeline")
+        # ══════════════════════ PHASE 0: Preflight ══════════════════════
+        # Phase 0 does real work now: launch browser, verify each platform's
+        # login session, check env dependencies (Gemini key, ffmpeg). If any
+        # platform is not logged in, emit `login_required` and pause the
+        # pipeline — frontend shows a sticky banner with Retry.
+        emit_event("phase_start", phase=0, description="Verifying environment + logins")
         _p0_start = time.time()
-        emit_event("agent_progress", phase=0, agent="system", status="Preparing", progress="Loading configuration and API keys...")
-        emit_event("agent_progress", phase=0, agent="system", status="Launching", progress="Starting Chromium browser with automation profile...")
+
+        emit_event("agent_progress", phase=0, agent="system", status="Launching",
+                   progress="Starting Chromium browser with automation profile…")
         await browser.start()
-        emit_event("agent_progress", phase=0, agent="system", status="Verifying", progress="Browser launched — verifying connectivity to AI platforms...")
-        emit_event("agent_progress", phase=0, agent="system", status="Ready", progress="All services verified — pipeline ready to begin")
-        emit_event("phase_complete", phase=0, durationSec=int(time.time() - _p0_start), summary="Browser launched, all services verified")
+
+        # Build list of platforms to verify based on enabled agents + phases
+        _agents_cfg = config.get("agents", {}) if isinstance(config, dict) else {}
+        _need_chatgpt = _agents_cfg.get("chatgpt", True)
+        _need_gemini = _agents_cfg.get("gemini", True)
+        _need_claude = _agents_cfg.get("claude", True)
+        _need_notebooklm = 3 not in skip_phases
+        _need_youtube = 4 not in skip_phases and config.get("videoEnabled", True) if isinstance(config, dict) else 4 not in skip_phases
+        _need_gmail = 5 not in skip_phases and config.get("emailEnabled", True) if isinstance(config, dict) else 5 not in skip_phases
+        _need_gdocs = 5 not in skip_phases
+
+        preflight_platforms = []
+        if _need_chatgpt:    preflight_platforms.append(("ChatGPT", "chatgpt"))
+        if _need_gemini:     preflight_platforms.append(("Gemini", "gemini"))
+        if _need_claude:     preflight_platforms.append(("Claude", "claude"))
+        if _need_notebooklm: preflight_platforms.append(("NotebookLM", "notebooklm"))
+        if _need_youtube:    preflight_platforms.append(("YouTube Studio", "youtube"))
+        if _need_gmail:      preflight_platforms.append(("Gmail", "gmail"))
+        if _need_gdocs:      preflight_platforms.append(("Google Docs", "gdocs"))
+
+        # Per-platform login verification + env checks, in a retry loop.
+        # After each pass, if anything is missing we emit `login_required`,
+        # pause the pipeline, and wait for the frontend's Retry button to
+        # send a resume command. Then we re-verify and either proceed or
+        # pause again.
+        label_by_key = {key: label for label, key in preflight_platforms}
+        _preflight_tabs: dict[str, object] = {}
+        attempt = 0
+        while True:
+            attempt += 1
+            _preflight_results: dict[str, bool] = {}
+
+            emit_event("agent_progress", phase=0, agent="system", status="Verifying",
+                       progress=f"Checking logins for {len(preflight_platforms)} platform(s) (attempt {attempt})…")
+
+            for label, key in preflight_platforms:
+                emit_event("agent_progress", phase=0, agent=key, status="checking",
+                           progress=f"Verifying {label} login…")
+                try:
+                    info = LOGIN_PLATFORMS.get(key)
+                    root = info["root"] if info else "about:blank"
+                    tab = _preflight_tabs.get(key)
+                    if tab is None:
+                        tab = await browser.new_tab(root)
+                        _preflight_tabs[key] = tab
+                    else:
+                        # Re-navigate on retry so we pick up new login state
+                        try:
+                            await tab.goto(root, wait_until="domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass
+                    # Settle for SPA hydration
+                    await asyncio.sleep(2.0)
+                    ok = await verify_login(tab, key, ensure_nav=False)
+                except Exception as e:
+                    log(f"Phase 0: login check failed for {key}: {e}", "WARN")
+                    ok = False
+                _preflight_results[key] = ok
+                emit_event("agent_progress", phase=0, agent=key,
+                           status="ok" if ok else "needs_login",
+                           progress=f"{label}: {'logged in ✓' if ok else 'login required ✗'}")
+
+            # Env checks: Gemini key for nano-banana thumbnail + ffmpeg for video
+            _env_ok = True
+            _env_errors: list[str] = []
+            if _need_youtube:
+                if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+                    _env_ok = False
+                    _env_errors.append("GOOGLE_API_KEY / GEMINI_API_KEY missing (needed for thumbnail)")
+                if not shutil.which("ffmpeg"):
+                    _env_ok = False
+                    _env_errors.append("ffmpeg not on PATH (needed for video encoding)")
+
+            _missing_logins = [k for k, v in _preflight_results.items() if not v]
+            if not _missing_logins and _env_ok:
+                break  # Everything green — proceed to Phase 1
+
+            missing_labels = [label_by_key.get(k, k) for k in _missing_logins]
+            emit_event("login_required",
+                       phase=0,
+                       platforms=_missing_logins,
+                       platformLabels=missing_labels,
+                       machineName=socket.gethostname(),
+                       envErrors=_env_errors,
+                       attempt=attempt,
+                       message=(
+                           f"Log into {', '.join(missing_labels)} in the browser on your setup PC." if missing_labels
+                           else "Environment check failed — see errors above."
+                       ))
+            _controls.request_pause()
+            emit_event("pipeline_paused", phase=0, reason="login_required")
+            await _controls.wait_if_paused()
+            if _controls.is_stop():
+                emit_event("pipeline_stopped", phase=0, reason="stopped during login_required")
+                return
+            # Loop re-runs the checks — frontend's Retry button sends a
+            # standard `resume` command that lands us here.
+
+        emit_event("agent_progress", phase=0, agent="system", status="ready",
+                   progress=f"Environment verified. {len(preflight_platforms)} platform(s) logged in.")
+        emit_event("phase_complete", phase=0,
+                   durationSec=int(time.time() - _p0_start),
+                   summary=f"Preflight passed — {len(preflight_platforms)} platform(s) ready")
 
         # ══════════════════════ PHASE 1: Brief ══════════════════════
         p1 = None
@@ -5642,9 +6739,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 log(f"Phase 1: SKIPPED — loaded brief from {brief_file} ({len(brief_text)} chars)")
             else:
                 fb1 = get_feedback(1)
-                p1 = await run_phase1(browser, cua_client, topic, pdf_paths, verbose, feedback=fb1)
-                if fb1:
-                    clear_feedback(1)
+                # Restart loop: if mid-phase pause+input+resume trips
+                # `_runtime.restart_requested`, merge the buffered context into
+                # the topic and rerun Phase 1. Capped at 3 attempts.
+                p1 = None
+                current_topic = topic
+                for _p1_attempt in range(3):
+                    _runtime.restart_requested = False
+                    p1 = await run_phase1(browser, cua_client, current_topic, pdf_paths, verbose, feedback=fb1)
+                    if fb1:
+                        clear_feedback(1)
+                        fb1 = ""  # only feed in on first attempt
+                    if not _runtime.restart_requested:
+                        break
+                    extra_ctx_retry = _controls.pop_extra_context()
+                    if not extra_ctx_retry:
+                        break
+                    current_topic = current_topic + "\n\nADDITIONAL USER CONTEXT:\n" + extra_ctx_retry
+                    log(f"[Phase 1] Mid-phase restart with +{len(extra_ctx_retry)} chars of user input")
+                    emit_event("phase_restart", phase=1,
+                               reason="mid_phase_input_on_resume",
+                               chars=len(extra_ctx_retry), attempt=_p1_attempt+1)
                 if not p1 or not p1["text"]:
                     log("Phase 1 failed — no brief generated", "ERROR")
                     emit_event("pipeline_error", phase=1, error="no brief generated")
@@ -5659,16 +6774,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Create BriefArtifact for reliable Phase 2 paste
             brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
             log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
-            # ── Link-before-advance: extract shareable ChatGPT link ──
-            log("Phase 1: Extracting shareable link before advancing...")
-            _p1_link_results = await extract_phase_links(1, browser, cua_client, verbose=verbose)
-            _p1_links = [r.to_dict() for r in _p1_link_results if r.success]
-            if _p1_links:
-                brief_url = _p1_links[0]["url"]
-                brief_artifact.url = brief_url
-                # Real-time link emission for frontend PhaseDropdown
-                emit_event("link_extracted", phase=1, agent="chatgpt",
-                           url=brief_url, label="ChatGPT Brief", verified=True)
+            # ── B1: Link-first phase_complete — 3× retry, halt on final fail ──
+            log("Phase 1: Extracting verified ChatGPT share link (3× retry)...")
+            p1_link = await extract_with_retry(
+                phase=1, agent="chatgpt", browser=browser, cua_client=cua_client,
+                extractor_fn=extract_share_link_chatgpt,
+                label="ChatGPT Brief", verbose=verbose,
+            )
+            if not p1_link.verified:
+                log(f"Phase 1 HALT — no verified ChatGPT link after 3 retries: {p1_link.error}", "ERROR")
+                emit_event("pipeline_error", phase=1,
+                           error=f"Could not extract verified ChatGPT share link: {p1_link.error}")
+                _update_firestore_research({"status": "failed", "phase": 1})
+                return
+            brief_url = p1_link.url
+            brief_artifact.url = brief_url
+            _p1_links = [{"label": "ChatGPT Brief", "url": brief_url, "verified": True}]
             save_checkpoint(queue_dir, 1, topic=topic, brief_url=brief_url)
             update_delivery(brief_url=brief_url)
             save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
@@ -5704,15 +6825,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     emit_event("pipeline_stopped", phase=1, reason="stop_after_pause")
                     _update_firestore_research({"status": "stopped", "phase": 1})
                     return
-                # Relaunch browser on resume (no active agents to restore since Phase 1 is done)
+                # Relaunch browser on resume
                 browser = Browser(PROFILE_DIR, headless=False)
                 await browser.start()
                 emit_event("pipeline_resumed", phase=1)
                 _update_firestore_research({"status": "ongoing"})
-                # Restart-phase logic: if user supplied input while paused, regenerate the brief
+                # Pause+resume+input semantics: rerun the paused phase with the
+                # user's input folded into the combined topic. The resulting
+                # brief carries the new guidance forward into Phase 2 naturally.
                 if _controls.peek_extra_context():
                     resume_input = _controls.pop_extra_context()
-                    log(f"Phase 1: Resume-with-input — regenerating brief with {len(resume_input)} extra chars")
+                    log(f"Phase 1 resume-with-input — regenerating brief with {len(resume_input)} extra chars")
                     emit_event("phase_restart", phase=1, reason="user_input_on_resume", chars=len(resume_input))
                     combined_topic = topic + "\n\nADDITIONAL USER CONTEXT:\n" + resume_input
                     p1_new = await run_phase1(browser, cua_client, combined_topic, pdf_paths, verbose, feedback="")
@@ -5726,7 +6849,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         emit_event("phase_complete", phase=1,
                                    summary=f"Brief regenerated with user input ({len(brief_text)} chars)",
                                    links=[{"label": "ChatGPT Brief", "url": brief_url}] if brief_url else [])
-                # Phase-boundary input handling: any buffered extra_context goes into Phase 2's brief (handled below)
             if _controls.is_stop():
                 return
 
@@ -5760,8 +6882,25 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 research_brief += f'\n\nUSER FEEDBACK (incorporate this into your research): {fb2}'
                 log(f"Phase 2: Injecting user feedback: {fb2[:100]}")
                 clear_feedback(2)
-            results = await run_phase2(browser, cua_client, research_brief, verbose,
-                                       enabled_agents=enabled_agents)
+            # Restart loop: if mid-phase pause + input triggers a restart, merge
+            # the new context into the brief and rerun the whole phase. Cap at
+            # 3 restarts to prevent infinite loops if something goes sideways.
+            results = {}
+            for _p2_attempt in range(3):
+                _runtime.restart_requested = False
+                results = await run_phase2(browser, cua_client, research_brief, verbose,
+                                           enabled_agents=enabled_agents)
+                if not _runtime.restart_requested:
+                    break
+                extra_ctx_retry = _controls.pop_extra_context()
+                if not extra_ctx_retry:
+                    log("[Phase 2] restart_requested but extra_context empty — continuing", "WARN")
+                    break
+                research_brief += f'\n\nADDITIONAL USER CONTEXT (restart #{_p2_attempt+1}):\n{extra_ctx_retry}'
+                log(f"[Phase 2] Mid-phase restart with +{len(extra_ctx_retry)} chars of user input")
+                emit_event("phase_restart", phase=2,
+                           reason="mid_phase_input_on_resume",
+                           chars=len(extra_ctx_retry), attempt=_p2_attempt+1)
             # Safety filter: ensure only enabled agents appear in results
             if enabled_agents:
                 agent_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
@@ -5807,7 +6946,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     if key not in agents:
                         agents[key] = {}
                     agents[key]["completionTimeSec"] = r.get("elapsed_sec", 0)
-                # Compile source URLs from track events (DOM scraping + Firecrawl)
+                # Compile source URLs from track events (DOM scraping)
                 events_file = _tracks_dir / "events.jsonl" if _tracks_dir else None
                 if events_file and events_file.exists():
                     try:
@@ -5848,66 +6987,81 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     data["sourceRefs"] = refs
                 meta["agents"] = agents
                 meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            # ── Link-before-advance: build links from round-robin results ──
-            # The round-robin already extracted shareable links per-agent (with
-            # proper page switching). Do NOT call extract_phase_links(2,...) which
-            # operates on browser.page (the last active tab) and would extract
-            # all 3 agents' links from Claude's page — causing ChatGPT and
-            # Gemini link extraction to fail.
-            #
-            # Instead: collect links from results. If any agent is missing a
-            # verified link, retry on their specific page.
+            # ── B1: Link-first phase_complete — per-agent 3× retry, modal on fail ──
+            extractor_map = {"chatgpt": extract_share_link_chatgpt,
+                             "gemini":  extract_share_link_gemini,
+                             "claude":  extract_share_link_claude}
             _share_markers = {
                 "ChatGPT": ["chatgpt.com/share"],
-                "Gemini": ["gemini.google.com/share", "g.co/gemini"],
-                "Claude": ["claude.site/artifacts", "claude.site/"],
+                "Gemini":  ["gemini.google.com/share", "g.co/gemini"],
+                "Claude":  ["claude.site/artifacts", "claude.site/"],
             }
-            _p2_links = []
-            _retry_agents = []  # Agents that need a link retry
+            _p2_links: list[dict] = []
+            _p2_skipped_agents: list[str] = []
             for name, r in results.items():
-                agent_key = name.lower().replace(" ", "")
-                agent_url = r.get("url", "")
-                markers = _share_markers.get(name, [])
-                is_verified = agent_url and any(m in agent_url for m in markers)
-                if agent_url:
-                    _p2_links.append({"label": f"{name} Research", "url": agent_url, "verified": is_verified})
-                if not is_verified and r.get("page"):
-                    _retry_agents.append((name, r))
-            # Retry link extraction for agents missing verified public links
-            extractor_map = {"chatgpt": extract_share_link_chatgpt,
-                             "gemini": extract_share_link_gemini,
-                             "claude": extract_share_link_claude}
-            for name, r in _retry_agents:
                 agent_key = name.lower().replace(" ", "")
                 if agent_key not in extractor_map:
                     continue
-                log(f"[{name}] Retrying link extraction on correct page...")
-                try:
-                    await browser.switch_to_page(r["page"])
-                    await asyncio.sleep(1)
-                    link_result = await extractor_map[agent_key](
-                        browser, cua_client=cua_client, verbose=verbose)
-                    if link_result.success and link_result.verified:
-                        # Update the link in _p2_links
-                        for link in _p2_links:
-                            if link["label"] == f"{name} Research":
-                                link["url"] = link_result.url
-                                link["verified"] = True
-                        # Re-emit with verified URL
-                        emit_event("link_extracted", phase=2, agent=agent_key,
-                                   url=link_result.url, label=f"{name} Research",
-                                   verified=True)
-                        log(f"[{name}] Retry succeeded: {link_result.url}")
-                    else:
-                        log(f"[{name}] Retry also unverified — keeping page URL", "WARN")
-                except Exception as e:
-                    log(f"[{name}] Retry link extraction failed: {e}", "WARN")
+                # Fast-path: round-robin already captured a verified link.
+                round_url = r.get("url", "")
+                markers = _share_markers.get(name, [])
+                if round_url and any(m in round_url for m in markers) and validate_link(agent_key, round_url):
+                    _p2_links.append({"label": f"{name} Research", "url": round_url, "verified": True})
+                    emit_event("link_extracted", phase=2, agent=agent_key,
+                               url=round_url, label=f"{name} Research", verified=True)
+                    continue
+                # Switch to the agent's page and try link extraction up to 3× with user decision.
+                page_obj = r.get("page")
+                if not page_obj:
+                    log(f"[{name}] No page handle — skipping link extraction", "WARN")
+                    emit_event("link_extraction_failed", phase=2, agent=agent_key,
+                               error="no page handle")
+                    _p2_skipped_agents.append(name)
+                    continue
+                # Decision loop: each round = 3× retry → agent_link_failed → user decides
+                while True:
+                    try:
+                        await browser.switch_to_page(page_obj)
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        log(f"[{name}] switch_to_page failed: {e}", "WARN")
+                    link_res = await extract_with_retry(
+                        phase=2, agent=agent_key, browser=browser, cua_client=cua_client,
+                        extractor_fn=extractor_map[agent_key],
+                        label=f"{name} Research", verbose=verbose,
+                    )
+                    if link_res.verified:
+                        _p2_links.append({"label": f"{name} Research",
+                                          "url": link_res.url, "verified": True})
+                        break
+                    # Ask the user: retry / skip / stop
+                    decision = await wait_for_agent_decision(
+                        agent=agent_key, phase=2,
+                        reason=f"Could not extract verified {name} share link after 3 retries: {link_res.error}",
+                    )
+                    if decision == "retry":
+                        log(f"[{name}] User chose RETRY — re-running extraction")
+                        continue
+                    if decision == "stop":
+                        log("User chose STOP after Phase 2 link failure", "WARN")
+                        emit_event("pipeline_stopped", phase=2,
+                                   reason="user_stop_on_agent_link_failed", agent=agent_key)
+                        _update_firestore_research({"status": "stopped", "phase": 2})
+                        return
+                    # skip → record best-effort URL (unverified) and move on
+                    log(f"[{name}] User chose SKIP — continuing without verified link", "WARN")
+                    _p2_skipped_agents.append(name)
+                    if round_url:
+                        _p2_links.append({"label": f"{name} Research",
+                                          "url": round_url, "verified": False})
+                    break
             done_count = sum(1 for r in results.values() if r["status"] == "done")
             total_chars = sum(len(r.get("text", "")) for r in results.values())
             verified_count = sum(1 for l in _p2_links if l.get("verified"))
-            log(f"Phase 2 links: {verified_count}/{len(_p2_links)} verified")
+            log(f"Phase 2 links: {verified_count} verified, {len(_p2_skipped_agents)} skipped")
             emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
-                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars total — {verified_count} verified links")
+                skippedAgents=_p2_skipped_agents,
+                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — {verified_count} verified links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
         else:
             log("Phase 2: Loading existing research files")
@@ -5977,15 +7131,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log("No research output — skipping Phases 3-5", "WARN")
             return
 
-        # ── Consume any extra context added during/after Phase 2 ──
-        # Save it as an additional document so NotebookLM can use it as a source
-        _late_context = _controls.pop_extra_context()
-        if _late_context:
-            log(f"Consuming extra context for Phase 3+ ({len(_late_context)} chars)")
-            ctx_path = queue_dir / "documents" / "user_context.md"
-            ctx_path.write_text(f"# Additional User Context\n\n{_late_context}", encoding="utf-8")
-            emit_event("agent_progress", phase=2, agent="system",
-                       status="context_saved", progress=f"User context saved ({len(_late_context)} chars)")
+        # Post-Phase-2: add_context is no longer accepted (guarded at command
+        # listener). Any residual extra_context from a pre-P2 race is dropped
+        # with a warning — no NotebookLM addendum, no prompt, no cascade.
+        if _controls.peek_extra_context():
+            dropped = _controls.pop_extra_context()
+            log(f"Dropping {len(dropped)} chars of residual extra_context post-P2 "
+                f"(add_context disabled for Phase 3+)", "WARN")
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 3: NotebookLM Processing (upload + audio) ══════════════════════
@@ -6003,14 +7155,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     results[name] = {"status": "done", "text": md_file.read_text(encoding="utf-8"),
                                      "url": "", "page": None}
             # Sub-step 3a: Upload to NotebookLM
-            p3 = await run_phase3(browser, cua_client, results, topic, queue_dir, verbose)
+            p3 = await run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose)
             links = p3.get("links", {})
             notebook_url = p3.get("notebook_url", "")
-            # Validate notebook URL before emitting
-            if notebook_url and validate_link("notebooklm", notebook_url):
+            # B1: Link-first — retry notebook URL extraction on validation failure
+            if not (notebook_url and validate_link("notebooklm", notebook_url)):
+                log("[NotebookLM] Notebook URL missing/invalid — retrying via extractor (3×)", "WARN")
+                nb_res = await extract_with_retry(
+                    phase=3, agent="notebooklm", browser=browser, cua_client=cua_client,
+                    extractor_fn=extract_notebooklm_url,
+                    label="NotebookLM Notebook", verbose=verbose,
+                )
+                if nb_res.verified:
+                    notebook_url = nb_res.url
+                else:
+                    log(f"Phase 3 HALT — no verified NotebookLM URL: {nb_res.error}", "ERROR")
+                    emit_event("pipeline_error", phase=3,
+                               error=f"Could not extract verified NotebookLM URL: {nb_res.error}")
+                    _update_firestore_research({"status": "failed", "phase": 3})
+                    return
+            else:
                 emit_validated_link(3, "notebooklm", notebook_url, "NotebookLM Notebook")
-            elif notebook_url:
-                log(f"[NotebookLM] URL doesn't look right: {notebook_url}", "WARN")
             (queue_dir / "links.json").write_text(json.dumps(links, indent=2), encoding="utf-8")
             save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
                             notebook_url=notebook_url)
@@ -6018,7 +7183,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Sub-step 3b: Generate audio overview
             audio_overview_url = ""
             if notebook_url:
-                p4 = await run_phase4(browser, cua_client, notebook_url, queue_dir, verbose)
+                p4 = await run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose)
                 audio_path = p4.get("audio_path")
                 audio_overview_url = p4.get("audio_overview_url", "")
                 save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
@@ -6032,10 +7197,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview")
             save_meta(queue_dir, topic, 3)
             # Build Phase 3 links — include both notebook and audio overview
+            # Only include links that pass validation (no fake/placeholder URLs)
             _p3_links = []
-            if notebook_url:
-                _p3_links.append({"label": "NotebookLM Notebook", "url": notebook_url, "verified": validate_link("notebooklm", notebook_url)})
-            if audio_overview_url and audio_overview_url != notebook_url:
+            if notebook_url and validate_link("notebooklm", notebook_url):
+                _p3_links.append({"label": "NotebookLM Notebook", "url": notebook_url, "verified": True})
+            if audio_overview_url and audio_overview_url != notebook_url and validate_link("notebooklm", audio_overview_url):
                 _p3_links.append({"label": "Audio Overview", "url": audio_overview_url, "verified": True})
             emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
                 summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}{', audio link extracted' if audio_overview_url else ''}")
@@ -6073,14 +7239,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 await browser.start()
                 emit_event("pipeline_resumed", phase=3)
                 _update_firestore_research({"status": "ongoing"})
-                # Restart-phase: if user supplied input while paused, save as addendum source
-                # (Phase 3 fresh notebook restart is heavy — use append-via-addendum pattern instead)
+                # Post-P2 input is disabled. Drop any residual buffer silently.
                 if _controls.peek_extra_context():
-                    resume_input = _controls.pop_extra_context()
-                    log(f"Phase 3: Resume-with-input — saved as addendum source ({len(resume_input)} chars)")
-                    emit_event("phase_restart", phase=3, reason="user_input_on_resume", chars=len(resume_input))
-                    ctx_path = queue_dir / "documents" / "user_context.md"
-                    ctx_path.write_text(f"# Additional User Context\n\n{resume_input}", encoding="utf-8")
+                    _ = _controls.pop_extra_context()
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 4: YouTube Upload ══════════════════════
@@ -6092,23 +7253,37 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=4, description="Converting audio to video + YouTube upload", agents=["youtube"])
             _p4_start = time.time()
             if audio_path:
-                p5 = await run_phase5(browser, cua_client, audio_path, topic, queue_dir,
+                p5 = await run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                                        links=links, notebook_url=notebook_url, verbose=verbose)
                 youtube_url = p5.get("youtube_url", "")
-                # STRICT validation — only emit real video URLs, never studio URLs
-                _yt_valid = youtube_url and validate_link("youtube", youtube_url)
-                if _yt_valid:
+                # B1: Link-first — retry YouTube URL extraction on validation failure
+                if not (youtube_url and validate_link("youtube", youtube_url)):
+                    if youtube_url:
+                        log(f"[YouTube] REJECTED invalid URL: {youtube_url} — retrying extractor (3×)", "WARN")
+                    else:
+                        log("[YouTube] No URL from upload — retrying extractor (3×)", "WARN")
+                    yt_res = await extract_with_retry(
+                        phase=4, agent="youtube", browser=browser, cua_client=cua_client,
+                        extractor_fn=extract_youtube_url,
+                        label="YouTube Video", verbose=verbose,
+                    )
+                    if yt_res.verified:
+                        youtube_url = yt_res.url
+                    else:
+                        log(f"Phase 4 HALT — no verified YouTube URL: {yt_res.error}", "ERROR")
+                        emit_event("pipeline_error", phase=4,
+                                   error=f"Could not extract verified YouTube URL: {yt_res.error}")
+                        _update_firestore_research({"status": "failed", "phase": 4})
+                        return
+                else:
                     emit_validated_link(4, "youtube", youtube_url, "YouTube Video")
-                elif youtube_url:
-                    log(f"[YouTube] REJECTED invalid URL: {youtube_url}", "WARN")
-                    youtube_url = ""  # Don't propagate bad URLs
                 save_checkpoint(queue_dir, 4, topic=topic, brief_url=brief_url,
                                 notebook_url=notebook_url, youtube_url=youtube_url)
                 update_delivery(youtube_url=youtube_url)
                 save_meta(queue_dir, topic, 4)
-                _p4_links = [{"label": "YouTube Video", "url": youtube_url, "verified": True}] if youtube_url else []
+                _p4_links = [{"label": "YouTube Video", "url": youtube_url, "verified": True}]
                 emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links,
-                    summary=f"Video uploaded: {youtube_url}" if youtube_url else "YouTube upload failed — no video URL extracted")
+                    summary=f"Video uploaded: {youtube_url}")
             else:
                 log("Skipping Phase 4 — no audio from Phase 3", "WARN")
                 emit_event("phase_skipped", phase=4, reason="No audio produced in Phase 3")
@@ -6156,25 +7331,39 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _p5_start = time.time()
             # Use audio overview URL if extracted, else notebook URL as fallback
             _effective_audio_url = audio_overview_url if audio_overview_url else notebook_url
-            p6 = await run_phase6(browser, cua_client, topic, links, notebook_url, youtube_url,
+            p6 = await run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
                                   brief_url=brief_url, audio_url=_effective_audio_url,
                                   email=email, verbose=verbose)
             doc_url = p6.get("doc_url", "")
-            # Validate Google Doc URL
-            if doc_url and validate_link("gdocs", doc_url):
+            # B1: Link-first — retry Google Doc URL extraction on validation failure
+            if not (doc_url and validate_link("gdocs", doc_url)):
+                if doc_url:
+                    log(f"[Google Doc] URL doesn't look right: {doc_url} — retrying extractor (3×)", "WARN")
+                else:
+                    log("[Google Doc] No URL returned — retrying extractor (3×)", "WARN")
+                gd_res = await extract_with_retry(
+                    phase=5, agent="gdocs", browser=browser, cua_client=cua_client,
+                    extractor_fn=extract_gdoc_url,
+                    label="Google Doc Hub", verbose=verbose,
+                )
+                if gd_res.verified:
+                    doc_url = gd_res.url
+                else:
+                    log(f"Phase 5 HALT — no verified Google Doc URL: {gd_res.error}", "ERROR")
+                    emit_event("pipeline_error", phase=5,
+                               error=f"Could not extract verified Google Doc URL: {gd_res.error}")
+                    _update_firestore_research({"status": "failed", "phase": 5})
+                    return
+            else:
                 emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
-            elif doc_url:
-                log(f"[Google Doc] URL doesn't look right: {doc_url}", "WARN")
             update_delivery(doc_url=doc_url, email_sent=p6.get("email_sent", False),
                             status="completed")
             save_checkpoint(queue_dir, 5, topic=topic, brief_url=brief_url, notebook_url=notebook_url,
                             youtube_url=youtube_url, doc_url=doc_url)
             save_meta(queue_dir, topic, 5, status="completed")
-            _p5_links = []
-            if doc_url and validate_link("gdocs", doc_url):
-                _p5_links.append({"label": "Google Doc Hub", "url": doc_url, "verified": True})
+            _p5_links = [{"label": "Google Doc Hub", "url": doc_url, "verified": True}]
             if p6.get("email_sent"):
-                _p5_links.append({"label": "Email Sent", "url": ""})
+                _p5_links.append({"label": "Open Gmail", "url": "https://mail.google.com", "verified": True})
             emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start), links=_p5_links,
                 summary=f"Google Doc created{', email sent' if p6.get('email_sent') else ''}")
 
@@ -6632,12 +7821,12 @@ async def run_server(port=8000):
     init_firebase()
     # Load run analytics for realistic ETAs
     load_analytics()
-    # Load PipeToken (required for token-scoped queue + heartbeat)
-    token = load_pipe_token()
+    # Load ResearchToken (required for token-scoped queue + heartbeat)
+    token = load_research_token()
     if token:
-        log(f"PipeToken loaded: {token[:8]}...")
+        log(f"ResearchToken loaded: {token[:8]}...")
     else:
-        log("No PipeToken found — run `python research.py --setup` to generate one", "WARN")
+        log("No ResearchToken found — run `python research.py --setup` to generate one", "WARN")
         log("Falling back to legacy pipeline_requests/ listener", "WARN")
     worker_task = asyncio.create_task(_job_worker())
     log("Job worker started (direct)")
@@ -6655,82 +7844,194 @@ async def run_server(port=8000):
         if heartbeat_task:
             heartbeat_task.cancel()
         # Mark offline on shutdown
-        if _firebase_db and _pipe_token:
+        if _firebase_db and _research_token:
             try:
-                _firebase_db.collection("pipe_tokens").document(_pipe_token).update({"status": "offline"})
+                _firebase_db.collection("research_tokens").document(_research_token).update({"status": "offline"})
             except Exception:
                 pass
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
-async def run_setup(profile_dir, wait_minutes=5):
-    # ── Step 1: Generate PipeToken ──
-    log("")
-    log("=" * 60)
-    log("  Super Research — Backend Setup")
-    log("=" * 60)
-    log("")
+async def run_setup(profile_dir, wait_minutes=10):
+    """Guided setup: generate/reuse ResearchToken, render ASCII QR, open
+    login tabs, auto-verify per-platform login every 30s, exit cleanly when
+    all green (or on user Ctrl+C / timeout).
 
-    # Initialize Firebase for token registration
+    Markers only tick after a real authenticated signal in the DOM — generic
+    chat-input elements are deliberately excluded from LOGIN_PLATFORMS.
+
+    QR payload is the bare token string so the in-app scanner just extracts
+    + saves to the user's Firebase profile — no URL round-trips needed.
+    """
+    BAR = "═" * 62
+    SUB = "─" * 62
+
+    def banner(title):
+        print("")
+        print(f"  {BAR}")
+        print(f"    {title}")
+        print(f"  {BAR}")
+        print("")
+
+    def divider(label=""):
+        if label:
+            print(f"  {SUB}  {label}")
+        else:
+            print(f"  {SUB}")
+
+    banner("Super Research — Backend Setup")
+
+    # ── Step 1: Firebase + ResearchToken ──────────────────────────────────
+    print("  [1/3] Research token")
     firebase_ok = init_firebase()
     if not firebase_ok:
-        log("Firebase not available — PipeToken will be local only.", "WARN")
+        log("    Firebase not available — token will be LOCAL ONLY (app won't find it).", "WARN")
 
-    # Check for existing token
-    existing = load_pipe_token()
+    existing = load_research_token()
     if existing:
-        log(f"Existing PipeToken found: {existing}")
-        log("Reusing existing token. Delete pipe_config.json to generate a new one.")
         token = existing
+        print(f"    Reusing existing token — delete {RESEARCH_CONFIG_PATH.name} to mint a new one.")
     else:
-        token = generate_pipe_token()
+        token = generate_research_token()
+        print(f"    Minted new token, registered with Firebase.")
 
-    log("")
-    log("-" * 60)
-    log(f"  Your PipeToken: {token}")
-    log("-" * 60)
-    log("  Enter this token in Super Research app:")
-    log("  Account > Pipeline Connection > Paste token > Link")
-    log("-" * 60)
-    log("")
+    print("")
+    print(f"    Token: {token}")
+    print("")
 
-    # ── Step 2: Browser login setup ──
-    log("Step 2: Log into all research platforms")
-    log("A browser will open. Log into each tab:")
-    log("")
+    # ── Step 2: QR rendering ──────────────────────────────────────────────
+    print("  [2/3] Scan QR in the Super Research app")
+    print("         chat → Connect (or) Account → Pipeline Connection")
+    print("")
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1, box_size=1,
+                           error_correction=qrcode.constants.ERROR_CORRECT_L)
+        qr.add_data(token)
+        qr.make(fit=True)
+        qr.print_ascii(tty=True, invert=True)
+    except ImportError:
+        log("    qrcode lib missing — run `pip install -r requirements.txt` first.", "WARN")
+        print("    Paste the token manually in the app: Account → Pipeline Connection")
+    except Exception as e:
+        log(f"    QR render failed: {e}", "WARN")
+    print("")
+
+    # ── Step 3: Open platform tabs + verify logins ─────────────────────────
+    print("  [3/3] Platform logins")
+    print("         Log into each tab — we'll re-check every 30 seconds.")
+    print("")
+
     browser = Browser(profile_dir, headless=False)
     await browser.start()
     services = [
-        ("ChatGPT", "https://chatgpt.com"), ("Gemini", "https://gemini.google.com"),
-        ("Claude", "https://claude.ai"), ("NotebookLM", "https://notebooklm.google.com"),
-        ("YouTube Studio", "https://studio.youtube.com"), ("Gmail", "https://mail.google.com"),
-        ("Google Docs", "https://docs.google.com"),
+        ("ChatGPT",        "https://chatgpt.com",           "chatgpt"),
+        ("Gemini",         "https://gemini.google.com",     "gemini"),
+        ("Claude",         "https://claude.ai",             "claude"),
+        ("NotebookLM",     "https://notebooklm.google.com", "notebooklm"),
+        ("YouTube Studio", "https://studio.youtube.com",    "youtube"),
+        ("Gmail",          "https://mail.google.com",       "gmail"),
+        ("Google Docs",    "https://docs.google.com",       "gdocs"),
     ]
-    for i, (n, u) in enumerate(services, 1):
-        log(f"  {i}. {n} — {u}")
-    log("")
-    await browser.navigate(services[0][1])
-    await asyncio.sleep(3)
-    for n, u in services[1:]:
+    pages_by_platform: dict[str, any] = {}
+    try:
+        await browser.navigate(services[0][1])
+        pages_by_platform[services[0][2]] = browser.page
+    except Exception as e:
+        log(f"    Failed to open {services[0][0]}: {e}", "WARN")
+    await asyncio.sleep(2)
+    for name, url, key in services[1:]:
         try:
-            await browser.new_tab(u)
-            log(f"  Opened: {n}")
-            await asyncio.sleep(3)
+            p = await browser.new_tab(url)
+            pages_by_platform[key] = p
+            await asyncio.sleep(1.5)
         except Exception as e:
-            log(f"  Failed: {n} ({e})", "WARN")
-    log("")
-    log(f"Log into all {len(services)} tabs. You have {wait_minutes} minutes.")
-    for r in range(wait_minutes * 60, 0, -30):
-        log(f"  Waiting... {r//60}m {r%60}s remaining.")
+            log(f"    Failed: {name} ({e})", "WARN")
+
+    divider(f"Verifying every 30s (timeout: {wait_minutes}m — Ctrl+C to cancel)")
+    print("")
+
+    # Longest platform label for neat column alignment
+    pad = max(len(n) for n, _u, _k in services)
+    deadline = time.time() + wait_minutes * 60
+    all_ok = False
+    last_results: dict[str, bool] = {}
+    check_n = 0
+
+    while time.time() < deadline:
+        check_n += 1
+        results: dict[str, bool] = {}
+        for _name, _u, key in services:
+            p = pages_by_platform.get(key)
+            if not p:
+                results[key] = False
+                continue
+            try:
+                ok = await verify_login(p, key)
+            except Exception:
+                ok = False
+            results[key] = ok
+
+        # Only re-render the checklist when something flipped (or on first pass)
+        if results != last_results:
+            done_count = sum(1 for v in results.values() if v)
+            print(f"    Check #{check_n} — {done_count}/{len(services)} logged in")
+            for name, _u, key in services:
+                mark = "[ok]" if results.get(key) else "[  ]"
+                print(f"        {mark}  {name.ljust(pad)}")
+            print("")
+            if _firebase_db and token:
+                try:
+                    _firebase_db.collection("research_tokens").document(token).update({
+                        "logins": {k: bool(v) for k, v in results.items()},
+                        "setupState": "ready" if all(results.values()) else "awaiting_login",
+                        "lastSetupCheck": int(time.time()),
+                    })
+                except Exception:
+                    pass
+            last_results = results
+
+        if all(results.values()):
+            all_ok = True
+            break
         await asyncio.sleep(30)
+
     await browser.close()
-    log("")
-    log("=" * 60)
-    log("  Setup complete!")
-    log(f"  PipeToken: {token}")
-    log("  Start the server:  python research.py --serve")
-    log("=" * 60)
+
+    # ── Final banner ──────────────────────────────────────────────────────
+    print("")
+    if all_ok:
+        print(f"  {BAR}")
+        print(f"    SETUP COMPLETE — all {len(services)} platforms verified.")
+        print(f"  {BAR}")
+        print("")
+        print("    What happens now:")
+        print("      · Browser has been closed.")
+        print("      · ResearchToken is saved locally AND registered with Firebase.")
+        print("      · This process will exit; setup does not stay running.")
+        print("")
+        print("    Next step — start the server:")
+        print("        python research.py --serve")
+        print("")
+        print("    Keep --serve running in a separate terminal while you use the")
+        print("    app. The app talks to this server via Firebase (no VPN/ngrok).")
+        print(f"  {BAR}")
+    else:
+        print(f"  {BAR}")
+        print("    Setup timed out — some platforms are still not logged in.")
+        print(f"  {BAR}")
+        print("")
+        print("    Last check:")
+        for name, _u, key in services:
+            mark = "[ok]" if last_results.get(key) else "[  ]"
+            print(f"        {mark}  {name}")
+        print("")
+        print("    Your token is saved. Re-run:")
+        print("        python research.py --setup")
+        print("")
+        print(f"  {BAR}")
+    print("")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

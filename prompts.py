@@ -104,8 +104,8 @@ Your task: Configure Claude for research. Nothing else.
 
 Steps:
 1. Look at the Claude.ai page.
-2. Click the model selector; pick "Opus 4.6 Extended" (the Extended variant — this IS extended thinking).
-3. Click the "+" or tools menu near the input; enable the "Research" tool.
+2. Click the model selector; pick "Opus 4.7 Adaptive" (the Adaptive Thinking variant).
+3. Click the "+" or tools menu near the input; enable the "Research" mode/tool.
 4. Close the menu (Escape) and click the message input area to focus it.
 5. Say "ready for paste" and STOP.
 
@@ -116,11 +116,11 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 - DO NOT send anything.
 - DO NOT click Send / Submit.
 - DO NOT attach any files.
-- If the Extended variant is already selected: say "ready for paste" immediately and STOP.
-- If Research tool toggle is already on: leave it alone.
+- If the Adaptive variant is already selected: say "ready for paste" immediately and STOP.
+- If Research mode toggle is already on: leave it alone.
 - If options are unavailable: say "partial setup" and STOP.
 
-Once model + Research tool are set and input is focused, your job is DONE. No exploration."""
+Once model + Research mode are set and input is focused, your job is DONE. No exploration."""
 
 # ── Verification & Diagnosis ──────────────────────────────────────────────────
 
@@ -179,20 +179,20 @@ ABSOLUTELY FORBIDDEN:
 
 PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + """
 
-Your task: Verify Claude is correctly configured for Research (Opus 4.6 Extended + Research tool), and fix it if not.
+Your task: Verify Claude is correctly configured for Research (Opus 4.7 Adaptive Thinking + Research mode), and fix it if not.
 
 Check visually (screenshot):
-1. Does the model selector show "Opus 4.6 Extended" (or the Extended variant)?
-2. Is the "Research" tool enabled (usually indicated by a highlighted icon/badge near input)?
+1. Does the model selector show "Opus 4.7 Adaptive" (or the Adaptive Thinking variant)?
+2. Is the "Research" mode/tool enabled (usually indicated by a highlighted icon/badge near input)?
 3. Is the input area focused / ready for pasting?
 4. Are there any attachments already visible? If YES, that's a leftover — click the X to remove them.
 
-If model is Extended + Research tool is on + input is focused + NO stale attachments:
+If model is Opus 4.7 Adaptive + Research mode is on + input is focused + NO stale attachments:
   → Say "setup verified" and STOP immediately.
 
 Otherwise:
-  → If model is wrong: click model selector → pick "Opus 4.6 Extended" or the Extended variant.
-  → If Research tool is off: click "+" or tools menu → enable "Research".
+  → If model is wrong: click model selector → pick "Opus 4.7 Adaptive" or the Adaptive Thinking variant.
+  → If Research mode is off: click "+" or tools menu → enable "Research".
   → If stale attachments exist: click the X/remove button on each to clear them.
   → Click input area to focus.
   → Say "setup fixed" and STOP.
@@ -329,14 +329,18 @@ Steps:
 
 PROMPT_SHARE_GEMINI = SYSTEM_BASE + """
 
-Your task: Make this Gemini conversation shareable via link.
+Your task: Make this Gemini conversation shareable via a PUBLIC link.
 
 Steps:
-1. Look for a "Share" or export button.
-2. Click it.
-3. Enable "Anyone with the link" access if available.
-4. Copy the shareable link.
-5. Say "shared" with the URL if visible."""
+1. Look for a "Share" button (usually top area or menu).
+2. Click it to open the share dialog.
+3. CRITICAL: In the share dialog, look for an access/visibility dropdown. It may say "Restricted" or "Only people added".
+4. If you see "Restricted" — click the dropdown and select "Anyone with the link".
+5. If you see a toggle for "Enable sharing" or "Create public link" — enable it.
+6. Once set to public, copy the shareable link (click "Copy link" button if available).
+7. Say "shared" with the EXACT URL (should contain g.co/gemini or gemini.google.com/share).
+
+IMPORTANT: The link MUST be PUBLIC ("Anyone with the link"), not restricted to specific people."""
 
 PROMPT_PUBLISH_CLAUDE = SYSTEM_BASE + """
 
@@ -388,16 +392,17 @@ Steps:
 
 PROMPT_AUDIO_GENERATE = SYSTEM_BASE + """
 
-Your task: Generate a long-form audio overview in NotebookLM.
+Your task: Generate ONE long-form "Deep dive" audio overview in NotebookLM.
+The podcast MUST be configured as Deep dive + Long before clicking Generate.
 
 Steps:
-1. Make sure all sources are selected/checked in the Sources panel.
-2. Find "Audio Overview" in the Studio panel (usually right side).
-3. Click "Audio Overview" or "Generate".
-4. Look for duration options — set to "Long" if available.
-5. Look for "Deep dive" option and select it if available.
-6. Click "Generate" to start.
-7. Say "generating" once started."""
+1. Make sure ALL sources are selected/checked in the Sources panel (tick "Select all" if present).
+2. In the Studio panel (right side), click "Audio Overview" to open options.
+3. In the options/customize panel, set FORMAT to "Deep dive" (not Brief / Critique).
+4. Set LENGTH/DURATION to "Long" (not Default / Short).
+5. Only ONCE those two options are confirmed, click "Generate".
+6. Do NOT click Generate more than once — double-clicks create duplicate audios.
+7. Say "generating" once the generation has started (progress indicator visible)."""
 
 PROMPT_AUDIO_CHECK = SYSTEM_BASE + """
 
@@ -421,64 +426,65 @@ Download the generated audio overview.
 
 PROMPT_YOUTUBE_UPLOAD = SYSTEM_BASE + """
 
-Your task: Upload a video to YouTube Studio as UNLISTED and SAVE/PUBLISH it.
+Your task: Upload a video to YouTube Studio as UNLISTED + "Not made for kids", and SAVE/PUBLISH it.
 
 Steps:
 1. Click "Create" button (camera icon with + at top right).
 2. Click "Upload videos".
 3. Click the upload area or "SELECT FILES" — the file dialog is auto-handled.
-4. Wait for the video to start processing (you'll see a progress bar and details form).
+4. Wait for the video to start processing (progress bar + details form appear).
 
-DETAILS PAGE:
+DETAILS PAGE (step 1 of 4):
 5. Set the TITLE to the provided title text.
 6. Set the DESCRIPTION to the provided description text.
-7. Scroll down to find "Upload thumbnail" — click it to upload a custom thumbnail image. The file dialog is auto-handled.
-8. Continue scrolling down to "Audience" section — select "No, it's not made for kids".
-9. Click "NEXT" to go to Video elements page.
+7. Scroll down to find "Upload thumbnail" — click it to upload the custom thumbnail image. The file dialog is auto-handled.
+8. Continue scrolling down to the "Audience" section. YOU MUST select the radio button: "No, it's not made for kids". Verify the dot appears in that radio option before continuing.
+9. Click "NEXT".
 
-TIP: To scroll inside the dialog, click on the content area first, then use Page Down key or mouse wheel.
+TIP: To scroll inside the dialog, click on the content area first, then use Page Down key or the mouse wheel.
 
-VIDEO ELEMENTS PAGE:
-9. If there are any required items, handle them. Otherwise click "NEXT".
+VIDEO ELEMENTS PAGE (step 2 of 4):
+10. If there are any required items, handle them. Otherwise click "NEXT".
 
-CHECKS PAGE:
-10. If there are any issues/warnings, resolve them. Otherwise click "NEXT".
+CHECKS PAGE (step 3 of 4):
+11. If there are any issues/warnings, resolve them. Otherwise click "NEXT".
 
-VISIBILITY PAGE:
-11. Select "Unlisted" (not Public, not Private).
-12. CRITICAL — YOU MUST CLICK "SAVE" OR "PUBLISH":
-    - Look for a blue "SAVE" button at the bottom-right of the dialog
-    - Or a "Publish" button
-    - Click it! Do NOT stop without clicking Save/Publish
-    - Wait 2-3 seconds after clicking for the confirmation dialog to appear
+VISIBILITY PAGE (step 4 of 4):
+12. YOU MUST select the radio button "Unlisted" (NOT "Public", NOT "Private"). Verify the dot appears in "Unlisted" before continuing.
+13. CRITICAL — YOU MUST CLICK the blue "SAVE" or "Publish" button (bottom-right of the dialog).
+    - Do NOT stop without clicking Save/Publish.
+    - Wait 2-3 seconds for the confirmation dialog to appear.
 
 AFTER SAVE — EXTRACT THE VIDEO LINK:
-13. A confirmation dialog appears showing "Video published" with a video link
-14. The link looks like: https://youtu.be/XXXXXXXXXXX
-15. Click the "COPY" button next to the link if available
-16. Read the EXACT video URL and include it in your response
-17. Say "uploaded: https://youtu.be/XXXXXXXXXXX" with the REAL URL
+14. A confirmation dialog appears showing "Video published" (or "Video processing") with a video link.
+15. The link looks like: https://youtu.be/XXXXXXXXXXX
+16. Click the "COPY" button next to the link if available.
+17. Read the EXACT video URL and include it in your response.
+18. Say "uploaded: https://youtu.be/XXXXXXXXXXX" with the REAL URL.
 
 CRITICAL RULES:
-- You MUST click SAVE/PUBLISH — do not stop before saving
-- You MUST report the actual youtu.be/xxx link, NOT the studio.youtube.com URL
-- File dialog is auto-handled
-- Select "No, it's not made for kids" and "Unlisted" before saving
-- If you cannot find the Save button, scroll down or look at the bottom-right of the dialog"""
+- You MUST select "No, it's not made for kids" on the Details page.
+- You MUST select "Unlisted" on the Visibility page.
+- You MUST click SAVE/PUBLISH — do not stop before saving.
+- You MUST report the actual youtu.be/xxx link, NOT the studio.youtube.com URL.
+- File dialog is auto-handled (video first, then thumbnail).
+- If you cannot find the Save button, scroll down or look at the bottom-right of the dialog."""
 
 # ── Phase 6: Google Doc + Email ───────────────────────────────────────────────
 
 PROMPT_CREATE_DOC = SYSTEM_BASE + """
 
-Your task: Create a Google Doc with research artifact links.
+Your task: Fill a blank Google Doc with the provided content AND make it public.
+Both steps are required. Do NOT stop early.
 
 Steps:
-1. You should see a new blank Google Doc.
-2. Type the provided content (title + links).
-3. After entering content, click "Share" (top right).
-4. Set sharing to "Anyone with the link" → "Editor".
-5. Click Done.
-6. Say "created" when done."""
+1. You should see a new blank Google Doc. Click into the body and type/paste the provided content (title + links). Use the EXACT content given.
+2. After the content is entered, click the blue "Share" button at the top-right.
+3. In the Share dialog, find "General access" near the bottom. If it says "Restricted", click the dropdown and change it to "Anyone with the link".
+4. Confirm the role next to it is "Editor" (if not already).
+5. If there is a "Copy link" button, click it.
+6. Click "Done" to close the dialog.
+7. Say "created" when the doc is filled AND public."""
 
 PROMPT_SEND_EMAIL = SYSTEM_BASE + """
 
