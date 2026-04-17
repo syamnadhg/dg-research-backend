@@ -79,6 +79,62 @@ def log(msg, level="INFO"):
     print(f"[{ts}] [{level}] {msg}")
 
 
+# ── Terminal colors (used by --setup for the branded UI) ──────────────────
+# Detects tty + enables ANSI on Windows 10+ so colors render in cmd/powershell.
+_USE_COLOR = False
+try:
+    if sys.stdout.isatty():
+        _USE_COLOR = True
+        if sys.platform == "win32":
+            # Enable ANSI escape processing on Win10+ consoles
+            import ctypes
+            try:
+                _kernel32 = ctypes.windll.kernel32
+                _kernel32.SetConsoleMode(_kernel32.GetStdHandle(-11), 7)
+            except Exception:
+                pass
+except Exception:
+    _USE_COLOR = False
+
+# Palette roughly matching the app's "Super Research" brand — blue accent
+# (matches "Super" in the header), dim grey for auxiliary lines, soft green
+# for ok marks, amber for warn. Numeric codes are ANSI 256-color.
+_ACCENT   = "\033[38;5;75m"   # bright blue
+_DIM      = "\033[38;5;244m"  # muted grey
+_OK       = "\033[38;5;108m"  # muted green
+_WARN     = "\033[38;5;214m"  # amber
+_BOLD     = "\033[1m"
+_RESET    = "\033[0m"
+
+def _c(color: str, text: str) -> str:
+    return f"{color}{text}{_RESET}" if _USE_COLOR else text
+
+def _setup_logo():
+    """Branded header for --setup. Renders a compact 'SUPER RESEARCH' block
+    with the app's blue accent, then a single dim rule + step summary."""
+    bar = _c(_DIM, "━" * 62)
+    print()
+    print(f"  {bar}")
+    print()
+    print(f"                   {_c(_BOLD + _ACCENT, 'SUPER')} {_c(_BOLD, 'RESEARCH')}")
+    print(f"             {_c(_DIM, 'Multi-agent deep research · Backend setup')}")
+    print()
+    print(f"  {bar}")
+    print()
+    print(
+        f"  {_c(_DIM, 'Three steps:')}   "
+        f"{_c(_ACCENT, '1')} Token   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '2')} Logins   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '3')} Serve"
+    )
+
+def _setup_step(n: int, total: int, title: str):
+    """Section header for each --setup step."""
+    print()
+    print(f"  {_c(_ACCENT + _BOLD, f'[{n}/{total}]')} {_c(_BOLD, title)}")
+    print(f"  {_c(_DIM, '─' * 58)}")
+
+
 def log_action(action, details=""):
     ts = datetime.now().strftime("%H:%M:%S")
     extra = f" — {details}" if details else ""
@@ -1065,13 +1121,21 @@ LOGIN_PLATFORMS = {
 }
 
 
-async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_timeout: int = 15000) -> bool:
+async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_timeout: int = 15000, strict: bool = False) -> bool:
     """Verify the platform session is authenticated on the given page.
 
     Checks (in order):
       1. Any of the platform's DOM markers is present (fast, deterministic).
-      2. Fallback: URL/form heuristic from check_auth() — returns False only if
-         a login URL pattern matches or a password input is visible.
+      2. Negative-signal check: visible Sign in / Log in button OR password
+         input field → returns False.
+      3. Ambiguous (no positive markers + no negative signals):
+         - strict=False (pipeline path, default): fail-OPEN → return True and
+           let downstream check_auth() catch real session failures. Tolerant
+           of DOM selector drift after the user has already completed setup.
+         - strict=True (setup path): fail-CLOSED → return False. Used by
+           --setup step 3 where the entire point is to wait until the user
+           actually logs in; we cannot let a persistent browser profile with
+           partial state fool setup into auto-advancing.
 
     When `ensure_nav=True`, navigates to the platform root before checking so
     callers don't have to set up the URL themselves.
@@ -1130,12 +1194,15 @@ async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_tim
         except Exception:
             pass
 
-        # Ambiguous — no positive markers, no negative signals. Previously we
-        # defaulted to False, which trapped users in a retry loop whenever
-        # our selectors drifted. Fail OPEN here: the pipeline will surface
-        # real session errors downstream (login-wall redirects on navigation,
-        # SessionExpiredError from check_auth, etc.) but won't block on a
-        # DOM selector that hasn't been updated for the platform's latest UI.
+        # Ambiguous — no positive markers, no negative signals. Split based
+        # on caller context:
+        #   strict=True (setup step 3): fail-CLOSED — we need to WAIT until
+        #     the user actually logs in; auto-advancing would defeat setup.
+        #   strict=False (pipeline runs): fail-OPEN — don't trap the user on
+        #     drifted selectors when check_auth() will catch real failures.
+        if strict:
+            log(f"[verify_login:strict] {platform}: no login markers yet — waiting", "INFO")
+            return False
         log(f"[verify_login] {platform}: ambiguous (no markers + no negative signals) — assuming logged in", "WARN")
         return True
     except Exception as e:
@@ -7956,16 +8023,13 @@ async def run_setup(profile_dir, wait_minutes=10):
         else:
             print(f"  {SUB}")
 
-    banner("Super Research — Backend Setup")
-    print("    Three steps:  Token  →  Logins  →  Serve")
-    print("")
+    _setup_logo()
 
     # ══════════════════════════════════════════════════════════════════════
     # [1/3] TOKEN SETUP — mint, register in Firestore, render QR, wait for
     #       the app to claim the link. All token-side work lives here.
     # ══════════════════════════════════════════════════════════════════════
-    print("  [1/3] Token setup")
-    divider()
+    _setup_step(1, 3, "Token setup")
 
     firebase_ok = init_firebase()
     if not firebase_ok:
@@ -7976,10 +8040,10 @@ async def run_setup(profile_dir, wait_minutes=10):
     existing = load_research_token()
     if existing:
         token = existing
-        print(f"    Reusing existing token — delete {RESEARCH_CONFIG_PATH.name} for a fresh one.")
+        print(f"  {_c(_DIM, 'Reusing existing token')}  {_c(_DIM, '·')}  delete {RESEARCH_CONFIG_PATH.name} for a fresh one.")
     else:
         token = generate_research_token()
-        print("    Minted new token.")
+        print(f"  {_c(_OK, 'Minted new token.')}")
 
     # Upsert in Firestore on every --setup run so a reused local token can't
     # drift out of sync with what the app reads.
@@ -7992,15 +8056,16 @@ async def run_setup(profile_dir, wait_minutes=10):
             "lastHeartbeat": SERVER_TIMESTAMP,
             "createdAt": SERVER_TIMESTAMP,
         }, merge=True)
-        print(f"    [ok] Registered in Firestore (project={_firebase_db.project}).")
+        print(f"  {_c(_OK, '[ok]')} Registered with {_c(_BOLD, _firebase_db.project)}")
     except Exception as e:
         log("    FIRESTORE REGISTRATION FAILED — the app will reject this token.", "ERROR")
         log(f"        {e}", "ERROR")
         return
 
-    print("")
-    print(f"    Token:  {token}")
-    print("")
+    print()
+    print(f"  {_c(_DIM, 'Token')}")
+    print(f"  {_c(_BOLD + _ACCENT, token)}")
+    print()
     try:
         import qrcode
         qr = qrcode.QRCode(border=1, box_size=1,
@@ -8012,13 +8077,12 @@ async def run_setup(profile_dir, wait_minutes=10):
         log("    qrcode lib missing — run `pip install -r requirements.txt` first.", "WARN")
     except Exception as e:
         log(f"    QR render failed: {e}", "WARN")
-    print("")
-    print("    Pair this token in the Super Research app:")
-    print("        • Scan QR   →  chat → Connect → Scan QR")
-    print("        • or Paste  →  Account → Pipeline Connection")
-    print("")
-    print("    Waiting for the app to pair this token...")
-    print("    (Ctrl+C to cancel)")
+    print()
+    print(f"  {_c(_DIM, 'Pair this token in the Super Research app:')}")
+    print(f"       {_c(_ACCENT, '•')} Scan QR  {_c(_DIM, '→')}  chat → Connect → Scan QR")
+    print(f"       {_c(_ACCENT, '•')} or Paste {_c(_DIM, '→')}  Account → Pipeline Connection")
+    print()
+    print(f"  {_c(_DIM, 'Waiting for the app to pair…')}  {_c(_DIM, '(Ctrl+C to cancel)')}")
 
     # Watch the token doc directly — the app calls claimResearchToken after
     # validating + saving, which writes {linkedUid, linkedEmail, linkedAt}
@@ -8044,15 +8108,13 @@ async def run_setup(profile_dir, wait_minutes=10):
         tick += 1
         if tick % 10 == 0 and linked_uid is None:
             elapsed = wait_minutes * 60 - int(link_deadline - time.time())
-            print(f"    ...still waiting ({elapsed}s elapsed)")
+            print(f"  {_c(_DIM, f'...still waiting ({elapsed}s elapsed)')}")
         await asyncio.sleep(3)
 
     if linked_uid is None:
-        print("")
-        print(f"  {BAR}")
-        print("    Timed out waiting for app pairing.")
-        print(f"  {BAR}")
-        print("    Re-run when ready:  python research.py --setup")
+        print()
+        print(f"  {_c(_WARN, 'Timed out waiting for app pairing.')}")
+        print(f"  {_c(_DIM, 'Re-run when ready:')}  {_c(_BOLD, 'python research.py --setup')}")
         return
 
     # Prefer the email written by the scanner; fall back to Firebase Auth.
@@ -8064,15 +8126,15 @@ async def run_setup(profile_dir, wait_minutes=10):
         except Exception:
             linked_email = linked_uid[:8]
 
-    print(f"    [ok] Linked to {linked_email}")
-    print("")
+    print()
+    print(f"  {_c(_OK, '[ok]')}  Linked to {_c(_BOLD, linked_email or '—')}")
+    print()
 
     # ══════════════════════════════════════════════════════════════════════
     # [2/3] BROWSER LOGINS — open 7 platform tabs and wait for real auth.
     # ══════════════════════════════════════════════════════════════════════
-    print("  [2/3] Browser logins")
-    divider()
-    print("    Log into each of the 7 tabs. We re-check every 30 seconds.")
+    _setup_step(2, 3, "Browser logins")
+    print(f"  {_c(_DIM, 'Log into each of the 7 tabs. We re-check every 30 seconds.')}")
     print("")
 
     browser = Browser(profile_dir, headless=False)
@@ -8120,7 +8182,7 @@ async def run_setup(profile_dir, wait_minutes=10):
                 results[key] = False
                 continue
             try:
-                ok = await verify_login(p, key)
+                ok = await verify_login(p, key, strict=True)
             except Exception:
                 ok = False
             results[key] = ok
@@ -8128,10 +8190,12 @@ async def run_setup(profile_dir, wait_minutes=10):
         # Only re-render the checklist when something flipped (or on first pass)
         if results != last_results:
             done_count = sum(1 for v in results.values() if v)
-            print(f"    Check #{check_n} — {done_count}/{len(services)} logged in")
+            print(f"  {_c(_DIM, f'Check #{check_n}')}  {_c(_BOLD, f'{done_count}/{len(services)}')} {_c(_DIM, 'logged in')}")
             for name, _u, key in services:
-                mark = "[ok]" if results.get(key) else "[  ]"
-                print(f"        {mark}  {name.ljust(pad)}")
+                ok = results.get(key)
+                mark = _c(_OK, "[ok]") if ok else _c(_DIM, "[  ]")
+                name_colored = name if ok else _c(_DIM, name)
+                print(f"        {mark}  {name_colored.ljust(pad + (len(_c(_DIM, '')) if not ok and _USE_COLOR else 0))}")
             print("")
             if _firebase_db and token:
                 try:
@@ -8156,39 +8220,41 @@ async def run_setup(profile_dir, wait_minutes=10):
         # ══════════════════════════════════════════════════════════════════════
         # [3/3] START RESEARCH SERVER — clear next-action instructions.
         # ══════════════════════════════════════════════════════════════════════
-        print(f"  [3/3] Start research server")
-        divider()
-        print(f"    [ok] Paired with {linked_email}")
-        print(f"    [ok] All {len(services)} platforms logged in")
-        print("    [ok] Browser closed")
+        _setup_step(3, 3, "Start research server")
+        print(f"  {_c(_OK, '[ok]')}  Paired with {_c(_BOLD, linked_email or '—')}")
+        print(f"  {_c(_OK, '[ok]')}  All {len(services)} platforms logged in")
+        print(f"  {_c(_OK, '[ok]')}  Browser closed")
         print("")
-        print("    Setup is complete. To start accepting research jobs from the app:")
+        print(f"  {_c(_DIM, 'Setup is complete. To start accepting research jobs from the app:')}")
         print("")
-        print("        1) Press  Ctrl+C   (close this --setup process)")
-        print("        2) Run    python research.py --serve")
+        print(f"     {_c(_ACCENT, '1)')}  Press  {_c(_BOLD, 'Ctrl+C')}   {_c(_DIM, '(close this --setup process)')}")
+        print(f"     {_c(_ACCENT, '2)')}  Run    {_c(_BOLD, 'python research.py --serve')}")
         print("")
-        print("    Then fire a topic in the Super Research app — this machine")
-        print("    will run the pipeline. Keep --serve running the whole time.")
-        print("")
+        print(f"  {_c(_DIM, 'Then fire a topic in the Super Research app — this machine')}")
+        print(f"  {_c(_DIM, 'will run the pipeline. Keep --serve running the whole time.')}")
+        print()
+        print(f"  {_c(_DIM, '━' * 62)}")
+        print()
         # Stay alive so the user sees the message clearly until they Ctrl+C.
-        # A quick exit would scroll the message off-screen on some terminals.
         try:
             while True:
                 await asyncio.sleep(3600)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
     else:
-        print(f"  {BAR}")
-        print("    Setup timed out — some platforms are still not logged in.")
-        print(f"  {BAR}")
+        print()
+        print(f"  {_c(_WARN, '━' * 62)}")
+        print(f"  {_c(_WARN, 'Setup timed out — some platforms are still not logged in.')}")
+        print(f"  {_c(_WARN, '━' * 62)}")
         print("")
-        print("    Last check:")
+        print(f"  {_c(_DIM, 'Last check:')}")
         for name, _u, key in services:
-            mark = "[ok]" if last_results.get(key) else "[  ]"
-            print(f"        {mark}  {name}")
+            ok = last_results.get(key)
+            mark = _c(_OK, "[ok]") if ok else _c(_DIM, "[  ]")
+            print(f"        {mark}  {name if ok else _c(_DIM, name)}")
         print("")
-        print("    Your token is saved. Re-run when ready:")
-        print("        python research.py --setup")
+        print(f"  {_c(_DIM, 'Your token is saved. Re-run when ready:')}")
+        print(f"        {_c(_BOLD, 'python research.py --setup')}")
         print("")
 
 
