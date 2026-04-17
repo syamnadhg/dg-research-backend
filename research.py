@@ -809,6 +809,23 @@ def _start_command_listener(uid, research_id, loop):
                     log(f"Command received: SKIP_AGENT agent={_ag}")
                 else:
                     log(f"Command received: SKIP_AGENT rejected — unknown agent '{_ag}'", "WARN")
+            elif action == "skip_phase":
+                # Abandon the current phase with whatever partial results we
+                # have and jump to the next. Triggered by the watchdog banner
+                # when the backend has been unresponsive for 45+ min and the
+                # user picks "Skip phase".
+                _ph = data.get("phase")
+                try:
+                    _ph = int(_ph) if _ph is not None else None
+                except (TypeError, ValueError):
+                    _ph = None
+                if _ph is not None:
+                    loop.call_soon_threadsafe(_controls.request_skip_phase, _ph)
+                    # Also release any pause so the phase coroutine can exit cleanly
+                    loop.call_soon_threadsafe(_controls.request_resume)
+                    log(f"Command received: SKIP_PHASE phase={_ph}")
+                else:
+                    log("Command received: SKIP_PHASE rejected — no phase number", "WARN")
             elif action == "agent_decision":
                 # Frontend response to agent_link_failed modal.
                 decision = (data.get("decision", "") or "").lower()
@@ -855,6 +872,10 @@ class PipelineControls:
         # consumes these on its next tick — drops the agent from `pending`,
         # extracts whatever partial output exists, and emits agent_skipped.
         self.skipped_agents: set[str] = set()
+        # Watchdog banner's "Skip phase" button queues phase numbers here.
+        # Each phase's coroutine checks is_phase_skip_requested(N) at its
+        # natural yield points and exits early with phase_skipped when set.
+        self.skipped_phases: set[int] = set()
 
     def request_stop(self):
         self.stop_event.set()
@@ -975,6 +996,31 @@ class PipelineControls:
         key = (agent or "").strip().lower()
         if key:
             self.skipped_agents.add(key)
+
+    def request_skip_phase(self, phase: int):
+        """User picked "Skip phase" from the 45-min backend-silent banner.
+        The current phase coroutine checks is_phase_skip_requested() at each
+        yield point and exits early with a phase_skipped event, so partial
+        results survive and the pipeline advances to the next phase."""
+        try:
+            self.skipped_phases.add(int(phase))
+        except (TypeError, ValueError):
+            pass
+
+    def is_phase_skip_requested(self, phase: int) -> bool:
+        return int(phase) in self.skipped_phases
+
+    def consume_phase_skip(self, phase: int) -> bool:
+        """Called by the phase coroutine once it's acted on the skip — removes
+        the flag so the next phase doesn't inherit it."""
+        try:
+            p = int(phase)
+        except (TypeError, ValueError):
+            return False
+        if p in self.skipped_phases:
+            self.skipped_phases.discard(p)
+            return True
+        return False
 
     async def interruptible_sleep(self, seconds, check_interval=10):
         """Sleep in small increments, checking stop/pause every check_interval seconds.
@@ -5497,32 +5543,64 @@ async def detect_human_verification(page, platform: str, label: str) -> tuple[bo
 
 async def wait_for_verification_clearance(browser, cua_client, page, platform: str, label: str,
                                           verbose=False, max_wait_loops: int = 120) -> bool:
-    """Pause the pipeline and wait for the user to solve a human-verification gate.
+    """Handle a human-verification gate on an agent page.
 
     Flow:
-      1. Emit human_verification_required event (frontend banner + Resume button)
-      2. request_pause on the asyncio controls
-      3. Wait for resume OR stop, polling the page every 5s to auto-detect clearance
-      4. On clearance (verification gone), auto-resume and return True
-      5. On stop, return False
-
-    Works for ANY platform (ChatGPT, Gemini, Claude, NotebookLM, etc.) — caller
-    passes the platform name + label for the banner copy.
+      0. CUA auto-attempt — brief (3 iterations) — handles the common case
+         where the gate is a single "I am human" checkbox that CUA can click
+         on its own. If cleared, return True silently, no chat interruption.
+      1. Only if CUA couldn't clear it: emit human_verification_required and
+         pause. The frontend banner surfaces Retry / Skip agent / Stop.
+      2. Poll the page every 5s while paused — if the gate clears by any
+         means (user solves manually, CUA's click-through lands late, etc.),
+         auto-resume.
+      3. Return False on stop or skip_agent.
     """
-    # Detect the specific challenge so the UI can tell the user what to solve
+    # Detect the specific challenge for banner copy AND to confirm there
+    # IS one to solve before bothering CUA.
     _, reason = await detect_human_verification(page, platform, label)
+    platform_key = platform.lower()
+
+    # ── CUA auto-attempt (3 iterations max — fast fail) ──
+    # Many verification gates — especially Cloudflare Turnstile — are just a
+    # single "I am human" checkbox. CUA can click it and the page clears.
+    # This keeps us silent in the common case. Only if CUA can't solve do we
+    # bother the user with a chat banner.
+    try:
+        log(f"[{label}] Verification detected ({reason or 'unknown'}) — CUA auto-attempt (3 iter max)…")
+        await browser.switch_to_page(page)
+        sys_prompt = (
+            "You are looking at a human-verification challenge (Cloudflare, CAPTCHA, or similar) "
+            "that is blocking access to an AI agent. If you can see a simple checkbox or button labeled "
+            "something like 'I am human', 'Verify', 'Continue', or 'Not a robot' — click it once. "
+            "Do NOT try to solve image-selection puzzles or anything requiring complex reasoning. "
+            "If there's nothing simple to click, STOP immediately and respond with the word 'blocked'."
+        )
+        user_prompt = "Click the single human-verification checkbox if one is visible. Otherwise stop and say 'blocked'."
+        result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
+            model=CUA_MODEL, max_iterations=3, verbose=verbose)
+        # Give the page a moment to re-render after a successful click
+        await asyncio.sleep(3)
+        blocked, _ = await detect_human_verification(page, platform, label)
+        if not blocked:
+            log(f"[{label}] CUA cleared verification ✓ — proceeding silently")
+            return True
+        _cua_text = (result.get("text") or "")[:120]
+        log(f"[{label}] CUA couldn't clear verification ({_cua_text}) — asking user", "WARN")
+    except Exception as e:
+        log(f"[{label}] CUA auto-attempt errored: {e} — falling back to user prompt", "WARN")
+
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
-    emit_event("human_verification_required", phase=2, agent=platform.lower(),
-               platform=platform.lower(),
+    emit_event("human_verification_required", phase=2, agent=platform_key,
+               platform=platform_key,
                platformLabel=platform.capitalize(),
                reason=reason or "Human verification challenge",
-               message=f"{platform.capitalize()} is asking for human verification. Solve it in the browser, then tap Resume.")
+               message=f"{platform.capitalize()} is asking for human verification. I tried and couldn't clear it — solve it in the browser and tap Resume, or Skip this agent.")
     _controls.request_pause()
-    emit_event("pipeline_paused", phase=2, reason="human_verification_required", agent=platform.lower())
+    emit_event("pipeline_paused", phase=2, reason="human_verification_required", agent=platform_key)
 
     # Poll every 5s — if the user solves the challenge without tapping Resume,
     # we still notice and auto-continue. Also yields to stop/skip/resume signals.
-    platform_key = platform.lower()
     for _ in range(max_wait_loops):
         await asyncio.sleep(5)
         if _controls.is_stop():
@@ -7320,9 +7398,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
         # ══════════════════════ PHASE 1: Brief ══════════════════════
         p1 = None
-        if 1 in skip_phases:
-            log("Phase 1: SKIPPED by config")
-            emit_event("phase_skipped", phase=1, reason="Disabled in pipeline config")
+        _user_skip_p1 = _controls.consume_phase_skip(1)
+        if 1 in skip_phases or _user_skip_p1:
+            _reason = "user_skip" if _user_skip_p1 else "Disabled in pipeline config"
+            log(f"Phase 1: SKIPPED ({_reason})")
+            emit_event("phase_skipped", phase=1, reason=_reason)
         elif start_phase <= 1:
             emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
             _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
@@ -7448,9 +7528,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 2: Deep Research ══════════════════════
         results = {}
-        if 2 in skip_phases:
-            log("Phase 2: SKIPPED by config")
-            emit_event("phase_skipped", phase=2, reason="Disabled in pipeline config")
+        _user_skip_p2 = _controls.consume_phase_skip(2)
+        if 2 in skip_phases or _user_skip_p2:
+            _reason = "user_skip" if _user_skip_p2 else "Disabled in pipeline config"
+            log(f"Phase 2: SKIPPED ({_reason})")
+            emit_event("phase_skipped", phase=2, reason=_reason)
         elif start_phase <= 2:
             if not brief_text:
                 log("No brief text available — cannot run Phase 2", "ERROR")
@@ -7735,9 +7817,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 3: NotebookLM Processing (upload + audio) ══════════════════════
         audio_path = None
-        if 3 in skip_phases:
-            log("Phase 3: SKIPPED by config")
-            emit_event("phase_skipped", phase=3, reason="Disabled in pipeline config")
+        _user_skip_p3 = _controls.consume_phase_skip(3)
+        if 3 in skip_phases or _user_skip_p3:
+            _reason = "user_skip" if _user_skip_p3 else "Disabled in pipeline config"
+            log(f"Phase 3: SKIPPED ({_reason})")
+            emit_event("phase_skipped", phase=3, reason=_reason)
         elif start_phase <= 3:
             emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
             _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
@@ -7839,8 +7923,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 4: YouTube Upload ══════════════════════
-        if 4 in skip_phases or not video_enabled:
-            _reason = "Disabled in pipeline config" if 4 in skip_phases else "Video disabled"
+        _user_skip_p4 = _controls.consume_phase_skip(4)
+        if 4 in skip_phases or not video_enabled or _user_skip_p4:
+            _reason = "user_skip" if _user_skip_p4 else ("Disabled in pipeline config" if 4 in skip_phases else "Video disabled")
             log(f"Phase 4: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=4, reason=_reason)
         elif start_phase <= 4:
@@ -7917,8 +8002,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 5: Report & Notification ══════════════════════
-        if 5 in skip_phases or not email_enabled:
-            _reason = "Disabled in pipeline config" if 5 in skip_phases else "Email disabled"
+        _user_skip_p5 = _controls.consume_phase_skip(5)
+        if 5 in skip_phases or not email_enabled or _user_skip_p5:
+            _reason = "user_skip" if _user_skip_p5 else ("Disabled in pipeline config" if 5 in skip_phases else "Email disabled")
             log(f"Phase 5: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=5, reason=_reason)
         else:
@@ -8550,11 +8636,28 @@ async def run_setup(profile_dir, wait_minutes=10):
     print(f"       {_c(_ACCENT, '•')} Scan QR  {_c(_DIM, '→')}  chat → Connect → Scan QR")
     print(f"       {_c(_ACCENT, '•')} or Paste {_c(_DIM, '→')}  Account → Pipeline Connection")
     print()
+    # Critical: clear any stale link fields from a previous --setup run BEFORE
+    # we start watching. If the user unlinked via the app but the release write
+    # silently failed, `linkedUid` might still be present — we'd read it here
+    # and auto-advance as if paired. Resetting the fields on every --setup
+    # guarantees the email NEVER appears until the user does a live pair.
+    try:
+        _firebase_db.collection("research_tokens").document(token).update({
+            "linkedUid": "",
+            "linkedEmail": "",
+            "linkedAt": None,
+        })
+        log("Cleared any stale link on this token — waiting for a fresh pair from the app.", "INFO")
+    except Exception as e:
+        log(f"    Could not reset stale link fields: {e}", "WARN")
+
     print(f"  {_c(_DIM, 'Waiting for the app to pair…')}  {_c(_DIM, '(Ctrl+C to cancel)')}")
 
-    # Watch the token doc directly — the app calls claimResearchToken after
-    # validating + saving, which writes {linkedUid, linkedEmail, linkedAt}
-    # here. Single-doc read per tick, no composite index required.
+    # Watch the token doc — the app calls claimResearchToken after validating
+    # + saving, which writes {linkedUid, linkedEmail, linkedAt} here. We now
+    # require ALL THREE to be present, plus linkedAt newer than this --setup
+    # started, so a stale pre-run claim can never slip through.
+    setup_started_ms = int(time.time() * 1000)
     linked_uid: str | None = None
     linked_email: str | None = None
     link_deadline = time.time() + wait_minutes * 60
@@ -8565,9 +8668,23 @@ async def run_setup(profile_dir, wait_minutes=10):
             doc = _firebase_db.collection("research_tokens").document(token).get()
             if doc.exists:
                 data = doc.to_dict() or {}
-                if data.get("linkedUid"):
-                    linked_uid = data.get("linkedUid")
-                    linked_email = data.get("linkedEmail") or None
+                _uid = data.get("linkedUid") or ""
+                _email = data.get("linkedEmail") or ""
+                _at = data.get("linkedAt")
+                # linkedAt is a Firestore Timestamp — convert to ms-since-epoch.
+                _at_ms = 0
+                if _at is not None:
+                    try:
+                        _at_ms = int(_at.timestamp() * 1000)
+                    except Exception:
+                        _at_ms = 0
+                # Accept the link only when all three fields are present AND
+                # the claim is newer than this --setup started (prevents a
+                # cached pre-run claim from auto-advancing). 30s skew tolerance
+                # for server/client clock drift.
+                if _uid and _email and _at_ms >= setup_started_ms - 30_000:
+                    linked_uid = _uid
+                    linked_email = _email
                     break
         except Exception as e:
             if not first_err_logged:
@@ -8607,6 +8724,24 @@ async def run_setup(profile_dir, wait_minutes=10):
 
     browser = Browser(profile_dir, headless=False)
     await browser.start()
+
+    # CUA client for visual double-verification. Best-effort: if no key is
+    # available, Step 2 falls back to Playwright-only verification (same as
+    # before). With a key present, each platform has to pass BOTH Playwright
+    # DOM checks AND CUA vision before Step 2 clears it — matches Phase 0
+    # init rigor.
+    _setup_cua_client = None
+    _setup_cua_api_key = os.environ.get("CUA_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if _setup_cua_api_key:
+        try:
+            import anthropic as _anthropic
+            _setup_cua_client = _anthropic.Anthropic(api_key=_setup_cua_api_key)
+            log("Setup Step 2: CUA vision verifier enabled — each platform will be double-checked.", "INFO")
+        except Exception as e:
+            log(f"Setup Step 2: Could not init CUA client ({e}) — Playwright-only verification.", "WARN")
+    else:
+        log("Setup Step 2: No CUA_API_KEY — Playwright-only verification (less rigorous).", "WARN")
+
     services = [
         ("ChatGPT",        "https://chatgpt.com",           "chatgpt"),
         ("Gemini",         "https://gemini.google.com",     "gemini"),
@@ -8649,11 +8784,31 @@ async def run_setup(profile_dir, wait_minutes=10):
             if not p:
                 results[key] = False
                 continue
+            # LAYER 1 — Playwright DOM check. Fast, zero-cost, catches the
+            # obvious unauthenticated state (login form visible, redirect to
+            # /login, etc.). If this fails, the platform is definitely not
+            # logged in — skip CUA since that would just burn budget.
             try:
-                ok = await verify_login(p, key, strict=True)
+                playwright_ok = await verify_login(p, key, strict=True)
             except Exception:
-                ok = False
-            results[key] = ok
+                playwright_ok = False
+            if not playwright_ok:
+                results[key] = False
+                continue
+            # LAYER 2 — CUA vision check. Only platforms that Playwright
+            # already accepts get here. CUA can still say NO if what looks
+            # like an authed layout is actually a half-logged-out state (stale
+            # session, expired cookie, interstitial). Two-strike retry built
+            # in. Skipped when no CUA key is available.
+            if not _setup_cua_client:
+                results[key] = True
+                continue
+            try:
+                cua_ok = await verify_login_cua(p, key, _setup_cua_client)
+            except Exception as e:
+                log(f"    CUA verify error for {key}: {e}", "WARN")
+                cua_ok = False
+            results[key] = bool(cua_ok)
 
         # Only re-render the checklist when something flipped (or on first pass)
         if results != last_results:
