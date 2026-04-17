@@ -7956,25 +7956,26 @@ async def run_setup(profile_dir, wait_minutes=10):
         print("         Waiting for you to scan or paste the token in the app...")
         print("         (Ctrl+C to cancel)")
         print("")
+        # Watch the token doc directly for linkedUid/linkedEmail fields that
+        # the frontend writes when the user scans or pastes. This avoids a
+        # collection_group query (which would need a composite index) — just
+        # a single-doc read on each tick.
         link_deadline = time.time() + wait_minutes * 60
         tick = 0
+        first_err_logged = False
         while time.time() < link_deadline and linked_uid is None:
             try:
-                results = list(
-                    _firebase_db.collection_group("settings")
-                    .where("researchToken", "==", token)
-                    .limit(1)
-                    .stream()
-                )
-                if results:
-                    path_parts = results[0].reference.path.split("/")
-                    if len(path_parts) >= 2 and path_parts[0] == "users":
-                        linked_uid = path_parts[1]
+                doc = _firebase_db.collection("research_tokens").document(token).get()
+                if doc.exists:
+                    data = doc.to_dict() or {}
+                    if data.get("linkedUid"):
+                        linked_uid = data.get("linkedUid")
+                        linked_email = data.get("linkedEmail") or None
                         break
             except Exception as e:
-                # First-miss is likely the index not being built; keep polling quietly
-                if tick == 0:
+                if not first_err_logged:
                     log(f"    Link poll error (continuing): {e}", "WARN")
+                    first_err_logged = True
             tick += 1
             if tick % 10 == 0:
                 elapsed = wait_minutes * 60 - int(link_deadline - time.time())
@@ -7991,13 +7992,14 @@ async def run_setup(profile_dir, wait_minutes=10):
             print("")
             return
 
-        # Resolve user email for a friendly confirmation
-        try:
-            from firebase_admin import auth as fb_auth
-            user_obj = fb_auth.get_user(linked_uid)
-            linked_email = user_obj.email or linked_uid[:8]
-        except Exception:
-            linked_email = linked_uid[:8]
+        # Fall back to resolving email via Auth if the scanner didn't write it
+        if not linked_email:
+            try:
+                from firebase_admin import auth as fb_auth
+                user_obj = fb_auth.get_user(linked_uid)
+                linked_email = user_obj.email or linked_uid[:8]
+            except Exception:
+                linked_email = linked_uid[:8]
 
         print("")
         print(f"    [ok] Linked — {linked_email}")
