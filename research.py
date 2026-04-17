@@ -6781,22 +6781,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Loop re-runs the checks — frontend's Retry button sends a
             # standard `resume` command that lands us here.
 
-        # Close the preflight verification tabs — each phase opens its own
-        # tab on a fresh URL anyway, and carrying 7 idle tabs through the
-        # rest of the run bloats memory and clutters the window. The browser
-        # itself stays alive; only the Phase 0 verification tabs close.
-        _closed = 0
+        # Close the preflight verification tabs so they don't clutter the
+        # window through Phases 1-5. CRITICAL: Browser.new_tab() reassigns
+        # self.page to each new tab, so `browser.page` is the LAST preflight
+        # tab we opened. Phase 1 navigates `browser.page` to ChatGPT — we
+        # must KEEP that page alive. So: close every preflight tab EXCEPT
+        # whichever one is currently browser.page. Phase 1's navigate() will
+        # then reuse that page as its ChatGPT tab.
+        primary = browser.page
         for _key, _tab in _preflight_tabs.items():
+            if _tab is primary:
+                continue
             try:
                 await _tab.close()
-                _closed += 1
-            except Exception as _e:
-                log(f"Phase 0: tab close failed for {_key}: {_e}", "WARN")
+            except Exception:
+                pass
         _preflight_tabs.clear()
-        log(f"Phase 0: closed {_closed} preflight tab(s) before Phase 1")
 
-        emit_event("agent_progress", phase=0, agent="system", status="ready",
-                   progress=f"Environment verified. {len(preflight_platforms)} platform(s) logged in.")
         emit_event("phase_complete", phase=0,
                    durationSec=int(time.time() - _p0_start),
                    summary=f"Preflight passed — {len(preflight_platforms)} platform(s) ready")
