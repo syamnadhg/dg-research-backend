@@ -56,15 +56,17 @@ Optional: `GEMINI_API_KEY` for nano-banana thumbnail generation in Phase 4.
 python research.py --setup
 ```
 
-The flow has three clearly-labeled stages in the terminal:
+The flow has three gated stages — each waits for the previous to confirm before advancing:
 
 **`[1/3] Research token`**
-Mints a new ResearchToken (UUID) or reuses the one in `research_config.json`. The token registers in Firestore (`research_tokens/{token}`) with `status: active`, `machineName`, `createdAt`, `lastHeartbeat`. Delete `research_config.json` if you want to mint a fresh one.
+Mints a new ResearchToken (UUID) or reuses the one in `research_config.json`. The token registers in Firestore (`research_tokens/{token}`) with `status: active`, `machineName`, `createdAt`, `lastHeartbeat`. The token is printed and an ASCII QR renders immediately below it. Delete `research_config.json` if you want to mint a fresh one.
 
-**`[2/3] Scan QR in the Super Research app`**
-Renders a scannable QR code right in the terminal. The QR payload is the bare token string (no URL hops). You have two equally-good ways to link the app:
+**`[2/3] Link token to your app account` — this gate blocks step 3**
+Setup waits (polling Firestore every 3s) until your app actually links the token to an authenticated user. Two equally-good ways:
 - **Scan** — in the Super Research app: chat → *Connect* bubble → *Scan QR* button, OR Account → Pipeline Connection → small QR icon beside the paste field. Point the phone camera at the terminal QR.
 - **Paste** — copy the token line printed above the QR and paste it into Account → Pipeline Connection → *Paste your ResearchToken* → *Link*.
+
+Once the app writes the token to your `users/{uid}/settings.researchToken` field, setup resolves your email via Firebase Auth and prints `[ok] Linked — you@example.com`. Only then does step 3 begin. Default timeout is 10 minutes.
 
 **`[3/3] Platform logins`**
 Opens 7 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds:

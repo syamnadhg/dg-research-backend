@@ -7882,7 +7882,7 @@ async def run_setup(profile_dir, wait_minutes=10):
 
     banner("Super Research — Backend Setup")
 
-    # ── Step 1: Firebase + ResearchToken ──────────────────────────────────
+    # ── Step 1: Firebase + ResearchToken + QR ─────────────────────────────
     print("  [1/3] Research token")
     firebase_ok = init_firebase()
     if not firebase_ok:
@@ -7899,10 +7899,8 @@ async def run_setup(profile_dir, wait_minutes=10):
     print("")
     print(f"    Token: {token}")
     print("")
-
-    # ── Step 2: QR rendering ──────────────────────────────────────────────
-    print("  [2/3] Scan QR in the Super Research app")
-    print("         chat → Connect (or) Account → Pipeline Connection")
+    print("    Scan the QR below in the Super Research app:")
+    print("        chat → Connect  (or)  Account → Pipeline Connection")
     print("")
     try:
         import qrcode
@@ -7917,6 +7915,67 @@ async def run_setup(profile_dir, wait_minutes=10):
     except Exception as e:
         log(f"    QR render failed: {e}", "WARN")
     print("")
+
+    # ── Step 2: Wait for token link confirmation ──────────────────────────
+    # Gates the browser-login step behind a successful app → Firestore link
+    # so the user actually scans/pastes before we open 7 browser tabs they
+    # may not yet be ready to log into.
+    print("  [2/3] Link token to your app account")
+    linked_uid: str | None = None
+    linked_email: str | None = None
+
+    if not firebase_ok:
+        log("    Cannot verify link — Firebase unavailable. Skipping to logins.", "WARN")
+    else:
+        print("         Waiting for you to scan or paste the token in the app...")
+        print("         (Ctrl+C to cancel)")
+        print("")
+        link_deadline = time.time() + wait_minutes * 60
+        tick = 0
+        while time.time() < link_deadline and linked_uid is None:
+            try:
+                results = list(
+                    _firebase_db.collection_group("settings")
+                    .where("researchToken", "==", token)
+                    .limit(1)
+                    .stream()
+                )
+                if results:
+                    path_parts = results[0].reference.path.split("/")
+                    if len(path_parts) >= 2 and path_parts[0] == "users":
+                        linked_uid = path_parts[1]
+                        break
+            except Exception as e:
+                # First-miss is likely the index not being built; keep polling quietly
+                if tick == 0:
+                    log(f"    Link poll error (continuing): {e}", "WARN")
+            tick += 1
+            if tick % 10 == 0:
+                elapsed = wait_minutes * 60 - int(link_deadline - time.time())
+                print(f"         ...still waiting ({elapsed}s elapsed)")
+            await asyncio.sleep(3)
+
+        if linked_uid is None:
+            print("")
+            print(f"  {BAR}")
+            print("    Timed out waiting for app link.")
+            print(f"  {BAR}")
+            print("")
+            print("    Re-run when ready:  python research.py --setup")
+            print("")
+            return
+
+        # Resolve user email for a friendly confirmation
+        try:
+            from firebase_admin import auth as fb_auth
+            user_obj = fb_auth.get_user(linked_uid)
+            linked_email = user_obj.email or linked_uid[:8]
+        except Exception:
+            linked_email = linked_uid[:8]
+
+        print("")
+        print(f"    [ok] Linked — {linked_email}")
+        print("")
 
     # ── Step 3: Open platform tabs + verify logins ─────────────────────────
     print("  [3/3] Platform logins")
