@@ -738,11 +738,13 @@ def _start_command_listener(uid, research_id, loop):
                     try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
                     except Exception: pass
                 log("Command received: STOP — server will exit after cleanup")
-                # Schedule a delayed server exit so pipeline can close browser + emit final events
+                # Schedule a delayed server exit so pipeline can close browser + emit final events.
+                # 3s is enough for pipeline_stopped to emit; anything longer leaves the user
+                # staring at a "Stopped" tile while the backend is still alive.
                 import threading
                 def _exit_after_stop():
                     import time as _t, os as _os
-                    _t.sleep(10)
+                    _t.sleep(3)
                     log("Exiting server after Stop", "WARN")
                     _os._exit(0)
                 threading.Thread(target=_exit_after_stop, daemon=True).start()
@@ -7976,7 +7978,12 @@ async def run_server(port=8000):
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str):
-        """STOP: terminate pipeline, save partial results, mark as stopped (not resumable)."""
+        """STOP: terminate pipeline, save partial results, mark as stopped (not resumable).
+
+        Also schedules a hard process exit 3s later — matches the Firestore
+        command-listener path so that hitting Stop reliably ends the backend
+        no matter which transport got there first.
+        """
         queue = queues_root / run_id
         if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
@@ -7986,6 +7993,16 @@ async def run_server(port=8000):
             p.unlink()
         # Also set asyncio event for immediate response
         _controls.request_stop()
+        # Schedule backend exit so Stop truly ends things even when the pipeline
+        # is stuck in a long Playwright wait or retry loop. Daemon thread so it
+        # doesn't block the response.
+        import threading as _threading
+        def _exit_after_http_stop():
+            import time as _t, os as _os
+            _t.sleep(3)
+            log("Exiting server after HTTP stop", "WARN")
+            _os._exit(0)
+        _threading.Thread(target=_exit_after_http_stop, daemon=True).start()
         return {"status": "stop_requested", "id": run_id}
 
     @app.post("/api/runs/{run_id}/pause")
