@@ -785,6 +785,17 @@ def _start_command_listener(uid, research_id, loop):
                     loop.call_soon_threadsafe(_controls.update_config, cfg)
                     _write_config_to_disk(cfg)
                     log(f"Command received: CONFIG update (written to disk)")
+            elif action == "skip_init_verify":
+                # User bailed on Phase 0 login verification from the dropdown.
+                loop.call_soon_threadsafe(_controls.request_skip_init_verify)
+                log("Command received: SKIP_INIT_VERIFY — Phase 0 will proceed without full verify")
+            elif action == "retry_init_verify":
+                # User tapped Retry on the login_required banner. Same as
+                # resume, but the frontend has already torn down the old
+                # Phase 0 tile — backend will re-emit phase_start so a fresh
+                # tile renders below the retry banner.
+                loop.call_soon_threadsafe(_controls.request_retry_init_verify)
+                log("Command received: RETRY_INIT_VERIFY — re-running Phase 0 with a fresh tile")
             elif action == "agent_decision":
                 # Frontend response to agent_link_failed modal.
                 decision = (data.get("decision", "") or "").lower()
@@ -821,6 +832,11 @@ class PipelineControls:
         self._config_updates: dict = {}
         # B1: per-agent link-fail decision ("retry" | "skip" | "stop")
         self.pending_agent_decision: str | None = None
+        # Phase 0: user-triggered mid-loop skip of the CUA verification gate.
+        self.skip_init_verify: bool = False
+        # Phase 0: user hit Retry on the login_required banner — triggers a
+        # fresh phase_start emit so the frontend can render a new tile below.
+        self.retry_init_verify: bool = False
 
     def request_stop(self):
         self.stop_event.set()
@@ -913,6 +929,25 @@ class PipelineControls:
         self.extra_context.clear()
         self._config_updates.clear()
         self.pending_agent_decision = None
+        self.skip_init_verify = False
+        self.retry_init_verify = False
+
+    def request_skip_init_verify(self):
+        """User clicked 'Skip verification' in Phase 0 dropdown — bail the
+        CUA loop and proceed to Phase 1. Also releases any pause so the
+        login_required wait exits immediately."""
+        self.skip_init_verify = True
+        self.pause_event.clear()
+        self.resume_event.set()
+
+    def request_retry_init_verify(self):
+        """User tapped Retry on the login_required banner. Distinct from a
+        plain resume: sets a flag so Phase 0 re-emits phase_start before
+        running the next verification attempt (frontend uses this to render
+        a fresh Phase 0 tile below the retry banner, in chronological order)."""
+        self.retry_init_verify = True
+        self.pause_event.clear()
+        self.resume_event.set()
 
     async def interruptible_sleep(self, seconds, check_interval=10):
         """Sleep in small increments, checking stop/pause every check_interval seconds.
@@ -1208,6 +1243,118 @@ async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_tim
     except Exception as e:
         log(f"[verify_login] {platform}: {e}", "WARN")
         return False
+
+
+# Human-readable platform names used when prompting CUA for login verification.
+# Keep these descriptive so the model knows which brand/site to identify.
+_PLATFORM_DISPLAY = {
+    "chatgpt":    "ChatGPT (chatgpt.com)",
+    "gemini":     "Google Gemini (gemini.google.com)",
+    "claude":     "Claude (claude.ai)",
+    "notebooklm": "Google NotebookLM (notebooklm.google.com)",
+    "youtube":    "YouTube Studio (studio.youtube.com)",
+    "gmail":      "Gmail (mail.google.com)",
+    "gdocs":      "Google Docs (docs.google.com)",
+}
+
+
+async def _cua_login_call(page, platform: str, cua_client) -> tuple[bool, str]:
+    """Single CUA vision call. Returns (verdict_yes, raw_response)."""
+    display = _PLATFORM_DISPLAY.get(platform.lower(), platform)
+    try:
+        buf = await page.screenshot(type="png", timeout=10000, full_page=False)
+        b64 = base64.b64encode(buf).decode("ascii")
+    except Exception as e:
+        log(f"[verify_login_cua:{platform}] screenshot failed: {e}", "WARN")
+        return (False, f"screenshot error: {e}")
+
+    # Tight, positive-leaning prompt. We want YES when the authenticated app
+    # UI is visible even if some secondary login-looking affordance exists.
+    # False positives on modals/login walls are an order of magnitude worse
+    # than false negatives — but false negatives (logged-in user shown as
+    # logged-out) break the pipeline flow entirely, so we bias YES.
+    prompt = (
+        f"Screenshot of {display}.\n\n"
+        f"Say YES if the authenticated app is visible and usable — e.g., "
+        f"a chat composer, sidebar with user's own history, inbox with "
+        f"messages, project/doc list, profile avatar, or any other UI "
+        f"that only appears AFTER sign-in.\n\n"
+        f"Say NO ONLY if the main content is clearly a login wall: a "
+        f"centered sign-in form with a password field, a Google account "
+        f"picker at accounts.google.com, or a marketing landing page "
+        f"where the dominant action is \"Log in\" / \"Sign up\".\n\n"
+        f"A transient loading spinner, a cookie banner, a sidebar nav "
+        f"link labelled \"Log in\" on an otherwise-authenticated page, "
+        f"or a small upsell popup do NOT count as a login wall — answer "
+        f"YES in those cases.\n\n"
+        f"Reply with ONLY one word: YES or NO."
+    )
+    try:
+        resp = await asyncio.to_thread(
+            cua_client.messages.create,
+            model=CUA_MODEL,
+            max_tokens=8,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        raw = ""
+        try:
+            for blk in resp.content:
+                if getattr(blk, "type", None) == "text":
+                    raw = (blk.text or "").strip()
+                    break
+        except Exception:
+            raw = ""
+        verdict = raw.strip().lower()
+        return (verdict.startswith("yes"), raw or "")
+    except Exception as e:
+        return (False, f"API error: {e}")
+
+
+async def verify_login_cua(page, platform: str, cua_client) -> bool:
+    """Vision-based login verification with a two-strike retry.
+
+    DOM selectors drift and some platforms show auth-like markers (New chat,
+    sidebar nav) even on the logged-out landing page. Vision is the only
+    reliable way to tell "modal/login wall" from "authenticated app".
+
+    Strategy: one quick check → if NO, wait 3s (lets Claude.ai / Gemini /
+    Google Docs finish hydrating) and re-check once. Only flag as not
+    logged in if BOTH checks disagree. Eliminates false positives from
+    transient loading states while still catching real logout walls.
+
+    Returns True iff at least one of the checks clearly says YES.
+    """
+    ok1, raw1 = await _cua_login_call(page, platform, cua_client)
+    if ok1:
+        log(f"[verify_login_cua:{platform}] LOGGED IN ✓ (Claude: {raw1[:30]})", "INFO")
+        return True
+
+    # Second attempt — let the page hydrate a bit more and re-check. Some
+    # SPAs (claude.ai/chats, docs.google.com) paint a neutral "loading"
+    # state for the first 3-4s that CUA misreads as a login wall.
+    log(f"[verify_login_cua:{platform}] first pass said NO ({raw1[:30]}) — re-checking after settle", "INFO")
+    try:
+        await asyncio.sleep(3.5)
+        # Kick a tiny scroll so lazy-hydrated UI paints (harmless if page ignores).
+        try:
+            await page.evaluate("() => window.scrollBy(0, 0)")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    ok2, raw2 = await _cua_login_call(page, platform, cua_client)
+    if ok2:
+        log(f"[verify_login_cua:{platform}] LOGGED IN ✓ on retry (Claude: {raw2[:30]})", "INFO")
+        return True
+
+    log(f"[verify_login_cua:{platform}] NOT LOGGED IN ✗ (Claude both passes: '{raw1[:20]}' / '{raw2[:20]}')", "INFO")
+    return False
 
 
 # ── Auth check after resume navigation ───────────────────────────────────
@@ -6770,6 +6917,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         if _need_gmail:      preflight_platforms.append(("Gmail", "gmail"))
         if _need_gdocs:      preflight_platforms.append(("Google Docs", "gdocs"))
 
+        # Honor the user's preference (global Settings → Pipeline → Skip
+        # login verification, plus any per-run override in pipeline_config).
+        # When on, we skip the per-platform CUA round entirely: browser is
+        # already running, Phase 1 will navigate itself to ChatGPT.
+        _skip_verify_pref = bool(pipeline_config.get("skipInitVerify", False)) if isinstance(pipeline_config, dict) else False
+        if _skip_verify_pref:
+            log("Phase 0: skipInitVerify=true — bypassing login verification per user pref", "INFO")
+            emit_event("agent_progress", phase=0, agent="system", status="Skipped",
+                       progress="Login verification skipped (per your pipeline settings)")
+            preflight_platforms = []  # Nothing to verify below — while loop skipped
+
         # Per-platform login verification + env checks, in a retry loop.
         # After each pass, if anything is missing we emit `login_required`,
         # pause the pipeline, and wait for the frontend's Retry button to
@@ -6778,14 +6936,26 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         label_by_key = {key: label for label, key in preflight_platforms}
         _preflight_tabs: dict[str, object] = {}
         attempt = 0
-        while True:
+        while preflight_platforms:
             attempt += 1
             _preflight_results: dict[str, bool] = {}
 
+            log(f"Phase 0: verifying logins for {len(preflight_platforms)} platform(s) (attempt {attempt}) via CUA vision", "INFO")
             emit_event("agent_progress", phase=0, agent="system", status="Verifying",
                        progress=f"Checking logins for {len(preflight_platforms)} platform(s) (attempt {attempt})…")
 
+            # Mid-loop skip: user clicked "Skip verification" in the Phase 0
+            # dropdown. Release any pause, emit a clean status, and break.
+            if _controls.skip_init_verify:
+                log("Phase 0: SKIP_INIT_VERIFY received mid-loop — proceeding to Phase 1", "INFO")
+                emit_event("agent_progress", phase=0, agent="system", status="Skipped",
+                           progress="Verification skipped by user")
+                break
+
             for label, key in preflight_platforms:
+                if _controls.skip_init_verify:
+                    break
+                log(f"Phase 0: checking {label}…", "INFO")
                 emit_event("agent_progress", phase=0, agent=key, status="checking",
                            progress=f"Verifying {label} login…")
                 try:
@@ -6801,9 +6971,28 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             await tab.goto(root, wait_until="domcontentloaded", timeout=15000)
                         except Exception:
                             pass
-                    # Settle for SPA hydration
-                    await asyncio.sleep(2.0)
-                    ok = await verify_login(tab, key, ensure_nav=False)
+                    # Settle for SPA hydration before vision check. Claude.ai
+                    # and Google Docs paint a neutral "loading" shell for
+                    # ~3-4s that CUA misreads as a login wall if we peek too
+                    # early. 4s here + 3.5s retry buffer inside verify_login_cua
+                    # covers the slowest case without blowing up Phase 0 time.
+                    await asyncio.sleep(4.0)
+                    # Cheap negative signal first: URL on a known login host means
+                    # definitely not logged in — skip the CUA call to save budget.
+                    try:
+                        current_url = (tab.url or "").lower()
+                    except Exception:
+                        current_url = ""
+                    login_hosts = ("auth.openai.com", "accounts.google.com/signin",
+                                   "login.live.com", "claude.ai/login", "claude.ai/signup")
+                    if any(h in current_url for h in login_hosts):
+                        log(f"Phase 0: {label} on login URL ({current_url[:60]}) — not logged in", "INFO")
+                        ok = False
+                    else:
+                        # Primary gate: CUA vision verification. DOM markers lie
+                        # on logged-out landing pages (ChatGPT shows New Chat btn
+                        # pre-auth), so screenshot + ask Claude instead.
+                        ok = await verify_login_cua(tab, key, cua_client)
                 except Exception as e:
                     log(f"Phase 0: login check failed for {key}: {e}", "WARN")
                     ok = False
@@ -6845,6 +7034,30 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if _controls.is_stop():
                 emit_event("pipeline_stopped", phase=0, reason="stopped during login_required")
                 return
+            if _controls.skip_init_verify:
+                log("Phase 0: SKIP_INIT_VERIFY received during login_required — proceeding", "INFO")
+                emit_event("agent_progress", phase=0, agent="system", status="Skipped",
+                           progress="Verification skipped by user")
+                break
+            # Resumed from login_required — tell the frontend we're re-checking
+            # so it can clear its "paused" state + render the fresh attempt
+            # visibly below the retry banner.
+            emit_event("pipeline_resumed", phase=0, reason="retry")
+            # If the user hit "Retry" (retry_init_verify), re-emit phase_start
+            # so the frontend creates a fresh Phase 0 tile below the retry
+            # banner. Plain `resume` alone wouldn't — the tile would stay at
+            # its old position at the top of the chat.
+            if _controls.retry_init_verify:
+                _controls.retry_init_verify = False
+                # Close old preflight tabs so the next round opens clean ones.
+                for _k, _t in list(_preflight_tabs.items()):
+                    try: await _t.close()
+                    except Exception: pass
+                _preflight_tabs.clear()
+                emit_event("phase_start", phase=0,
+                           description=f"Re-verifying environment + logins (attempt {attempt + 1})")
+                _p0_start = time.time()  # Reset so the new tile shows fresh elapsed time
+            log("Phase 0: resumed from login_required — re-running verification", "INFO")
             # Loop re-runs the checks — frontend's Retry button sends a
             # standard `resume` command that lands us here.
 
@@ -6865,9 +7078,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 pass
         _preflight_tabs.clear()
 
+        if _skip_verify_pref or _controls.skip_init_verify:
+            _p0_summary = "Preflight skipped — trusting existing sessions"
+        elif preflight_platforms:
+            _p0_summary = f"Preflight passed — {len(preflight_platforms)} platform(s) ready"
+        else:
+            _p0_summary = "Preflight complete"
         emit_event("phase_complete", phase=0,
                    durationSec=int(time.time() - _p0_start),
-                   summary=f"Preflight passed — {len(preflight_platforms)} platform(s) ready")
+                   summary=_p0_summary)
 
         # ══════════════════════ PHASE 1: Brief ══════════════════════
         p1 = None
