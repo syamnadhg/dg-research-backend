@@ -533,9 +533,15 @@ async def _heartbeat_loop():
                                 "lastHeartbeat": SERVER_TIMESTAMP,
                             })
                     except Exception:
-                        # Device doc may have been deleted from the app — that's
-                        # fine, don't crash the heartbeat.
-                        pass
+                        # Device doc is gone — user unlinked from the Account
+                        # page. Recreate it so a subsequent paste-token flow
+                        # (which claims the token but doesn't write the device
+                        # doc) results in the device tile reappearing within
+                        # one heartbeat interval (~30s).
+                        try:
+                            write_device_doc(paired_uid, _research_token)
+                        except Exception as e:
+                            log(f"Device doc recreate failed: {e}", "WARN")
         except Exception as e:
             log(f"Heartbeat write failed: {e}", "WARN")
         await asyncio.sleep(30)
