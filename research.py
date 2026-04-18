@@ -2818,13 +2818,39 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=3)
                     except Exception:
                         pass
 
-                # Strategy 3: Playwright keyboard.insert_text (no clipboard needed)
+                # Strategy 3: Playwright keyboard.insert_text (no clipboard needed,
+                # but sends everything as one big inserted blob — some composers
+                # like Gemini's rich-textarea don't always update controller state
+                # on a single insert event).
                 if not pasted:
                     try:
                         await ta.click()
                         await page.keyboard.press("Control+a")
                         await asyncio.sleep(0.1)
                         await page.keyboard.insert_text(brief_text)
+                        await asyncio.sleep(1.5)
+                        pasted = True
+                        break
+                    except Exception:
+                        pass
+
+                # Strategy 4: Real keyboard type — dispatches a genuine keydown/
+                # keypress/keyup per character, which any controlled composer
+                # has to handle (that's the contract of a browser). Slower
+                # (~0.5–2s for typical briefs) but virtually always works, and
+                # it's the only thing that reliably gets past Gemini's
+                # rich-textarea when CDP paste / execCommand / insert_text all
+                # leave the composer visually empty.
+                if not pasted:
+                    try:
+                        await ta.click()
+                        await page.keyboard.press("Control+a")
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.press("Delete")
+                        await asyncio.sleep(0.1)
+                        # delay=2ms per char keeps it realistic without adding
+                        # seconds to the run (a 5k-char brief is ~10s of typing).
+                        await page.keyboard.type(brief_text, delay=2)
                         await asyncio.sleep(1.5)
                         pasted = True
                         break
@@ -2840,10 +2866,30 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=3)
             continue
 
         # Verify: scrape textarea and check length. Claude: also accept attachment tile as success.
+        # For Gemini, `div[contenteditable="true"]` can match a non-composer
+        # sidebar element; also try the explicit rich-textarea path so we
+        # don't falsely fail a successful paste just because we read the
+        # wrong container.
         try:
             content_len = await page.evaluate("""() => {
-                const ta = document.querySelector('#prompt-textarea, div[contenteditable="true"], textarea, .ProseMirror');
-                return ta ? (ta.innerText || ta.value || ta.textContent || '').length : 0;
+                const candidates = [
+                    '#prompt-textarea',
+                    'rich-textarea div[contenteditable="true"]',
+                    '.ProseMirror',
+                    'div[contenteditable="true"][data-placeholder]',
+                    'div[contenteditable="true"]',
+                    'textarea[placeholder]',
+                    'textarea',
+                ];
+                let best = 0;
+                for (const sel of candidates) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        if (el.offsetParent === null) continue;  // must be visible
+                        const txt = (el.innerText || el.value || el.textContent || '');
+                        if (txt.length > best) best = txt.length;
+                    }
+                }
+                return best;
             }""")
             expected = len(brief_text)
             ratio = content_len / expected if expected > 0 else 0
