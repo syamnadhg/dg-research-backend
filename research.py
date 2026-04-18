@@ -934,12 +934,26 @@ def start_firestore_start_listener(job_queue, loop):
     log(f"Firestore start listener active on {listener_label}")
 
 
-def setup_firestore_run(uid, research_id, loop=None):
+def setup_firestore_run(uid, research_id, loop=None, run_id=None):
     """Set per-run Firestore context. Call at pipeline start."""
     global _fb_uid, _fb_research_id, _fb_seq, _fb_listener
     _fb_uid = uid
     _fb_research_id = research_id
     _fb_seq = 0
+    # Persist owner so the DELETE endpoint can cascade-delete Firestore
+    # subcollections when the user purges a run from disk. Without this, the
+    # DELETE endpoint only knows the backend run_id and would leave partial
+    # docs/audios orphaned in Firestore.
+    if run_id and uid and research_id:
+        try:
+            queue_dir = Path(__file__).parent / "queues" / run_id
+            queue_dir.mkdir(parents=True, exist_ok=True)
+            (queue_dir / "owner.json").write_text(
+                json.dumps({"uid": uid, "researchId": research_id}),
+                encoding="utf-8",
+            )
+        except Exception as _e:
+            log(f"owner.json write failed: {_e}", "WARN")
     # Start command listener if Firestore is available
     if _firebase_db and uid and research_id and _controls:
         _start_command_listener(uid, research_id, loop or asyncio.get_event_loop())
@@ -8612,7 +8626,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             email = None
     if uid:
         # Use frontend research_id for Firestore paths (not run_id which is the backend dir name)
-        setup_firestore_run(uid, research_id or run_id, asyncio.get_running_loop())
+        setup_firestore_run(uid, research_id or run_id, asyncio.get_running_loop(), run_id=run_id)
     # Start mid-run input dispatcher (watches _controls.extra_context, pastes to active pages)
     try:
         _runtime.dispatcher_task = asyncio.create_task(run_input_dispatcher())
@@ -9738,6 +9752,69 @@ async def run_server(port=8000):
     queues_root = Path(__file__).parent / "queues"
     tracks_root = Path(__file__).parent / "tracks"
 
+    # ── Startup sweep: purge stale failed runs older than 7 days ──
+    # Without this, queues/ and tracks/ pile up forever with partial MDs,
+    # partial audio, and orphaned Firestore docs. We only sweep entries whose
+    # delivery.json status is NOT in a clean-parked set, and only if the dir
+    # hasn't been touched in > 7 days so active debugging sessions aren't
+    # wiped out.
+    try:
+        now_ts = time.time()
+        STALE_SECONDS = 7 * 86400
+        KEEP_STATUSES = {"completed", "paused", "paused_backend_restart"}
+        swept = 0
+        if queues_root.exists():
+            for d in queues_root.iterdir():
+                if not d.is_dir():
+                    continue
+                delivery_path = d / "delivery.json"
+                status = ""
+                try:
+                    if delivery_path.exists():
+                        status = json.loads(delivery_path.read_text(encoding="utf-8")).get("status", "")
+                except Exception:
+                    pass
+                if status in KEEP_STATUSES:
+                    continue
+                try:
+                    mtime = d.stat().st_mtime
+                except Exception:
+                    continue
+                if (now_ts - mtime) < STALE_SECONDS:
+                    continue
+                # Cascade Firestore cleanup if owner.json is present
+                owner_path = d / "owner.json"
+                if owner_path.exists() and _firebase_db:
+                    try:
+                        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                        uid, rid = owner.get("uid"), owner.get("researchId")
+                        if uid and rid:
+                            ref = _firebase_db.collection("users").document(uid) \
+                                .collection("researches").document(rid)
+                            for sub in ("documents", "audios", "messages",
+                                        "pipeline_events", "commands"):
+                                try:
+                                    for sd in ref.collection(sub).stream():
+                                        try: sd.reference.delete()
+                                        except Exception: pass
+                                except Exception: pass
+                            try: ref.delete()
+                            except Exception: pass
+                    except Exception: pass
+                # Nuke local dirs
+                import shutil as _shutil
+                try: _shutil.rmtree(d)
+                except Exception: pass
+                try:
+                    tdir = tracks_root / d.name
+                    if tdir.exists(): _shutil.rmtree(tdir)
+                except Exception: pass
+                swept += 1
+        if swept:
+            log(f"[startup-sweep] purged {swept} stale run(s) older than 7 days", "INFO")
+    except Exception as _se:
+        log(f"[startup-sweep] failed: {_se}", "WARN")
+
     @app.get("/api/runs")
     async def list_runs():
         """List all pipeline runs — returns frontend-compatible Research objects."""
@@ -10123,12 +10200,45 @@ async def run_server(port=8000):
 
     @app.delete("/api/runs/{run_id}")
     async def delete_run(run_id: str):
-        """Delete a completed/stopped run's queue and tracks."""
+        """Delete a completed/stopped run's queue, tracks, and cascade-delete
+        the matching Firestore documents/audios/messages/pipeline_events/
+        commands subcollections. Without the cascade, partial docs from failed
+        runs would linger in Firestore forever."""
         import shutil
         queue = queues_root / run_id
         tracks = tracks_root / run_id
         if not queue.exists() and not tracks.exists():
             return JSONResponse({"error": "not found"}, 404)
+
+        # ── Cascade Firestore cleanup before nuking the owner file ──
+        owner_path = queue / "owner.json"
+        if owner_path.exists() and _firebase_db:
+            try:
+                owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                uid = owner.get("uid")
+                rid = owner.get("researchId")
+                if uid and rid:
+                    research_ref = _firebase_db.collection("users").document(uid) \
+                        .collection("researches").document(rid)
+                    # Delete known subcollections. Firestore requires enumerating
+                    # docs and deleting individually — no native recursive delete
+                    # in the Python SDK's positional-arg API.
+                    for sub in ("documents", "audios", "messages",
+                                "pipeline_events", "commands"):
+                        try:
+                            for sd in research_ref.collection(sub).stream():
+                                try: sd.reference.delete()
+                                except Exception: pass
+                        except Exception as _se:
+                            log(f"[delete_run] subcollection {sub} sweep: {_se}", "WARN")
+                    # Finally drop the research doc itself
+                    try: research_ref.delete()
+                    except Exception as _rde:
+                        log(f"[delete_run] research doc delete: {_rde}", "WARN")
+                    log(f"[delete_run] cascaded Firestore for users/{uid}/researches/{rid}")
+            except Exception as _oe:
+                log(f"[delete_run] owner.json parse failed: {_oe}", "WARN")
+
         try:
             if queue.exists(): shutil.rmtree(queue)
             if tracks.exists(): shutil.rmtree(tracks)
