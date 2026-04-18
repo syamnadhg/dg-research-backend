@@ -498,7 +498,6 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
         return
     import socket as _socket
     import platform as _platform
-    from google.cloud.firestore import SERVER_TIMESTAMP
     device_id = load_device_id() or generate_device_id()
     hostname = _socket.gethostname()
     try:
@@ -519,7 +518,11 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
         "hostname": hostname,
         "os": os_str,
         "token": token,
-        "lastHeartbeat": SERVER_TIMESTAMP,
+        # Millis-as-int (NOT SERVER_TIMESTAMP). Frontend reads it as a number
+        # and compares `Date.now() - lastHeartbeat`; a Firestore Timestamp
+        # object would coerce to NaN and the device would look permanently
+        # offline even while the backend is heartbeating normally.
+        "lastHeartbeat": int(time.time() * 1000),
         # Auto-detect indestructible from the scheduled task so the toggle
         # survives unlink+relink (task isn't uninstalled by unlink). If
         # schtasks says "installed", we overwrite whatever was in the doc;
@@ -541,7 +544,12 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
 
 async def _heartbeat_loop():
     """Write lastHeartbeat to research_tokens/{token} AND the paired device
-    doc every 30s so the frontend can show Online/Offline status per device."""
+    doc every 30s so the frontend can show Online/Offline status per device.
+
+    Token doc uses SERVER_TIMESTAMP (frontend reads `.seconds` off the
+    Timestamp). Device doc uses millis-as-int — the frontend compares
+    `Date.now() - lastHeartbeat` directly, so a Timestamp object would
+    become NaN and the tile would look perpetually offline. """
     from google.cloud.firestore import SERVER_TIMESTAMP
     while True:
         try:
@@ -558,7 +566,7 @@ async def _heartbeat_loop():
                     try:
                         _firebase_db.collection("users").document(paired_uid) \
                             .collection("devices").document(device_id).update({
-                                "lastHeartbeat": SERVER_TIMESTAMP,
+                                "lastHeartbeat": int(time.time() * 1000),
                             })
                     except Exception:
                         # Device doc is gone — user unlinked from the Account
@@ -573,6 +581,50 @@ async def _heartbeat_loop():
         except Exception as e:
             log(f"Heartbeat write failed: {e}", "WARN")
         await asyncio.sleep(30)
+
+
+_token_relink_watch = None  # Firestore Watch handle; kept for lifetime cleanup
+
+
+def _start_token_relink_watcher(token: str):
+    """Subscribe to research_tokens/{token} and react to linkedUid flips in
+    real time, so a user pasting the token into the Account page gets their
+    device tile back in well under a second instead of waiting up to ~30s
+    for the next heartbeat. The heartbeat self-heal at _heartbeat_loop() is
+    kept as a safety net in case the watcher drops.
+
+    The Firestore Admin SDK fires the snapshot callback in a background
+    thread — we do sync work only (write_device_doc + save_device_config).
+    Idempotent against repeated snapshots for the same uid. """
+    global _token_relink_watch
+    if not _firebase_db or not token:
+        return
+    doc_ref = _firebase_db.collection("research_tokens").document(token)
+
+    def _on_snap(snapshots, changes, read_time):
+        try:
+            for snap in snapshots:
+                data = snap.to_dict() or {}
+                new_uid = (data.get("linkedUid") or "").strip()
+                if not new_uid:
+                    continue
+                current_uid = load_paired_uid() or ""
+                if new_uid == current_uid:
+                    continue
+                log(f"Token relinked → {new_uid[:8]}… — refreshing device doc now.")
+                try:
+                    save_device_config(paired_uid=new_uid)
+                    write_device_doc(new_uid, token)
+                except Exception as e:
+                    log(f"Relink refresh failed: {e}", "WARN")
+        except Exception as e:
+            log(f"Relink watcher callback error: {e}", "WARN")
+
+    try:
+        _token_relink_watch = doc_ref.on_snapshot(_on_snap)
+        log("Token relink watcher started")
+    except Exception as e:
+        log(f"Could not start relink watcher (falling back to 30s heartbeat): {e}", "WARN")
 
 
 # ── Run Analytics (phase duration tracking for realistic ETAs) ────────────
@@ -8882,6 +8934,11 @@ async def run_server(port=8000):
                 log(f"Could not resolve paired uid from token doc: {e}", "WARN")
         if paired_uid:
             write_device_doc(paired_uid, token)
+        # Sub-second relink: watch the token doc so a paste-token flow
+        # (which only writes linkedUid, never touches the device doc) gets
+        # reflected in the Account page tile almost immediately, instead of
+        # waiting up to 30s for the heartbeat-based self-heal.
+        _start_token_relink_watcher(token)
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     try:
@@ -8890,6 +8947,13 @@ async def run_server(port=8000):
         worker_task.cancel()
         if heartbeat_task:
             heartbeat_task.cancel()
+        global _token_relink_watch
+        if _token_relink_watch is not None:
+            try:
+                _token_relink_watch.unsubscribe()
+            except Exception:
+                pass
+            _token_relink_watch = None
         # Mark offline on shutdown. Stale heartbeat alone would tip the UI
         # over to "offline" after ~20 min; touching status here lets the
         # Account page reflect a clean shutdown immediately.
