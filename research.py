@@ -9273,6 +9273,46 @@ async def run_setup(profile_dir, wait_minutes=10):
 _INDESTRUCTIBLE_TASK_NAME = "SuperResearchBackend"
 
 
+def run_daemon_loop(port: int = 8000):
+    """Wrapper that keeps `--serve` alive. The scheduled task installed by
+    --resurrect invokes this instead of --serve directly so that the
+    backend restarts automatically on ANY exit — clean shutdown from the
+    Stop button (which calls os._exit to force Chromium cleanup), crashes,
+    upstream failures, anything. Without this, --resurrect only fires the
+    process once per logon, which defeats the "indestructible" promise.
+
+    Loops forever with a 5s delay between restarts. Exits only on
+    KeyboardInterrupt so the user can Ctrl+C out of the wrapper itself
+    when they want to stop the loop. `--exorcise` deletes the scheduled
+    task; the currently-running wrapper keeps going until the next reboot
+    (or the user ends it via Task Manager) — deliberate, so a surprise
+    --exorcise doesn't yank the rug out mid-pipeline."""
+    import sys as _sys
+    import subprocess as _subprocess
+    import time as _time
+
+    script_path = str(Path(__file__).resolve())
+    python_exe = _sys.executable
+    restarts = 0
+    while True:
+        try:
+            log(f"[daemon-loop] Starting --serve (restart #{restarts})")
+            result = _subprocess.run([python_exe, script_path, "--serve", "--port", str(port)])
+            log(f"[daemon-loop] --serve exited with code {result.returncode}")
+        except KeyboardInterrupt:
+            log("[daemon-loop] Interrupted — exiting wrapper")
+            return
+        except Exception as e:
+            log(f"[daemon-loop] Subprocess launch failed: {e}", "WARN")
+        restarts += 1
+        log(f"[daemon-loop] Restarting in 5s…")
+        try:
+            _time.sleep(5)
+        except KeyboardInterrupt:
+            log("[daemon-loop] Interrupted during sleep — exiting wrapper")
+            return
+
+
 def _write_indestructible_flag(enabled: bool):
     """Push the Indestructible flag to the device doc so the frontend can
     branch watchdog copy. Best-effort — if Firebase isn't reachable we still
@@ -9316,7 +9356,11 @@ def run_resurrect():
     script_path = str(Path(__file__).resolve())
     # Use the full path to python.exe so the task runs even if PATH isn't set
     # up for the scheduler's session. Quote both to tolerate spaces.
-    task_run = f'"{python_exe}" "{script_path}" --serve'
+    # Launch the daemon-loop wrapper (not --serve directly) so the backend
+    # auto-restarts on any exit — including the os._exit(0) that the Stop
+    # button calls for Chromium cleanup. Without this, the scheduled task
+    # only fires once per logon and the backend stays dead after Stop.
+    task_run = f'"{python_exe}" "{script_path}" --daemon-loop'
 
     # Initialize Firebase so the flag write later succeeds. Cheap no-op if
     # the sa file is missing — we just skip the flag.
@@ -9359,9 +9403,10 @@ def run_resurrect():
     _write_indestructible_flag(True)
     print(f"  {_c(_OK, '[ok]')} Synced to the Super Research app")
     print()
-    print(f"  {_c(_DIM, 'From now on, `--serve` auto-starts when you log in. The')}")
-    print(f"  {_c(_DIM, 'startup auto-retry (for crashed/incomplete runs) is already')}")
-    print(f"  {_c(_DIM, 'built in — Indestructible mode completes the loop.')}")
+    print(f"  {_c(_DIM, 'From now on, a daemon wrapper auto-starts at user logon and')}")
+    print(f"  {_c(_DIM, 'keeps `--serve` alive — relaunching it on crash, Stop button,')}")
+    print(f"  {_c(_DIM, 'or any exit. Combined with the startup auto-resume for')}")
+    print(f"  {_c(_DIM, 'incomplete runs, Indestructible mode is fully closed-loop.')}")
     print()
     print(f"  {_c(_DIM, 'To undo:')} {_c(_BOLD, 'python research.py --exorcise')}")
 
@@ -9436,6 +9481,8 @@ def main():
         help="Install a Windows Scheduled Task that auto-starts `--serve` on user logon (Indestructible mode)")
     parser.add_argument("--exorcise", action="store_true",
         help="Remove the Indestructible Scheduled Task installed by --resurrect")
+    parser.add_argument("--daemon-loop", action="store_true",
+        help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the Indestructible scheduled task.")
     args = parser.parse_args()
 
     if args.resurrect:
@@ -9444,6 +9491,10 @@ def main():
 
     if args.exorcise:
         run_exorcise()
+        return
+
+    if args.daemon_loop:
+        run_daemon_loop(args.port)
         return
 
     if args.setup:
