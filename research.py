@@ -254,6 +254,11 @@ _fb_seq = 0             # Per-run: monotonic event sequence number
 _fb_listener = None     # Per-run: command listener unsubscribe handle
 _research_token = None  # ResearchToken: this backend instance's unique ID
 
+# Shared queue state: mutated by the job worker in run_server, read by the
+# Firestore start listener (module-level function) so queued research docs
+# know the current backend busy state + what they're waiting behind.
+_QUEUE_STATE = {"running": False, "current_job": None, "queue_ref": None, "recompute_fn": None}
+
 
 def init_firebase():
     """Initialize Firebase Admin SDK from service-account JSON. Call once at server start.
@@ -712,6 +717,59 @@ def start_firestore_start_listener(job_queue, loop):
             if data.get("processed"):
                 continue
             action = data.get("action", "start")
+            # Handle cancel-queued: remove the target research from the job
+            # queue before it reaches the worker and mark it stopped. The
+            # actively-running job is handled by its own per-run command
+            # listener, not here.
+            if action == "cancel":
+                target_rid = data.get("researchId", "")
+                target_uid = data.get("uid", "")
+                if not target_rid or not target_uid:
+                    try:
+                        doc.reference.update({"processed": True, "error": "missing researchId/uid"})
+                    except Exception:
+                        pass
+                    continue
+                # Don't interfere with the actively-running job — per-run
+                # command listener handles it via its own stop path.
+                current = _QUEUE_STATE.get("current_job") or {}
+                if current.get("research_id") == target_rid:
+                    log(f"Cancel: target {target_rid} is actively running — skipping queue surgery", "INFO")
+                    try:
+                        doc.reference.update({"processed": True, "note": "actively running; use stop"})
+                    except Exception:
+                        pass
+                    continue
+                def _do_cancel(rid=target_rid, u=target_uid, dref=doc.reference):
+                    try:
+                        dq = job_queue._queue  # deque
+                        kept = [j for j in dq if j.get("research_id") != rid]
+                        removed = any(j.get("research_id") == rid for j in dq)
+                        dq.clear()
+                        for j in kept:
+                            dq.append(j)
+                        if removed and _firebase_db:
+                            try:
+                                _firebase_db.collection("users").document(u) \
+                                    .collection("researches").document(rid) \
+                                    .update({
+                                        "status": "stopped",
+                                        "phase": 0,
+                                        "summary": "Cancelled before starting",
+                                    })
+                            except Exception as ex:
+                                log(f"Cancel: failed to mark stopped: {ex}", "WARN")
+                            fn = _QUEUE_STATE.get("recompute_fn")
+                            if fn:
+                                fn()
+                        try:
+                            dref.update({"processed": True, "cancelled": removed})
+                        except Exception:
+                            pass
+                    except Exception as ex:
+                        log(f"Cancel queued failed: {ex}", "WARN")
+                loop.call_soon_threadsafe(_do_cancel)
+                continue
             if action != "start":
                 continue
             uid = data.get("uid", "")
@@ -729,17 +787,48 @@ def start_firestore_start_listener(job_queue, loop):
             # Generate run_id
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             log(f"Firestore start: uid={uid[:8]}... topic={topic[:40]} run_id={run_id}")
-            # Write run_id back to the research doc so frontend can read it
+            # Decide initial status: "ongoing" if worker is idle, else "queued"
+            # with position + behind-target so the chat banner + tile badge can
+            # tell the user which run must finish first.
+            is_busy = bool(_QUEUE_STATE.get("running")) or job_queue.qsize() > 0
+            if is_busy:
+                # Position in queue = current pending + 1 (this one)
+                position = job_queue.qsize() + 1
+                behind_rid = ""
+                behind_title = ""
+                current = _QUEUE_STATE.get("current_job")
+                if current:
+                    behind_rid = current.get("research_id") or ""
+                    behind_title = (current.get("topic") or "")[:60]
+                elif job_queue.qsize() > 0:
+                    try:
+                        pending_list = list(job_queue._queue)  # snapshot deque
+                        if pending_list:
+                            first = pending_list[0]
+                            behind_rid = first.get("research_id") or ""
+                            behind_title = (first.get("topic") or "")[:60]
+                    except Exception:
+                        pass
+                status_payload = {
+                    "backendRunId": run_id,
+                    "status": "queued",
+                    "queuePosition": position,
+                    "queuedBehindRunId": behind_rid,
+                    "queuedBehindTitle": behind_title,
+                }
+            else:
+                status_payload = {"backendRunId": run_id, "status": "ongoing"}
+            # Write run_id + initial status back to the research doc
             try:
                 _firebase_db.collection("users").document(uid) \
                     .collection("researches").document(research_id) \
-                    .update({"backendRunId": run_id, "status": "ongoing"})
+                    .update(status_payload)
             except Exception as e:
                 log(f"Failed to write backendRunId: {e}", "WARN")
                 try:
                     _firebase_db.collection("users").document(uid) \
                         .collection("researches").document(research_id) \
-                        .set({"backendRunId": run_id, "status": "ongoing"}, merge=True)
+                        .set(status_payload, merge=True)
                 except Exception:
                     pass
             # Mark processed
@@ -8518,6 +8607,71 @@ async def run_server(port=8000):
     # ── Job queue: one pipeline at a time, multiple can be queued ──
     _job_queue = asyncio.Queue()
     _queue_running = False
+    _QUEUE_STATE["queue_ref"] = _job_queue
+    _QUEUE_STATE["recompute_fn"] = None  # set below after defining helper
+
+    def _flip_queued_to_ongoing(uid_val, research_id_val):
+        """Worker pickup: flip status from queued → ongoing and clear queue
+        fields. No-op if Firestore is unavailable or uid/rid missing (HTTP
+        /api/runs path doesn't carry them)."""
+        if not (_firebase_db and uid_val and research_id_val):
+            return
+        try:
+            from google.cloud.firestore import DELETE_FIELD
+            _firebase_db.collection("users").document(uid_val) \
+                .collection("researches").document(research_id_val) \
+                .update({
+                    "status": "ongoing",
+                    "queuePosition": DELETE_FIELD,
+                    "queuedBehindRunId": DELETE_FIELD,
+                    "queuedBehindTitle": DELETE_FIELD,
+                })
+        except Exception as e:
+            log(f"Failed to flip queued→ongoing for {research_id_val}: {e}", "WARN")
+
+    def _recompute_queue_positions():
+        """After a job finishes, shift remaining queued jobs' positions up by
+        one and re-point their `queuedBehindRunId/Title` at the new head (or
+        clear if they're next). Reads `_job_queue._queue` as a snapshot."""
+        if not _firebase_db:
+            return
+        try:
+            pending = list(_job_queue._queue)
+        except Exception:
+            return
+        for idx, qjob in enumerate(pending):
+            uid_v = qjob.get("uid")
+            rid_v = qjob.get("research_id")
+            if not uid_v or not rid_v:
+                continue
+            new_pos = idx + 1
+            # The head job (idx 0) waits behind nothing — it starts next.
+            # Others wait behind the job immediately before them.
+            if idx == 0:
+                patch = {"queuePosition": new_pos}
+                try:
+                    from google.cloud.firestore import DELETE_FIELD
+                    patch["queuedBehindRunId"] = DELETE_FIELD
+                    patch["queuedBehindTitle"] = DELETE_FIELD
+                except Exception:
+                    pass
+            else:
+                prev = pending[idx - 1]
+                patch = {
+                    "queuePosition": new_pos,
+                    "queuedBehindRunId": prev.get("research_id") or "",
+                    "queuedBehindTitle": (prev.get("topic") or "")[:60],
+                }
+            try:
+                _firebase_db.collection("users").document(uid_v) \
+                    .collection("researches").document(rid_v) \
+                    .update(patch)
+            except Exception as e:
+                log(f"Failed to recompute queue position for {rid_v}: {e}", "WARN")
+
+    # Expose the recompute helper to the module-level Firestore listener so
+    # the cancel-queued action can also trigger a position refresh.
+    _QUEUE_STATE["recompute_fn"] = _recompute_queue_positions
 
     async def _job_worker():
         """Process pipeline jobs one at a time from the queue."""
@@ -8525,7 +8679,12 @@ async def run_server(port=8000):
         while True:
             job = await _job_queue.get()
             _queue_running = True
+            _QUEUE_STATE["running"] = True
+            _QUEUE_STATE["current_job"] = job
             log(f"Starting queued job: {job['topic'][:60]}")
+            # Flip this run's research doc from queued → ongoing. No-op for
+            # the very first start in an idle backend (already ongoing).
+            _flip_queued_to_ongoing(job.get("uid"), job.get("research_id"))
             try:
                 await run_pipeline(topic=job["topic"], email=job.get("email", ""),
                                    verbose=True, resume_dir=job.get("resume_dir"),
@@ -8535,7 +8694,11 @@ async def run_server(port=8000):
                 log(f"Pipeline job error: {e}", "ERROR")
             finally:
                 _queue_running = False
+                _QUEUE_STATE["running"] = False
+                _QUEUE_STATE["current_job"] = None
                 _job_queue.task_done()
+                # Shift remaining queued jobs up one position.
+                _recompute_queue_positions()
 
     # Start the worker + Firestore start listener on server startup
     @app.on_event("startup")
