@@ -606,9 +606,14 @@ def _start_token_relink_watcher(token: str):
             for snap in snapshots:
                 data = snap.to_dict() or {}
                 new_uid = (data.get("linkedUid") or "").strip()
-                if not new_uid:
-                    continue
                 current_uid = load_paired_uid() or ""
+                # Unlink event: linkedUid was cleared. The start listener gates
+                # on linkedUid per-request, so we don't need to tear it down —
+                # just log it so ops can see the transition in backend.log.
+                if not new_uid:
+                    if current_uid:
+                        log(f"Token unlinked (linkedUid cleared for paired uid {current_uid[:8]}…) — incoming pipeline starts will be rejected.")
+                    continue
                 if new_uid == current_uid:
                     continue
                 log(f"Token relinked → {new_uid[:8]}… — refreshing device doc now.")
@@ -870,6 +875,34 @@ def start_firestore_start_listener(job_queue, loop):
                 except Exception:
                     pass
                 continue
+            # Token-unlink guard: a device that was unpaired from Account
+            # settings clears linkedUid on the token doc. The queue listener
+            # itself stays alive (we may relink later), but we must reject
+            # any start requests that arrive between unlink and relink —
+            # otherwise the backend happily processes work for a device the
+            # user revoked. Also enforces uid match so a stolen token can't
+            # trigger runs against someone else's account.
+            if _research_token:
+                try:
+                    tdoc = _firebase_db.collection("research_tokens").document(_research_token).get()
+                    tdata = tdoc.to_dict() or {}
+                    linked_uid = (tdata.get("linkedUid") or "").strip()
+                    if not linked_uid:
+                        log(f"Rejecting start: token unlinked (linkedUid empty). uid={uid[:8]} topic={topic[:40]}", "WARN")
+                        try:
+                            doc.reference.update({"processed": True, "error": "token unlinked"})
+                        except Exception:
+                            pass
+                        continue
+                    if uid != linked_uid:
+                        log(f"Rejecting start: uid mismatch (linked={linked_uid[:8]} req={uid[:8]})", "WARN")
+                        try:
+                            doc.reference.update({"processed": True, "error": "uid mismatch"})
+                        except Exception:
+                            pass
+                        continue
+                except Exception as e:
+                    log(f"Token validation failed (allowing request through): {e}", "WARN")
             # Generate run_id
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             log(f"Firestore start: uid={uid[:8]}... topic={topic[:40]} run_id={run_id}")
@@ -2999,9 +3032,14 @@ async def extract_with_retry(
             emit_event("link_extract_retry", phase=phase, agent=agent,
                        attempt=attempt, maxAttempts=max_retries, error=last_err)
             await asyncio.sleep(retry_delay)
-    # All retries exhausted
+    # All retries exhausted. Include a human-readable description so the
+    # frontend step list shows something meaningful ("Couldn't extract link
+    # after N attempts") instead of the raw event name, and so the agent
+    # alert panel has content to render if a caller routes this as a
+    # terminal failure rather than proceeding to wait_for_agent_decision.
     emit_event("link_extraction_failed", phase=phase, agent=agent,
-               error=last_err, attempts=max_retries)
+               error=last_err, attempts=max_retries,
+               description=f"Couldn't extract a verified link after {max_retries} attempts")
     return LinkResult(url="", label=kwargs.get("label", ""),
                       platform=agent, verified=False, error=last_err)
 
@@ -3285,6 +3323,41 @@ def emit_event(event_type, phase=None, agent=None, **data):
             record_phase_duration(phase, dur, agent=agent or "")
     # Write to Firestore (frontend real-time transport)
     _emit_to_firestore(event)
+
+
+def fail_phase(phase, error, reason=None, agent=None, actions=None, **extra):
+    """Emit a paired pipeline_error + pipeline_stopped for a terminal phase
+    failure, and mark the Firestore research doc as failed in one shot.
+
+    Use this anywhere a phase decides it cannot continue and is about to
+    `return` from the pipeline. It guarantees the frontend gets both the
+    root-cause error (routed to the phase alert panel) AND the terminal
+    stop signal (so the phase tile freezes, polling tears down, and the
+    chat surfaces the stopped state).
+
+    Every event carries phase + (optional) agent so the frontend can route
+    to the right alert panel without guessing. `reason` is human copy shown
+    in the alert details; `error` stays as a short machine-tag. `actions`
+    is an optional list of retry/skip/continue buttons for the alert panel."""
+    payload = {"error": error}
+    if reason:
+        payload["reason"] = reason
+    if actions:
+        payload["actions"] = actions
+    payload.update(extra)
+    emit_event("pipeline_error", phase=phase, agent=agent, **payload)
+    stop_payload = {}
+    if reason:
+        stop_payload["reason"] = reason
+    if error and "error" not in stop_payload:
+        stop_payload["error"] = error
+    if extra.get("partial_agents"):
+        stop_payload["partial_agents"] = extra["partial_agents"]
+    emit_event("pipeline_stopped", phase=phase, agent=agent, **stop_payload)
+    try:
+        _update_firestore_research({"status": "failed", "phase": phase})
+    except Exception:
+        pass
 
 
 async def scrape_progress_chatgpt(page):
@@ -3810,32 +3883,87 @@ class Browser:
         # shares a singleton process broker with the user's personal Chrome
         # (26+ processes). The new instance delegates to the running Chrome and
         # exits, killing the automation browser. Bundled Chromium is independent.
+        # User-Agent override: Playwright's bundled Chromium reports a UA
+        # that includes "HeadlessChrome" on some builds and lags the stable
+        # Chrome version on others. Cloudflare / ChatGPT scores that as a
+        # bot signal on its own — overriding to a current-stable Chrome UA
+        # on Windows is the single highest-impact stealth change (closes
+        # the UA vs. UACH mismatch that triggers Turnstile). Keep the major
+        # close to the bundled Chromium version so UA+UACH stay consistent.
+        real_chrome_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self.profile_dir,
             headless=self.headless,
             viewport={"width": API_WIDTH, "height": API_HEIGHT},
+            user_agent=real_chrome_ua,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
                 "--no-default-browser-check",
+                # Disable Chrome's "automation-controlled" infobar (visible
+                # to page scripts through window.outerHeight delta) — the
+                # existing --disable-blink-features flag covers the JS API
+                # but this flag hides the infobar itself.
+                "--disable-infobars",
+                # Prevent a suspicious permissions-API fingerprint where
+                # notifications query returns "denied" instantly (headless
+                # quirk). Sites compare that against the shim below.
+                "--disable-features=IsolateOrigins,site-per-process",
             ],
             ignore_default_args=["--enable-automation"],
         )
         # Stealth init script — runs on every document load BEFORE any page
         # JS. Hides the automation signals Cloudflare / Anthropic read to
-        # decide whether to fire Turnstile. Without this, `navigator.webdriver`
-        # is `true` on every page and Claude's anti-bot flags us even though
-        # we already passed `--disable-blink-features=AutomationControlled` +
-        # `ignore_default_args=["--enable-automation"]` at launch time.
+        # decide whether to fire Turnstile. This is the layered defense
+        # alongside the UA override + launch flags above.
         #
-        # Just a `webdriver` override lands most of the win; plugins + languages
-        # lookalikes close the remaining fingerprint gaps without being so
-        # heavy-handed that we risk breaking legitimate pages.
+        # Coverage:
+        #  - navigator.webdriver      (primary automation tell)
+        #  - navigator.plugins        (empty array is a headless signal)
+        #  - navigator.languages      (empty or ["en-US"] mismatch)
+        #  - navigator.vendor         (must be "Google Inc." on Chrome)
+        #  - navigator.platform       (match UA: "Win32")
+        #  - navigator.hardwareConcurrency (0 is suspicious; real machines 4-16)
+        #  - navigator.deviceMemory   (undefined is suspicious; 8 is safe)
+        #  - window.chrome.runtime    (missing = headless; presence = real)
+        #  - permissions.query shim   (notifications "denied" instantly = bot)
+        #  - WebGL vendor + renderer  (SwiftShader = headless tell)
+        #  - window.outerWidth/Height (viewport mismatch = automation)
         await self.context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            window.chrome = window.chrome || { runtime: {} };
+            Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+            window.chrome = window.chrome || {};
+            window.chrome.runtime = window.chrome.runtime || {};
+            // Permissions API: real Chrome returns 'prompt' for notifications
+            // on fresh sessions; headless returns 'denied' instantly. Shim so
+            // the query matches real browser behavior.
+            const _origQuery = window.navigator.permissions && window.navigator.permissions.query;
+            if (_origQuery) {
+                window.navigator.permissions.query = (p) => (
+                    p && p.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission || 'prompt' })
+                        : _origQuery.call(window.navigator.permissions, p)
+                );
+            }
+            // WebGL: headless reports "SwiftShader" / "ANGLE" giveaways.
+            // Override the vendor/renderer strings on getParameter to look
+            // like real integrated Intel graphics (common on Windows laptops).
+            try {
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(p) {
+                    if (p === 37445) return 'Intel Inc.';
+                    if (p === 37446) return 'Intel Iris OpenGL Engine';
+                    return getParameter.call(this, p);
+                };
+            } catch (e) {}
         """)
         if self.context.pages:
             self.page = self.context.pages[0]
@@ -4066,32 +4194,62 @@ async def agent_loop(client, browser, system_prompt, user_message,
             )
         except Exception as e:
             err = str(e)
-            if "rate_limit" in err.lower() or "429" in err:
+            # Resolve which phase/agent this CUA call is serving so the
+            # frontend can route the warning to the correct per-agent
+            # badge inside Phase 2 instead of collapsing into a phase-wide
+            # banner. Fall back to _runtime.phase when caller omitted it.
+            _phase = phase if phase is not None else _runtime.phase
+            _agent = agent_name or None
+            low = err.lower()
+            if "rate_limit" in low or "429" in err:
                 log("Rate limited — waiting 30s", "WARN")
-                # Narrate to frontend so the dropdown shows "API rate-limited,
-                # retrying in 30s…" instead of a silent gap.
                 try:
-                    emit_event("pipeline_warning", phase=_runtime.phase,
+                    emit_event("pipeline_warning", phase=_phase, agent=_agent,
                                message="Anthropic API rate-limited — retrying in 30s…",
                                details="Claude API returned HTTP 429 for a CUA call. Backing off automatically.",
                                alertType="retrying")
                 except Exception:
                     pass
                 await asyncio.sleep(30); continue
-            elif "overloaded" in err.lower() or "529" in err:
+            elif "overloaded" in low or "529" in err:
                 log("API overloaded — waiting 60s", "WARN")
                 try:
-                    emit_event("pipeline_warning", phase=_runtime.phase,
+                    emit_event("pipeline_warning", phase=_phase, agent=_agent,
                                message="Anthropic API overloaded — retrying in 60s…",
                                details="Claude API returned HTTP 529 for a CUA call. Backing off automatically.",
                                alertType="retrying")
                 except Exception:
                     pass
                 await asyncio.sleep(60); continue
+            elif "workspace api usage limits" in low or ("400" in err and "usage limit" in low):
+                # Non-recoverable: workspace cap is hit, retrying won't help
+                # until the cap is raised in the Anthropic Console or the
+                # reset date passes. Surface as a pipeline_error with an
+                # actionable reason and bail out of the loop — callers can
+                # decide whether to fall back or fail the phase.
+                log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
+                try:
+                    emit_event("pipeline_error", phase=_phase, agent=_agent,
+                               error="claude_api_cap",
+                               reason="Claude API hit the workspace usage cap. Raise it in the Anthropic Console or wait until the reset date, then retry.",
+                               details=err[:200])
+                except Exception:
+                    pass
+                return {"status": "error", "text": str(e)}
+            elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
+                log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
+                try:
+                    emit_event("pipeline_error", phase=_phase, agent=_agent,
+                               error="claude_api_unauthorized",
+                               reason="Claude API key was rejected. Update CUA_API_KEY and restart the backend.",
+                               details=err[:200])
+                except Exception:
+                    pass
+                return {"status": "error", "text": str(e)}
             else:
                 log(f"API error: {e}", "ERROR")
                 try:
-                    emit_event("pipeline_warning", phase=_runtime.phase,
+                    emit_event("pipeline_warning", phase=_phase, agent=_agent,
                                message="Anthropic API error — CUA call failed",
                                details=f"{err[:200]}",
                                alertType="error")
@@ -5989,6 +6147,18 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     await browser.navigate("https://chatgpt.com")
     await asyncio.sleep(3)
 
+    # Early HV check — if Cloudflare Turnstile / CAPTCHA is gating ChatGPT,
+    # resolve it BEFORE running Pro-model selection. Those CUA calls can't
+    # succeed on a blocked page and will burn workspace quota for nothing.
+    # On clear-failure, return None so the pipeline runner emits
+    # pipeline_error + pipeline_stopped via fail_phase(...) downstream.
+    if cua_client:
+        cleared = await check_hv_gate(browser, cua_client, "chatgpt", "ChatGPT",
+                                       phase=1, verbose=verbose)
+        if not cleared:
+            log("Phase 1: HV gate could not be cleared — aborting phase", "ERROR")
+            return None
+
     # Select Pro model via CUA
     if cua_client:
         log("Selecting Pro + Extended Thinking...")
@@ -6703,7 +6873,8 @@ async def detect_session_expiry(page, platform: str, label: str) -> tuple[bool, 
 
 
 async def wait_for_verification_clearance(browser, cua_client, page, platform: str, label: str,
-                                          verbose=False, max_wait_loops: int = 120) -> bool:
+                                          verbose=False, max_wait_loops: int = 120,
+                                          phase: int = 2) -> bool:
     """Handle a human-verification gate on an agent page.
 
     Flow:
@@ -6716,6 +6887,10 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
          means (user solves manually, CUA's click-through lands late, etc.),
          auto-resume.
       3. Return False on stop or skip_agent.
+
+    `phase` parameter routes all emit_event calls to the correct phase tile
+    in the frontend — default 2 for Phase 2 agents, pass 1/3/4/5 when
+    calling from other phase handlers.
     """
     # Detect the specific challenge for banner copy AND to confirm there
     # IS one to solve before bothering CUA.
@@ -6737,7 +6912,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     try:
         log(f"[{label}] Verification detected ({reason or 'unknown'}) — CUA fallback (3 iter, in place)…")
         # Dropdown narration: "trying auto-clear (1/2)…" with a spinning badge.
-        emit_event("pipeline_warning", phase=2, agent=platform_key,
+        emit_event("pipeline_warning", phase=phase, agent=platform_key,
                    message=f"{label} hit a human-verification challenge — trying auto-clear (attempt 1/2)…",
                    details=f"Reason: {reason or 'unknown challenge'}. Running CUA first pass.",
                    alertType="retrying")
@@ -6750,7 +6925,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         if not blocked:
             log(f"[{label}] CUA cleared verification ✓ — proceeding silently")
             # Clear the dropdown badge immediately so the user sees recovery.
-            emit_event("agent_verified", phase=2, agent=platform_key)
+            emit_event("agent_verified", phase=phase, agent=platform_key)
             return True
         _cua_text = (result.get("text") or "")[:120]
         log(f"[{label}] CUA first pass didn't clear ({_cua_text}) — cooldown + reload + retry", "WARN")
@@ -6770,7 +6945,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         # user knows we haven't given up — we're giving Cloudflare's bot-score
         # decay more room before retrying. 3 min is conservative; shorter
         # windows sometimes still got flagged.
-        emit_event("pipeline_warning", phase=2, agent=platform_key,
+        emit_event("pipeline_warning", phase=phase, agent=platform_key,
                    message=f"{label} auto-clear 1 didn't work — cooling down 3 min, then retrying…",
                    details="Cloudflare bot scores decay with time. Giving the session breathing room.",
                    alertType="retrying")
@@ -6788,7 +6963,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         blocked, _ = await detect_human_verification(page, platform, label)
         if blocked:
             log(f"[{label}] Turnstile still present after cooldown — CUA 5-iter retry")
-            emit_event("pipeline_warning", phase=2, agent=platform_key,
+            emit_event("pipeline_warning", phase=phase, agent=platform_key,
                        message=f"{label} still blocked after cooldown — retrying auto-clear (attempt 2/2)…",
                        details="Running CUA second pass with 5 iterations.",
                        alertType="retrying")
@@ -6804,7 +6979,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             # pill / Opus Adaptive + Research tool / Pro Extended Thinking
             # active on the fresh page.
             log(f"[{label}] CUA retry cleared verification ✓ — re-running setup")
-            emit_event("agent_verified", phase=2, agent=platform_key)
+            emit_event("agent_verified", phase=phase, agent=platform_key)
             pl = platform.lower()
             try:
                 if pl == "claude":
@@ -6822,28 +6997,28 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
 
     # ── User manual fallback — pause pipeline, banner with Resume/Skip ──
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
-    emit_event("human_verification_required", phase=2, agent=platform_key,
+    emit_event("human_verification_required", phase=phase, agent=platform_key,
                platform=platform_key,
                platformLabel=platform.capitalize(),
                reason=reason or "Human verification challenge",
                message=f"{platform.capitalize()} is asking for human verification. I tried and couldn't clear it — solve it in the browser and tap Resume, or Skip this agent.")
     _controls.request_pause()
-    emit_event("pipeline_paused", phase=2, reason="human_verification_required", agent=platform_key)
+    emit_event("pipeline_paused", phase=phase, reason="human_verification_required", agent=platform_key)
 
     # Poll every 5s — if the user solves the challenge without tapping Resume,
     # we still notice and auto-continue. Also yields to stop/skip/resume signals.
     for _ in range(max_wait_loops):
         await asyncio.sleep(5)
         if _controls.is_stop():
-            emit_event("pipeline_stopped", phase=2, reason="stopped during human_verification", agent=platform_key)
+            emit_event("pipeline_stopped", phase=phase, reason="stopped during human_verification", agent=platform_key)
             return False
         # User tapped "Skip agent" in the banner → drop this agent cleanly
         if platform_key in _controls.skipped_agents:
             _controls.skipped_agents.discard(platform_key)
             log(f"[{label}] User chose Skip agent during human verification — dropping {platform_key}", "INFO")
-            emit_event("agent_skipped", phase=2, agent=platform_key,
+            emit_event("agent_skipped", phase=phase, agent=platform_key,
                        reason="human_verification_skipped")
-            emit_event("pipeline_resumed", phase=2, reason="skip_agent_during_verification", agent=platform_key)
+            emit_event("pipeline_resumed", phase=phase, reason="skip_agent_during_verification", agent=platform_key)
             _controls.request_resume()
             return False
         if not _controls.is_pause():
@@ -6851,7 +7026,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             blocked, _ = await detect_human_verification(page, platform, label)
             if blocked:
                 log(f"[{label}] Resume tapped but verification still present — re-pausing", "WARN")
-                emit_event("human_verification_required", phase=2, agent=platform_key,
+                emit_event("human_verification_required", phase=phase, agent=platform_key,
                            platform=platform_key,
                            platformLabel=platform.capitalize(),
                            reason=reason or "Human verification challenge",
@@ -6859,18 +7034,53 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                 _controls.request_pause()
                 continue
             log(f"[{label}] Verification cleared ✓")
-            emit_event("pipeline_resumed", phase=2, reason="human_verification_cleared", agent=platform_key)
+            emit_event("pipeline_resumed", phase=phase, reason="human_verification_cleared", agent=platform_key)
             return True
         # Auto-detect clearance even without explicit resume
         blocked, _ = await detect_human_verification(page, platform, label)
         if not blocked:
             log(f"[{label}] Verification auto-cleared ✓")
             _controls.request_resume()
-            emit_event("pipeline_resumed", phase=2, reason="human_verification_cleared", agent=platform_key)
+            emit_event("pipeline_resumed", phase=phase, reason="human_verification_cleared", agent=platform_key)
             return True
 
     log(f"[{label}] Human verification timed out ({max_wait_loops * 5}s) — skipping agent", "WARN")
     return False
+
+
+async def check_hv_gate(browser, cua_client, platform: str, label: str,
+                         phase: int, verbose: bool = False) -> bool:
+    """Early HV (human-verification) gate detection + clearance.
+
+    Call this right after `browser.navigate(url)` in any phase handler. If
+    the landing page is behind a Cloudflare / CAPTCHA / "verify you are
+    human" gate, we resolve it BEFORE spending CUA budget on the phase's
+    actual work (selector clicks, prompt submission, etc.) — those would
+    fail anyway on a blocked page and burn rate-limit / workspace quota.
+
+    Returns True if the gate is clear (either was never there, or we
+    cleared it via CUA / user pause-resume). Returns False if the gate
+    couldn't be cleared — caller should abort the phase cleanly.
+
+    Historically only Phase 2 used this; ports to P1/P3/P4/P5 mirror
+    `start_agent_no_gemini_wait` but scope events to the caller's phase."""
+    try:
+        blocked, reason = await detect_human_verification(browser.page, platform, label)
+    except Exception as e:
+        log(f"[{label}] HV detection errored ({e}) — assuming clear", "WARN")
+        return True
+    if not blocked:
+        return True
+    log(f"[{label}] Phase {phase}: HV gate detected ({reason or 'unknown'}) — clearing before phase work", "WARN")
+    try:
+        return await wait_for_verification_clearance(
+            browser, cua_client, browser.page,
+            platform=platform, label=label,
+            verbose=verbose, phase=phase,
+        )
+    except Exception as e:
+        log(f"[{label}] wait_for_verification_clearance errored: {e}", "WARN")
+        return False
 
 
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
@@ -7392,6 +7602,17 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             page = await browser.new_tab("https://notebooklm.google.com")
             await asyncio.sleep(4)
 
+            # Early HV check — NotebookLM occasionally hits Google's bot gate
+            # on fresh tabs when the session fingerprint looks suspicious.
+            # Clearing first avoids wasted CUA calls on a blocked page.
+            if cua_client:
+                cleared = await check_hv_gate(browser, cua_client, "notebooklm", "NotebookLM",
+                                               phase=3, verbose=verbose)
+                if not cleared:
+                    log("Phase 3: HV gate on NotebookLM could not be cleared — retrying or aborting", "ERROR")
+                    p3_attempt += 1
+                    continue
+
             for i, md_path in enumerate(md_files):
                 log(f"Uploading {md_path.name} ({i+1}/{len(md_files)})...")
                 browser.set_upload_file(str(md_path))
@@ -7538,6 +7759,17 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     if "notebooklm" not in current:
         await browser.navigate(notebook_url)
         await asyncio.sleep(4)
+
+    # Early HV gate check — NotebookLM occasionally sits behind Google's bot
+    # challenge when the session fingerprint drifts. Clearing it upfront
+    # saves us from a cascade of failed CUA clicks that would consume
+    # workspace quota without moving forward.
+    if cua_client:
+        cleared = await check_hv_gate(browser, cua_client, "notebooklm", "NotebookLM",
+                                       phase=4, verbose=verbose)
+        if not cleared:
+            log("Phase 4: HV gate on NotebookLM could not be cleared — aborting audio step", "ERROR")
+            return {"audio_path": None}
 
     # Wrap generation + polling in a retry loop so the user can re-trigger
     # audio generation from scratch if the first attempt times out.
@@ -8037,6 +8269,19 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     log("Uploading to YouTube (unlisted)...")
     page = await browser.new_tab("https://studio.youtube.com")
     await asyncio.sleep(4)
+
+    # Early HV check — YouTube Studio can throw Google's account-challenge
+    # interstitial on fresh tabs, especially after fingerprint drift. CUA
+    # can't fight past that automatically, so pause early for the user.
+    if cua_client:
+        cleared = await check_hv_gate(browser, cua_client, "youtube", "YouTube Studio",
+                                       phase=5, verbose=verbose)
+        if not cleared:
+            log("Phase 5: HV gate on YouTube Studio could not be cleared — aborting upload", "ERROR")
+            emit_event("pipeline_error", phase=5, agent="youtube",
+                       error="youtube_hv_unresolved",
+                       reason="YouTube Studio is showing a human-verification challenge we couldn't clear. Resolve it in the browser and retry.")
+            return {"youtube_url": ""}
 
     # Queue video first, then thumbnail for sequential file dialogs
     browser.set_upload_file(str(video_path))
@@ -9004,7 +9249,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                chars=len(extra_ctx_retry), attempt=_p1_attempt+1)
                 if not p1 or not p1["text"]:
                     log("Phase 1 failed — no brief generated", "ERROR")
-                    emit_event("pipeline_error", phase=1, error="no brief generated")
+                    # Paired pipeline_error + pipeline_stopped so the phase
+                    # tile freezes cleanly and the dropdown surfaces the
+                    # real reason — without this, the tile kept narrating
+                    # pleasant progress after the backend gave up.
+                    fail_phase(
+                        phase=1,
+                        error="no brief generated",
+                        reason="ChatGPT Pro didn't produce a research brief after all retries. Check the ChatGPT session is signed in, then try again.",
+                        agent="chatgpt",
+                    )
                     return
                 brief_text = p1["text"]
                 brief_url = p1.get("url", "")
@@ -9693,10 +9947,29 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         log("Interrupted — progress saved to checkpoint", "WARN")
         raise
     except Exception as e:
-        log(f"Fatal: {e}", "ERROR")
-        emit_event("pipeline_error", error=str(e))
+        # Uncaught exception anywhere in the pipeline — surface it with
+        # whatever phase context we have so the frontend can route the
+        # error to the correct phase tile instead of silently dropping it.
         import traceback
+        tb = traceback.format_exc()
+        log(f"Fatal: {e}", "ERROR")
         traceback.print_exc()
+        # _runtime.phase is the most-recently-entered phase — use it as
+        # the routing hint so the error lands on the right phase tile
+        # instead of defaulting to 0 and polluting the P0 dropdown.
+        last_phase = 0
+        try:
+            rp = getattr(_runtime, "phase", None)
+            if isinstance(rp, int):
+                last_phase = rp
+        except Exception:
+            pass
+        fail_phase(
+            phase=last_phase,
+            error=str(e)[:200] or "unexpected failure",
+            reason="The pipeline hit an unexpected error. Details saved to backend.log and tracks/events.jsonl.",
+            agent=None,
+        )
     finally:
         # New pause semantics: browser is closed by pause_and_close_browser when pause fires.
         # Here we just ensure cleanup on stop/complete/error — don't double-close if already closed.
