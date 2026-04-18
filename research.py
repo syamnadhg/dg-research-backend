@@ -5956,11 +5956,10 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     _, reason = await detect_human_verification(page, platform, label)
     platform_key = platform.lower()
 
-    # ── Tier 1: CUA auto-attempt in place (3 iterations max — fast fail) ──
-    # Many verification gates — especially Cloudflare Turnstile — are just a
-    # single "I am human" checkbox. CUA can click it and the page clears.
-    # This keeps us silent in the common case. Only if CUA can't solve do we
-    # escalate to Tier 2 (cooldown + reload) or Tier 3 (ask user).
+    # ── CUA fallback — first pass (in place, 3 iterations) ──
+    # Most Turnstile gates are a single "I am human" checkbox that CUA can
+    # click. This keeps us silent in the common case. Only if it can't do we
+    # cool down + reload and try once more, or (last) ask the user.
     sys_prompt = (
         "You are looking at a human-verification challenge (Cloudflare, CAPTCHA, or similar) "
         "that is blocking access to an AI agent. If you can see a simple checkbox or button labeled "
@@ -5970,7 +5969,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     )
     user_prompt = "Click the single human-verification checkbox if one is visible. Otherwise stop and say 'blocked'."
     try:
-        log(f"[{label}] Verification detected ({reason or 'unknown'}) — Tier 1 CUA in place (3 iter)…")
+        log(f"[{label}] Verification detected ({reason or 'unknown'}) — CUA fallback (3 iter, in place)…")
         await browser.switch_to_page(page)
         result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
             model=CUA_MODEL, max_iterations=3, verbose=verbose)
@@ -5978,22 +5977,22 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         await asyncio.sleep(3)
         blocked, _ = await detect_human_verification(page, platform, label)
         if not blocked:
-            log(f"[{label}] Tier 1 cleared verification ✓ — proceeding silently")
+            log(f"[{label}] CUA cleared verification ✓ — proceeding silently")
             return True
         _cua_text = (result.get("text") or "")[:120]
-        log(f"[{label}] Tier 1 CUA couldn't clear ({_cua_text}) — trying Tier 2", "WARN")
+        log(f"[{label}] CUA first pass didn't clear ({_cua_text}) — cooldown + reload + retry", "WARN")
     except Exception as e:
-        log(f"[{label}] Tier 1 CUA errored: {e} — trying Tier 2", "WARN")
+        log(f"[{label}] CUA first pass errored: {e} — cooldown + reload + retry", "WARN")
 
-    # ── Tier 2: Cooldown + reload + fresh CUA attempt ──
+    # ── CUA fallback — second pass (cooldown + reload, 5 iterations) ──
     # Cloudflare's bot-score heuristic partially decays with time, and a clean
     # page navigation (blank → original URL) re-runs the stealth init script
     # against a fresh document, which often defuses a recently-flagged session.
-    # If Turnstile still fires, CUA gets more iterations (5) because this is
-    # our last auto-resort before bothering the user.
+    # If Turnstile still fires, CUA gets more iterations this time around
+    # since it's our last auto-resort before bothering the user.
     try:
         original_url = page.url
-        log(f"[{label}] Tier 2: blank page → 45s cooldown → reload → CUA (5 iter)…")
+        log(f"[{label}] CUA fallback retry: blank → 45s cooldown → reload → CUA (5 iter)…")
         try:
             await page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
         except Exception:
@@ -6003,11 +6002,11 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             await page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(4)
         except Exception as e:
-            log(f"[{label}] Tier 2 reload failed: {e} — falling through to user", "WARN")
+            log(f"[{label}] Reload failed: {e} — escalating to user", "WARN")
 
         blocked, _ = await detect_human_verification(page, platform, label)
         if blocked:
-            log(f"[{label}] Tier 2: Turnstile still present after cooldown — CUA 5-iter retry")
+            log(f"[{label}] Turnstile still present after cooldown — CUA 5-iter retry")
             await browser.switch_to_page(page)
             await agent_loop(cua_client, browser, sys_prompt, user_prompt,
                 model=CUA_MODEL, max_iterations=5, verbose=verbose)
@@ -6019,7 +6018,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             # caller's subsequent paste/send logic still finds Deep Research
             # pill / Opus Adaptive + Research tool / Pro Extended Thinking
             # active on the fresh page.
-            log(f"[{label}] Tier 2 cleared verification ✓ — re-running setup")
+            log(f"[{label}] CUA retry cleared verification ✓ — re-running setup")
             pl = platform.lower()
             try:
                 if pl == "claude":
@@ -6029,13 +6028,13 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                 elif pl == "chatgpt":
                     await setup_chatgpt_dr(page)
             except Exception as e:
-                log(f"[{label}] Tier 2 setup re-run warning: {e}", "WARN")
+                log(f"[{label}] Post-clear setup re-run warning: {e}", "WARN")
             return True
-        log(f"[{label}] Tier 2 CUA still blocked — escalating to user", "WARN")
+        log(f"[{label}] CUA retry still blocked — escalating to user", "WARN")
     except Exception as e:
-        log(f"[{label}] Tier 2 errored: {e} — escalating to user", "WARN")
+        log(f"[{label}] CUA retry errored: {e} — escalating to user", "WARN")
 
-    # ── Tier 3: Pause pipeline and ask user to solve manually ──
+    # ── User manual fallback — pause pipeline, banner with Resume/Skip ──
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
     emit_event("human_verification_required", phase=2, agent=platform_key,
                platform=platform_key,
