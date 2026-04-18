@@ -466,11 +466,34 @@ def generate_device_id():
     return new_id
 
 
+def _detect_indestructible() -> bool:
+    """Probe Windows Task Scheduler for the SuperResearchBackend task. The
+    scheduled task is the actual source of truth for indestructible mode —
+    the device doc is just a Firestore mirror that can drift (e.g., after
+    unlink deletes the doc but the task lives on). Returns False on
+    non-Windows platforms or when schtasks isn't available."""
+    import platform as _platform
+    if _platform.system() != "Windows":
+        return False
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            ["schtasks", "/Query", "/TN", _INDESTRUCTIBLE_TASK_NAME],
+            capture_output=True,
+            timeout=5,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW — avoid flashing console
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def write_device_doc(uid: str, token: str, device_name: str | None = None):
     """Upsert users/{uid}/devices/{deviceId}. Preserves user-editable `name`
-    and `indestructible` fields from any prior doc. Call once from --setup
-    after pairing succeeds, and again from --serve startup to refresh
-    token + heartbeat if the token changed."""
+    from any prior doc and auto-detects `indestructible` from the real
+    scheduled task (so unlink+relink doesn't lose the toggle). Call once
+    from --setup after pairing succeeds, and again from --serve startup to
+    refresh token + heartbeat if the token changed."""
     if not _firebase_db or not uid or not token:
         return
     import socket as _socket
@@ -497,6 +520,11 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
         "os": os_str,
         "token": token,
         "lastHeartbeat": SERVER_TIMESTAMP,
+        # Auto-detect indestructible from the scheduled task so the toggle
+        # survives unlink+relink (task isn't uninstalled by unlink). If
+        # schtasks says "installed", we overwrite whatever was in the doc;
+        # the task is the truth.
+        "indestructible": _detect_indestructible(),
     }
     # First-write-only fields. User rename flows through the Account page,
     # so we must not clobber it on subsequent setup or heartbeat writes.
