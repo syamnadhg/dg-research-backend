@@ -3492,13 +3492,29 @@ class Browser:
             ],
             ignore_default_args=["--enable-automation"],
         )
+        # Stealth init script — runs on every document load BEFORE any page
+        # JS. Hides the automation signals Cloudflare / Anthropic read to
+        # decide whether to fire Turnstile. Without this, `navigator.webdriver`
+        # is `true` on every page and Claude's anti-bot flags us even though
+        # we already passed `--disable-blink-features=AutomationControlled` +
+        # `ignore_default_args=["--enable-automation"]` at launch time.
+        #
+        # Just a `webdriver` override lands most of the win; plugins + languages
+        # lookalikes close the remaining fingerprint gaps without being so
+        # heavy-handed that we risk breaking legitimate pages.
+        await self.context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = window.chrome || { runtime: {} };
+        """)
         if self.context.pages:
             self.page = self.context.pages[0]
         else:
             self.page = await self.context.new_page()
         self.context.on("page", self._attach_file_handler)
         self._attach_file_handler(self.page)
-        log("Browser started")
+        log("Browser started (stealth: webdriver/plugins/languages/chrome shims applied)")
 
     def _attach_file_handler(self, page):
         page.on("filechooser", self._on_file_chooser)
@@ -5940,35 +5956,86 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     _, reason = await detect_human_verification(page, platform, label)
     platform_key = platform.lower()
 
-    # ── CUA auto-attempt (3 iterations max — fast fail) ──
+    # ── Tier 1: CUA auto-attempt in place (3 iterations max — fast fail) ──
     # Many verification gates — especially Cloudflare Turnstile — are just a
     # single "I am human" checkbox. CUA can click it and the page clears.
     # This keeps us silent in the common case. Only if CUA can't solve do we
-    # bother the user with a chat banner.
+    # escalate to Tier 2 (cooldown + reload) or Tier 3 (ask user).
+    sys_prompt = (
+        "You are looking at a human-verification challenge (Cloudflare, CAPTCHA, or similar) "
+        "that is blocking access to an AI agent. If you can see a simple checkbox or button labeled "
+        "something like 'I am human', 'Verify', 'Continue', or 'Not a robot' — click it once. "
+        "Do NOT try to solve image-selection puzzles or anything requiring complex reasoning. "
+        "If there's nothing simple to click, STOP immediately and respond with the word 'blocked'."
+    )
+    user_prompt = "Click the single human-verification checkbox if one is visible. Otherwise stop and say 'blocked'."
     try:
-        log(f"[{label}] Verification detected ({reason or 'unknown'}) — CUA auto-attempt (3 iter max)…")
+        log(f"[{label}] Verification detected ({reason or 'unknown'}) — Tier 1 CUA in place (3 iter)…")
         await browser.switch_to_page(page)
-        sys_prompt = (
-            "You are looking at a human-verification challenge (Cloudflare, CAPTCHA, or similar) "
-            "that is blocking access to an AI agent. If you can see a simple checkbox or button labeled "
-            "something like 'I am human', 'Verify', 'Continue', or 'Not a robot' — click it once. "
-            "Do NOT try to solve image-selection puzzles or anything requiring complex reasoning. "
-            "If there's nothing simple to click, STOP immediately and respond with the word 'blocked'."
-        )
-        user_prompt = "Click the single human-verification checkbox if one is visible. Otherwise stop and say 'blocked'."
         result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
             model=CUA_MODEL, max_iterations=3, verbose=verbose)
         # Give the page a moment to re-render after a successful click
         await asyncio.sleep(3)
         blocked, _ = await detect_human_verification(page, platform, label)
         if not blocked:
-            log(f"[{label}] CUA cleared verification ✓ — proceeding silently")
+            log(f"[{label}] Tier 1 cleared verification ✓ — proceeding silently")
             return True
         _cua_text = (result.get("text") or "")[:120]
-        log(f"[{label}] CUA couldn't clear verification ({_cua_text}) — asking user", "WARN")
+        log(f"[{label}] Tier 1 CUA couldn't clear ({_cua_text}) — trying Tier 2", "WARN")
     except Exception as e:
-        log(f"[{label}] CUA auto-attempt errored: {e} — falling back to user prompt", "WARN")
+        log(f"[{label}] Tier 1 CUA errored: {e} — trying Tier 2", "WARN")
 
+    # ── Tier 2: Cooldown + reload + fresh CUA attempt ──
+    # Cloudflare's bot-score heuristic partially decays with time, and a clean
+    # page navigation (blank → original URL) re-runs the stealth init script
+    # against a fresh document, which often defuses a recently-flagged session.
+    # If Turnstile still fires, CUA gets more iterations (5) because this is
+    # our last auto-resort before bothering the user.
+    try:
+        original_url = page.url
+        log(f"[{label}] Tier 2: blank page → 45s cooldown → reload → CUA (5 iter)…")
+        try:
+            await page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        await asyncio.sleep(45)
+        try:
+            await page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(4)
+        except Exception as e:
+            log(f"[{label}] Tier 2 reload failed: {e} — falling through to user", "WARN")
+
+        blocked, _ = await detect_human_verification(page, platform, label)
+        if blocked:
+            log(f"[{label}] Tier 2: Turnstile still present after cooldown — CUA 5-iter retry")
+            await browser.switch_to_page(page)
+            await agent_loop(cua_client, browser, sys_prompt, user_prompt,
+                model=CUA_MODEL, max_iterations=5, verbose=verbose)
+            await asyncio.sleep(3)
+            blocked, _ = await detect_human_verification(page, platform, label)
+
+        if not blocked:
+            # Page just reloaded — re-run platform-specific setup so the
+            # caller's subsequent paste/send logic still finds Deep Research
+            # pill / Opus Adaptive + Research tool / Pro Extended Thinking
+            # active on the fresh page.
+            log(f"[{label}] Tier 2 cleared verification ✓ — re-running setup")
+            pl = platform.lower()
+            try:
+                if pl == "claude":
+                    await setup_claude_dr(page)
+                elif pl == "gemini":
+                    await setup_gemini_dr(page)
+                elif pl == "chatgpt":
+                    await setup_chatgpt_dr(page)
+            except Exception as e:
+                log(f"[{label}] Tier 2 setup re-run warning: {e}", "WARN")
+            return True
+        log(f"[{label}] Tier 2 CUA still blocked — escalating to user", "WARN")
+    except Exception as e:
+        log(f"[{label}] Tier 2 errored: {e} — escalating to user", "WARN")
+
+    # ── Tier 3: Pause pipeline and ask user to solve manually ──
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
     emit_event("human_verification_required", phase=2, agent=platform_key,
                platform=platform_key,
