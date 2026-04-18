@@ -5,6 +5,8 @@ Automates multi-agent deep research across 6 platforms using Claude Computer Use
 ## Quick Start
 
 ```bash
+# 0. You need a Firebase Admin key file. See "Firebase Admin Key" below.
+
 # 1. Install
 git clone <repo-url>
 cd research-automate
@@ -13,11 +15,30 @@ pip install -r requirements.txt
 # 2. Setup (one-time: mints ResearchToken, renders QR, waits for logins)
 python research.py --setup
 
-# 3. Start the server (keep running in a separate terminal)
+# 3. Start the server (keep it running)
 python research.py --serve
+
+# 3a. (Optional, recommended) Survive reboots + crashes.
+python research.py --resurrect
 ```
 
-That's it. Three commands to a running backend.
+That's it. Four commands to a hands-off always-on backend.
+
+## Firebase Admin Key (required) — `firebase-service-account.json`
+
+The backend needs a Firebase Admin SDK key to read the queue, write heartbeats, and stream events. **This file is NOT committed to git and never will be.**
+
+**How to get it:** Sammy (sammy.guli@distributedglobal.com) will email you the JSON file directly. One file per person.
+
+**Where it goes (exact path):**
+
+```
+research-automate/firebase-service-account.json
+```
+
+That's it — same directory as `research.py`. The `.gitignore` is pre-configured so you can never accidentally commit it. If Python can't find the file, `--setup` / `--serve` will fail loudly with a clear path in the error.
+
+> **Coming in the next update:** a proper pairing-time token exchange so new users self-onboard without the admin key at all. Until then, email flow stays.
 
 ## Setup Details
 
@@ -111,19 +132,35 @@ python research.py --serve
 ```
 
 The server runs on port 8000 with:
-- A heartbeat that tells the web app this backend is online (updates `research_tokens/{token}.lastHeartbeat` every 30s)
-- A Firestore listener for queued jobs, commands (stop/pause/resume/config/add_context/agent_decision)
-- A local HTTP API for fallback control (when Firestore isn't reachable)
+- A **30s heartbeat** → updates `research_tokens/{token}.lastHeartbeat` AND the paired `users/{uid}/devices/{deviceId}.lastHeartbeat` so the app's Account page and sidebar device switcher both show the right online/offline dot.
+- A **token-doc watcher** for sub-second relink: if you unlink this device from the app and paste the token back, the device tile reappears in well under a second instead of waiting up to 30s for the next heartbeat to self-heal it.
+- A **Firestore queue listener** — picks up jobs from `research_tokens/{token}/queue/`. Single-worker per backend: if you fire a second topic on the same PC while the first is running, the second lands in an explicit `queued` state (with a chat banner + Cancel button in the app) until the first finishes.
+- A **command listener** for stop / pause / resume / config / add_context / agent_decision.
+- A **local HTTP API** on `http://localhost:8000` for the CLI + any direct calls.
 
-Keep `--serve` running in a separate terminal while you use the app. If the server stops, the web app's 60-second watchdog detects it, marks running tiles as stopped, and prevents a reload from resurrecting the pipeline.
+Keep `--serve` running while you use the app. If the server stops, the web app's 60s watchdog detects it, marks running tiles as stopped, and prevents a reload from resurrecting the pipeline.
+
+### Step 5a (optional, recommended): Make it indestructible
+
+```bash
+python research.py --resurrect
+```
+
+Registers a Windows Scheduled Task that runs a **daemon-loop wrapper** — a tiny supervisor process that (re-)starts `--serve` whenever it exits for any reason: crash, stop button, logout, reboot, etc. The task is set to ONLOGON + AT STARTUP with unlimited duration, so the backend is effectively always-on while the PC is powered.
+
+The Account page's **Indestructible** toggle reflects the real scheduled task state (`schtasks /Query`), so the toggle survives unlink+relink. Turn it off from the same page if you ever want to stop auto-restart.
 
 ### Step 6: Fire a research topic in the app
 
 Open Super Research (the web app) → type a topic → backend picks it up from Firestore → pipeline runs here. If the app says "No backend connected" there's a Connect bubble with a Scan QR button that links in seconds.
 
-## Multiple Users
+## Multiple Devices (same user)
 
-Multiple people can use the same backend. Share your PipeToken with them — they paste it in their own Account settings. Each user's research is scoped to their own account; the backend just processes the queue.
+One account can pair multiple PCs. Each `--setup` on a new machine registers its own `users/{uid}/devices/{deviceId}` doc. The app's sidebar gets a device switcher (with online/offline dots) and every research is stamped with the device it ran on — so jobs you fire from the app route back to the specific PC that was **active** when you hit Start. If you fire two jobs on the same device while one is running, the second queues; if you fire one on a different device, both run in parallel.
+
+## Multiple Users (same backend)
+
+Multiple people can also share one backend. Share your ResearchToken — they paste it in their own Account settings. Per-user scoping happens via Firestore security rules; the backend just drains the shared queue.
 
 ## Pipeline Phases
 

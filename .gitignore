@@ -6,8 +6,23 @@ __pycache__/
 dist/
 build/
 .env
+
+# Firebase Admin SDK key — NEVER commit. Sammy emails this personally.
+# Drop it at: research-automate/firebase-service-account.json
 firebase-service-account.json
+
+# Per-machine local state — backend writes these on --setup / --serve.
 pipe_config.json
+research_config.json
+device_config.json
 run_analytics.json
+backend.log
+backend.err.log
+
+# Playwright user data (logged-in browser sessions) stays local.
+.playwright-profile/
+playwright-profile/
+
+# Pipeline output — not source.
 queues/
 tracks/
