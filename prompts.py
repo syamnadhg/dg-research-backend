@@ -15,18 +15,7 @@ SYSTEM_BASE = (
 
 PROMPT_SELECT_PRO = SYSTEM_BASE + """
 
-Your task: Select ChatGPT Pro mode with Extended Thinking BEFORE submitting any message.
-
-Steps:
-1. Look at the current screen. You should see ChatGPT loaded.
-2. Start a new conversation if one is already open.
-3. Look for the model selector dropdown (usually at the top).
-4. Click on it and select "Pro" or "o1 pro" option.
-5. If there's an "Extended thinking" toggle, enable it.
-6. Take a screenshot to confirm Pro mode is selected.
-7. Say "Pro mode selected" when done.
-
-IMPORTANT: Do this BEFORE typing any message. Just select the model."""
+Task: Select ChatGPT Pro (or "o1 pro") in the model selector. If an Extended Thinking toggle is visible, enable it. Do NOT type a message. When Pro is confirmed selected, say "Pro mode selected"."""
 
 PROMPT_SUBMIT_FALLBACK = SYSTEM_BASE + """
 
@@ -126,28 +115,15 @@ Once model + Research mode are set and input is focused, your job is DONE. No ex
 
 PROMPT_VALIDATE_CHATGPT_SETUP = SYSTEM_BASE + """
 
-Your task: Verify ChatGPT is correctly configured for Deep Research, and fix it if not.
+Task: Verify ChatGPT is ready for Deep Research. Do NOT type, paste, or send anything.
 
-Check visually (screenshot):
-1. Is "Deep Research" mode ACTIVE? Look for a "Deep research" pill/badge/label near the composer, or the deep-research indicator.
-2. Is the input area focused / ready for pasting?
+Check the screenshot:
+1. "Deep research" pill/badge visible and highlighted near the composer.
+2. Input area focused and ready for paste.
 
-If Deep Research is ACTIVE + input is focused:
-  → Say "setup verified" and STOP immediately.
-
-If Deep Research is NOT active:
-  → Click the "+" / tools menu, find "Deep research" and click to enable it.
-  → Click the input area to focus.
-  → Say "setup fixed" and STOP.
-
-If you cannot enable Deep Research:
-  → Say "setup failed: <specific reason>" and STOP.
-
-ABSOLUTELY FORBIDDEN:
-- DO NOT type any text.
-- DO NOT paste any text.
-- DO NOT send any message.
-- DO NOT compose prompts."""
+If both true: say "setup verified" and STOP.
+If Deep research is off: open the "+" / tools menu, click "Deep research", click the input to focus, then say "setup fixed" and STOP.
+If Deep research is unavailable or blocked: say "setup failed: <describe exactly what you see>" and STOP."""
 
 
 PROMPT_VALIDATE_GEMINI_SETUP = SYSTEM_BASE + """
@@ -222,42 +198,32 @@ CRITICAL RULES:
 
 PROMPT_DIAGNOSE = SYSTEM_BASE + """
 
-Your task: Answer these YES/NO questions about what you see on screen.
+Task: Decide the generation state by checking the bottom of the chat — composer area and end of the AI response. Ignore the top of the page.
 
-FIRST: Focus on the BOTTOM of the chat — the area near the composer/input box and the END of the AI's response. Stop buttons and loading indicators live there, NOT at the top. If the page seems to show middle content, the report may still be generating at the bottom out of view.
+Run these three checks in order and stop at the first that matches.
 
-Questions:
-1. Is there a STOP button visible anywhere on the page?
-   - YES = a SQUARE icon (like ⬛ solid square), OR a button with visible text "Stop generating" / "Stop" / "Cancel".
-   - NO = anything else.
-   CRITICAL — the following are NOT stop buttons, answer NO for these:
-     • Audio/microphone icons (mic symbol 🎤)
-     • Voice-input equalizer/waveform animations — vertical bars like ||| or |l|l| with varying heights. These indicate voice input mode, NOT generation.
-     • Volume meters, sound-wave indicators, VU meters
-     • Send arrow / paper-plane icons
-     • Model selector buttons / dropdowns
-     • Attach / plus "+" buttons
-   In Claude specifically, the composer at the bottom often shows a small animated audio/waveform icon even when idle — this is VOICE INPUT UI and has nothing to do with whether Claude is still generating.
-2. Is there a loading/spinning/pulsing animation near the AI response (a true "thinking" spinner or progress bar), OR explicit "Researching..." / "Thinking..." / "Generating..." / "..." text visible? — YES or NO?
-3. Is there a completed AI response visible with a clear FINAL paragraph (not cut off, no trailing cursor)? — YES or NO?
-4. Is there a "Start research" button that needs clicking? — YES or NO?
-5. Is there any error message or popup? — YES or NO?
+CHECK 1 — Is there a real STOP button?
+  Real stop button = solid square icon (⬛), OR a button reading exactly "Stop", "Stop generating", or "Cancel" next to the response.
+  NOT a stop button: microphone icons, audio/voice equalizer bars (vertical bars of varying height), VU meters, Send arrow, model selector, attach/+ button. Claude's composer shows a small animated waveform even when idle — that is voice input, not generation.
+  If a real stop button exists → GENERATING.
 
-CLAUDE-SPECIFIC completion hint: when Claude's Research tool finishes, a RESEARCH ARTIFACT appears (often in a right-side panel OR as an inline artifact card in the conversation). If you see a fully-rendered artifact/document card with a title and content, research is done.
+CHECK 2 — Is there an active progress indicator near the response?
+  Counts: spinning ring, pulsing dot, progress bar, or literal text "Thinking…", "Researching…", "Generating…", typing cursor at the end of the last paragraph.
+  If any of those is visible → GENERATING.
 
-DECISION RULES (strict):
-- If Q1=YES or Q2=YES → still generating. A visible stop button OVERRIDES any appearance of completeness, BUT remember an audio equalizer is NOT a stop button (Q1=NO for that).
-- If Q1=NO and Q2=NO and Q3=YES → response complete.
-- If Q4=YES → needs click.
-- If none of the above clearly apply → still generating (safer default).
+CHECK 3 — Is the response complete?
+  Counts: final paragraph is present, no trailing ellipsis/cursor, no "continue generating" prompt. For Claude specifically, a fully-rendered Research artifact (right-side panel or inline card with title + body) means complete.
+  If complete → DONE.
 
-MANDATORY OUTPUT FORMAT — the LAST line of your response must be exactly ONE of:
+OTHER: If a "Start research" button is visible and must be clicked → NEEDS_CLICK. If an error banner or blocking popup is visible → ERROR. Otherwise default to GENERATING.
+
+MANDATORY OUTPUT — the LAST line of your response must be exactly one of:
 CONCLUSION: GENERATING
 CONCLUSION: DONE
 CONCLUSION: NEEDS_CLICK
 CONCLUSION: ERROR
 
-Do not add any other text after this line. Do not wrap it in quotes. No punctuation after DONE/GENERATING/NEEDS_CLICK/ERROR. This structured line is parsed programmatically — your answer is ignored if this line is missing or malformed."""
+No quotes, no trailing punctuation. This line is parsed programmatically."""
 
 PROMPT_FIX_ISSUE = SYSTEM_BASE + """
 
@@ -287,20 +253,13 @@ IMPORTANT: The document card is BELOW the user's message in the chat. Scroll dow
 
 PROMPT_COPY_ARTIFACT_CLAUDE = SYSTEM_BASE + """
 
-Your task: Open and copy the Claude research document.
+Task: Open and copy the Claude research document.
 
-Steps:
-1. If there's a "Claude Code" tab open, close it (click X on that tab).
-2. Scroll DOWN in the chat (left panel) to find document buttons/cards with the document title.
-3. CRITICAL — pick the correct artifact:
-   - If TWO document buttons/cards are visible, click the SECOND (bottom) one — the first may be a thinking trace, plan, or intermediate artifact. The final research report is the SECOND/LAST one.
-   - If only ONE document exists, click it.
-   - If THREE or more, click the LAST (bottom-most) one.
-4. The document opens in the right panel. Look for a "Copy" button at the top of the artifact panel. Click it.
-5. If no Copy button, click inside the document text in the right panel, press Ctrl+A (select all), then Ctrl+C (copy).
-6. Say "copied" when done.
-
-IMPORTANT: Always prefer the LAST/BOTTOM-most artifact — that's the final research output. Earlier artifacts are often drafts or thinking traces."""
+1. Close the "Claude Code" tab if open.
+2. Scroll the chat (left panel) to the BOTTOM. Always click the LAST (bottom-most) artifact card — earlier ones are thinking traces or drafts.
+3. The document opens in the right panel. Click the "Copy" button at the top of the artifact panel.
+4. If no Copy button, click inside the document text, press Ctrl+A, then Ctrl+C.
+5. Say "copied" when done."""
 
 PROMPT_COPY_RESPONSE = SYSTEM_BASE + """
 
@@ -426,49 +385,20 @@ Download the generated audio overview.
 
 PROMPT_YOUTUBE_UPLOAD = SYSTEM_BASE + """
 
-Your task: Upload a video to YouTube Studio as UNLISTED + "Not made for kids", and SAVE/PUBLISH it.
+Task: Upload a video to YouTube Studio as UNLISTED + "Not made for kids" and save it. End state: a https://youtu.be/... link reported in your response.
 
-Steps:
-1. Click "Create" button (camera icon with + at top right).
-2. Click "Upload videos".
-3. Click the upload area or "SELECT FILES" — the file dialog is auto-handled.
-4. Wait for the video to start processing (progress bar + details form appear).
+Flow (4-page dialog):
+1. Click "Create" (top right) → "Upload videos" → click the upload area. File dialogs are auto-handled.
+2. DETAILS page — set Title, set Description, click "Upload thumbnail" (auto-handled), scroll to Audience and select "No, it's not made for kids". Click NEXT.
+3. VIDEO ELEMENTS page — click NEXT (handle any required items first).
+4. CHECKS page — click NEXT (resolve any blockers first).
+5. VISIBILITY page — select "Unlisted" (not Public, not Private). Click the blue SAVE/PUBLISH at the bottom-right.
 
-DETAILS PAGE (step 1 of 4):
-5. Set the TITLE to the provided title text.
-6. Set the DESCRIPTION to the provided description text.
-7. Scroll down to find "Upload thumbnail" — click it to upload the custom thumbnail image. The file dialog is auto-handled.
-8. Continue scrolling down to the "Audience" section. YOU MUST select the radio button: "No, it's not made for kids". Verify the dot appears in that radio option before continuing.
-9. Click "NEXT".
+After save, the confirmation dialog shows a https://youtu.be/XXXXXXXXXXX link. Copy the real URL and reply exactly: "uploaded: <real url>".
 
-TIP: To scroll inside the dialog, click on the content area first, then use Page Down key or the mouse wheel.
+Non-negotiable: "No, it's not made for kids" + "Unlisted" + SAVE clicked. Never stop before Save. Never report the studio.youtube.com URL — always the short youtu.be URL from the confirmation.
 
-VIDEO ELEMENTS PAGE (step 2 of 4):
-10. If there are any required items, handle them. Otherwise click "NEXT".
-
-CHECKS PAGE (step 3 of 4):
-11. If there are any issues/warnings, resolve them. Otherwise click "NEXT".
-
-VISIBILITY PAGE (step 4 of 4):
-12. YOU MUST select the radio button "Unlisted" (NOT "Public", NOT "Private"). Verify the dot appears in "Unlisted" before continuing.
-13. CRITICAL — YOU MUST CLICK the blue "SAVE" or "Publish" button (bottom-right of the dialog).
-    - Do NOT stop without clicking Save/Publish.
-    - Wait 2-3 seconds for the confirmation dialog to appear.
-
-AFTER SAVE — EXTRACT THE VIDEO LINK:
-14. A confirmation dialog appears showing "Video published" (or "Video processing") with a video link.
-15. The link looks like: https://youtu.be/XXXXXXXXXXX
-16. Click the "COPY" button next to the link if available.
-17. Read the EXACT video URL and include it in your response.
-18. Say "uploaded: https://youtu.be/XXXXXXXXXXX" with the REAL URL.
-
-CRITICAL RULES:
-- You MUST select "No, it's not made for kids" on the Details page.
-- You MUST select "Unlisted" on the Visibility page.
-- You MUST click SAVE/PUBLISH — do not stop before saving.
-- You MUST report the actual youtu.be/xxx link, NOT the studio.youtube.com URL.
-- File dialog is auto-handled (video first, then thumbnail).
-- If you cannot find the Save button, scroll down or look at the bottom-right of the dialog."""
+To scroll inside the dialog: click the content area, then Page Down or mouse wheel."""
 
 # ── Phase 6: Google Doc + Email ───────────────────────────────────────────────
 
