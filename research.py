@@ -6362,24 +6362,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         log(f"[Claude] Hard-fail: {int(elapsed/60)}m elapsed with only "
                             f"{_art_count} artifact(s) — final document missing", "ERROR")
                         agent_key_hf = "claude"
+                        # agent_link_failed → AgentLinkFailedBanner with
+                        # Retry · Skip. pipeline_warning lands on a phase-
+                        # level surface the user won't notice.
                         try:
-                            emit_event("pipeline_warning", phase=2, agent=agent_key_hf,
-                                       message=f"Claude produced only {_art_count} artifact — the final document is missing",
-                                       details=("Claude research mode produces 2 artifacts: references, then "
-                                                f"the report. Only {_art_count} arrived. Retry asks Claude to "
-                                                "finish the document. Wait extends the budget by 15 min. "
-                                                "Skip drops Claude and proceeds with the other agents."),
-                                       alertType="warn",
-                                       actions=[
-                                           {"id": "retry", "label": "Retry", "style": "primary",
-                                            "command": {"action": "retry_agent", "agent": agent_key_hf}},
-                                           {"id": "wait", "label": "Wait", "style": "default",
-                                            "command": {"action": "wait_longer_agent", "agent": agent_key_hf}},
-                                           {"id": "skip", "label": "Skip", "style": "default",
-                                            "command": {"action": "skip_agent", "agent": agent_key_hf}},
-                                       ])
+                            emit_event("agent_link_failed", phase=2, agent=agent_key_hf,
+                                       attempts=1,
+                                       lastError=f"Claude produced only {_art_count} artifact — final document missing")
                         except Exception:
                             pass
+                        p.setdefault("hf_timeouts", 0)
                         decision = await _controls.await_agent_decision(agent_key_hf, timeout=300.0)
                         log(f"[Claude] 2-artifact hard-fail decision: {decision}")
                         if decision == "stop":
@@ -6387,6 +6379,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         if decision == "skip":
                             continue
                         if decision == "retry":
+                            p["hf_timeouts"] = 0
                             followup = (
                                 "Your research is incomplete — the final comprehensive report artifact is missing. "
                                 "Please produce the complete research document artifact now — include every section, "
@@ -6404,7 +6397,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             p.pop("_cached_text", None)
                             p["empty_retries"] = 0
                             continue
-                        # wait_longer / timeout → extend budget, keep polling
+                        # wait_longer / timeout → extend budget ONCE; after the
+                        # 2nd unanswered timeout, auto-skip instead of looping
+                        # hard-fails forever.
+                        p["hf_timeouts"] += 1
+                        if p["hf_timeouts"] >= 2:
+                            log(f"[Claude] 2-artifact hard-fail timed out {p['hf_timeouts']}× "
+                                f"without a user decision — auto-skipping agent", "WARN")
+                            _controls.skipped_agents.add(agent_key_hf)
+                            continue
                         p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
                         p["done_count"] = 0
                         p["cua_confirmed"] = False
@@ -6562,39 +6563,43 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if has_content and not link_verified and agent_key_lc in ("gemini", "claude"):
                     log(f"[{name}] Public share extraction failed after all retries — "
                         f"hard-fail (no private fallback for {name})", "ERROR")
+                    # Emit agent_link_failed so the frontend renders the per-agent
+                    # AgentLinkFailedBanner with Retry · Skip buttons (Phase 2 B1
+                    # gate). pipeline_warning lands on a different surface and
+                    # was silently ignored by the user in E2E #3.
                     try:
-                        emit_event("pipeline_warning", phase=2, agent=agent_key_lc,
-                                   message=f"{name}: public share link could not be created",
-                                   details=(f"{name} requires a PUBLIC share link — private conversation "
-                                            "URLs are not accepted. Retry re-attempts the share flow. "
-                                            "Skip drops this agent and proceeds with the others."),
-                                   alertType="warn",
-                                   actions=[
-                                       {"id": "retry", "label": "Retry", "style": "primary",
-                                        "command": {"action": "retry_agent", "agent": agent_key_lc}},
-                                       {"id": "skip", "label": "Skip", "style": "default",
-                                        "command": {"action": "skip_agent", "agent": agent_key_lc}},
-                                   ])
+                        emit_event("agent_link_failed", phase=2, agent=agent_key_lc,
+                                   attempts=3,
+                                   lastError=f"{name} requires a public share link — private URL rejected")
                     except Exception:
                         pass
+                    # Track how many times this hard-fail has timed out without a
+                    # user decision. After 2 timeouts, auto-skip so the loop
+                    # doesn't keep firing hard-fails indefinitely.
+                    p.setdefault("hf_timeouts", 0)
                     hf_decision = await _controls.await_agent_decision(agent_key_lc, timeout=300.0)
                     log(f"[{name}] Public-share hard-fail decision: {hf_decision}")
                     if hf_decision == "stop":
                         break
                     if hf_decision == "skip":
-                        # skipped_agents handler will finalize on the next tick
                         continue
                     if hf_decision == "retry":
-                        # Wipe caches + reset so the next tick retries the
-                        # share flow from scratch.
+                        p["hf_timeouts"] = 0
                         p["link_retries"] = 0
                         p.pop("_cached_text", None)
                         p["done_count"] = 0
                         p["cua_confirmed"] = False
                         p["last_cua_check"] = time.time() + 30
                         continue
-                    # wait_longer / timeout → extend budget, keep polling.
-                    # User's intent: don't silently accept a private URL.
+                    # wait_longer / timeout → extend budget ONCE; on the second
+                    # unanswered timeout, auto-skip so the pipeline advances
+                    # instead of looping hard-fails forever.
+                    p["hf_timeouts"] += 1
+                    if p["hf_timeouts"] >= 2:
+                        log(f"[{name}] Hard-fail timed out {p['hf_timeouts']}× "
+                            f"without a user decision — auto-skipping agent", "WARN")
+                        _controls.skipped_agents.add(agent_key_lc)
+                        continue
                     p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
                     p["link_retries"] = 0
                     p.pop("_cached_text", None)
