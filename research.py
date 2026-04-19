@@ -11664,6 +11664,72 @@ async def run_setup(profile_dir, wait_minutes=10):
 _INDESTRUCTIBLE_TASK_NAME = "SuperResearchBackend"
 
 
+def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
+    """Return [(pid, cmdline, role), ...] for every python.exe whose
+    command line references this script. role ∈ {'daemon-loop', 'serve',
+    'other'}. Single source of truth for --resurrect (what's running
+    before I spawn?) and --exorcise (what do I need to kill?).
+
+    Matches on "research.py" substring so subprocess invocations launched
+    from different cwd styles (absolute, relative, with/without quotes)
+    all get caught. Safe on non-Windows — returns [] when wmic is absent."""
+    try:
+        ps = subprocess.run(
+            ["wmic", "process", "where", "name='python.exe'",
+             "get", "processid,commandline", "/format:list"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return []
+    entries: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+    for line in (ps.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            if cur:
+                entries.append(cur); cur = {}
+            continue
+        if "=" in line:
+            k, _, v = line.partition("=")
+            cur[k.strip()] = v.strip()
+    if cur:
+        entries.append(cur)
+    results: list[tuple[int, str, str]] = []
+    for e in entries:
+        cmdline = e.get("CommandLine", "")
+        if "research.py" not in cmdline:
+            continue
+        try:
+            pid = int(e.get("ProcessId", ""))
+        except ValueError:
+            continue
+        if "--daemon-loop" in cmdline:
+            role = "daemon-loop"
+        elif "--serve" in cmdline:
+            role = "serve"
+        else:
+            role = "other"
+        results.append((pid, cmdline, role))
+    return results
+
+
+def _kill_pids(pids: list[int]) -> int:
+    """taskkill /F each PID. Returns count that successfully terminated.
+    Silent on individual failures — caller can re-enumerate to confirm."""
+    killed = 0
+    for pid in pids:
+        try:
+            r = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                killed += 1
+        except Exception:
+            pass
+    return killed
+
+
 def run_daemon_loop(port: int = 8000):
     """Wrapper that keeps `--serve` alive. The scheduled task installed by
     --resurrect invokes this instead of --serve directly so that the
@@ -11814,58 +11880,28 @@ def run_resurrect():
 
     # ── Activate the supervisor NOW, not at next logon ─────────────────
     # Without this, --resurrect only schedules the task and leaves the
-    # backend on whatever the user had before (plain --serve, nothing,
-    # etc.). Active indestructible mode needs --daemon-loop running so
-    # --serve is supervised. Three steps: (a) detect an already-running
-    # daemon-loop (re-run of --resurrect = no-op on this half), (b)
-    # taskkill any plain --serve so port 8000 is free for the supervised
-    # child, (c) spawn --daemon-loop DETACHED so it outlives this call.
-    daemon_already_running = False
-    plain_serve_pids: list[int] = []
-    try:
-        ps = _subprocess.run(
-            ["wmic", "process", "where", "name='python.exe'",
-             "get", "processid,commandline", "/format:list"],
-            capture_output=True, text=True, timeout=15,
-        )
-        entries: list[dict[str, str]] = []
-        cur: dict[str, str] = {}
-        for line in (ps.stdout or "").splitlines():
-            line = line.strip()
-            if not line:
-                if cur:
-                    entries.append(cur); cur = {}
-                continue
-            if "=" in line:
-                k, _, v = line.partition("=")
-                cur[k.strip()] = v.strip()
-        if cur:
-            entries.append(cur)
-        for e in entries:
-            cmdline = e.get("CommandLine", "")
-            try:
-                pid = int(e.get("ProcessId", ""))
-            except ValueError:
-                continue
-            if "--daemon-loop" in cmdline:
-                daemon_already_running = True
-            elif "--serve" in cmdline:
-                plain_serve_pids.append(pid)
-    except Exception:
-        pass
+    # backend on whatever the user had before. Active indestructible mode
+    # needs --daemon-loop running so --serve is supervised. Steps:
+    #   (a) detect an already-running daemon-loop (re-run = no-op),
+    #   (b) taskkill any plain --serve so port 8000 is free for the
+    #       supervised child,
+    #   (c) spawn --daemon-loop DETACHED + CREATE_NEW_PROCESS_GROUP so
+    #       it outlives this call and doesn't inherit our console,
+    #   (d) verify the spawn actually worked by re-polling until the
+    #       daemon-loop PID appears (so we don't print "started" for
+    #       a child that crashed on import).
+    import time as _time
+    procs = _enumerate_research_py_procs()
+    daemon_pid = next((pid for pid, _c, role in procs if role == "daemon-loop"), None)
+    plain_serve_pids = [pid for pid, _c, role in procs if role == "serve"]
 
-    if daemon_already_running:
-        print(f"  {_c(_OK, '[ok]')} Supervisor already running — nothing to spawn")
+    if daemon_pid is not None:
+        print(f"  {_c(_OK, '[ok]')} Supervisor already running (PID {daemon_pid}) — nothing to spawn")
     else:
-        for pid in plain_serve_pids:
-            try:
-                _subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                                capture_output=True, text=True, timeout=10)
-            except Exception:
-                pass
         if plain_serve_pids:
-            plural = "s" if len(plain_serve_pids) != 1 else ""
-            print(f"  {_c(_OK, '[ok]')} Stopped {len(plain_serve_pids)} standalone --serve process{plural} to free port 8000")
+            killed = _kill_pids(plain_serve_pids)
+            plural = "es" if killed != 1 else ""
+            print(f"  {_c(_OK, '[ok]')} Stopped {killed} standalone --serve process{plural} to free port 8000")
         _DETACHED = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
         _NEWGROUP = getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         try:
@@ -11877,10 +11913,25 @@ def run_resurrect():
                 stdin=_subprocess.DEVNULL,
                 close_fds=True,
             )
-            print(f"  {_c(_OK, '[ok]')} Supervisor started (--daemon-loop, detached)")
         except Exception as e:
-            print(f"  {_c(_WARN, 'Could not start supervisor now:')} {e}")
+            print(f"  {_c(_WARN, 'Could not spawn supervisor:')} {e}")
             print(f"  {_c(_DIM, 'The scheduled task still fires at next logon.')}")
+        else:
+            spawned_pid = None
+            deadline = _time.time() + 5.0
+            while _time.time() < deadline:
+                _time.sleep(0.5)
+                for pid, _c, role in _enumerate_research_py_procs():
+                    if role == "daemon-loop":
+                        spawned_pid = pid
+                        break
+                if spawned_pid is not None:
+                    break
+            if spawned_pid is not None:
+                print(f"  {_c(_OK, '[ok]')} Supervisor started (PID {spawned_pid}, detached)")
+            else:
+                print(f"  {_c(_WARN, 'Supervisor did not appear within 5s — check backend.err.log.')}")
+                print(f"  {_c(_DIM, 'The scheduled task still fires at next logon as a fallback.')}")
     print()
 
     print(f"  {_c(_DIM, 'From now on, a daemon wrapper supervises `--serve` — relaunching')}")
@@ -11895,15 +11946,21 @@ def run_exorcise():
     """Remove the Indestructible setup — completely. Idempotent: succeeds
     whether or not the task/loop exists.
 
-    Three-step nuke (2026-04-18):
-      1. Delete the Windows Scheduled Task so `--daemon-loop` won't
+    Full-reset semantics (2026-04-19): after --exorcise the system is
+    back to "nothing related to research.py is running". If a pipeline
+    was in-flight under the supervised --serve, it aborts — that's the
+    deliberate cost of a clean undo. Re-run --serve yourself to bring
+    the backend back, or --resurrect to re-enable supervision.
+
+    Four-step reset:
+      1. Delete the Windows Scheduled Task so --daemon-loop won't
          auto-start at next logon.
-      2. Terminate any currently-running `--daemon-loop` processes so
-         the user doesn't have to wait for a reboot to stop the
-         supervisor. The `--serve` child is intentionally LEFT alive so
-         the current pipeline can finish — the user manages it manually
-         from then on.
-      3. Flip the Firestore indestructible flag to false."""
+      2. Kill every running --daemon-loop AND every --serve process,
+         looping for up to 8s so a mid-enumeration respawn (daemon-loop
+         spawns --serve every ~5s between deaths) still gets caught.
+      3. Flip the Firestore indestructible flag to false.
+      4. Verify the final state — if anything survived, warn the user
+         with PIDs so they can nuke from Task Manager."""
     import subprocess as _subprocess
     import platform as _platform
 
@@ -11947,69 +12004,62 @@ def run_exorcise():
             for line in result.stderr.strip().splitlines():
                 print(f"     {line}")
 
-    # ── Step 2: kill any running --daemon-loop processes ──
-    # Without this, the user has to wait for a reboot (or find the PID
-    # themselves) for the supervisor to stop respawning --serve. WMIC
-    # lookup — matches by command line, never by bare name (so we don't
-    # touch unrelated python.exe processes). --serve is deliberately
-    # spared so an in-flight pipeline isn't yanked; once the user stops
-    # --serve themselves, nothing auto-restarts it.
+    # ── Step 2: kill supervisor AND supervised --serve, loop until clean ──
+    # The daemon-loop respawns --serve every ~5s between deaths, so a
+    # single-shot enumerate+kill misses any --serve that happened to be
+    # respawning at the wrong moment. Loop for up to 8s, re-enumerating
+    # each tick. Always kill daemon-loop first so it can't respawn a
+    # freshly-killed --serve. `self_pid` is excluded in case --exorcise
+    # was itself launched through the supervisor.
+    import time as _time
     self_pid = os.getpid()
-    killed = 0
-    try:
-        ps = _subprocess.run(
-            ["wmic", "process", "where",
-             "name='python.exe'", "get", "processid,commandline", "/format:list"],
-            capture_output=True, text=True, timeout=15,
-        )
-        raw = ps.stdout or ""
-        # WMIC /format:list prints blocks of "Key=Value" pairs.
-        entries: list[dict[str, str]] = []
-        cur: dict[str, str] = {}
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                if cur:
-                    entries.append(cur)
-                    cur = {}
-                continue
-            if "=" in line:
-                k, _, v = line.partition("=")
-                cur[k.strip()] = v.strip()
-        if cur:
-            entries.append(cur)
-        for e in entries:
-            cmdline = e.get("CommandLine", "")
-            pid_str = e.get("ProcessId", "")
-            if "--daemon-loop" not in cmdline:
-                continue
-            try:
-                pid = int(pid_str)
-            except ValueError:
-                continue
-            if pid == self_pid:
-                continue  # Don't kill ourselves if --exorcise was launched via the loop
-            try:
-                _subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                                capture_output=True, text=True, timeout=10)
-                killed += 1
-            except Exception as e:
-                print(f"  {_c(_WARN, f'Failed to kill PID {pid}:')} {e}")
-    except Exception as e:
-        print(f"  {_c(_WARN, 'Could not enumerate daemon-loop processes:')} {e}")
+    killed_daemon_total = 0
+    killed_serve_total = 0
+    deadline = _time.time() + 8.0
+    last_survivors: list[tuple[int, str, str]] = []
+    while True:
+        procs = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
+        daemon_pids = [pid for pid, _c, role in procs if role == "daemon-loop"]
+        serve_pids = [pid for pid, _c, role in procs if role == "serve"]
+        if not daemon_pids and not serve_pids:
+            last_survivors = procs  # only 'other' left, which we don't touch
+            break
+        killed_daemon_total += _kill_pids(daemon_pids)
+        killed_serve_total += _kill_pids(serve_pids)
+        if _time.time() >= deadline:
+            last_survivors = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
+            break
+        _time.sleep(0.5)
 
-    if killed:
-        print(f"  {_c(_OK, '[ok]')} Stopped {killed} running daemon-loop process{'es' if killed != 1 else ''}")
+    if killed_daemon_total:
+        plural = "es" if killed_daemon_total != 1 else ""
+        print(f"  {_c(_OK, '[ok]')} Stopped {killed_daemon_total} daemon-loop process{plural}")
     else:
-        print(f"  {_c(_DIM, 'No running daemon-loop processes to stop.')}")
+        print(f"  {_c(_DIM, 'No daemon-loop processes were running.')}")
+    if killed_serve_total:
+        plural = "s" if killed_serve_total != 1 else ""
+        print(f"  {_c(_OK, '[ok]')} Stopped {killed_serve_total} --serve process{plural}")
+    else:
+        print(f"  {_c(_DIM, 'No --serve processes were running.')}")
 
     # ── Step 3: sync the Firestore flag ──
     _write_indestructible_flag(False)
     print(f"  {_c(_OK, '[ok]')} Synced to the Super Research app")
+
+    # ── Step 4: final-state verification ──
+    stragglers = [(pid, role) for pid, _c, role in last_survivors if role in ("daemon-loop", "serve")]
     print()
-    print(f"  {_c(_DIM, 'The backend no longer auto-starts at logon and no supervisor is')}")
-    print(f"  {_c(_DIM, 'running. Any current --serve keeps going until it dies; then')}")
-    print(f"  {_c(_DIM, 'run')} {_c(_BOLD, 'python research.py --serve')} {_c(_DIM, 'manually to bring it back.')}")
+    if stragglers:
+        print(f"  {_c(_WARN, 'Warning:')} {len(stragglers)} related process(es) would not terminate:")
+        for pid, role in stragglers:
+            print(f"     {_c(_BOLD, f'PID {pid}')}  ({role})")
+        print(f"  {_c(_DIM, 'Kill them from Task Manager or re-run --exorcise.')}")
+    else:
+        print(f"  {_c(_OK, 'Clean reset — no research.py processes running.')}")
+    print()
+    print(f"  {_c(_DIM, 'Indestructible mode is off. The backend does not auto-start at')}")
+    print(f"  {_c(_DIM, 'logon. To bring it back manually:')} {_c(_BOLD, 'python research.py --serve')}")
+    print(f"  {_c(_DIM, 'To re-enable supervision:')} {_c(_BOLD, 'python research.py --resurrect')}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
