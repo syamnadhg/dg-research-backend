@@ -20,9 +20,13 @@ python research.py --serve
 
 # 3a. (Optional, recommended) Survive reboots + crashes.
 python research.py --resurrect
+
+# 3b. (Undo 3a) Clean full-reset — kills supervisor + serve, removes
+#     the Scheduled Task, syncs the Firestore flag.
+python research.py --exorcise
 ```
 
-That's it. Four commands to a hands-off always-on backend.
+That's it. Four commands to a hands-off always-on backend — plus `--exorcise` when you need a clean teardown.
 
 ## Firebase Admin Key (required) — `firebase-service-account.json`
 
@@ -151,6 +155,23 @@ python research.py --resurrect
 Registers a Windows Scheduled Task that runs a **daemon-loop wrapper** — a tiny supervisor process that (re-)starts `--serve` whenever it exits for any reason: crash, stop button, logout, reboot, etc. The task is set to ONLOGON + AT STARTUP with unlimited duration, so the backend is effectively always-on while the PC is powered.
 
 The Account page's **Indestructible** toggle reflects the real scheduled task state (`schtasks /Query`), so the toggle survives unlink+relink. Turn it off from the same page if you ever want to stop auto-restart.
+
+### Step 5b (undo Step 5a): `--exorcise`
+
+```bash
+python research.py --exorcise
+```
+
+The opposite of `--resurrect` — a clean full-reset of everything indestructible. Four-step:
+
+1. **Deletes the Windows Scheduled Task** so `--daemon-loop` won't auto-start at next logon / reboot.
+2. **Kills every running `--daemon-loop` AND `--serve` process**, looping for up to 8s so a mid-enumeration respawn still gets caught (the supervisor respawns `--serve` every ~5s between deaths, so a single-shot kill misses any `--serve` that happened to be respawning at the wrong moment).
+3. **Flips the Firestore `indestructible` flag to `false`** so the Account toggle matches reality instantly.
+4. **Final-state verification** — if anything survived, prints the surviving PIDs so you can nuke them from Task Manager (or re-run `--exorcise`).
+
+Idempotent: works whether or not the task/loop was installed. After `--exorcise` the system is back to "nothing research.py-related is running" — any in-flight pipeline under the supervised `--serve` aborts (the deliberate cost of a clean undo). To bring the backend back, re-run `--serve` yourself; to re-enable supervision, run `--resurrect` again.
+
+Turning off the **Indestructible** toggle in the app → Account page runs the same teardown remotely.
 
 ### Step 6: Fire a research topic in the app
 
