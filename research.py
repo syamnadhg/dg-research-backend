@@ -12580,8 +12580,8 @@ def run_resurrect():
     _setup_step(4, 4, "Handoff")
     import time as _time
     procs = _enumerate_research_py_procs()
-    daemon_pid = next((pid for pid, _c, role in procs if role == "daemon-loop"), None)
-    plain_serve_pids = [pid for pid, _c, role in procs if role == "serve"]
+    daemon_pid = next((pid for pid, _cmd, role in procs if role == "daemon-loop"), None)
+    plain_serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
 
     if daemon_pid is not None:
         print(f"  {_c(_OK, '[ok]')}  Supervisor already running (PID {daemon_pid}) — nothing to spawn")
@@ -12609,7 +12609,7 @@ def run_resurrect():
             deadline = _time.time() + 5.0
             while _time.time() < deadline:
                 _time.sleep(0.5)
-                for pid, _c, role in _enumerate_research_py_procs():
+                for pid, _cmd, role in _enumerate_research_py_procs():
                     if role == "daemon-loop":
                         spawned_pid = pid
                         break
@@ -12705,8 +12705,8 @@ def run_exorcise():
     last_survivors: list[tuple[int, str, str]] = []
     while True:
         procs = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
-        daemon_pids = [pid for pid, _c, role in procs if role == "daemon-loop"]
-        serve_pids = [pid for pid, _c, role in procs if role == "serve"]
+        daemon_pids = [pid for pid, _cmd, role in procs if role == "daemon-loop"]
+        serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
         if not daemon_pids and not serve_pids:
             last_survivors = procs  # only 'other' left, which we don't touch
             break
@@ -12736,7 +12736,7 @@ def run_exorcise():
     _write_indestructible_flag(False)
     print(f"  {_c(_OK, '[ok]')}  Synced to the Super Research app")
 
-    stragglers = [(pid, role) for pid, _c, role in last_survivors if role in ("daemon-loop", "serve")]
+    stragglers = [(pid, role) for pid, _cmd, role in last_survivors if role in ("daemon-loop", "serve")]
     print()
     if stragglers:
         print(f"  {_c(_WARN, '[--]')}  {len(stragglers)} related process(es) would not terminate:")
