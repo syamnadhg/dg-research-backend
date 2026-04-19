@@ -23,6 +23,9 @@ backend.err.log
 .playwright-profile/
 playwright-profile/
 
-# Pipeline output — not source.
-queues/
-tracks/
+# Pipeline output — not source. Keep the README in each dir so the
+# schemas for queues/*/ and tracks/*/ stay discoverable in the repo.
+queues/*
+!queues/README.md
+tracks/*
+!tracks/README.md
