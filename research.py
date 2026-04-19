@@ -36,7 +36,7 @@ if sys.platform == "win32":
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-PROFILE_DIR = Path.home() / ".openclaw" / "browser-profile"
+PROFILE_DIR = Path.home() / ".super-research" / "browser-profile"
 BETA_FLAG = "computer-use-2025-11-24"
 # All configurable via env vars (defaults are production-tuned)
 CUA_MODEL = os.environ.get("CUA_MODEL", "claude-opus-4-7")
@@ -4080,22 +4080,37 @@ class Browser:
         # shares a singleton process broker with the user's personal Chrome
         # (26+ processes). The new instance delegates to the running Chrome and
         # exits, killing the automation browser. Bundled Chromium is independent.
-        # User-Agent override: Playwright's bundled Chromium reports a UA
-        # that includes "HeadlessChrome" on some builds and lags the stable
-        # Chrome version on others. Cloudflare / ChatGPT scores that as a
-        # bot signal on its own — overriding to a current-stable Chrome UA
-        # on Windows is the single highest-impact stealth change (closes
-        # the UA vs. UACH mismatch that triggers Turnstile). Keep the major
-        # close to the bundled Chromium version so UA+UACH stay consistent.
+        # User-Agent + UACH override (STEALTH-2026-04-18): Playwright's
+        # bundled Chromium reports a UA that includes "HeadlessChrome" on
+        # some builds and lags the stable Chrome version on others.
+        # Cloudflare / ChatGPT / Claude treat an old UA as a bot signal,
+        # and — worse — if the UA-string major doesn't match the auto-
+        # emitted User-Agent Client Hints (sec-ch-ua), Cloudflare scores
+        # that mismatch as certain-bot and no amount of manual "I am
+        # human" clicking clears the session.
+        #
+        # Fix: bump both UA and UACH together so they agree on Chrome
+        # major 141. Keep within a few majors of Playwright's bundled
+        # Chromium so WebGL / JS feature-detection doesn't drift either.
+        _CHROME_MAJOR = "141"
         real_chrome_ua = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            f"(KHTML, like Gecko) Chrome/{_CHROME_MAJOR}.0.0.0 Safari/537.36"
         )
+        # sec-ch-ua ordering matters less than version consistency. The
+        # "Not A;Brand" brand is Chrome's GREASE randomizer — spec-legal,
+        # and omitting it looks just as bot-y as a stale UA.
+        uach_headers = {
+            "sec-ch-ua": f'"Google Chrome";v="{_CHROME_MAJOR}", "Not?A_Brand";v="24", "Chromium";v="{_CHROME_MAJOR}"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        }
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self.profile_dir,
             headless=self.headless,
             viewport={"width": API_WIDTH, "height": API_HEIGHT},
             user_agent=real_chrome_ua,
+            extra_http_headers=uach_headers,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
