@@ -11683,11 +11683,29 @@ def run_daemon_loop(port: int = 8000):
 
     script_path = str(Path(__file__).resolve())
     python_exe = _sys.executable
+    # When --resurrect spawns daemon-loop detached (DETACHED_PROCESS), this
+    # wrapper runs with no console. A naked `subprocess.run` on python.exe
+    # (a console app) then forces Windows to ALLOCATE A NEW CONSOLE for
+    # every --serve spawn — and every restart pops another visible terminal
+    # window. CREATE_NO_WINDOW suppresses that allocation, and redirecting
+    # stdio to the log files keeps uvicorn's output tailable without a
+    # window ever appearing.
+    _NO_WINDOW = getattr(_subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    _log_dir = Path(script_path).parent
+    _serve_log = _log_dir / "backend.log"
+    _serve_err = _log_dir / "backend.err.log"
     restarts = 0
     while True:
         try:
             log(f"[daemon-loop] Starting --serve (restart #{restarts})")
-            result = _subprocess.run([python_exe, script_path, "--serve", "--port", str(port)])
+            with open(_serve_log, "ab") as _out, open(_serve_err, "ab") as _err:
+                result = _subprocess.run(
+                    [python_exe, script_path, "--serve", "--port", str(port)],
+                    stdin=_subprocess.DEVNULL,
+                    stdout=_out,
+                    stderr=_err,
+                    creationflags=_NO_WINDOW,
+                )
             log(f"[daemon-loop] --serve exited with code {result.returncode}")
         except KeyboardInterrupt:
             log("[daemon-loop] Interrupted — exiting wrapper")
