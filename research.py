@@ -4073,117 +4073,51 @@ class Browser:
             except Exception:
                 pass
 
-        from playwright.async_api import async_playwright
-        self.playwright = await async_playwright().start()
-        # Use Playwright's BUNDLED Chromium — NOT the system Chrome.
-        # channel="chrome" reuses the installed Chrome binary which on Windows
-        # shares a singleton process broker with the user's personal Chrome
-        # (26+ processes). The new instance delegates to the running Chrome and
-        # exits, killing the automation browser. Bundled Chromium is independent.
-        # User-Agent + UACH override (STEALTH-2026-04-18): Playwright's
-        # bundled Chromium reports a UA that includes "HeadlessChrome" on
-        # some builds and lags the stable Chrome version on others.
-        # Cloudflare / ChatGPT / Claude treat an old UA as a bot signal,
-        # and — worse — if the UA-string major doesn't match the auto-
-        # emitted User-Agent Client Hints (sec-ch-ua), Cloudflare scores
-        # that mismatch as certain-bot and no amount of manual "I am
-        # human" clicking clears the session.
+        # STEALTH-2026-04-19: Escalated from playwright + UA/UACH spoof to
+        # patchright + real Chrome binary. Prior stack (playwright's bundled
+        # Chromium, manual UA/UACH overrides, --disable-blink-features, init
+        # scripts) still got blocked by ChatGPT and Claude login — bot-score
+        # too high even with all the shims. patchright is a drop-in async
+        # replacement that patches the deeper CDP / runtime.enable / chrome
+        # object / headless-mode detection vectors internally, and pairs
+        # with channel="chrome" to run the user's installed Chrome binary
+        # instead of the bundled Chromium.
         #
-        # Fix: bump both UA and UACH together so they agree on Chrome
-        # major 141. Keep within a few majors of Playwright's bundled
-        # Chromium so WebGL / JS feature-detection doesn't drift either.
-        _CHROME_MAJOR = "141"
-        real_chrome_ua = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{_CHROME_MAJOR}.0.0.0 Safari/537.36"
-        )
-        # sec-ch-ua ordering matters less than version consistency. The
-        # "Not A;Brand" brand is Chrome's GREASE randomizer — spec-legal,
-        # and omitting it looks just as bot-y as a stale UA.
-        uach_headers = {
-            "sec-ch-ua": f'"Google Chrome";v="{_CHROME_MAJOR}", "Not?A_Brand";v="24", "Chromium";v="{_CHROME_MAJOR}"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        }
+        # channel="chrome" was previously avoided because we feared the
+        # Windows singleton broker would delegate to the user's personal
+        # Chrome and exit. That only happens when sharing a user-data-dir;
+        # we now use a DEDICATED profile at ~/.super-research/browser-profile
+        # so Chrome launches a separate process independent of the user's
+        # daily browsing instance.
+        #
+        # Per patchright docs, we MUST NOT set user_agent, extra_http_headers,
+        # or automation-disabling args — patchright handles those internally,
+        # and adding them back produces inconsistencies that detection
+        # scripts flag. Keep the init_script below as a belt-and-suspenders
+        # layer; it's additive and patchright tolerates it.
+        from patchright.async_api import async_playwright
+        self.playwright = await async_playwright().start()
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self.profile_dir,
+            channel="chrome",
             headless=self.headless,
             viewport={"width": API_WIDTH, "height": API_HEIGHT},
-            user_agent=real_chrome_ua,
-            extra_http_headers=uach_headers,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-                # Disable Chrome's "automation-controlled" infobar (visible
-                # to page scripts through window.outerHeight delta) — the
-                # existing --disable-blink-features flag covers the JS API
-                # but this flag hides the infobar itself.
-                "--disable-infobars",
-                # Prevent a suspicious permissions-API fingerprint where
-                # notifications query returns "denied" instantly (headless
-                # quirk). Sites compare that against the shim below.
-                "--disable-features=IsolateOrigins,site-per-process",
-            ],
-            ignore_default_args=["--enable-automation"],
+            no_viewport=False,
         )
-        # Stealth init script — runs on every document load BEFORE any page
-        # JS. Hides the automation signals Cloudflare / Anthropic read to
-        # decide whether to fire Turnstile. This is the layered defense
-        # alongside the UA override + launch flags above.
-        #
-        # Coverage:
-        #  - navigator.webdriver      (primary automation tell)
-        #  - navigator.plugins        (empty array is a headless signal)
-        #  - navigator.languages      (empty or ["en-US"] mismatch)
-        #  - navigator.vendor         (must be "Google Inc." on Chrome)
-        #  - navigator.platform       (match UA: "Win32")
-        #  - navigator.hardwareConcurrency (0 is suspicious; real machines 4-16)
-        #  - navigator.deviceMemory   (undefined is suspicious; 8 is safe)
-        #  - window.chrome.runtime    (missing = headless; presence = real)
-        #  - permissions.query shim   (notifications "denied" instantly = bot)
-        #  - WebGL vendor + renderer  (SwiftShader = headless tell)
-        #  - window.outerWidth/Height (viewport mismatch = automation)
-        await self.context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-            window.chrome = window.chrome || {};
-            window.chrome.runtime = window.chrome.runtime || {};
-            // Permissions API: real Chrome returns 'prompt' for notifications
-            // on fresh sessions; headless returns 'denied' instantly. Shim so
-            // the query matches real browser behavior.
-            const _origQuery = window.navigator.permissions && window.navigator.permissions.query;
-            if (_origQuery) {
-                window.navigator.permissions.query = (p) => (
-                    p && p.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission || 'prompt' })
-                        : _origQuery.call(window.navigator.permissions, p)
-                );
-            }
-            // WebGL: headless reports "SwiftShader" / "ANGLE" giveaways.
-            // Override the vendor/renderer strings on getParameter to look
-            // like real integrated Intel graphics (common on Windows laptops).
-            try {
-                const getParameter = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function(p) {
-                    if (p === 37445) return 'Intel Inc.';
-                    if (p === 37446) return 'Intel Iris OpenGL Engine';
-                    return getParameter.call(this, p);
-                };
-            } catch (e) {}
-        """)
+        # patchright owns the stealth layer from here. The prior hand-rolled
+        # add_init_script (webdriver/plugins/languages/vendor/platform/
+        # hardwareConcurrency/deviceMemory/chrome.runtime/permissions/WebGL)
+        # ran AFTER patchright's own patches and overwrote them with values
+        # that don't match what real Chrome actually exposes, producing
+        # fingerprints worse than either layer alone. Keep the file-chooser
+        # wiring; that's unrelated to stealth.
         if self.context.pages:
             self.page = self.context.pages[0]
         else:
             self.page = await self.context.new_page()
         self.context.on("page", self._attach_file_handler)
         self._attach_file_handler(self.page)
-        log("Browser started (stealth: webdriver/plugins/languages/chrome shims applied)")
+        log("Browser started (stealth: patchright + channel=chrome)")
 
     def _attach_file_handler(self, page):
         page.on("filechooser", self._on_file_chooser)
