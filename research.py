@@ -54,25 +54,105 @@ MAX_WAIT_DEEP = int(os.environ.get("MAX_WAIT_DEEP", "90"))       # minutes — P
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def _read_user_scope_env(name: str) -> str:
+    """Read a Windows User-scope env var via PowerShell. Empty string
+    on non-Windows or failure. Persistent across shells — settable via
+    the Account page sync (preferred) or PowerShell
+    SetEnvironmentVariable(..., 'User')."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"[System.Environment]::GetEnvironmentVariable('{name}','User')"],
+            capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
 def get_env(name):
+    """os.environ first, User-scope Windows env as fallback. Keeps the
+    legacy contract for callers that just want 'whatever env has this
+    name'. See resolve_api_key for CUA key resolution order, which is
+    deliberately reversed."""
     val = os.environ.get(name, "")
     if not val:
-        try:
-            r = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-Command",
-                 f"[System.Environment]::GetEnvironmentVariable('{name}','User')"],
-                capture_output=True, text=True, timeout=5)
-            val = r.stdout.strip()
-        except Exception:
-            pass
+        val = _read_user_scope_env(name)
     return val
 
 
+def _read_firestore_api_keys() -> dict:
+    """Best-effort read of users/{paired_uid}/settings/prefs → apiKeys.
+    Returns dict of {gemini, anthropic, deepgram} strings (any subset),
+    or empty dict if unpaired / Firestore unreachable / uid unknown.
+
+    This is the Account page sync: the user sets keys in the web app,
+    they land in Firestore, and the backend picks them up on startup
+    without needing a shell env or PowerShell setup. Read-only and
+    silent on failure — env fallback still works."""
+    try:
+        uid = load_paired_uid()
+        if not uid:
+            return {}
+        if _firebase_db is None:
+            # Firestore not initialized yet (e.g. startup path that
+            # hasn't called initialize_firebase_admin). Skip quietly.
+            return {}
+        snap = _firebase_db.collection("users").document(uid) \
+            .collection("settings").document("prefs").get()
+        if not snap.exists:
+            return {}
+        data = snap.to_dict() or {}
+        keys = data.get("apiKeys") or {}
+        # Strip + filter empty values so callers can treat any present
+        # key as authoritative.
+        return {k: str(v).strip() for k, v in keys.items() if v and str(v).strip()}
+    except Exception as e:
+        log(f"[_read_firestore_api_keys] read failed (non-fatal): {e}", "WARN")
+        return {}
+
+
 def resolve_api_key(cli_key=None):
-    if cli_key: return cli_key
+    """Resolve the CUA / Anthropic API key. Priority (highest first):
+        1. --api-key CLI argument
+        2. Firestore apiKeys.anthropic (from the web app's Account page)
+        3. Windows User-scope CUA_API_KEY
+        4. Windows User-scope ANTHROPIC_API_KEY
+        5. os.environ CUA_API_KEY  (shell / .bashrc)
+        6. os.environ ANTHROPIC_API_KEY
+
+    Rationale: the user's intentional settings — CLI arg, web app, or
+    PowerShell SetEnvironmentVariable 'User' — should always win over a
+    stale shell profile that may have cached an old key. This prevents
+    the 'I set a new key in PowerShell but the backend keeps using the
+    old one from .bashrc' trap.
+
+    Logs which source was chosen so mismatches are debuggable."""
+    if cli_key:
+        log(f"[resolve_api_key] using --api-key CLI argument", "INFO")
+        return cli_key
+    # 2. Firestore Account page key
+    fs_keys = _read_firestore_api_keys()
+    if fs_keys.get("anthropic"):
+        log(f"[resolve_api_key] using apiKeys.anthropic from Firestore (Account page)", "INFO")
+        return fs_keys["anthropic"]
+    # 3 + 4. User-scope env (persistent)
     for var in ("CUA_API_KEY", "ANTHROPIC_API_KEY"):
-        key = get_env(var)
-        if key: return key
+        key = _read_user_scope_env(var)
+        if key:
+            shell_val = os.environ.get(var, "")
+            if shell_val and shell_val != key:
+                log(f"[resolve_api_key] {var}: Windows User-scope wins over shell env (shell had a stale value)", "INFO")
+            else:
+                log(f"[resolve_api_key] using {var} from Windows User-scope", "INFO")
+            return key
+    # 5 + 6. os.environ (shell-inherited)
+    for var in ("CUA_API_KEY", "ANTHROPIC_API_KEY"):
+        key = os.environ.get(var, "").strip()
+        if key:
+            log(f"[resolve_api_key] using {var} from shell env (no User-scope / Firestore key)", "INFO")
+            return key
     return None
 
 
