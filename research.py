@@ -4724,7 +4724,13 @@ async def agent_loop(client, browser, system_prompt, user_message,
                     emit_event("pipeline_error", phase=_phase, agent=_agent,
                                error="claude_api_cap",
                                reason="Claude API hit the workspace usage cap. Raise it in the Anthropic Console or wait until the reset date, then retry.",
-                               details=err[:200])
+                               details=err[:200],
+                               actions=[
+                                   {"id": "retry", "label": "Retry", "style": "primary",
+                                    "command": {"action": "retry_phase", "phase": _phase}},
+                                   {"id": "skip", "label": "Skip phase", "style": "default",
+                                    "command": {"action": "skip_phase", "phase": _phase}},
+                               ])
                 except Exception:
                     pass
                 return {"status": "error", "text": str(e)}
@@ -5223,6 +5229,20 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     "If a Stop button is visible anywhere, say 'still generating'. "
                     "Only say 'response complete' if there is NO stop button AND the final paragraph of the response is visible.",
                     model=CUA_MODEL, max_iterations=3, verbose=verbose)
+                # CRITICAL: A structural CUA failure (workspace cap, 401, 529,
+                # etc.) returns {"status": "error", "text": str(exception)}.
+                # Previously that error text fell through the heuristic parse
+                # below and hit the "assume complete" default, silently
+                # advancing the phase on a dead CUA call. Now: skip CUA this
+                # tick, trust the DOM check on the next poll. The underlying
+                # Anthropic error has already been surfaced to the frontend
+                # via pipeline_error by agent_loop's own error handler.
+                if diag.get("status") == "error":
+                    log(f"[{label}] CUA diagnostic unavailable ({(diag.get('text') or '')[:80]}) — "
+                        f"falling back to DOM for this poll tick", "WARN")
+                    cua_checked = False
+                    await asyncio.sleep(poll_interval)
+                    continue
                 diag_text = (diag.get("text") or "").lower()
                 cua_checked = True
 
