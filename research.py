@@ -451,6 +451,30 @@ def save_device_config(device_id: str | None = None, paired_uid: str | None = No
     RESEARCH_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
 
 
+def clear_paired_uid():
+    """Wipe pairedUid from memory + research_config.json without touching
+    deviceId or researchToken. Used when the relink watcher sees linkedUid
+    cleared — local state must forget the old owner so the heartbeat stops
+    recreating the device doc under their account. deviceId + researchToken
+    stay put so a subsequent relink (via paste-token) resumes without a
+    re-setup."""
+    global _device_paired_uid
+    _device_paired_uid = None
+    if not RESEARCH_CONFIG_PATH.exists():
+        return
+    try:
+        local_cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if "pairedUid" not in local_cfg:
+        return
+    local_cfg.pop("pairedUid", None)
+    try:
+        RESEARCH_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"Could not clear pairedUid from config: {e}", "WARN")
+
+
 def generate_device_id():
     """Mint a new stable deviceId shaped '<sanitized-hostname>-<6-char-hex>'.
     Called once per machine — subsequent --setup runs reuse the persisted id."""
@@ -559,7 +583,13 @@ async def _heartbeat_loop():
                     "status": "active",
                 })
                 # Mirror to device doc for the per-device status indicator.
-                # Skip silently when setup hasn't pinned a paired uid yet.
+                # Skip silently when no paired uid is pinned — either setup
+                # hasn't run yet, or the user just unlinked and the relink
+                # watcher cleared pairedUid. The token heartbeat above keeps
+                # firing so the relink watcher (which sits on the token doc)
+                # stays responsive; we just stop writing under the old
+                # owner's account. A relink restores pairedUid and the next
+                # tick recreates the device doc under the new owner.
                 paired_uid = load_paired_uid()
                 device_id = load_device_id()
                 if paired_uid and device_id:
@@ -569,15 +599,13 @@ async def _heartbeat_loop():
                                 "lastHeartbeat": int(time.time() * 1000),
                             })
                     except Exception:
-                        # Device doc is gone — user unlinked from the Account
-                        # page. Recreate it so a subsequent paste-token flow
-                        # (which claims the token but doesn't write the device
-                        # doc) results in the device tile reappearing within
-                        # one heartbeat interval (~30s).
-                        try:
-                            write_device_doc(paired_uid, _research_token)
-                        except Exception as e:
-                            log(f"Device doc recreate failed: {e}", "WARN")
+                        # Doc missing but pairedUid still set — either a
+                        # transient Firestore blip or the relink watcher
+                        # hasn't yet seen the unlink event. Leave it alone;
+                        # if the unlink is real, the relink watcher will
+                        # call clear_paired_uid() shortly and subsequent
+                        # ticks skip the mirror block entirely.
+                        pass
         except Exception as e:
             log(f"Heartbeat write failed: {e}", "WARN")
         await asyncio.sleep(30)
@@ -607,12 +635,15 @@ def _start_token_relink_watcher(token: str):
                 data = snap.to_dict() or {}
                 new_uid = (data.get("linkedUid") or "").strip()
                 current_uid = load_paired_uid() or ""
-                # Unlink event: linkedUid was cleared. The start listener gates
-                # on linkedUid per-request, so we don't need to tear it down —
-                # just log it so ops can see the transition in backend.log.
+                # Unlink event: linkedUid was cleared. Forget the old owner
+                # locally so the heartbeat stops mirroring to their device
+                # path (otherwise the Account tile reappears within 30s).
+                # Token + deviceId stay intact — a relink from any user with
+                # the same token restores pairing without re-setup.
                 if not new_uid:
                     if current_uid:
-                        log(f"Token unlinked (linkedUid cleared for paired uid {current_uid[:8]}…) — incoming pipeline starts will be rejected.")
+                        log(f"Token unlinked (linkedUid cleared for paired uid {current_uid[:8]}…) — clearing local pairedUid; heartbeat will stop mirroring until relink.")
+                        clear_paired_uid()
                     continue
                 if new_uid == current_uid:
                     continue
@@ -1111,6 +1142,20 @@ def _start_command_listener(uid, research_id, loop):
             if data.get("processed"):
                 continue
             action = data.get("action", "")
+            if action == "ping":
+                # Watchdog confirmation ping. Frontend writes this when it
+                # suspects silence; our processing of the command proves
+                # the backend is alive. Fast path — no _controls side
+                # effects, just mark the doc processed with a pongedAt
+                # timestamp the watchdog can read back.
+                try:
+                    doc.reference.update({
+                        "processed": True,
+                        "pongedAt": int(time.time() * 1000),
+                    })
+                except Exception:
+                    pass
+                continue
             if action == "stop":
                 loop.call_soon_threadsafe(_controls.request_stop)
                 # Bridge: also create file sentinel for old phase-boundary checks
@@ -1579,6 +1624,29 @@ class PipelineControls:
                 return "retry"
             if self.consume_continue_anyway():
                 return "continue_anyway"
+            await asyncio.sleep(0.5)
+        return "timeout"
+
+    async def await_phase_decision(self, phase: int, timeout: float = 3600.0) -> str:
+        """Wait for the user to resolve a phase-level pipeline_error. Returns:
+            'retry' — Retry clicked (consume_retry_phase)
+            'skip'  — Skip clicked (consume_phase_skip)
+            'stop'  — Stop clicked (stop_event)
+            'timeout' — 1-hour wait expired (caller should default to stop)
+
+        Used by all phase callers after fail_phase(...) to honor the
+        never-die contract (ARCHITECTURE CHANGE 2026-04-18). Polls every
+        0.5s; pause_event is also checked so an indefinite HV pause
+        doesn't starve the decision."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if self.stop_event.is_set():
+                return "stop"
+            if self.consume_retry_phase(phase):
+                return "retry"
+            if self.consume_phase_skip(phase):
+                return "skip"
             await asyncio.sleep(0.5)
         return "timeout"
 
@@ -3326,38 +3394,167 @@ def emit_event(event_type, phase=None, agent=None, **data):
 
 
 def fail_phase(phase, error, reason=None, agent=None, actions=None, **extra):
-    """Emit a paired pipeline_error + pipeline_stopped for a terminal phase
-    failure, and mark the Firestore research doc as failed in one shot.
+    """Soft-pause a phase on an unrecoverable error. Emits pipeline_error
+    ONLY — never pipeline_stopped, never Firestore status=failed. The
+    pipeline sits alive awaiting the user's decision, which the caller
+    picks up with `await _controls.await_phase_decision(phase)`.
 
-    Use this anywhere a phase decides it cannot continue and is about to
-    `return` from the pipeline. It guarantees the frontend gets both the
-    root-cause error (routed to the phase alert panel) AND the terminal
-    stop signal (so the phase tile freezes, polling tears down, and the
-    chat surfaces the stopped state).
+    ARCHITECTURE CHANGE 2026-04-18 (never-die contract): Previously this
+    helper also emitted pipeline_stopped + marked the run as failed, which
+    tore the pipeline down as soon as a phase hit an issue. New contract:
+    the pipeline only terminates on an explicit user Stop click. Every
+    other failure surfaces as a phase alert with Retry/Skip/Stop buttons
+    and waits for the user.
 
     Every event carries phase + (optional) agent so the frontend can route
     to the right alert panel without guessing. `reason` is human copy shown
     in the alert details; `error` stays as a short machine-tag. `actions`
-    is an optional list of retry/skip/continue buttons for the alert panel."""
+    defaults to ['retry','skip'] — callers can override when a retry path
+    isn't meaningful (rare)."""
     payload = {"error": error}
     if reason:
         payload["reason"] = reason
-    if actions:
-        payload["actions"] = actions
+    # PhaseAlertPanel expects action objects, not bare ids. Default to
+    # [Retry, Skip] tied to the retry_phase / skip_phase command listener.
+    # Callers can override with their own shape when specific semantics
+    # are required (e.g. resume_from_checkpoint).
+    payload["actions"] = actions if actions else [
+        {"id": "retry", "label": "Retry", "style": "primary",
+         "command": {"action": "retry_phase", "phase": phase}},
+        {"id": "skip", "label": "Skip", "style": "default",
+         "command": {"action": "skip_phase", "phase": phase}},
+    ]
     payload.update(extra)
     emit_event("pipeline_error", phase=phase, agent=agent, **payload)
-    stop_payload = {}
-    if reason:
-        stop_payload["reason"] = reason
-    if error and "error" not in stop_payload:
-        stop_payload["error"] = error
-    if extra.get("partial_agents"):
-        stop_payload["partial_agents"] = extra["partial_agents"]
-    emit_event("pipeline_stopped", phase=phase, agent=agent, **stop_payload)
+
+
+# ── Per-phase login probe (never-die contract) ─────────────────────────
+# NEVER-DIE-MIGRATION-2026-04-18: Phase 0 runs the full CUA login
+# verification round, but only when skipInitVerify=false. When the user
+# opts into skipInitVerify=true, the pipeline dives straight into Phase
+# 1 and historically would flail into a login wall — Phase 1 pastes
+# into the logged-out ChatGPT landing, waits forever, eventually times
+# out. These helpers close the loophole: each phase entry calls
+# `await_phase_login_probe(...)` which, when Phase 0's CUA round was
+# skipped, opens a probe tab per platform, runs verify_login_cua, and
+# on a miss surfaces the familiar login_required phase alert with
+# Retry / Skip instead of letting the phase die silently.
+
+_PLATFORM_LABELS = {
+    "chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude",
+    "notebooklm": "NotebookLM", "youtube": "YouTube",
+    "gmail": "Gmail", "gdocs": "Google Docs",
+}
+_LOGIN_HOST_NEGATIVES = (
+    "auth.openai.com", "accounts.google.com/signin",
+    "login.live.com", "claude.ai/login", "claude.ai/signup",
+)
+
+
+async def _probe_phase_logins(browser, cua_client, phase: int, platform_keys: list[str]):
+    """Open a probe tab per platform, run verify_login_cua, close the
+    tabs, restore browser.page. Returns (missing_keys, missing_labels).
+    On any probe-level exception, the platform is conservatively treated
+    as missing so the user can resolve."""
+    orig_page = getattr(browser, "page", None)
+    probe_tabs: list = []
+    missing_keys: list[str] = []
     try:
-        _update_firestore_research({"status": "failed", "phase": phase})
-    except Exception:
-        pass
+        for key in platform_keys:
+            info = LOGIN_PLATFORMS.get(key)
+            if not info:
+                continue
+            ok = False
+            try:
+                tab = await browser.new_tab(info["root"])
+                probe_tabs.append(tab)
+                # Same 4s settle Phase 0 uses — SPAs paint a neutral
+                # "loading" shell for ~3-4s that CUA misreads as a wall.
+                await asyncio.sleep(4.0)
+                try:
+                    current_url = (tab.url or "").lower()
+                except Exception:
+                    current_url = ""
+                if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
+                    ok = False
+                else:
+                    ok = await verify_login_cua(tab, key, cua_client)
+            except Exception as e:
+                log(f"Phase {phase}: login probe failed for {key}: {e}", "WARN")
+                ok = False
+            if not ok:
+                missing_keys.append(key)
+    finally:
+        for t in probe_tabs:
+            try:
+                await t.close()
+            except Exception:
+                pass
+        # Restore browser.page to the pre-probe tab so downstream phase
+        # work has a valid page. new_tab() reassigns self.page each call,
+        # so without this, browser.page points at the closed last probe.
+        try:
+            if orig_page is not None and not orig_page.is_closed():
+                browser.page = orig_page
+        except Exception:
+            pass
+    missing_labels = [_PLATFORM_LABELS.get(k, k) for k in missing_keys]
+    return missing_keys, missing_labels
+
+
+async def await_phase_login_probe(
+    browser, cua_client, phase: int, platform_keys: list[str], pipeline_config,
+) -> str:
+    """Per-phase entry login gate. Returns one of:
+        'ok'      — all platforms logged in, or probe disabled
+        'skip'    — user bypassed the probe after seeing missing logins
+        'stop'    — user hit Stop on the probe alert
+        'timeout' — no user response within 1h
+
+    No-op when skipInitVerify=false (Phase 0 already ran CUA). When
+    skipInitVerify=true, probes each platform_key in turn; on miss,
+    emits login_required + fail_phase and awaits the user's decision
+    (mirrors the Phase 0 login_required flow)."""
+    skip_init = False
+    if isinstance(pipeline_config, dict):
+        skip_init = bool(pipeline_config.get("skipInitVerify", False))
+    if not skip_init or not platform_keys:
+        return "ok"
+    attempt = 0
+    while True:
+        attempt += 1
+        missing_keys, missing_labels = await _probe_phase_logins(
+            browser, cua_client, phase, platform_keys,
+        )
+        if not missing_keys:
+            if attempt > 1:
+                emit_event("pipeline_resumed", phase=phase, reason="login_probe_pass")
+            return "ok"
+        emit_event(
+            "login_required",
+            phase=phase,
+            platforms=missing_keys,
+            platformLabels=missing_labels,
+            machineName=socket.gethostname(),
+            attempt=attempt,
+            message=f"Log into {', '.join(missing_labels)} on your setup PC, then tap Retry.",
+        )
+        fail_phase(
+            phase=phase,
+            error=f"Login required: {', '.join(missing_labels)}",
+            reason=(
+                f"Phase {phase} needs an active session on {', '.join(missing_labels)}. "
+                "Log in on your setup PC, then tap Retry. Skip proceeds anyway — the "
+                "phase will raise a fresh alert if it hits a real login wall."
+            ),
+            agent="system",
+        )
+        decision = await _controls.await_phase_decision(phase)
+        if decision == "retry":
+            log(f"Phase {phase}: user retry on login probe — re-checking", "INFO")
+            emit_event("phase_restart", phase=phase, reason="user_retry_login_probe", attempt=attempt)
+            continue
+        return decision  # skip | stop | timeout
 
 
 async def scrape_progress_chatgpt(page):
@@ -6872,21 +7069,71 @@ async def detect_session_expiry(page, platform: str, label: str) -> tuple[bool, 
         return False, ""
 
 
+async def _playwright_hv_click(page, label: str) -> bool:
+    """Cheap DOM-based HV click. Returns True iff we actually clicked
+    something. No budget for image-puzzles — those fall through to CUA.
+
+    NEVER-DIE-MIGRATION-2026-04-18: Tier 0 of the HV chain. Cloudflare
+    Turnstile is cross-origin-iframe'd so we can't touch its DOM, but we
+    can mouse.click at the checkbox's known position inside the iframe.
+    For in-page 'Verify you are human' / 'Continue' buttons, plain
+    locator clicks work."""
+    # Cloudflare Turnstile — checkbox inside a cross-origin iframe.
+    try:
+        cf = page.locator(
+            'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+        ).first
+        if await cf.count() > 0:
+            box = await cf.bounding_box()
+            if box:
+                # The checkbox sits ~30px in from the iframe's left edge,
+                # vertically centered. Cross-origin body is unreachable
+                # but mouse events at page coordinates land inside it.
+                cx = box["x"] + 30
+                cy = box["y"] + box["height"] / 2
+                await page.mouse.click(cx, cy)
+                log(f"[{label}] Playwright: clicked Turnstile checkbox at ({cx:.0f},{cy:.0f})")
+                return True
+    except Exception as e:
+        log(f"[{label}] Playwright Turnstile click errored: {e}", "WARN")
+    # In-page 'Verify you are human' / 'Continue' / 'I am human' buttons.
+    for sel in (
+        'button:has-text("Verify you are human")',
+        'button:has-text("I am human")',
+        'button:has-text("I\'m human")',
+        'button:has-text("Continue")',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click(timeout=3000)
+                log(f"[{label}] Playwright: clicked '{sel}'")
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def wait_for_verification_clearance(browser, cua_client, page, platform: str, label: str,
                                           verbose=False, max_wait_loops: int = 120,
                                           phase: int = 2) -> bool:
     """Handle a human-verification gate on an agent page.
 
-    Flow:
-      0. CUA auto-attempt — brief (3 iterations) — handles the common case
-         where the gate is a single "I am human" checkbox that CUA can click
-         on its own. If cleared, return True silently, no chat interruption.
-      1. Only if CUA couldn't clear it: emit human_verification_required and
-         pause. The frontend banner surfaces Retry / Skip agent / Stop.
-      2. Poll the page every 5s while paused — if the gate clears by any
-         means (user solves manually, CUA's click-through lands late, etc.),
-         auto-resume.
-      3. Return False on stop or skip_agent.
+    Flow (NEVER-DIE-MIGRATION-2026-04-18, full HV chain):
+      0. Playwright cheap-click — cross-origin iframe click on the
+         Turnstile checkbox, or in-page 'Verify you are human' button.
+         Zero CUA budget; most Cloudflare checkboxes clear here.
+      1. CUA in-place (3 iter) — vision click for whatever Playwright
+         missed. Silent on success.
+      2. 3-minute cooldown + page reload — lets Cloudflare's bot score
+         decay, re-runs stealth init against a fresh document.
+      3. CUA retry (5 iter) — second pass on the reloaded page.
+      4. Kill-tab — close the page, open a fresh tab at the same URL.
+         A new cookie jar + clean document sometimes clears a stuck
+         session that the reload alone couldn't.
+      5. User pause — human_verification_required alert with
+         Resume / Skip agent. Polls every 5s so a manual solve auto-
+         resumes even if the user never taps Resume.
 
     `phase` parameter routes all emit_event calls to the correct phase tile
     in the frontend — default 2 for Phase 2 agents, pass 1/3/4/5 when
@@ -6896,6 +7143,23 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     # IS one to solve before bothering CUA.
     _, reason = await detect_human_verification(page, platform, label)
     platform_key = platform.lower()
+
+    # ── Tier 0: Playwright cheap-click ──
+    # Most Cloudflare gates are a single checkbox. A direct Playwright
+    # click clears them for zero CUA cost. Keep the banner subtle here —
+    # only escalate to "retrying" alert if this attempt fails.
+    try:
+        clicked = await _playwright_hv_click(page, label)
+        if clicked:
+            await asyncio.sleep(3)
+            blocked, _ = await detect_human_verification(page, platform, label)
+            if not blocked:
+                log(f"[{label}] Playwright cleared verification ✓ — CUA not needed")
+                emit_event("agent_verified", phase=phase, agent=platform_key)
+                return True
+            log(f"[{label}] Playwright click didn't clear — escalating to CUA", "WARN")
+    except Exception as e:
+        log(f"[{label}] Playwright HV tier errored: {e} — escalating to CUA", "WARN")
 
     # ── CUA fallback — first pass (in place, 3 iterations) ──
     # Most Turnstile gates are a single "I am human" checkbox that CUA can
@@ -6991,9 +7255,47 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             except Exception as e:
                 log(f"[{label}] Post-clear setup re-run warning: {e}", "WARN")
             return True
-        log(f"[{label}] CUA retry still blocked — escalating to user", "WARN")
+        log(f"[{label}] CUA retry still blocked — escalating to tab-kill", "WARN")
     except Exception as e:
-        log(f"[{label}] CUA retry errored: {e} — escalating to user", "WARN")
+        log(f"[{label}] CUA retry errored: {e} — escalating to tab-kill", "WARN")
+
+    # ── Tier 4: Kill the tab, open a fresh one ──
+    # NEVER-DIE-MIGRATION-2026-04-18: Last automated tier before
+    # surfacing to the user. Close + reopen the page — a fresh cookie
+    # context and clean document layout occasionally clears a stubborn
+    # bot flag that the cooldown + reload couldn't. Cheap insurance
+    # before we interrupt the user.
+    try:
+        original_url = page.url
+        log(f"[{label}] CUA exhausted — killing the tab and re-opening for a clean slate")
+        emit_event("pipeline_warning", phase=phase, agent=platform_key,
+                   message=f"{label} still blocked — closing & re-opening the tab as a last auto-attempt…",
+                   details="Fresh tab with a clean document context — sometimes defuses a stubborn bot flag.",
+                   alertType="retrying")
+        try:
+            await page.close()
+        except Exception:
+            pass
+        page = await browser.new_tab(original_url)
+        await asyncio.sleep(4)
+        blocked, _ = await detect_human_verification(page, platform, label)
+        if not blocked:
+            log(f"[{label}] Fresh tab cleared verification ✓ — re-running setup")
+            emit_event("agent_verified", phase=phase, agent=platform_key)
+            pl = platform.lower()
+            try:
+                if pl == "claude":
+                    await setup_claude_dr(page)
+                elif pl == "gemini":
+                    await setup_gemini_dr(page)
+                elif pl == "chatgpt":
+                    await setup_chatgpt_dr(page)
+            except Exception as e:
+                log(f"[{label}] Post-kill-tab setup re-run warning: {e}", "WARN")
+            return True
+        log(f"[{label}] Fresh tab still blocked — escalating to user", "WARN")
+    except Exception as e:
+        log(f"[{label}] Kill-tab tier errored: {e} — escalating to user", "WARN")
 
     # ── User manual fallback — pause pipeline, banner with Resume/Skip ──
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
@@ -8997,27 +9299,49 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
         emit_event("agent_progress", phase=0, agent="system", status="Launching",
                    progress="Starting Chromium browser with automation profile…")
-        try:
-            await browser.start()
-        except Exception as _launch_err:
-            # Most common launch failures:
-            #   • Profile locked by another running Chrome instance →
-            #     SingletonLock couldn't be removed (another Playwright run)
-            #   • Playwright not installed → `playwright install chromium` missing
-            #   • Chromium binary missing / corrupt
-            _err_msg = str(_launch_err)
-            _low = _err_msg.lower()
-            if "profile" in _low and ("lock" in _low or "in use" in _low or "singleton" in _low):
-                emit_event("pipeline_error", phase=0, agent="system",
-                           error=f"Chrome profile is locked by another session. Close any running automation browsers (or previous pipeline runs) and try again. Details: {_err_msg[:200]}")
-            elif "executable" in _low or "chromium" in _low or "browser" in _low:
-                emit_event("pipeline_error", phase=0, agent="system",
-                           error=f"Browser binary missing or failed to start. Try `playwright install chromium`. Details: {_err_msg[:200]}")
-            else:
-                emit_event("pipeline_error", phase=0, agent="system",
-                           error=f"Browser launch failed: {_err_msg[:300]}")
-            _update_firestore_research({"status": "failed", "phase": 0})
-            raise
+        # ARCHITECTURE 2026-04-18 (never-die): browser-launch failures are
+        # user-recoverable (close other Chrome, run `playwright install`,
+        # etc.). Retry re-invokes browser.start() in-place; Stop ends the
+        # run. Skip isn't offered — every downstream phase needs a working
+        # browser, so skipping Phase 0 is meaningless.
+        while True:
+            try:
+                await browser.start()
+                break
+            except Exception as _launch_err:
+                # Most common launch failures:
+                #   • Profile locked by another running Chrome instance →
+                #     SingletonLock couldn't be removed (another Playwright run)
+                #   • Playwright not installed → `playwright install chromium` missing
+                #   • Chromium binary missing / corrupt
+                _err_msg = str(_launch_err)
+                _low = _err_msg.lower()
+                if "profile" in _low and ("lock" in _low or "in use" in _low or "singleton" in _low):
+                    _friendly = f"Chrome profile is locked by another session. Close any running automation browsers (or previous pipeline runs), then click Retry."
+                elif "executable" in _low or "chromium" in _low or "browser" in _low:
+                    _friendly = f"Browser binary missing or failed to start. Run `playwright install chromium`, then click Retry."
+                else:
+                    _friendly = f"Browser launch failed: {_err_msg[:200]}"
+                log(f"Phase 0 browser launch failed: {_err_msg[:200]} — awaiting user decision", "ERROR")
+                fail_phase(
+                    phase=0,
+                    error=f"Browser launch failed: {_err_msg[:200]}",
+                    reason=_friendly,
+                    agent="system",
+                    actions=[
+                        {"id": "retry", "label": "Retry", "style": "primary",
+                         "command": {"action": "retry_phase", "phase": 0}},
+                    ],
+                )
+                decision = await _controls.await_phase_decision(0)
+                if decision == "retry":
+                    log("Phase 0 browser launch: user requested retry", "INFO")
+                    emit_event("phase_restart", phase=0, reason="user_retry_browser_launch", attempt=0)
+                    continue
+                # skip (not offered but handled defensively) / stop / timeout
+                log(f"Phase 0 browser launch: user {decision} — terminating pipeline", "INFO")
+                emit_event("pipeline_stopped", phase=0, reason=f"user_{decision}_browser_launch")
+                return
 
         # Build list of platforms to verify based on enabled agents + phases
         _agents_cfg = config.get("agents", {}) if isinstance(config, dict) else {}
@@ -9221,10 +9545,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
             _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
             _p1_start = time.time()
-            if brief_file:
-                brief_text = Path(brief_file).read_text(encoding="utf-8")
-                log(f"Phase 1: SKIPPED — loaded brief from {brief_file} ({len(brief_text)} chars)")
-            else:
+            # NEVER-DIE-MIGRATION-2026-04-18: Per-phase login probe. No-op
+            # when Phase 0 already ran the CUA round; kicks in only when
+            # skipInitVerify=true. On miss, surfaces login_required +
+            # Retry/Skip so Phase 1 doesn't flail into a logged-out
+            # ChatGPT landing.
+            _p1_probe = await await_phase_login_probe(browser, cua_client, 1, ["chatgpt"], pipeline_config)
+            if _p1_probe in ("stop", "timeout"):
+                emit_event("pipeline_stopped", phase=1, reason=f"user_{_p1_probe}_login_probe")
+                return
+            # ARCHITECTURE 2026-04-18: Never-die retry loop. Any fail_phase
+            # inside this block awaits the user's Retry/Skip/Stop decision
+            # via _controls.await_phase_decision(1). Retry loops back; Skip
+            # breaks out with brief_text="" so downstream phases can decide
+            # what to do with no brief; Stop returns from the pipeline.
+            _p1_skipped_after_error = False
+            while True:
+                if brief_file:
+                    brief_text = Path(brief_file).read_text(encoding="utf-8")
+                    log(f"Phase 1: SKIPPED — loaded brief from {brief_file} ({len(brief_text)} chars)")
+                    brief_url = ""
+                    break
                 fb1 = get_feedback(1)
                 # Restart loop: if mid-phase pause+input+resume trips
                 # `_runtime.restart_requested`, merge the buffered context into
@@ -9248,20 +9589,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                reason="mid_phase_input_on_resume",
                                chars=len(extra_ctx_retry), attempt=_p1_attempt+1)
                 if not p1 or not p1["text"]:
-                    log("Phase 1 failed — no brief generated", "ERROR")
-                    # Paired pipeline_error + pipeline_stopped so the phase
-                    # tile freezes cleanly and the dropdown surfaces the
-                    # real reason — without this, the tile kept narrating
-                    # pleasant progress after the backend gave up.
+                    log("Phase 1 failed — no brief generated; awaiting user decision", "ERROR")
                     fail_phase(
                         phase=1,
                         error="no brief generated",
                         reason="ChatGPT Pro didn't produce a research brief after all retries. Check the ChatGPT session is signed in, then try again.",
                         agent="chatgpt",
                     )
+                    decision = await _controls.await_phase_decision(1)
+                    if decision == "retry":
+                        log("Phase 1: user requested retry — re-running from the top", "INFO")
+                        emit_event("phase_restart", phase=1, reason="user_retry_after_error", attempt=0)
+                        continue
+                    if decision == "skip":
+                        log("Phase 1: user skipped after error — continuing with empty brief", "INFO")
+                        emit_event("phase_skipped", phase=1, reason="user_skip_after_error")
+                        brief_text = ""
+                        brief_url = ""
+                        _p1_skipped_after_error = True
+                        break
+                    # stop / timeout — only way the pipeline actually ends
+                    log(f"Phase 1: user {decision} after error — terminating pipeline", "INFO")
+                    emit_event("pipeline_stopped", phase=1, reason=f"user_{decision}_after_error")
                     return
                 brief_text = p1["text"]
                 brief_url = p1.get("url", "")
+                break
                 # Brief-short acknowledgement: run_phase1 already emitted a
                 # pipeline_warning with [continue_anyway] buttons when the
                 # brief is 100-500 chars. If the user pressed Continue, the
@@ -9272,35 +9625,69 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if _controls.consume_continue_anyway():
                     log("Phase 1: brief-short warning dismissed by user (continue_anyway)")
             # Save brief in documents/
-            _brief_md = f"# Research Brief\n\n{brief_text}"
-            (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
-            # Sync to Firestore documents subcollection for Vercel Documents page
-            save_document_to_firestore("brief", _brief_md, "Research Brief")
-            # Create BriefArtifact for reliable Phase 2 paste
-            brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
-            log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
-            # ── B1: Link-first phase_complete — 3× retry, halt on final fail ──
-            log("Phase 1: Extracting verified ChatGPT share link (3× retry)...")
-            p1_link = await extract_with_retry(
-                phase=1, agent="chatgpt", browser=browser, cua_client=cua_client,
-                extractor_fn=extract_share_link_chatgpt,
-                label="ChatGPT Brief", verbose=verbose,
-            )
-            if not p1_link.verified:
-                log(f"Phase 1 HALT — no verified ChatGPT link after 3 retries: {p1_link.error}", "ERROR")
-                emit_event("pipeline_error", phase=1,
-                           error=f"Could not extract verified ChatGPT share link: {p1_link.error}")
-                _update_firestore_research({"status": "failed", "phase": 1})
-                return
-            brief_url = p1_link.url
-            brief_artifact.url = brief_url
-            _p1_links = [{"label": "ChatGPT Brief", "url": brief_url, "verified": True}]
-            save_checkpoint(queue_dir, 1, topic=topic, brief_url=brief_url)
-            update_delivery(brief_url=brief_url)
-            save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
-            emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start), links=_p1_links,
-                summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
-            _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
+            if _p1_skipped_after_error:
+                # User chose Skip after a brief-generation error — emit a
+                # stub phase_complete so the pipeline tile shows the skip
+                # outcome instead of hanging, and set brief_artifact to an
+                # empty shell so downstream Phase 2 can make its own
+                # decision (it has its own fail_phase + await_phase_decision
+                # when the paste step finds no content).
+                brief_artifact = BriefArtifact(text="", url="")
+                emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),
+                    summary="Phase 1 skipped after error — no brief generated")
+                _update_firestore_research({"phase": 1, "status": "ongoing"})
+            else:
+                _brief_md = f"# Research Brief\n\n{brief_text}"
+                (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
+                # Sync to Firestore documents subcollection for Vercel Documents page
+                save_document_to_firestore("brief", _brief_md, "Research Brief")
+                # Create BriefArtifact for reliable Phase 2 paste
+                brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
+                log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
+                # ── B1: Link-first phase_complete — 3× retry, then await user ──
+                # ARCHITECTURE 2026-04-18: if link extraction fails, fall into
+                # the never-die retry loop instead of terminating the run.
+                while True:
+                    log("Phase 1: Extracting verified ChatGPT share link (3× retry)...")
+                    p1_link = await extract_with_retry(
+                        phase=1, agent="chatgpt", browser=browser, cua_client=cua_client,
+                        extractor_fn=extract_share_link_chatgpt,
+                        label="ChatGPT Brief", verbose=verbose,
+                    )
+                    if p1_link.verified:
+                        break
+                    log(f"Phase 1: no verified ChatGPT link after 3 retries: {p1_link.error} — awaiting user decision", "ERROR")
+                    fail_phase(
+                        phase=1,
+                        error=f"Could not extract verified ChatGPT share link: {p1_link.error}",
+                        reason="Extraction couldn't confirm the ChatGPT share link after all retries. Retry to try again, or skip to continue with just the brief text.",
+                        agent="chatgpt",
+                    )
+                    decision = await _controls.await_phase_decision(1)
+                    if decision == "retry":
+                        log("Phase 1 link extraction: user requested retry", "INFO")
+                        emit_event("phase_restart", phase=1, reason="user_retry_link_extract", attempt=0)
+                        continue
+                    if decision == "skip":
+                        log("Phase 1 link extraction: user skipped — proceeding with brief text but no share link", "INFO")
+                        # Synthesize a minimal p1_link so downstream code
+                        # that expects `p1_link.url` gets "" without a
+                        # separate guard.
+                        p1_link = type("_EmptyLink", (), {"url": "", "verified": False, "error": "skipped_by_user"})()
+                        break
+                    # stop / timeout
+                    log(f"Phase 1 link extraction: user {decision} — terminating pipeline", "INFO")
+                    emit_event("pipeline_stopped", phase=1, reason=f"user_{decision}_link_extract")
+                    return
+                brief_url = p1_link.url
+                brief_artifact.url = brief_url
+                _p1_links = [{"label": "ChatGPT Brief", "url": brief_url, "verified": True}] if p1_link.verified else []
+                save_checkpoint(queue_dir, 1, topic=topic, brief_url=brief_url)
+                update_delivery(brief_url=brief_url)
+                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
+                emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start), links=_p1_links,
+                    summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
+                _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
         else:
             # Load brief from documents/ (new location) or root (old location)
             for bp in [queue_dir / "documents" / "brief.md", queue_dir / "brief.md"]:
@@ -9377,6 +9764,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             for da in disabled_agents:
                 emit_event("agent_skipped", phase=2, agent=da)
             _p2_start = time.time()
+            # NEVER-DIE-MIGRATION-2026-04-18: Per-phase login probe for
+            # each enabled agent. Only runs when skipInitVerify=true.
+            _p2_probe = await await_phase_login_probe(browser, cua_client, 2, list(enabled_agents), pipeline_config)
+            if _p2_probe in ("stop", "timeout"):
+                emit_event("pipeline_stopped", phase=2, reason=f"user_{_p2_probe}_login_probe")
+                return
             fb2 = get_feedback(2)
             # Use BriefArtifact for full verified paste (never the "already_sent" heuristic)
             research_brief = (brief_artifact.text if brief_artifact else brief_text)
@@ -9631,46 +10024,36 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                summary=f"Phase 2 regenerated with user input")
 
         # ── Check we have research output to continue ──
-        # Wrap in a retry loop so the user can re-run Phase 2 with the same
-        # brief if all three agents came back empty. Caps at 1 retry to
-        # avoid infinite loops (rare in practice — normally at least one
-        # agent succeeds, and a retry surfaces the same issue).
+        # ARCHITECTURE 2026-04-18 (never-die): no retries_left cap. If
+        # Phase 2 produced nothing, surface a phase alert and wait for
+        # the user to choose Retry / Skip / Stop. Retry re-runs Phase 2;
+        # Skip advances past Phase 3 entirely (no notebook/audio); Stop
+        # ends the run. Previously we capped at 1 retry and then
+        # silently marked the run failed — that broke the contract.
         doc_dir = queue_dir / "documents"
         md_files = [f for f in doc_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
         has_results = md_files or any(r.get("text") for r in results.values())
+        _p3gate_skipped = False
         _p3gate_attempt = 0
-        _p3gate_max = 1
-        while not has_results and _p3gate_attempt <= _p3gate_max:
-            log("No research output — offering Phase 2 retry or stop", "WARN")
-            retries_left = max(0, _p3gate_max - _p3gate_attempt)
-            _gate_actions = []
-            if retries_left > 0:
-                _gate_actions.append({
-                    "id": "retry", "label": f"Retry Phase 2 ({retries_left} left)",
-                    "style": "primary",
-                    "command": {"action": "retry_phase", "phase": 2},
-                })
-            _gate_actions.append({
-                "id": "stop", "label": "Stop pipeline",
-                "style": "danger",
-                "command": {"action": "stop"},
-            })
-            emit_event("pipeline_error", phase=3,
-                       error="Phase 2 produced no documents — can't continue to NotebookLM. All three agents timed out, errored, or returned empty. Retry re-runs Phase 2 with the same brief; Stop halts the pipeline.",
-                       actions=_gate_actions)
-            if retries_left <= 0:
-                _update_firestore_research({"status": "failed", "phase": 3})
-                return
-            # Wait up to 10 min for decision. Default (timeout) = stop so
-            # the pipeline doesn't hang indefinitely if the user is away.
-            gate_decision = await _controls.await_retry_or_continue(phase=2, timeout=600.0)
+        while not has_results:
+            _p3gate_attempt += 1
+            log(f"No research output (attempt {_p3gate_attempt}) — awaiting user decision", "WARN")
+            fail_phase(
+                phase=3,
+                error="Phase 2 produced no documents — can't continue to NotebookLM.",
+                reason="All three agents timed out, errored, or returned empty. Retry re-runs Phase 2 with the same brief; Skip moves past Phase 3 (no notebook, no audio).",
+                actions=[
+                    {"id": "retry", "label": "Retry Phase 2", "style": "primary",
+                     "command": {"action": "retry_phase", "phase": 3}},
+                    {"id": "skip", "label": "Skip Phase 3", "style": "default",
+                     "command": {"action": "skip_phase", "phase": 3}},
+                ],
+            )
+            gate_decision = await _controls.await_phase_decision(3)
             log(f"Phase 3 gate decision: {gate_decision}")
             if gate_decision == "retry":
-                _p3gate_attempt += 1
                 try:
-                    emit_event("phase_restart", phase=2,
-                               reason="user_retry_p3_gate",
-                               attempt=_p3gate_attempt + 1)
+                    emit_event("phase_restart", phase=2, reason="user_retry_p3_gate", attempt=_p3gate_attempt + 1)
                 except Exception:
                     pass
                 _retry_brief_text = (brief_artifact.text if brief_artifact else brief_text) or ""
@@ -9688,8 +10071,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 md_files = [f for f in doc_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
                 has_results = md_files or any(r.get("text") for r in results.values())
                 continue
-            # stop / continue_anyway / timeout → halt
-            _update_firestore_research({"status": "failed", "phase": 3})
+            if gate_decision == "skip":
+                log("Phase 3 gate: user skipped — continuing past Phase 3 with no documents", "INFO")
+                emit_event("phase_skipped", phase=3, reason="user_skip_no_docs")
+                # await_phase_decision(3) already consumed the skip flag, so
+                # re-add it to the set. The Phase 3 entry block below reads
+                # consume_phase_skip(3) and will short-circuit past the upload
+                # step when the flag is present.
+                _controls.skipped_phases.add(3)
+                _p3gate_skipped = True
+                break
+            # stop / timeout → end the run
+            log(f"Phase 3 gate: user {gate_decision} — terminating pipeline", "INFO")
+            emit_event("pipeline_stopped", phase=3, reason=f"user_{gate_decision}_no_docs")
             return
 
         # Post-Phase-2: add_context is no longer accepted (guarded at command
@@ -9712,6 +10106,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
             _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
             _p3_start = time.time()
+            # NEVER-DIE-MIGRATION-2026-04-18: Per-phase login probe.
+            # Only runs when skipInitVerify=true.
+            _p3_probe = await await_phase_login_probe(browser, cua_client, 3, ["notebooklm"], pipeline_config)
+            if _p3_probe in ("stop", "timeout"):
+                emit_event("pipeline_stopped", phase=3, reason=f"user_{_p3_probe}_login_probe")
+                return
             if not results:
                 for md_file in md_files:
                     stem = md_file.stem.lower()
@@ -9722,21 +10122,39 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             p3 = await run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose)
             links = p3.get("links", {})
             notebook_url = p3.get("notebook_url", "")
-            # B1: Link-first — retry notebook URL extraction on validation failure
+            # B1: Link-first — retry notebook URL extraction on validation failure.
+            # ARCHITECTURE 2026-04-18 (never-die): wrap the retry in a decision
+            # loop so repeated extract failures surface as a phase alert with
+            # Retry / Skip instead of silently terminating.
             if not (notebook_url and validate_link("notebooklm", notebook_url)):
                 log("[NotebookLM] Notebook URL missing/invalid — retrying via extractor (3×)", "WARN")
-                nb_res = await extract_with_retry(
-                    phase=3, agent="notebooklm", browser=browser, cua_client=cua_client,
-                    extractor_fn=extract_notebooklm_url,
-                    label="NotebookLM Notebook", verbose=verbose,
-                )
-                if nb_res.verified:
-                    notebook_url = nb_res.url
-                else:
-                    log(f"Phase 3 HALT — no verified NotebookLM URL: {nb_res.error}", "ERROR")
-                    emit_event("pipeline_error", phase=3,
-                               error=f"Could not extract verified NotebookLM URL: {nb_res.error}")
-                    _update_firestore_research({"status": "failed", "phase": 3})
+                while True:
+                    nb_res = await extract_with_retry(
+                        phase=3, agent="notebooklm", browser=browser, cua_client=cua_client,
+                        extractor_fn=extract_notebooklm_url,
+                        label="NotebookLM Notebook", verbose=verbose,
+                    )
+                    if nb_res.verified:
+                        notebook_url = nb_res.url
+                        break
+                    log(f"Phase 3: no verified NotebookLM URL after retries — awaiting user decision ({nb_res.error})", "ERROR")
+                    fail_phase(
+                        phase=3,
+                        error=f"Could not extract verified NotebookLM URL: {nb_res.error}",
+                        reason="NotebookLM extraction couldn't confirm a valid notebook URL. Retry tries again; Skip moves past Phase 3 without a notebook link.",
+                        agent="notebooklm",
+                    )
+                    decision = await _controls.await_phase_decision(3)
+                    if decision == "retry":
+                        log("Phase 3 link extraction: user requested retry", "INFO")
+                        emit_event("phase_restart", phase=3, reason="user_retry_link_extract", attempt=0)
+                        continue
+                    if decision == "skip":
+                        log("Phase 3 link extraction: user skipped — proceeding without notebook URL", "INFO")
+                        notebook_url = ""
+                        break
+                    log(f"Phase 3 link extraction: user {decision} — terminating pipeline", "INFO")
+                    emit_event("pipeline_stopped", phase=3, reason=f"user_{decision}_link_extract")
                     return
             else:
                 emit_validated_link(3, "notebooklm", notebook_url, "NotebookLM Notebook")
@@ -9818,28 +10236,53 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=4, description="Converting audio to video + YouTube upload", agents=["youtube"])
             _update_firestore_research({"phase": 4, "currentPhase": 4, "status": "ongoing"})
             _p4_start = time.time()
+            # NEVER-DIE-MIGRATION-2026-04-18: Per-phase login probe.
+            # Only runs when skipInitVerify=true.
+            _p4_probe = await await_phase_login_probe(browser, cua_client, 4, ["youtube"], pipeline_config)
+            if _p4_probe in ("stop", "timeout"):
+                emit_event("pipeline_stopped", phase=4, reason=f"user_{_p4_probe}_login_probe")
+                return
             if audio_path:
                 p5 = await run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                                        links=links, notebook_url=notebook_url, verbose=verbose)
                 youtube_url = p5.get("youtube_url", "")
-                # B1: Link-first — retry YouTube URL extraction on validation failure
+                # B1: Link-first — retry YouTube URL extraction on validation failure.
+                # ARCHITECTURE 2026-04-18 (never-die): wrap the retry in a
+                # decision loop so repeated extract failures surface as a
+                # phase alert with Retry / Skip instead of silently
+                # terminating.
                 if not (youtube_url and validate_link("youtube", youtube_url)):
                     if youtube_url:
                         log(f"[YouTube] REJECTED invalid URL: {youtube_url} — retrying extractor (3×)", "WARN")
                     else:
                         log("[YouTube] No URL from upload — retrying extractor (3×)", "WARN")
-                    yt_res = await extract_with_retry(
-                        phase=4, agent="youtube", browser=browser, cua_client=cua_client,
-                        extractor_fn=extract_youtube_url,
-                        label="YouTube Video", verbose=verbose,
-                    )
-                    if yt_res.verified:
-                        youtube_url = yt_res.url
-                    else:
-                        log(f"Phase 4 HALT — no verified YouTube URL: {yt_res.error}", "ERROR")
-                        emit_event("pipeline_error", phase=4,
-                                   error=f"Could not extract verified YouTube URL: {yt_res.error}")
-                        _update_firestore_research({"status": "failed", "phase": 4})
+                    while True:
+                        yt_res = await extract_with_retry(
+                            phase=4, agent="youtube", browser=browser, cua_client=cua_client,
+                            extractor_fn=extract_youtube_url,
+                            label="YouTube Video", verbose=verbose,
+                        )
+                        if yt_res.verified:
+                            youtube_url = yt_res.url
+                            break
+                        log(f"Phase 4: no verified YouTube URL after retries — awaiting user decision ({yt_res.error})", "ERROR")
+                        fail_phase(
+                            phase=4,
+                            error=f"Could not extract verified YouTube URL: {yt_res.error}",
+                            reason="YouTube extraction couldn't confirm a valid video URL. Retry tries again; Skip moves past Phase 4 without a video link.",
+                            agent="youtube",
+                        )
+                        decision = await _controls.await_phase_decision(4)
+                        if decision == "retry":
+                            log("Phase 4 link extraction: user requested retry", "INFO")
+                            emit_event("phase_restart", phase=4, reason="user_retry_link_extract", attempt=0)
+                            continue
+                        if decision == "skip":
+                            log("Phase 4 link extraction: user skipped — proceeding without YouTube URL", "INFO")
+                            youtube_url = ""
+                            break
+                        log(f"Phase 4 link extraction: user {decision} — terminating pipeline", "INFO")
+                        emit_event("pipeline_stopped", phase=4, reason=f"user_{decision}_link_extract")
                         return
                 else:
                     emit_validated_link(4, "youtube", youtube_url, "YouTube Video")
@@ -9897,30 +10340,54 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=5, description="Creating Google Doc hub + sending email notification", agents=["gdocs", "gmail"])
             _update_firestore_research({"phase": 5, "currentPhase": 5, "status": "ongoing"})
             _p5_start = time.time()
+            # NEVER-DIE-MIGRATION-2026-04-18: Per-phase login probe for
+            # both Gmail and Google Docs. Only runs when skipInitVerify=true.
+            _p5_probe = await await_phase_login_probe(browser, cua_client, 5, ["gdocs", "gmail"], pipeline_config)
+            if _p5_probe in ("stop", "timeout"):
+                emit_event("pipeline_stopped", phase=5, reason=f"user_{_p5_probe}_login_probe")
+                return
             # Use audio overview URL if extracted, else notebook URL as fallback
             _effective_audio_url = audio_overview_url if audio_overview_url else notebook_url
             p6 = await run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
                                   brief_url=brief_url, audio_url=_effective_audio_url,
                                   email=email, verbose=verbose)
             doc_url = p6.get("doc_url", "")
-            # B1: Link-first — retry Google Doc URL extraction on validation failure
+            # B1: Link-first — retry Google Doc URL extraction on validation failure.
+            # ARCHITECTURE 2026-04-18 (never-die): wrap retries in a
+            # decision loop so the user sees Retry / Skip instead of a
+            # silent termination.
             if not (doc_url and validate_link("gdocs", doc_url)):
                 if doc_url:
                     log(f"[Google Doc] URL doesn't look right: {doc_url} — retrying extractor (3×)", "WARN")
                 else:
                     log("[Google Doc] No URL returned — retrying extractor (3×)", "WARN")
-                gd_res = await extract_with_retry(
-                    phase=5, agent="gdocs", browser=browser, cua_client=cua_client,
-                    extractor_fn=extract_gdoc_url,
-                    label="Google Doc Hub", verbose=verbose,
-                )
-                if gd_res.verified:
-                    doc_url = gd_res.url
-                else:
-                    log(f"Phase 5 HALT — no verified Google Doc URL: {gd_res.error}", "ERROR")
-                    emit_event("pipeline_error", phase=5,
-                               error=f"Could not extract verified Google Doc URL: {gd_res.error}")
-                    _update_firestore_research({"status": "failed", "phase": 5})
+                while True:
+                    gd_res = await extract_with_retry(
+                        phase=5, agent="gdocs", browser=browser, cua_client=cua_client,
+                        extractor_fn=extract_gdoc_url,
+                        label="Google Doc Hub", verbose=verbose,
+                    )
+                    if gd_res.verified:
+                        doc_url = gd_res.url
+                        break
+                    log(f"Phase 5: no verified Google Doc URL after retries — awaiting user decision ({gd_res.error})", "ERROR")
+                    fail_phase(
+                        phase=5,
+                        error=f"Could not extract verified Google Doc URL: {gd_res.error}",
+                        reason="Google Doc extraction couldn't confirm a valid URL. Retry tries again; Skip moves past Phase 5 without a report link (email/notification step may be skipped too).",
+                        agent="gdocs",
+                    )
+                    decision = await _controls.await_phase_decision(5)
+                    if decision == "retry":
+                        log("Phase 5 link extraction: user requested retry", "INFO")
+                        emit_event("phase_restart", phase=5, reason="user_retry_link_extract", attempt=0)
+                        continue
+                    if decision == "skip":
+                        log("Phase 5 link extraction: user skipped — proceeding without Google Doc URL", "INFO")
+                        doc_url = ""
+                        break
+                    log(f"Phase 5 link extraction: user {decision} — terminating pipeline", "INFO")
+                    emit_event("pipeline_stopped", phase=5, reason=f"user_{decision}_link_extract")
                     return
             else:
                 emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
