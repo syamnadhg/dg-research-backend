@@ -2194,6 +2194,13 @@ async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_tim
         return False
 
 
+# Structural CUA failures (billing cap, invalid key, overload) are raised
+# as this exception so callers can distinguish them from a legitimate
+# login-wall NO verdict. See _cua_login_call for the matched error patterns.
+class CuaUnavailableError(RuntimeError):
+    pass
+
+
 # Human-readable platform names used when prompting CUA for login verification.
 # Keep these descriptive so the model knows which brand/site to identify.
 _PLATFORM_DISPLAY = {
@@ -2262,6 +2269,21 @@ async def _cua_login_call(page, platform: str, cua_client) -> tuple[bool, str]:
         verdict = raw.strip().lower()
         return (verdict.startswith("yes"), raw or "")
     except Exception as e:
+        # Distinguish structural API failures (billing cap, invalid key,
+        # overload) from a genuine login-wall NO. The caller treats a
+        # False verdict as "not logged in" and prompts the user to log
+        # in — but if the REAL blocker is an Anthropic 400/401/529, the
+        # user chasing a phantom auth issue wastes their time. We surface
+        # those errors as an exception so Phase 0 can emit a dedicated
+        # pipeline_error ("CUA unavailable — [Skip] [Stop]") instead of
+        # spinning on login_required.
+        err = str(e)
+        low = err.lower()
+        if ("workspace api usage limits" in low
+            or ("400" in err and "usage limit" in low)
+            or ("401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low))
+            or "overloaded" in low or "529" in err):
+            raise CuaUnavailableError(err) from e
         return (False, f"API error: {e}")
 
 
@@ -9982,6 +10004,36 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     else:
                         # Primary gate: CUA vision verification.
                         ok = await verify_login_cua(tab, key, cua_client)
+                except CuaUnavailableError as cua_err:
+                    # Structural Anthropic failure (billing cap / invalid
+                    # key / 529). Surface a distinct alert so the user
+                    # doesn't chase a phantom auth issue. Default actions:
+                    # skip this platform (proceed with remaining) or stop.
+                    log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
+                    emit_event("pipeline_error", phase=0, agent=key,
+                               error="cua_unavailable",
+                               reason=f"CUA vision check can't run: {str(cua_err)[:180]}",
+                               details="Raise the Anthropic workspace cap, swap CUA_API_KEY, or skip remaining verification.",
+                               actions=[
+                                   {"id": "skip", "label": "Skip verification", "style": "default",
+                                    "command": {"action": "skip_init_verify"}},
+                                   {"id": "retry", "label": "Retry", "style": "primary",
+                                    "command": {"action": "retry_phase", "phase": 0}},
+                               ])
+                    _controls.request_pause()
+                    emit_event("pipeline_paused", phase=0, reason="cua_unavailable")
+                    await _controls.wait_if_paused()
+                    if _controls.is_stop():
+                        emit_event("pipeline_stopped", phase=0, reason="stopped during cua_unavailable")
+                        return
+                    if _controls.skip_init_verify:
+                        log(f"Phase 0: SKIP_INIT_VERIFY during {label} (CUA unavailable) — skipping remaining", "INFO")
+                        _global_skip = True
+                        break
+                    # retry — clear flag + loop continues, cookie probe runs again
+                    _controls.consume_retry_phase(0)
+                    _controls.retry_init_verify = False
+                    continue
                 except Exception as e:
                     log(f"Phase 0: login check failed for {key}: {e}", "WARN")
                     ok = False
@@ -10012,18 +10064,29 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     log(f"Phase 0: SKIP_INIT_VERIFY during {label} — skipping remaining platforms", "INFO")
                     _global_skip = True
                     break
-                emit_event("pipeline_resumed", phase=0, reason="retry")
-                if _controls.retry_init_verify:
+                # Unify retry signals: the login_required banner's dedicated
+                # "Retry" button writes action="retry_init_verify", but the
+                # generic PhaseAlertPanel Retry button writes action="retry_phase"
+                # with phase=0. Both mean the same thing here — the user
+                # acted in the browser, re-check this platform with fresh state.
+                if _controls.consume_retry_phase(0):
+                    _controls.retry_init_verify = True
+                _is_retry = bool(_controls.retry_init_verify)
+                emit_event("pipeline_resumed", phase=0, reason="retry" if _is_retry else "resume")
+                # Always close the tab on resume. The user just did something
+                # in the browser (logged in, solved a CAPTCHA, dismissed a
+                # popup) — re-using the stale tab would make the next CUA
+                # screenshot identical to the pre-pause one, defeating the retry.
+                _t = _preflight_tabs.pop(key, None)
+                if _t is not None:
+                    try: await _t.close()
+                    except Exception: pass
+                if _is_retry:
                     _controls.retry_init_verify = False
-                    # Hard-reset the tab for this platform so the retry opens clean.
-                    _t = _preflight_tabs.pop(key, None)
-                    if _t is not None:
-                        try: await _t.close()
-                        except Exception: pass
                     emit_event("phase_start", phase=0,
                                description=f"Re-checking {label} (attempt {attempt + 1})")
                     _update_firestore_research({"phase": 0, "currentPhase": 0, "status": "ongoing"})
-                log(f"Phase 0: resumed — re-checking {label}", "INFO")
+                log(f"Phase 0: resumed ({'retry' if _is_retry else 'resume'}) — re-checking {label}", "INFO")
                 # while loop continues — re-check same platform with fresh state
             # Inner while exited — either verified, skipped globally, or stopped.
             if _global_skip:
