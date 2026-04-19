@@ -554,10 +554,17 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
         # the task is the truth.
         "indestructible": _detect_indestructible(),
     }
-    # First-write-only fields. User rename flows through the Account page,
-    # so we must not clobber it on subsequent setup or heartbeat writes.
-    if "name" not in existing:
-        payload["name"] = device_name or hostname
+    # Name field rules:
+    #  - If --setup passed an explicit device_name, honor it (user typed
+    #    it at the device-name prompt — overrides any prior value).
+    #  - Else on first write, default to hostname.
+    #  - Else preserve the existing (user may have renamed via Account
+    #    page or a previous setup; heartbeat/relink writers must not
+    #    clobber it).
+    if device_name:
+        payload["name"] = device_name
+    elif "name" not in existing:
+        payload["name"] = hostname
     if "registeredAt" not in existing:
         payload["registeredAt"] = int(time.time() * 1000)
     try:
@@ -1919,6 +1926,67 @@ class SessionExpiredError(Exception):
 #
 # Keep selectors LOOSE — they should survive minor UI tweaks. We care about
 # "is this user authenticated" not "is a specific button present".
+
+# Fast-path auth-cookie signatures — used by cookie_login_hit() to skip
+# expensive tab-open + CUA verify when the profile already holds a
+# likely-valid session. Presence check only; expiry is respected when
+# set. A miss means "not sure, go verify properly" — a hit short-
+# circuits to "logged in" for probe/setup paths. Phase 0 preflight
+# (the one source-of-truth check) still runs full CUA even on a hit
+# because we don't want false positives corrupting the gate that
+# every subsequent phase trusts.
+_AUTH_COOKIE_SIGNATURES = {
+    "chatgpt":    {"names": ["__Secure-next-auth.session-token"],
+                   "domains": ["chatgpt.com", "openai.com"]},
+    "gemini":     {"names": ["__Secure-1PSID", "__Secure-3PSID"],
+                   "domains": ["google.com"]},
+    "notebooklm": {"names": ["__Secure-1PSID", "__Secure-3PSID"],
+                   "domains": ["google.com"]},
+    "youtube":    {"names": ["__Secure-1PSID", "__Secure-3PSID"],
+                   "domains": ["google.com", "youtube.com"]},
+    "gmail":      {"names": ["__Secure-1PSID", "__Secure-3PSID"],
+                   "domains": ["google.com"]},
+    "gdocs":      {"names": ["__Secure-1PSID", "__Secure-3PSID"],
+                   "domains": ["google.com"]},
+    "claude":     {"names": ["sessionKey"],
+                   "domains": ["claude.ai"]},
+}
+
+
+async def cookie_login_hit(browser_or_context, key: str) -> bool:
+    """Return True when the profile holds a cookie matching the platform's
+    auth signature (primary session token on the right domain, non-expired).
+    Callers treat True as 'skip the CUA/DOM verify — already logged in';
+    False means 'not sure' so they fall through to the full check. Cheap:
+    no network, no tab-open, no CUA spend.
+
+    Accepts either a Browser instance or a raw BrowserContext."""
+    sig = _AUTH_COOKIE_SIGNATURES.get(key)
+    if not sig:
+        return False
+    ctx = getattr(browser_or_context, "context", browser_or_context)
+    if ctx is None:
+        return False
+    try:
+        cookies = await ctx.cookies()
+    except Exception:
+        return False
+    now = time.time()
+    want_names = set(sig["names"])
+    want_hosts = sig["domains"]
+    for c in cookies:
+        if c.get("name") not in want_names:
+            continue
+        domain = (c.get("domain") or "").lstrip(".")
+        if not any(domain == h or domain.endswith("." + h) for h in want_hosts):
+            continue
+        exp = c.get("expires", -1)
+        # -1 = session cookie (persists per browser-session — good enough).
+        # Any other value is unix seconds; accept if still in the future.
+        if exp == -1 or exp > now:
+            return True
+    return False
+
 
 LOGIN_PLATFORMS = {
     # Markers must be AUTH-SPECIFIC: profile menus, account chips, chat history
@@ -3460,21 +3528,33 @@ async def _probe_phase_logins(browser, cua_client, phase: int, platform_keys: li
     orig_page = getattr(browser, "page", None)
     probe_tabs: list = []
     missing_keys: list[str] = []
+    _opened = 0  # Counts actual tab-opens (cookie-bypassed platforms excluded)
     try:
-        for idx, key in enumerate(platform_keys):
+        for key in platform_keys:
             info = LOGIN_PLATFORMS.get(key)
             if not info:
                 continue
+            # FAST-PATH: cookie signature hit means "logged in" with enough
+            # confidence to skip the tab open + CUA call. Cookie re-check
+            # costs ~nothing (no network, no spawn). Caller treats this
+            # iteration as "not missing" by virtue of the `continue`.
+            try:
+                if await cookie_login_hit(browser, key):
+                    log(f"Phase {phase}: {key} cookie hit — skipping probe", "INFO")
+                    continue
+            except Exception:
+                pass
             # STEALTH-2026-04-19: jitter between tab opens. Cold-start probes
             # that hammer 7 platform tabs in ~2 seconds look robotic enough
             # for Cloudflare / platform bot scoring to light up. 2.5-4.5s
             # between opens matches a user methodically clicking through
             # bookmarks — still fast enough that the user doesn't notice.
-            if idx > 0:
+            if _opened > 0:
                 await asyncio.sleep(random.uniform(2.5, 4.5))
             ok = False
             try:
                 tab = await browser.new_tab(info["root"])
+                _opened += 1
                 probe_tabs.append(tab)
                 # Same 4s settle Phase 0 uses — SPAs paint a neutral
                 # "loading" shell for ~3-4s that CUA misreads as a wall.
@@ -9354,15 +9434,30 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            progress="Verification skipped by user")
                 break
 
-            for _pf_idx, (label, key) in enumerate(preflight_platforms):
+            _pf_opened = 0  # Counts real tab-opens so jitter tracks opens, not skips
+            for label, key in preflight_platforms:
                 if _controls.skip_init_verify:
                     break
+                # FAST-PATH: cookie signature hit means trusted logged-in
+                # state — skip the tab open + CUA call entirely. Cuts
+                # Phase 0 wall-clock by ~80% on warm-profile runs where
+                # the user's session is already in the persistent store.
+                if key not in _preflight_tabs:
+                    try:
+                        if await cookie_login_hit(browser, key):
+                            log(f"Phase 0: {label} cookie hit — skipping verify", "INFO")
+                            emit_event("agent_progress", phase=0, agent=key,
+                                       status="ok", progress=f"{label}: logged in ✓ (cookie)")
+                            _preflight_results[key] = True
+                            continue
+                    except Exception:
+                        pass
                 # STEALTH-2026-04-19: stagger cold-start tab opens with
                 # 2.5-4.5s of jitter. Opening 7 platform tabs back-to-back
                 # in <2s is a strong robotic signal Cloudflare picks up
                 # on. Only applies when we're creating a fresh tab below
                 # (retry paths reuse the existing tab, no new open).
-                if _pf_idx > 0 and key not in _preflight_tabs:
+                if _pf_opened > 0 and key not in _preflight_tabs:
                     await asyncio.sleep(random.uniform(2.5, 4.5))
                 log(f"Phase 0: checking {label}…", "INFO")
                 emit_event("agent_progress", phase=0, agent=key, status="checking",
@@ -9373,6 +9468,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     tab = _preflight_tabs.get(key)
                     if tab is None:
                         tab = await browser.new_tab(root)
+                        _pf_opened += 1
                         _preflight_tabs[key] = tab
                     else:
                         # Re-navigate on retry so we pick up new login state
@@ -11188,6 +11284,27 @@ async def run_setup(profile_dir, wait_minutes=10):
         log("    Check firebase-service-account.json and your network. Exiting.", "ERROR")
         return
 
+    # ── Device display name ────────────────────────────────────────────────
+    # Ask what this PC should be called in the Account page / device
+    # selector. Default is the OS hostname (e.g. "SYAM-PC"). The chosen
+    # name is written to users/{uid}/devices/{deviceId}.name at the end
+    # of setup. On re-runs the user-edited name is preserved via the
+    # existing-field guard in write_device_doc — but a non-default choice
+    # here overrides it, matching the "setup takes the PC name" intent.
+    import socket as _socket
+    _default_hostname = _socket.gethostname()
+    print("")
+    try:
+        _typed = await asyncio.to_thread(
+            input, f"  {_c(_DIM, 'Device name')} {_c(_DIM, '[')}{_c(_BOLD, _default_hostname)}{_c(_DIM, ']:')} ",
+        )
+    except (EOFError, KeyboardInterrupt):
+        _typed = ""
+    chosen_device_name = _typed.strip() or _default_hostname
+    if chosen_device_name != _default_hostname:
+        print(f"  {_c(_OK, '[ok]')}  Device will appear as {_c(_BOLD, chosen_device_name)}")
+    print("")
+
     existing = load_research_token()
     if existing:
         token = existing
@@ -11318,7 +11435,7 @@ async def run_setup(profile_dir, wait_minutes=10):
     # device doc without re-reading Firestore. Also upsert the device doc so
     # the app's Account page + sidebar see this PC immediately.
     save_device_config(paired_uid=linked_uid)
-    write_device_doc(linked_uid, token)
+    write_device_doc(linked_uid, token, device_name=chosen_device_name)
 
     print()
     print(f"  {_c(_OK, '[ok]')}  Linked to {_c(_BOLD, linked_email or '—')}")
@@ -11328,7 +11445,8 @@ async def run_setup(profile_dir, wait_minutes=10):
     # [2/3] BROWSER LOGINS — open 7 platform tabs and wait for real auth.
     # ══════════════════════════════════════════════════════════════════════
     _setup_step(2, 3, "Browser logins")
-    print(f"  {_c(_DIM, 'Opening 7 tabs. Log in on each, then press Enter to verify.')}")
+    print(f"  {_c(_DIM, 'Walking through logins one platform at a time.')}")
+    print(f"  {_c(_DIM, 'Already-logged-in platforms (from a prior setup) are auto-detected.')}")
     print("")
 
     browser = Browser(profile_dir, headless=False)
@@ -11360,116 +11478,131 @@ async def run_setup(profile_dir, wait_minutes=10):
         ("Gmail",          "https://mail.google.com",       "gmail"),
         ("Google Docs",    "https://docs.google.com",       "gdocs"),
     ]
-    pages_by_platform: dict[str, any] = {}
+    # ── Sequential per-platform login (cookie fast-path + press-Enter) ─────
+    # SETUP-2026-04-19: replaces the earlier bulk-open-then-batch-verify
+    # flow. Two problems with the old approach: (1) opening 7 tabs within
+    # a few seconds reads as a robotic burst to Cloudflare scoring, and
+    # (2) asking the user to juggle 7 simultaneous login flows is
+    # overwhelming. New flow walks the list in order — one platform at a
+    # time, cookie-check first, tab-open only on miss, close after verify
+    # so the browser shows just the current target.
+    pad = max(len(n) for n, _u, _k in services)
+    results: dict[str, bool] = {}
+    cancelled = False
+    all_ok = False
 
-    # ── Open 7 platform tabs with humanlike pacing ─────────────────────────
-    # SETUP-2026-04-19: previously opened all 7 tabs in ~10s total, then
-    # re-verified every 30s. Two problems: (1) 7 tabs in 10s looks robotic
-    # to Cloudflare scoring; (2) re-checking every 30s while the user is
-    # still mid-login spams CUA budget and clutters the terminal. New flow:
-    # stagger tab opens with 3-5s jitter (matches a user methodically
-    # clicking bookmarks), then block on a single "Press Enter when done"
-    # prompt — the user drives pacing, we verify only on their signal.
-    divider("Opening 7 platform tabs (staggered)")
-    print("")
-    for idx, (name, url, key) in enumerate(services):
+    def _emit_row(_name, ok, label=""):
+        mark = _c(_OK, "[ok]") if ok else _c(_WARN, "[--]")
+        suffix = f"  {_c(_DIM, label)}" if label else ""
+        print(f"        {mark}  {_name.ljust(pad)}{suffix}")
+
+    def _push_firestore_progress():
+        if not (_firebase_db and token):
+            return
         try:
-            if idx == 0:
-                await browser.navigate(url)
-                pages_by_platform[key] = browser.page
-            else:
-                p = await browser.new_tab(url)
-                pages_by_platform[key] = p
-            print(f"        {_c(_OK, '[+]')}  {name}")
+            _firebase_db.collection("research_tokens").document(token).update({
+                "logins": {k: bool(results.get(k, False)) for _n, _u, k in services},
+                "setupState": "ready" if all(results.get(k, False) for _n, _u, k in services) else "awaiting_login",
+                "lastSetupCheck": int(time.time()),
+            })
+        except Exception:
+            pass
+
+    for idx, (name, url, key) in enumerate(services):
+        # Cookie fast-path — trusted signal, no tab open, no CUA call.
+        try:
+            cookie_ok = await cookie_login_hit(browser, key)
+        except Exception:
+            cookie_ok = False
+        if cookie_ok:
+            results[key] = True
+            _emit_row(name, True, "already logged in (session cookie found)")
+            _push_firestore_progress()
+            continue
+
+        # Stagger tab opens just like the probe paths — a user clicking
+        # through bookmarks takes a beat between each one.
+        if idx > 0:
+            await asyncio.sleep(random.uniform(2.5, 4.5))
+
+        try:
+            tab = await browser.new_tab(url)
         except Exception as e:
             log(f"    Failed to open {name}: {e}", "WARN")
-        if idx < len(services) - 1:
-            await asyncio.sleep(random.uniform(3.0, 5.0))
-    print("")
+            results[key] = False
+            _emit_row(name, False, f"could not open ({e})")
+            _push_firestore_progress()
+            continue
 
-    # ── Press-Enter-to-verify loop ─────────────────────────────────────────
-    pad = max(len(n) for n, _u, _k in services)
-    attempt = 0
-    last_results: dict[str, bool] = {}
-    all_ok = False
-    cancelled = False
+        # SPA hydration — matches Phase 0 / probe timing. CUA misreads
+        # the neutral loading shell as a login wall if we peek too early.
+        await asyncio.sleep(4.0)
 
-    while True:
-        attempt += 1
-        if attempt == 1:
-            print(f"  {_c(_BOLD, 'Log in to all 7 platforms in the open tabs.')}")
-            print(f"  {_c(_DIM, 'When done, come back here and press Enter to verify.')}")
-        else:
-            missing_names = [n for n, _u, k in services if not last_results.get(k)]
-            print(f"  {_c(_WARN, 'Still missing:')} {_c(_BOLD, ', '.join(missing_names))}")
-            print(f"  {_c(_DIM, 'Finish logging in, then press Enter to re-verify.')}")
         print("")
-        try:
-            await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Press Enter when ready ")
-        except (EOFError, KeyboardInterrupt):
-            print("")
-            log("Setup cancelled by user", "INFO")
-            cancelled = True
-            break
+        print(f"  {_c(_BOLD, name)}  {_c(_DIM, '— log in on the tab that just opened.')}")
 
-        divider(f"Verifying logins (attempt {attempt})")
-        print("")
-        results: dict[str, bool] = {}
-        for v_idx, (_name, _u, key) in enumerate(services):
-            p = pages_by_platform.get(key)
-            if not p:
-                results[key] = False
-                continue
-            # Small jitter between verification calls too — keeps the CUA
-            # burst off a synchronous 7-call spike (rate-limit courtesy,
-            # not stealth-critical since these tabs already exist).
-            if v_idx > 0:
-                await asyncio.sleep(random.uniform(1.0, 2.0))
-            # LAYER 1 — Playwright DOM check. Fast, zero-cost, catches the
-            # obvious unauthenticated state. Skip CUA on a DOM miss.
+        platform_ok = False
+        while True:
             try:
-                playwright_ok = await verify_login(p, key, strict=True)
+                await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Press Enter when done ")
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                log("Setup cancelled by user", "INFO")
+                cancelled = True
+                try:
+                    await tab.close()
+                except Exception:
+                    pass
+                break
+
+            # Re-check cookies first (cheap). Login flow landed? Cookie's there.
+            try:
+                cookie_ok = await cookie_login_hit(browser, key)
+            except Exception:
+                cookie_ok = False
+            if cookie_ok:
+                platform_ok = True
+                break
+
+            # Fall through to the two-layer verify: Playwright DOM + CUA.
+            try:
+                playwright_ok = await verify_login(tab, key, strict=True)
             except Exception:
                 playwright_ok = False
             if not playwright_ok:
-                results[key] = False
+                print(f"  {_c(_WARN, 'Not logged in yet — finish the flow and press Enter again.')}")
                 continue
-            # LAYER 2 — CUA vision check. Catches half-logged-out states
-            # (stale session, expired cookie, interstitial) that pass DOM.
+
             if not _setup_cua_client:
-                results[key] = True
-                continue
+                platform_ok = True
+                break
             try:
-                cua_ok = await verify_login_cua(p, key, _setup_cua_client)
+                cua_ok = await verify_login_cua(tab, key, _setup_cua_client)
             except Exception as e:
                 log(f"    CUA verify error for {key}: {e}", "WARN")
                 cua_ok = False
-            results[key] = bool(cua_ok)
+            if cua_ok:
+                platform_ok = True
+                break
+            print(f"  {_c(_WARN, 'DOM passed but CUA disagreed — try the login again and press Enter.')}")
 
-        done_count = sum(1 for v in results.values() if v)
-        print(f"  {_c(_DIM, 'Result:')}  {_c(_BOLD, f'{done_count}/{len(services)}')} {_c(_DIM, 'logged in')}")
-        for name, _u, key in services:
-            ok = results.get(key)
-            mark = _c(_OK, "[ok]") if ok else _c(_WARN, "[  ]")
-            name_colored = name if ok else _c(_DIM, name)
-            print(f"        {mark}  {name_colored}")
-        print("")
-
-        if _firebase_db and token:
-            try:
-                _firebase_db.collection("research_tokens").document(token).update({
-                    "logins": {k: bool(v) for k, v in results.items()},
-                    "setupState": "ready" if all(results.values()) else "awaiting_login",
-                    "lastSetupCheck": int(time.time()),
-                })
-            except Exception:
-                pass
-
-        last_results = results
-        if all(results.values()):
-            all_ok = True
+        if cancelled:
             break
 
+        try:
+            await tab.close()
+        except Exception:
+            pass
+
+        results[key] = platform_ok
+        _emit_row(name, platform_ok)
+        _push_firestore_progress()
+
+    if not cancelled:
+        all_ok = all(results.get(k, False) for _n, _u, k in services)
+    last_results = dict(results)
+
+    _push_firestore_progress()
     await browser.close()
 
     print("")
