@@ -26,6 +26,7 @@ import random
 import shutil
 import argparse
 import subprocess
+import collections
 from pathlib import Path
 from prompts import *
 from datetime import datetime
@@ -3469,6 +3470,30 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=3)
 
 # ── Event Emission (dual-write: disk + Firestore) ────────────────────────────
 
+# T2 narrator ring buffer. Populated by emit_event, read by _narrator_loop.
+# Bounded at 50 — wide enough to cover ~2-5 min at typical event density,
+# tight enough that the narrator prompt never balloons. Appended AFTER the
+# Firestore write so the frontend and the ring-buffer never diverge in
+# order. Do NOT rely on this for frontend-observable state — it's a
+# backend-only snapshot for narration prompts.
+_recent_events: "collections.deque" = collections.deque(maxlen=50)
+
+
+def _recent_events_window(seconds: float) -> list:
+    """Return recent events no older than `seconds`, oldest → newest.
+    Filters out `phase_narration` so the narrator doesn't feed on its
+    own output (would produce drift + hall-of-mirrors summaries)."""
+    cutoff_ms = int((time.time() - seconds) * 1000)
+    out = []
+    for e in list(_recent_events):
+        if e.get("timestamp", 0) < cutoff_ms:
+            continue
+        if e.get("type") == "phase_narration":
+            continue
+        out.append(e)
+    return out
+
+
 def emit_event(event_type, phase=None, agent=None, **data):
     """Emit a typed event to events.jsonl AND Firestore pipeline_events."""
     if not _tracks_dir:
@@ -3496,6 +3521,24 @@ def emit_event(event_type, phase=None, agent=None, **data):
             record_phase_duration(phase, dur, agent=agent or "")
     # Write to Firestore (frontend real-time transport)
     _emit_to_firestore(event)
+    # Drop into the narrator ring buffer (after Firestore so ordering
+    # cannot drift between what the frontend sees and what the narrator
+    # reasons from).
+    try:
+        _recent_events.append(event)
+    except Exception:
+        pass
+    # T2 narrator lifecycle — auto-wired to phase boundaries so every
+    # phase_start / phase_complete / phase_skipped / pipeline_stopped site
+    # doesn't need manual start/stop_narrator calls. Single point of truth.
+    try:
+        if event_type == "phase_start" and isinstance(phase, int) and phase >= 0:
+            start_narrator(phase)
+        elif event_type in ("phase_complete", "phase_skipped",
+                             "pipeline_stopped", "pipeline_complete"):
+            stop_narrator()
+    except Exception:
+        pass
 
 
 def fail_phase(phase, error, reason=None, agent=None, actions=None, **extra):
@@ -3531,6 +3574,207 @@ def fail_phase(phase, error, reason=None, agent=None, actions=None, **extra):
     ]
     payload.update(extra)
     emit_event("pipeline_error", phase=phase, agent=agent, **payload)
+
+
+# ── T2: Phase narration (Gemini Flash — one human sentence per tick) ─────────
+# A per-phase async task that watches the ring buffer and emits a
+# `phase_narration` event every few seconds so the user always sees a live
+# story in the phase dropdown, not just raw progress bars. Tight (6s) during
+# data-rich phases (P1 brief, P2 parallel DR) so the narration can cite real
+# scrape content; looser (20s) during scripted phases (P0/3/4/5) where state
+# changes in chunky steps. Cost ~$0.02/run on Gemini 2.0 Flash.
+#
+# Interaction with T4 watchdog: each `phase_narration` emit flows through
+# the frontend's `markEventReceived` → refreshes `eventSilenceSec`, so the
+# watchdog stays in "alive" state during genuine work. When the backend
+# really dies, narration stops too — and watchdog correctly flips to silent.
+
+PHASE_FLOW_CONTEXT = {
+    0: ("Phase 0 is the warmup: launch a dedicated Chrome profile and probe "
+        "that ChatGPT, Gemini, Claude, NotebookLM, YouTube, Gmail, and "
+        "Google Docs are all logged in. With skipInitVerify the probe is a "
+        "cookie sniff (<10s); full verify is a per-platform CUA round (1-2 min)."),
+    1: ("Phase 1 is brief generation. ChatGPT Pro with Extended Thinking "
+        "drafts a detailed research brief from the topic + any PDFs. The "
+        "flow is: open ChatGPT, clear any HV gate, select Pro + Thinking, "
+        "attach PDFs, submit the brief prompt, then ~10-20 min of reasoning "
+        "+ writing while the frontend token-streams the output."),
+    2: ("Phase 2 is parallel deep research. ChatGPT Deep Research, Gemini "
+        "Deep Research, and Claude Adaptive Thinking + Research tools run "
+        "at the same time with the same brief. Each crawls 40-60+ sources "
+        "and produces an independent 5-15k-word markdown report. Runs "
+        "30-90 min; per-agent sources, sections, and thinking stream live."),
+    3: ("Phase 3 is NotebookLM: upload each agent's .md to Google "
+        "NotebookLM, rename the notebook, make it public, then generate a "
+        "podcast-style audio overview where two AI hosts discuss the "
+        "findings. Upload + audio gen together take 15-25 min."),
+    4: ("Phase 4 is video: render a thumbnail, wrap the audio + thumbnail "
+        "into an MP4 with ffmpeg, then upload the video to YouTube as "
+        "unlisted. Processing + URL extraction together take 3-8 min."),
+    5: ("Phase 5 is delivery: create a Google Doc hub listing every output "
+        "link (brief, reports, NotebookLM, YouTube), make it publicly "
+        "shareable, and email the user a notification with every link via "
+        "Gmail."),
+}
+
+_narrator_task = None  # type: asyncio.Task | None
+
+
+def _narrator_cadence_for_phase(phase: int) -> float:
+    # P1+P2 stream rich real data — tighter cadence catches sub-step changes.
+    # P0/3/4/5 transition in chunky deterministic steps — 20s is plenty.
+    return 6.0 if phase in (1, 2) else 20.0
+
+
+def _compact_event_for_narration(e: dict) -> str:
+    """Flatten an event into one line for the narrator prompt. Skips
+    high-cardinality fields and caps each value at 120 chars so a 20-event
+    window stays well under the Gemini Flash input budget."""
+    t = e.get("type", "")
+    ph = e.get("phase", "")
+    ag = e.get("agent", "")
+    d = e.get("data", {}) or {}
+    parts = [f"{t} ph={ph}"]
+    if ag:
+        parts.append(f"agent={ag}")
+    for k in ("status", "progress", "error", "message", "reason",
+              "sources", "sections", "partialTextLen", "elapsedSec"):
+        v = d.get(k)
+        if v in (None, "", [], {}):
+            continue
+        if isinstance(v, (list, dict)):
+            s = json.dumps(v)[:120]
+        else:
+            s = str(v)[:120]
+        parts.append(f"{k}={s}")
+    return " | ".join(parts)
+
+
+async def _narrator_loop(phase: int):
+    """Poll the ring buffer every `cadence` seconds. Synthesize one human
+    sentence. Emit as `phase_narration`. Back off on 429 / network blip."""
+    if not GEMINI_API_KEY:
+        return
+    if phase is None or phase < 0:
+        return
+    cadence = _narrator_cadence_for_phase(phase)
+    last_narration = ""
+    backoff_ticks_left = 0
+    try:
+        import requests as _requests
+    except Exception:
+        return
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+    try:
+        while True:
+            await asyncio.sleep(cadence if backoff_ticks_left == 0 else 15.0)
+            if backoff_ticks_left > 0:
+                backoff_ticks_left -= 1
+            # Skip narration during stop/pause so the user isn't getting
+            # "still working" lines while the pipeline is actually frozen.
+            try:
+                if _controls.is_stop() or _controls.is_pause():
+                    continue
+            except Exception:
+                pass
+            recent = _recent_events_window(30.0)
+            phase_ctx = PHASE_FLOW_CONTEXT.get(phase, "")
+            data_rich = phase in (1, 2)
+            style_note = (
+                "CITE the real scrape content when you can — reference specific "
+                "source counts, section titles, or partialTextLen numbers you see "
+                "in the events. Do not invent specifics."
+                if data_rich else
+                "Reason from the hardcoded phase flow + elapsed time + last status "
+                "transition. Do not invent specific numbers."
+            )
+            system = (
+                "You narrate ONE human sentence summarizing what the Super Research "
+                "pipeline is doing RIGHT NOW for a user watching the phase dropdown. "
+                f"Phase {phase}: {phase_ctx} {style_note} "
+                "Output exactly ONE sentence, <= 110 chars. No markdown. No prefix "
+                "like 'Currently' or 'Status:'. No em-dashes. If the events show "
+                "nothing new, say something like 'Still working on <last known step>.'"
+            )
+            event_lines = "\n".join(
+                f"- {_compact_event_for_narration(e)}" for e in recent[-20:]
+            )
+            user_msg = f"Recent events (newest last):\n{event_lines or '[none]'}"
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+                "systemInstruction": {"parts": [{"text": system}]},
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 80},
+            }
+            try:
+                resp = await asyncio.to_thread(
+                    _requests.post, url, json=payload, timeout=5)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+            if resp.status_code == 429:
+                backoff_ticks_left = 3  # 3 × 15s soft back-off window
+                continue
+            if resp.status_code >= 400:
+                continue
+            try:
+                j = resp.json()
+                text = (j.get("candidates", [{}])[0]
+                         .get("content", {})
+                         .get("parts", [{}])[0]
+                         .get("text", ""))
+            except Exception:
+                continue
+            text = (text or "").strip().strip('"').strip("`").strip()
+            # Dedupe — skip emitting the same line twice in a row.
+            if not text or text == last_narration:
+                continue
+            last_narration = text
+            try:
+                emit_event("phase_narration", phase=phase, text=text)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        return
+    except Exception as _e:
+        try:
+            log(f"[narrator] loop crashed ({_e}) — narration stopped for phase {phase}", "WARN")
+        except Exception:
+            pass
+        return
+
+
+def start_narrator(phase: int):
+    """Cancel any existing narrator task and start a fresh one scoped to
+    this phase. Wired automatically from emit_event on `phase_start`.
+    Safe to call when there's no running event loop (silently no-ops)."""
+    global _narrator_task
+    try:
+        if _narrator_task and not _narrator_task.done():
+            _narrator_task.cancel()
+    except Exception:
+        pass
+    try:
+        _narrator_task = asyncio.create_task(_narrator_loop(phase))
+    except RuntimeError:
+        # No running event loop (pre-startup / CLI paths). Skip.
+        _narrator_task = None
+
+
+def stop_narrator():
+    """Cancel the narrator task. Wired automatically from emit_event on
+    `phase_complete` / `phase_skipped`. Also called explicitly by
+    orchestrator teardown / exception paths."""
+    global _narrator_task
+    try:
+        if _narrator_task and not _narrator_task.done():
+            _narrator_task.cancel()
+    except Exception:
+        pass
+    _narrator_task = None
 
 
 # ── Per-phase login probe (never-die contract) ─────────────────────────
