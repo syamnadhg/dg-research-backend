@@ -22,6 +22,7 @@ import json
 import base64
 import socket
 import asyncio
+import random
 import shutil
 import argparse
 import subprocess
@@ -3460,10 +3461,17 @@ async def _probe_phase_logins(browser, cua_client, phase: int, platform_keys: li
     probe_tabs: list = []
     missing_keys: list[str] = []
     try:
-        for key in platform_keys:
+        for idx, key in enumerate(platform_keys):
             info = LOGIN_PLATFORMS.get(key)
             if not info:
                 continue
+            # STEALTH-2026-04-19: jitter between tab opens. Cold-start probes
+            # that hammer 7 platform tabs in ~2 seconds look robotic enough
+            # for Cloudflare / platform bot scoring to light up. 2.5-4.5s
+            # between opens matches a user methodically clicking through
+            # bookmarks — still fast enough that the user doesn't notice.
+            if idx > 0:
+                await asyncio.sleep(random.uniform(2.5, 4.5))
             ok = False
             try:
                 tab = await browser.new_tab(info["root"])
@@ -9346,9 +9354,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            progress="Verification skipped by user")
                 break
 
-            for label, key in preflight_platforms:
+            for _pf_idx, (label, key) in enumerate(preflight_platforms):
                 if _controls.skip_init_verify:
                     break
+                # STEALTH-2026-04-19: stagger cold-start tab opens with
+                # 2.5-4.5s of jitter. Opening 7 platform tabs back-to-back
+                # in <2s is a strong robotic signal Cloudflare picks up
+                # on. Only applies when we're creating a fresh tab below
+                # (retry paths reuse the existing tab, no new open).
+                if _pf_idx > 0 and key not in _preflight_tabs:
+                    await asyncio.sleep(random.uniform(2.5, 4.5))
                 log(f"Phase 0: checking {label}…", "INFO")
                 emit_event("agent_progress", phase=0, agent=key, status="checking",
                            progress=f"Verifying {label} login…")
@@ -11313,7 +11328,7 @@ async def run_setup(profile_dir, wait_minutes=10):
     # [2/3] BROWSER LOGINS — open 7 platform tabs and wait for real auth.
     # ══════════════════════════════════════════════════════════════════════
     _setup_step(2, 3, "Browser logins")
-    print(f"  {_c(_DIM, 'Log into each of the 7 tabs. We re-check every 30 seconds.')}")
+    print(f"  {_c(_DIM, 'Opening 7 tabs. Log in on each, then press Enter to verify.')}")
     print("")
 
     browser = Browser(profile_dir, headless=False)
@@ -11346,42 +11361,72 @@ async def run_setup(profile_dir, wait_minutes=10):
         ("Google Docs",    "https://docs.google.com",       "gdocs"),
     ]
     pages_by_platform: dict[str, any] = {}
-    try:
-        await browser.navigate(services[0][1])
-        pages_by_platform[services[0][2]] = browser.page
-    except Exception as e:
-        log(f"    Failed to open {services[0][0]}: {e}", "WARN")
-    await asyncio.sleep(2)
-    for name, url, key in services[1:]:
-        try:
-            p = await browser.new_tab(url)
-            pages_by_platform[key] = p
-            await asyncio.sleep(1.5)
-        except Exception as e:
-            log(f"    Failed: {name} ({e})", "WARN")
 
-    divider(f"Verifying every 30s (timeout: {wait_minutes}m — Ctrl+C to cancel)")
+    # ── Open 7 platform tabs with humanlike pacing ─────────────────────────
+    # SETUP-2026-04-19: previously opened all 7 tabs in ~10s total, then
+    # re-verified every 30s. Two problems: (1) 7 tabs in 10s looks robotic
+    # to Cloudflare scoring; (2) re-checking every 30s while the user is
+    # still mid-login spams CUA budget and clutters the terminal. New flow:
+    # stagger tab opens with 3-5s jitter (matches a user methodically
+    # clicking bookmarks), then block on a single "Press Enter when done"
+    # prompt — the user drives pacing, we verify only on their signal.
+    divider("Opening 7 platform tabs (staggered)")
+    print("")
+    for idx, (name, url, key) in enumerate(services):
+        try:
+            if idx == 0:
+                await browser.navigate(url)
+                pages_by_platform[key] = browser.page
+            else:
+                p = await browser.new_tab(url)
+                pages_by_platform[key] = p
+            print(f"        {_c(_OK, '[+]')}  {name}")
+        except Exception as e:
+            log(f"    Failed to open {name}: {e}", "WARN")
+        if idx < len(services) - 1:
+            await asyncio.sleep(random.uniform(3.0, 5.0))
     print("")
 
-    # Longest platform label for neat column alignment
+    # ── Press-Enter-to-verify loop ─────────────────────────────────────────
     pad = max(len(n) for n, _u, _k in services)
-    deadline = time.time() + wait_minutes * 60
-    all_ok = False
+    attempt = 0
     last_results: dict[str, bool] = {}
-    check_n = 0
+    all_ok = False
+    cancelled = False
 
-    while time.time() < deadline:
-        check_n += 1
+    while True:
+        attempt += 1
+        if attempt == 1:
+            print(f"  {_c(_BOLD, 'Log in to all 7 platforms in the open tabs.')}")
+            print(f"  {_c(_DIM, 'When done, come back here and press Enter to verify.')}")
+        else:
+            missing_names = [n for n, _u, k in services if not last_results.get(k)]
+            print(f"  {_c(_WARN, 'Still missing:')} {_c(_BOLD, ', '.join(missing_names))}")
+            print(f"  {_c(_DIM, 'Finish logging in, then press Enter to re-verify.')}")
+        print("")
+        try:
+            await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Press Enter when ready ")
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            log("Setup cancelled by user", "INFO")
+            cancelled = True
+            break
+
+        divider(f"Verifying logins (attempt {attempt})")
+        print("")
         results: dict[str, bool] = {}
-        for _name, _u, key in services:
+        for v_idx, (_name, _u, key) in enumerate(services):
             p = pages_by_platform.get(key)
             if not p:
                 results[key] = False
                 continue
+            # Small jitter between verification calls too — keeps the CUA
+            # burst off a synchronous 7-call spike (rate-limit courtesy,
+            # not stealth-critical since these tabs already exist).
+            if v_idx > 0:
+                await asyncio.sleep(random.uniform(1.0, 2.0))
             # LAYER 1 — Playwright DOM check. Fast, zero-cost, catches the
-            # obvious unauthenticated state (login form visible, redirect to
-            # /login, etc.). If this fails, the platform is definitely not
-            # logged in — skip CUA since that would just burn budget.
+            # obvious unauthenticated state. Skip CUA on a DOM miss.
             try:
                 playwright_ok = await verify_login(p, key, strict=True)
             except Exception:
@@ -11389,11 +11434,8 @@ async def run_setup(profile_dir, wait_minutes=10):
             if not playwright_ok:
                 results[key] = False
                 continue
-            # LAYER 2 — CUA vision check. Only platforms that Playwright
-            # already accepts get here. CUA can still say NO if what looks
-            # like an authed layout is actually a half-logged-out state (stale
-            # session, expired cookie, interstitial). Two-strike retry built
-            # in. Skipped when no CUA key is available.
+            # LAYER 2 — CUA vision check. Catches half-logged-out states
+            # (stale session, expired cookie, interstitial) that pass DOM.
             if not _setup_cua_client:
                 results[key] = True
                 continue
@@ -11404,31 +11446,29 @@ async def run_setup(profile_dir, wait_minutes=10):
                 cua_ok = False
             results[key] = bool(cua_ok)
 
-        # Only re-render the checklist when something flipped (or on first pass)
-        if results != last_results:
-            done_count = sum(1 for v in results.values() if v)
-            print(f"  {_c(_DIM, f'Check #{check_n}')}  {_c(_BOLD, f'{done_count}/{len(services)}')} {_c(_DIM, 'logged in')}")
-            for name, _u, key in services:
-                ok = results.get(key)
-                mark = _c(_OK, "[ok]") if ok else _c(_DIM, "[  ]")
-                name_colored = name if ok else _c(_DIM, name)
-                print(f"        {mark}  {name_colored.ljust(pad + (len(_c(_DIM, '')) if not ok and _USE_COLOR else 0))}")
-            print("")
-            if _firebase_db and token:
-                try:
-                    _firebase_db.collection("research_tokens").document(token).update({
-                        "logins": {k: bool(v) for k, v in results.items()},
-                        "setupState": "ready" if all(results.values()) else "awaiting_login",
-                        "lastSetupCheck": int(time.time()),
-                    })
-                except Exception:
-                    pass
-            last_results = results
+        done_count = sum(1 for v in results.values() if v)
+        print(f"  {_c(_DIM, 'Result:')}  {_c(_BOLD, f'{done_count}/{len(services)}')} {_c(_DIM, 'logged in')}")
+        for name, _u, key in services:
+            ok = results.get(key)
+            mark = _c(_OK, "[ok]") if ok else _c(_WARN, "[  ]")
+            name_colored = name if ok else _c(_DIM, name)
+            print(f"        {mark}  {name_colored}")
+        print("")
 
+        if _firebase_db and token:
+            try:
+                _firebase_db.collection("research_tokens").document(token).update({
+                    "logins": {k: bool(v) for k, v in results.items()},
+                    "setupState": "ready" if all(results.values()) else "awaiting_login",
+                    "lastSetupCheck": int(time.time()),
+                })
+            except Exception:
+                pass
+
+        last_results = results
         if all(results.values()):
             all_ok = True
             break
-        await asyncio.sleep(30)
 
     await browser.close()
 
@@ -11461,15 +11501,16 @@ async def run_setup(profile_dir, wait_minutes=10):
     else:
         print()
         print(f"  {_c(_WARN, '━' * 62)}")
-        print(f"  {_c(_WARN, 'Setup timed out — some platforms are still not logged in.')}")
+        print(f"  {_c(_WARN, 'Setup cancelled — not all platforms logged in yet.')}")
         print(f"  {_c(_WARN, '━' * 62)}")
         print("")
-        print(f"  {_c(_DIM, 'Last check:')}")
-        for name, _u, key in services:
-            ok = last_results.get(key)
-            mark = _c(_OK, "[ok]") if ok else _c(_DIM, "[  ]")
-            print(f"        {mark}  {name if ok else _c(_DIM, name)}")
-        print("")
+        if last_results:
+            print(f"  {_c(_DIM, 'Last check:')}")
+            for name, _u, key in services:
+                ok = last_results.get(key)
+                mark = _c(_OK, "[ok]") if ok else _c(_DIM, "[  ]")
+                print(f"        {mark}  {name if ok else _c(_DIM, name)}")
+            print("")
         print(f"  {_c(_DIM, 'Your token is saved. Re-run when ready:')}")
         print(f"        {_c(_BOLD, 'python research.py --setup')}")
         print("")
