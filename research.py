@@ -1274,12 +1274,20 @@ def _start_command_listener(uid, research_id, loop):
                     log("Command received: RETRY_PHASE rejected — no phase number", "WARN")
             elif action == "retry_agent":
                 # User clicked "Retry [Agent]" on a Phase 2 agent warning.
-                # Phase 2's polling loop checks consume_retry_agent(key) and
-                # submits a follow-up prompt to continue/regenerate.
+                # Mode selector:
+                #   "soft" (default) — polling pastes a follow-up into the
+                #                      existing tab, preserves partial output
+                #   "hard"           — polling closes the tab and re-runs the
+                #                      full setup (fresh session, no partial)
+                # Hard retry is capped at 2/agent/phase by the polling loop.
                 _ag = (data.get("agent") or "").strip()
-                if _ag:
+                _mode = (data.get("mode") or "soft").strip().lower()
+                if _ag and _mode == "hard":
+                    loop.call_soon_threadsafe(_controls.request_retry_agent_hard, _ag)
+                    log(f"Command received: RETRY_AGENT agent={_ag} mode=hard")
+                elif _ag:
                     loop.call_soon_threadsafe(_controls.request_retry_agent, _ag)
-                    log(f"Command received: RETRY_AGENT agent={_ag}")
+                    log(f"Command received: RETRY_AGENT agent={_ag} mode=soft")
                 else:
                     log("Command received: RETRY_AGENT rejected — no agent", "WARN")
             elif action == "continue_partial_agent":
@@ -1402,6 +1410,15 @@ class PipelineControls:
         # warning (timeout or empty-final). Phase 2 polling checks
         # consume_retry_agent(key) and submits a follow-up prompt.
         self.retry_agents: set[str] = set()
+        # Hard retry-agent: user chose "Retry (hard)" on a Phase 2 agent
+        # warning, or a handler escalated to hard semantics. Instead of
+        # pasting a follow-up into the same tab, the polling loop closes
+        # the page, re-runs start_agent_no_gemini_wait from scratch, and
+        # replaces pending[name]. Use for session-expiry / broken-tab
+        # cases where soft retry cannot recover. Capped at 2 per-agent
+        # per-phase via pending[name]["hard_retry_count"] — above that,
+        # falls through to soft retry.
+        self.retry_agents_hard: set[str] = set()
         # Continue-partial: user accepted a Phase 2 agent's short/timed-out
         # output. Phase 2 polling finalizes the agent with status
         # "done_partial" / "timeout_partial".
@@ -1515,6 +1532,7 @@ class PipelineControls:
         self.skip_email = False
         self.retry_phase_requested.clear()
         self.retry_agents.clear()
+        self.retry_agents_hard.clear()
         self.continue_partial_agents.clear()
         self.poke_agents.clear()
         self.wait_longer_agents.clear()
@@ -1670,6 +1688,24 @@ class PipelineControls:
         key = (agent or "").strip().lower()
         if key in self.retry_agents:
             self.retry_agents.discard(key)
+            return True
+        return False
+
+    def request_retry_agent_hard(self, agent: str):
+        """Hard retry: close the agent's tab and re-run start_agent_no_gemini_wait
+        from scratch. Preserves other agents; only this one gets a clean slate.
+        Use when the soft follow-up can't recover (e.g., session expired, tab
+        crashed, hostile Cloudflare gate)."""
+        key = (agent or "").strip().lower()
+        if key:
+            self.retry_agents_hard.add(key)
+            self.pause_event.clear()
+            self.resume_event.set()
+
+    def consume_retry_agent_hard(self, agent: str) -> bool:
+        key = (agent or "").strip().lower()
+        if key in self.retry_agents_hard:
+            self.retry_agents_hard.discard(key)
             return True
         return False
 
@@ -5024,6 +5060,90 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
 
 # ── Round-Robin Polling (Phase 2) ─────────────────────────────────────────────
 
+async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
+                                 brief_path, verbose: bool):
+    """Hard-retry helper: re-run the per-agent setup for a Phase 2 agent from
+    scratch (fresh tab, Pro/DR mode selection, brief paste, submit, verify).
+
+    Mirrors the per-agent setup blocks inside `run_phase2` — kept in sync
+    manually because run_phase2's setup is entangled with agent startup
+    ordering (Gemini waits for Start-research button AFTER ChatGPT/Claude
+    submit). For a single-agent restart, ordering doesn't matter: run the
+    agent's own setup in isolation.
+
+    Returns `(new_page, verified_bool)` or `None` on hard failure."""
+    if name == "ChatGPT":
+        new_page = await start_agent_no_gemini_wait(
+            browser, cua_client, "https://chatgpt.com",
+            PROMPT_CHATGPT_DEEP_RESEARCH,
+            "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+            brief_text, "2A-retry", "ChatGPT", verbose, brief_path=brief_path)
+        verified = await wait_until_verified(
+            verify_chatgpt_generating, new_page, "2A-retry",
+            browser=browser, cua_client=cua_client,
+            max_retries=15, interval=3, verbose=verbose)
+        return (new_page, verified)
+
+    if name == "Claude":
+        new_page = await start_agent_no_gemini_wait(
+            browser, cua_client, "https://claude.ai/new",
+            PROMPT_CLAUDE_DEEP_RESEARCH,
+            "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+            brief_text, "2C-retry", "Claude", verbose, brief_path=brief_path)
+        verified = await wait_until_verified(
+            verify_claude_generating, new_page, "2C-retry",
+            browser=browser, cua_client=cua_client,
+            max_retries=15, interval=3, verbose=verbose)
+        return (new_page, verified)
+
+    if name == "Gemini":
+        new_page = await start_agent_no_gemini_wait(
+            browser, cua_client, "https://gemini.google.com",
+            PROMPT_GEMINI_DEEP_RESEARCH,
+            "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+            brief_text, "2B-retry", "Gemini", verbose, brief_path=brief_path)
+        await browser.switch_to_page(new_page)
+        await asyncio.sleep(2)
+
+        # Gemini needs an extra click: wait up to 90s for "Start research"
+        # button, click via JS, fall back to CUA if JS can't find it.
+        start_clicked = False
+        for attempt in range(45):
+            try:
+                clicked = await new_page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        const txt = b.textContent.trim().toLowerCase();
+                        if (txt.includes('start research')) { b.click(); return true; }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    start_clicked = True
+                    await asyncio.sleep(5)
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+        if not start_clicked and cua_client:
+            await browser.switch_to_page(new_page)
+            fix = await agent_loop(cua_client, browser,
+                PROMPT_GEMINI_START_RESEARCH,
+                "Click the 'Start research' button to begin the deep research.",
+                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+            if "click" in (fix.get("text") or "").lower():
+                start_clicked = True
+                await asyncio.sleep(5)
+
+        verified = await wait_until_verified(
+            verify_gemini_generating, new_page, "2B-retry",
+            browser=browser, cua_client=cua_client,
+            max_retries=15, interval=3, verbose=verbose)
+        return (new_page, verified)
+
+    return None
+
+
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -5216,6 +5336,119 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # Whether or not the agent was actually in pending, clear it from
             # the skip set so we don't keep firing agent_skipped every tick.
             _controls.skipped_agents.discard(_ag_key)
+
+        # ── Hard retry (close tab + re-run setup from scratch) ──
+        # Unlike the soft retry (pastes a follow-up into the same tab and
+        # extends the budget — handled per-agent in the timeout branch
+        # below), hard retry throws away the tab and starts the agent
+        # fresh. Use when the session died or the tab is otherwise
+        # unrecoverable. Other agents keep running untouched.
+        _hard_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
+        for _agent_key in ("chatgpt", "gemini", "claude"):
+            if not _controls.consume_retry_agent_hard(_agent_key):
+                continue
+            _agent_name = _hard_name_map.get(_agent_key)
+            if not _agent_name or _agent_name not in pending:
+                continue
+            p = pending[_agent_name]
+            _hard_count = int(p.get("hard_retry_count", 0)) + 1
+            # Cap: 2 hard retries per agent per phase. Above the cap,
+            # fall through to soft retry (follow-up in same tab) instead
+            # of looping forever through expensive tab restarts.
+            if _hard_count > 2:
+                try:
+                    emit_event("pipeline_warning", phase=2, agent=_agent_key,
+                               message=f"{_agent_name} hit the 2-hard-retry cap — queuing a soft retry instead",
+                               details="Hard retry opens a fresh tab and resubmits the brief. Two attempts have already failed. Continuing with a soft follow-up in the existing tab; use Skip to drop the agent entirely.",
+                               alertType="warn")
+                except Exception:
+                    pass
+                _controls.retry_agents.add(_agent_key)
+                continue
+            log(f"[{_agent_name}] Hard retry #{_hard_count} — closing tab, re-running setup", "WARN")
+            try:
+                emit_event("pipeline_warning", phase=2, agent=_agent_key,
+                           message=f"Hard-retrying {_agent_name} — reopening tab and resubmitting brief",
+                           details=f"Attempt {_hard_count}/2. Any partial output in the closed tab is discarded.",
+                           alertType="retrying")
+            except Exception:
+                pass
+            # Resolve the brief from runtime state (populated before Phase 2 kicks
+            # off at line ~10050: `_runtime.original_inputs = {..., 'brief': ...}`).
+            _brief_text_hr = _runtime.original_inputs.get("brief") or ""
+            _brief_path_hr = None
+            if _tracks_dir:
+                _bp = Path(__file__).parent / "queues" / _tracks_dir.name / "documents" / "brief.md"
+                if _bp.exists():
+                    _brief_path_hr = str(_bp)
+            # Close old tab — non-fatal if it's already gone.
+            try:
+                old_page = p.get("page")
+                if old_page is not None:
+                    await old_page.close()
+            except Exception:
+                pass
+            # Re-run agent setup. On crash, drop the agent from pending so
+            # the phase can proceed with whoever else is still healthy.
+            try:
+                restart = await _restart_phase2_agent(
+                    _agent_name, browser, cua_client,
+                    _brief_text_hr, _brief_path_hr, verbose)
+            except Exception as _e:
+                log(f"[{_agent_name}] Hard retry setup crashed: {_e}", "ERROR")
+                try:
+                    emit_event("pipeline_error", phase=2, agent=_agent_key,
+                               error=f"Hard retry failed: {_e}")
+                except Exception:
+                    pass
+                del pending[_agent_name]
+                results[_agent_name] = {"status": "hard_retry_failed", "text": "",
+                                         "url": "", "page": None, "elapsed_sec": 0}
+                continue
+            if restart is None:
+                log(f"[{_agent_name}] Hard retry returned None — dropping agent", "WARN")
+                del pending[_agent_name]
+                results[_agent_name] = {"status": "hard_retry_failed", "text": "",
+                                         "url": "", "page": None, "elapsed_sec": 0}
+                continue
+            new_page, verified_h = restart
+            _now = time.time()
+            pending[_agent_name] = {
+                "page": new_page,
+                "url": new_page.url if new_page else "",
+                "start_time": _now,
+                "done_count": 0,
+                "cua_confirmed": False,
+                "last_heartbeat": _now,
+                "last_cua_check": _now,
+                "last_artifact_scrape": _now,
+                "observer_text_len": 0,
+                "empty_retries": 0,
+                "hard_retry_count": _hard_count,
+            }
+            _runtime.register_page(_agent_key, new_page,
+                                    new_page.url if new_page else "")
+            if verified_h:
+                try:
+                    await inject_agent_observer(new_page, _agent_key)
+                except Exception:
+                    pass
+                try:
+                    emit_event("agent_progress", phase=2, agent=_agent_key,
+                               status="generating",
+                               progress=f"{_agent_name} restarted (hard retry #{_hard_count}) — running")
+                except Exception:
+                    pass
+                log(f"[{_agent_name}] Hard retry successful ✓")
+            else:
+                log(f"[{_agent_name}] Hard retry tab opened but not verified yet — polling will re-check", "WARN")
+                try:
+                    emit_event("pipeline_warning", phase=2, agent=_agent_key,
+                               message=f"{_agent_name} reopened but not verified yet",
+                               details="The new tab loaded and the brief was resubmitted, but generation verification didn't land within the window. The round-robin will keep polling; verification often completes a few seconds later.",
+                               alertType="warn")
+                except Exception:
+                    pass
 
         for name in list(pending.keys()):
             p = pending[name]
@@ -6378,8 +6611,21 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     log("=" * 60)
 
     # Navigate to ChatGPT
+    emit_event("agent_progress", phase=1, agent="chatgpt",
+               status="starting",
+               progress="Opening ChatGPT…")
     await browser.navigate("https://chatgpt.com")
     await asyncio.sleep(3)
+
+    # Inject MutationObserver early — right after navigate, before HV check.
+    # The scrape selector (`[data-message-author-role="assistant"]`) doesn't
+    # exist on HV/login pages, so early-inject produces no false positives
+    # and captures any brief streaming that starts before `verify-generating`
+    # closes. `inject_agent_observer` is idempotent on re-call.
+    try:
+        await inject_agent_observer(browser.page, "chatgpt")
+    except Exception:
+        pass
 
     # Early HV check — if Cloudflare Turnstile / CAPTCHA is gating ChatGPT,
     # resolve it BEFORE running Pro-model selection. Those CUA calls can't
@@ -6387,6 +6633,9 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # On clear-failure, return None so the pipeline runner emits
     # pipeline_error + pipeline_stopped via fail_phase(...) downstream.
     if cua_client:
+        emit_event("agent_progress", phase=1, agent="chatgpt",
+                   status="verifying",
+                   progress="Checking for CAPTCHA / human-verification gate…")
         cleared = await check_hv_gate(browser, cua_client, "chatgpt", "ChatGPT",
                                        phase=1, verbose=verbose)
         if not cleared:
@@ -6396,6 +6645,9 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # Select Pro model via CUA
     if cua_client:
         log("Selecting Pro + Extended Thinking...")
+        emit_event("agent_progress", phase=1, agent="chatgpt",
+                   status="selecting_model",
+                   progress="Selecting ChatGPT Pro with Extended Thinking…")
         result = await agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
             "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
             model=CUA_MODEL, max_iterations=15, verbose=verbose)
@@ -6404,8 +6656,15 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             log("Pro mode not available", "WARN")
 
     # Attach PDFs
-    for pdf in pdf_paths:
-        log(f"Attaching PDF: {Path(pdf).name}")
+    _pdf_total = len(pdf_paths) if pdf_paths else 0
+    for _pdf_idx, pdf in enumerate(pdf_paths, 1):
+        _pdf_name = Path(pdf).name
+        log(f"Attaching PDF: {_pdf_name}")
+        _pdf_progress = (f"Attaching {_pdf_name} ({_pdf_idx}/{_pdf_total})…"
+                         if _pdf_total > 1 else f"Attaching {_pdf_name}…")
+        emit_event("agent_progress", phase=1, agent="chatgpt",
+                   status="attaching_pdf",
+                   progress=_pdf_progress)
         attached = await attach_pdf_chatgpt(browser, pdf)
         if not attached and cua_client:
             log("Trying CUA for PDF attachment...")
@@ -6425,6 +6684,9 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     if feedback:
         prompt += f'\n\nUSER FEEDBACK (incorporate this): {feedback}'
         log(f"Phase 1: Injecting user feedback: {feedback[:100]}")
+    emit_event("agent_progress", phase=1, agent="chatgpt",
+               status="submitting",
+               progress="Submitting the research-brief prompt…")
     submitted = await submit_chatgpt_direct(browser, prompt)
     if not submitted and cua_client:
         log("Falling back to CUA for submit...")
@@ -6433,6 +6695,9 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             model=CUA_MODEL, max_iterations=15, verbose=verbose)
 
     # VERIFY: confirm ChatGPT is generating
+    emit_event("agent_progress", phase=1, agent="chatgpt",
+               status="verifying_generation",
+               progress="Waiting for ChatGPT Pro + Thinking to start generating…")
     verified = await wait_until_verified(verify_chatgpt_generating, browser.page, "Phase1",
         browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
     if not verified:
@@ -6449,13 +6714,12 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             pass
         return None
 
-    # Register brief page with dispatcher for mid-run user input
+    # Register brief page with dispatcher for mid-run user input.
+    # MutationObserver was already injected earlier (right after navigate) so
+    # the observer has been capturing token-level stream during verify.
     _runtime.phase = 1
     _runtime.sub_state = "1_brief_generating"
     _runtime.register_page("chatgpt", browser.page, browser.page.url)
-
-    # Inject MutationObserver for live token-level streaming to frontend
-    await inject_agent_observer(browser.page, "chatgpt")
 
     # Wait for response
     log(f"Polling for response (every {POLL_PRO}s, max {MAX_WAIT_PRO}min)...")
@@ -7954,6 +8218,9 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
 
             for i, md_path in enumerate(md_files):
                 log(f"Uploading {md_path.name} ({i+1}/{len(md_files)})...")
+                emit_event("agent_progress", phase=3, agent="notebooklm",
+                           status="uploading",
+                           progress=f"Uploading source {i+1}/{len(md_files)}: {md_path.name}")
                 browser.set_upload_file(str(md_path))
 
                 if i == 0:
@@ -7972,12 +8239,18 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # YouTube, and the email subject all line up on the same short name.
             title = smart_title(topic)
             log(f"Renaming notebook to '{title}'...")
+            emit_event("agent_progress", phase=3, agent="notebooklm",
+                       status="renaming",
+                       progress=f"Renaming notebook to '{title}'…")
             await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
                 f"Rename this notebook to: {title}",
                 model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
             # C1: make notebook public (Share → "Anyone with the link" → Save)
             # BEFORE emitting the URL, so the frontend's link is always viewable.
+            emit_event("agent_progress", phase=3, agent="notebooklm",
+                       status="sharing",
+                       progress="Setting notebook to 'Anyone with the link can view'…")
             notebook_url = await browser.current_url()
             try:
                 log("NotebookLM: opening share dialog to set 'Anyone with link'...")
@@ -8563,11 +8836,17 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     video_dir.mkdir(exist_ok=True)
 
     # Generate thumbnail (Gemini Imagen → Pillow fallback) — save to queues root
+    emit_event("agent_progress", phase=4, agent="youtube",
+               status="rendering_thumbnail",
+               progress="Generating video thumbnail (Gemini Imagen)…")
     title_card = queue_dir / "thumbnail.png"
     generate_thumbnail(topic, title_card)
 
     # ffmpeg: audio + title card → MP4
     video_path = video_dir / "research_overview.mp4"
+    emit_event("agent_progress", phase=4, agent="youtube",
+               status="wrapping_video",
+               progress="Wrapping audio + thumbnail into MP4 (ffmpeg)…")
     log("Converting audio to video (ffmpeg)...")
     try:
         cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", "2", "-i", str(title_card),
@@ -8606,6 +8885,9 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
 
     # Upload to YouTube
     log("Uploading to YouTube (unlisted)...")
+    emit_event("agent_progress", phase=4, agent="youtube",
+               status="opening_studio",
+               progress="Opening YouTube Studio…")
     page = await browser.new_tab("https://studio.youtube.com")
     await asyncio.sleep(4)
 
@@ -8640,6 +8922,9 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
         desc_parts.append(f"NotebookLM: {notebook_url}")
     description = "\n".join(desc_parts)
 
+    emit_event("agent_progress", phase=4, agent="youtube",
+               status="uploading",
+               progress=f"Uploading video '{title}' to YouTube (unlisted)…")
     result = await agent_loop(cua_client, browser, PROMPT_YOUTUBE_UPLOAD,
         f'Upload video. Title: "{title}"\nDescription:\n{description}\n\n'
         f'All file dialogs are auto-handled (video first, then thumbnail).',
@@ -8721,6 +9006,9 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
         log(f"[YouTube] Save verification: {e}", "WARN")
 
     # Extract REAL YouTube video URL — NEVER fall back to studio.youtube.com
+    emit_event("agent_progress", phase=4, agent="youtube",
+               status="processing",
+               progress="YouTube is processing the upload — extracting public video URL…")
     await asyncio.sleep(2)
     youtube_url = ""
 
@@ -8866,17 +9154,26 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
 
     # Create Google Doc: create → fill → make public → emit link
     log("Creating Google Doc...")
+    emit_event("agent_progress", phase=5, agent="gdocs",
+               status="creating",
+               progress="Opening a new Google Doc…")
     doc_url = ""
     try:
         page = await browser.new_tab("https://docs.google.com/document/create")
         await asyncio.sleep(5)
 
+        emit_event("agent_progress", phase=5, agent="gdocs",
+                   status="writing",
+                   progress=f"Writing research hub ({len(doc_content)} chars, {len(doc_lines)} lines)…")
         await agent_loop(cua_client, browser, PROMPT_CREATE_DOC,
             f"Type this content into the doc, then share with 'Anyone with link' as Editor:\n\n{doc_content}",
             model=CUA_MODEL, max_iterations=20, verbose=verbose)
         await asyncio.sleep(2)
 
         # C5: DOM safety net — ensure the doc is public even if CUA missed the share step
+        emit_event("agent_progress", phase=5, agent="gdocs",
+                   status="sharing",
+                   progress="Setting doc to 'Anyone with the link can edit'…")
         try:
             if await _ensure_gdoc_public(page):
                 log("Google Doc public share confirmed via DOM")
@@ -8922,6 +9219,9 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
             pass
     elif email:
         log(f"Sending email to {email}...")
+        emit_event("agent_progress", phase=5, agent="gmail",
+                   status="composing",
+                   progress=f"Opening Gmail and composing notification email to {email}…")
         try:
             page = await browser.new_tab("https://mail.google.com")
             await asyncio.sleep(4)
