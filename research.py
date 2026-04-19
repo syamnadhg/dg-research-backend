@@ -101,10 +101,12 @@ except Exception:
 # Palette roughly matching the app's "Super Research" brand — blue accent
 # (matches "Super" in the header), dim grey for auxiliary lines, soft green
 # for ok marks, amber for warn. Numeric codes are ANSI 256-color.
-_ACCENT   = "\033[38;5;75m"   # bright blue
+_ACCENT   = "\033[38;5;75m"   # bright blue — matches app brand
 _DIM      = "\033[38;5;244m"  # muted grey
 _OK       = "\033[38;5;108m"  # muted green
 _WARN     = "\033[38;5;214m"  # amber
+_BRIGHT   = "\033[38;5;231m"  # glowing white — for 'resurgam' rising-from-rest vibe
+_RED      = "\033[38;5;160m"  # dignified deep red — for 'requiescat' resting vibe
 _BOLD     = "\033[1m"
 _RESET    = "\033[0m"
 
@@ -135,6 +137,24 @@ def _setup_step(n: int, total: int, title: str):
     print()
     print(f"  {_c(_ACCENT + _BOLD, f'[{n}/{total}]')} {_c(_BOLD, title)}")
     print(f"  {_c(_DIM, '─' * 58)}")
+
+
+def _branded_header(tagline_text: str, tagline_color: str, tagline_gloss: str):
+    """Shared banner for --resurrect / --exorcise / --serve. Keeps the SUPER
+    RESEARCH wordmark identical to --setup, then drops a single Latin-ish
+    tagline with a dim gloss beneath it so the command's vibe reads without
+    derailing the scannability of the rest of the output.
+
+    tagline_color is a foreground escape; BOLD is added by the caller inside
+    the _c(...) call so different commands can pick different weights."""
+    bar = _c(_DIM, "━" * 62)
+    print()
+    print(f"  {bar}")
+    print()
+    print(f"                   {_c(_BOLD + _ACCENT, 'SUPER')} {_c(_BOLD, 'RESEARCH')}")
+    print(f"                   {_c(tagline_color, tagline_text)}  {_c(_DIM, tagline_gloss)}")
+    print()
+    print(f"  {bar}")
 
 
 def log_action(action, details=""):
@@ -11675,6 +11695,37 @@ async def run_server(port=8000):
         # reflected in the Account page tile almost immediately, instead of
         # waiting up to 30s for the heartbeat-based self-heal.
         _start_token_relink_watcher(token)
+
+    # ── Branded --serve banner — 'aegis, standing watch' ──
+    # Shows which account this backend is paired to, where it's listening,
+    # and how to tear it down. Keeps the structural DNA of --setup /
+    # --resurrect / --exorcise (SUPER RESEARCH wordmark + dim rule + Latin
+    # tagline) so the three commands feel like a matched set.
+    _branded_header("aegis", _BOLD + _ACCENT, "standing watch")
+    print()
+    _paired_email = ""
+    try:
+        paired_uid = load_paired_uid()
+        if _firebase_db and paired_uid:
+            snap = _firebase_db.collection("users").document(paired_uid).get()
+            if snap.exists:
+                _paired_email = (snap.to_dict() or {}).get("email", "") or ""
+    except Exception:
+        pass
+    token_short = f"{_research_token[:8]}…" if _research_token else "—"
+    print(f"  {_c(_DIM, 'Paired to:')}     {_c(_BOLD, _paired_email or '(not paired)')}")
+    print(f"  {_c(_DIM, 'Token:')}         {_c(_BOLD, token_short)}  {_c(_OK, '(active)') if _research_token else ''}")
+    print(f"  {_c(_DIM, 'Local API:')}     {_c(_BOLD, f'http://0.0.0.0:{port}')}")
+    print(f"  {_c(_DIM, 'Heartbeat:')}     {_c(_BOLD, '30s cadence')}")
+    print()
+    print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
+    print()
+    print(f"  {_c(_DIM, 'Stop:')}          {_c(_BOLD, 'Ctrl+C')}")
+    print(f"  {_c(_DIM, 'Full teardown:')} {_c(_BOLD, 'python research.py --exorcise')}")
+    print()
+    print(f"  {_c(_DIM, '━' * 62)}")
+    print()
+
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     try:
@@ -12288,9 +12339,7 @@ def run_resurrect():
     import subprocess as _subprocess
     import platform as _platform
 
-    _setup_logo()
-    print(f"  {_c(_BOLD, 'Indestructible mode — install')}")
-    print(f"  {_c(_DIM, '─' * 62)}")
+    _branded_header("resurgam", _BOLD + _BRIGHT, "the backend rises")
     print()
 
     if _platform.system() != "Windows":
@@ -12312,13 +12361,16 @@ def run_resurrect():
     # the sa file is missing — we just skip the flag.
     init_firebase()
 
-    # Ensure the device has a paired uid before we go further. Otherwise
-    # auto-start would launch a server with no linked user, which is useless.
+    # ── [1/4] Pre-flight ──
+    _setup_step(1, 4, "Pre-flight")
     if not load_paired_uid():
-        print(f"  {_c(_WARN, 'Device not paired yet.')}")
-        print(f"  {_c(_DIM, 'Run')} {_c(_BOLD, 'python research.py --setup')} {_c(_DIM, 'first, then retry --resurrect.')}")
+        print(f"  {_c(_WARN, '[..]')} Device not paired yet.")
+        print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, 'python research.py --setup')} {_c(_DIM, 'first, then retry --resurrect.')}")
         return
+    print(f"  {_c(_OK, '[ok]')}  Setup complete on this machine")
 
+    # ── [2/4] Binding the supervisor ──
+    _setup_step(2, 4, "Binding the supervisor")
     cmd = [
         "schtasks", "/Create",
         "/TN", _INDESTRUCTIBLE_TASK_NAME,
@@ -12331,26 +12383,26 @@ def run_resurrect():
     try:
         result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except Exception as e:
-        print(f"  {_c(_WARN, 'Failed to run schtasks:')} {e}")
+        print(f"  {_c(_WARN, '[--]')}  Failed to run schtasks: {e}")
         return
 
     if result.returncode != 0:
-        print(f"  {_c(_WARN, 'schtasks returned non-zero status.')}")
+        print(f"  {_c(_WARN, '[--]')}  schtasks returned non-zero status.")
         if result.stderr.strip():
-            print(f"  {_c(_DIM, 'stderr:')}")
+            print(f"  {_c(_DIM, '     stderr:')}")
             for line in result.stderr.strip().splitlines():
-                print(f"     {line}")
+                print(f"       {line}")
         return
 
-    print(f"  {_c(_OK, '[ok]')} Scheduled Task installed ({_INDESTRUCTIBLE_TASK_NAME})")
-    print(f"  {_c(_OK, '[ok]')} Runs at every user logon")
-    print(f"  {_c(_DIM, 'Executes:')} {task_run}")
-    print()
-    _write_indestructible_flag(True)
-    print(f"  {_c(_OK, '[ok]')} Synced to the Super Research app")
-    print()
+    print(f"  {_c(_OK, '[ok]')}  Scheduled Task pinned to logon + startup ({_INDESTRUCTIBLE_TASK_NAME})")
+    print(f"  {_c(_DIM, '     Executes:')} {task_run}")
 
-    # ── Activate the supervisor NOW, not at next logon ─────────────────
+    # ── [3/4] Firestore sync ──
+    _setup_step(3, 4, "Firestore sync")
+    _write_indestructible_flag(True)
+    print(f"  {_c(_OK, '[ok]')}  Synced to the Super Research app")
+
+    # ── [4/4] Handoff — activate the supervisor NOW, not at next logon ──
     # Without this, --resurrect only schedules the task and leaves the
     # backend on whatever the user had before. Active indestructible mode
     # needs --daemon-loop running so --serve is supervised. Steps:
@@ -12362,18 +12414,19 @@ def run_resurrect():
     #   (d) verify the spawn actually worked by re-polling until the
     #       daemon-loop PID appears (so we don't print "started" for
     #       a child that crashed on import).
+    _setup_step(4, 4, "Handoff")
     import time as _time
     procs = _enumerate_research_py_procs()
     daemon_pid = next((pid for pid, _c, role in procs if role == "daemon-loop"), None)
     plain_serve_pids = [pid for pid, _c, role in procs if role == "serve"]
 
     if daemon_pid is not None:
-        print(f"  {_c(_OK, '[ok]')} Supervisor already running (PID {daemon_pid}) — nothing to spawn")
+        print(f"  {_c(_OK, '[ok]')}  Supervisor already running (PID {daemon_pid}) — nothing to spawn")
     else:
         if plain_serve_pids:
             killed = _kill_pids(plain_serve_pids)
             plural = "es" if killed != 1 else ""
-            print(f"  {_c(_OK, '[ok]')} Stopped {killed} standalone --serve process{plural} to free port 8000")
+            print(f"  {_c(_OK, '[ok]')}  Stopped {killed} standalone --serve process{plural} to free port 8000")
         _DETACHED = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
         _NEWGROUP = getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         try:
@@ -12386,8 +12439,8 @@ def run_resurrect():
                 close_fds=True,
             )
         except Exception as e:
-            print(f"  {_c(_WARN, 'Could not spawn supervisor:')} {e}")
-            print(f"  {_c(_DIM, 'The scheduled task still fires at next logon.')}")
+            print(f"  {_c(_WARN, '[--]')}  Could not spawn supervisor: {e}")
+            print(f"  {_c(_DIM, '     The scheduled task still fires at next logon.')}")
         else:
             spawned_pid = None
             deadline = _time.time() + 5.0
@@ -12400,18 +12453,17 @@ def run_resurrect():
                 if spawned_pid is not None:
                     break
             if spawned_pid is not None:
-                print(f"  {_c(_OK, '[ok]')} Supervisor started (PID {spawned_pid}, detached)")
+                print(f"  {_c(_OK, '[ok]')}  Supervisor started (PID {spawned_pid}, detached)")
             else:
-                print(f"  {_c(_WARN, 'Supervisor did not appear within 5s — check backend.err.log.')}")
-                print(f"  {_c(_DIM, 'The scheduled task still fires at next logon as a fallback.')}")
-    print()
+                print(f"  {_c(_WARN, '[--]')}  Supervisor did not appear within 5s — check backend.err.log.")
+                print(f"  {_c(_DIM, '     The scheduled task still fires at next logon as a fallback.')}")
 
-    print(f"  {_c(_DIM, 'From now on, a daemon wrapper supervises `--serve` — relaunching')}")
-    print(f"  {_c(_DIM, 'it on crash, Stop button, or any exit. Combined with the startup')}")
-    print(f"  {_c(_DIM, 'auto-resume for incomplete runs, Indestructible mode is fully')}")
-    print(f"  {_c(_DIM, 'closed-loop.')}")
     print()
-    print(f"  {_c(_DIM, 'To undo:')} {_c(_BOLD, 'python research.py --exorcise')}")
+    print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}")
+    print(f"  {_c(_DIM, '  --serve now respawns on any exit (crash, Stop, logout, reboot).')}")
+    print()
+    print(f"  {_c(_DIM, '  To undo:')}  {_c(_BOLD, 'python research.py --exorcise')}")
+    print()
 
 
 def run_exorcise():
@@ -12436,9 +12488,7 @@ def run_exorcise():
     import subprocess as _subprocess
     import platform as _platform
 
-    _setup_logo()
-    print(f"  {_c(_BOLD, 'Indestructible mode — remove')}")
-    print(f"  {_c(_DIM, '─' * 62)}")
+    _branded_header("requiescat", _BOLD + _RED, "let the loop rest")
     print()
 
     if _platform.system() != "Windows":
@@ -12447,7 +12497,8 @@ def run_exorcise():
 
     init_firebase()
 
-    # ── Step 1: delete the Scheduled Task ──
+    # ── [1/4] Unbinding schedule ──
+    _setup_step(1, 4, "Unbinding schedule")
     cmd = [
         "schtasks", "/Delete",
         "/TN", _INDESTRUCTIBLE_TASK_NAME,
@@ -12456,7 +12507,7 @@ def run_exorcise():
     try:
         result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except Exception as e:
-        print(f"  {_c(_WARN, 'Failed to run schtasks:')} {e}")
+        print(f"  {_c(_WARN, '[--]')}  Failed to run schtasks: {e}")
         return
 
     # Exit code 1 with a "does not exist" message means the task wasn't
@@ -12466,17 +12517,17 @@ def run_exorcise():
         and "ERROR: The system cannot find the file specified." in (result.stdout + result.stderr)
     )
     if result.returncode == 0:
-        print(f"  {_c(_OK, '[ok]')} Scheduled Task removed ({_INDESTRUCTIBLE_TASK_NAME})")
+        print(f"  {_c(_OK, '[ok]')}  Scheduled Task removed ({_INDESTRUCTIBLE_TASK_NAME})")
     elif not_installed:
-        print(f"  {_c(_DIM, 'Task was not installed — nothing to remove.')}")
+        print(f"  {_c(_DIM, '     Nothing bound — task was not installed.')}")
     else:
-        print(f"  {_c(_WARN, 'schtasks returned non-zero status.')}")
+        print(f"  {_c(_WARN, '[--]')}  schtasks returned non-zero status.")
         if result.stderr.strip():
-            print(f"  {_c(_DIM, 'stderr:')}")
+            print(f"  {_c(_DIM, '     stderr:')}")
             for line in result.stderr.strip().splitlines():
-                print(f"     {line}")
+                print(f"       {line}")
 
-    # ── Step 2: kill supervisor AND supervised --serve, loop until clean ──
+    # ── [2/4] + [3/4] kill supervisor AND supervised --serve, loop until clean ──
     # The daemon-loop respawns --serve every ~5s between deaths, so a
     # single-shot enumerate+kill misses any --serve that happened to be
     # respawning at the wrong moment. Loop for up to 8s, re-enumerating
@@ -12503,31 +12554,34 @@ def run_exorcise():
             break
         _time.sleep(0.5)
 
+    _setup_step(2, 4, "Dispelling daemon-loop")
     if killed_daemon_total:
         plural = "es" if killed_daemon_total != 1 else ""
-        print(f"  {_c(_OK, '[ok]')} Stopped {killed_daemon_total} daemon-loop process{plural}")
+        print(f"  {_c(_OK, '[ok]')}  Stopped {killed_daemon_total} daemon-loop process{plural}")
     else:
-        print(f"  {_c(_DIM, 'No daemon-loop processes were running.')}")
+        print(f"  {_c(_DIM, '     No daemon-loop processes were running.')}")
+
+    _setup_step(3, 4, "Stilling --serve")
     if killed_serve_total:
         plural = "s" if killed_serve_total != 1 else ""
-        print(f"  {_c(_OK, '[ok]')} Stopped {killed_serve_total} --serve process{plural}")
+        print(f"  {_c(_OK, '[ok]')}  Stopped {killed_serve_total} --serve process{plural}")
     else:
-        print(f"  {_c(_DIM, 'No --serve processes were running.')}")
+        print(f"  {_c(_DIM, '     No --serve processes were running.')}")
 
-    # ── Step 3: sync the Firestore flag ──
+    # ── [4/4] Firestore sync + verification ──
+    _setup_step(4, 4, "Firestore sync")
     _write_indestructible_flag(False)
-    print(f"  {_c(_OK, '[ok]')} Synced to the Super Research app")
+    print(f"  {_c(_OK, '[ok]')}  Synced to the Super Research app")
 
-    # ── Step 4: final-state verification ──
     stragglers = [(pid, role) for pid, _c, role in last_survivors if role in ("daemon-loop", "serve")]
     print()
     if stragglers:
-        print(f"  {_c(_WARN, 'Warning:')} {len(stragglers)} related process(es) would not terminate:")
+        print(f"  {_c(_WARN, '[--]')}  {len(stragglers)} related process(es) would not terminate:")
         for pid, role in stragglers:
-            print(f"     {_c(_BOLD, f'PID {pid}')}  ({role})")
-        print(f"  {_c(_DIM, 'Kill them from Task Manager or re-run --exorcise.')}")
+            print(f"       {_c(_BOLD, f'PID {pid}')}  ({role})")
+        print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --exorcise.')}")
     else:
-        print(f"  {_c(_OK, 'Clean reset — no research.py processes running.')}")
+        print(f"  {_c(_BOLD + _RED, '  Silence.')}  {_c(_DIM, 'No research.py process remains.')}")
     print()
     print(f"  {_c(_DIM, 'Indestructible mode is off. The backend does not auto-start at')}")
     print(f"  {_c(_DIM, 'logon. To bring it back manually:')} {_c(_BOLD, 'python research.py --serve')}")
