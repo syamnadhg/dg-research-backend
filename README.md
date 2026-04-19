@@ -177,6 +177,24 @@ Multiple people can also share one backend. Share your ResearchToken — they pa
 
 Times based on real run analytics. Total: ~1h 50m for a full pipeline.
 
+## Phase narration (backend Gemini Flash + frontend fallback)
+
+Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. Apr 19 added a two-tier narration system so there's always a visible human-language pulse:
+
+- **Backend (Gemini 2.0 Flash inside `research.py`)** — every active phase has a narrator worker that reads a bounded ring buffer of recent events (~40) and emits a `phase_narration` event about every 45s. Narrator warms on `phase_start`, stays quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Cost envelope: ~200 input / 30 output tokens per narration → <$0.02 per full pipeline run.
+- **Frontend fallback (Gemini 2.0 Flash via `/api/narrate`)** — if the backend narrator goes silent for >15s on the currently-running phase AND the watchdog considers the backend alive, the frontend writes a speculative sentence into the same dropdown slot, rendered italic with a **"Likely: …"** prefix so the user sees it's a guess. Budget-capped at 20 calls per research. Disabled when the watchdog says the backend is actually dead (PokeNote owns that surface).
+
+## Phase 0 verification (sequential, Apr 19)
+
+Preflight now walks platforms one at a time instead of opening 7 tabs at once. For each enabled platform:
+
+1. `cookie_login_hit()` reads the persistent profile's cookie store for that platform's primary session token. Hit → emit `agent_progress status=ok` and move on. No tab, no network, no CUA.
+2. Cookie miss → open that one tab, wait 4s for SPA hydration, check URL for known login hosts.
+3. Still ambiguous → CUA vision verification.
+4. Still not logged in → emit `login_required` **scoped to that single platform** and pause for user retry. The next platform does NOT open until the current one is resolved (Cloudflare stealth + less user overwhelm).
+
+Matches the `--setup` script's one-at-a-time walk that's been working well for months. Global "Skip verification" still bypasses the whole sequence. Per-phase login checks at every subsequent phase are cookie-only (no tabs, no CUA) — they catch mid-run session drift without re-opening anything.
+
 ## Per-phase alert narration
 
 Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, share-link misses, login-expired, ffmpeg failures, email auth problems, and more — emits into the correct phase's `PhaseAlertPanel` inside the app's phase dropdown. No chat-bubble spam. Per-phase coverage:

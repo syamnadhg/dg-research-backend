@@ -68,8 +68,13 @@ Frontend polls `GET /api/runs/{id}/events?offset=N` or connects via `WS /ws/{run
 ### User-interruption gates
 | Type | Phase | Description |
 |------|-------|-------------|
-| login_required | 0-5 | Platform session missing — frontend surfaces login instructions + Retry. Fired from Phase 0 preflight AND per-phase login probes when skipInitVerify=true. |
+| login_required | 0-5 | Platform session missing. **Phase 0** (as of Apr 19): sequential — fired with `platforms: [key]` scoped to the ONE platform currently being verified, one at a time until all pass. **Phases 1-5**: cookie-only probe at phase entry fires this with the missing platforms for that phase regardless of `skipInitVerify`. |
 | human_verification_required | 1-5 | Cloudflare / CAPTCHA / "Verify you are human" gate persisted past all auto-clear tiers (Playwright → CUA×2 → tab-kill). Pauses pipeline until user resolves. |
+
+### Phase narration (Apr 19)
+| Type | Phase | Description |
+|------|-------|-------------|
+| phase_narration | 1-5 | Backend Gemini 2.0 Flash narrator emits one human-readable sentence describing what's happening in the current phase. Fed by a bounded ring buffer (~40 recent events). Cadence ~45s; warms on `phase_start`, tears down on `phase_complete` / `pipeline_stopped` / `pipeline_paused`. Frontend renders inside the active phase dropdown (above PokeNote). Payload: `{text, timestamp, speculative: false}`. Speculative entries with `speculative: true` come from the frontend's `/api/narrate` fallback route when the backend narrator has been silent >15s. |
 
 ### Infra + misc
 | Type | Phase | Description |
