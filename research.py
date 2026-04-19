@@ -11793,10 +11793,82 @@ def run_resurrect():
     _write_indestructible_flag(True)
     print(f"  {_c(_OK, '[ok]')} Synced to the Super Research app")
     print()
-    print(f"  {_c(_DIM, 'From now on, a daemon wrapper auto-starts at user logon and')}")
-    print(f"  {_c(_DIM, 'keeps `--serve` alive — relaunching it on crash, Stop button,')}")
-    print(f"  {_c(_DIM, 'or any exit. Combined with the startup auto-resume for')}")
-    print(f"  {_c(_DIM, 'incomplete runs, Indestructible mode is fully closed-loop.')}")
+
+    # ── Activate the supervisor NOW, not at next logon ─────────────────
+    # Without this, --resurrect only schedules the task and leaves the
+    # backend on whatever the user had before (plain --serve, nothing,
+    # etc.). Active indestructible mode needs --daemon-loop running so
+    # --serve is supervised. Three steps: (a) detect an already-running
+    # daemon-loop (re-run of --resurrect = no-op on this half), (b)
+    # taskkill any plain --serve so port 8000 is free for the supervised
+    # child, (c) spawn --daemon-loop DETACHED so it outlives this call.
+    daemon_already_running = False
+    plain_serve_pids: list[int] = []
+    try:
+        ps = _subprocess.run(
+            ["wmic", "process", "where", "name='python.exe'",
+             "get", "processid,commandline", "/format:list"],
+            capture_output=True, text=True, timeout=15,
+        )
+        entries: list[dict[str, str]] = []
+        cur: dict[str, str] = {}
+        for line in (ps.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                if cur:
+                    entries.append(cur); cur = {}
+                continue
+            if "=" in line:
+                k, _, v = line.partition("=")
+                cur[k.strip()] = v.strip()
+        if cur:
+            entries.append(cur)
+        for e in entries:
+            cmdline = e.get("CommandLine", "")
+            try:
+                pid = int(e.get("ProcessId", ""))
+            except ValueError:
+                continue
+            if "--daemon-loop" in cmdline:
+                daemon_already_running = True
+            elif "--serve" in cmdline:
+                plain_serve_pids.append(pid)
+    except Exception:
+        pass
+
+    if daemon_already_running:
+        print(f"  {_c(_OK, '[ok]')} Supervisor already running — nothing to spawn")
+    else:
+        for pid in plain_serve_pids:
+            try:
+                _subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                capture_output=True, text=True, timeout=10)
+            except Exception:
+                pass
+        if plain_serve_pids:
+            plural = "s" if len(plain_serve_pids) != 1 else ""
+            print(f"  {_c(_OK, '[ok]')} Stopped {len(plain_serve_pids)} standalone --serve process{plural} to free port 8000")
+        _DETACHED = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
+        _NEWGROUP = getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        try:
+            _subprocess.Popen(
+                [python_exe, script_path, "--daemon-loop"],
+                creationflags=_DETACHED | _NEWGROUP,
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                stdin=_subprocess.DEVNULL,
+                close_fds=True,
+            )
+            print(f"  {_c(_OK, '[ok]')} Supervisor started (--daemon-loop, detached)")
+        except Exception as e:
+            print(f"  {_c(_WARN, 'Could not start supervisor now:')} {e}")
+            print(f"  {_c(_DIM, 'The scheduled task still fires at next logon.')}")
+    print()
+
+    print(f"  {_c(_DIM, 'From now on, a daemon wrapper supervises `--serve` — relaunching')}")
+    print(f"  {_c(_DIM, 'it on crash, Stop button, or any exit. Combined with the startup')}")
+    print(f"  {_c(_DIM, 'auto-resume for incomplete runs, Indestructible mode is fully')}")
+    print(f"  {_c(_DIM, 'closed-loop.')}")
     print()
     print(f"  {_c(_DIM, 'To undo:')} {_c(_BOLD, 'python research.py --exorcise')}")
 
