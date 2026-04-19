@@ -1882,12 +1882,14 @@ class PipelineControls:
 
     async def await_agent_decision(self, agent: str, timeout: float = 300.0) -> str:
         """Wait for user decision on a Phase 2 agent pipeline_warning
-        offering [Retry] / [Continue with partial] / [Skip]. Returns:
+        offering [Retry] / [Wait] / [Skip]. Returns:
             'retry'            — retry this agent with a follow-up prompt
-            'continue_partial' — accept current output and finalize
+            'wait_longer'      — extend the polling budget without nudging
+            'continue_partial' — accept current output and finalize (legacy
+                                  command, still handled for backward compat)
             'skip'             — drop this agent entirely
             'stop'             — pipeline stopped
-            'timeout'          — no decision in window (caller defaults to continue_partial)
+            'timeout'          — no decision in window (caller defaults to wait_longer)
         Polls every 0.5s. Skip is detected via existing skipped_agents set (NOT consumed here — the main Phase 2 loop handles the removal)."""
         key = (agent or "").strip().lower()
         loop = asyncio.get_event_loop()
@@ -1897,6 +1899,8 @@ class PipelineControls:
                 return "stop"
             if self.consume_retry_agent(key):
                 return "retry"
+            if self.consume_wait_longer_agent(key):
+                return "wait_longer"
             if self.consume_continue_partial(key):
                 return "continue_partial"
             if key in self.skipped_agents:
@@ -3774,13 +3778,16 @@ def _compact_event_for_narration(e: dict) -> str:
 
 async def _narrator_loop(phase: int):
     """Poll the ring buffer every `cadence` seconds. Synthesize one human
-    sentence. Emit as `phase_narration`. Back off on 429 / network blip."""
+    sentence (phase-wide) plus, for Phase 2, one sentence per active agent.
+    Emits `phase_narration` always and `agent_narration` for Phase 2.
+    Back off on 429 / network blip."""
     if not GEMINI_API_KEY:
         return
     if phase is None or phase < 0:
         return
     cadence = _narrator_cadence_for_phase(phase)
     last_narration = ""
+    last_agent_lines: dict[str, str] = {}
     backoff_ticks_left = 0
     try:
         import requests as _requests
@@ -3790,13 +3797,32 @@ async def _narrator_loop(phase: int):
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     )
+
+    def _call_gemini(system: str, user_msg: str, max_tokens: int = 80):
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
+        }
+        try:
+            resp = _requests.post(url, json=payload, timeout=5)
+        except Exception:
+            return None, 0
+        try:
+            j = resp.json()
+            text = (j.get("candidates", [{}])[0]
+                     .get("content", {})
+                     .get("parts", [{}])[0]
+                     .get("text", ""))
+        except Exception:
+            return None, resp.status_code
+        return (text or "").strip(), resp.status_code
+
     try:
         while True:
             await asyncio.sleep(cadence if backoff_ticks_left == 0 else 15.0)
             if backoff_ticks_left > 0:
                 backoff_ticks_left -= 1
-            # Skip narration during stop/pause so the user isn't getting
-            # "still working" lines while the pipeline is actually frozen.
             try:
                 if _controls.is_stop() or _controls.is_pause():
                     continue
@@ -3825,40 +3851,61 @@ async def _narrator_loop(phase: int):
                 f"- {_compact_event_for_narration(e)}" for e in recent[-20:]
             )
             user_msg = f"Recent events (newest last):\n{event_lines or '[none]'}"
-            payload = {
-                "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
-                "systemInstruction": {"parts": [{"text": system}]},
-                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 80},
-            }
-            try:
-                resp = await asyncio.to_thread(
-                    _requests.post, url, json=payload, timeout=5)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+
+            text, status_code = await asyncio.to_thread(_call_gemini, system, user_msg)
+            if status_code == 429:
+                backoff_ticks_left = 3
                 continue
-            if resp.status_code == 429:
-                backoff_ticks_left = 3  # 3 × 15s soft back-off window
+            if not text or status_code >= 400:
                 continue
-            if resp.status_code >= 400:
-                continue
-            try:
-                j = resp.json()
-                text = (j.get("candidates", [{}])[0]
-                         .get("content", {})
-                         .get("parts", [{}])[0]
-                         .get("text", ""))
-            except Exception:
-                continue
-            text = (text or "").strip().strip('"').strip("`").strip()
-            # Dedupe — skip emitting the same line twice in a row.
-            if not text or text == last_narration:
-                continue
-            last_narration = text
-            try:
-                emit_event("phase_narration", phase=phase, text=text)
-            except Exception:
-                pass
+            text = text.strip().strip('"').strip("`").strip()
+            if text and text != last_narration:
+                last_narration = text
+                try:
+                    emit_event("phase_narration", phase=phase, text=text)
+                except Exception:
+                    pass
+
+            # ── Phase 2: per-agent narration ──
+            # Filter the recent window per agent and emit one
+            # `agent_narration` per active agent so the accordion row
+            # carries live context scoped to that platform.
+            if phase == 2:
+                agent_keys = ("chatgpt", "gemini", "claude")
+                for akey in agent_keys:
+                    a_events = [e for e in recent
+                                if (e.get("agent") or "").lower() == akey
+                                or (e.get("data", {}) or {}).get("agent", "").lower() == akey]
+                    if not a_events:
+                        continue
+                    a_lines = "\n".join(
+                        f"- {_compact_event_for_narration(e)}" for e in a_events[-12:]
+                    )
+                    a_system = (
+                        f"You narrate ONE human sentence about what the {akey.upper()} "
+                        "agent is doing RIGHT NOW in the Super Research Phase 2 (deep "
+                        "research) run. CITE the real numbers (sources, chars, sections) "
+                        "when they appear in the events. Output exactly ONE sentence, "
+                        "<= 100 chars. No markdown. No prefix. No em-dashes."
+                    )
+                    a_user = (
+                        f"Recent events for {akey.upper()} (newest last):\n"
+                        f"{a_lines or '[none]'}"
+                    )
+                    a_text, a_status = await asyncio.to_thread(_call_gemini, a_system, a_user, 60)
+                    if a_status == 429:
+                        backoff_ticks_left = 3
+                        break
+                    if not a_text or a_status >= 400:
+                        continue
+                    a_text = a_text.strip().strip('"').strip("`").strip()
+                    if a_text and a_text != last_agent_lines.get(akey):
+                        last_agent_lines[akey] = a_text
+                        try:
+                            emit_event("agent_narration", phase=2,
+                                       agent=akey, text=a_text)
+                        except Exception:
+                            pass
     except asyncio.CancelledError:
         return
     except Exception as _e:
@@ -4733,9 +4780,23 @@ async def execute_action(browser, action, params):
 
 async def agent_loop(client, browser, system_prompt, user_message,
                      model=CUA_MODEL, max_iterations=30, verbose=False,
-                     phase=None, agent_name=None):
-    """CUA agent loop — proven from original research.py."""
-    initial_ss = await browser.screenshot()
+                     phase=None, agent_name=None, target_page=None):
+    """CUA agent loop — proven from original research.py.
+
+    target_page (optional): Playwright Page reference. When provided, every
+    screenshot re-anchors to this tab via bring_to_front. Prevents the
+    "Claude polls screenshotted Gemini's tab" race when another async path
+    swaps browser.page between iterations.
+    """
+    async def _anchored_screenshot():
+        if target_page is not None:
+            try:
+                await browser.switch_to_page(target_page)
+            except Exception:
+                pass
+        return await browser.screenshot()
+
+    initial_ss = await _anchored_screenshot()
     if not initial_ss:
         return {"status": "error", "text": "Could not take initial screenshot"}
 
@@ -4800,17 +4861,30 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 # actionable reason and bail out of the loop — callers can
                 # decide whether to fall back or fail the phase.
                 log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
+                # Phase 2 NEEDS CUA for polling — no fallback possible, so
+                # the only honest option is to end the research. Other phases
+                # (0/5) can still skip CUA gracefully.
                 try:
-                    emit_event("pipeline_error", phase=_phase, agent=_agent,
-                               error="claude_api_cap",
-                               reason="Claude API hit the workspace usage cap. Raise it in the Anthropic Console or wait until the reset date, then retry.",
-                               details=err[:200],
-                               actions=[
-                                   {"id": "retry", "label": "Retry", "style": "primary",
-                                    "command": {"action": "retry_phase", "phase": _phase}},
-                                   {"id": "skip", "label": "Skip phase", "style": "default",
-                                    "command": {"action": "skip_phase", "phase": _phase}},
-                               ])
+                    if _phase == 2:
+                        emit_event("pipeline_error", phase=_phase, agent=_agent,
+                                   error="claude_api_cap",
+                                   reason="Claude API hit the workspace usage cap. Phase 2 cannot run without CUA — raise the cap in the Anthropic Console or end the research.",
+                                   details=err[:200],
+                                   actions=[
+                                       {"id": "stop", "label": "End research", "style": "danger",
+                                        "command": {"action": "stop"}},
+                                   ])
+                    else:
+                        emit_event("pipeline_error", phase=_phase, agent=_agent,
+                                   error="claude_api_cap",
+                                   reason="Claude API hit the workspace usage cap. Raise it in the Anthropic Console or wait until the reset date, then retry.",
+                                   details=err[:200],
+                                   actions=[
+                                       {"id": "retry", "label": "Retry", "style": "primary",
+                                        "command": {"action": "retry_phase", "phase": _phase}},
+                                       {"id": "skip", "label": "Skip", "style": "default",
+                                        "command": {"action": "skip_phase", "phase": _phase}},
+                                   ])
                 except Exception:
                     pass
                 return {"status": "error", "text": str(e)}
@@ -4860,17 +4934,24 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 log("Stuck — same action 5x. Injecting hint.", "WARN")
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": "You seem stuck. Try a different approach."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": await browser.screenshot()}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": await _anchored_screenshot()}},
                 ]})
                 recent_actions.clear()
                 continue
 
             if act == "screenshot":
-                ss = await browser.screenshot()
+                ss = await _anchored_screenshot()
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id,
                     "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}}]})
             else:
                 ss = await execute_action(browser, act, tb.input)
+                # Re-anchor after action — execute_action may have navigated,
+                # opened a new tab, or the OS swapped focus during the click.
+                if target_page is not None:
+                    try:
+                        await browser.switch_to_page(target_page)
+                    except Exception:
+                        pass
                 tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": [
                     {"type": "text", "text": f"Action '{act}' executed."},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ss}},
@@ -5804,24 +5885,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     emit_event("pipeline_warning", phase=2, agent=agent_key_to,
                                message=f"{name} timed out after {max_wait_min} min — {_sources_note}{partial_len} chars extracted",
                                details=("The agent exceeded its research budget. "
-                                        "Retry sends a follow-up asking this agent to finish + regenerate (adds ~15 min). "
-                                        "Continue with partial forwards what's already here to NotebookLM. "
+                                        "Retry sends a 'finish + regenerate' follow-up (adds ~15 min). "
+                                        "Wait grants another 15 min without nudging the agent. "
                                         "Skip drops this agent entirely; others proceed."),
                                alertType="warn",
                                actions=[
-                                   {"id": "retry", "label": f"Retry {name}",
+                                   {"id": "retry", "label": "Retry",
                                     "style": "primary",
                                     "command": {"action": "retry_agent", "agent": agent_key_to}},
-                                   {"id": "continue_partial", "label": "Continue with partial",
+                                   {"id": "wait", "label": "Wait",
                                     "style": "default",
-                                    "command": {"action": "continue_partial_agent", "agent": agent_key_to}},
-                                   {"id": "skip", "label": "Skip agent",
+                                    "command": {"action": "wait_longer_agent", "agent": agent_key_to}},
+                                   {"id": "skip", "label": "Skip",
                                     "style": "default",
                                     "command": {"action": "skip_agent", "agent": agent_key_to}},
                                ])
                 except Exception:
                     pass
-                # Wait up to 5 min for decision. Default (timeout) = continue_partial.
+                # Wait up to 5 min for decision. Default (timeout) = wait_longer
+                # — keep polling rather than silently accepting partial output.
                 decision = await _controls.await_agent_decision(agent_key_to, timeout=300.0)
                 log(f"[{name}] Timeout user decision: {decision}")
                 if decision == "stop":
@@ -5857,9 +5939,20 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     p.pop("_cached_text", None)
                     p["empty_retries"] = 0
                     continue
-                # 'continue_partial' or 'timeout' → finalize with partial text
-                status_fin = "timeout_partial" if decision == "continue_partial" else "timeout"
-                results[name] = {"status": status_fin, "text": partial_text or "",
+                if decision in ("wait_longer", "timeout"):
+                    # User picked "Wait" (or auto-default timeout) — grant
+                    # another 15 min without pinging the agent. Keep polling.
+                    try:
+                        emit_event("pipeline_warning", phase=2, agent=agent_key_to,
+                                   message=f"Extending {name}'s budget by 15 min — still waiting for completion",
+                                   alertType="retrying")
+                    except Exception:
+                        pass
+                    p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
+                    continue
+                # Legacy 'continue_partial' only — no button surfaces this
+                # anymore, but keep handling for in-flight commands.
+                results[name] = {"status": "timeout_partial", "text": partial_text or "",
                                  "url": p.get("url", ""), "page": p["page"]}
                 del pending[name]
                 continue
@@ -6022,19 +6115,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     emit_event("pipeline_warning", phase=2, agent=agent_key_stuck,
                                message=f"{name} stalled — no text or source growth for {int(no_growth_secs/60)} min (currently {_partial_text_len} chars, {_src_count} sources)",
                                details=("The agent's output hasn't grown in a while. "
-                                        "This could mean the model is stuck on a thinking loop or the page went idle. "
-                                        "Poke sends a gentle 'please continue' prompt. "
-                                        "Wait longer grants another 15 min before re-prompting. "
+                                        "Retry sends a 'please continue' follow-up. "
+                                        "Wait grants another 15 min of budget. "
                                         "Skip drops this agent."),
                                alertType="warn",
                                actions=[
-                                   {"id": "retry", "label": f"Poke {name}",
+                                   {"id": "retry", "label": "Retry",
                                     "style": "primary",
                                     "command": {"action": "poke_agent", "agent": agent_key_stuck}},
-                                   {"id": "continue_partial", "label": "Wait longer",
+                                   {"id": "wait", "label": "Wait",
                                     "style": "default",
                                     "command": {"action": "wait_longer_agent", "agent": agent_key_stuck}},
-                                   {"id": "skip", "label": "Skip agent",
+                                   {"id": "skip", "label": "Skip",
                                     "style": "default",
                                     "command": {"action": "skip_agent", "agent": agent_key_stuck}},
                                ])
@@ -6140,7 +6232,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "Or is the response FULLY complete (no stop button anywhere, no loading, the final paragraph visible)? "
                 "Answer 'still generating' or 'response complete'. "
                 "If you see a Stop button ANYWHERE on the page (composer OR research card), answer 'still generating'.",
-                model=CUA_MODEL, max_iterations=3, verbose=verbose)
+                model=CUA_MODEL, max_iterations=3, verbose=verbose,
+                phase=2, agent_name=normalize_agent_key(name), target_page=p["page"])
             diag_text_raw = (diag.get("text") or "")
             diag_text = diag_text_raw.lower()
             p["last_cua_check"] = time.time()
@@ -6236,25 +6329,86 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     except Exception:
                         pass
 
-                # Claude-specific: validate completion via artifact count
-                # If only 1 artifact exists early in the run, the "done" verdict is
-                # likely from the planning phase ending — real completion produces 2 artifacts
-                if name == "Claude" and elapsed < (max_wait_min * 60 * 0.8):
+                # Claude-specific: validate completion via artifact count.
+                # Research mode on Opus 4.7 with Adaptive Thinking produces
+                # TWO artifacts — (1) references, (2) the final report. We
+                # need BOTH before we trust the "done" verdict.
+                #
+                #   • < 80% budget + < 2 artifacts → revert to polling
+                #     (early done-verdict is almost always the planning phase)
+                #   • ≥ 80% budget + < 2 artifacts → hard-fail, ask user
+                #     (Retry with follow-up asking for the missing artifact,
+                #      Skip drops Claude, Wait extends budget by 15 min)
+                if name == "Claude":
                     try:
                         _art_count = await _count_claude_artifacts(p["page"])
-                        if _art_count < 2:
-                            log(f"[Claude] CUA says done but only {_art_count} artifact(s) at "
-                                f"{int(elapsed/60)}m — likely still researching. Reverting.", "WARN")
+                    except Exception:
+                        _art_count = 2  # on DOM query failure, trust extraction
+                    if _art_count < 2 and elapsed < (max_wait_min * 60 * 0.8):
+                        log(f"[Claude] CUA says done but only {_art_count} artifact(s) at "
+                            f"{int(elapsed/60)}m — likely still researching. Reverting.", "WARN")
+                        p["done_count"] = 0
+                        p["cua_confirmed"] = False
+                        p["last_cua_check"] = time.time()
+                        emit_event("agent_progress", phase=2, agent="claude",
+                                   status="generating",
+                                   progress=f"Still researching — only {_art_count} artifact(s) so far",
+                                   elapsedSec=int(elapsed))
+                        continue
+                    if _art_count < 2:
+                        # Hard-fail path — budget 80%+ spent and the 2nd
+                        # artifact never materialized. Don't silently accept
+                        # the 1st one (that's the references, not the report).
+                        log(f"[Claude] Hard-fail: {int(elapsed/60)}m elapsed with only "
+                            f"{_art_count} artifact(s) — final document missing", "ERROR")
+                        agent_key_hf = "claude"
+                        try:
+                            emit_event("pipeline_warning", phase=2, agent=agent_key_hf,
+                                       message=f"Claude produced only {_art_count} artifact — the final document is missing",
+                                       details=("Claude research mode produces 2 artifacts: references, then "
+                                                f"the report. Only {_art_count} arrived. Retry asks Claude to "
+                                                "finish the document. Wait extends the budget by 15 min. "
+                                                "Skip drops Claude and proceeds with the other agents."),
+                                       alertType="warn",
+                                       actions=[
+                                           {"id": "retry", "label": "Retry", "style": "primary",
+                                            "command": {"action": "retry_agent", "agent": agent_key_hf}},
+                                           {"id": "wait", "label": "Wait", "style": "default",
+                                            "command": {"action": "wait_longer_agent", "agent": agent_key_hf}},
+                                           {"id": "skip", "label": "Skip", "style": "default",
+                                            "command": {"action": "skip_agent", "agent": agent_key_hf}},
+                                       ])
+                        except Exception:
+                            pass
+                        decision = await _controls.await_agent_decision(agent_key_hf, timeout=300.0)
+                        log(f"[Claude] 2-artifact hard-fail decision: {decision}")
+                        if decision == "stop":
+                            break
+                        if decision == "skip":
+                            continue
+                        if decision == "retry":
+                            followup = (
+                                "Your research is incomplete — the final comprehensive report artifact is missing. "
+                                "Please produce the complete research document artifact now — include every section, "
+                                "finding, and source. This is the deliverable document, not the references list."
+                            )
+                            try:
+                                await browser.switch_to_page(p["page"])
+                                await paste_followup(p["page"], followup, "claude", label="Claude-retry-artifact")
+                            except Exception as _e:
+                                log(f"[Claude] Retry follow-up failed: {_e}", "WARN")
+                            p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
                             p["done_count"] = 0
                             p["cua_confirmed"] = False
                             p["last_cua_check"] = time.time()
-                            emit_event("agent_progress", phase=2, agent="claude",
-                                       status="generating",
-                                       progress=f"Still researching — only {_art_count} artifact(s) so far",
-                                       elapsedSec=int(elapsed))
+                            p.pop("_cached_text", None)
+                            p["empty_retries"] = 0
                             continue
-                    except Exception:
-                        pass  # On failure, proceed with extraction anyway
+                        # wait_longer / timeout → extend budget, keep polling
+                        p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
+                        p["done_count"] = 0
+                        p["cua_confirmed"] = False
+                        continue
 
                 # Extract content (use cached text from link-retry if available)
                 text = p.pop("_cached_text", "")
@@ -6307,17 +6461,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                    message=f"{name} finished but no readable text was extracted",
                                    details=("CUA says the agent is done, but 3 extraction attempts came "
                                             "back empty. Retry sends a follow-up asking for the complete "
-                                            "report. Continue with partial keeps what little we have. "
-                                            "Skip drops this agent and proceeds with the other agents."),
+                                            "report. Skip drops this agent and proceeds with the others."),
                                    alertType="warn",
                                    actions=[
-                                       {"id": "retry", "label": f"Retry {name}",
+                                       {"id": "retry", "label": "Retry",
                                         "style": "primary",
                                         "command": {"action": "retry_agent", "agent": ag_key_empty}},
-                                       {"id": "continue_partial", "label": "Continue with partial",
-                                        "style": "default",
-                                        "command": {"action": "continue_partial_agent", "agent": ag_key_empty}},
-                                       {"id": "skip", "label": "Skip agent",
+                                       {"id": "skip", "label": "Skip",
                                         "style": "default",
                                         "command": {"action": "skip_agent", "agent": ag_key_empty}},
                                    ])
@@ -6404,7 +6554,58 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                    partialTextLen=len(text), elapsedSec=int(elapsed))
                         continue
 
-                # Emit link
+                # ── Public-share-only hard-fail for Gemini + Claude ──
+                # User rule (2026-04-19): Gemini/Claude/NotebookLM MUST have a
+                # public share link. Conversation URLs don't count. When all
+                # retries fail, surface an AgentAlert with Retry · Skip rather
+                # than silently emitting an unverified private link.
+                if has_content and not link_verified and agent_key_lc in ("gemini", "claude"):
+                    log(f"[{name}] Public share extraction failed after all retries — "
+                        f"hard-fail (no private fallback for {name})", "ERROR")
+                    try:
+                        emit_event("pipeline_warning", phase=2, agent=agent_key_lc,
+                                   message=f"{name}: public share link could not be created",
+                                   details=(f"{name} requires a PUBLIC share link — private conversation "
+                                            "URLs are not accepted. Retry re-attempts the share flow. "
+                                            "Skip drops this agent and proceeds with the others."),
+                                   alertType="warn",
+                                   actions=[
+                                       {"id": "retry", "label": "Retry", "style": "primary",
+                                        "command": {"action": "retry_agent", "agent": agent_key_lc}},
+                                       {"id": "skip", "label": "Skip", "style": "default",
+                                        "command": {"action": "skip_agent", "agent": agent_key_lc}},
+                                   ])
+                    except Exception:
+                        pass
+                    hf_decision = await _controls.await_agent_decision(agent_key_lc, timeout=300.0)
+                    log(f"[{name}] Public-share hard-fail decision: {hf_decision}")
+                    if hf_decision == "stop":
+                        break
+                    if hf_decision == "skip":
+                        # skipped_agents handler will finalize on the next tick
+                        continue
+                    if hf_decision == "retry":
+                        # Wipe caches + reset so the next tick retries the
+                        # share flow from scratch.
+                        p["link_retries"] = 0
+                        p.pop("_cached_text", None)
+                        p["done_count"] = 0
+                        p["cua_confirmed"] = False
+                        p["last_cua_check"] = time.time() + 30
+                        continue
+                    # wait_longer / timeout → extend budget, keep polling.
+                    # User's intent: don't silently accept a private URL.
+                    p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
+                    p["link_retries"] = 0
+                    p.pop("_cached_text", None)
+                    p["done_count"] = 0
+                    p["cua_confirmed"] = False
+                    continue
+
+                # Emit link — ChatGPT allows conversation URL fallback (the
+                # conversation is not public-shareable by design, so the chat
+                # URL is the honest link). Gemini/Claude only reach here with
+                # verified=true (hard-fail branch above catches the rest).
                 if validate_link(agent_key_lc, agent_url):
                     emit_validated_link(2, agent_key_lc, agent_url, f"{name} Research")
                 else:
@@ -6684,22 +6885,31 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 
 
 async def extract_gemini_response(page, browser=None, cua_client=None, label="Gemini", verbose=False):
-    """Extract last response from Gemini — HTML→MD → copy button → JS → clipboard."""
+    """Dedicated Gemini extractor — HTML→MD → copy button → JS → clipboard.
+    Each method emits an explicit log line so the path that succeeded (or
+    the one that silently returned empty) is visible in the run log.
+    Returns the markdown/text or "" on total failure."""
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
+    # Method 1: HTML → markdown from Gemini's response containers
     md = await _extract_html_to_md(page, [
         'message-content', '.model-response-text', '.response-container',
     ], label)
     if md and len(md) > 100:
+        log(f"[{label}] Extracted via HTML→MD: {len(md)} chars")
         return md
+    log(f"[{label}] HTML→MD returned {len(md or '')} chars — trying copy button", "WARN")
 
+    # Method 2: click Gemini's built-in Copy button
     copied = await _try_copy_button(page, browser, cua_client, label, verbose)
     if copied and len(copied) > 100:
         log(f"[{label}] Extracted via copy button: {len(copied)} chars")
         return copied
+    log(f"[{label}] Copy button returned {len(copied or '')} chars — trying JS", "WARN")
 
+    # Method 3: innerText from response containers
     try:
         text = await page.evaluate("""() => {
             const r = document.querySelectorAll('message-content, .model-response-text, .response-container');
@@ -6709,18 +6919,24 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             return '';
         }""")
         if text and len(text) > 100:
-            log(f"[{label}] Extracted via JS: {len(text)} chars")
+            log(f"[{label}] Extracted via JS innerText: {len(text)} chars")
             return text
-    except Exception:
-        pass
+        log(f"[{label}] JS innerText returned {len(text or '')} chars — trying select-all", "WARN")
+    except Exception as _e:
+        log(f"[{label}] JS innerText error: {_e}", "WARN")
 
-    # Method 4: Select-all clipboard (last resort)
-    log(f"[{label}] Trying select-all clipboard fallback", "WARN")
+    # Method 4: select-all + clipboard (last resort)
+    log(f"[{label}] Falling back to select-all clipboard", "WARN")
     await page.keyboard.press("Control+a")
     await asyncio.sleep(0.5)
     await page.keyboard.press("Control+c")
     await asyncio.sleep(1)
-    return get_clipboard()
+    clip = get_clipboard() or ""
+    if clip and len(clip) > 100:
+        log(f"[{label}] Extracted via select-all clipboard: {len(clip)} chars")
+    else:
+        log(f"[{label}] All extraction methods failed — returning empty", "ERROR")
+    return clip
 
 
 async def extract_claude_response(page, browser=None, cua_client=None, label="Claude", verbose=False):
@@ -7289,90 +7505,138 @@ async def setup_gemini_dr(page) -> bool:
 
 
 async def setup_claude_dr(page) -> bool:
-    """Enable Claude Adaptive Thinking + Research tool via direct selectors.
-    Claude.ai: model dropdown shows 'Opus 4.7 Adaptive' variant; Research is in tools menu."""
+    """Enable Claude Opus 4.7 + Adaptive Thinking + Research tool via
+    direct Playwright selectors. These are THREE independent controls in
+    the current Claude.ai UI:
+        1. Model dropdown        → Opus 4.7
+        2. Adaptive Thinking     → on (separate toggle/pill, often next to the model name)
+        3. Research tool         → on (inside the "+" tools menu)
+    The CUA fallback lives one layer up in setup_agent so this routine can
+    hard-return False the moment any step fails, without fighting the DOM."""
     try:
         await asyncio.sleep(2)
-        # Step 1: Model selector — click the model dropdown button.
-        # IMPORTANT: Prioritize Opus over Sonnet. The model selector button
-        # in Claude's UI shows the currently-selected model name. We search
-        # for "opus" first; only if not found, fall back to "sonnet"/"claude".
-        model_picked = await page.evaluate("""() => {
+
+        # ── Step 1: open model dropdown and pick Opus 4.7 ─────────────
+        dropdown_clicked = await page.evaluate("""() => {
             const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
-            // Priority 1: button already showing "opus"
+            // Model selector button shows the currently-selected model name.
+            // Priority: already-Opus > Sonnet > any button with "claude"
             let dropdown = btns.find(b => (b.textContent || '').toLowerCase().includes('opus'));
-            // Priority 2: any model-selector button (sonnet, claude, etc.)
             if (!dropdown) dropdown = btns.find(b => {
                 const t = (b.textContent || '').toLowerCase();
-                return t.includes('sonnet') || t.includes('claude');
+                return t.includes('sonnet') || t.includes('haiku') || t.includes('claude');
             });
             if (dropdown) { dropdown.click(); return true; }
             return false;
         }""")
-        if model_picked:
-            await asyncio.sleep(1.0)
-            # Pick "Opus Adaptive Thinking" from the dropdown — prioritize Opus,
-            # never settle for Sonnet if Opus is available.
-            selected = await page.evaluate("""() => {
-                const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, a')];
-                // Priority 1: "Opus" + "Extended"
+        if dropdown_clicked:
+            await asyncio.sleep(0.8)
+            opus_selected = await page.evaluate("""() => {
+                const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, a, li')];
+                // Priority 1: exact "Opus 4.7"
                 let pick = items.find(el => {
                     const t = (el.textContent || '').trim().toLowerCase();
-                    return t.includes('opus') && (t.includes('extended') || t.includes('thinking'));
+                    return t.includes('opus') && t.includes('4.7');
                 });
-                // Priority 2: "Opus 4" (any Opus variant)
+                // Priority 2: any Opus 4.x variant (future-proof)
                 if (!pick) pick = items.find(el => {
                     const t = (el.textContent || '').trim().toLowerCase();
                     return t.includes('opus') && t.includes('4');
                 });
-                // Priority 3: "Extended Thinking" (standalone option)
-                if (!pick) pick = items.find(el => {
-                    const t = (el.textContent || '').trim().toLowerCase();
-                    return t === 'extended thinking' || (t.includes('extended') && t.includes('thinking'));
-                });
+                // Priority 3: any Opus at all
+                if (!pick) pick = items.find(el => (el.textContent || '').toLowerCase().includes('opus'));
                 if (pick) { pick.click(); return pick.textContent.trim(); }
                 return null;
             }""")
-            if selected:
-                log(f"Claude model selected: {selected}")
+            if opus_selected:
+                log(f"[Claude] Model selected via Playwright: {opus_selected}")
             else:
-                log("Could not find Opus Adaptive Thinking in dropdown — may default to current model", "WARN")
-            await asyncio.sleep(0.8)
-
-        # Step 2: Open tools menu ("+" button) — enable "Research" tool
-        tools_opened = False
-        for sel in ['button[aria-label*="tools"]', 'button[aria-label*="attach"]',
-                    'button[aria-label="Open tools menu"]', 'button[aria-label*="+"]']:
-            try:
-                btn = await page.query_selector(sel)
-                if btn:
-                    await btn.click()
-                    await asyncio.sleep(0.8)
-                    tools_opened = True
-                    break
-            except Exception:
-                continue
-        if tools_opened:
-            await page.evaluate("""() => {
-                const items = document.querySelectorAll('[role="menuitem"], button, [role="switch"], [role="checkbox"]');
-                for (const el of items) {
-                    const t = (el.textContent || '').trim().toLowerCase();
-                    const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                    if (t === 'research' || a === 'research' || t.includes('research tool')) {
-                        el.click(); return true;
-                    }
-                }
-                return false;
-            }""")
-            await asyncio.sleep(0.8)
-            # Close menu by clicking body or pressing Escape
+                log("[Claude] Opus 4.7 not found in dropdown", "WARN")
+                return False
+            await asyncio.sleep(0.6)
+            # Dismiss the dropdown so the Adaptive Thinking toggle is clickable
             try:
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
+        else:
+            log("[Claude] Model dropdown button not found", "WARN")
+            return False
 
-        # Focus input
+        # ── Step 2: toggle Adaptive Thinking ON ────────────────────────
+        # The toggle is a separate control — usually a pill/switch near
+        # the model name or inside a "Thinking" submenu. We look for any
+        # element whose text or aria-label is exactly "adaptive thinking"
+        # or "extended thinking" that isn't already active.
+        adaptive_state = await page.evaluate("""() => {
+            const els = [...document.querySelectorAll(
+                'button, [role="switch"], [role="checkbox"], [role="menuitem"], [role="option"], label'
+            )].filter(el => el.offsetParent !== null);
+            const matches = els.filter(el => {
+                const t = (el.textContent || '').trim().toLowerCase();
+                const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                return t === 'adaptive thinking' || t === 'extended thinking' ||
+                       a === 'adaptive thinking' || a === 'extended thinking' ||
+                       t.startsWith('adaptive thinking') || t.startsWith('extended thinking');
+            });
+            if (!matches.length) return { found: false };
+            const el = matches[0];
+            const checked = el.getAttribute('aria-checked') === 'true' ||
+                             el.getAttribute('aria-pressed') === 'true' ||
+                             el.dataset.state === 'checked' || el.dataset.state === 'on';
+            if (!checked) { el.click(); return { found: true, toggled: true, label: el.textContent.trim() }; }
+            return { found: true, toggled: false, label: el.textContent.trim() };
+        }""")
+        if not adaptive_state.get("found"):
+            log("[Claude] Adaptive Thinking toggle not found — UI may have shipped under a new label", "WARN")
+        else:
+            log(f"[Claude] Adaptive Thinking {'enabled' if adaptive_state.get('toggled') else 'already on'}: "
+                f"{adaptive_state.get('label')}")
+        await asyncio.sleep(0.4)
+
+        # ── Step 3: open tools menu and enable Research ────────────────
+        tools_opened = False
+        for sel in ['button[aria-label*="tools"]', 'button[aria-label*="Tools"]',
+                    'button[aria-label="Open tools menu"]',
+                    'button[aria-label*="attach"]', 'button[aria-label*="+"]']:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    await asyncio.sleep(0.6)
+                    tools_opened = True
+                    break
+            except Exception:
+                continue
+        research_enabled = False
+        if tools_opened:
+            research_enabled = await page.evaluate("""() => {
+                const items = [...document.querySelectorAll(
+                    '[role="menuitem"], button, [role="switch"], [role="checkbox"], label'
+                )];
+                const target = items.find(el => {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                    return t === 'research' || a === 'research' || t.includes('research tool');
+                });
+                if (!target) return false;
+                const checked = target.getAttribute('aria-checked') === 'true' ||
+                                 target.getAttribute('aria-pressed') === 'true' ||
+                                 target.dataset.state === 'checked' || target.dataset.state === 'on';
+                if (!checked) target.click();
+                return true;
+            }""")
+            await asyncio.sleep(0.4)
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+        if not research_enabled:
+            log("[Claude] Research tool not found in tools menu", "WARN")
+
+        # Focus the input so the brief paste/attach lands cleanly.
         for sel in ['div[contenteditable="true"]', '[aria-label*="message"]', '.ProseMirror']:
             try:
                 inp = await page.query_selector(sel)
@@ -7381,7 +7645,8 @@ async def setup_claude_dr(page) -> bool:
                     break
             except Exception:
                 continue
-        return True
+        # Success only when all three critical knobs are in place
+        return bool(opus_selected) and bool(research_enabled)
     except Exception as e:
         log(f"[setup_claude_dr] {e}", "WARN")
         return False
@@ -8187,18 +8452,15 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             emit_event("pipeline_warning", phase=2, agent=ag_key_send,
                        message=f"{label}: Send button required CUA fallback — may not have submitted",
                        details=("Playwright couldn't find the Send button via DOM selectors, so CUA "
-                                "clicked on what it thought was Send. Retry re-runs the CUA send attempt. "
-                                "Continue trusts the click landed and waits for the agent to start. "
-                                "Skip drops this agent entirely."),
+                                "clicked on what it thought was Send. Retry re-runs the CUA send. "
+                                "Skip drops this agent. If you do nothing, the poll continues assuming "
+                                "the click landed."),
                        alertType="warn",
                        actions=[
-                           {"id": "retry", "label": "Retry send",
+                           {"id": "retry", "label": "Retry",
                             "style": "primary",
                             "command": {"action": "retry_agent", "agent": ag_key_send}},
-                           {"id": "continue_partial", "label": "Continue (trust it)",
-                            "style": "default",
-                            "command": {"action": "continue_partial_agent", "agent": ag_key_send}},
-                           {"id": "skip", "label": "Skip agent",
+                           {"id": "skip", "label": "Skip",
                             "style": "default",
                             "command": {"action": "skip_agent", "agent": ag_key_send}},
                        ])
