@@ -11549,12 +11549,11 @@ def run_daemon_loop(port: int = 8000):
     upstream failures, anything. Without this, --resurrect only fires the
     process once per logon, which defeats the "indestructible" promise.
 
-    Loops forever with a 5s delay between restarts. Exits only on
-    KeyboardInterrupt so the user can Ctrl+C out of the wrapper itself
-    when they want to stop the loop. `--exorcise` deletes the scheduled
-    task; the currently-running wrapper keeps going until the next reboot
-    (or the user ends it via Task Manager) — deliberate, so a surprise
-    --exorcise doesn't yank the rug out mid-pipeline."""
+    Loops forever with a 5s delay between restarts. Exits on
+    KeyboardInterrupt OR on SIGTERM/taskkill (so --exorcise can stop
+    the live loop without requiring a reboot). The --serve child
+    process is NOT killed — it stays alive so the current pipeline
+    finishes, and the user manages it manually from then on."""
     import sys as _sys
     import subprocess as _subprocess
     import time as _time
@@ -11680,8 +11679,18 @@ def run_resurrect():
 
 
 def run_exorcise():
-    """Remove the Indestructible Scheduled Task. Idempotent — succeeds even
-    if the task wasn't installed."""
+    """Remove the Indestructible setup — completely. Idempotent: succeeds
+    whether or not the task/loop exists.
+
+    Three-step nuke (2026-04-18):
+      1. Delete the Windows Scheduled Task so `--daemon-loop` won't
+         auto-start at next logon.
+      2. Terminate any currently-running `--daemon-loop` processes so
+         the user doesn't have to wait for a reboot to stop the
+         supervisor. The `--serve` child is intentionally LEFT alive so
+         the current pipeline can finish — the user manages it manually
+         from then on.
+      3. Flip the Firestore indestructible flag to false."""
     import subprocess as _subprocess
     import platform as _platform
 
@@ -11696,6 +11705,7 @@ def run_exorcise():
 
     init_firebase()
 
+    # ── Step 1: delete the Scheduled Task ──
     cmd = [
         "schtasks", "/Delete",
         "/TN", _INDESTRUCTIBLE_TASK_NAME,
@@ -11724,11 +11734,69 @@ def run_exorcise():
             for line in result.stderr.strip().splitlines():
                 print(f"     {line}")
 
+    # ── Step 2: kill any running --daemon-loop processes ──
+    # Without this, the user has to wait for a reboot (or find the PID
+    # themselves) for the supervisor to stop respawning --serve. WMIC
+    # lookup — matches by command line, never by bare name (so we don't
+    # touch unrelated python.exe processes). --serve is deliberately
+    # spared so an in-flight pipeline isn't yanked; once the user stops
+    # --serve themselves, nothing auto-restarts it.
+    self_pid = os.getpid()
+    killed = 0
+    try:
+        ps = _subprocess.run(
+            ["wmic", "process", "where",
+             "name='python.exe'", "get", "processid,commandline", "/format:list"],
+            capture_output=True, text=True, timeout=15,
+        )
+        raw = ps.stdout or ""
+        # WMIC /format:list prints blocks of "Key=Value" pairs.
+        entries: list[dict[str, str]] = []
+        cur: dict[str, str] = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                if cur:
+                    entries.append(cur)
+                    cur = {}
+                continue
+            if "=" in line:
+                k, _, v = line.partition("=")
+                cur[k.strip()] = v.strip()
+        if cur:
+            entries.append(cur)
+        for e in entries:
+            cmdline = e.get("CommandLine", "")
+            pid_str = e.get("ProcessId", "")
+            if "--daemon-loop" not in cmdline:
+                continue
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            if pid == self_pid:
+                continue  # Don't kill ourselves if --exorcise was launched via the loop
+            try:
+                _subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                capture_output=True, text=True, timeout=10)
+                killed += 1
+            except Exception as e:
+                print(f"  {_c(_WARN, f'Failed to kill PID {pid}:')} {e}")
+    except Exception as e:
+        print(f"  {_c(_WARN, 'Could not enumerate daemon-loop processes:')} {e}")
+
+    if killed:
+        print(f"  {_c(_OK, '[ok]')} Stopped {killed} running daemon-loop process{'es' if killed != 1 else ''}")
+    else:
+        print(f"  {_c(_DIM, 'No running daemon-loop processes to stop.')}")
+
+    # ── Step 3: sync the Firestore flag ──
     _write_indestructible_flag(False)
     print(f"  {_c(_OK, '[ok]')} Synced to the Super Research app")
     print()
-    print(f"  {_c(_DIM, 'The backend no longer auto-starts at logon. You can still')}")
-    print(f"  {_c(_DIM, 'run it manually with')} {_c(_BOLD, 'python research.py --serve')}.")
+    print(f"  {_c(_DIM, 'The backend no longer auto-starts at logon and no supervisor is')}")
+    print(f"  {_c(_DIM, 'running. Any current --serve keeps going until it dies; then')}")
+    print(f"  {_c(_DIM, 'run')} {_c(_BOLD, 'python research.py --serve')} {_c(_DIM, 'manually to bring it back.')}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
