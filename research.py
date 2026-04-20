@@ -6454,6 +6454,35 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                    elapsedSec=int(elapsed))
                         continue
                     if _art_count < 2:
+                        # ── C2: one-shot auto-nudge before the hard-fail modal ──
+                        # Give Claude 90s to produce artifact 2 after an explicit
+                        # ask, before interrupting the user. Fires once per agent
+                        # per phase (p["nudged_artifact"]).
+                        if not p.get("nudged_artifact"):
+                            p["nudged_artifact"] = True
+                            nudge_art = (
+                                "Your research is incomplete — the final comprehensive report "
+                                "artifact is missing. Please produce the complete research "
+                                "document artifact now — include every section, finding, and "
+                                "source. This is the deliverable document, not the references list."
+                            )
+                            try:
+                                emit_event("agent_progress", phase=2, agent="claude",
+                                           status="nudging",
+                                           progress="Nudging Claude to publish artifact 2 (90s)…")
+                                await browser.switch_to_page(p["page"])
+                                await paste_followup(p["page"], nudge_art, "claude",
+                                                     label="Claude-nudge-artifact")
+                                log(f"[Claude] Sent artifact-2 nudge — waiting 90s")
+                                await asyncio.sleep(90)
+                            except Exception as _ne:
+                                log(f"[Claude] Artifact nudge failed: {_ne}", "WARN")
+                            # Rewind so next CUA tick re-checks artifact count
+                            p["done_count"] = 0
+                            p["cua_confirmed"] = False
+                            p["last_cua_check"] = time.time()
+                            p["start_time"] = time.time() - (max_wait_min * 60) + (10 * 60)
+                            continue
                         # Hard-fail path — budget 80%+ spent and the 2nd
                         # artifact never materialized. Don't silently accept
                         # the 1st one (that's the references, not the report).
@@ -6659,6 +6688,49 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # retries fail, surface an AgentAlert with Retry · Skip rather
                 # than silently emitting an unverified private link.
                 if has_content and not link_verified and agent_key_lc in ("gemini", "claude"):
+                    # ── C2: one-shot auto-nudge before the hard-fail modal ──
+                    # Ask the agent directly to surface the public link. Gemini:
+                    # Share & Export flow. Claude: publish the report artifact.
+                    # After the wait, rewind state so the next main-loop tick
+                    # re-runs extraction against the nudged UI. Fires once per
+                    # agent per phase (p["nudged_public"]).
+                    if not p.get("nudged_public"):
+                        p["nudged_public"] = True
+                        if agent_key_lc == "gemini":
+                            nudge_pub = (
+                                "Please make the share link public so it's accessible. "
+                                "Click Share & Export → Create public link → Anyone with "
+                                "the link → Copy."
+                            )
+                            wait_pub = 60
+                        else:  # claude
+                            nudge_pub = (
+                                "Please publish your final research report artifact so it "
+                                "has a public link. Open the second artifact (the "
+                                "comprehensive report, not the references list) and click "
+                                "Publish."
+                            )
+                            wait_pub = 90
+                        try:
+                            emit_event("agent_progress", phase=2, agent=agent_key_lc,
+                                       status="nudging",
+                                       progress=f"Nudging {name} to surface the public link ({wait_pub}s)…")
+                            await browser.switch_to_page(p["page"])
+                            await paste_followup(p["page"], nudge_pub, agent_key_lc,
+                                                 label=f"{name}-nudge-public")
+                            log(f"[{name}] Sent public-link nudge — waiting {wait_pub}s")
+                            await asyncio.sleep(wait_pub)
+                        except Exception as _ne:
+                            log(f"[{name}] Public-link nudge failed: {_ne}", "WARN")
+                        # Rewind so next tick re-runs CUA + extraction against
+                        # the post-nudge DOM. If the nudge worked we pick up a
+                        # verified link and skip this branch entirely.
+                        p["done_count"] = 0
+                        p["cua_confirmed"] = False
+                        p["last_cua_check"] = time.time()
+                        p["link_retries"] = 0
+                        p.pop("_cached_text", None)
+                        continue
                     log(f"[{name}] Public share extraction failed after all retries — "
                         f"hard-fail (no private fallback for {name})", "ERROR")
                     # Emit agent_link_failed so the frontend renders the per-agent
