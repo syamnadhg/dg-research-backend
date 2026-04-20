@@ -1008,6 +1008,7 @@ def start_firestore_start_listener(job_queue, loop):
             topic = data.get("topic", "").strip()
             email = data.get("email", "")
             config = data.get("config", {})
+            brief_text = (data.get("briefText") or "").strip()
             if not topic or not uid or not research_id:
                 log(f"Firestore start request missing fields: uid={uid}, rid={research_id}, topic={topic[:30]}", "WARN")
                 try:
@@ -1097,9 +1098,10 @@ def start_firestore_start_listener(job_queue, loop):
                 pass
             # Queue the job (default-arg capture avoids lambda-in-loop closure bug)
             loop.call_soon_threadsafe(
-                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id:
+                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text:
                     job_queue.put_nowait(
-                        {"topic": t, "email": e, "config": c, "run_id": r, "uid": u, "research_id": ri}
+                        {"topic": t, "email": e, "config": c, "run_id": r,
+                         "uid": u, "research_id": ri, "brief_text": bt}
                     )
             )
 
@@ -2789,7 +2791,14 @@ class LinkResult:
 
 
 async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief", verbose=False):
-    """Extract shareable ChatGPT link: Share button → Create link → copy URL."""
+    """Extract shareable ChatGPT link: Share button → Create link → copy URL.
+
+    Iframe short-circuit (2026-04): ChatGPT Deep Research renders inside a
+    cross-origin sandbox iframe that often intercepts pointer events on the
+    host Share button. Default Playwright click retries for 30s per attempt
+    and then throws. We use a 3s click timeout so the iframe-intercept path
+    fails fast — the caller (extract_and_record_agent) then falls back to
+    the chat URL without burning 90s across retries."""
     page = browser.page
     url = await browser.current_url() or ""
     try:
@@ -2801,7 +2810,15 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
             if share_btn:
                 break
         if share_btn:
-            await share_btn.click()
+            # Short-timeout click — iframe intercepts surface as timeout here,
+            # and we want to abort the public-share path immediately rather
+            # than waste 30s per retry attempt.
+            try:
+                await share_btn.click(timeout=3000)
+            except Exception as _ce:
+                log(f"[{label}] Share click short-circuited ({_ce}) — public-link fast-fail", "WARN")
+                return LinkResult(url=url, label=label, platform="chatgpt",
+                                  verified=False, error=f"share_click_intercept: {_ce}")
             await asyncio.sleep(2)
             # Look for "Create link" or "Copy link" button in modal
             link_btn = None
@@ -2811,7 +2828,12 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
                 if link_btn:
                     break
             if link_btn:
-                await link_btn.click()
+                try:
+                    await link_btn.click(timeout=3000)
+                except Exception as _ce2:
+                    log(f"[{label}] Create/Copy link click short-circuited ({_ce2})", "WARN")
+                    return LinkResult(url=url, label=label, platform="chatgpt",
+                                      verified=False, error=f"link_click_intercept: {_ce2}")
                 await asyncio.sleep(2)
             # PRIMARY — try to get URL from input field in modal
             share_input = await page.query_selector('input[readonly][value*="chatgpt.com/share"]')
@@ -4581,6 +4603,273 @@ SCRAPE_FNS = {
 }
 
 
+# ── Per-Agent Completion Detectors (Playwright-only) ──────────────────────────
+# Atomic single-shot detectors for the round-robin loop. Each returns
+# (done: bool, reason: str). Reason is a short string for logging/telemetry.
+# The caller tracks "2 consecutive polls" semantics where required — detectors
+# just report the current signal snapshot from a single poll.
+#
+# Rules (locked 2026-04 with Phase 2 orchestration overhaul):
+#   ChatGPT: no Stop (host + iframe) AND ("Research completed" text OR partial>5000)
+#   Claude : no Stop/"sources and counting" AND
+#            (artifacts>=2 OR done-text OR (partial>8000 AND summary/conclusion heading))
+#   Gemini : no Start-research AND no Stop AND
+#            (Share/Export visible OR (partial>5000 AND no active keywords))
+
+async def detect_completion_chatgpt(page):
+    """ChatGPT Deep Research completion detector. Playwright-only.
+    Returns (done, reason). Checks both host page and the cross-origin DR
+    iframe for Stop button + completion text."""
+    try:
+        host = await page.evaluate("""() => {
+            let hasStop = !!document.querySelector(
+                'button[aria-label="Stop generating"], button[aria-label*="Stop"], ' +
+                'button[data-testid="stop-button"], button[data-testid*="stop"]'
+            );
+            if (!hasStop) {
+                for (const b of document.querySelectorAll('button')) {
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    if (t === 'stop' || t === 'stop generating' || t === 'stop research') {
+                        hasStop = true; break;
+                    }
+                }
+            }
+            const bl = (document.body?.innerText || '').toLowerCase();
+            const doneKws = ['research completed', 'research complete',
+                             'finished research', 'deep research completed'];
+            const hasDoneText = doneKws.some(k => bl.includes(k));
+            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+            let hostLen = 0;
+            if (msgs.length > 0) hostLen = msgs[msgs.length-1].innerText.length;
+            return { hasStop, hasDoneText, hostLen };
+        }""")
+
+        iframe_stop = False
+        iframe_done = False
+        iframe_len = 0
+        try:
+            for frame in page.frames:
+                try:
+                    src = (frame.url or "").lower()
+                except Exception:
+                    continue
+                if not src:
+                    continue
+                if ("deep_research" in src or "oaiusercontent" in src):
+                    try:
+                        data = await frame.evaluate("""() => {
+                            let hasStop = false;
+                            for (const b of document.querySelectorAll('button')) {
+                                const t = (b.textContent || '').trim().toLowerCase();
+                                const al = (b.getAttribute('aria-label') || '').toLowerCase();
+                                if (t === 'stop' || t === 'stop research' ||
+                                    al.includes('stop')) { hasStop = true; break; }
+                            }
+                            const bl = (document.body?.innerText || '').toLowerCase();
+                            const doneKws = ['research completed', 'finished research',
+                                             'deep research completed'];
+                            return {
+                                hasStop,
+                                done: doneKws.some(k => bl.includes(k)),
+                                len:  (document.body?.innerText || '').length
+                            };
+                        }""")
+                        if data:
+                            iframe_stop = bool(data.get("hasStop"))
+                            iframe_done = bool(data.get("done"))
+                            iframe_len = int(data.get("len") or 0)
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
+
+        has_stop = host["hasStop"] or iframe_stop
+        partial_len = max(host["hostLen"], iframe_len)
+        has_done = host["hasDoneText"] or iframe_done
+
+        if has_stop:
+            return (False, f"stop_btn_present (partial_len={partial_len}, iframe_stop={iframe_stop})")
+        if has_done:
+            return (True, f"no_stop + done_text (partial_len={partial_len})")
+        if partial_len > 5000:
+            return (True, f"no_stop + partial_len={partial_len}>5000")
+        return (False, f"no_stop but partial_len={partial_len}<=5000")
+    except Exception as e:
+        return (False, f"detect_error: {e}")
+
+
+async def detect_completion_claude(page):
+    """Claude Research completion detector. Playwright-only.
+    Returns (done, reason). Uses 2-artifact signal + text markers + heading check."""
+    try:
+        data = await page.evaluate("""() => {
+            let hasStop = false;
+            for (const b of document.querySelectorAll('button')) {
+                const txt = (b.textContent || '').trim().toLowerCase();
+                const al  = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (txt === 'stop' || txt === 'stop generating' || txt === 'stop research' ||
+                    txt === 'stop researching' ||
+                    al.includes('stop response') || al.includes('stop research') ||
+                    al.includes('stop generating')) { hasStop = true; break; }
+            }
+            if (!hasStop && document.querySelector(
+                '[data-is-streaming="true"], .streaming, [class*="animate-pulse"]'
+            )) hasStop = true;
+
+            const bodyText = document.body?.innerText || '';
+            const doneM = bodyText.match(/research\\s+completed(?:\\s+in\\s+[\\dhms]+)?/i);
+            const researchDone = !!doneM;
+            const liveM = bodyText.match(/\\d[\\d,]*\\s+sources?\\s+and\\s+counting/i);
+            const liveActive = !!liveM;
+
+            let artifactCount = 0;
+            const sels = [
+                'button[data-testid*="artifact"]',
+                '[data-testid*="artifact-preview"]',
+                '.artifact-card', '.artifact-preview',
+                'button[data-artifact-id]',
+                '[class*="artifact"][role="button"]',
+            ];
+            for (const sel of sels) {
+                const f = document.querySelectorAll(sel);
+                if (f.length > 0) { artifactCount = f.length; break; }
+            }
+            if (artifactCount === 0) {
+                artifactCount = document.querySelectorAll(
+                    '.font-claude-message button[class*="block"], ' +
+                    '.font-claude-message [class*="artifact"]'
+                ).length;
+            }
+
+            let textLen = 0;
+            const msgs = document.querySelectorAll('.font-claude-message, .contents .prose');
+            if (msgs.length > 0) textLen = msgs[msgs.length-1].innerText.length;
+            const artifact = document.querySelector(
+                'aside .prose, aside [class*="content"], [class*="artifact-panel"] .prose'
+            );
+            if (artifact) textLen = Math.max(textLen, artifact.innerText.length);
+            const researchCard = document.querySelector(
+                '[class*="research-card"], [data-testid*="research"], [class*="research-report"]'
+            );
+            if (researchCard) textLen = Math.max(textLen, (researchCard.innerText || '').length);
+
+            const hs = Array.from(document.querySelectorAll(
+                '.font-claude-message h1, .font-claude-message h2, .font-claude-message h3, ' +
+                'aside h1, aside h2, aside h3, ' +
+                '[class*="artifact"] h1, [class*="artifact"] h2'
+            )).map(h => (h.innerText || '').trim().toLowerCase());
+            const hasSummaryHeading = hs.some(h =>
+                h.includes('summary') || h.includes('conclusion') ||
+                h.includes('executive') || h.includes('overview')
+            );
+            return { hasStop, researchDone, liveActive, artifactCount, textLen, hasSummaryHeading };
+        }""")
+
+        if data["liveActive"]:
+            return (False, f"live_sources_counting (artifacts={data['artifactCount']}, partial_len={data['textLen']})")
+        if data["hasStop"]:
+            return (False, f"stop_btn_present (artifacts={data['artifactCount']}, partial_len={data['textLen']})")
+
+        artifacts = int(data["artifactCount"])
+        text_len = int(data["textLen"])
+        done_text = bool(data["researchDone"])
+        has_heading = bool(data["hasSummaryHeading"])
+
+        if artifacts >= 2:
+            return (True, f"no_stop + artifacts={artifacts}>=2 (partial_len={text_len})")
+        if done_text:
+            return (True, f"no_stop + done_text (partial_len={text_len}, artifacts={artifacts})")
+        if text_len > 8000 and has_heading:
+            return (True, f"no_stop + partial_len={text_len}>8000 + summary_heading (artifacts={artifacts})")
+        return (False, f"no_stop insufficient (artifacts={artifacts}, partial_len={text_len}, heading={has_heading})")
+    except Exception as e:
+        return (False, f"detect_error: {e}")
+
+
+async def detect_completion_gemini(page):
+    """Gemini Deep Research completion detector. Playwright-only.
+    Returns (done, reason). Honors the planning gate — Start-research button
+    visible → NOT started yet → never complete."""
+    try:
+        data = await page.evaluate("""() => {
+            let hasStop = false;
+            const stopSels = 'button[aria-label="Stop"], button[aria-label*="stop"], ' +
+                             'button[aria-label="Cancel"], button[title*="Stop"]';
+            if (document.querySelector(stopSels)) hasStop = true;
+            if (!hasStop) {
+                for (const b of document.querySelectorAll('button')) {
+                    const txt = (b.textContent || '').trim().toLowerCase();
+                    if (txt === 'stop' || txt === 'stop generating' || txt === 'cancel') {
+                        hasStop = true; break;
+                    }
+                }
+            }
+            if (!hasStop && document.querySelector(
+                '[data-is-streaming="true"], .loading-indicator, .streaming'
+            )) hasStop = true;
+
+            let hasStartBtn = false;
+            for (const b of document.querySelectorAll('button')) {
+                const txt = (b.textContent || '').trim().toLowerCase();
+                if (txt === 'start research' || txt.includes('start research')) {
+                    hasStartBtn = true; break;
+                }
+            }
+
+            let hasShareExport = false;
+            const shareKws = ['share & export', 'share and export'];
+            for (const b of document.querySelectorAll('button, [role="button"]')) {
+                const txt = (b.textContent || '').trim().toLowerCase();
+                const al  = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (shareKws.some(k => txt === k || al.includes(k))) {
+                    hasShareExport = true; break;
+                }
+                if (txt === 'share' || txt === 'export' ||
+                    al === 'share' || al === 'export') {
+                    hasShareExport = true; break;
+                }
+            }
+
+            let textLen = 0;
+            const responses = document.querySelectorAll('message-content, .model-response-text');
+            if (responses.length > 0) textLen = responses[responses.length-1].innerText.length;
+
+            const bl = (document.body?.innerText || '').toLowerCase();
+            const activeKws = ['researching', 'searching the web', 'analyzing sources',
+                               'reading sources', 'browsing the web', 'gathering sources'];
+            const hasActiveKw = activeKws.some(k => bl.includes(k));
+
+            return { hasStop, hasStartBtn, hasShareExport, textLen, hasActiveKw };
+        }""")
+
+        if data["hasStartBtn"]:
+            return (False, "start_research_btn_visible (pre-research)")
+        if data["hasStop"]:
+            return (False, f"stop_btn_present (partial_len={data['textLen']})")
+
+        text_len = int(data["textLen"])
+        has_share = bool(data["hasShareExport"])
+        active_kw = bool(data["hasActiveKw"])
+
+        if has_share:
+            return (True, f"no_stop + share/export_visible (partial_len={text_len})")
+        if text_len > 5000 and not active_kw:
+            return (True, f"no_stop + partial_len={text_len}>5000 + no_active_kw")
+        if text_len > 5000 and active_kw:
+            return (False, f"no_stop but active_kw present (partial_len={text_len})")
+        return (False, f"no_stop insufficient (partial_len={text_len}, active_kw={active_kw})")
+    except Exception as e:
+        return (False, f"detect_error: {e}")
+
+
+DETECT_FNS = {
+    "ChatGPT": detect_completion_chatgpt,
+    "Gemini":  detect_completion_gemini,
+    "Claude":  detect_completion_claude,
+}
+
+
 # ── Claude Artifact DOM Helpers ──────────────────────────────────────────────
 
 async def _count_claude_artifacts(page):
@@ -5256,7 +5545,13 @@ async def agent_loop(client, browser, system_prompt, user_message,
 
 async def verify_chatgpt_generating(page) -> bool:
     """Check if ChatGPT is actively generating (stop button visible).
-    Scrolls both page body AND chat container — DR stop button is in chat UI, not input area."""
+    Scrolls both page body AND chat container — DR stop button is in chat UI, not input area.
+
+    2026-04 iframe fix: ChatGPT Deep Research renders inside a cross-origin
+    sandbox iframe (connector_openai_deep_research.web-sandbox.oaiusercontent.com).
+    Host-page selectors miss the DR stop button + progress entirely, so we
+    walk `page.frames` and check inside the DR iframe for any "researching"/
+    "sources"/"stop" signal. Matches the detect_completion_chatgpt pattern."""
     try:
         await page.evaluate("""() => {
             // Scroll the page body
@@ -5267,7 +5562,7 @@ async def verify_chatgpt_generating(page) -> bool:
             containers.forEach(c => c.scrollTop = c.scrollHeight);
         }""")
         await asyncio.sleep(0.3)
-        return await page.evaluate("""() => {
+        host_hit = await page.evaluate("""() => {
             // Check standard composer stop buttons
             const stop = document.querySelector('button[aria-label="Stop generating"]')
                 || document.querySelector('button[data-testid="stop-button"]')
@@ -5297,8 +5592,62 @@ async def verify_chatgpt_generating(page) -> bool:
                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
                 if (label.includes('stop')) return true;
             }
+            // Body-level DR keyword sweep — the host page shows "Researching"/
+            // "Sources found" banners even when the card lives in the iframe.
+            const bl = (document.body?.innerText || '').toLowerCase();
+            const hostKws = ['researching', 'sources found', 'sources and counting',
+                             'deep research', 'searching the web', 'reading sources'];
+            if (hostKws.some(k => bl.includes(k))) return true;
             return !!document.querySelector('.result-streaming, [data-is-streaming="true"]');
         }""")
+        if host_hit:
+            return True
+
+        # ── DR iframe walk ──
+        # Deep Research renders inside cross-origin oaiusercontent sandbox.
+        # Walk frames, look for deep_research/oaiusercontent URL match, then
+        # check for stop button / active keywords / partial content inside.
+        try:
+            for frame in page.frames:
+                try:
+                    src = (frame.url or "").lower()
+                except Exception:
+                    continue
+                if not src:
+                    continue
+                if ("deep_research" in src or "oaiusercontent" in src):
+                    try:
+                        active = await frame.evaluate("""() => {
+                            // Any stop button
+                            for (const b of document.querySelectorAll('button')) {
+                                const t = (b.textContent || '').trim().toLowerCase();
+                                const al = (b.getAttribute('aria-label') || '').toLowerCase();
+                                if (t === 'stop' || t === 'stop research' ||
+                                    al.includes('stop')) return true;
+                            }
+                            // Spinner / progress
+                            if (document.querySelector(
+                                '[role="progressbar"], [class*="progress"], [class*="spinner"], ' +
+                                '[class*="loading"], [data-is-streaming="true"]'
+                            )) return true;
+                            // Active keywords
+                            const bl = (document.body?.innerText || '').toLowerCase();
+                            const kws = ['researching', 'searching', 'reading sources',
+                                         'sources found', 'sources and counting',
+                                         'analyzing', 'browsing'];
+                            if (kws.some(k => bl.includes(k))) return true;
+                            // Non-trivial body content = the DR card rendered something
+                            if ((document.body?.innerText || '').length > 200) return true;
+                            return false;
+                        }""")
+                        if active:
+                            return True
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
+        return False
     except Exception:
         return False
 
@@ -5844,6 +6193,178 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
     return None
 
 
+# ── Per-Agent Extract + Record (content-first, link-second) ──────────────────
+# Called by poll_all_agents_round_robin the moment detect_completion_* flips
+# True for an agent. Runs the locked 2026-04 emission ladder end-to-end so the
+# frontend gets the MD, the public link (or chat-URL fallback), and the
+# `complete` status all together — backend and frontend stay in sync, and the
+# frontend tick mark appears at the same moment the backend marks completed_set.
+#
+# Emission order (user-locked):
+#   1. agent_progress status=extracting          (before we touch anything)
+#   2. extract content → save documents/<agent>.md + Firestore mirror
+#   3. attempt public Share/Publish link (short-circuited for ChatGPT iframe)
+#   4. emit link_extracted { url, verified, fallback? }
+#      (public if verified, else chat-URL fallback with verified=False)
+#   5. agent_progress status=complete
+#   Caller then does completed_set.add(agent) and clears extraction_in_progress.
+
+async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
+                                    elapsed_sec=0, verbose=False):
+    """Per-agent extract + save + link + emit ladder. Returns a result dict
+    the caller drops into results[]. Never raises — on any internal failure
+    returns status='failed' so the poll loop can decide whether to retry."""
+    agent_key = name.lower().replace(" ", "")
+
+    # Step 1 — Emit extracting so the frontend can show "Extracting…" spinner
+    try:
+        emit_event("agent_progress", phase=2, agent=agent_key,
+                   status="extracting",
+                   progress=f"Extracting {name} research content…")
+    except Exception:
+        pass
+
+    # Pull the agent's tab to the foreground so extract_*_response can operate
+    try:
+        await browser.switch_to_page(page)
+        await asyncio.sleep(1)
+    except Exception as e:
+        log(f"[{name}] switch_to_page failed: {e}", "WARN")
+
+    # Step 2 — Content extraction (HTML→MD → copy button → JS → clipboard)
+    extract_fn_map = {
+        "ChatGPT": extract_chatgpt_response,
+        "Gemini":  extract_gemini_response,
+        "Claude":  extract_claude_response,
+    }
+    extract_fn = extract_fn_map.get(name)
+    text = ""
+    if extract_fn:
+        try:
+            text = await extract_fn(page, browser=browser, cua_client=cua_client,
+                                     label=name, verbose=verbose) or ""
+        except Exception as e:
+            log(f"[{name}] Content extraction error: {e}", "WARN")
+            text = ""
+    n_chars = len(text)
+
+    # Step 2b — Save MD to disk + Firestore mirror (only if content is real)
+    if text and queue_dir:
+        try:
+            documents_dir = queue_dir / "documents"
+            documents_dir.mkdir(parents=True, exist_ok=True)
+            fname = agent_key + ".md"
+            md_content = f"# {name} Deep Research\n\n{text}"
+            (documents_dir / fname).write_text(md_content, encoding="utf-8")
+            try:
+                save_document_to_firestore(agent_key, md_content, f"{name} Deep Research")
+            except Exception as _fs_e:
+                log(f"[{name}] Firestore document sync failed: {_fs_e}", "WARN")
+            log(f"[{name}] Saved {n_chars} chars to documents/{fname}")
+        except Exception as e:
+            log(f"[{name}] MD save failed: {e}", "WARN")
+
+    # Step 3 — Public share link (ChatGPT gets iframe short-circuit: single
+    # fast attempt; Gemini/Claude use the full 2-retry path since their share
+    # flows live in the host DOM and benefit from retries).
+    extractor_map = {
+        "ChatGPT": extract_share_link_chatgpt,
+        "Gemini":  extract_share_link_gemini,
+        "Claude":  extract_share_link_claude,
+    }
+    max_retries = 1 if name == "ChatGPT" else 2
+
+    public_url = ""
+    verified = False
+    fallback = None
+    link_error = ""
+
+    extractor = extractor_map.get(name)
+    if extractor:
+        try:
+            link_res = await extract_with_retry(
+                phase=2, agent=agent_key, browser=browser, cua_client=cua_client,
+                extractor_fn=extractor,
+                max_retries=max_retries, retry_delay=2.0,
+                label=f"{name} Research", verbose=verbose,
+            )
+            if link_res.verified and link_res.url:
+                public_url = link_res.url
+                verified = True
+            else:
+                link_error = link_res.error or ""
+        except Exception as e:
+            link_error = f"{type(e).__name__}: {e}"
+            log(f"[{name}] Link extraction exception: {link_error}", "WARN")
+
+    # Step 4 — Fallback to chat URL if public link didn't land. This is the
+    # honest always-available link (user's own conversation in their account).
+    # We still emit link_extracted so the frontend clears any "extracting…"
+    # state and shows the fallback URL.
+    if not verified:
+        chat_url = ""
+        try:
+            chat_url = (page.url or "") if page else ""
+        except Exception:
+            chat_url = ""
+        chat_markers = {
+            "ChatGPT": ["chatgpt.com/c/"],
+            "Gemini":  ["gemini.google.com/app", "gemini.google.com/chat"],
+            "Claude":  ["claude.ai/chat", "claude.ai/new"],
+        }
+        if chat_url and any(m in chat_url for m in chat_markers.get(name, [])):
+            public_url = chat_url
+            fallback = "chat_url"
+            log(f"[{name}] Public share unavailable — using chat URL: {chat_url}")
+            try:
+                emit_event("link_extracted", phase=2, agent=agent_key,
+                           url=chat_url, label=f"{name} Research",
+                           verified=False, fallback="chat_url")
+            except Exception:
+                pass
+        else:
+            log(f"[{name}] No chat URL match either — leaving url blank", "WARN")
+
+    # Close any stray share modal (Escape is a no-op if nothing's open)
+    try:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+    # Step 5 — Final agent_progress. Status rules:
+    #   done     — content extracted (text len > 0)
+    #   partial  — link extracted but no content (rare; usually timeout path)
+    #   failed   — neither content nor link
+    if n_chars > 0:
+        status = "done"
+    elif public_url:
+        status = "partial"
+    else:
+        status = "failed"
+
+    try:
+        emit_event("agent_progress", phase=2, agent=agent_key,
+                   status="complete" if status == "done" else status,
+                   progress=f"Content extracted: {n_chars} chars ({elapsed_sec}s)",
+                   partialTextLen=n_chars,
+                   elapsedSec=int(elapsed_sec or 0),
+                   links=[{"label": f"{name} Research", "url": public_url}] if public_url else [])
+    except Exception:
+        pass
+
+    return {
+        "status": status,
+        "text": text,
+        "url": public_url,
+        "verified": verified,
+        "fallback": fallback,
+        "page": page,
+        "elapsed_sec": int(elapsed_sec or 0),
+        "link_error": link_error,
+    }
+
+
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -5867,9 +6388,29 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     results = {}
 
     for name, agent in agents.items():
-        if not agent["verified"]:
-            results[name] = {"status": "not_verified", "text": "", "url": agent["url"]}
+        # 2026-04 fix: don't drop an agent just because verify_*_generating
+        # returned False. Verifiers can miss real activity (e.g. ChatGPT DR
+        # lives in a cross-origin iframe that host-side selectors can't see).
+        # As long as the tab exists we keep it in the round-robin — the
+        # Playwright detectors + CUA fallback decide completion. If the tab
+        # is truly dead, the 90-min per-agent timeout fires eventually.
+        # Only skip when there's no page handle at all (tab never opened).
+        if not agent.get("page"):
+            results[name] = {"status": "not_verified", "text": "", "url": agent.get("url", "")}
             continue
+        if not agent["verified"]:
+            log(f"[{name}] verify_{name.lower()}_generating returned False but page exists — "
+                f"keeping in round-robin (detectors will decide).", "WARN")
+            try:
+                emit_event("pipeline_warning", phase=2, agent=name.lower().replace(" ", ""),
+                           message=f"{name} verification uncertain — continuing to poll",
+                           details=(f"The DOM verifier couldn't confirm {name} is generating, but "
+                                    "the tab is open. Playwright + CUA detectors will monitor it "
+                                    "alongside the other agents. If nothing surfaces, the 90-min "
+                                    "hard timeout will release it."),
+                           alertType="warn")
+            except Exception:
+                pass
         # Use research_started_at if available (e.g., Gemini waits for "Start research")
         # so elapsed/MIN_WAIT are computed from actual research start, not submission.
         _research_t = agent.get("research_started_at", time.time())
@@ -6518,8 +7059,112 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 emit_event("heartbeat", phase=2, agent=agent_key)
                 p["last_heartbeat"] = time.time()
 
-            # Check completion — CUA-primary (DOM selectors unreliable across all 3 platforms)
-            # CUA checks every 3 min per agent (cost-effective, actually works)
+            # ── Playwright-primary completion check (2026-04 overhaul) ─────
+            # Every tick: run the tight Playwright detector. On 2 consecutive
+            # positive readings, go straight to content-first extraction +
+            # link-second assembly via extract_and_record_agent. CUA is now a
+            # fallback only — skipped entirely when the detector is confident.
+            # Minimizes CUA spend and keeps backend/frontend in sync: the
+            # `agent_progress status=complete` event only fires after MD is
+            # saved and link_extracted has been emitted.
+            detect_fn = DETECT_FNS.get(name)
+            if detect_fn and elapsed >= MIN_WAIT.get(name, 180):
+                try:
+                    dom_done, dom_reason = await detect_fn(p["page"])
+                except Exception as _de:
+                    log(f"[{name}] detect_completion error: {_de}", "WARN")
+                    dom_done, dom_reason = (False, f"detect_error: {_de}")
+                p.setdefault("dom_done_count", 0)
+                p.setdefault("extraction_attempts", 0)
+                if dom_done:
+                    p["dom_done_count"] += 1
+                    log(f"[{name}] DOM completion signal {p['dom_done_count']}/2 — {dom_reason}")
+                    if p["dom_done_count"] >= 2:
+                        p["extraction_attempts"] += 1
+                        log(f"[{name}] Playwright-confirmed done — starting extract_and_record "
+                            f"(attempt {p['extraction_attempts']}/3)")
+                        _queue_dir = (Path(__file__).parent / "queues" / _tracks_dir.name) \
+                                     if _tracks_dir else None
+                        res = await extract_and_record_agent(
+                            name, p["page"], browser, cua_client,
+                            queue_dir=_queue_dir,
+                            elapsed_sec=int(elapsed),
+                            verbose=verbose,
+                        )
+                        if res["status"] == "done" or (res["text"] and res["url"]) or \
+                           (res["verified"] and res["url"]):
+                            _runtime.unregister_page(
+                                name.lower().replace(" ", ""),
+                                final_status="done",
+                            )
+                            _runtime.agent_chat_urls[
+                                name.lower().replace(" ", "")
+                            ] = res["url"] or ""
+                            results[name] = res
+                            del pending[name]
+                            log(f"[{name}] Extraction complete — "
+                                f"{len(res['text'])} chars, "
+                                f"url={(res['url'] or '')[:80] or '(none)'}, "
+                                f"verified={res['verified']}")
+                            continue
+                        if res["status"] == "partial" and (res["text"] or res["url"]):
+                            _runtime.unregister_page(
+                                name.lower().replace(" ", ""),
+                                final_status="done",
+                            )
+                            _runtime.agent_chat_urls[
+                                name.lower().replace(" ", "")
+                            ] = res["url"] or ""
+                            results[name] = res
+                            del pending[name]
+                            log(f"[{name}] Partial extraction accepted — moving on")
+                            continue
+                        # Extraction produced nothing usable. Reset the
+                        # consecutive-done counter so we re-confirm before
+                        # another attempt. After 3 failed attempts surface a
+                        # pipeline_error with Retry/Skip so the user decides.
+                        log(f"[{name}] Extraction attempt {p['extraction_attempts']}/3 "
+                            f"returned no content or link — reverting to polling", "WARN")
+                        p["dom_done_count"] = 0
+                        if p["extraction_attempts"] >= 3:
+                            emit_event("pipeline_error", phase=2, agent=agent_key,
+                                       error=f"{name} extraction failed after 3 confirmed-done attempts",
+                                       details=(f"The Playwright detector confirmed {name} was done, "
+                                                "but 3 extraction attempts returned no content. "
+                                                "Retry runs the extraction pipeline again. "
+                                                "Skip drops this agent from the results."),
+                                       actions=[
+                                           {"id": "retry", "label": "Retry extraction",
+                                            "style": "primary"},
+                                           {"id": "skip",  "label": "Skip agent",
+                                            "style": "default"},
+                                       ])
+                            decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
+                            log(f"[{name}] Extraction-failed decision: {decision}")
+                            if decision == "retry":
+                                p["extraction_attempts"] = 0
+                                p["dom_done_count"] = 0
+                                continue
+                            if decision == "skip":
+                                results[name] = {"status": "skipped_by_user",
+                                                 "text": "", "url": "",
+                                                 "page": p["page"],
+                                                 "elapsed_sec": int(elapsed)}
+                                del pending[name]
+                                emit_event("agent_skipped", phase=2, agent=agent_key,
+                                           reason="extraction_failure_skip")
+                                continue
+                            if decision == "stop":
+                                break
+                        continue
+                else:
+                    if p.get("dom_done_count", 0) > 0:
+                        log(f"[{name}] DOM completion signal reset — {dom_reason}")
+                    p["dom_done_count"] = 0
+
+            # Check completion — CUA-primary fallback (only if Playwright was
+            # not confident within the MIN_WAIT + budget window). CUA checks
+            # every 5 min per agent (cost-effective, actually works).
             if (time.time() - p.get("last_cua_check", 0)) < CUA_CHECK_INTERVAL:
                 # Not time for CUA check yet — skip this agent this cycle
                 continue
@@ -8979,6 +9624,15 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     else:
         log("\n--- 2A: ChatGPT SKIPPED (disabled in config) ---")
 
+    # ── Startup gap: 30s before opening the next agent ──
+    # Human-cadence stagger reduces anti-bot signal and lets ChatGPT's DR
+    # iframe settle before we start issuing Claude commands. User-locked
+    # 2026-04 overhaul: sequential 30s gaps, each agent verify-started
+    # before moving on.
+    if enabled_agents is None or "claude" in enabled_agents:
+        log("\n[Startup gap] Waiting 30s before opening Claude...")
+        await asyncio.sleep(30)
+
     # ── Step 2 (2B): Claude — Opus 4.7 + Adaptive Thinking + Research tool ──
     if enabled_agents is None or "claude" in enabled_agents:
         log("\n--- 2B: Claude Deep Research ---")
@@ -9008,6 +9662,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     else:
         log("\n--- 2B: Claude SKIPPED (disabled in config) ---")
 
+    # ── Startup gap: 30s before opening Gemini ──
+    if enabled_agents is None or "gemini" in enabled_agents:
+        log("\n[Startup gap] Waiting 30s before opening Gemini...")
+        await asyncio.sleep(30)
+
     # ── Step 3 (2C): Gemini — submit brief, let it generate plan (don't click Start yet) ──
     if enabled_agents is None or "gemini" in enabled_agents:
         log("\n--- 2C: Gemini Deep Research (submit + let it plan) ---")
@@ -9022,74 +9681,80 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     else:
         log("\n--- 2C: Gemini SKIPPED (disabled in config) ---")
 
-    # ── Pre-scrape buffer: let agents render initial state ──
-    # Gemini needs ~30-90s to draft the plan; ChatGPT/Claude need time to
-    # pull their first sources. Scraping immediately would snapshot near-empty
-    # DOMs. Waiting a full minute also stays at human cadence — no bot-tight
-    # polling that could raise Cloudflare/anti-bot flags on these pages.
-    log("\n  [2 buffer] Waiting 90s for agents to render initial state before scrape-pass...")
-    await asyncio.sleep(90)
-
-    # ── Round-robin scrape-pass (one sweep: ChatGPT → Claude → Gemini) ──
-    # Collect rich DOM state from each agent before the main 5-min rotation,
-    # so the frontend's live-narration panel populates immediately. Each
-    # agent emits agent_progress with sources, partial_text_len, and steps.
-    # Gemini stays gated as 'generating'/planning by scrape_progress_gemini
-    # because the "Start research" button is still present.
-    log("\n--- 2 scrape-pass: ChatGPT → Claude → Gemini (prime frontend narration) ---")
+    # ── First wave: 60s sequential per agent (2026-04 overhaul) ──
+    # Instead of one instant snapshot, dwell on each agent's tab for 60s and
+    # emit agent_progress every ~15s. This gives the frontend a richer,
+    # ladder-like narration start while staying at human cadence. Sequence
+    # order matches the original submission: ChatGPT → Claude → Gemini.
+    # Gemini's planning-gate inside scrape_progress_gemini keeps its status
+    # pinned to 'planning' while the Start-research button is still visible.
+    log("\n--- 2 first-wave (60s sequential per agent): ChatGPT → Claude → Gemini ---")
     _scrape_targets = [
         ("chatgpt", "ChatGPT", chatgpt_page, scrape_progress_chatgpt),
-        ("claude", "Claude", claude_page, scrape_progress_claude),
-        ("gemini", "Gemini", gemini_page, scrape_progress_gemini),
+        ("claude",  "Claude",  claude_page,  scrape_progress_claude),
+        ("gemini",  "Gemini",  gemini_page,  scrape_progress_gemini),
     ]
+    _FIRST_WAVE_SEC = 60
+    _FIRST_WAVE_TICK = 15
     for _ag_key, _ag_name, _ag_page, _scrape_fn in _scrape_targets:
         if _ag_page is None:
             continue
         try:
             await browser.switch_to_page(_ag_page)
             await asyncio.sleep(1)
-            _snap = await _scrape_fn(_ag_page)
-            # Belt-and-suspenders: even if scrape_progress_gemini's planning-gate
-            # somehow lets 'complete' through (DOM churn, future regressions), the
-            # scrape-pass runs BEFORE Start-research click, so force non-complete.
-            if _ag_key == "gemini":
-                _st = (_snap.get("status") or "").lower()
-                if _st in ("complete", "done"):
-                    _snap["status"] = "generating"
-                    _snap["phase"] = "planning"
-            _sources = int(_snap.get("sources", 0) or 0)
-            _partial = int(_snap.get("partial_text_len", 0) or 0)
-            _steps = _snap.get("steps", []) or []
-            _progress = _snap.get("progress") or (
-                f"Working — {_sources} sources, {_partial} chars" if _partial else
-                (_steps[-1] if _steps else f"{_ag_name} starting up")
-            )
-            emit_event("agent_progress", phase=2, agent=_ag_key,
-                       status=_snap.get("status", "generating"),
-                       progress=_progress,
-                       sources=_sources,
-                       source_urls=(_snap.get("source_urls", []) or [])[:10],
-                       partial_text_len=_partial,
-                       steps=_steps[-3:] if _steps else [],
-                       thinking=(_snap.get("thinking") or "")[:300])
-            log(f"  [Scrape-pass] {_ag_name}: status={_snap.get('status')}, sources={_sources}, partial_len={_partial}")
         except Exception as _e:
-            log(f"  [Scrape-pass] {_ag_name} failed (non-fatal): {_e}", "WARN")
+            log(f"  [First-wave] switch to {_ag_name} failed: {_e}", "WARN")
+            continue
+        log(f"  [First-wave] Dwelling on {_ag_name} for {_FIRST_WAVE_SEC}s...")
+        _wave_start = time.time()
+        _last_emit_len = -1
+        while time.time() - _wave_start < _FIRST_WAVE_SEC:
+            try:
+                _snap = await _scrape_fn(_ag_page) or {}
+                if _ag_key == "gemini":
+                    _st = (_snap.get("status") or "").lower()
+                    if _st in ("complete", "done"):
+                        _snap["status"] = "generating"
+                        _snap["phase"] = "planning"
+                _sources = int(_snap.get("sources", 0) or 0)
+                _partial = int(_snap.get("partial_text_len", 0) or 0)
+                _steps = _snap.get("steps", []) or []
+                _progress = _snap.get("progress") or (
+                    f"Working — {_sources} sources, {_partial} chars" if _partial else
+                    (_steps[-1] if _steps else f"{_ag_name} starting up")
+                )
+                # Only emit if something actually changed to avoid frontend churn
+                if _partial != _last_emit_len or _last_emit_len < 0:
+                    emit_event("agent_progress", phase=2, agent=_ag_key,
+                               status=_snap.get("status", "generating"),
+                               progress=_progress,
+                               sources=_sources,
+                               source_urls=(_snap.get("source_urls", []) or [])[:10],
+                               partial_text_len=_partial,
+                               steps=_steps[-3:] if _steps else [],
+                               thinking=(_snap.get("thinking") or "")[:300])
+                    _last_emit_len = _partial
+                    log(f"  [First-wave/{_ag_name}] status={_snap.get('status')}, "
+                        f"sources={_sources}, partial_len={_partial}")
+            except Exception as _e:
+                log(f"  [First-wave/{_ag_name}] tick failed (non-fatal): {_e}", "WARN")
+            await asyncio.sleep(_FIRST_WAVE_TICK)
 
     # ── Step 4 (2D): Return to Gemini — wait for plan + click "Start research" ──
+    # 2026-04 overhaul: no rotation to ChatGPT/Claude during this wait. We
+    # dwell on the Gemini tab until the Start-research button is clicked;
+    # the OFFICIAL round-robin only begins after that click. ChatGPT/Claude
+    # keep running in the background — their state from the first-wave dwell
+    # is the last frontend update until the round-robin picks them up.
     if gemini_page is not None:
-        log("\n--- 2D: Gemini — waiting for research plan + clicking 'Start research' ---")
+        log("\n--- 2D: Gemini — waiting for research plan + clicking 'Start research' (focused, no rotation) ---")
         await browser.switch_to_page(gemini_page)
         await asyncio.sleep(2)
 
-        # Human-cadence wait loop: max ~10 min, tick every 60s. No bot-tight
-        # polling — that would be conspicuous on Gemini's Cloudflare/anti-bot
-        # telemetry. Each tick: check the Start-research button, then scrape
-        # ChatGPT + Claude so the frontend narration panel keeps populating
-        # while Gemini plans (otherwise those tabs appear frozen in the UI).
         start_clicked = False
         _start_wait_max_sec = 10 * 60
         _loop_start = time.time()
+        _last_plan_emit = 0.0
         while time.time() - _loop_start < _start_wait_max_sec:
             # 1. Check Start-research button on Gemini and click if present
             try:
@@ -9110,38 +9775,31 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             except Exception:
                 pass
 
-            # 2. Scrape ChatGPT + Claude to keep frontend narration fresh
-            for _ag_key, _ag_name, _ag_page, _scrape_fn in [
-                ("chatgpt", "ChatGPT", chatgpt_page, scrape_progress_chatgpt),
-                ("claude", "Claude", claude_page, scrape_progress_claude),
-            ]:
-                if _ag_page is None:
-                    continue
+            # 2. Emit a Gemini planning heartbeat every ~60s so the frontend
+            # knows Gemini is still drafting the plan. No rotation — we do
+            # NOT scrape ChatGPT/Claude here; they kept their first-wave
+            # state and will refresh on the official round-robin.
+            if time.time() - _last_plan_emit >= 60:
                 try:
-                    await browser.switch_to_page(_ag_page)
-                    await asyncio.sleep(1)
-                    _snap = await _scrape_fn(_ag_page)
-                    _sources = int(_snap.get("sources", 0) or 0)
-                    _partial = int(_snap.get("partial_text_len", 0) or 0)
-                    _steps = _snap.get("steps", []) or []
-                    _progress = _snap.get("progress") or (
-                        f"Working — {_sources} sources, {_partial} chars" if _partial else
-                        (_steps[-1] if _steps else f"{_ag_name} researching")
-                    )
-                    emit_event("agent_progress", phase=2, agent=_ag_key,
-                               status=_snap.get("status", "generating"),
-                               progress=_progress,
-                               sources=_sources,
-                               source_urls=(_snap.get("source_urls", []) or [])[:10],
-                               partial_text_len=_partial,
-                               steps=_steps[-3:] if _steps else [],
-                               thinking=(_snap.get("thinking") or "")[:300])
+                    _gm = await scrape_progress_gemini(gemini_page) or {}
+                    _gm_status = (_gm.get("status") or "generating")
+                    if _gm_status in ("complete", "done"):
+                        _gm_status = "generating"
+                    emit_event("agent_progress", phase=2, agent="gemini",
+                               status=_gm_status,
+                               progress=_gm.get("progress") or "Gemini drafting research plan...",
+                               sources=int(_gm.get("sources", 0) or 0),
+                               source_urls=(_gm.get("source_urls", []) or [])[:10],
+                               partial_text_len=int(_gm.get("partial_text_len", 0) or 0),
+                               steps=(_gm.get("steps") or [])[-3:],
+                               plan=(_gm.get("plan") or "")[:500])
+                    _last_plan_emit = time.time()
                 except Exception:
                     pass
 
             _elapsed = int(time.time() - _loop_start)
             log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
         # CUA fallback for Start research
         if not start_clicked:
@@ -10591,8 +11249,15 @@ def detect_resume_phase(queue_dir):
 
 async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        api_key=None, email=None, resume_dir=None, config=None,
-                       run_id=None, uid=None, research_id=None):
-    """Run the full pipeline. Supports resume from a previous queue directory."""
+                       run_id=None, uid=None, research_id=None, brief_text=""):
+    """Run the full pipeline. Supports resume from a previous queue directory.
+
+    brief_text (2026-04): inline brief content passed from the frontend when
+    the user toggled Phase 1 off. Written to the new run's
+    queues/<run>/documents/brief.md before Phase 1 decides its path; this
+    makes `brief_file` point at the fresh file and flows through the
+    `_brief_from_file` branch, skipping ChatGPT brief generation + share-link
+    extraction."""
     pdf_paths = pdf_paths or []
     api_key = resolve_api_key(api_key)
     if not api_key:
@@ -10653,6 +11318,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Save pipeline config for new runs
         pipeline_config = config or {}
         (queue_dir / "config.json").write_text(json.dumps(pipeline_config, indent=2), encoding="utf-8")
+        # Inline brief → persist as the new run's brief.md, then route the
+        # pipeline through brief_file so Phase 1 lands on the `_brief_from_file`
+        # branch (no ChatGPT brief generation, no share-link extraction).
+        if brief_text and not brief_file:
+            _inline_brief_path = queue_dir / "documents" / "brief.md"
+            _inline_md = brief_text if brief_text.lstrip().startswith("# Research Brief") \
+                         else f"# Research Brief\n\n{brief_text}"
+            _inline_brief_path.write_text(_inline_md, encoding="utf-8")
+            brief_file = str(_inline_brief_path)
+            log(f"Inline brief persisted ({len(brief_text)} chars) → {_inline_brief_path.name}")
 
     log(f"Queue: {queue_dir}")
     tracks_dir = init_tracks(queue_dir.name)  # Same name as queue — one research = one tracks folder
@@ -11060,11 +11735,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # breaks out with brief_text="" so downstream phases can decide
             # what to do with no brief; Stop returns from the pipeline.
             _p1_skipped_after_error = False
+            _brief_from_file = False
             while True:
                 if brief_file:
                     brief_text = Path(brief_file).read_text(encoding="utf-8")
+                    # Strip the common "# Research Brief\n\n" prefix if present so
+                    # downstream token counts / paste ops aren't inflated by it.
+                    if brief_text.startswith("# Research Brief\n\n"):
+                        brief_text = brief_text[len("# Research Brief\n\n"):]
                     log(f"Phase 1: SKIPPED — loaded brief from {brief_file} ({len(brief_text)} chars)")
                     brief_url = ""
+                    _brief_from_file = True
                     break
                 fb1 = get_feedback(1)
                 # Restart loop: if mid-phase pause+input+resume trips
@@ -11135,6 +11816,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 brief_artifact = BriefArtifact(text="", url="")
                 emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),
                     summary="Phase 1 skipped after error — no brief generated")
+                _update_firestore_research({"phase": 1, "status": "ongoing"})
+            elif _brief_from_file:
+                # Phase 1 bypassed via --brief-file (or frontend briefText).
+                # Persist to disk + Firestore but DO NOT try to extract a
+                # ChatGPT share link — there's no ChatGPT brief session to
+                # share from. The brief is the user-supplied text; they can
+                # link to it from the frontend documents page instead.
+                _brief_md = f"# Research Brief\n\n{brief_text}"
+                (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
+                save_document_to_firestore("brief", _brief_md, "Research Brief")
+                brief_artifact = BriefArtifact(text=brief_text, url="")
+                log(f"BriefArtifact (from file): {brief_artifact.chars} chars, "
+                    f"{len(brief_artifact.sections)} sections")
+                save_checkpoint(queue_dir, 1, topic=topic, brief_url="")
+                save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
+                emit_event("phase_complete", phase=1,
+                    durationSec=int(time.time() - _p1_start),
+                    summary=f"Research brief loaded from file ({brief_artifact.chars} chars)")
                 _update_firestore_research({"phase": 1, "status": "ongoing"})
             else:
                 _brief_md = f"# Research Brief\n\n{brief_text}"
@@ -12439,7 +13138,8 @@ async def run_server(port=8000):
                 await run_pipeline(topic=job["topic"], email=job.get("email", ""),
                                    verbose=True, resume_dir=job.get("resume_dir"),
                                    config=job.get("config"), run_id=job.get("run_id"),
-                                   uid=job.get("uid"), research_id=job.get("research_id"))
+                                   uid=job.get("uid"), research_id=job.get("research_id"),
+                                   brief_text=job.get("brief_text", ""))
             except Exception as e:
                 log(f"Pipeline job error: {e}", "ERROR")
             finally:
@@ -12538,7 +13238,10 @@ async def run_server(port=8000):
     @app.post("/api/runs")
     async def start_run(request_data: dict):
         """Start a new pipeline run. Queued if another is already running.
-        Body: {topic, email?, config?: {agents, skipPhases, videoEnabled, emailEnabled}}"""
+        Body: {topic, email?, briefText?, config?: {agents, skipPhases, videoEnabled, emailEnabled}}
+
+        briefText: inline brief content that bypasses Phase 1 brief generation.
+        When provided, Phase 1 is skipped and Phase 2 runs against this brief."""
         topic = request_data.get("topic")
         if not topic or not topic.strip():
             return JSONResponse({"error": "topic is required"}, 400)
@@ -12546,13 +13249,15 @@ async def run_server(port=8000):
         email = request_data.get("email", "")
         uid = request_data.get("uid", "")  # Firebase user ID for Firestore bridge
         config = request_data.get("config", {})
+        brief_text = (request_data.get("briefText") or "").strip()
         # Validate config
         agents_cfg = config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
         if not any(agents_cfg.values()):
             return JSONResponse({"error": "at least one agent must be enabled"}, 400)
         from datetime import datetime as _dt
         run_id = f"{safe_name(topic)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
-        await _job_queue.put({"topic": topic, "email": email, "config": config, "run_id": run_id, "uid": uid})
+        await _job_queue.put({"topic": topic, "email": email, "config": config,
+                              "run_id": run_id, "uid": uid, "brief_text": brief_text})
         position = _job_queue.qsize()
         is_running = _queue_running
         status = "running" if position <= 1 and not is_running else f"queued (position {position})"
