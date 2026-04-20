@@ -11717,6 +11717,34 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _reason = "user_skip" if _user_skip_p1 else "Disabled in pipeline config"
             log(f"Phase 1: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=1, reason=_reason)
+            # Phase-1-skip must still hydrate brief_text so Phase 2 has a
+            # brief to paste. Priority: explicit brief_file > on-disk
+            # documents/brief.md (written by the inline-brief path earlier,
+            # or by a previous run we're resuming). Phase 2 hard-fails
+            # without this ("No brief text available — cannot run Phase 2").
+            _loaded_from = None
+            if brief_file and Path(brief_file).exists():
+                try:
+                    brief_text = Path(brief_file).read_text(encoding="utf-8")
+                    _loaded_from = f"brief_file={brief_file}"
+                except Exception as _e:
+                    log(f"Phase 1 skip: could not read brief_file ({_e})", "WARN")
+            if not brief_text:
+                for _bp in [queue_dir / "documents" / "brief.md", queue_dir / "brief.md"]:
+                    if _bp.exists():
+                        try:
+                            brief_text = _bp.read_text(encoding="utf-8")
+                            _loaded_from = f"disk={_bp}"
+                            break
+                        except Exception:
+                            continue
+            if brief_text.startswith("# Research Brief\n\n"):
+                brief_text = brief_text[len("# Research Brief\n\n"):]
+            brief_artifact = BriefArtifact(text=brief_text, url="")
+            if brief_text:
+                log(f"Phase 1 skip: loaded brief ({len(brief_text)} chars) from {_loaded_from}")
+            else:
+                log("Phase 1 skip: no brief source — Phase 2 will fail unless one appears", "WARN")
         elif start_phase <= 1:
             emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
             _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
