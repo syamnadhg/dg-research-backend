@@ -3033,7 +3033,14 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
                 clip = get_clipboard()
                 if clip and ("gemini" in clip or "g.co" in clip) and "share" in clip:
                     url = clip
-        verified = "share" in url.lower() and ("gemini" in url.lower() or "g.co" in url.lower())
+        # Tight public-link gate: Gemini's Share & Export flow produces URLs on
+        # gemini.google.com/share/ or g.co/gemini/... — require one of those
+        # explicitly so that a stale chat URL (gemini.google.com/app/...) or a
+        # share-dialog URL never sneaks through as verified. The Phase 2 outer
+        # loop will fall back to the chat URL silently with verified=False when
+        # this gate fails.
+        _lu = url.lower()
+        verified = ("gemini.google.com/share" in _lu) or ("g.co/gemini" in _lu)
         return LinkResult(url=url, label=label, platform="gemini", verified=verified)
     except Exception as e:
         return LinkResult(url=url, label=label, platform="gemini", error=str(e))
@@ -3065,8 +3072,11 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
                 clip = get_clipboard()
                 if clip and "claude." in clip:
                     url = clip
-        original_url = await browser.current_url()
-        verified = ("claude.site" in url or "claude.ai" in url) and url != original_url
+        # Tight public-link gate: Claude has a reliable Publish flow, so only a
+        # claude.site/ URL counts as verified. A bare claude.ai/chat/... URL is
+        # the user's own chat (not a public share) — the Phase 2 outer loop will
+        # fall back to it silently with verified=False when this gate fails.
+        verified = "claude.site" in url.lower()
         return LinkResult(url=url, label=label, platform="claude", verified=verified)
     except Exception as e:
         return LinkResult(url=url, label=label, platform="claude", error=str(e))
@@ -4246,8 +4256,23 @@ async def scrape_progress_gemini(page):
                 const lastStep = r.steps[r.steps.length - 1].toLowerCase();
                 if (lastStep.includes('searching') || lastStep.includes('reading') || lastStep.includes('analyzing') || lastStep.includes('browsing')) isActive = true;
             }
-            r.status = isActive ? 'generating' : (r.partial_text_len > 0 ? 'complete' : 'idle');
-            r.phase = isActive ? 'researching' : (r.steps.length > 0 ? 'researching' : (r.plan ? 'planning' : (r.partial_text_len > 0 ? 'done' : 'waiting')));
+            // Planning-gate: if "Start research" button is visible, Gemini has
+            // produced a plan but research hasn't started — do NOT mark complete
+            // even if r.partial_text_len > 0 (that text is the plan, not output).
+            let hasStartBtn = false;
+            const allBtns = document.querySelectorAll('button');
+            for (const b of allBtns) {
+                const txt = (b.textContent || '').trim().toLowerCase();
+                if (txt === 'start research' || txt.includes('start research')) { hasStartBtn = true; break; }
+            }
+            if (hasStartBtn) {
+                r.status = 'generating';
+                r.phase = 'planning';
+                if (!r.progress) r.progress = 'Research plan ready — awaiting Start';
+            } else {
+                r.status = isActive ? 'generating' : (r.partial_text_len > 0 ? 'complete' : 'idle');
+                r.phase = isActive ? 'researching' : (r.steps.length > 0 ? 'researching' : (r.plan ? 'planning' : (r.partial_text_len > 0 ? 'done' : 'waiting')));
+            }
             return r;
         }""")
     except Exception as e:
@@ -8695,13 +8720,21 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
 
 
 async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_agents=None):
-    """Phase 2: ChatGPT (already in GPT from Phase 1) → Gemini (submit+plan) → Claude → Gemini (Start) → Poll all.
+    """Phase 2: ChatGPT → Claude → Gemini (submit+plan) → scrape-pass → Gemini (Start) → Poll all.
+
+    Sequence change: Gemini moved to last of the setup trio. One round-robin scrape
+    pass (ChatGPT → Claude → Gemini) is inserted between Gemini's brief submission and
+    the 'Start research' click — it primes the frontend with rich agent_progress data
+    (sources, partial_text_len, steps) immediately, instead of waiting for the first
+    main-rotation poll tick. Gemini stays in 'planning' (never 'complete') until its
+    'Start research' button is clicked — gated by scrape_progress_gemini's planning-gate.
+
     enabled_agents: list of agent keys to run (e.g. ["chatgpt", "gemini"]). None = all."""
     log("=" * 60)
     log("PHASE 2: Deep Research")
     if enabled_agents:
         log(f"  Enabled agents: {enabled_agents}")
-    log("  Sequence: ChatGPT → Gemini (submit+plan) → Claude → Gemini (click Start) → Poll all")
+    log("  Sequence: ChatGPT → Claude → Gemini (submit+plan) → scrape-pass → Gemini (Start) → Poll all")
     log("=" * 60)
 
     # Ensure brief.md is on disk for file-attachment delivery (Option A).
@@ -8721,8 +8754,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             brief_path = None
 
     agents = {}
+    chatgpt_page = None
+    claude_page = None
+    gemini_page = None
 
-    # ── Step 1: ChatGPT (we're already in ChatGPT from Phase 1 — just open Deep Research) ──
+    # ── Step 1 (2A): ChatGPT — already in ChatGPT from Phase 1, just open Deep Research ──
     if enabled_agents is None or "chatgpt" in enabled_agents:
         log("\n--- 2A: ChatGPT Deep Research (already in ChatGPT) ---")
         emit_event("agent_progress", phase=2, agent="chatgpt", status="starting", progress="Opening ChatGPT Deep Research mode...")
@@ -8751,59 +8787,121 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     else:
         log("\n--- 2A: ChatGPT SKIPPED (disabled in config) ---")
 
-    # ── Step 2: Gemini (submit brief, let it generate research plan — don't wait for Start yet) ──
-    gemini_page = None
-    if enabled_agents is None or "gemini" in enabled_agents:
-        log("\n--- 2B: Gemini Deep Research (submit + let it plan) ---")
-        emit_event("agent_progress", phase=2, agent="gemini", status="starting", progress="Opening Gemini and submitting research brief...")
-        gemini_page = await start_agent_no_gemini_wait(
-            browser, cua_client, "https://gemini.google.com",
-            PROMPT_GEMINI_DEEP_RESEARCH,
-            "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2B", "Gemini", verbose, brief_path=brief_path)
-        log("[2B] Gemini brief submitted — letting it generate research plan")
-    else:
-        log("\n--- 2B: Gemini SKIPPED (disabled in config) ---")
-
-    # ── Step 3: Claude (starts instantly after submission) ──
+    # ── Step 2 (2B): Claude — Opus 4.7 + Adaptive Thinking + Research tool ──
     if enabled_agents is None or "claude" in enabled_agents:
-        log("\n--- 2C: Claude Deep Research ---")
+        log("\n--- 2B: Claude Deep Research ---")
         emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Opus 4.7 Adaptive + Research tools...")
         for attempt in range(2):
             if attempt > 0:
-                log("[2C] Retrying Claude (fresh tab)...", "WARN")
+                log("[2B] Retrying Claude (fresh tab)...", "WARN")
                 try: await claude_page.close()
                 except Exception: pass
             claude_page = await start_agent_no_gemini_wait(
                 browser, cua_client, "https://claude.ai/new",
                 PROMPT_CLAUDE_DEEP_RESEARCH,
                 "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-                brief_text, "2C", "Claude", verbose, brief_path=brief_path)
-            verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2C",
+                brief_text, "2B", "Claude", verbose, brief_path=brief_path)
+            verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2B",
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
             if verified_c:
                 break
         agents["Claude"] = {"page": claude_page, "verified": verified_c, "url": claude_page.url}
         if verified_c:
             emit_event("agent_progress", phase=2, agent="claude", status="generating", progress="Claude Adaptive Thinking started and verified")
-            log("[2C] Claude is running ✓")
+            log("[2B] Claude is running ✓")
             await inject_agent_observer(claude_page, "claude")
         else:
-            log("[2C] Claude failed after 2 attempts", "ERROR")
+            log("[2B] Claude failed after 2 attempts", "ERROR")
             emit_event("pipeline_error", phase=2, agent="claude", error="Failed to start after 2 attempts")
     else:
-        log("\n--- 2C: Claude SKIPPED (disabled in config) ---")
+        log("\n--- 2B: Claude SKIPPED (disabled in config) ---")
 
-    # ── Step 4: Go back to Gemini — wait for plan + click "Start research" ──
+    # ── Step 3 (2C): Gemini — submit brief, let it generate plan (don't click Start yet) ──
+    if enabled_agents is None or "gemini" in enabled_agents:
+        log("\n--- 2C: Gemini Deep Research (submit + let it plan) ---")
+        emit_event("agent_progress", phase=2, agent="gemini", status="starting", progress="Opening Gemini and submitting research brief...")
+        gemini_page = await start_agent_no_gemini_wait(
+            browser, cua_client, "https://gemini.google.com",
+            PROMPT_GEMINI_DEEP_RESEARCH,
+            "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+            brief_text, "2C", "Gemini", verbose, brief_path=brief_path)
+        log("[2C] Gemini brief submitted — letting it generate research plan")
+        emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini generating research plan...")
+    else:
+        log("\n--- 2C: Gemini SKIPPED (disabled in config) ---")
+
+    # ── Pre-scrape buffer: let agents render initial state ──
+    # Gemini needs ~30-90s to draft the plan; ChatGPT/Claude need time to
+    # pull their first sources. Scraping immediately would snapshot near-empty
+    # DOMs. Waiting a full minute also stays at human cadence — no bot-tight
+    # polling that could raise Cloudflare/anti-bot flags on these pages.
+    log("\n  [2 buffer] Waiting 90s for agents to render initial state before scrape-pass...")
+    await asyncio.sleep(90)
+
+    # ── Round-robin scrape-pass (one sweep: ChatGPT → Claude → Gemini) ──
+    # Collect rich DOM state from each agent before the main 5-min rotation,
+    # so the frontend's live-narration panel populates immediately. Each
+    # agent emits agent_progress with sources, partial_text_len, and steps.
+    # Gemini stays gated as 'generating'/planning by scrape_progress_gemini
+    # because the "Start research" button is still present.
+    log("\n--- 2 scrape-pass: ChatGPT → Claude → Gemini (prime frontend narration) ---")
+    _scrape_targets = [
+        ("chatgpt", "ChatGPT", chatgpt_page, scrape_progress_chatgpt),
+        ("claude", "Claude", claude_page, scrape_progress_claude),
+        ("gemini", "Gemini", gemini_page, scrape_progress_gemini),
+    ]
+    for _ag_key, _ag_name, _ag_page, _scrape_fn in _scrape_targets:
+        if _ag_page is None:
+            continue
+        try:
+            await browser.switch_to_page(_ag_page)
+            await asyncio.sleep(1)
+            _snap = await _scrape_fn(_ag_page)
+            # Belt-and-suspenders: even if scrape_progress_gemini's planning-gate
+            # somehow lets 'complete' through (DOM churn, future regressions), the
+            # scrape-pass runs BEFORE Start-research click, so force non-complete.
+            if _ag_key == "gemini":
+                _st = (_snap.get("status") or "").lower()
+                if _st in ("complete", "done"):
+                    _snap["status"] = "generating"
+                    _snap["phase"] = "planning"
+            _sources = int(_snap.get("sources", 0) or 0)
+            _partial = int(_snap.get("partial_text_len", 0) or 0)
+            _steps = _snap.get("steps", []) or []
+            _progress = _snap.get("progress") or (
+                f"Working — {_sources} sources, {_partial} chars" if _partial else
+                (_steps[-1] if _steps else f"{_ag_name} starting up")
+            )
+            emit_event("agent_progress", phase=2, agent=_ag_key,
+                       status=_snap.get("status", "generating"),
+                       progress=_progress,
+                       sources=_sources,
+                       source_urls=(_snap.get("source_urls", []) or [])[:10],
+                       partial_text_len=_partial,
+                       steps=_steps[-3:] if _steps else [],
+                       thinking=(_snap.get("thinking") or "")[:300])
+            log(f"  [Scrape-pass] {_ag_name}: status={_snap.get('status')}, sources={_sources}, partial_len={_partial}")
+        except Exception as _e:
+            log(f"  [Scrape-pass] {_ag_name} failed (non-fatal): {_e}", "WARN")
+
+    # ── Step 4 (2D): Return to Gemini — wait for plan + click "Start research" ──
     if gemini_page is not None:
-        log("\n--- 2B: Gemini — waiting for research plan + clicking 'Start research' ---")
+        log("\n--- 2D: Gemini — waiting for research plan + clicking 'Start research' ---")
         await browser.switch_to_page(gemini_page)
         await asyncio.sleep(2)
 
-        # Wait up to 90s for "Start research" button (Gemini needs time to generate plan)
+        # Human-cadence wait loop: max ~10 min, tick every 60s. No bot-tight
+        # polling — that would be conspicuous on Gemini's Cloudflare/anti-bot
+        # telemetry. Each tick: check the Start-research button, then scrape
+        # ChatGPT + Claude so the frontend narration panel keeps populating
+        # while Gemini plans (otherwise those tabs appear frozen in the UI).
         start_clicked = False
-        for attempt in range(45):
+        _start_wait_max_sec = 10 * 60
+        _loop_start = time.time()
+        while time.time() - _loop_start < _start_wait_max_sec:
+            # 1. Check Start-research button on Gemini and click if present
             try:
+                await browser.switch_to_page(gemini_page)
                 clicked = await gemini_page.evaluate("""() => {
                     const btns = document.querySelectorAll('button');
                     for (const b of btns) {
@@ -8813,19 +8911,49 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     return false;
                 }""")
                 if clicked:
-                    log("[2B] Clicked 'Start research' via JS ✓")
+                    log("[2D] Clicked 'Start research' via JS ✓")
                     start_clicked = True
                     await asyncio.sleep(5)
                     break
             except Exception:
                 pass
-            if attempt % 10 == 9:
-                log(f"[2B] Still waiting for research plan... ({(attempt+1)*2}s)")
-            await asyncio.sleep(2)
+
+            # 2. Scrape ChatGPT + Claude to keep frontend narration fresh
+            for _ag_key, _ag_name, _ag_page, _scrape_fn in [
+                ("chatgpt", "ChatGPT", chatgpt_page, scrape_progress_chatgpt),
+                ("claude", "Claude", claude_page, scrape_progress_claude),
+            ]:
+                if _ag_page is None:
+                    continue
+                try:
+                    await browser.switch_to_page(_ag_page)
+                    await asyncio.sleep(1)
+                    _snap = await _scrape_fn(_ag_page)
+                    _sources = int(_snap.get("sources", 0) or 0)
+                    _partial = int(_snap.get("partial_text_len", 0) or 0)
+                    _steps = _snap.get("steps", []) or []
+                    _progress = _snap.get("progress") or (
+                        f"Working — {_sources} sources, {_partial} chars" if _partial else
+                        (_steps[-1] if _steps else f"{_ag_name} researching")
+                    )
+                    emit_event("agent_progress", phase=2, agent=_ag_key,
+                               status=_snap.get("status", "generating"),
+                               progress=_progress,
+                               sources=_sources,
+                               source_urls=(_snap.get("source_urls", []) or [])[:10],
+                               partial_text_len=_partial,
+                               steps=_steps[-3:] if _steps else [],
+                               thinking=(_snap.get("thinking") or "")[:300])
+                except Exception:
+                    pass
+
+            _elapsed = int(time.time() - _loop_start)
+            log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
+            await asyncio.sleep(60)
 
         # CUA fallback for Start research
         if not start_clicked:
-            log("[2B] JS couldn't find button — CUA clicking 'Start research'")
+            log("[2D] JS couldn't find button — CUA clicking 'Start research'")
             await browser.switch_to_page(gemini_page)
             fix = await agent_loop(cua_client, browser,
                 PROMPT_GEMINI_START_RESEARCH,
@@ -8834,11 +8962,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             fix_text = (fix.get("text") or "").lower()
             if "click" in fix_text:
                 start_clicked = True
-                log("[2B] CUA clicked 'Start research' ✓")
+                log("[2D] CUA clicked 'Start research' ✓")
                 await asyncio.sleep(5)
 
         # Verify Gemini is actually researching
-        verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2B",
+        verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2D",
             browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
         # Record when research actually started (after "Start research" click)
         # so the round-robin doesn't check for completion prematurely
@@ -8846,10 +8974,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                             "research_started_at": time.time()}
         if verified_b:
             emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini Deep Research plan created and started")
-            log("[2B] Gemini is researching ✓")
+            log("[2D] Gemini is researching ✓")
             await inject_agent_observer(gemini_page, "gemini")
         else:
-            log("[2B] Gemini may not be running", "WARN")
+            log("[2D] Gemini may not be running", "WARN")
 
     # ── Verify all launched agents are running ──
     total = len(agents)
@@ -11114,26 +11242,35 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _p2_links.append({"label": f"{name} Research",
                                           "url": link_res.url, "verified": True})
                         break
-                    # ── C3: ChatGPT conversation-URL fallback ──
-                    # Rule (2026-04-19): ChatGPT Pro chats don't always expose
-                    # a public /share/ link — if the public-share ladder fails,
-                    # the conversation URL is the honest, always-available
-                    # fallback (it's the user's own chat, fully accessible in
-                    # their own account). Gemini/Claude get the hard-fail modal
-                    # because they DO have reliable public-share flows.
-                    if agent_key == "chatgpt":
-                        try:
-                            conv_url = (page_obj.url or "") if page_obj else ""
-                        except Exception:
-                            conv_url = ""
-                        if "chatgpt.com/c/" in conv_url:
-                            log(f"[{name}] Public share unavailable — using conversation URL: {conv_url}")
-                            emit_event("link_extracted", phase=2, agent=agent_key,
-                                       url=conv_url, label=f"{name} Research",
-                                       verified=False, fallback="conv_url")
-                            _p2_links.append({"label": f"{name} Research",
-                                              "url": conv_url, "verified": False})
-                            break
+                    # ── Unified chat-URL fallback (ChatGPT/Gemini/Claude) ──
+                    # Rule (2026-04-20): link-extraction failure is NOT a phase-
+                    # level failure. The agent's own chat URL is the honest,
+                    # always-available fallback — it's the user's own conversation,
+                    # accessible in their own account. We emit link_extracted with
+                    # verified=False so the frontend knows it's a fallback (the
+                    # UI can render it differently, e.g. without the "public" tag).
+                    # The tight public-link gate in extract_share_link_{claude,gemini}
+                    # means Gemini/Claude now also land here when the Publish /
+                    # Share & Export flow can't produce a public URL — matches the
+                    # user's B2/B3 pivot (silent fallback instead of hard-fail modal).
+                    _chat_url = ""
+                    try:
+                        _chat_url = (page_obj.url or "") if page_obj else ""
+                    except Exception:
+                        _chat_url = ""
+                    _chat_url_markers = {
+                        "chatgpt": ["chatgpt.com/c/"],
+                        "gemini":  ["gemini.google.com/app", "gemini.google.com/chat"],
+                        "claude":  ["claude.ai/chat", "claude.ai/new"],
+                    }
+                    if _chat_url and any(m in _chat_url for m in _chat_url_markers.get(agent_key, [])):
+                        log(f"[{name}] Public share unavailable — using chat URL: {_chat_url}")
+                        emit_event("link_extracted", phase=2, agent=agent_key,
+                                   url=_chat_url, label=f"{name} Research",
+                                   verified=False, fallback="chat_url")
+                        _p2_links.append({"label": f"{name} Research",
+                                          "url": _chat_url, "verified": False})
+                        break
                     # Ask the user: retry / skip / stop
                     decision = await wait_for_agent_decision(
                         agent=agent_key, phase=2,
