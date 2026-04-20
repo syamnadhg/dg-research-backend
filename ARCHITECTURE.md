@@ -63,6 +63,7 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 | `heartbeat` | N | `{phase, ts}` | Emitted ~60s during long waits so frontend liveness watchdog stays green |
 | `login_required` | 0-5 | `{platforms: string[], platformLabels: string[], envErrors?: string[], attempt, message}` | **Phase 0 (Apr 19): sequential — fired with `platforms: [key]` scoped to the ONE platform currently being verified, one at a time until all pass. Phases 1-5: cookie-only probe at phase entry fires this with the missing platforms for that phase regardless of `skipInitVerify`.** |
 | `phase_narration` | 1-5 | `{text: string, timestamp: int}` | **Gemini 2.0 Flash narrator (Apr 19).** Emits one human-readable sentence describing what's happening in the active phase, every ~45s. Fed by a bounded ring buffer (~40 recent events). Warms on `phase_start`, quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Frontend stores in `phaseNarrations[researchId][phase]` and renders inside the phase dropdown. Speculative counterpart emitted by the frontend's `/api/narrate` fallback route carries `speculative: true` and renders italic with a "Likely: …" prefix. |
+| `agent_narration` | 2 | `{agent: string, text: string, timestamp: int}` | **Per-agent Gemini 2.0 Flash narrator (Apr 19 late-late).** Emits one human-readable sentence per active Phase 2 agent every ~6s. Separate Flash API call per agent (not one call for all of Phase 2) because per-agent context changes fast during P1/P2. Frontend stores in `agentNarrations[researchId][agentKey]`, rendered by `AgentAccordionRow` in preference over the legacy `richNarrative` string. Cleared on phase-2 complete. Cost bounded: ~200 in / 30 out per call × 3 agents × a few hundred seconds per run. |
 
 ---
 
@@ -178,10 +179,12 @@ Every failure category emits a `phase_alert` event that the frontend routes to t
 | 1 | Brief paste retry (per attempt) | `phase_alert {type:"brief_paste_retry", attempt, max}` | — |
 | 1 | Brief short/partial output | `phase_alert {type:"brief_short", details}` | `retry_phase(1)` · `continue_anyway` |
 | 1 | Brief model error | `phase_alert {type:"brief_model_error", error}` | — |
-| 2 | 90-min timeout | `phase_alert {type:"phase2_timeout", sources}` | `retry_agent` · `continue_partial_agent` · `skip_agent` |
-| 2 | Empty-final (3× CUA done + extract empty) | `phase_alert {type:"agent_empty_final"}` | `retry_agent` · `continue_partial_agent` · `skip_agent` |
-| 2 | Send-button CUA fallback | `phase_alert {type:"send_button_fallback"}` | `retry_agent` · `continue_partial_agent` · `skip_agent` |
-| 2 | Stuck-agent (no growth 20 min + non-active status) | `phase_alert {type:"stuck_agent"}` | `poke_agent` · `wait_longer_agent` · `skip_agent` |
+| 2 | 90-min poll timeout | `phase_alert {type:"phase2_timeout", sources}` | `retry_agent` · `skip_agent` · `wait_longer_agent` (Apr 19 late-late: Wait extends budget 15 min; Poke removed) |
+| 2 | Workspace cap hit | `phase_alert {type:"workspace_cap"}` | **End research only** (`stop`) — no retry; other phases keep Retry/Skip |
+| 2 | Empty-final (3× CUA done + extract empty) | `phase_alert {type:"agent_empty_final"}` | `retry_agent` · `skip_agent` |
+| 2 | Send-button CUA fallback | `phase_alert {type:"send_button_fallback"}` | `retry_agent` · `skip_agent` |
+| 2 | Claude <2 artifacts at ≥80% wait | `phase_alert {type:"claude_two_artifact_fail"}` | `retry_agent` · `skip_agent` (Apr 19 late-late hard-fail — no silent half-answer) |
+| 2 | Stuck-agent (no growth 20 min + non-active status) | `phase_alert {type:"stuck_agent"}` | `retry_agent` · `wait_longer_agent` · `skip_agent` (Apr 19 late-late: relabeled from Poke/Wait longer/Skip) |
 | 2 | Session expired mid-run (2× confirmed) | `pipeline_error {type:"session_expiry"}` | `retry_agent` (= relogin retry) · `skip_agent` |
 | 2 | Paste outer-retry | `phase_alert {type:"paste_outer_retry"}` | — |
 | 2 | HV detected / auto-clear / cooldown / success / fail | `phase_alert {type:"hv_*", stage}` — detected → auto 1/2 → cooldown 180s → retry 2/2 → success/fail | `HV Resume` (fail) |
@@ -206,6 +209,19 @@ Each alert carries a `phase` field so the frontend can dedup on `(phase, type, t
 
 **Action semantics recap:** default `[Skip]` always advances past the failing step. Extra actions are declared in the event's `actions` array and wired to the corresponding Firestore command: `HV Resume` → HV resume dispatch, `continue_anyway` / `skip_audio` / `skip_email` → their named commands.
 
+### Normalized error matrix (Apr 19 late-late)
+
+The agent-level action set was consolidated to reduce noise:
+
+| Situation | Default options |
+|-----------|----------------|
+| Every agent/phase alert (unless overridden below) | **Retry · Skip** |
+| Phase 2 workspace cap hit | **End research** only (`action=stop`) |
+| Phase 2 poll timeout | **Retry · Skip · Wait** (Wait extends budget 15 min) |
+| Stuck-agent (renamed vocabulary) | **Retry · Wait · Skip** (was Poke / Wait longer / Skip agent) |
+
+**Removed entirely:** the `[Poke]` button (folded into Retry, which now does the hard tab close+reopen from Apr 19 early `retry_agent`) and `[Proceed without CUA]` (let users walk into broken-state pipelines with no recovery path). Frontend PhaseAlertPanel already renders every alert via the `action.command` passthrough, so the normalization was pure backend: change the `actions` array the event carries and the UI follows.
+
 ---
 
 ## Retry / Continue / Skip Decision Gates
@@ -228,11 +244,13 @@ Retry counters: hard-capped (P1=2, P3=2, P4=1) so a misbehaving platform can't s
 
 | Gate | Site | Timeout | Options | Retry action |
 |------|------|---------|---------|--------------|
-| Agent 90-min timeout | poll_all_agents_round_robin | 5 min | `[Retry]` · `[Continue with partial]` · `[Skip agent]` | `paste_followup` "please output complete report", +15 min budget |
-| Agent empty-final | 3× CUA done + empty extract | 5 min | Same three-way | Same follow-up, reset done state |
-| Agent send-button fallback | start_agent_no_gemini_wait | 90 s | `[Retry send]` · `[Continue (trust it)]` · `[Skip agent]` | Re-run `PROMPT_CLICK_SEND` CUA loop |
-| Stuck-agent | Inline (when `elapsed > 20m` AND `no_growth > 20m` AND status NOT in `{planning, thinking, researching, searching}`) | async (non-blocking, consumed on next poll tick) | `[Poke Agent]` · `[Wait longer]` · `[Skip agent]` | Mild "please continue" follow-up |
-| Session expiry | Inline (requires 2× consecutive confirms spaced 2 min) | 30 min | `[I've logged in — Retry]` · `[Skip agent]` | Reload tab + keep polling |
+| Agent 90-min poll timeout | poll_all_agents_round_robin | 5 min | `[Retry]` · `[Skip]` · `[Wait]` (Apr 19 late-late: Wait extends budget 15 min) | `paste_followup` "please output complete report" on Retry; `target_page` re-anchor on next poll tick |
+| Agent empty-final | 3× CUA done + empty extract | 5 min | `[Retry]` · `[Skip]` | Same follow-up, reset done state |
+| Agent send-button fallback | start_agent_no_gemini_wait | 90 s | `[Retry]` · `[Skip]` | Re-run `PROMPT_CLICK_SEND` CUA loop |
+| Claude 2-artifact hard-fail | Inline (elapsed ≥ 80% of wait AND <2 artifacts) | 5 min | `[Retry]` · `[Skip]` | Retry closes + reopens Claude tab via hard-mode `retry_agent` |
+| Workspace cap | Phase 2 platform constraint hit | — | **`[End research]` only** (`stop`) | n/a |
+| Stuck-agent | Inline (when `elapsed > 20m` AND `no_growth > 20m` AND status NOT in `{planning, thinking, researching, searching}`) | async (non-blocking) | `[Retry]` · `[Wait]` · `[Skip]` (Apr 19 late-late — relabeled from Poke / Wait longer / Skip agent) | Retry = hard-mode tab close+reopen; Wait resets the no-growth timer 15 min |
+| Session expiry | Inline (requires 2× consecutive confirms spaced 2 min) | 30 min | `[I've logged in — Retry]` · `[Skip]` | Reload tab + keep polling |
 
 **False-alarm suppression baked into the detectors:**
 - Stuck-agent: 20-min elapsed floor, checks text AND source growth, skips during known active statuses.
@@ -277,3 +295,5 @@ Emits a chat notification: *"Backend disconnected during Phase N (no heartbeat f
 *Updated: 2026-04-18 — added `phase_alert` + `phase_alert_clear` events with per-phase emit matrix; new commands `continue_anyway` / `skip_audio` / `skip_email` (all wired via `_controls.set_*`); HV cooldown 45s → 180s; queue persistence across `--daemon-loop` restart.*
 
 *Updated: 2026-04-19 — **Sequential Phase 0 verification** (one platform at a time — cookie → tab-open → CUA → `login_required` scoped to that platform; matches `--setup` script's walk). **Cookie-only per-phase login probe** (runs on every phase regardless of `skipInitVerify`; `cookie_login_hit` read only, no tabs/CUA; catches mid-run session drift). **`phase_narration` event** (Gemini 2.0 Flash narrator emits one human-readable sentence every ~45s during active phases; frontend `/api/narrate` fallback fills >15s gaps with speculative "Likely: …" entries). Frontend stack: `phaseNarrations` store slice + `<PhaseNarrationLine>` + `useNarrationFallback` hook, budget-capped at 20 fallback calls per run.*
+
+*Updated: 2026-04-19 (late-late) — **Phase 2 per-agent extraction rules**: ChatGPT keeps public-share-then-conversation-URL fallback; Gemini + Claude PUBLIC share ONLY, hard-fail on miss. Explicit `[gemini_extractor] method=X result=Y` logs; `link_extracted` per agent the moment a verified link lands. **Claude 2-artifact hard-fail** at ≥80% wait time. **Tab round-robin**: `agent_loop(target_page=None)` + `_anchored_screenshot()`; `bring_to_front()` before every polling tick + after every `execute_action`. **Playwright Claude setup**: `setup_claude_dr` rewritten as 3 Playwright steps (Opus 4.7 dropdown, Adaptive Thinking, Research tool) — no more CUA vision for setup. **Normalized error matrix**: default Retry · Skip everywhere; Phase 2 workspace cap → End research only; Phase 2 poll timeout → Retry · Skip · Wait; removed Poke + "Proceed without CUA"; stuck-agent relabeled Retry/Wait/Skip. **New `agent_narration` event**: per-agent Gemini 2.0 Flash call, ~6s cadence during P1/P2. Backend commit `547bf17`.*

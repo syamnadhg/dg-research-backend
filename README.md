@@ -216,6 +216,21 @@ Preflight now walks platforms one at a time instead of opening 7 tabs at once. F
 
 Matches the `--setup` script's one-at-a-time walk that's been working well for months. Global "Skip verification" still bypasses the whole sequence. Per-phase login checks at every subsequent phase are cookie-only (no tabs, no CUA) — they catch mid-run session drift without re-opening anything.
 
+## Phase 2 — per-agent extraction rules (Apr 19 late-late)
+
+Phase 2 now enforces different link-extraction rules per platform. The right rule for each platform comes from how each service exposes authenticated conversations:
+
+- **ChatGPT** — unchanged from Phase 1 brief behavior: public-share link extraction first, falls back to the conversation URL if the share flow fails. A conversation URL is acceptable because it's publicly readable to anyone with the link (shareable without explicit action).
+- **Gemini + Claude** — **PUBLIC share links ONLY**, hard-fail on miss. No conversation-URL fallback — those URLs are private to the authenticated session and would fail silent-ticks downstream. If the share flow fails after 3× retries, the agent surfaces a Retry / Skip gate (matching the B1 link-first completion gate).
+
+Every extraction method logs explicitly: `[gemini_extractor] method=X result=Y` (and equivalent per platform). Makes post-mortem debugging of "why did this agent not tick" trivial. `link_extracted` is emitted per agent the moment a verified link lands (no phase-end batching).
+
+**Claude 2-artifact wait hard-fail.** If Claude has reached ≥80% of its allotted wait time AND has <2 artifacts in the side panel, the pipeline hard-fails that agent with Retry / Skip — no silent half-answer. First artifact is almost always a research plan, not the final report; accepting a single-artifact Claude as done produces a broken downstream.
+
+**Tab round-robin — `target_page` anchoring.** `agent_loop` now accepts a `target_page=None` parameter. Before every polling tick it calls `bring_to_front()` on that agent's tab so CUA always sees a live browser viewport, not a stale background capture from whichever tab happened to be front when three agents were racing. `_anchored_screenshot()` helper handles the pattern; re-anchors after every `execute_action` too. Prevents cross-agent tab interference — e.g. Gemini's vision call returning Claude's screenshot because Claude's tab happened to be front-of-stack when the capture fired.
+
+**Claude setup via Playwright (not CUA).** `setup_claude_dr` was rewritten as 3 Playwright steps — select Opus 4.7 from the model dropdown, toggle Adaptive Thinking, enable the Research tool — all DOM selectors + `.click()` calls. Eliminates ~30-90s of CUA vision overhead per setup and removes a class of "CUA clicked the wrong thing" setup failures. CUA is still used mid-run for anything that isn't deterministic DOM.
+
 ## Per-phase alert narration
 
 Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, share-link misses, login-expired, ffmpeg failures, email auth problems, and more — emits into the correct phase's `PhaseAlertPanel` inside the app's phase dropdown. No chat-bubble spam. Per-phase coverage:
@@ -229,6 +244,18 @@ Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, s
 - **Cross-cutting** — Anthropic 429/529 narrate as retrying; other API errors surface as `pipeline_warning` on the current phase
 
 Default action on every alert is `[Skip]` (advance past the failure). Phase-specific alerts offer extra actions: `HV Resume`, `continue_anyway`, `skip_audio`, `skip_email`. **Stop is NOT a per-phase action** — pause/stop/resume stay global in the app's chat input bar.
+
+### Error matrix (normalized, Apr 19 late-late)
+
+The per-alert action set was consolidated to reduce noise and remove affordances that invited broken states:
+
+- **Default everywhere: Retry · Skip.** Every failure surface offers this pair unless it's specifically overridden below.
+- **Workspace cap hit in Phase 2 → `End research` only** (`action=stop`). No point retrying when the user is out of workspace slots; other phases keep Retry · Skip.
+- **Poll timeout in Phase 2 → Retry · Skip · Wait** (Wait extends the agent's budget by 15 min). Only phase that gets a third option because "wait a little longer" is a frequently-correct user choice for Phase 2.
+- **Removed the "Poke" button and "Proceed without CUA" options entirely.** Poke morphed into the normalized Retry (which in turn does the hard tab close+reopen from the Apr 19 early `retry_agent` work). "Proceed without CUA" let users walk into broken-state pipelines with no recovery path.
+- **Stuck-agent buttons relabeled** to match the normalized vocabulary: Poke → **Retry**, "Wait longer" → **Wait**, "Skip agent" → **Skip**.
+
+The backend's per-agent narrator runs alongside the phase narrator during P1/P2 — separate Gemini 2.0 Flash calls emit `agent_narration` events (one per active agent, ~6s cadence) that the frontend shows inside each agent row of the Phase 2 accordion. Cost bounded: ~200 in / 30 out per call × 3 agents × a few hundred seconds per run.
 
 ## CLI Mode
 
