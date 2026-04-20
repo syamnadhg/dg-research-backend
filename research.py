@@ -11144,10 +11144,30 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             done_count = sum(1 for r in results.values() if r["status"] == "done")
             total_chars = sum(len(r.get("text", "")) for r in results.values())
             verified_count = sum(1 for l in _p2_links if l.get("verified"))
-            log(f"Phase 2 links: {verified_count} verified, {len(_p2_skipped_agents)} skipped")
+            any_link_count = len(_p2_links)
+            log(f"Phase 2 links: {verified_count} verified, "
+                f"{any_link_count - verified_count} unverified-fallback, "
+                f"{len(_p2_skipped_agents)} skipped")
+            # ── C8: phase_complete invariant — every non-skipped enabled agent ──
+            # ── should have a link entry (public share OR ChatGPT conv URL).    ──
+            # Decision loops that flow into this block always append to _p2_links
+            # on success, conv-URL fallback, or skip-with-round_url. Missing
+            # entries here mean a code path bypassed the link collection —
+            # log loudly so regressions surface in the next E2E instead of
+            # silently emitting phase_complete with a missing agent.
+            _linked_agents = {(l.get("label") or "").split(" ")[0] for l in _p2_links}
+            _expected_agents = set(results.keys()) - set(_p2_skipped_agents)
+            _missing_links = _expected_agents - _linked_agents
+            if _missing_links:
+                log(f"[Phase 2] phase_complete invariant breach: {sorted(_missing_links)} "
+                    f"are non-skipped but have no link entry. Emitting phase_complete "
+                    f"anyway so the pipeline advances — these agents will render as "
+                    f"unlinked on the frontend. Investigate the path that skipped "
+                    f"the link append.", "ERROR")
             emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
                 skippedAgents=_p2_skipped_agents,
-                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — {verified_count} verified links")
+                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — "
+                        f"{verified_count} verified + {any_link_count - verified_count} fallback links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
         else:
             log("Phase 2: Loading existing research files")
