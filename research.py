@@ -1252,6 +1252,28 @@ def _start_command_listener(uid, research_id, loop):
             data = doc.to_dict() or {}
             if data.get("processed"):
                 continue
+            # Stale-command defense: Firestore's onSnapshot replays every
+            # existing doc as ADDED on first attach. If a previous session
+            # wrote a stop/pause/etc and either (a) never reached the
+            # mark-processed line (os._exit crashed the Firestore write) or
+            # (b) the SDK buffered the write and the process died before
+            # flush, that doc stays unprocessed forever. Next serve then
+            # re-executes it the moment the listener reattaches — which has
+            # killed multiple test sessions within seconds of startup.
+            # 30s is well past the frontend's typical command round-trip,
+            # so any command older than that is from a previous session.
+            STALE_COMMAND_AGE_MS = 30_000
+            _ts = data.get("timestamp")
+            if isinstance(_ts, (int, float)) and _ts > 0:
+                _age_ms = int(time.time() * 1000) - int(_ts)
+                if _age_ms > STALE_COMMAND_AGE_MS:
+                    # Mark it processed so it stops replaying on future
+                    # listener attaches, but do NOT execute.
+                    try:
+                        doc.reference.update({"processed": True, "staleSkipped": True})
+                    except Exception:
+                        pass
+                    continue
             action = data.get("action", "")
             if action == "ping":
                 # Watchdog confirmation ping. Frontend writes this when it
@@ -1268,6 +1290,17 @@ def _start_command_listener(uid, research_id, loop):
                     pass
                 continue
             if action == "stop":
+                # Mark processed BEFORE scheduling the 3s exit timer so the
+                # flag lands even if the Firestore Admin SDK buffers the
+                # tail-end mark-processed write (at line ~1455) and
+                # os._exit(0) kills the buffer before flush. Without this,
+                # an ungraceful exit leaves the stop doc unprocessed and
+                # the next serve replays it the moment the listener
+                # reattaches — killing the fresh session within seconds.
+                try:
+                    doc.reference.update({"processed": True})
+                except Exception:
+                    pass
                 loop.call_soon_threadsafe(_controls.request_stop)
                 # Bridge: also create file sentinel for old phase-boundary checks
                 if _tracks_dir:
@@ -1441,9 +1474,15 @@ def _start_command_listener(uid, research_id, loop):
                     loop.call_soon_threadsafe(_controls.set_agent_decision, decision)
                     if decision == "stop":
                         # Full stop semantics — match the dedicated STOP action:
+                        # mark doc processed BEFORE scheduling exit (same
+                        # reasoning as the top-level stop handler above),
                         # flip the asyncio event, write the sentinel, and
                         # schedule the server exit. Previously this path set
                         # only the event, leaving the backend alive.
+                        try:
+                            doc.reference.update({"processed": True})
+                        except Exception:
+                            pass
                         loop.call_soon_threadsafe(_controls.request_stop)
                         if _tracks_dir:
                             try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
