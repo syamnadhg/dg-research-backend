@@ -5664,7 +5664,20 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     _runtime.sub_state = "2_parallel_polling"
     log(f"\n--- Round-robin polling {len(pending)} agents (max {max_wait_min}min each) ---")
 
+    # ── C1: tick counter drives strict-rotation cursor ──
+    # Every tick shifts the per-agent iteration order by one, so after a
+    # full rotation every agent has had its turn at being processed first.
+    # Fixes the "only one agent gets polled" starvation that appears when
+    # an earlier agent's await_agent_decision or long CUA check eats the
+    # tick's budget before later agents are reached.
+    _tick_counter = 0
+    # Target 5 min of cursor dwell per agent — at the default 30s poll
+    # interval that's 10 ticks between full rotations, still giving each
+    # agent a shot at foreground focus every single tick via the shift.
+    _tick_counter_initial = 0
+
     while pending:
+        _tick_counter += 1
         # ── Stop/Pause check via asyncio Events ──
         if _controls.is_stop() or _controls.is_pause():
             is_stop = _controls.is_stop()
@@ -5919,9 +5932,28 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
 
-        for name in list(pending.keys()):
+        # Rotate iteration order so no agent is always "first". With 3
+        # agents, the order cycles A→B→C, B→C→A, C→A→B, A→B→C, ensuring
+        # that over 3 ticks every agent has been processed first.
+        _pending_keys = list(pending.keys())
+        if _pending_keys:
+            _shift = _tick_counter % len(_pending_keys)
+            _pending_keys = _pending_keys[_shift:] + _pending_keys[:_shift]
+
+        for name in _pending_keys:
             p = pending[name]
             elapsed = time.time() - p["start_time"]
+
+            # ── C6: cursor foreground + partial-content refresh ──
+            # Bring this agent's tab to the front before any scrape/check so
+            # its MutationObserver has the freshest token stream (Chromium
+            # throttles background tabs less under Playwright than a normal
+            # browser, but foregrounding still produces materially fresher
+            # data — especially after a long blocking await on another agent).
+            try:
+                await browser.switch_to_page(p["page"])
+            except Exception as _sw_err:
+                log(f"[{name}] switch_to_page at cursor start failed: {_sw_err}", "WARN")
 
             # Timeout
             if elapsed > max_wait_min * 60:
