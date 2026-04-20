@@ -3400,16 +3400,19 @@ async def extract_with_retry(
 
 
 async def wait_for_agent_decision(agent: str, reason: str, phase: int = 2,
-                                   options=("retry", "skip", "stop")) -> str:
+                                   options=("retry", "skip")) -> str:
     """Emit agent_link_failed, pause pipeline, wait for user's decision.
-    Returns 'retry' | 'skip' | 'stop'. Defaults to 'skip' if pipeline resumes
-    without a decision set. Returns 'stop' if stop was requested."""
+    Returns 'retry' | 'skip' — and may return 'stop' if the user hit Stop
+    from the chat input bar while the banner was up (caught via
+    _controls.is_stop()). The banner itself no longer offers Stop as a
+    button; pipeline-level stop lives in the chat bar only (2026-04-19
+    design rule applied to AgentAlertPanel)."""
     _controls.pending_agent_decision = None
     emit_event("agent_link_failed", phase=phase, agent=agent,
                reason=reason, options=list(options))
     _controls.request_pause()
     emit_event("pipeline_paused", phase=phase, reason="agent_link_failed", agent=agent)
-    log(f"[{agent}] Waiting for user decision (retry/skip/stop) — reason: {reason}")
+    log(f"[{agent}] Waiting for user decision (retry/skip) — reason: {reason}")
     await _controls.wait_if_paused()
     if _controls.is_stop():
         return "stop"
@@ -3709,6 +3712,17 @@ def emit_event(event_type, phase=None, agent=None, **data):
         _recent_events.append(event)
     except Exception:
         pass
+    # B3: keep _runtime.phase in sync with the actual running phase so that
+    # rate-limit warnings (and any other `phase` fallback inside agent_loop)
+    # land on the correct phase badge instead of drifting to a stale one.
+    # Must happen BEFORE narrator start so narrators for a new phase see
+    # the updated value. Agnostic of caller — every phase_start site gets
+    # the runtime invariant for free.
+    if event_type == "phase_start" and isinstance(phase, int) and phase >= 0:
+        try:
+            _runtime.phase = phase
+        except Exception:
+            pass
     # T2 narrator lifecycle — auto-wired to phase boundaries so every
     # phase_start / phase_complete / phase_skipped / pipeline_stopped site
     # doesn't need manual start/stop_narrator calls. Single point of truth.
