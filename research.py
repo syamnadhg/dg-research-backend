@@ -2874,11 +2874,66 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
     page = browser.page
     url = await browser.current_url() or ""
     try:
-        # Try share button
-        share_btn = await page.query_selector('[aria-label="Share"]')
-        if share_btn:
-            await share_btn.click()
-            await asyncio.sleep(2)
+        # ── Open "Share & Export" dialog ──
+        # Current Gemini Deep Research UI uses "Share & Export" (not a plain
+        # "Share" aria-label). Try the new label first, then the older plain
+        # "Share" variants, then a text-content fallback for variants where
+        # aria-label is missing entirely.
+        share_opened = False
+        for sel in [
+            'button[aria-label="Share & Export"]',
+            'button[aria-label="Share and export"]',
+            'button[aria-label*="Share & Export"]',
+            'button[aria-label*="Share and export"]',
+            'button[aria-label="Share"]',
+            'button[aria-label*="Share"]',
+        ]:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    share_opened = True
+                    await asyncio.sleep(2)
+                    break
+            except Exception:
+                continue
+        if not share_opened:
+            try:
+                clicked = await page.evaluate("""() => {
+                    const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
+                    const target = btns.find(b => {
+                        const t = (b.textContent || '').trim().toLowerCase();
+                        return t === 'share & export' || t === 'share and export' || t === 'share';
+                    });
+                    if (target) { target.click(); return true; }
+                    return false;
+                }""")
+                if clicked:
+                    share_opened = True
+                    await asyncio.sleep(2)
+            except Exception:
+                pass
+        if share_opened:
+            # "Share & Export" opens a submenu (Create public link / Export
+            # to Docs / Copy). Click the public-link option before the link
+            # lookup, otherwise we land on the Export flow.
+            try:
+                await page.evaluate("""() => {
+                    const items = [...document.querySelectorAll(
+                        '[role="menuitem"], [role="option"], button, li, a'
+                    )].filter(el => el.offsetParent !== null);
+                    const target = items.find(el => {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        return t === 'create public link' ||
+                               t === 'public link' ||
+                               t.includes('create public link') ||
+                               t.includes('create a public link');
+                    });
+                    if (target) target.click();
+                }""")
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
 
             # ── Ensure public visibility ("Anyone with the link") ──
             # Gemini share dialog may default to Restricted — click through to public
