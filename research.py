@@ -5330,8 +5330,19 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                              and progress.get("sources", 0) == 0
                              and _merged_partial_len < 500)
                     if is_et:
+                        # Agent-specific label: ChatGPT kept "Extended Thinking",
+                        # Claude renamed to "Adaptive Thinking", Gemini uses
+                        # "Planning" (pre-research planning step). Emitting the
+                        # wrong label on Claude misleads users into thinking a
+                        # deprecated setting is on.
+                        _nk = normalize_agent_key(label)
+                        _think_label = (
+                            "Adaptive Thinking" if _nk == "claude" else
+                            "Planning" if _nk == "gemini" else
+                            "Extended Thinking"
+                        )
                         progress["status"] = "extended_thinking"
-                        progress["progress"] = f"Extended Thinking active ({elapsed_sec // 60}min elapsed, typical {expected_min}min)"
+                        progress["progress"] = f"{_think_label} active ({elapsed_sec // 60}min elapsed, typical {expected_min}min)"
                     agent_key = normalize_agent_key(label)
                     emit_event("agent_progress", phase=phase, agent=agent_key,
                         status=progress.get("status", ""),
@@ -7571,9 +7582,11 @@ async def setup_claude_dr(page) -> bool:
 
         # ── Step 2: toggle Adaptive Thinking ON ────────────────────────
         # The toggle is a separate control — usually a pill/switch near
-        # the model name or inside a "Thinking" submenu. We look for any
-        # element whose text or aria-label is exactly "adaptive thinking"
-        # or "extended thinking" that isn't already active.
+        # the model name or inside a "Thinking" submenu. State-aware:
+        # only click when not already on. "Extended Thinking" as a label
+        # no longer exists on current Claude.ai (was renamed to Adaptive
+        # Thinking) — matching it risks clicking a stale/cached pill on
+        # a partially-loaded page, so that fallback is intentionally gone.
         adaptive_state = await page.evaluate("""() => {
             const els = [...document.querySelectorAll(
                 'button, [role="switch"], [role="checkbox"], [role="menuitem"], [role="option"], label'
@@ -7581,9 +7594,10 @@ async def setup_claude_dr(page) -> bool:
             const matches = els.filter(el => {
                 const t = (el.textContent || '').trim().toLowerCase();
                 const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                return t === 'adaptive thinking' || t === 'extended thinking' ||
-                       a === 'adaptive thinking' || a === 'extended thinking' ||
-                       t.startsWith('adaptive thinking') || t.startsWith('extended thinking');
+                return t === 'adaptive thinking' ||
+                       a === 'adaptive thinking' ||
+                       t.startsWith('adaptive thinking') ||
+                       a.startsWith('adaptive thinking');
             });
             if (!matches.length) return { found: false };
             const el = matches[0];
@@ -7601,10 +7615,16 @@ async def setup_claude_dr(page) -> bool:
         await asyncio.sleep(0.4)
 
         # ── Step 3: open tools menu and enable Research ────────────────
+        # Precise selectors first — the old `button[aria-label*="+"]`
+        # wildcard was matching unrelated buttons ("New chat", etc.)
+        # and occasionally opened the wrong surface.
         tools_opened = False
-        for sel in ['button[aria-label*="tools"]', 'button[aria-label*="Tools"]',
-                    'button[aria-label="Open tools menu"]',
-                    'button[aria-label*="attach"]', 'button[aria-label*="+"]']:
+        for sel in ['button[aria-label="Open tools menu"]',
+                    'button[aria-label*="tools menu"]',
+                    'button[aria-label*="Tools menu"]',
+                    'button[data-testid*="tools"]',
+                    'button[aria-label*="attach"]',
+                    'button[aria-haspopup="menu"][aria-label*="tools"]']:
             try:
                 btn = await page.query_selector(sel)
                 if btn:
@@ -7616,14 +7636,19 @@ async def setup_claude_dr(page) -> bool:
                 continue
         research_enabled = False
         if tools_opened:
+            # State-aware + accept label variations ("Research", "Research
+            # tool", "Deep research"). Only clicks when not already on.
             research_enabled = await page.evaluate("""() => {
                 const items = [...document.querySelectorAll(
                     '[role="menuitem"], button, [role="switch"], [role="checkbox"], label'
-                )];
+                )].filter(el => el.offsetParent !== null);
                 const target = items.find(el => {
                     const t = (el.textContent || '').trim().toLowerCase();
                     const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                    return t === 'research' || a === 'research' || t.includes('research tool');
+                    return t === 'research' || a === 'research' ||
+                           t === 'research tool' || a === 'research tool' ||
+                           t === 'deep research' || a === 'deep research' ||
+                           t.startsWith('research ') || a.startsWith('research ');
                 });
                 if (!target) return false;
                 const checked = target.getAttribute('aria-checked') === 'true' ||
