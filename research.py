@@ -947,6 +947,27 @@ def start_firestore_start_listener(job_queue, loop):
             data = doc.to_dict() or {}
             if data.get("processed"):
                 continue
+            # Stale-queue defense: Firestore's onSnapshot replays every
+            # existing unprocessed doc as ADDED on first attach. If a
+            # previous serve session wrote a start request but crashed /
+            # exited before marking processed, that doc replays on the
+            # NEXT serve startup and silently kicks off a research the
+            # user never asked for. This has killed multiple test
+            # sessions. Mirrors the stale-command defense in
+            # _start_command_listener.
+            # Threshold past the frontend's worst-case command round-trip
+            # so legitimate "just-fired" starts always pass.
+            STALE_QUEUE_AGE_MS = 30_000
+            _ts = data.get("timestamp")
+            if isinstance(_ts, (int, float)) and _ts > 0:
+                _age_ms = int(time.time() * 1000) - int(_ts)
+                if _age_ms > STALE_QUEUE_AGE_MS:
+                    try:
+                        doc.reference.update({"processed": True, "staleSkipped": True})
+                    except Exception:
+                        pass
+                    log(f"Queue: skipped stale doc (age={_age_ms // 1000}s, action={data.get('action', 'start')})", "INFO")
+                    continue
             action = data.get("action", "start")
             # Handle cancel-queued: remove the target research from the job
             # queue before it reaches the worker and mark it stopped. The
@@ -1044,6 +1065,28 @@ def start_firestore_start_listener(job_queue, loop):
                         continue
                 except Exception as e:
                     log(f"Token validation failed (allowing request through): {e}", "WARN")
+            # Research-doc existence check — user may have deleted the chat
+            # from the app between firing the research and us picking up the
+            # queue doc. Without this, we'd run a full pipeline and try to
+            # write back status to a doc that doesn't exist (the "404 No
+            # document to update" WARN the user saw), which wastes an hour
+            # of API calls on work the user already abandoned. Mark the
+            # queue doc staleSkipped so it doesn't replay on future
+            # listener attaches.
+            try:
+                research_doc = _firebase_db.collection("users").document(uid) \
+                    .collection("researches").document(research_id).get()
+                if not research_doc.exists:
+                    log(f"Queue: skipped — research doc {research_id} no longer exists (user deleted chat?)", "INFO")
+                    try:
+                        doc.reference.update({"processed": True, "staleSkipped": True,
+                                              "reason": "research doc deleted"})
+                    except Exception:
+                        pass
+                    continue
+            except Exception as e:
+                log(f"Queue: research-doc existence check failed (allowing through): {e}", "WARN")
+
             # Generate run_id
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             log(f"Firestore start: uid={uid[:8]}... topic={topic[:40]} run_id={run_id}")
@@ -8497,10 +8540,17 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
 # ── Playwright-direct platform setup (replaces vision-based CUA setup) ────────
 
 async def setup_chatgpt_dr(page) -> bool:
-    """Enable ChatGPT Deep Research mode via direct selectors. Returns True on success."""
+    """Enable ChatGPT Deep Research mode via direct selectors. Returns True on success.
+
+    Step-by-step logs emit on every branch so next run's log tells us
+    exactly which step broke — previously this was one-line "setup failed"
+    with no detail, leaving us guessing whether the + menu opened, whether
+    the DR option was found, or whether verification landed.
+    """
     try:
         await asyncio.sleep(2)
-        # Click the "+" / tools menu in composer
+        # Step 1: open the + / tools menu in the composer
+        menu_sel = None
         for sel in ['button[aria-label*="Use a tool"]',
                     'button[aria-label*="Attach"]',
                     'button[data-testid="composer-plus-btn"]',
@@ -8510,10 +8560,16 @@ async def setup_chatgpt_dr(page) -> bool:
                 if btn:
                     await btn.click()
                     await asyncio.sleep(0.8)
+                    menu_sel = sel
                     break
             except Exception:
                 continue
-        # Click "Deep research" option in menu
+        if not menu_sel:
+            log("[setup_chatgpt_dr] Step 1 FAIL: tools/+ menu button not found — selectors may have rotated", "WARN")
+            return False
+        log(f"[setup_chatgpt_dr] Step 1 OK: opened tools menu via {menu_sel}")
+
+        # Step 2: click "Deep research" option in the menu
         clicked = await page.evaluate("""() => {
             const items = document.querySelectorAll('[role="menuitem"], button, div[role="option"]');
             for (const el of items) {
@@ -8525,47 +8581,85 @@ async def setup_chatgpt_dr(page) -> bool:
             return false;
         }""")
         if not clicked:
+            log("[setup_chatgpt_dr] Step 2 FAIL: 'Deep research' menu item not found — menu opened but option missing", "WARN")
             return False
+        log("[setup_chatgpt_dr] Step 2 OK: clicked Deep research menu option")
         await asyncio.sleep(1.5)
-        # Verify Deep Research pill/label present in composer area
+
+        # Step 3: verify DR actually activated — look for the DR pill in the
+        # composer area (not anywhere in body text, which was the previous
+        # false-positive-prone check that matched tooltips and help labels).
         active = await page.evaluate("""() => {
-            const text = document.body.innerText.toLowerCase();
-            return text.includes('deep research');
+            const composer = document.querySelector('form') || document.body;
+            // Prefer a visible pill/chip inside the composer
+            const chips = [...composer.querySelectorAll('button, [role="button"], span, div')];
+            for (const el of chips) {
+                if (!el.offsetParent) continue;
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t === 'deep research' || t === 'deep research off') {
+                    // Composer-level visible pill is the active-mode indicator
+                    return { ok: true, via: 'pill', text: el.textContent.trim().slice(0, 40) };
+                }
+            }
+            // Secondary signal: composer placeholder changes for DR mode
+            const ta = document.querySelector('#prompt-textarea, textarea, [contenteditable="true"]');
+            if (ta) {
+                const placeholder = (ta.getAttribute('placeholder') || ta.getAttribute('data-placeholder') || '').toLowerCase();
+                if (placeholder.includes('research')) {
+                    return { ok: true, via: 'placeholder', text: placeholder.slice(0, 60) };
+                }
+            }
+            return { ok: false };
         }""")
-        return bool(active)
+        if not active or not active.get("ok"):
+            log("[setup_chatgpt_dr] Step 3 FAIL: clicked DR but no pill/placeholder change visible after 1.5s — click may have been intercepted", "WARN")
+            return False
+        log(f"[setup_chatgpt_dr] Step 3 OK: verified DR active via {active.get('via')} → {active.get('text')}")
+        return True
     except Exception as e:
-        log(f"[setup_chatgpt_dr] {e}", "WARN")
+        log(f"[setup_chatgpt_dr] exception: {e}", "WARN")
         return False
 
 
 async def setup_gemini_dr(page) -> bool:
-    """Enable Gemini Deep Research pill via direct selectors. Returns True on success."""
+    """Enable Gemini Deep Research pill via direct selectors. Returns True on success.
+
+    Step-by-step logs emit on every branch so next run's log tells us
+    whether the pill was missing, the model-dropdown fallback fired, or
+    verification couldn't find the active pill afterwards.
+    """
     try:
         await asyncio.sleep(2)
-        # Look for the "Deep research" button/pill — various UI layouts
-        clicked = await page.evaluate("""() => {
-            // Direct button with aria or text "Deep research"
+
+        # Step 1: try the direct Deep Research pill/button in the composer
+        direct_clicked = await page.evaluate("""() => {
             const candidates = document.querySelectorAll('button, [role="button"], [role="menuitem"]');
             for (const b of candidates) {
+                if (!b.offsetParent) continue;
                 const t = (b.textContent || '').trim().toLowerCase();
                 const a = (b.getAttribute('aria-label') || '').toLowerCase();
                 if (t === 'deep research' || a === 'deep research' || t.startsWith('deep research')) {
-                    // Check it's not already active (pill with active class)
                     b.click();
                     return true;
                 }
             }
             return false;
         }""")
-        if not clicked:
-            # Try the model/mode dropdown first
+        if direct_clicked:
+            log("[setup_gemini_dr] Step 1 OK: clicked DR pill directly in composer")
+        else:
+            log("[setup_gemini_dr] Step 1: DR pill not directly visible — trying model-dropdown fallback", "INFO")
+
+        # Step 2 (fallback): DR may live inside the model/tools dropdown
+        if not direct_clicked:
             for sel in ['button[aria-label*="model"]', 'button[data-test-id*="model"]']:
                 try:
                     btn = await page.query_selector(sel)
                     if btn:
                         await btn.click()
                         await asyncio.sleep(0.8)
-                        clicked = await page.evaluate("""() => {
+                        log(f"[setup_gemini_dr] Step 2: opened {sel}")
+                        direct_clicked = await page.evaluate("""() => {
                             const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
                             for (const el of items) {
                                 const t = (el.textContent || '').trim().toLowerCase();
@@ -8573,24 +8667,48 @@ async def setup_gemini_dr(page) -> bool:
                             }
                             return false;
                         }""")
-                        break
-                except Exception:
+                        if direct_clicked:
+                            log(f"[setup_gemini_dr] Step 2 OK: DR selected via {sel} dropdown")
+                            break
+                        else:
+                            log(f"[setup_gemini_dr] Step 2 {sel}: dropdown opened but DR option absent", "WARN")
+                except Exception as e:
+                    log(f"[setup_gemini_dr] Step 2 {sel} errored: {e}", "WARN")
                     continue
-        if not clicked:
+
+        if not direct_clicked:
+            log("[setup_gemini_dr] FAIL: neither direct pill nor dropdown fallback landed DR — selectors likely rotated", "WARN")
             return False
+
         await asyncio.sleep(1.5)
-        # Verify pill is visible
+
+        # Step 3: verify the pill is visible AND reads as active (not just
+        # a hover tooltip or inactive label). Gemini exposes the active
+        # state via aria-pressed / aria-selected on its chip buttons.
         active = await page.evaluate("""() => {
-            const pills = document.querySelectorAll('button, [role="button"], span');
+            const pills = document.querySelectorAll('button, [role="button"]');
             for (const p of pills) {
+                if (!p.offsetParent) continue;
                 const t = (p.textContent || '').trim().toLowerCase();
-                if (t === 'deep research' && p.offsetParent !== null) return true;
+                if (t !== 'deep research') continue;
+                const pressed = p.getAttribute('aria-pressed') === 'true' ||
+                                 p.getAttribute('aria-selected') === 'true' ||
+                                 (p.className || '').toLowerCase().includes('active') ||
+                                 (p.className || '').toLowerCase().includes('selected');
+                return { ok: true, pressed, text: p.textContent.trim().slice(0, 40) };
             }
-            return false;
+            return { ok: false };
         }""")
-        return bool(active)
+        if not active or not active.get("ok"):
+            log("[setup_gemini_dr] Step 3 FAIL: DR pill not visible after click — UI may not have reflected the selection", "WARN")
+            return False
+        if not active.get("pressed"):
+            log(f"[setup_gemini_dr] Step 3 WARN: DR pill visible but no active-state attribute ({active.get('text')}) — proceeding but may be in off state")
+        else:
+            log(f"[setup_gemini_dr] Step 3 OK: DR pill active → {active.get('text')}")
+        return True
     except Exception as e:
-        log(f"[setup_gemini_dr] {e}", "WARN")
+        log(f"[setup_gemini_dr] exception: {e}", "WARN")
         return False
 
 
@@ -8620,6 +8738,7 @@ async def setup_claude_dr(page) -> bool:
             return false;
         }""")
         if dropdown_clicked:
+            log("[setup_claude_dr] Step 1A OK: opened model dropdown")
             await asyncio.sleep(0.8)
             opus_selected = await page.evaluate("""() => {
                 const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, a, li')];
@@ -8639,9 +8758,9 @@ async def setup_claude_dr(page) -> bool:
                 return null;
             }""")
             if opus_selected:
-                log(f"[Claude] Model selected via Playwright: {opus_selected}")
+                log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected}")
             else:
-                log("[Claude] Opus 4.7 not found in dropdown", "WARN")
+                log("[setup_claude_dr] Step 1B FAIL: Opus 4.7 option not in dropdown — rollout or A/B difference?", "WARN")
                 return False
             await asyncio.sleep(0.6)
             # Dismiss the dropdown so the Adaptive Thinking toggle is clickable
@@ -8651,7 +8770,7 @@ async def setup_claude_dr(page) -> bool:
             except Exception:
                 pass
         else:
-            log("[Claude] Model dropdown button not found", "WARN")
+            log("[setup_claude_dr] Step 1A FAIL: model dropdown button not found — selector list likely stale", "WARN")
             return False
 
         # ── Step 2: toggle Adaptive Thinking ON ────────────────────────
@@ -8682,10 +8801,10 @@ async def setup_claude_dr(page) -> bool:
             return { found: true, toggled: false, label: el.textContent.trim() };
         }""")
         if not adaptive_state.get("found"):
-            log("[Claude] Adaptive Thinking toggle not found — UI may have shipped under a new label", "WARN")
+            log("[setup_claude_dr] Step 2 WARN: Adaptive Thinking toggle not found — UI may have shipped under a new label", "WARN")
         else:
-            log(f"[Claude] Adaptive Thinking {'enabled' if adaptive_state.get('toggled') else 'already on'}: "
-                f"{adaptive_state.get('label')}")
+            log(f"[setup_claude_dr] Step 2 OK: Adaptive Thinking {'just enabled' if adaptive_state.get('toggled') else 'already on'} "
+                f"(label='{adaptive_state.get('label')}')")
         await asyncio.sleep(0.4)
 
         # ── Step 3: open tools menu and enable Research ────────────────
@@ -8693,6 +8812,7 @@ async def setup_claude_dr(page) -> bool:
         # wildcard was matching unrelated buttons ("New chat", etc.)
         # and occasionally opened the wrong surface.
         tools_opened = False
+        tools_sel_used = None
         for sel in ['button[aria-label="Open tools menu"]',
                     'button[aria-label*="tools menu"]',
                     'button[aria-label*="Tools menu"]',
@@ -8705,9 +8825,14 @@ async def setup_claude_dr(page) -> bool:
                     await btn.click()
                     await asyncio.sleep(0.6)
                     tools_opened = True
+                    tools_sel_used = sel
                     break
             except Exception:
                 continue
+        if tools_opened:
+            log(f"[setup_claude_dr] Step 3A OK: opened tools menu via {tools_sel_used}")
+        else:
+            log("[setup_claude_dr] Step 3A FAIL: tools menu button not found — aria-labels rotated or language changed", "WARN")
         research_enabled = False
         if tools_opened:
             # State-aware + accept label variations ("Research", "Research
@@ -8737,8 +8862,10 @@ async def setup_claude_dr(page) -> bool:
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-        if not research_enabled:
-            log("[Claude] Research tool not found in tools menu", "WARN")
+        if research_enabled:
+            log("[setup_claude_dr] Step 3B OK: Research tool toggled on")
+        else:
+            log("[setup_claude_dr] Step 3B FAIL: Research tool item not found in tools menu — will run in chat mode, NOT research", "WARN")
 
         # Focus the input so the brief paste/attach lands cleanly.
         for sel in ['div[contenteditable="true"]', '[aria-label*="message"]', '.ProseMirror']:
