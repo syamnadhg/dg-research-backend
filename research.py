@@ -4112,13 +4112,20 @@ async def await_phase_login_probe(
 async def scrape_progress_chatgpt(page):
     """Scrape ChatGPT's current research progress (Playwright JS — zero CUA cost).
     Returns rich data for web app: status, thinking steps, sources, sections, text length.
-    Selectors use multiple fallbacks per field — if ChatGPT UI changes, values degrade gracefully."""
+
+    Deep Research note: as of 2026, ChatGPT Deep Research renders inside a cross-origin
+    iframe (connector_openai_deep_research.web-sandbox.oaiusercontent.com). Main-page
+    selectors miss DR content, so we iterate `page.frames` and scrape the DR frame
+    separately, then merge. Main-page signals (title, model, stop button) still come
+    from the host page."""
     try:
-        return await page.evaluate("""() => {
+        # ---- Main-page scrape (host page: title, model, stop button, chat-level DR indicators)
+        result = await page.evaluate("""() => {
             const r = {
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], steps: [],
-                partial_text_len: 0, plan: '', model: '', title: ''
+                partial_text_len: 0, plan: '', model: '', title: '',
+                dr_active: false, dr_done_text: false, has_stop_btn: false
             };
             // Model info
             const modelEl = document.querySelector('[data-testid="model-selector"], .model-label');
@@ -4126,10 +4133,32 @@ async def scrape_progress_chatgpt(page):
             // Conversation title
             const titleEl = document.querySelector('h1, [data-testid="conversation-title"]');
             if (titleEl) r.title = titleEl.innerText.substring(0, 100);
-            // Thinking/research progress
+            // Stop-button detection (aria-label + text fallback)
+            r.has_stop_btn = !!document.querySelector(
+                'button[aria-label="Stop generating"], button[aria-label*="Stop"], ' +
+                'button[data-testid="stop-button"], button[data-testid*="stop"]'
+            );
+            if (!r.has_stop_btn) {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    if (t === 'stop' || t === 'stop generating' || t === 'stop research') { r.has_stop_btn = true; break; }
+                }
+            }
+            // Body-level DR indicators (host page shows banner/status strings even when content is in iframe)
+            const bodyLower = document.body.innerText.toLowerCase();
+            const drKws = ['researching', 'sources found', 'sources and counting',
+                          'searching the web', 'reading sources', 'analyzing',
+                          'deep research', 'looking into', 'investigating'];
+            r.dr_active = drKws.some(kw => bodyLower.includes(kw));
+            // Completion indicators
+            const doneKws = ['research completed', 'research complete',
+                             'finished research', 'deep research completed'];
+            r.dr_done_text = doneKws.some(kw => bodyLower.includes(kw));
+            // Thinking/research progress (host page, rare in iframe DR but kept for chat mode)
             const thinking = document.querySelector('.thinking-text, [data-thinking], .research-progress, .step-text');
             if (thinking) r.thinking = thinking.innerText.substring(0, 500);
-            // Sources/citations — scoped to assistant messages + canvas (skip navigation links)
+            // Sources/citations (host page — kept for non-DR chat)
             const srcSet = new Set();
             document.querySelectorAll(
                 '.citation, .source-link, [data-citation], ' +
@@ -4137,47 +4166,156 @@ async def scrape_progress_chatgpt(page):
                 '[data-testid="canvas"] a[href*="http"], .canvas-container a[href*="http"]'
             ).forEach(s => {
                 const href = s.href || '';
-                if (href.startsWith('http') && !href.includes('chatgpt.com') && !href.includes('openai.com') && !href.includes('chat.openai') && href.length < 500)
+                if (href.startsWith('http') && !href.includes('chatgpt.com') && !href.includes('openai.com') && !href.includes('chat.openai') && !href.includes('oaiusercontent') && href.length < 500)
                     srcSet.add(href);
             });
             r.source_urls = Array.from(srcSet).slice(0, 30);
             r.sources = r.source_urls.length;
-            // Response sections (headings found so far)
+            // Response sections (host page headings)
             const headings = document.querySelectorAll('[data-message-author-role="assistant"] h1, [data-message-author-role="assistant"] h2, [data-message-author-role="assistant"] h3');
             r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80));
-            // Partial response length
+            // Partial response length (host page)
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
             if (msgs.length > 0) r.partial_text_len = msgs[msgs.length-1].innerText.length;
-            // Also capture canvas/artifact content from DR
+            // Canvas/artifact content
             const canvas = document.querySelector('[data-testid="canvas"], .canvas-container, .canvas-content');
             if (canvas && canvas.innerText.length > r.partial_text_len) r.partial_text_len = canvas.innerText.length;
-            // Steps — synthesize from research activity (ChatGPT lacks Gemini's step DOM)
-            // Try real step elements first, then synthesize from available data
-            const chatSteps = document.querySelectorAll('.research-step, .step-content, [data-research-step], .search-in-progress, [data-message-author-role="tool"]');
-            if (chatSteps.length > 0) {
-                r.steps = Array.from(chatSteps).map(s => s.innerText.substring(0, 150)).filter(s => s.length > 3);
-            }
-            if (r.steps.length === 0) {
-                if (r.thinking) r.steps.push('Extended Thinking: ' + r.thinking.substring(0, 100));
-                const hosts = new Set();
-                r.source_urls.forEach(u => { try { hosts.add(new URL(u).hostname.replace('www.', '')); } catch(e) {} });
-                Array.from(hosts).slice(0, 5).forEach(h => r.steps.push('Researching ' + h));
-                if (r.sections.length > 0) r.steps.push('Writing: ' + r.sections[r.sections.length - 1]);
-                if (r.partial_text_len > 3000) r.steps.push('Generating brief: ' + Math.round(r.partial_text_len / 1000) + 'k chars');
-            }
-            if (r.steps.length > 0 && !r.progress) r.progress = r.steps[r.steps.length - 1];
-            // Plan — from research outline (sections as structure)
-            if (r.sections.length >= 2) r.plan = 'Research outline: ' + r.sections.slice(0, 5).join(' \\u2192 ');
-            // Status — handles both standard ChatGPT and Deep Research
-            const stop = document.querySelector('button[aria-label="Stop generating"], button[data-testid="stop-button"]');
-            const bodyLower = document.body.innerText.toLowerCase();
-            const drActive = ['researching', 'sources found', 'searching the web', 'analyzing'].some(kw => bodyLower.includes(kw));
-            if (stop) { r.status = 'generating'; r.phase = 'researching'; }
-            else if (drActive) { r.status = 'generating'; r.phase = 'deep_research'; r.progress = r.progress || 'Deep Research in progress'; }
-            else if (r.partial_text_len > 100) { r.status = 'complete'; r.phase = 'done'; }
-            else { r.status = 'idle'; r.phase = 'waiting'; }
             return r;
         }""")
+
+        # ---- Iframe scrape (Deep Research content lives here as of 2026)
+        try:
+            for frame in page.frames:
+                try:
+                    src = (frame.url or "").lower()
+                except Exception:
+                    continue
+                if not src:
+                    continue
+                # Match any OpenAI DR sandbox iframe (URL substring varies)
+                if ("deep_research" in src or "oaiusercontent" in src or "web-sandbox.oaiusercontent" in src):
+                    try:
+                        dr = await frame.evaluate("""() => {
+                            const d = {
+                                steps: [], source_urls: [], sections: [],
+                                partial_text_len: 0, progress: '', thinking: '',
+                                is_active: false, is_done: false
+                            };
+                            // 1. Steps: DR shows an activity/timeline panel
+                            const stepEls = document.querySelectorAll(
+                                '[class*="step"], [class*="activity"], [class*="timeline"] li, ' +
+                                '[data-step], [class*="research-step"], ' +
+                                'li[class*="activity"], [role="listitem"]'
+                            );
+                            d.steps = Array.from(stepEls).map(e => (e.innerText || '').trim().substring(0, 180))
+                                                         .filter(s => s.length > 3).slice(-12);
+                            // 2. Sources: DR shows a source list — collect http links inside iframe
+                            const srcSet = new Set();
+                            document.querySelectorAll('a[href^="http"]').forEach(a => {
+                                const h = a.href || '';
+                                if (h.length < 500 &&
+                                    !h.includes('chatgpt.com') && !h.includes('openai.com') &&
+                                    !h.includes('oaiusercontent')) srcSet.add(h);
+                            });
+                            d.source_urls = Array.from(srcSet).slice(0, 30);
+                            // 3. Headings in the DR report
+                            const hs = document.querySelectorAll('h1, h2, h3');
+                            d.sections = Array.from(hs).map(h => (h.innerText || '').trim().substring(0, 80))
+                                                       .filter(s => s.length > 1);
+                            // 4. Partial text — use body text as proxy
+                            d.partial_text_len = (document.body?.innerText || '').length;
+                            // 5. Activity detection inside iframe
+                            const bodyLower = (document.body?.innerText || '').toLowerCase();
+                            const activeKws = ['researching', 'searching', 'reading', 'analyzing',
+                                               'sources found', 'sources and counting', 'browsing'];
+                            d.is_active = activeKws.some(kw => bodyLower.includes(kw));
+                            // 6. Completion indicators inside iframe
+                            const doneKws = ['research completed', 'finished research',
+                                             'deep research completed'];
+                            d.is_done = doneKws.some(kw => bodyLower.includes(kw));
+                            // 7. Latest step as progress
+                            if (d.steps.length > 0) d.progress = d.steps[d.steps.length - 1];
+                            return d;
+                        }""")
+                        if dr:
+                            # Merge: iframe data is authoritative for DR content
+                            if dr.get("partial_text_len", 0) > result.get("partial_text_len", 0):
+                                result["partial_text_len"] = dr["partial_text_len"]
+                            iframe_srcs = dr.get("source_urls") or []
+                            if len(iframe_srcs) > result.get("sources", 0):
+                                result["source_urls"] = iframe_srcs
+                                result["sources"] = len(iframe_srcs)
+                            if dr.get("steps"):
+                                result["steps"] = dr["steps"]
+                                if dr.get("progress"):
+                                    result["progress"] = dr["progress"]
+                            if dr.get("sections"):
+                                # prefer iframe sections (the actual DR report)
+                                result["sections"] = dr["sections"]
+                            # Status override from iframe signals
+                            if dr.get("is_active"):
+                                result["dr_active"] = True
+                            if dr.get("is_done"):
+                                result["dr_done_text"] = True
+                    except Exception as _ie:
+                        log(f"ChatGPT DR iframe evaluate skipped: {_ie}", "DEBUG")
+                    break
+        except Exception as _fe:
+            log(f"ChatGPT frames iteration skipped: {_fe}", "DEBUG")
+
+        # ---- Synthesize steps if iframe didn't provide any
+        if not result.get("steps"):
+            synth = []
+            if result.get("thinking"):
+                synth.append("Extended Thinking: " + result["thinking"][:100])
+            hosts = set()
+            for u in result.get("source_urls", []):
+                try:
+                    from urllib.parse import urlparse
+                    h = urlparse(u).hostname or ""
+                    if h.startswith("www."):
+                        h = h[4:]
+                    if h:
+                        hosts.add(h)
+                except Exception:
+                    pass
+            for h in list(hosts)[:5]:
+                synth.append(f"Researching {h}")
+            if result.get("sections"):
+                synth.append(f"Writing: {result['sections'][-1]}")
+            if result.get("partial_text_len", 0) > 3000:
+                synth.append(f"Generating brief: {round(result['partial_text_len']/1000)}k chars")
+            result["steps"] = synth
+
+        if result.get("steps") and not result.get("progress"):
+            result["progress"] = result["steps"][-1]
+
+        # Plan line (sections as outline)
+        if len(result.get("sections", [])) >= 2 and not result.get("plan"):
+            result["plan"] = "Research outline: " + " \u2192 ".join(result["sections"][:5])
+
+        # ---- Final status resolution
+        has_stop = result.pop("has_stop_btn", False)
+        dr_active = result.pop("dr_active", False)
+        dr_done_text = result.pop("dr_done_text", False)
+        partial = result.get("partial_text_len", 0)
+        if has_stop or dr_active:
+            result["status"] = "generating"
+            result["phase"] = "deep_research" if dr_active else "researching"
+            if not result.get("progress"):
+                result["progress"] = "Deep Research in progress"
+        elif dr_done_text and partial > 100:
+            result["status"] = "complete"
+            result["phase"] = "done"
+        elif partial > 100:
+            # Partial content but no active/done signal — call it complete (historical behavior)
+            result["status"] = "complete"
+            result["phase"] = "done"
+        else:
+            result["status"] = "idle"
+            result["phase"] = "waiting"
+
+        return result
     except Exception as e:
         log(f"ChatGPT scrape failed (selectors may need update): {e}", "WARN")
         return {"status": "scrape_error", "progress": "Selector mismatch — ChatGPT UI may have changed", "sources": 0, "partial_text_len": 0}
@@ -4282,7 +4420,13 @@ async def scrape_progress_gemini(page):
 
 async def scrape_progress_claude(page):
     """Scrape Claude's current research progress — rich data for web app.
-    Selectors use multiple fallbacks — degrades gracefully on UI changes."""
+
+    Claude Research (2026) shows:
+      - "Stop research" button (not "Stop Response") while active
+      - "N sources and counting" text while gathering sources
+      - "Research completed in Xm" card header when done
+      - Research renders inside a card/artifact panel, not main chat stream
+    We detect these text markers as primary activity signals."""
     try:
         return await page.evaluate("""() => {
             const r = {
@@ -4290,17 +4434,28 @@ async def scrape_progress_claude(page):
                 sources: 0, source_urls: [], sections: [], steps: [],
                 tool_uses: [], partial_text_len: 0, plan: '', model: '', title: ''
             };
-            // Conversation title (Claude shows it in sidebar / window title)
+            // Conversation title
             const ctitle = document.querySelector('[data-conversation-title], .conversation-title, header h1, h1.truncate, [data-testid="conversation-title"]');
             if (ctitle) r.title = ctitle.innerText.substring(0, 100);
             else if (document.title) r.title = document.title.replace(/ - Claude$/, '').replace(/^Claude$/, '').substring(0, 100);
             // Model info
             const modelEl = document.querySelector('.model-selector, [data-testid="model-name"]');
             if (modelEl) r.model = modelEl.innerText.substring(0, 50);
-            // Thinking content (Extended Thinking shows this)
+            // Thinking content
             const thinking = document.querySelector('[data-is-thinking="true"], .thinking-content, .thinking-block');
             if (thinking) r.thinking = thinking.innerText.substring(0, 500);
-            // Research/tool use activity — Claude Research shows tool_use blocks
+
+            // ---- Text-based markers (Claude Research surfaces activity as text, not attributes)
+            const bodyText = document.body?.innerText || '';
+            const bodyLower = bodyText.toLowerCase();
+            // "N sources and counting" → research actively gathering
+            const srcCountM = bodyText.match(/(\\d[\\d,]*)\\s+sources?\\s+and\\s+counting/i);
+            const liveSrcCount = srcCountM ? parseInt(srcCountM[1].replace(/,/g, ''), 10) : 0;
+            // "Research completed in Xm" → research done
+            const doneM = bodyText.match(/research\\s+completed(?:\\s+in\\s+[\\dhms]+)?/i);
+            const researchDone = !!doneM;
+
+            // ---- Tool uses (Research tool, web_search, browse, etc.)
             const tools = document.querySelectorAll(
                 '.tool-use-content, [data-tool-name], .tool-result, ' +
                 '[class*="tool-use"], [class*="tool_use"], [data-testid*="tool"], ' +
@@ -4308,72 +4463,109 @@ async def scrape_progress_claude(page):
             );
             r.tool_uses = Array.from(tools).map(t => {
                 const name = t.getAttribute('data-tool-name') || '';
-                const txt = t.innerText.substring(0, 200);
+                const txt = (t.innerText || '').substring(0, 200);
                 return name ? `${name}: ${txt}` : txt;
             }).filter(t => t.length > 3);
-            if (r.tool_uses.length > 0) r.progress = r.tool_uses[r.tool_uses.length - 1].substring(0, 200);
-            // Sources — from research tool results + citations + artifact links
+
+            // ---- Sources — citations, tool-result links, artifact links
             const srcSet = new Set();
-            // Citation links in assistant messages
             document.querySelectorAll('.font-claude-message a[href*="http"], .contents a[href*="http"]').forEach(a => {
                 const href = a.href || '';
                 if (href.startsWith('http') && !href.includes('claude.ai') && !href.includes('anthropic.com'))
                     srcSet.add(href);
             });
-            // Research tool search results (URLs in tool output blocks)
             document.querySelectorAll('[class*="tool"] a[href], .tool-result a[href]').forEach(a => {
-                if (a.href?.startsWith('http')) srcSet.add(a.href);
+                if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
             });
-            // Artifact panel links (when artifact 1 is open)
             document.querySelectorAll('aside a[href*="http"], [class*="artifact"] a[href*="http"]').forEach(a => {
+                if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
+            });
+            // Broad research-card link sweep: any http link inside an element whose class/text
+            // mentions "research" (research report lives inside card wrappers with dynamic classes)
+            document.querySelectorAll('[class*="research"] a[href*="http"], [data-testid*="research"] a[href*="http"]').forEach(a => {
                 if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
             });
             r.source_urls = Array.from(srcSet).slice(0, 30);
             r.sources = r.source_urls.length;
-            // Response sections — check both conversation and artifact panel
+            // If DOM didn't surface individual source links but Claude shows "N sources" text, trust the text count
+            if (r.sources === 0 && liveSrcCount > 0) r.sources = liveSrcCount;
+
+            // ---- Sections — headings across conversation, artifact, and research card
             const headings = document.querySelectorAll(
                 '.font-claude-message h1, .font-claude-message h2, .font-claude-message h3, ' +
                 '.contents h1, .contents h2, .contents h3, ' +
                 'aside h1, aside h2, aside h3, ' +
-                '[class*="artifact"] h1, [class*="artifact"] h2'
+                '[class*="artifact"] h1, [class*="artifact"] h2, ' +
+                '[class*="research"] h1, [class*="research"] h2, [class*="research"] h3'
             );
-            r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80)).filter(s => s.length > 1);
-            // Partial text — check conversation + artifact panel
-            const msgs = document.querySelectorAll('.font-claude-message, .contents .prose');
+            r.sections = Array.from(headings).map(h => (h.innerText || '').substring(0, 80)).filter(s => s.length > 1);
+
+            // ---- Partial text — conversation + artifact + research card
             let textLen = 0;
+            const msgs = document.querySelectorAll('.font-claude-message, .contents .prose');
             if (msgs.length > 0) textLen = msgs[msgs.length-1].innerText.length;
-            // Also check artifact panel content (may have more text)
             const artifact = document.querySelector('aside .prose, aside [class*="content"], [class*="artifact-panel"] .prose');
             if (artifact) textLen = Math.max(textLen, artifact.innerText.length);
+            // Research card container text (major content host when "Research" tool is used)
+            const researchCard = document.querySelector('[class*="research-card"], [data-testid*="research"], [class*="research-report"]');
+            if (researchCard) textLen = Math.max(textLen, (researchCard.innerText || '').length);
             r.partial_text_len = textLen;
-            // Synthesize steps from tool_uses, thinking, sources, and sections
-            // (Claude lacks Gemini's native step DOM — we build equivalent data)
+
+            // ---- Steps: synthesize from tool_uses + live markers + sources
             if (r.thinking) r.steps.push('Extended Thinking: ' + r.thinking.substring(0, 100));
             r.tool_uses.slice(-5).forEach(t => {
                 const brief = t.substring(0, 120);
-                r.steps.push(brief.includes('earch') ? 'Searching: ' + brief : brief);
+                r.steps.push(brief.toLowerCase().includes('earch') ? 'Searching: ' + brief : brief);
             });
+            if (liveSrcCount > 0) r.steps.push(`Gathering sources (${liveSrcCount} and counting)`);
             const cHosts = new Set();
             r.source_urls.forEach(u => { try { cHosts.add(new URL(u).hostname.replace('www.', '')); } catch(e) {} });
             Array.from(cHosts).slice(0, 5).forEach(h => r.steps.push('Browsing ' + h));
             if (r.sections.length > 0) r.steps.push('Building: ' + r.sections[r.sections.length - 1]);
             if (r.partial_text_len > 3000) r.steps.push('Artifact: ' + Math.round(r.partial_text_len / 1000) + 'k chars');
-            // Plan — from research structure (sections as outline)
+            if (researchDone) r.steps.push('Research completed');
+
+            if (r.tool_uses.length > 0) r.progress = r.tool_uses[r.tool_uses.length - 1].substring(0, 200);
+            else if (r.steps.length > 0) r.progress = r.steps[r.steps.length - 1];
+            else if (liveSrcCount > 0) r.progress = `${liveSrcCount} sources and counting`;
+
+            // Plan
             if (r.sections.length >= 2) r.plan = 'Research structure: ' + r.sections.slice(0, 5).join(' \\u2192 ');
-            // Status — multi-strategy detection (like Gemini)
-            const stop = document.querySelector('button[aria-label="Stop Response"]');
-            let hasStop = !!stop;
-            if (!hasStop) {
-                const btns = document.querySelectorAll('button');
-                for (const b of btns) {
-                    const txt = (b.textContent || '').trim().toLowerCase();
-                    if (txt === 'stop' || txt === 'stop generating') { hasStop = true; break; }
-                }
+
+            // ---- Status resolution (multi-strategy)
+            // 1. "Stop research" / "Stop" button — primary active signal
+            let hasStop = false;
+            const btns = document.querySelectorAll('button');
+            for (const b of btns) {
+                const txt = (b.textContent || '').trim().toLowerCase();
+                const al  = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (txt === 'stop' || txt === 'stop generating' || txt === 'stop research' ||
+                    txt === 'stop researching' ||
+                    al.includes('stop response') || al.includes('stop research') ||
+                    al.includes('stop generating')) { hasStop = true; break; }
             }
-            // Also check for streaming indicators
+            // 2. Streaming DOM markers
             if (!hasStop && document.querySelector('[data-is-streaming="true"], .streaming, [class*="animate-pulse"]')) hasStop = true;
-            r.status = hasStop ? 'generating' : (r.partial_text_len > 0 ? 'complete' : 'idle');
-            r.phase = r.thinking ? 'thinking' : (r.tool_uses.length > 0 ? 'researching' : (hasStop ? 'generating' : (r.partial_text_len > 0 ? 'done' : 'waiting')));
+            // 3. "sources and counting" → still gathering (active)
+            if (!hasStop && liveSrcCount > 0) hasStop = true;
+            // 4. Body keyword sweep for active research verbs
+            if (!hasStop) {
+                const activeKws = ['searching the web', 'analyzing sources', 'reading sources',
+                                   'browsing', 'conducting research', 'gathering information'];
+                if (activeKws.some(kw => bodyLower.includes(kw))) hasStop = true;
+            }
+
+            // Resolve status — completion text trumps stale "active" signals
+            if (researchDone && !hasStop) {
+                r.status = 'complete'; r.phase = 'done';
+            } else if (hasStop) {
+                r.status = 'generating';
+                r.phase = r.thinking ? 'thinking' : (r.tool_uses.length > 0 || liveSrcCount > 0 ? 'researching' : 'generating');
+            } else if (r.partial_text_len > 0 || r.sources > 0) {
+                r.status = 'complete'; r.phase = 'done';
+            } else {
+                r.status = 'idle'; r.phase = 'waiting';
+            }
             return r;
         }""")
     except Exception as e:
