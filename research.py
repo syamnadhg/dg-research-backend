@@ -10996,6 +10996,26 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _p2_links.append({"label": f"{name} Research",
                                           "url": link_res.url, "verified": True})
                         break
+                    # ── C3: ChatGPT conversation-URL fallback ──
+                    # Rule (2026-04-19): ChatGPT Pro chats don't always expose
+                    # a public /share/ link — if the public-share ladder fails,
+                    # the conversation URL is the honest, always-available
+                    # fallback (it's the user's own chat, fully accessible in
+                    # their own account). Gemini/Claude get the hard-fail modal
+                    # because they DO have reliable public-share flows.
+                    if agent_key == "chatgpt":
+                        try:
+                            conv_url = (page_obj.url or "") if page_obj else ""
+                        except Exception:
+                            conv_url = ""
+                        if "chatgpt.com/c/" in conv_url:
+                            log(f"[{name}] Public share unavailable — using conversation URL: {conv_url}")
+                            emit_event("link_extracted", phase=2, agent=agent_key,
+                                       url=conv_url, label=f"{name} Research",
+                                       verified=False, fallback="conv_url")
+                            _p2_links.append({"label": f"{name} Research",
+                                              "url": conv_url, "verified": False})
+                            break
                     # Ask the user: retry / skip / stop
                     decision = await wait_for_agent_decision(
                         agent=agent_key, phase=2,
