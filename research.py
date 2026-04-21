@@ -193,37 +193,25 @@ _RESET    = "\033[0m"
 def _c(color: str, text: str) -> str:
     return f"{color}{text}{_RESET}" if _USE_COLOR else text
 
-def _setup_logo():
-    """Branded header for --pair. Renders a compact 'SUPER RESEARCH' block
-    with the app's blue accent, then a single dim rule + step summary."""
-    bar = _c(_DIM, "━" * 62)
-    print()
-    print(f"  {bar}")
-    print()
-    print(f"                   {_c(_BOLD + _ACCENT, 'SUPER')} {_c(_BOLD, 'RESEARCH')}")
-    print(f"             {_c(_DIM, 'Multi-agent deep research · Backend setup')}")
-    print()
-    print(f"  {bar}")
-    print()
-    print(
-        f"  {_c(_DIM, 'Three steps:')}   "
-        f"{_c(_ACCENT, '1')} Token   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '2')} Logins   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '3')} Serve"
-    )
+# Signature glyph — appears before every command's Latin tagline. Subtle
+# enough not to read as decoration, specific enough to make any `serve` /
+# `pair` / `resurrect` / `retire` / `unpair` terminal output instantly
+# recognizable as Super Research.
+_SIGIL = "◆"
 
-def _setup_step(n: int, total: int, title: str):
-    """Section header for each --pair step."""
-    print()
-    print(f"  {_c(_ACCENT + _BOLD, f'[{n}/{total}]')} {_c(_BOLD, title)}")
-    print(f"  {_c(_DIM, '─' * 58)}")
+# Braille-dot spinner — used during `--pair`'s wait-for-app-to-claim-token
+# loop and anywhere else we poll a slow Firestore condition. Ten frames
+# cycled at ~100ms gives a calm, continuous rotation that reads as "alive,
+# still working" without feeling impatient.
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 def _branded_header(tagline_text: str, tagline_color: str, tagline_gloss: str):
-    """Shared banner for --resurrect / --retire / --serve. Keeps the SUPER
-    RESEARCH wordmark identical to --pair, then drops a single Latin-ish
-    tagline with a dim gloss beneath it so the command's vibe reads without
-    derailing the scannability of the rest of the output.
+    """Shared banner for every subcommand (--pair / --serve / --resurrect /
+    --retire / --unpair). Renders the SUPER RESEARCH wordmark, then a single
+    line carrying the signature ◆ glyph, the Latin tagline in the caller's
+    chosen color, and a dim English gloss — so every command reads as part
+    of one matched set while the motto still signals the action's vibe.
 
     tagline_color is a foreground escape; BOLD is added by the caller inside
     the _c(...) call so different commands can pick different weights."""
@@ -232,9 +220,86 @@ def _branded_header(tagline_text: str, tagline_color: str, tagline_gloss: str):
     print(f"  {bar}")
     print()
     print(f"                   {_c(_BOLD + _ACCENT, 'SUPER')} {_c(_BOLD, 'RESEARCH')}")
-    print(f"                   {_c(tagline_color, tagline_text)}  {_c(_DIM, tagline_gloss)}")
+    print(
+        f"                {_c(tagline_color, _SIGIL)}  "
+        f"{_c(tagline_color, tagline_text)} {_c(_DIM, '·')} "
+        f"{_c(_DIM, tagline_gloss)}"
+    )
     print()
     print(f"  {bar}")
+
+
+def _setup_logo():
+    """Branded header for --pair. Thin wrapper around _branded_header so
+    --pair wears the same crown as the other four commands, plus a compact
+    3-step preview line so the user sees the whole arc before step [1/3]
+    starts."""
+    _branded_header("vinculum", _BOLD + _ACCENT, "the bond is forged")
+    print()
+    print(
+        f"  {_c(_DIM, 'Three steps:')}   "
+        f"{_c(_ACCENT, '1')} Token   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '2')} Logins   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '3')} Serve"
+    )
+
+
+def _setup_step(n: int, total: int, title: str):
+    """Section header for each step inside a subcommand (pair / resurrect /
+    retire / unpair). Dim underline gives a consistent visual rhythm between
+    phases without requiring each caller to track its own state."""
+    print()
+    print(f"  {_c(_ACCENT + _BOLD, f'[{n}/{total}]')} {_c(_BOLD, title)}")
+    print(f"  {_c(_DIM, '─' * 58)}")
+
+
+def _render_context_strip(items: list[tuple[str, str]]):
+    """Print a 'metadata strip' of (label, preformatted_value) pairs right
+    after _branded_header, before any [n/total] step counters fire. Gives
+    every subcommand the same 'here's where you are' header that --serve's
+    Paired to / Token / Local API / Heartbeat block already nails.
+
+    Caller pre-formats values (so green `(active)` chips, dim fallbacks,
+    etc. are its call). Labels auto-pad to the longest one so the right
+    column aligns without manual column math in every caller."""
+    if not items:
+        return
+    label_width = max(len(lab) for lab, _ in items)
+    print()
+    for lab, val in items:
+        print(f"  {_c(_DIM, (lab + ':').ljust(label_width + 2))}  {val}")
+
+
+def _fetch_paired_email(paired_uid: str | None) -> str:
+    """Best-effort lookup of the user's email for display. Returns empty
+    string if Firestore is unreachable or the uid is unknown — callers
+    fall back to showing '(not paired)' or the truncated uid."""
+    if not paired_uid or not _firebase_db:
+        return ""
+    try:
+        snap = _firebase_db.collection("users").document(paired_uid).get()
+        if snap.exists:
+            return (snap.to_dict() or {}).get("email", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
+def _render_next_actions(items: list[tuple[str, str]]):
+    """Print a compact 'Next' block at the tail of every subcommand: 2-3
+    likely follow-up commands with one-liner purposes. items = [(command,
+    description), ...]. Gives the user a consistent discovery surface for
+    adjacent tooling so they're not hunting through --help or memory."""
+    if not items:
+        return
+    bar = _c(_DIM, "┈" * 62)
+    cmd_width = min(max(len(c) for c, _ in items), 40)
+    print()
+    print(f"  {bar}")
+    print(f"  {_c(_DIM, 'Next')}")
+    for cmd, desc in items:
+        print(f"    {_c(_ACCENT, '→')}  {_c(_BOLD, cmd.ljust(cmd_width))}   {_c(_DIM, desc)}")
+    print()
 
 
 def log_action(action, details=""):
@@ -13605,29 +13670,25 @@ async def run_server(port=8000):
     # --resurrect / --retire (SUPER RESEARCH wordmark + dim rule + Latin
     # tagline) so the three commands feel like a matched set.
     _branded_header("aegis", _BOLD + _ACCENT, "standing watch")
-    print()
-    _paired_email = ""
-    try:
-        paired_uid = load_paired_uid()
-        if _firebase_db and paired_uid:
-            snap = _firebase_db.collection("users").document(paired_uid).get()
-            if snap.exists:
-                _paired_email = (snap.to_dict() or {}).get("email", "") or ""
-    except Exception:
-        pass
+    _paired_email = _fetch_paired_email(load_paired_uid())
     token_short = f"{_research_token[:8]}…" if _research_token else "—"
-    print(f"  {_c(_DIM, 'Paired to:')}     {_c(_BOLD, _paired_email or '(not paired)')}")
-    print(f"  {_c(_DIM, 'Token:')}         {_c(_BOLD, token_short)}  {_c(_OK, '(active)') if _research_token else ''}")
-    print(f"  {_c(_DIM, 'Local API:')}     {_c(_BOLD, f'http://0.0.0.0:{port}')}")
-    print(f"  {_c(_DIM, 'Heartbeat:')}     {_c(_BOLD, '30s cadence')}")
+    token_val = (f"{_c(_BOLD, token_short)}  {_c(_OK, '(active)')}"
+                 if _research_token else _c(_DIM, "—"))
+    _render_context_strip([
+        ("Paired to", _c(_BOLD, _paired_email or "(not paired)")),
+        ("Token",     token_val),
+        ("Local API", _c(_BOLD, f"http://0.0.0.0:{port}")),
+        ("Heartbeat", _c(_BOLD, "30s cadence")),
+    ])
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
     print()
-    print(f"  {_c(_DIM, 'Stop:')}          {_c(_BOLD, 'Ctrl+C')}")
-    print(f"  {_c(_DIM, 'Full teardown:')} {_c(_BOLD, 'python research.py --retire')}")
-    print()
-    print(f"  {_c(_DIM, '━' * 62)}")
-    print()
+    print(f"  {_c(_DIM, 'Stop:')}  {_c(_BOLD, 'Ctrl+C')}")
+    _render_next_actions([
+        ("python research.py --resurrect", "auto-restart on boot (supervised)"),
+        ("python research.py --retire", "remove the supervisor"),
+        ("python research.py --unpair", "fully disconnect this machine"),
+    ])
 
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
@@ -13728,7 +13789,7 @@ async def run_pair(profile_dir, wait_minutes=10):
         _typed = ""
     chosen_device_name = _typed.strip() or _default_hostname
     if chosen_device_name != _default_hostname:
-        print(f"  {_c(_OK, '[ok]')}  Device will appear as {_c(_BOLD, chosen_device_name)}")
+        print(f"  {_c(_OK, '✓')}  Device will appear as {_c(_BOLD, chosen_device_name)}")
     print("")
 
     existing = load_research_token()
@@ -13750,7 +13811,7 @@ async def run_pair(profile_dir, wait_minutes=10):
             "lastHeartbeat": SERVER_TIMESTAMP,
             "createdAt": SERVER_TIMESTAMP,
         }, merge=True)
-        print(f"  {_c(_OK, '[ok]')} Registered with {_c(_BOLD, _firebase_db.project)}")
+        print(f"  {_c(_OK, '✓')} Registered with {_c(_BOLD, _firebase_db.project)}")
     except Exception as e:
         log("    FIRESTORE REGISTRATION FAILED — the app will reject this token.", "ERROR")
         log(f"        {e}", "ERROR")
@@ -13809,38 +13870,56 @@ async def run_pair(profile_dir, wait_minutes=10):
     link_deadline = time.time() + wait_minutes * 60
     tick = 0
     first_err_logged = False
+    # Spinner-driven wait: poll Firestore once per 3-second window while a
+    # Braille-dot frame ticks every 100ms on the same line so the terminal
+    # reads as alive. Elapsed counter ticks up beside the spinner. Single
+    # \r-overwritten line — no scrolling wall of "...still waiting" noise.
+    wait_start_ts = time.time()
+    frame_idx = 0
+    POLL_EVERY_FRAMES = 30  # 30 × 100ms ≈ 3s (matches previous poll cadence)
     while time.time() < link_deadline and linked_uid is None:
-        try:
-            doc = _firebase_db.collection("research_tokens").document(token).get()
-            if doc.exists:
-                data = doc.to_dict() or {}
-                _uid = data.get("linkedUid") or ""
-                _email = data.get("linkedEmail") or ""
-                _at = data.get("linkedAt")
-                # linkedAt is a Firestore Timestamp — convert to ms-since-epoch.
-                _at_ms = 0
-                if _at is not None:
-                    try:
-                        _at_ms = int(_at.timestamp() * 1000)
-                    except Exception:
-                        _at_ms = 0
-                # Accept the link only when all three fields are present AND
-                # the claim is newer than this --pair started (prevents a
-                # cached pre-run claim from auto-advancing). 30s skew tolerance
-                # for server/client clock drift.
-                if _uid and _email and _at_ms >= setup_started_ms - 30_000:
-                    linked_uid = _uid
-                    linked_email = _email
-                    break
-        except Exception as e:
-            if not first_err_logged:
-                log(f"    Link poll error (continuing): {e}", "WARN")
-                first_err_logged = True
-        tick += 1
-        if tick % 10 == 0 and linked_uid is None:
-            elapsed = wait_minutes * 60 - int(link_deadline - time.time())
-            print(f"  {_c(_DIM, f'...still waiting ({elapsed}s elapsed)')}")
-        await asyncio.sleep(3)
+        # Poll Firestore on frame 0 of each window
+        if frame_idx % POLL_EVERY_FRAMES == 0:
+            try:
+                doc = _firebase_db.collection("research_tokens").document(token).get()
+                if doc.exists:
+                    data = doc.to_dict() or {}
+                    _uid = data.get("linkedUid") or ""
+                    _email = data.get("linkedEmail") or ""
+                    _at = data.get("linkedAt")
+                    # linkedAt is a Firestore Timestamp — convert to ms-since-epoch.
+                    _at_ms = 0
+                    if _at is not None:
+                        try:
+                            _at_ms = int(_at.timestamp() * 1000)
+                        except Exception:
+                            _at_ms = 0
+                    # Accept the link only when all three fields are present AND
+                    # the claim is newer than this --pair started (prevents a
+                    # cached pre-run claim from auto-advancing). 30s skew tolerance
+                    # for server/client clock drift.
+                    if _uid and _email and _at_ms >= setup_started_ms - 30_000:
+                        linked_uid = _uid
+                        linked_email = _email
+                        break
+            except Exception as e:
+                if not first_err_logged:
+                    log(f"    Link poll error (continuing): {e}", "WARN")
+                    first_err_logged = True
+        # Advance spinner
+        frame = _SPINNER_FRAMES[frame_idx % len(_SPINNER_FRAMES)]
+        elapsed = int(time.time() - wait_start_ts)
+        mm, ss = divmod(elapsed, 60)
+        sys.stdout.write(
+            f"\r  {_c(_ACCENT, frame)}  {_c(_DIM, 'waiting for the app to pair…')}   "
+            f"{_c(_DIM, f'{mm:d}:{ss:02d}')}    "
+        )
+        sys.stdout.flush()
+        frame_idx += 1
+        await asyncio.sleep(0.1)
+    # Clear the spinner line so the next print starts clean
+    sys.stdout.write("\r" + " " * 72 + "\r")
+    sys.stdout.flush()
 
     if linked_uid is None:
         print()
@@ -13864,7 +13943,7 @@ async def run_pair(profile_dir, wait_minutes=10):
     write_device_doc(linked_uid, token, device_name=chosen_device_name)
 
     print()
-    print(f"  {_c(_OK, '[ok]')}  Linked to {_c(_BOLD, linked_email or '—')}")
+    print(f"  {_c(_OK, '✓')}  Linked to {_c(_BOLD, linked_email or '—')}")
     print()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -14037,24 +14116,16 @@ async def run_pair(profile_dir, wait_minutes=10):
         # [3/3] START RESEARCH SERVER — clear next-action instructions.
         # ══════════════════════════════════════════════════════════════════════
         _setup_step(3, 3, "Start research server")
-        print(f"  {_c(_OK, '[ok]')}  Paired with {_c(_BOLD, linked_email or '—')}")
-        print(f"  {_c(_OK, '[ok]')}  All {len(services)} platforms logged in")
-        print(f"  {_c(_OK, '[ok]')}  Browser closed")
-        print("")
-        print(f"  {_c(_DIM, 'Setup is complete. To start accepting research jobs from the app:')}")
-        print("")
-        print(f"     {_c(_ACCENT, '1)')}  Press  {_c(_BOLD, 'Ctrl+C')}   {_c(_DIM, '(close this --pair process)')}")
-        print(f"     {_c(_ACCENT, '2)')}  Run    {_c(_BOLD, 'python research.py --serve')}")
-        print("")
-        print(f"  {_c(_DIM, 'Then fire a topic in the Super Research app — this machine')}")
-        print(f"  {_c(_DIM, 'will run the pipeline. Keep --serve running the whole time.')}")
+        print(f"  {_c(_OK, '✓')}  Paired with {_c(_BOLD, linked_email or '—')}")
+        print(f"  {_c(_OK, '✓')}  All {len(services)} platforms logged in")
+        print(f"  {_c(_OK, '✓')}  Browser closed")
         print()
-        print(f"  {_c(_DIM, 'To fully disconnect this machine from Super Research later')}")
-        print(f"  {_c(_DIM, '(deletes token + device doc + local config):')}")
-        print(f"        {_c(_BOLD, 'python research.py --unpair')}")
-        print()
-        print(f"  {_c(_DIM, '━' * 62)}")
-        print()
+        print(f"  {_c(_BOLD + _ACCENT, '  The bond is forged.')}  {_c(_DIM, 'Close this process with')} {_c(_BOLD, 'Ctrl+C')}{_c(_DIM, ', then run --serve.')}")
+        _render_next_actions([
+            ("python research.py --serve", "start accepting jobs"),
+            ("python research.py --resurrect", "auto-restart on boot (supervised)"),
+            ("python research.py --unpair", "fully disconnect this machine"),
+        ])
         # Stay alive so the user sees the message clearly until they Ctrl+C.
         try:
             while True:
@@ -14247,11 +14318,12 @@ def run_resurrect():
     import platform as _platform
 
     _branded_header("resurgam", _BOLD + _BRIGHT, "the backend rises")
-    print()
 
     if _platform.system() != "Windows":
+        print()
         print(f"  {_c(_WARN, 'Only supported on Windows today.')}")
-        print(f"  {_c(_DIM, 'macOS/Linux users: roll your own launchd / systemd unit.')}")
+        print(f"  {_c(_DIM, 'macOS / Linux desktop: cross-platform supervisors are tracked as')}")
+        print(f"  {_c(_DIM, 'task #355 (launchd + systemd-user). See PERSISTENCE-RECIPE.md.')}")
         return
 
     python_exe = _sys.executable
@@ -14268,13 +14340,25 @@ def run_resurrect():
     # the sa file is missing — we just skip the flag.
     init_firebase()
 
+    # Context strip — show device / pairing / current supervisor state before
+    # the user watches us rearrange any of them.
+    paired_uid = load_paired_uid()
+    device_id = load_device_id()
+    paired_email = _fetch_paired_email(paired_uid)
+    currently_supervised = _detect_supervised()
+    _render_context_strip([
+        ("Device",    _c(_BOLD, device_id or "(not paired)")),
+        ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+        ("Current",   _c(_OK, "supervised") if currently_supervised else _c(_DIM, "unsupervised → arming scheduled task")),
+    ])
+
     # ── [1/4] Pre-flight ──
     _setup_step(1, 4, "Pre-flight")
-    if not load_paired_uid():
-        print(f"  {_c(_WARN, '[..]')} Device not paired yet.")
+    if not paired_uid:
+        print(f"  {_c(_WARN, '⚠')} Device not paired yet.")
         print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, 'python research.py --pair')} {_c(_DIM, 'first, then retry --resurrect.')}")
         return
-    print(f"  {_c(_OK, '[ok]')}  Setup complete on this machine")
+    print(f"  {_c(_OK, '✓')}  Setup complete on this machine")
 
     # ── [2/4] Binding the supervisor ──
     _setup_step(2, 4, "Binding the supervisor")
@@ -14290,24 +14374,24 @@ def run_resurrect():
     try:
         result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except Exception as e:
-        print(f"  {_c(_WARN, '[--]')}  Failed to run schtasks: {e}")
+        print(f"  {_c(_WARN, '⚠')}  Failed to run schtasks: {e}")
         return
 
     if result.returncode != 0:
-        print(f"  {_c(_WARN, '[--]')}  schtasks returned non-zero status.")
+        print(f"  {_c(_WARN, '⚠')}  schtasks returned non-zero status.")
         if result.stderr.strip():
             print(f"  {_c(_DIM, '     stderr:')}")
             for line in result.stderr.strip().splitlines():
                 print(f"       {line}")
         return
 
-    print(f"  {_c(_OK, '[ok]')}  Scheduled Task pinned to logon + startup ({_SUPERVISOR_TASK_NAME})")
+    print(f"  {_c(_OK, '✓')}  Scheduled Task pinned to logon + startup ({_SUPERVISOR_TASK_NAME})")
     print(f"  {_c(_DIM, '     Executes:')} {task_run}")
 
     # ── [3/4] Firestore sync ──
     _setup_step(3, 4, "Firestore sync")
     _write_supervised_flag(True)
-    print(f"  {_c(_OK, '[ok]')}  Synced to the Super Research app")
+    print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
 
     # ── [4/4] Handoff — activate the supervisor NOW, not at next logon ──
     # Without this, --resurrect only schedules the task and leaves the
@@ -14328,12 +14412,12 @@ def run_resurrect():
     plain_serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
 
     if daemon_pid is not None:
-        print(f"  {_c(_OK, '[ok]')}  Supervisor already running (PID {daemon_pid}) — nothing to spawn")
+        print(f"  {_c(_OK, '✓')}  Supervisor already running (PID {daemon_pid}) — nothing to spawn")
     else:
         if plain_serve_pids:
             killed = _kill_pids(plain_serve_pids)
             plural = "es" if killed != 1 else ""
-            print(f"  {_c(_OK, '[ok]')}  Stopped {killed} standalone --serve process{plural} to free port 8000")
+            print(f"  {_c(_OK, '✓')}  Stopped {killed} standalone --serve process{plural} to free port 8000")
         _DETACHED = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
         _NEWGROUP = getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         try:
@@ -14346,7 +14430,7 @@ def run_resurrect():
                 close_fds=True,
             )
         except Exception as e:
-            print(f"  {_c(_WARN, '[--]')}  Could not spawn supervisor: {e}")
+            print(f"  {_c(_WARN, '⚠')}  Could not spawn supervisor: {e}")
             print(f"  {_c(_DIM, '     The scheduled task still fires at next logon.')}")
         else:
             spawned_pid = None
@@ -14360,17 +14444,18 @@ def run_resurrect():
                 if spawned_pid is not None:
                     break
             if spawned_pid is not None:
-                print(f"  {_c(_OK, '[ok]')}  Supervisor started (PID {spawned_pid}, detached)")
+                print(f"  {_c(_OK, '✓')}  Supervisor started (PID {spawned_pid}, detached)")
             else:
-                print(f"  {_c(_WARN, '[--]')}  Supervisor did not appear within 5s — check backend.err.log.")
+                print(f"  {_c(_WARN, '⚠')}  Supervisor did not appear within 5s — check backend.err.log.")
                 print(f"  {_c(_DIM, '     The scheduled task still fires at next logon as a fallback.')}")
 
     print()
-    print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}")
-    print(f"  {_c(_DIM, '  --serve now respawns on any exit (crash, Stop, logout, reboot).')}")
-    print()
-    print(f"  {_c(_DIM, '  To undo:')}  {_c(_BOLD, 'python research.py --retire')}")
-    print()
+    print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  {_c(_DIM, '--serve respawns on any exit.')}")
+    _render_next_actions([
+        ("python research.py --serve", "confirm it's up (optional — supervisor handles it)"),
+        ("python research.py --retire", "remove supervision"),
+        ("python research.py --unpair", "fully disconnect this machine"),
+    ])
 
 
 def run_retire():
@@ -14396,13 +14481,24 @@ def run_retire():
     import platform as _platform
 
     _branded_header("requiescat", _BOLD + _RED, "let the loop rest")
-    print()
 
     if _platform.system() != "Windows":
+        print()
         print(f"  {_c(_WARN, 'Only supported on Windows today.')}")
         return
 
     init_firebase()
+
+    # Context strip — what's about to get torn down.
+    paired_uid = load_paired_uid()
+    device_id = load_device_id()
+    paired_email = _fetch_paired_email(paired_uid)
+    currently_supervised = _detect_supervised()
+    _render_context_strip([
+        ("Device",    _c(_BOLD, device_id or "(not paired)")),
+        ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+        ("Current",   _c(_OK, "supervised") if currently_supervised else _c(_DIM, "unsupervised — nothing to undo")),
+    ])
 
     # ── [1/4] Unbinding schedule ──
     _setup_step(1, 4, "Unbinding schedule")
@@ -14414,7 +14510,7 @@ def run_retire():
     try:
         result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except Exception as e:
-        print(f"  {_c(_WARN, '[--]')}  Failed to run schtasks: {e}")
+        print(f"  {_c(_WARN, '⚠')}  Failed to run schtasks: {e}")
         return
 
     # Exit code 1 with a "does not exist" message means the task wasn't
@@ -14424,11 +14520,11 @@ def run_retire():
         and "ERROR: The system cannot find the file specified." in (result.stdout + result.stderr)
     )
     if result.returncode == 0:
-        print(f"  {_c(_OK, '[ok]')}  Scheduled Task removed ({_SUPERVISOR_TASK_NAME})")
+        print(f"  {_c(_OK, '✓')}  Scheduled Task removed ({_SUPERVISOR_TASK_NAME})")
     elif not_installed:
         print(f"  {_c(_DIM, '     Nothing bound — task was not installed.')}")
     else:
-        print(f"  {_c(_WARN, '[--]')}  schtasks returned non-zero status.")
+        print(f"  {_c(_WARN, '⚠')}  schtasks returned non-zero status.")
         if result.stderr.strip():
             print(f"  {_c(_DIM, '     stderr:')}")
             for line in result.stderr.strip().splitlines():
@@ -14464,35 +14560,36 @@ def run_retire():
     _setup_step(2, 4, "Dispelling daemon-loop")
     if killed_daemon_total:
         plural = "es" if killed_daemon_total != 1 else ""
-        print(f"  {_c(_OK, '[ok]')}  Stopped {killed_daemon_total} daemon-loop process{plural}")
+        print(f"  {_c(_OK, '✓')}  Stopped {killed_daemon_total} daemon-loop process{plural}")
     else:
         print(f"  {_c(_DIM, '     No daemon-loop processes were running.')}")
 
     _setup_step(3, 4, "Stilling --serve")
     if killed_serve_total:
         plural = "s" if killed_serve_total != 1 else ""
-        print(f"  {_c(_OK, '[ok]')}  Stopped {killed_serve_total} --serve process{plural}")
+        print(f"  {_c(_OK, '✓')}  Stopped {killed_serve_total} --serve process{plural}")
     else:
         print(f"  {_c(_DIM, '     No --serve processes were running.')}")
 
     # ── [4/4] Firestore sync + verification ──
     _setup_step(4, 4, "Firestore sync")
     _write_supervised_flag(False)
-    print(f"  {_c(_OK, '[ok]')}  Synced to the Super Research app")
+    print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
 
     stragglers = [(pid, role) for pid, _cmd, role in last_survivors if role in ("daemon-loop", "serve")]
     print()
     if stragglers:
-        print(f"  {_c(_WARN, '[--]')}  {len(stragglers)} related process(es) would not terminate:")
+        print(f"  {_c(_WARN, '⚠')}  {len(stragglers)} related process(es) would not terminate:")
         for pid, role in stragglers:
             print(f"       {_c(_BOLD, f'PID {pid}')}  ({role})")
         print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --retire.')}")
     else:
         print(f"  {_c(_BOLD + _RED, '  Silence.')}  {_c(_DIM, 'No research.py process remains.')}")
-    print()
-    print(f"  {_c(_DIM, 'Supervised mode is off. The backend does not auto-start at')}")
-    print(f"  {_c(_DIM, 'logon. To bring it back manually:')} {_c(_BOLD, 'python research.py --serve')}")
-    print(f"  {_c(_DIM, 'To re-enable supervision:')} {_c(_BOLD, 'python research.py --resurrect')}")
+    _render_next_actions([
+        ("python research.py --serve", "bring the backend back manually"),
+        ("python research.py --resurrect", "re-enable supervision"),
+        ("python research.py --unpair", "fully disconnect this machine"),
+    ])
 
 
 def run_unpair():
@@ -14529,7 +14626,6 @@ def run_unpair():
     import time as _time
 
     _branded_header("absolvo", _BOLD + _ACCENT, "the bond dissolves")
-    print()
 
     # Load context BEFORE we nuke local state — the load_* helpers read
     # research_config.json, which step 4 deletes. init_firebase must run
@@ -14538,22 +14634,22 @@ def run_unpair():
     token = load_research_token()
     paired_uid = load_paired_uid()
     device_id = load_device_id()
+    paired_email = _fetch_paired_email(paired_uid)
 
     if not token and not paired_uid and not RESEARCH_CONFIG_PATH.exists():
+        print()
         print(f"  {_c(_DIM, 'Nothing to unpair — this machine has no local pairing config.')}")
         print(f"  {_c(_DIM, 'If the Super Research app still shows a stale device from this PC,')}")
         print(f"  {_c(_DIM, 'remove it there via Account → Devices.')}")
         print()
         return
 
-    print(f"  {_c(_DIM, 'Disconnecting this machine from Super Research.')}")
-    if token:
-        print(f"  {_c(_DIM, 'Token:')}       {_c(_BOLD, token[:8] + '…')}")
-    if paired_uid:
-        print(f"  {_c(_DIM, 'Paired uid:')}  {_c(_BOLD, paired_uid[:8] + '…')}")
-    if device_id:
-        print(f"  {_c(_DIM, 'Device id:')}   {_c(_BOLD, device_id)}")
-    print()
+    # Context strip — what's about to vanish.
+    _render_context_strip([
+        ("Device",    _c(_BOLD, device_id or "(unknown)")),
+        ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+        ("Token",     _c(_BOLD, (token[:8] + "…") if token else "(none)")),
+    ])
 
     total = 5
 
@@ -14564,13 +14660,13 @@ def run_unpair():
         try:
             result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
-                print(f"  {_c(_OK, '[ok]')}  Scheduled Task removed ({_SUPERVISOR_TASK_NAME})")
+                print(f"  {_c(_OK, '✓')}  Scheduled Task removed ({_SUPERVISOR_TASK_NAME})")
             elif "cannot find the file" in (result.stdout + result.stderr):
                 print(f"  {_c(_DIM, '     No scheduled task was installed.')}")
             else:
-                print(f"  {_c(_WARN, '[--]')}  schtasks returned non-zero — continuing.")
+                print(f"  {_c(_WARN, '⚠')}  schtasks returned non-zero — continuing.")
         except Exception as e:
-            print(f"  {_c(_WARN, '[--]')}  schtasks error (continuing): {e}")
+            print(f"  {_c(_WARN, '⚠')}  schtasks error (continuing): {e}")
 
     # Mirror run_retire's loop-until-clean pattern so a daemon-loop mid-respawn
     # of --serve still gets fully caught.
@@ -14589,7 +14685,7 @@ def run_unpair():
         _time.sleep(0.5)
     if killed_total:
         plural = "es" if killed_total != 1 else ""
-        print(f"  {_c(_OK, '[ok]')}  Stopped {killed_total} supervisor/serve process{plural}")
+        print(f"  {_c(_OK, '✓')}  Stopped {killed_total} supervisor/serve process{plural}")
     else:
         print(f"  {_c(_DIM, '     No supervisor/serve processes were running.')}")
 
@@ -14599,11 +14695,11 @@ def run_unpair():
         try:
             _firebase_db.collection("users").document(paired_uid) \
                 .collection("devices").document(device_id).delete()
-            print(f"  {_c(_OK, '[ok]')}  Deleted users/{paired_uid[:8]}…/devices/{device_id}")
+            print(f"  {_c(_OK, '✓')}  Deleted users/{paired_uid[:8]}…/devices/{device_id}")
         except Exception as e:
-            print(f"  {_c(_WARN, '[--]')}  Device doc delete failed: {e}")
+            print(f"  {_c(_WARN, '⚠')}  Device doc delete failed: {e}")
     elif not _firebase_db:
-        print(f"  {_c(_WARN, '[--]')}  Firebase unreachable — skipped.")
+        print(f"  {_c(_WARN, '⚠')}  Firebase unreachable — skipped.")
         print(f"  {_c(_DIM, '        Remove the device via the Account page when you can.')}")
     else:
         print(f"  {_c(_DIM, '     No paired account on this machine — nothing to remove.')}")
@@ -14613,11 +14709,11 @@ def run_unpair():
     if _firebase_db and token:
         try:
             _firebase_db.collection("research_tokens").document(token).delete()
-            print(f"  {_c(_OK, '[ok]')}  Deleted research_tokens/{token[:8]}…")
+            print(f"  {_c(_OK, '✓')}  Deleted research_tokens/{token[:8]}…")
         except Exception as e:
-            print(f"  {_c(_WARN, '[--]')}  Token doc delete failed: {e}")
+            print(f"  {_c(_WARN, '⚠')}  Token doc delete failed: {e}")
     elif not _firebase_db:
-        print(f"  {_c(_WARN, '[--]')}  Firebase unreachable — token doc left in place.")
+        print(f"  {_c(_WARN, '⚠')}  Firebase unreachable — token doc left in place.")
         print(f"  {_c(_DIM, '        Re-run --unpair with network to finish.')}")
     else:
         print(f"  {_c(_DIM, '     No token on this machine — nothing to revoke.')}")
@@ -14630,7 +14726,7 @@ def run_unpair():
             RESEARCH_CONFIG_PATH.unlink()
             wiped.append(RESEARCH_CONFIG_PATH.name)
     except Exception as e:
-        print(f"  {_c(_WARN, '[--]')}  Could not delete {RESEARCH_CONFIG_PATH.name}: {e}")
+        print(f"  {_c(_WARN, '⚠')}  Could not delete {RESEARCH_CONFIG_PATH.name}: {e}")
     try:
         if _LEGACY_PIPE_CONFIG_PATH.exists():
             _LEGACY_PIPE_CONFIG_PATH.unlink()
@@ -14638,7 +14734,7 @@ def run_unpair():
     except Exception:
         pass
     if wiped:
-        print(f"  {_c(_OK, '[ok]')}  Deleted: {', '.join(wiped)}")
+        print(f"  {_c(_OK, '✓')}  Deleted: {', '.join(wiped)}")
     else:
         print(f"  {_c(_DIM, '     No local config files to wipe.')}")
     # Zero in-memory state too, in case anything re-reads within this process.
@@ -14652,12 +14748,12 @@ def run_unpair():
     stragglers = [p for p in _enumerate_research_py_procs()
                   if p[0] != self_pid and p[2] in ("daemon-loop", "serve")]
     if stragglers:
-        print(f"  {_c(_WARN, '[--]')}  {len(stragglers)} related process(es) would not terminate:")
+        print(f"  {_c(_WARN, '⚠')}  {len(stragglers)} related process(es) would not terminate:")
         for pid, _cmd, role in stragglers:
             print(f"       {_c(_BOLD, f'PID {pid}')}  ({role})")
         print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --unpair.')}")
     else:
-        print(f"  {_c(_OK, '[ok]')}  No research.py process remains")
+        print(f"  {_c(_OK, '✓')}  No research.py process remains")
 
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  The bond dissolves.')}  {_c(_DIM, 'This machine is no longer paired.')}")
@@ -14666,9 +14762,9 @@ def run_unpair():
     print(f"       {_c(_DIM, '• Chrome profile at ~/.super-research/browser-profile/  (your logins)')}")
     print(f"       {_c(_DIM, '• Research history in queues/ and tracks/')}")
     print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
-    print()
-    print(f"  {_c(_DIM, 'To reconnect:')}  {_c(_BOLD, 'python research.py --pair')}")
-    print()
+    _render_next_actions([
+        ("python research.py --pair", "reconnect this machine (mints a fresh token)"),
+    ])
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
