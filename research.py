@@ -14049,6 +14049,10 @@ async def run_pair(profile_dir, wait_minutes=10):
         print(f"  {_c(_DIM, 'Then fire a topic in the Super Research app — this machine')}")
         print(f"  {_c(_DIM, 'will run the pipeline. Keep --serve running the whole time.')}")
         print()
+        print(f"  {_c(_DIM, 'To fully disconnect this machine from Super Research later')}")
+        print(f"  {_c(_DIM, '(deletes token + device doc + local config):')}")
+        print(f"        {_c(_BOLD, 'python research.py --unpair')}")
+        print()
         print(f"  {_c(_DIM, '━' * 62)}")
         print()
         # Stay alive so the user sees the message clearly until they Ctrl+C.
@@ -14491,6 +14495,182 @@ def run_retire():
     print(f"  {_c(_DIM, 'To re-enable supervision:')} {_c(_BOLD, 'python research.py --resurrect')}")
 
 
+def run_unpair():
+    """Fully disconnect this machine from Super Research — opposite of --pair.
+
+    Semantics: after --unpair, this PC appears NOWHERE in the Super Research
+    app. The device doc under the user account is deleted, the research_token
+    doc is revoked project-wide, local pairing config (token + deviceId +
+    pairedUid) is wiped. A subsequent --pair mints a fresh token and
+    registers a new device from scratch — there's no quiet "rejoin" path
+    that resurrects the old identity.
+
+    Preserved on disk (delete manually for a truly clean machine):
+      • Chrome profile at ~/.super-research/browser-profile/ (your logins)
+      • Pipeline history in queues/ + tracks/
+      • firebase-service-account.json (needed to re-pair)
+
+    This is the destructive counterpart to the app's "unlink" action, which
+    only clears linkedUid on the token doc and leaves the device/token
+    themselves live. --unpair is what the user runs when they're done with
+    Super Research on this PC entirely.
+
+    Five-step reset:
+      1. Kill every daemon-loop + serve process; remove the supervised
+         scheduled task if installed (otherwise it auto-respawns serve and
+         re-heartbeats the token we're about to delete).
+      2. Delete users/{uid}/devices/{deviceId} so the device vanishes from
+         the Account page device list.
+      3. Delete research_tokens/{token} so the token is gone project-wide.
+      4. Wipe local research_config.json (+ legacy pipe_config.json).
+      5. Verify nothing survived."""
+    import subprocess as _subprocess
+    import platform as _platform
+    import time as _time
+
+    _branded_header("absolvo", _BOLD + _ACCENT, "the bond dissolves")
+    print()
+
+    # Load context BEFORE we nuke local state — the load_* helpers read
+    # research_config.json, which step 4 deletes. init_firebase must run
+    # before any Firestore delete so _firebase_db is live.
+    init_firebase()
+    token = load_research_token()
+    paired_uid = load_paired_uid()
+    device_id = load_device_id()
+
+    if not token and not paired_uid and not RESEARCH_CONFIG_PATH.exists():
+        print(f"  {_c(_DIM, 'Nothing to unpair — this machine has no local pairing config.')}")
+        print(f"  {_c(_DIM, 'If the Super Research app still shows a stale device from this PC,')}")
+        print(f"  {_c(_DIM, 'remove it there via Account → Devices.')}")
+        print()
+        return
+
+    print(f"  {_c(_DIM, 'Disconnecting this machine from Super Research.')}")
+    if token:
+        print(f"  {_c(_DIM, 'Token:')}       {_c(_BOLD, token[:8] + '…')}")
+    if paired_uid:
+        print(f"  {_c(_DIM, 'Paired uid:')}  {_c(_BOLD, paired_uid[:8] + '…')}")
+    if device_id:
+        print(f"  {_c(_DIM, 'Device id:')}   {_c(_BOLD, device_id)}")
+    print()
+
+    total = 5
+
+    # ── [1/5] Stop supervisor + serve ──
+    _setup_step(1, total, "Stopping running processes")
+    if _platform.system() == "Windows":
+        cmd = ["schtasks", "/Delete", "/TN", _SUPERVISOR_TASK_NAME, "/F"]
+        try:
+            result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                print(f"  {_c(_OK, '[ok]')}  Scheduled Task removed ({_SUPERVISOR_TASK_NAME})")
+            elif "cannot find the file" in (result.stdout + result.stderr):
+                print(f"  {_c(_DIM, '     No scheduled task was installed.')}")
+            else:
+                print(f"  {_c(_WARN, '[--]')}  schtasks returned non-zero — continuing.")
+        except Exception as e:
+            print(f"  {_c(_WARN, '[--]')}  schtasks error (continuing): {e}")
+
+    # Mirror run_retire's loop-until-clean pattern so a daemon-loop mid-respawn
+    # of --serve still gets fully caught.
+    self_pid = os.getpid()
+    killed_total = 0
+    deadline = _time.time() + 8.0
+    while True:
+        procs = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
+        daemon_pids = [pid for pid, _cmd, role in procs if role == "daemon-loop"]
+        serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
+        if not daemon_pids and not serve_pids:
+            break
+        killed_total += _kill_pids(daemon_pids) + _kill_pids(serve_pids)
+        if _time.time() >= deadline:
+            break
+        _time.sleep(0.5)
+    if killed_total:
+        plural = "es" if killed_total != 1 else ""
+        print(f"  {_c(_OK, '[ok]')}  Stopped {killed_total} supervisor/serve process{plural}")
+    else:
+        print(f"  {_c(_DIM, '     No supervisor/serve processes were running.')}")
+
+    # ── [2/5] Delete device doc ──
+    _setup_step(2, total, "Removing device from your account")
+    if _firebase_db and paired_uid and device_id:
+        try:
+            _firebase_db.collection("users").document(paired_uid) \
+                .collection("devices").document(device_id).delete()
+            print(f"  {_c(_OK, '[ok]')}  Deleted users/{paired_uid[:8]}…/devices/{device_id}")
+        except Exception as e:
+            print(f"  {_c(_WARN, '[--]')}  Device doc delete failed: {e}")
+    elif not _firebase_db:
+        print(f"  {_c(_WARN, '[--]')}  Firebase unreachable — skipped.")
+        print(f"  {_c(_DIM, '        Remove the device via the Account page when you can.')}")
+    else:
+        print(f"  {_c(_DIM, '     No paired account on this machine — nothing to remove.')}")
+
+    # ── [3/5] Delete token doc ──
+    _setup_step(3, total, "Revoking token from project")
+    if _firebase_db and token:
+        try:
+            _firebase_db.collection("research_tokens").document(token).delete()
+            print(f"  {_c(_OK, '[ok]')}  Deleted research_tokens/{token[:8]}…")
+        except Exception as e:
+            print(f"  {_c(_WARN, '[--]')}  Token doc delete failed: {e}")
+    elif not _firebase_db:
+        print(f"  {_c(_WARN, '[--]')}  Firebase unreachable — token doc left in place.")
+        print(f"  {_c(_DIM, '        Re-run --unpair with network to finish.')}")
+    else:
+        print(f"  {_c(_DIM, '     No token on this machine — nothing to revoke.')}")
+
+    # ── [4/5] Wipe local config ──
+    _setup_step(4, total, "Wiping local pairing config")
+    wiped = []
+    try:
+        if RESEARCH_CONFIG_PATH.exists():
+            RESEARCH_CONFIG_PATH.unlink()
+            wiped.append(RESEARCH_CONFIG_PATH.name)
+    except Exception as e:
+        print(f"  {_c(_WARN, '[--]')}  Could not delete {RESEARCH_CONFIG_PATH.name}: {e}")
+    try:
+        if _LEGACY_PIPE_CONFIG_PATH.exists():
+            _LEGACY_PIPE_CONFIG_PATH.unlink()
+            wiped.append(_LEGACY_PIPE_CONFIG_PATH.name)
+    except Exception:
+        pass
+    if wiped:
+        print(f"  {_c(_OK, '[ok]')}  Deleted: {', '.join(wiped)}")
+    else:
+        print(f"  {_c(_DIM, '     No local config files to wipe.')}")
+    # Zero in-memory state too, in case anything re-reads within this process.
+    global _research_token, _device_id, _device_paired_uid
+    _research_token = None
+    _device_id = None
+    _device_paired_uid = None
+
+    # ── [5/5] Verify ──
+    _setup_step(5, total, "Confirming silence")
+    stragglers = [p for p in _enumerate_research_py_procs()
+                  if p[0] != self_pid and p[2] in ("daemon-loop", "serve")]
+    if stragglers:
+        print(f"  {_c(_WARN, '[--]')}  {len(stragglers)} related process(es) would not terminate:")
+        for pid, _cmd, role in stragglers:
+            print(f"       {_c(_BOLD, f'PID {pid}')}  ({role})")
+        print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --unpair.')}")
+    else:
+        print(f"  {_c(_OK, '[ok]')}  No research.py process remains")
+
+    print()
+    print(f"  {_c(_BOLD + _ACCENT, '  The bond dissolves.')}  {_c(_DIM, 'This machine is no longer paired.')}")
+    print()
+    print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
+    print(f"       {_c(_DIM, '• Chrome profile at ~/.super-research/browser-profile/  (your logins)')}")
+    print(f"       {_c(_DIM, '• Research history in queues/ and tracks/')}")
+    print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
+    print()
+    print(f"  {_c(_DIM, 'To reconnect:')}  {_c(_BOLD, 'python research.py --pair')}")
+    print()
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -14509,6 +14689,8 @@ def main():
         help="Install a Windows Scheduled Task that auto-starts `--serve` on user logon (Supervised mode)")
     parser.add_argument("--retire", action="store_true",
         help="Remove the Supervised Scheduled Task installed by --resurrect")
+    parser.add_argument("--unpair", action="store_true",
+        help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
     parser.add_argument("--daemon-loop", action="store_true",
         help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the Supervised scheduled task.")
     args = parser.parse_args()
@@ -14519,6 +14701,10 @@ def main():
 
     if args.retire:
         run_retire()
+        return
+
+    if args.unpair:
+        run_unpair()
         return
 
     if args.daemon_loop:
