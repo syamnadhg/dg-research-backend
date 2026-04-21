@@ -13344,13 +13344,14 @@ async def run_server(port=8000):
                 # Shift remaining queued jobs up one position.
                 _recompute_queue_positions()
 
-    # Start the worker + Firestore start listener on server startup
-    @app.on_event("startup")
-    async def _start_worker():
-        asyncio.create_task(_job_worker())
-        # Start global Firestore listener for pipeline start requests
-        if _firebase_db:
-            start_firestore_start_listener(_job_queue, asyncio.get_event_loop())
+    # Worker + Firestore start listener are launched below in the direct
+    # startup path (before `await server.serve()`). We used to ALSO register
+    # an `@app.on_event("startup")` handler that did the same thing as a
+    # belt-and-suspenders fallback — but FastAPI did fire it, and the result
+    # was TWO concurrent `_job_worker` tasks. Queue #2 got popped by worker
+    # B while worker A was still running #1, a second Browser(PROFILE_DIR)
+    # was instantiated, and Browser.start()'s orphan-Chrome sweep killed
+    # #1's browser mid-flight. Single-worker startup is now the only path.
 
     @app.get("/api/queue")
     async def get_queue_status():
@@ -13510,6 +13511,12 @@ async def run_server(port=8000):
         log("Falling back to legacy pipeline_requests/ listener", "WARN")
     worker_task = asyncio.create_task(_job_worker())
     log("Job worker started (direct)")
+    # Firestore start listener — must fire exactly once per serve session.
+    # This used to live inside an @app.on_event("startup") handler alongside
+    # a second _job_worker create_task; that duplicated the worker and caused
+    # the queue race where #2 killed #1's browser mid-run. Single-start here.
+    if _firebase_db:
+        start_firestore_start_listener(_job_queue, asyncio.get_event_loop())
     # Start heartbeat so frontend can show Online/Offline status
     heartbeat_task = None
     if token and _firebase_db:
