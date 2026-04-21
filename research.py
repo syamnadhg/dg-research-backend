@@ -11,7 +11,7 @@ Usage:
   python research.py "Topic here"                        # Full pipeline
   python research.py "Topic" --brief-file brief.txt      # Skip Phase 1
   python research.py "Topic" --pdf a.pdf --pdf b.pdf     # Attach PDFs to Phase 1
-  python research.py --setup                              # First-time login to all services
+  python research.py --pair                              # First-time login to all services
 """
 
 import sys
@@ -161,7 +161,7 @@ def log(msg, level="INFO"):
     print(f"[{ts}] [{level}] {msg}")
 
 
-# ── Terminal colors (used by --setup for the branded UI) ──────────────────
+# ── Terminal colors (used by --pair for the branded UI) ──────────────────
 # Detects tty + enables ANSI on Windows 10+ so colors render in cmd/powershell.
 _USE_COLOR = False
 try:
@@ -194,7 +194,7 @@ def _c(color: str, text: str) -> str:
     return f"{color}{text}{_RESET}" if _USE_COLOR else text
 
 def _setup_logo():
-    """Branded header for --setup. Renders a compact 'SUPER RESEARCH' block
+    """Branded header for --pair. Renders a compact 'SUPER RESEARCH' block
     with the app's blue accent, then a single dim rule + step summary."""
     bar = _c(_DIM, "━" * 62)
     print()
@@ -213,15 +213,15 @@ def _setup_logo():
     )
 
 def _setup_step(n: int, total: int, title: str):
-    """Section header for each --setup step."""
+    """Section header for each --pair step."""
     print()
     print(f"  {_c(_ACCENT + _BOLD, f'[{n}/{total}]')} {_c(_BOLD, title)}")
     print(f"  {_c(_DIM, '─' * 58)}")
 
 
 def _branded_header(tagline_text: str, tagline_color: str, tagline_gloss: str):
-    """Shared banner for --resurrect / --exorcise / --serve. Keeps the SUPER
-    RESEARCH wordmark identical to --setup, then drops a single Latin-ish
+    """Shared banner for --resurrect / --retire / --serve. Keeps the SUPER
+    RESEARCH wordmark identical to --pair, then drops a single Latin-ish
     tagline with a dim gloss beneath it so the command's vibe reads without
     derailing the scannability of the rest of the output.
 
@@ -456,7 +456,7 @@ def load_research_token():
 
 def generate_research_token():
     """Generate a new ResearchToken, store it in Firestore + local config.
-    Called during --setup. Returns the token string."""
+    Called during --pair. Returns the token string."""
     import uuid
     import socket
     global _research_token
@@ -496,9 +496,9 @@ def generate_research_token():
 # ── Device registry (multi-device support) ─────────────────────────────────
 # A "device" is a paired backend PC. One doc per device lives at
 # users/{uid}/devices/{deviceId}. Multiple devices let a user run concurrent
-# research on different machines. The deviceId is stable across --setup runs
+# research on different machines. The deviceId is stable across --pair runs
 # on the same machine (stored in research_config.json) so re-pairing preserves
-# the user's rename + indestructible toggle.
+# the user's rename + supervised toggle.
 
 _device_id: str | None = None
 _device_paired_uid: str | None = None
@@ -521,7 +521,7 @@ def load_device_id():
 
 def load_paired_uid():
     """Return the Firebase uid this device is paired to (from config file),
-    or None if --setup hasn't completed yet."""
+    or None if --pair hasn't completed yet."""
     global _device_paired_uid
     if _device_paired_uid:
         return _device_paired_uid
@@ -579,7 +579,7 @@ def clear_paired_uid():
 
 def generate_device_id():
     """Mint a new stable deviceId shaped '<sanitized-hostname>-<6-char-hex>'.
-    Called once per machine — subsequent --setup runs reuse the persisted id."""
+    Called once per machine — subsequent --pair runs reuse the persisted id."""
     import uuid
     import socket
     import re as _re
@@ -592,9 +592,9 @@ def generate_device_id():
     return new_id
 
 
-def _detect_indestructible() -> bool:
+def _detect_supervised() -> bool:
     """Probe Windows Task Scheduler for the SuperResearchBackend task. The
-    scheduled task is the actual source of truth for indestructible mode —
+    scheduled task is the actual source of truth for supervised mode —
     the device doc is just a Firestore mirror that can drift (e.g., after
     unlink deletes the doc but the task lives on). Returns False on
     non-Windows platforms or when schtasks isn't available."""
@@ -604,7 +604,7 @@ def _detect_indestructible() -> bool:
     import subprocess as _sp
     try:
         result = _sp.run(
-            ["schtasks", "/Query", "/TN", _INDESTRUCTIBLE_TASK_NAME],
+            ["schtasks", "/Query", "/TN", _SUPERVISOR_TASK_NAME],
             capture_output=True,
             timeout=5,
             creationflags=0x08000000,  # CREATE_NO_WINDOW — avoid flashing console
@@ -616,9 +616,9 @@ def _detect_indestructible() -> bool:
 
 def write_device_doc(uid: str, token: str, device_name: str | None = None):
     """Upsert users/{uid}/devices/{deviceId}. Preserves user-editable `name`
-    from any prior doc and auto-detects `indestructible` from the real
+    from any prior doc and auto-detects `supervised` from the real
     scheduled task (so unlink+relink doesn't lose the toggle). Call once
-    from --setup after pairing succeeds, and again from --serve startup to
+    from --pair after pairing succeeds, and again from --serve startup to
     refresh token + heartbeat if the token changed."""
     if not _firebase_db or not uid or not token:
         return
@@ -649,14 +649,14 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
         # object would coerce to NaN and the device would look permanently
         # offline even while the backend is heartbeating normally.
         "lastHeartbeat": int(time.time() * 1000),
-        # Auto-detect indestructible from the scheduled task so the toggle
+        # Auto-detect supervised from the scheduled task so the toggle
         # survives unlink+relink (task isn't uninstalled by unlink). If
         # schtasks says "installed", we overwrite whatever was in the doc;
         # the task is the truth.
-        "indestructible": _detect_indestructible(),
+        "supervised": _detect_supervised(),
     }
     # Name field rules:
-    #  - If --setup passed an explicit device_name, honor it (user typed
+    #  - If --pair passed an explicit device_name, honor it (user typed
     #    it at the device-name prompt — overrides any prior value).
     #  - Else on first write, default to hostname.
     #  - Else preserve the existing (user may have renamed via Account
@@ -937,7 +937,7 @@ def start_firestore_start_listener(job_queue, loop):
         listener_label = f"research_tokens/{_research_token[:8]}…/queue/"
     else:
         col_ref = _firebase_db.collection("pipeline_requests")
-        listener_label = "pipeline_requests/ (legacy — run --setup to get a ResearchToken)"
+        listener_label = "pipeline_requests/ (legacy — run --pair to get a ResearchToken)"
 
     def on_snapshot(col_snapshot, changes, read_time):
         for change in changes:
@@ -2285,7 +2285,7 @@ async def verify_login(page, platform: str, *, ensure_nav: bool = False, nav_tim
            let downstream check_auth() catch real session failures. Tolerant
            of DOM selector drift after the user has already completed setup.
          - strict=True (setup path): fail-CLOSED → return False. Used by
-           --setup step 3 where the entire point is to wait until the user
+           --pair step 3 where the entire point is to wait until the user
            actually logs in; we cannot let a persistent browser profile with
            partial state fool setup into auto-advancing.
 
@@ -4166,7 +4166,7 @@ async def await_phase_login_probe(
 
     `cua_client` and `pipeline_config` are unused here (kept in the
     signature for call-site compat; vision-level verification only
-    happens in Phase 0 and in the --setup script)."""
+    happens in Phase 0 and in the --pair script)."""
     del cua_client, pipeline_config  # unused — cookie-only probe
     if not platform_keys:
         return "ok"
@@ -11666,7 +11666,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # first, tab-open only on miss, CUA-verify, and if STILL not
         # logged in, emit `login_required` scoped to THAT platform and
         # wait for user retry before touching the next one. This mirrors
-        # how the --setup script already walks setup Step 2.
+        # how the --pair script already walks setup Step 2.
         label_by_key = {key: label for label, key in preflight_platforms}
         _preflight_tabs: dict[str, object] = {}
         _pf_opened = 0  # Counts real tab-opens across the whole sequence for stagger pacing
@@ -13507,7 +13507,7 @@ async def run_server(port=8000):
     if token:
         log(f"ResearchToken loaded: {token[:8]}...")
     else:
-        log("No ResearchToken found — run `python research.py --setup` to generate one", "WARN")
+        log("No ResearchToken found — run `python research.py --pair` to generate one", "WARN")
         log("Falling back to legacy pipeline_requests/ listener", "WARN")
     worker_task = asyncio.create_task(_job_worker())
     log("Job worker started (direct)")
@@ -13601,8 +13601,8 @@ async def run_server(port=8000):
 
     # ── Branded --serve banner — 'aegis, standing watch' ──
     # Shows which account this backend is paired to, where it's listening,
-    # and how to tear it down. Keeps the structural DNA of --setup /
-    # --resurrect / --exorcise (SUPER RESEARCH wordmark + dim rule + Latin
+    # and how to tear it down. Keeps the structural DNA of --pair /
+    # --resurrect / --retire (SUPER RESEARCH wordmark + dim rule + Latin
     # tagline) so the three commands feel like a matched set.
     _branded_header("aegis", _BOLD + _ACCENT, "standing watch")
     print()
@@ -13624,7 +13624,7 @@ async def run_server(port=8000):
     print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
     print()
     print(f"  {_c(_DIM, 'Stop:')}          {_c(_BOLD, 'Ctrl+C')}")
-    print(f"  {_c(_DIM, 'Full teardown:')} {_c(_BOLD, 'python research.py --exorcise')}")
+    print(f"  {_c(_DIM, 'Full teardown:')} {_c(_BOLD, 'python research.py --retire')}")
     print()
     print(f"  {_c(_DIM, '━' * 62)}")
     print()
@@ -13669,7 +13669,7 @@ async def run_server(port=8000):
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
-async def run_setup(profile_dir, wait_minutes=10):
+async def run_pair(profile_dir, wait_minutes=10):
     """Guided setup: generate/reuse ResearchToken, render ASCII QR, open
     login tabs, auto-verify per-platform login every 30s, exit cleanly when
     all green (or on user Ctrl+C / timeout).
@@ -13739,7 +13739,7 @@ async def run_setup(profile_dir, wait_minutes=10):
         token = generate_research_token()
         print(f"  {_c(_OK, 'Minted new token.')}")
 
-    # Upsert in Firestore on every --setup run so a reused local token can't
+    # Upsert in Firestore on every --pair run so a reused local token can't
     # drift out of sync with what the app reads.
     try:
         import socket
@@ -13782,10 +13782,10 @@ async def run_setup(profile_dir, wait_minutes=10):
     # further absorbs server/client drift.
     setup_started_ms = int(time.time() * 1000)
 
-    # Critical: clear any stale link fields from a previous --setup run BEFORE
+    # Critical: clear any stale link fields from a previous --pair run BEFORE
     # we start watching. If the user unlinked via the app but the release write
     # silently failed, `linkedUid` might still be present — we'd read it here
-    # and auto-advance as if paired. Resetting the fields on every --setup
+    # and auto-advance as if paired. Resetting the fields on every --pair
     # guarantees the email NEVER appears until the user does a live pair.
     try:
         _firebase_db.collection("research_tokens").document(token).update({
@@ -13801,7 +13801,7 @@ async def run_setup(profile_dir, wait_minutes=10):
 
     # Watch the token doc — the app calls claimResearchToken after validating
     # + saving, which writes {linkedUid, linkedEmail, linkedAt} here. We
-    # require ALL THREE to be present, plus linkedAt newer than this --setup
+    # require ALL THREE to be present, plus linkedAt newer than this --pair
     # started (with 30s skew tolerance), so a stale pre-run claim can never
     # slip through.
     linked_uid: str | None = None
@@ -13825,7 +13825,7 @@ async def run_setup(profile_dir, wait_minutes=10):
                     except Exception:
                         _at_ms = 0
                 # Accept the link only when all three fields are present AND
-                # the claim is newer than this --setup started (prevents a
+                # the claim is newer than this --pair started (prevents a
                 # cached pre-run claim from auto-advancing). 30s skew tolerance
                 # for server/client clock drift.
                 if _uid and _email and _at_ms >= setup_started_ms - 30_000:
@@ -13845,7 +13845,7 @@ async def run_setup(profile_dir, wait_minutes=10):
     if linked_uid is None:
         print()
         print(f"  {_c(_WARN, 'Timed out waiting for app pairing.')}")
-        print(f"  {_c(_DIM, 'Re-run when ready:')}  {_c(_BOLD, 'python research.py --setup')}")
+        print(f"  {_c(_DIM, 'Re-run when ready:')}  {_c(_BOLD, 'python research.py --pair')}")
         return
 
     # Prefer the email written by the scanner; fall back to Firebase Auth.
@@ -14043,7 +14043,7 @@ async def run_setup(profile_dir, wait_minutes=10):
         print("")
         print(f"  {_c(_DIM, 'Setup is complete. To start accepting research jobs from the app:')}")
         print("")
-        print(f"     {_c(_ACCENT, '1)')}  Press  {_c(_BOLD, 'Ctrl+C')}   {_c(_DIM, '(close this --setup process)')}")
+        print(f"     {_c(_ACCENT, '1)')}  Press  {_c(_BOLD, 'Ctrl+C')}   {_c(_DIM, '(close this --pair process)')}")
         print(f"     {_c(_ACCENT, '2)')}  Run    {_c(_BOLD, 'python research.py --serve')}")
         print("")
         print(f"  {_c(_DIM, 'Then fire a topic in the Super Research app — this machine')}")
@@ -14071,11 +14071,11 @@ async def run_setup(profile_dir, wait_minutes=10):
                 print(f"        {mark}  {name if ok else _c(_DIM, name)}")
             print("")
         print(f"  {_c(_DIM, 'Your token is saved. Re-run when ready:')}")
-        print(f"        {_c(_BOLD, 'python research.py --setup')}")
+        print(f"        {_c(_BOLD, 'python research.py --pair')}")
         print("")
 
 
-# ── Indestructible mode (--resurrect / --exorcise) ───────────────────────────
+# ── Supervised mode (--resurrect / --retire) ───────────────────────────
 #
 # Installs a Windows Scheduled Task that auto-starts `python research.py
 # --serve` at user logon, so a reboot (Windows Update, power blip, crash)
@@ -14087,14 +14087,14 @@ async def run_setup(profile_dir, wait_minutes=10):
 # retains access to the user's Chrome profile / cookies, which Playwright
 # needs for the logged-in agents.
 
-_INDESTRUCTIBLE_TASK_NAME = "SuperResearchBackend"
+_SUPERVISOR_TASK_NAME = "SuperResearchBackend"
 
 
 def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
     """Return [(pid, cmdline, role), ...] for every python.exe whose
     command line references this script. role ∈ {'daemon-loop', 'serve',
     'other'}. Single source of truth for --resurrect (what's running
-    before I spawn?) and --exorcise (what do I need to kill?).
+    before I spawn?) and --retire (what do I need to kill?).
 
     Matches on "research.py" substring so subprocess invocations launched
     from different cwd styles (absolute, relative, with/without quotes)
@@ -14162,10 +14162,10 @@ def run_daemon_loop(port: int = 8000):
     backend restarts automatically on ANY exit — clean shutdown from the
     Stop button (which calls os._exit to force Chromium cleanup), crashes,
     upstream failures, anything. Without this, --resurrect only fires the
-    process once per logon, which defeats the "indestructible" promise.
+    process once per logon, which defeats the "supervised" promise.
 
     Loops forever with a 5s delay between restarts. Exits on
-    KeyboardInterrupt OR on SIGTERM/taskkill (so --exorcise can stop
+    KeyboardInterrupt OR on SIGTERM/taskkill (so --retire can stop
     the live loop without requiring a reboot). The --serve child
     process is NOT killed — it stays alive so the current pipeline
     finishes, and the user manages it manually from then on."""
@@ -14213,8 +14213,8 @@ def run_daemon_loop(port: int = 8000):
             return
 
 
-def _write_indestructible_flag(enabled: bool):
-    """Push the Indestructible flag to the device doc so the frontend can
+def _write_supervised_flag(enabled: bool):
+    """Push the Supervised flag to the device doc so the frontend can
     branch watchdog copy. Best-effort — if Firebase isn't reachable we still
     succeed because the scheduled task is the actual source of truth."""
     if not _firebase_db:
@@ -14227,11 +14227,11 @@ def _write_indestructible_flag(enabled: bool):
     try:
         _firebase_db.collection("users").document(paired_uid) \
             .collection("devices").document(device_id).update({
-                "indestructible": bool(enabled),
+                "supervised": bool(enabled),
             })
-        log(f"Indestructible flag = {enabled} written to device doc.")
+        log(f"Supervised flag = {enabled} written to device doc.")
     except Exception as e:
-        log(f"Could not update indestructible flag: {e}", "WARN")
+        log(f"Could not update supervised flag: {e}", "WARN")
 
 
 def run_resurrect():
@@ -14268,7 +14268,7 @@ def run_resurrect():
     _setup_step(1, 4, "Pre-flight")
     if not load_paired_uid():
         print(f"  {_c(_WARN, '[..]')} Device not paired yet.")
-        print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, 'python research.py --setup')} {_c(_DIM, 'first, then retry --resurrect.')}")
+        print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, 'python research.py --pair')} {_c(_DIM, 'first, then retry --resurrect.')}")
         return
     print(f"  {_c(_OK, '[ok]')}  Setup complete on this machine")
 
@@ -14276,7 +14276,7 @@ def run_resurrect():
     _setup_step(2, 4, "Binding the supervisor")
     cmd = [
         "schtasks", "/Create",
-        "/TN", _INDESTRUCTIBLE_TASK_NAME,
+        "/TN", _SUPERVISOR_TASK_NAME,
         "/TR", task_run,
         "/SC", "ONLOGON",
         "/RL", "LIMITED",       # keep user privileges (Chrome profile access)
@@ -14297,17 +14297,17 @@ def run_resurrect():
                 print(f"       {line}")
         return
 
-    print(f"  {_c(_OK, '[ok]')}  Scheduled Task pinned to logon + startup ({_INDESTRUCTIBLE_TASK_NAME})")
+    print(f"  {_c(_OK, '[ok]')}  Scheduled Task pinned to logon + startup ({_SUPERVISOR_TASK_NAME})")
     print(f"  {_c(_DIM, '     Executes:')} {task_run}")
 
     # ── [3/4] Firestore sync ──
     _setup_step(3, 4, "Firestore sync")
-    _write_indestructible_flag(True)
+    _write_supervised_flag(True)
     print(f"  {_c(_OK, '[ok]')}  Synced to the Super Research app")
 
     # ── [4/4] Handoff — activate the supervisor NOW, not at next logon ──
     # Without this, --resurrect only schedules the task and leaves the
-    # backend on whatever the user had before. Active indestructible mode
+    # backend on whatever the user had before. Active supervised mode
     # needs --daemon-loop running so --serve is supervised. Steps:
     #   (a) detect an already-running daemon-loop (re-run = no-op),
     #   (b) taskkill any plain --serve so port 8000 is free for the
@@ -14365,15 +14365,15 @@ def run_resurrect():
     print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}")
     print(f"  {_c(_DIM, '  --serve now respawns on any exit (crash, Stop, logout, reboot).')}")
     print()
-    print(f"  {_c(_DIM, '  To undo:')}  {_c(_BOLD, 'python research.py --exorcise')}")
+    print(f"  {_c(_DIM, '  To undo:')}  {_c(_BOLD, 'python research.py --retire')}")
     print()
 
 
-def run_exorcise():
-    """Remove the Indestructible setup — completely. Idempotent: succeeds
+def run_retire():
+    """Remove the Supervised setup — completely. Idempotent: succeeds
     whether or not the task/loop exists.
 
-    Full-reset semantics (2026-04-19): after --exorcise the system is
+    Full-reset semantics (2026-04-19): after --retire the system is
     back to "nothing related to research.py is running". If a pipeline
     was in-flight under the supervised --serve, it aborts — that's the
     deliberate cost of a clean undo. Re-run --serve yourself to bring
@@ -14385,7 +14385,7 @@ def run_exorcise():
       2. Kill every running --daemon-loop AND every --serve process,
          looping for up to 8s so a mid-enumeration respawn (daemon-loop
          spawns --serve every ~5s between deaths) still gets caught.
-      3. Flip the Firestore indestructible flag to false.
+      3. Flip the Firestore supervised flag to false.
       4. Verify the final state — if anything survived, warn the user
          with PIDs so they can nuke from Task Manager."""
     import subprocess as _subprocess
@@ -14404,7 +14404,7 @@ def run_exorcise():
     _setup_step(1, 4, "Unbinding schedule")
     cmd = [
         "schtasks", "/Delete",
-        "/TN", _INDESTRUCTIBLE_TASK_NAME,
+        "/TN", _SUPERVISOR_TASK_NAME,
         "/F",
     ]
     try:
@@ -14420,7 +14420,7 @@ def run_exorcise():
         and "ERROR: The system cannot find the file specified." in (result.stdout + result.stderr)
     )
     if result.returncode == 0:
-        print(f"  {_c(_OK, '[ok]')}  Scheduled Task removed ({_INDESTRUCTIBLE_TASK_NAME})")
+        print(f"  {_c(_OK, '[ok]')}  Scheduled Task removed ({_SUPERVISOR_TASK_NAME})")
     elif not_installed:
         print(f"  {_c(_DIM, '     Nothing bound — task was not installed.')}")
     else:
@@ -14435,7 +14435,7 @@ def run_exorcise():
     # single-shot enumerate+kill misses any --serve that happened to be
     # respawning at the wrong moment. Loop for up to 8s, re-enumerating
     # each tick. Always kill daemon-loop first so it can't respawn a
-    # freshly-killed --serve. `self_pid` is excluded in case --exorcise
+    # freshly-killed --serve. `self_pid` is excluded in case --retire
     # was itself launched through the supervisor.
     import time as _time
     self_pid = os.getpid()
@@ -14473,7 +14473,7 @@ def run_exorcise():
 
     # ── [4/4] Firestore sync + verification ──
     _setup_step(4, 4, "Firestore sync")
-    _write_indestructible_flag(False)
+    _write_supervised_flag(False)
     print(f"  {_c(_OK, '[ok]')}  Synced to the Super Research app")
 
     stragglers = [(pid, role) for pid, _cmd, role in last_survivors if role in ("daemon-loop", "serve")]
@@ -14482,11 +14482,11 @@ def run_exorcise():
         print(f"  {_c(_WARN, '[--]')}  {len(stragglers)} related process(es) would not terminate:")
         for pid, role in stragglers:
             print(f"       {_c(_BOLD, f'PID {pid}')}  ({role})")
-        print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --exorcise.')}")
+        print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --retire.')}")
     else:
         print(f"  {_c(_BOLD + _RED, '  Silence.')}  {_c(_DIM, 'No research.py process remains.')}")
     print()
-    print(f"  {_c(_DIM, 'Indestructible mode is off. The backend does not auto-start at')}")
+    print(f"  {_c(_DIM, 'Supervised mode is off. The backend does not auto-start at')}")
     print(f"  {_c(_DIM, 'logon. To bring it back manually:')} {_c(_BOLD, 'python research.py --serve')}")
     print(f"  {_c(_DIM, 'To re-enable supervision:')} {_c(_BOLD, 'python research.py --resurrect')}")
 
@@ -14501,32 +14501,32 @@ def main():
     parser.add_argument("--email", "-e", help="Email for Phase 6 delivery")
     parser.add_argument("--api-key", "-k", help="CUA API key")
     parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--setup", action="store_true", help="First-time login setup")
+    parser.add_argument("--pair", action="store_true", help="First-time login setup")
     parser.add_argument("--resume", "-r", help="Resume from a previous queue directory (name or full path)")
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
     parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
     parser.add_argument("--resurrect", action="store_true",
-        help="Install a Windows Scheduled Task that auto-starts `--serve` on user logon (Indestructible mode)")
-    parser.add_argument("--exorcise", action="store_true",
-        help="Remove the Indestructible Scheduled Task installed by --resurrect")
+        help="Install a Windows Scheduled Task that auto-starts `--serve` on user logon (Supervised mode)")
+    parser.add_argument("--retire", action="store_true",
+        help="Remove the Supervised Scheduled Task installed by --resurrect")
     parser.add_argument("--daemon-loop", action="store_true",
-        help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the Indestructible scheduled task.")
+        help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the Supervised scheduled task.")
     args = parser.parse_args()
 
     if args.resurrect:
         run_resurrect()
         return
 
-    if args.exorcise:
-        run_exorcise()
+    if args.retire:
+        run_retire()
         return
 
     if args.daemon_loop:
         run_daemon_loop(args.port)
         return
 
-    if args.setup:
-        asyncio.run(run_setup(str(PROFILE_DIR)))
+    if args.pair:
+        asyncio.run(run_pair(str(PROFILE_DIR)))
         return
 
     if args.serve:
