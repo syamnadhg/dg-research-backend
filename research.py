@@ -13684,11 +13684,20 @@ async def run_server(port=8000):
     print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
     print()
     print(f"  {_c(_DIM, 'Stop:')}  {_c(_BOLD, 'Ctrl+C')}")
-    _render_next_actions([
-        ("python research.py --resurrect", "auto-restart on boot (supervised)"),
-        ("python research.py --retire", "remove the supervisor"),
-        ("python research.py --unpair", "fully disconnect this machine"),
-    ])
+    # Context-aware Next: before pairing, the only meaningful action is to
+    # pair; the supervisor/teardown commands need a paired device to do
+    # anything useful. After pairing, surface the full durability + exit
+    # menu so users discover resurrect/retire/unpair.
+    if _research_token and load_paired_uid():
+        _render_next_actions([
+            ("python research.py --resurrect", "auto-restart on boot (supervised)"),
+            ("python research.py --retire", "remove the supervisor"),
+            ("python research.py --unpair", "fully disconnect this machine"),
+        ])
+    else:
+        _render_next_actions([
+            ("python research.py --pair", "pair this machine to your account (required before jobs can run)"),
+        ])
 
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
