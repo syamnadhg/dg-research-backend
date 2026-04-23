@@ -232,15 +232,16 @@ def _branded_header(tagline_text: str, tagline_color: str, tagline_gloss: str):
 def _setup_logo():
     """Branded header for --pair. Thin wrapper around _branded_header so
     --pair wears the same crown as the other four commands, plus a compact
-    3-step preview line so the user sees the whole arc before step [1/3]
+    4-step preview line so the user sees the whole arc before step [1/4]
     starts."""
     _branded_header("vinculum", _BOLD + _ACCENT, "the bond is forged")
     print()
     print(
-        f"  {_c(_DIM, 'Three steps:')}   "
+        f"  {_c(_DIM, 'Four steps:')}   "
         f"{_c(_ACCENT, '1')} Token   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '2')} Logins   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '3')} Serve"
+        f"{_c(_ACCENT, '2')} On StartUp   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '3')} Logins   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '4')} Serve"
     )
 
 
@@ -300,6 +301,98 @@ def _render_next_actions(items: list[tuple[str, str]]):
     for cmd, desc in items:
         print(f"    {_c(_ACCENT, '→')}  {_c(_BOLD, cmd.ljust(cmd_width))}   {_c(_DIM, desc)}")
     print()
+
+
+class _SyncSpinnerCtx:
+    """Context manager rendering a Braille-dot spinner on a single line
+    until the block exits. Used around short sync poll loops (--retire kill
+    wait, --resurrect daemon-loop appearance, --unpair process cleanup)
+    so 5-8s of otherwise silent wall-clock time reads as 'alive' to the
+    user. Single \\r-overwritten line — no scroll noise."""
+    def __init__(self, label: str):
+        self.label = label
+        import threading as _threading
+        self._threading = _threading
+        self._stop = _threading.Event()
+        self._thread: _threading.Thread | None = None
+
+    def _spin(self):
+        i = 0
+        start = time.time()
+        while not self._stop.is_set():
+            frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
+            elapsed = int(time.time() - start)
+            sys.stdout.write(
+                f"\r  {_c(_ACCENT, frame)}  {_c(_DIM, self.label + '…')}   "
+                f"{_c(_DIM, f'{elapsed}s')}    "
+            )
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.1)
+
+    def __enter__(self):
+        self._thread = self._threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        sys.stdout.write("\r" + " " * 78 + "\r")
+        sys.stdout.flush()
+        return False
+
+
+def _sync_spinner_ctx(label: str) -> _SyncSpinnerCtx:
+    return _SyncSpinnerCtx(label)
+
+
+class _AsyncSpinnerCtx:
+    """Async variant of _sync_spinner_ctx — same visual, async-friendly
+    so it composes with `async with` inside run_pair without blocking the
+    event loop. Used in --pair step 4 while the supervisor spawn is
+    waited on (~5s)."""
+    def __init__(self, label: str):
+        self.label = label
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task | None = None
+
+    async def _spin(self):
+        i = 0
+        start = time.time()
+        while not self._stop.is_set():
+            frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
+            elapsed = int(time.time() - start)
+            sys.stdout.write(
+                f"\r  {_c(_ACCENT, frame)}  {_c(_DIM, self.label + '…')}   "
+                f"{_c(_DIM, f'{elapsed}s')}    "
+            )
+            sys.stdout.flush()
+            i += 1
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._spin())
+        return self
+
+    async def __aexit__(self, *exc):
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await self._task
+            except Exception:
+                pass
+        sys.stdout.write("\r" + " " * 78 + "\r")
+        sys.stdout.flush()
+        return False
+
+
+def _async_spinner_ctx(label: str) -> _AsyncSpinnerCtx:
+    return _AsyncSpinnerCtx(label)
 
 
 def log_action(action, details=""):
@@ -13670,10 +13763,11 @@ async def run_server(port=8000):
     # --resurrect / --retire (SUPER RESEARCH wordmark + dim rule + Latin
     # tagline) so the three commands feel like a matched set.
     _branded_header("aegis", _BOLD + _ACCENT, "standing watch")
-    _paired_email = _fetch_paired_email(load_paired_uid())
-    token_short = f"{_research_token[:8]}…" if _research_token else "—"
+    _paired_uid_now = load_paired_uid()
+    _paired_email = _fetch_paired_email(_paired_uid_now)
+    token_short = f"{_research_token[:8]}…" if _research_token else "(none)"
     token_val = (f"{_c(_BOLD, token_short)}  {_c(_OK, '(active)')}"
-                 if _research_token else _c(_DIM, "—"))
+                 if _research_token else _c(_DIM, "(none)"))
     _render_context_strip([
         ("Paired to", _c(_BOLD, _paired_email or "(not paired)")),
         ("Token",     token_val),
@@ -13684,19 +13778,28 @@ async def run_server(port=8000):
     print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
     print()
     print(f"  {_c(_DIM, 'Stop:')}  {_c(_BOLD, 'Ctrl+C')}")
-    # Context-aware Next: before pairing, the only meaningful action is to
-    # pair; the supervisor/teardown commands need a paired device to do
-    # anything useful. After pairing, surface the full durability + exit
-    # menu so users discover resurrect/retire/unpair.
-    if _research_token and load_paired_uid():
+
+    # Context-aware hint: fresh users running --serve without pairing see
+    # the banner succeed (port bound, listeners started) but no jobs will
+    # ever arrive until the app claims a token. Surface --pair. If paired
+    # but On Startup isn't enabled, surface --resurrect so users discover
+    # the "run in background" capability.
+    _currently_supervised = _detect_supervised()
+    if not (_research_token and _paired_uid_now):
+        print()
+        print(f"  {_c(_WARN, '⚠')}  Not paired yet — jobs will be ignored until this machine is paired.")
         _render_next_actions([
-            ("python research.py --resurrect", "auto-restart on boot (supervised)"),
-            ("python research.py --retire", "remove the supervisor"),
-            ("python research.py --unpair", "fully disconnect this machine"),
+            ("python research.py --pair", "pair this machine to your account"),
+        ])
+    elif not _currently_supervised:
+        _render_next_actions([
+            ("python research.py --resurrect", "enable On Startup (auto-start in background)"),
+            ("python research.py --unpair",    "fully disconnect this machine"),
         ])
     else:
         _render_next_actions([
-            ("python research.py --pair", "pair this machine to your account (required before jobs can run)"),
+            ("python research.py --retire", "disable On Startup"),
+            ("python research.py --unpair", "fully disconnect this machine"),
         ])
 
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
@@ -13750,29 +13853,13 @@ async def run_pair(profile_dir, wait_minutes=10):
     QR payload is the bare token string so the in-app scanner just extracts
     + saves to the user's Firebase profile — no URL round-trips needed.
     """
-    BAR = "═" * 62
-    SUB = "─" * 62
-
-    def banner(title):
-        print("")
-        print(f"  {BAR}")
-        print(f"    {title}")
-        print(f"  {BAR}")
-        print("")
-
-    def divider(label=""):
-        if label:
-            print(f"  {SUB}  {label}")
-        else:
-            print(f"  {SUB}")
-
     _setup_logo()
 
     # ══════════════════════════════════════════════════════════════════════
-    # [1/3] TOKEN SETUP — mint, register in Firestore, render QR, wait for
+    # [1/4] TOKEN SETUP — mint, register in Firestore, render QR, wait for
     #       the app to claim the link. All token-side work lives here.
     # ══════════════════════════════════════════════════════════════════════
-    _setup_step(1, 3, "Token setup")
+    _setup_step(1, 4, "Token setup")
 
     firebase_ok = init_firebase()
     if not firebase_ok:
@@ -13867,8 +13954,6 @@ async def run_pair(profile_dir, wait_minutes=10):
     except Exception as e:
         log(f"    Could not reset stale link fields: {e}", "WARN")
 
-    print(f"  {_c(_DIM, 'Waiting for the app to pair…')}  {_c(_DIM, '(Ctrl+C to cancel)')}")
-
     # Watch the token doc — the app calls claimResearchToken after validating
     # + saving, which writes {linkedUid, linkedEmail, linkedAt} here. We
     # require ALL THREE to be present, plus linkedAt newer than this --pair
@@ -13881,8 +13966,9 @@ async def run_pair(profile_dir, wait_minutes=10):
     first_err_logged = False
     # Spinner-driven wait: poll Firestore once per 3-second window while a
     # Braille-dot frame ticks every 100ms on the same line so the terminal
-    # reads as alive. Elapsed counter ticks up beside the spinner. Single
-    # \r-overwritten line — no scrolling wall of "...still waiting" noise.
+    # reads as alive. Elapsed counter + Ctrl+C hint ride alongside the
+    # spinner. Single \r-overwritten line — no scrolling wall of
+    # "...still waiting" noise.
     wait_start_ts = time.time()
     frame_idx = 0
     POLL_EVERY_FRAMES = 30  # 30 × 100ms ≈ 3s (matches previous poll cadence)
@@ -13921,13 +14007,13 @@ async def run_pair(profile_dir, wait_minutes=10):
         mm, ss = divmod(elapsed, 60)
         sys.stdout.write(
             f"\r  {_c(_ACCENT, frame)}  {_c(_DIM, 'waiting for the app to pair…')}   "
-            f"{_c(_DIM, f'{mm:d}:{ss:02d}')}    "
+            f"{_c(_DIM, f'{mm:d}:{ss:02d}')}   {_c(_DIM, '(Ctrl+C to cancel)')}    "
         )
         sys.stdout.flush()
         frame_idx += 1
         await asyncio.sleep(0.1)
     # Clear the spinner line so the next print starts clean
-    sys.stdout.write("\r" + " " * 72 + "\r")
+    sys.stdout.write("\r" + " " * 78 + "\r")
     sys.stdout.flush()
 
     if linked_uid is None:
@@ -13956,9 +14042,43 @@ async def run_pair(profile_dir, wait_minutes=10):
     print()
 
     # ══════════════════════════════════════════════════════════════════════
-    # [2/3] BROWSER LOGINS — open 7 platform tabs and wait for real auth.
+    # [2/4] ON STARTUP — ask whether to enable On Startup mode. We only
+    #       CAPTURE the answer here; the actual arming (schtasks install
+    #       + detached daemon-loop spawn) happens in step 4 AFTER logins
+    #       succeed, so an aborted login can't leave Firestore with
+    #       supervised=true while platforms are half-logged-in.
     # ══════════════════════════════════════════════════════════════════════
-    _setup_step(2, 3, "Browser logins")
+    _setup_step(2, 4, "On Startup")
+    print(f"  {_c(_DIM, 'Keep the backend running in the background?')}")
+    print(f"  {_c(_DIM, 'It will auto-start when you log in and stay alive through crashes')}")
+    print(f"  {_c(_DIM, 'and reboots. You can turn it off anytime with --retire.')}")
+    print()
+    enable_on_startup = False
+    try:
+        _startup_typed = await asyncio.to_thread(
+            input, f"  {_c(_ACCENT, '>')}  Enable On Startup? {_c(_DIM, '[Y/n]')}: ",
+        )
+        _ans = _startup_typed.strip().lower()
+        if _ans in ("", "y", "yes"):
+            enable_on_startup = True
+    except (EOFError, KeyboardInterrupt):
+        # Ctrl+C at the prompt — safer default is to skip arming, so a
+        # user who meant to abort doesn't end up with a silently-armed
+        # supervisor if they continue through the rest of --pair anyway.
+        enable_on_startup = False
+        print()
+    print()
+    if enable_on_startup:
+        print(f"  {_c(_OK, '✓')}  On Startup will be enabled after the logins finish.")
+    else:
+        print(f"  {_c(_DIM, '     Skipped. You will run --serve manually in step 4.')}")
+        print(f"  {_c(_DIM, '     Enable later with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # [3/4] BROWSER LOGINS — open 7 platform tabs and wait for real auth.
+    # ══════════════════════════════════════════════════════════════════════
+    _setup_step(3, 4, "Browser logins")
     print(f"  {_c(_DIM, 'Walking through logins one platform at a time.')}")
     print(f"  {_c(_DIM, 'Already-logged-in platforms (from a prior setup) are auto-detected.')}")
     print("")
@@ -14122,25 +14242,62 @@ async def run_pair(profile_dir, wait_minutes=10):
     print("")
     if all_ok:
         # ══════════════════════════════════════════════════════════════════════
-        # [3/3] START RESEARCH SERVER — clear next-action instructions.
+        # [4/4] READY — pair is complete. If the user opted into On Startup
+        #       back in step 2, arm the supervisor NOW (deferred from step 2
+        #       so an aborted login couldn't leave Firestore flagged as
+        #       supervised while platforms were half-logged-in). Final
+        #       message branches on whether the supervisor is live.
         # ══════════════════════════════════════════════════════════════════════
-        _setup_step(3, 3, "Start research server")
+        _setup_step(4, 4, "Ready")
         print(f"  {_c(_OK, '✓')}  Paired with {_c(_BOLD, linked_email or '—')}")
         print(f"  {_c(_OK, '✓')}  All {len(services)} platforms logged in")
         print(f"  {_c(_OK, '✓')}  Browser closed")
+
+        supervised_armed = False
+        if enable_on_startup:
+            print()
+            # Spin while arming — the 5s daemon-loop detection wait would
+            # otherwise look frozen.
+            async with _async_spinner_ctx("Enabling On Startup"):
+                ok, pid, info, killed_serves = await asyncio.to_thread(_arm_supervisor_quiet)
+            if ok:
+                supervised_armed = True
+                _write_supervised_flag(True)
+                print(f"  {_c(_OK, '✓')}  Scheduled Task pinned to login ({_SUPERVISOR_TASK_NAME})")
+                if killed_serves:
+                    plural = "es" if killed_serves != 1 else ""
+                    print(f"  {_c(_DIM, f'     Stopped {killed_serves} running --serve process{plural} to free port 8000.')}")
+                if pid is not None and info == "already running":
+                    print(f"  {_c(_OK, '✓')}  Backend already running (PID {pid})")
+                elif pid is not None:
+                    print(f"  {_c(_OK, '✓')}  Backend started (PID {pid}, running in background)")
+                else:
+                    print(f"  {_c(_WARN, '⚠')}  {info or 'Backend did not appear within 5s'}")
+                    print(f"  {_c(_DIM, '     The scheduled task still fires at next login as a fallback.')}")
+                print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+            else:
+                if info == "non-Windows":
+                    print(f"  {_c(_WARN, '⚠')}  On Startup is Windows-only today.")
+                    print(f"  {_c(_DIM, '     macOS / Linux desktop: tracked as task #355 (launchd + systemd-user).')}")
+                else:
+                    print(f"  {_c(_WARN, '⚠')}  Could not enable On Startup: {info}")
+                print(f"  {_c(_DIM, '     Run manually with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
+
         print()
-        print(f"  {_c(_BOLD + _ACCENT, '  The bond is forged.')}  {_c(_DIM, 'Close this process with')} {_c(_BOLD, 'Ctrl+C')}{_c(_DIM, ', then run --serve.')}")
-        _render_next_actions([
-            ("python research.py --serve", "start accepting jobs"),
-            ("python research.py --resurrect", "auto-restart on boot (supervised)"),
-            ("python research.py --unpair", "fully disconnect this machine"),
-        ])
-        # Stay alive so the user sees the message clearly until they Ctrl+C.
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
+        if supervised_armed:
+            print(f"  {_c(_BOLD + _ACCENT, '  The bond is forged.')}  {_c(_DIM, 'The backend is live — running in the background.')}")
+            _render_next_actions([
+                ("python research.py --retire", "disable On Startup"),
+                ("python research.py --unpair", "fully disconnect this machine"),
+            ])
+        else:
+            print(f"  {_c(_BOLD + _ACCENT, '  The bond is forged.')}  {_c(_DIM, 'Start the backend in this terminal to accept jobs:')}")
+            print()
+            print(f"       {_c(_BOLD, 'python research.py --serve')}")
+            _render_next_actions([
+                ("python research.py --resurrect", "enable On Startup (auto-start in background)"),
+                ("python research.py --unpair", "fully disconnect this machine"),
+            ])
     else:
         print()
         print(f"  {_c(_WARN, '━' * 62)}")
@@ -14318,6 +14475,89 @@ def _write_supervised_flag(enabled: bool):
         log(f"Could not update supervised flag: {e}", "WARN")
 
 
+def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
+    """Install the SuperResearchBackend scheduled task AND spawn a detached
+    daemon-loop. No terminal narration — callers do their own.
+
+    Returns (installed_ok, pid_or_None, info, killed_serve_count):
+      • installed_ok         — schtasks install succeeded
+      • pid_or_None          — daemon-loop pid if live-detected within 5s
+      • info:
+          - "non-Windows"    — platform not supported
+          - "already running" — daemon-loop was already live; pid reflects that
+          - ""               — fresh spawn detected within 5s
+          - "<error string>" — failure (schtasks error, Popen failed, spawn
+                               took > 5s to appear, etc.)
+      • killed_serve_count   — number of plain --serve processes we had to
+                               stop to free port 8000 for the supervised
+                               child. Callers warn the user since the other
+                               terminal's --serve died silently.
+
+    installed_ok=True + pid=None means the scheduled task is installed but
+    the live spawn did not appear — the next login will still fire it, so
+    On Startup mode is enabled for the future even if this turn didn't
+    catch the process handoff."""
+    import sys as _sys
+    import subprocess as _subprocess
+    import platform as _platform
+    import time as _time
+
+    if _platform.system() != "Windows":
+        return False, None, "non-Windows", 0
+
+    python_exe = _sys.executable
+    script_path = str(Path(__file__).resolve())
+    task_run = f'"{python_exe}" "{script_path}" --daemon-loop'
+
+    cmd = [
+        "schtasks", "/Create",
+        "/TN", _SUPERVISOR_TASK_NAME,
+        "/TR", task_run,
+        "/SC", "ONLOGON",
+        "/RL", "LIMITED",
+        "/IT",
+        "/F",
+    ]
+    try:
+        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return False, None, f"schtasks error: {e}", 0
+    if result.returncode != 0:
+        return False, None, (result.stderr or result.stdout or "schtasks returned non-zero").strip(), 0
+
+    procs = _enumerate_research_py_procs()
+    daemon_pid = next((pid for pid, _cmd, role in procs if role == "daemon-loop"), None)
+    if daemon_pid is not None:
+        return True, daemon_pid, "already running", 0
+
+    plain_serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
+    killed_serve_count = 0
+    if plain_serve_pids:
+        killed_serve_count = _kill_pids(plain_serve_pids)
+
+    _DETACHED = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
+    _NEWGROUP = getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    try:
+        _subprocess.Popen(
+            [python_exe, script_path, "--daemon-loop"],
+            creationflags=_DETACHED | _NEWGROUP,
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+            stdin=_subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception as e:
+        return True, None, f"spawn failed: {e}", killed_serve_count
+
+    deadline = _time.time() + 5.0
+    while _time.time() < deadline:
+        _time.sleep(0.5)
+        for pid, _cmd, role in _enumerate_research_py_procs():
+            if role == "daemon-loop":
+                return True, pid, "", killed_serve_count
+    return True, None, "daemon-loop did not appear within 5s", killed_serve_count
+
+
 def run_resurrect():
     """Install a Windows Scheduled Task that launches `python research.py
     --serve` at user logon. Idempotent — re-running overwrites the existing
@@ -14331,8 +14571,8 @@ def run_resurrect():
     if _platform.system() != "Windows":
         print()
         print(f"  {_c(_WARN, 'Only supported on Windows today.')}")
-        print(f"  {_c(_DIM, 'macOS / Linux desktop: cross-platform supervisors are tracked as')}")
-        print(f"  {_c(_DIM, 'task #355 (launchd + systemd-user). See PERSISTENCE-RECIPE.md.')}")
+        print(f"  {_c(_DIM, 'macOS / Linux desktop: cross-platform background runners are tracked')}")
+        print(f"  {_c(_DIM, 'as task #355 (launchd + systemd-user). See PERSISTENCE-RECIPE.md.')}")
         return
 
     python_exe = _sys.executable
@@ -14358,7 +14598,7 @@ def run_resurrect():
     _render_context_strip([
         ("Device",    _c(_BOLD, device_id or "(not paired)")),
         ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
-        ("Current",   _c(_OK, "supervised") if currently_supervised else _c(_DIM, "unsupervised → arming scheduled task")),
+        ("On Startup", _c(_OK, "on") if currently_supervised else _c(_DIM, "off → enabling")),
     ])
 
     # ── [1/4] Pre-flight ──
@@ -14367,10 +14607,10 @@ def run_resurrect():
         print(f"  {_c(_WARN, '⚠')} Device not paired yet.")
         print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, 'python research.py --pair')} {_c(_DIM, 'first, then retry --resurrect.')}")
         return
-    print(f"  {_c(_OK, '✓')}  Setup complete on this machine")
+    print(f"  {_c(_OK, '✓')}  Pairing complete on this machine")
 
-    # ── [2/4] Binding the supervisor ──
-    _setup_step(2, 4, "Binding the supervisor")
+    # ── [2/4] Scheduling auto-start ──
+    _setup_step(2, 4, "Scheduling auto-start")
     cmd = [
         "schtasks", "/Create",
         "/TN", _SUPERVISOR_TASK_NAME,
@@ -14394,7 +14634,7 @@ def run_resurrect():
                 print(f"       {line}")
         return
 
-    print(f"  {_c(_OK, '✓')}  Scheduled Task pinned to logon + startup ({_SUPERVISOR_TASK_NAME})")
+    print(f"  {_c(_OK, '✓')}  Scheduled Task pinned to login ({_SUPERVISOR_TASK_NAME})")
     print(f"  {_c(_DIM, '     Executes:')} {task_run}")
 
     # ── [3/4] Firestore sync ──
@@ -14421,12 +14661,12 @@ def run_resurrect():
     plain_serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
 
     if daemon_pid is not None:
-        print(f"  {_c(_OK, '✓')}  Supervisor already running (PID {daemon_pid}) — nothing to spawn")
+        print(f"  {_c(_OK, '✓')}  Backend already running (PID {daemon_pid}) — nothing to spawn")
     else:
         if plain_serve_pids:
             killed = _kill_pids(plain_serve_pids)
             plural = "es" if killed != 1 else ""
-            print(f"  {_c(_OK, '✓')}  Stopped {killed} standalone --serve process{plural} to free port 8000")
+            print(f"  {_c(_DIM, f'     Stopped {killed} running --serve process{plural} to free port 8000.')}")
         _DETACHED = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
         _NEWGROUP = getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         try:
@@ -14439,53 +14679,50 @@ def run_resurrect():
                 close_fds=True,
             )
         except Exception as e:
-            print(f"  {_c(_WARN, '⚠')}  Could not spawn supervisor: {e}")
-            print(f"  {_c(_DIM, '     The scheduled task still fires at next logon.')}")
+            print(f"  {_c(_WARN, '⚠')}  Could not start backend: {e}")
+            print(f"  {_c(_DIM, '     The scheduled task still fires at next login.')}")
         else:
             spawned_pid = None
-            deadline = _time.time() + 5.0
-            while _time.time() < deadline:
-                _time.sleep(0.5)
-                for pid, _cmd, role in _enumerate_research_py_procs():
-                    if role == "daemon-loop":
-                        spawned_pid = pid
+            with _sync_spinner_ctx("Starting backend"):
+                deadline = _time.time() + 5.0
+                while _time.time() < deadline:
+                    _time.sleep(0.5)
+                    for pid, _cmd, role in _enumerate_research_py_procs():
+                        if role == "daemon-loop":
+                            spawned_pid = pid
+                            break
+                    if spawned_pid is not None:
                         break
-                if spawned_pid is not None:
-                    break
             if spawned_pid is not None:
-                print(f"  {_c(_OK, '✓')}  Supervisor started (PID {spawned_pid}, detached)")
+                print(f"  {_c(_OK, '✓')}  Backend started (PID {spawned_pid}, running in background)")
             else:
-                print(f"  {_c(_WARN, '⚠')}  Supervisor did not appear within 5s — check backend.err.log.")
-                print(f"  {_c(_DIM, '     The scheduled task still fires at next logon as a fallback.')}")
+                print(f"  {_c(_WARN, '⚠')}  Backend did not appear within 5s — check backend.err.log.")
+                print(f"  {_c(_DIM, '     The scheduled task still fires at next login as a fallback.')}")
 
     print()
     print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  {_c(_DIM, '--serve respawns on any exit.')}")
     _render_next_actions([
-        ("python research.py --serve", "confirm it's up (optional — supervisor handles it)"),
-        ("python research.py --retire", "remove supervision"),
-        ("python research.py --unpair", "fully disconnect this machine"),
+        ("python research.py --retire", "disable On Startup"),
     ])
 
 
 def run_retire():
-    """Remove the Supervised setup — completely. Idempotent: succeeds
-    whether or not the task/loop exists.
+    """Disable On Startup — completely. Idempotent: succeeds whether or not
+    the scheduled task and backend are currently running.
 
-    Full-reset semantics (2026-04-19): after --retire the system is
-    back to "nothing related to research.py is running". If a pipeline
-    was in-flight under the supervised --serve, it aborts — that's the
-    deliberate cost of a clean undo. Re-run --serve yourself to bring
-    the backend back, or --resurrect to re-enable supervision.
+    Full-reset semantics: after --retire the machine is back to "nothing
+    related to research.py is running in the background". If a pipeline was
+    in-flight under the supervised --serve, it aborts — that's the deliberate
+    cost of a clean undo. Re-run --serve yourself to bring the backend back,
+    or --resurrect to re-enable On Startup.
 
-    Four-step reset:
-      1. Delete the Windows Scheduled Task so --daemon-loop won't
-         auto-start at next logon.
-      2. Kill every running --daemon-loop AND every --serve process,
-         looping for up to 8s so a mid-enumeration respawn (daemon-loop
-         spawns --serve every ~5s between deaths) still gets caught.
-      3. Flip the Firestore supervised flag to false.
-      4. Verify the final state — if anything survived, warn the user
-         with PIDs so they can nuke from Task Manager."""
+    Three-step reset:
+      1. Delete the Windows Scheduled Task so daemon-loop won't auto-start
+         at next login.
+      2. Kill every running daemon-loop AND every --serve process, looping
+         for up to 8s so a mid-enumeration respawn (daemon-loop spawns
+         --serve every ~5s between deaths) still gets caught.
+      3. Flip the Firestore On Startup flag to off + verify stragglers."""
     import subprocess as _subprocess
     import platform as _platform
 
@@ -14504,13 +14741,29 @@ def run_retire():
     paired_email = _fetch_paired_email(paired_uid)
     currently_supervised = _detect_supervised()
     _render_context_strip([
-        ("Device",    _c(_BOLD, device_id or "(not paired)")),
-        ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
-        ("Current",   _c(_OK, "supervised") if currently_supervised else _c(_DIM, "unsupervised — nothing to undo")),
+        ("Device",     _c(_BOLD, device_id or "(not paired)")),
+        ("Paired to",  _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+        ("On Startup", _c(_OK, "on") if currently_supervised else _c(_DIM, "off — nothing to undo")),
     ])
 
-    # ── [1/4] Unbinding schedule ──
-    _setup_step(1, 4, "Unbinding schedule")
+    # Short-circuit: if nothing is armed and nothing is running, there's
+    # nothing to retire. Walking through all 3 steps just to print "Nothing
+    # bound / No processes running" 3 times is noise — tell the user directly.
+    import time as _time
+    self_pid = os.getpid()
+    running_now = any(role in ("daemon-loop", "serve")
+                      for pid, _cmd, role in _enumerate_research_py_procs()
+                      if pid != self_pid)
+    if not currently_supervised and not running_now:
+        print()
+        print(f"  {_c(_DIM, 'Nothing to retire — On Startup is already off and no backend is running.')}")
+        _render_next_actions([
+            ("python research.py --resurrect", "enable On Startup"),
+        ])
+        return
+
+    # ── [1/3] Unbinding schedule ──
+    _setup_step(1, 3, "Unbinding schedule")
     cmd = [
         "schtasks", "/Delete",
         "/TN", _SUPERVISOR_TASK_NAME,
@@ -14539,49 +14792,46 @@ def run_retire():
             for line in result.stderr.strip().splitlines():
                 print(f"       {line}")
 
-    # ── [2/4] + [3/4] kill supervisor AND supervised --serve, loop until clean ──
+    # ── [2/3] Stopping backend ──
     # The daemon-loop respawns --serve every ~5s between deaths, so a
     # single-shot enumerate+kill misses any --serve that happened to be
     # respawning at the wrong moment. Loop for up to 8s, re-enumerating
     # each tick. Always kill daemon-loop first so it can't respawn a
     # freshly-killed --serve. `self_pid` is excluded in case --retire
     # was itself launched through the supervisor.
-    import time as _time
-    self_pid = os.getpid()
+    _setup_step(2, 3, "Stopping backend")
     killed_daemon_total = 0
     killed_serve_total = 0
     deadline = _time.time() + 8.0
     last_survivors: list[tuple[int, str, str]] = []
-    while True:
-        procs = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
-        daemon_pids = [pid for pid, _cmd, role in procs if role == "daemon-loop"]
-        serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
-        if not daemon_pids and not serve_pids:
-            last_survivors = procs  # only 'other' left, which we don't touch
-            break
-        killed_daemon_total += _kill_pids(daemon_pids)
-        killed_serve_total += _kill_pids(serve_pids)
-        if _time.time() >= deadline:
-            last_survivors = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
-            break
-        _time.sleep(0.5)
+    with _sync_spinner_ctx("Stopping backend — waiting for processes to exit"):
+        while True:
+            procs = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
+            daemon_pids = [pid for pid, _cmd, role in procs if role == "daemon-loop"]
+            serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
+            if not daemon_pids and not serve_pids:
+                last_survivors = procs  # only 'other' left, which we don't touch
+                break
+            killed_daemon_total += _kill_pids(daemon_pids)
+            killed_serve_total += _kill_pids(serve_pids)
+            if _time.time() >= deadline:
+                last_survivors = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
+                break
+            _time.sleep(0.5)
 
-    _setup_step(2, 4, "Dispelling daemon-loop")
     if killed_daemon_total:
         plural = "es" if killed_daemon_total != 1 else ""
         print(f"  {_c(_OK, '✓')}  Stopped {killed_daemon_total} daemon-loop process{plural}")
     else:
         print(f"  {_c(_DIM, '     No daemon-loop processes were running.')}")
-
-    _setup_step(3, 4, "Stilling --serve")
     if killed_serve_total:
         plural = "s" if killed_serve_total != 1 else ""
         print(f"  {_c(_OK, '✓')}  Stopped {killed_serve_total} --serve process{plural}")
     else:
         print(f"  {_c(_DIM, '     No --serve processes were running.')}")
 
-    # ── [4/4] Firestore sync + verification ──
-    _setup_step(4, 4, "Firestore sync")
+    # ── [3/3] Firestore sync + verification ──
+    _setup_step(3, 3, "Firestore sync")
     _write_supervised_flag(False)
     print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
 
@@ -14595,9 +14845,7 @@ def run_retire():
     else:
         print(f"  {_c(_BOLD + _RED, '  Silence.')}  {_c(_DIM, 'No research.py process remains.')}")
     _render_next_actions([
-        ("python research.py --serve", "bring the backend back manually"),
-        ("python research.py --resurrect", "re-enable supervision"),
-        ("python research.py --unpair", "fully disconnect this machine"),
+        ("python research.py --resurrect", "re-enable On Startup"),
     ])
 
 
@@ -14682,21 +14930,22 @@ def run_unpair():
     self_pid = os.getpid()
     killed_total = 0
     deadline = _time.time() + 8.0
-    while True:
-        procs = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
-        daemon_pids = [pid for pid, _cmd, role in procs if role == "daemon-loop"]
-        serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
-        if not daemon_pids and not serve_pids:
-            break
-        killed_total += _kill_pids(daemon_pids) + _kill_pids(serve_pids)
-        if _time.time() >= deadline:
-            break
-        _time.sleep(0.5)
+    with _sync_spinner_ctx("Stopping backend — waiting for processes to exit"):
+        while True:
+            procs = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
+            daemon_pids = [pid for pid, _cmd, role in procs if role == "daemon-loop"]
+            serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
+            if not daemon_pids and not serve_pids:
+                break
+            killed_total += _kill_pids(daemon_pids) + _kill_pids(serve_pids)
+            if _time.time() >= deadline:
+                break
+            _time.sleep(0.5)
     if killed_total:
         plural = "es" if killed_total != 1 else ""
-        print(f"  {_c(_OK, '✓')}  Stopped {killed_total} supervisor/serve process{plural}")
+        print(f"  {_c(_OK, '✓')}  Stopped {killed_total} backend process{plural}")
     else:
-        print(f"  {_c(_DIM, '     No supervisor/serve processes were running.')}")
+        print(f"  {_c(_DIM, '     No backend processes were running.')}")
 
     # ── [2/5] Delete device doc ──
     _setup_step(2, total, "Removing device from your account")
@@ -14791,13 +15040,13 @@ def main():
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
     parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
     parser.add_argument("--resurrect", action="store_true",
-        help="Install a Windows Scheduled Task that auto-starts `--serve` on user logon (Supervised mode)")
+        help="Enable On Startup: auto-start the backend at login and keep it running in the background")
     parser.add_argument("--retire", action="store_true",
-        help="Remove the Supervised Scheduled Task installed by --resurrect")
+        help="Disable On Startup: remove the auto-start scheduled task and stop the background backend")
     parser.add_argument("--unpair", action="store_true",
         help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
     parser.add_argument("--daemon-loop", action="store_true",
-        help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the Supervised scheduled task.")
+        help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the On Startup scheduled task.")
     args = parser.parse_args()
 
     if args.resurrect:
