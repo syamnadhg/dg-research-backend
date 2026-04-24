@@ -11829,27 +11829,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if _controls.skip_init_verify:
                     _global_skip = True
                     break
-                # NOTE: the cookie-only fast path was removed (2026-04-24).
-                # Stale auth cookies stayed in the profile after a session
-                # had been invalidated server-side; cookie_login_hit returned
-                # True for those, Phase 0 checked "ok" without opening a tab,
-                # and Phase 1 then blew up trying to drive a logged-out
-                # ChatGPT. Phase 0 is the one source-of-truth gate for
-                # Phases 1-5 — it has to actually talk to the platform.
+                # NOTE (2026-04-24 #2): cookie + Playwright pre-checks both
+                # removed. Cookies lie when the session is server-side
+                # invalidated but the cookie hasn't expired yet; Playwright
+                # strict DOM selectors match cached sidebar fragments on
+                # ChatGPT's logged-out landing (and probably other
+                # platforms' skeleton UIs too). Both gave us speed but let
+                # false positives through, which was tolerable only until
+                # we removed the per-phase login probe safety net — now
+                # Phase 0 is the only gate, and it must not lie.
                 #
-                # The flow below still stays cheap for the warm-profile case:
-                #   - Cookie probe (free) informs a log line but doesn't
-                #     short-circuit the verification.
-                #   - Tab open + Playwright DOM check (strict positive
-                #     match) handles the common logged-in case without any
-                #     CUA spend.
-                #   - CUA only fires when DOM is ambiguous or the URL is on
-                #     a known login host.
-                _cookie_hit = False
-                try:
-                    _cookie_hit = await cookie_login_hit(browser, key)
-                except Exception:
-                    _cookie_hit = False
+                # Flow below: tab open → 4s settle → URL check → CUA.
+                # Vision is the single source of truth. Slower (~5-10s per
+                # platform × up to 7 = ~1 min worst case on cold starts)
+                # but it actually looks at what's on screen. Not a
+                # performance win we can afford to keep taking.
                 # STEALTH-2026-04-19: jitter between cold-start tab opens.
                 # Back-to-back opens in <2s are a strong robotic signal.
                 if _pf_opened > 0 and key not in _preflight_tabs:
@@ -11885,24 +11879,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         log(f"Phase 0: {label} on login URL ({current_url[:60]}) — not logged in", "INFO")
                         ok = False
                     else:
-                        # Second cheap gate before spending CUA: Playwright
-                        # DOM check in strict mode. Returns True only on a
-                        # clear positive signal (platform-specific marker
-                        # like a "New chat" button). Ambiguity / negative
-                        # signals return False and we fall to CUA to
-                        # decide. Saves ~one CUA call per logged-in
-                        # platform on warm profiles.
-                        try:
-                            playwright_ok = await verify_login(tab, key, strict=True)
-                        except Exception:
-                            playwright_ok = False
-                        if playwright_ok:
-                            _source = "cookie+DOM" if _cookie_hit else "DOM"
-                            log(f"Phase 0: {label} DOM markers present — logged in via {_source}", "INFO")
-                            ok = True
-                        else:
-                            # DOM ambiguous or negative — escalate to CUA.
-                            ok = await verify_login_cua(tab, key, cua_client)
+                        # Vision verification is the gate. URL already
+                        # cleared the cheap "obvious login wall" case;
+                        # everything else is a CUA decision.
+                        ok = await verify_login_cua(tab, key, cua_client)
                 except CuaUnavailableError as cua_err:
                     # Structural Anthropic failure (billing cap / invalid
                     # key / 529). Surface a distinct alert so the user
