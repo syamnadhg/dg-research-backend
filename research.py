@@ -568,13 +568,15 @@ def init_firebase():
 
 
 _start_listener = None  # Global start-command listener
-_heartbeat_task = None  # Async task: writes lastHeartbeat every 15s
-# Heartbeat cadence. Paired with the frontend's 35s offline threshold (at
-# `DEVICE_OFFLINE_THRESHOLD_MS` in web/src/lib/firestore.ts) so that
-# missing 2 consecutive ticks plus a 5s slack flips the UI to offline.
-# Tightened from 30s/60s to shrink the "device killed → tile reflects it"
-# gap (user-visible in Sidebar dot + Account tile + startPipeline gate).
-HEARTBEAT_INTERVAL_SEC = 15
+_heartbeat_task = None  # Async task: writes lastHeartbeat every 5s
+# Heartbeat cadence. Paired with the frontend's 15s offline threshold at
+# `DEVICE_OFFLINE_THRESHOLD_MS` in web/src/lib/firestore.ts so missing
+# two consecutive ticks + a ~5s slack flips the UI to offline. Cadence
+# tightened over two passes (30→15→5) because user kept observing the
+# "device killed, tile still green" gap and asked for near-realtime.
+# Cost: 12 writes/min/device on token + device docs — negligible at
+# personal-usage scale.
+HEARTBEAT_INTERVAL_SEC = 5
 
 RESEARCH_CONFIG_PATH = Path(__file__).parent / "research_config.json"
 # Legacy path — auto-migrated on first load so existing users don't lose their token.
