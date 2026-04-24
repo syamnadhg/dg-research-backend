@@ -14346,6 +14346,31 @@ async def run_pair(profile_dir, wait_minutes=10):
                 else:
                     print(f"  {_c(_WARN, '⚠')}  Could not enable On Startup: {info}")
                 print(f"  {_c(_DIM, '     Run manually with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
+        else:
+            # User chose N to On Startup. Enforce that: remove any
+            # previously-installed scheduled task + kill any running
+            # daemon-loop / serve from a prior pair, so "N" genuinely means
+            # "nothing is running in the background — I will run --serve
+            # manually". Without this, a leftover supervisor from an
+            # earlier --pair/--resurrect keeps respawning --serve and the
+            # user can't tell where the backend is coming from.
+            print()
+            async with _async_spinner_ctx("Enforcing unsupervised mode"):
+                task_info, killed_procs = await asyncio.to_thread(_disarm_supervisor_quiet)
+            _write_supervised_flag(False)
+            if task_info == "removed":
+                print(f"  {_c(_OK, '✓')}  Removed leftover Scheduled Task ({_SUPERVISOR_TASK_NAME})")
+            elif task_info == "missing":
+                print(f"  {_c(_DIM, '     No scheduled task was installed.')}")
+            elif task_info == "non-Windows":
+                pass  # silent — schtasks is Windows-only
+            else:
+                print(f"  {_c(_WARN, '⚠')}  schtasks teardown: {task_info}")
+            if killed_procs:
+                plural = "es" if killed_procs != 1 else ""
+                print(f"  {_c(_OK, '✓')}  Stopped {killed_procs} leftover backend process{plural}")
+            else:
+                print(f"  {_c(_DIM, '     No backend processes were running.')}")
 
         print()
         if supervised_armed:
@@ -14620,6 +14645,54 @@ def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
             if role == "daemon-loop":
                 return True, pid, "", killed_serve_count
     return True, None, "daemon-loop did not appear within 5s", killed_serve_count
+
+
+def _disarm_supervisor_quiet() -> tuple[str, int]:
+    """Inverse of _arm_supervisor_quiet. Removes the Scheduled Task AND
+    kills every daemon-loop + --serve process. No terminal narration —
+    callers do their own.
+
+    Shared by the --pair N-branch (enforce "user said unsupervised") and
+    any future "reset supervisor" entry point. run_retire / run_unpair
+    still inline their own narration-rich versions since their step
+    reporting differs.
+
+    Returns (task_info, killed_count):
+      • task_info: "removed" | "missing" | "non-Windows" | error string
+      • killed_count: number of daemon-loop + serve procs stopped
+    """
+    import subprocess as _subprocess
+    import platform as _platform
+    import time as _time
+
+    task_info = "non-Windows"
+    if _platform.system() == "Windows":
+        cmd = ["schtasks", "/Delete", "/TN", _SUPERVISOR_TASK_NAME, "/F"]
+        try:
+            result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                task_info = "removed"
+            elif "cannot find the file" in (result.stdout + result.stderr).lower():
+                task_info = "missing"
+            else:
+                task_info = (result.stderr or result.stdout or "non-zero exit").strip()
+        except Exception as e:
+            task_info = f"schtasks error: {e}"
+
+    self_pid = os.getpid()
+    killed_total = 0
+    deadline = _time.time() + 8.0
+    while True:
+        procs = [p for p in _enumerate_research_py_procs() if p[0] != self_pid]
+        daemon_pids = [pid for pid, _cmd, role in procs if role == "daemon-loop"]
+        serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
+        if not daemon_pids and not serve_pids:
+            break
+        killed_total += _kill_pids(daemon_pids) + _kill_pids(serve_pids)
+        if _time.time() >= deadline:
+            break
+        _time.sleep(0.5)
+    return task_info, killed_total
 
 
 def run_resurrect():
@@ -14933,14 +15006,17 @@ def run_unpair():
     themselves live. --unpair is what the user runs when they're done with
     Super Research on this PC entirely.
 
-    Five-step reset:
-      1. Kill every daemon-loop + serve process; remove the supervised
-         scheduled task if installed (otherwise it auto-respawns serve and
-         re-heartbeats the token we're about to delete).
-      2. Delete users/{uid}/devices/{deviceId} so the device vanishes from
+    Five-step reset (order matters — config wipe FIRST to stop a
+    daemon-loop-respawned --serve from recreating the device doc moments
+    after step 3 deletes it):
+      1. Wipe local research_config.json (+ legacy pipe_config.json) and
+         zero in-memory caches. A respawned --serve now reads empty config
+         and bails in write_device_doc's `not uid or not token` guard.
+      2. Remove the scheduled task; kill every daemon-loop + serve process.
+         With config already wiped, lingering processes are harmless.
+      3. Delete users/{uid}/devices/{deviceId} so the device vanishes from
          the Account page device list.
-      3. Delete research_tokens/{token} so the token is gone project-wide.
-      4. Wipe local research_config.json (+ legacy pipe_config.json).
+      4. Delete research_tokens/{token} so the token is gone project-wide.
       5. Verify nothing survived."""
     import subprocess as _subprocess
     import platform as _platform
@@ -14974,8 +15050,44 @@ def run_unpair():
 
     total = 5
 
-    # ── [1/5] Stop supervisor + serve ──
-    _setup_step(1, total, "Stopping running processes")
+    # ── [1/5] Wipe local config FIRST ──
+    # Critical ordering: research_config.json must disappear BEFORE we kill
+    # + delete Firestore docs. A daemon-loop respawns --serve on a 5s loop
+    # (research.py:14495); if we killed processes first there's a window
+    # where a freshly-spawned --serve reads still-valid config, calls
+    # write_device_doc (which uses set({...}, merge=True) → CREATES), and
+    # resurrects the device doc moments after we deleted it. The user saw
+    # the tile "remove and readd" because of exactly this race. With the
+    # config wiped first, any respawned serve's load_paired_uid / token
+    # return None, so write_device_doc early-returns on the
+    # `not uid or not token` guard (research.py:792).
+    _setup_step(1, total, "Wiping local pairing config")
+    wiped = []
+    try:
+        if RESEARCH_CONFIG_PATH.exists():
+            RESEARCH_CONFIG_PATH.unlink()
+            wiped.append(RESEARCH_CONFIG_PATH.name)
+    except Exception as e:
+        print(f"  {_c(_WARN, '⚠')}  Could not delete {RESEARCH_CONFIG_PATH.name}: {e}")
+    try:
+        if _LEGACY_PIPE_CONFIG_PATH.exists():
+            _LEGACY_PIPE_CONFIG_PATH.unlink()
+            wiped.append(_LEGACY_PIPE_CONFIG_PATH.name)
+    except Exception:
+        pass
+    # Zero in-memory state too, so anything still running in this process
+    # can't re-read pre-wipe values from the global caches.
+    global _research_token, _device_id, _device_paired_uid
+    _research_token = None
+    _device_id = None
+    _device_paired_uid = None
+    if wiped:
+        print(f"  {_c(_OK, '✓')}  Deleted: {', '.join(wiped)}")
+    else:
+        print(f"  {_c(_DIM, '     No local config files to wipe.')}")
+
+    # ── [2/5] Stop supervisor + serve ──
+    _setup_step(2, total, "Stopping running processes")
     if _platform.system() == "Windows":
         cmd = ["schtasks", "/Delete", "/TN", _SUPERVISOR_TASK_NAME, "/F"]
         try:
@@ -14989,8 +15101,8 @@ def run_unpair():
         except Exception as e:
             print(f"  {_c(_WARN, '⚠')}  schtasks error (continuing): {e}")
 
-    # Mirror run_retire's loop-until-clean pattern so a daemon-loop mid-respawn
-    # of --serve still gets fully caught.
+    # Loop-until-clean pattern so a daemon-loop mid-respawn of --serve
+    # still gets fully caught.
     self_pid = os.getpid()
     killed_total = 0
     deadline = _time.time() + 8.0
@@ -15011,8 +15123,8 @@ def run_unpair():
     else:
         print(f"  {_c(_DIM, '     No backend processes were running.')}")
 
-    # ── [2/5] Delete device doc ──
-    _setup_step(2, total, "Removing device from your account")
+    # ── [3/5] Delete device doc ──
+    _setup_step(3, total, "Removing device from your account")
     if _firebase_db and paired_uid and device_id:
         try:
             _firebase_db.collection("users").document(paired_uid) \
@@ -15026,8 +15138,8 @@ def run_unpair():
     else:
         print(f"  {_c(_DIM, '     No paired account on this machine — nothing to remove.')}")
 
-    # ── [3/5] Delete token doc ──
-    _setup_step(3, total, "Revoking token from project")
+    # ── [4/5] Delete token doc ──
+    _setup_step(4, total, "Revoking token from project")
     if _firebase_db and token:
         try:
             _firebase_db.collection("research_tokens").document(token).delete()
@@ -15039,31 +15151,6 @@ def run_unpair():
         print(f"  {_c(_DIM, '        Re-run --unpair with network to finish.')}")
     else:
         print(f"  {_c(_DIM, '     No token on this machine — nothing to revoke.')}")
-
-    # ── [4/5] Wipe local config ──
-    _setup_step(4, total, "Wiping local pairing config")
-    wiped = []
-    try:
-        if RESEARCH_CONFIG_PATH.exists():
-            RESEARCH_CONFIG_PATH.unlink()
-            wiped.append(RESEARCH_CONFIG_PATH.name)
-    except Exception as e:
-        print(f"  {_c(_WARN, '⚠')}  Could not delete {RESEARCH_CONFIG_PATH.name}: {e}")
-    try:
-        if _LEGACY_PIPE_CONFIG_PATH.exists():
-            _LEGACY_PIPE_CONFIG_PATH.unlink()
-            wiped.append(_LEGACY_PIPE_CONFIG_PATH.name)
-    except Exception:
-        pass
-    if wiped:
-        print(f"  {_c(_OK, '✓')}  Deleted: {', '.join(wiped)}")
-    else:
-        print(f"  {_c(_DIM, '     No local config files to wipe.')}")
-    # Zero in-memory state too, in case anything re-reads within this process.
-    global _research_token, _device_id, _device_paired_uid
-    _research_token = None
-    _device_id = None
-    _device_paired_uid = None
 
     # ── [5/5] Verify ──
     _setup_step(5, total, "Confirming silence")
