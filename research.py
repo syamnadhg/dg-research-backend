@@ -613,15 +613,19 @@ def load_research_token():
 
 
 def generate_research_token():
-    """Generate a new ResearchToken, store it in Firestore + local config.
-    Called during --pair. Returns the token string."""
+    """Mint a new ResearchToken and register it in Firestore. Does NOT
+    persist it to research_config.json — the caller is expected to call
+    _persist_research_token_locally() only AFTER the pairing link is
+    confirmed, so a mid-pair Ctrl+C or timeout leaves no trace on disk.
+    The Firestore side is torn down by run_pair's abort cleanup if the
+    link never completes. Called during --pair; returns the token string.
+    """
     import uuid
     import socket
     global _research_token
     token = str(uuid.uuid4())
     machine_name = socket.gethostname()
 
-    # Store in Firestore
     if _firebase_db:
         try:
             from google.cloud.firestore import SERVER_TIMESTAMP
@@ -635,7 +639,17 @@ def generate_research_token():
         except Exception as e:
             log(f"Failed to register ResearchToken in Firestore: {e}", "WARN")
 
-    # Store locally
+    _research_token = token
+    return token
+
+
+def _persist_research_token_locally(token: str):
+    """Merge researchToken + machineName into research_config.json. Called
+    by --pair only after the app-side link is confirmed, so an aborted
+    setup never leaves a token on disk that re-runs would blindly reuse.
+    Safe to call on a reused token too (idempotent merge write)."""
+    import socket
+    machine_name = socket.gethostname()
     local_cfg = {}
     if RESEARCH_CONFIG_PATH.exists():
         try:
@@ -646,9 +660,6 @@ def generate_research_token():
     local_cfg["machineName"] = machine_name
     RESEARCH_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
     log(f"ResearchToken saved to {RESEARCH_CONFIG_PATH.name}")
-
-    _research_token = token
-    return token
 
 
 # ── Device registry (multi-device support) ─────────────────────────────────
@@ -13868,11 +13879,18 @@ async def run_pair(profile_dir, wait_minutes=10):
     chosen_device_name = _socket.gethostname()
 
     existing = load_research_token()
+    # Track whether we minted the token this run. If the user Ctrl+Cs or
+    # the wait loop times out below, we tear down a freshly-minted Firestore
+    # token doc so aborted setups leave no orphan behind. Reused tokens
+    # (from a prior successful --pair's local config) are preserved — the
+    # user is likely just retrying.
+    new_token_minted = False
     if existing:
         token = existing
         print(f"  {_c(_DIM, 'Reusing existing token')}  {_c(_DIM, '·')}  delete {RESEARCH_CONFIG_PATH.name} for a fresh one.")
     else:
         token = generate_research_token()
+        new_token_minted = True
         print(f"  {_c(_OK, 'Minted new token.')}")
 
     # Upsert in Firestore on every --pair run so a reused local token can't
@@ -13951,53 +13969,83 @@ async def run_pair(profile_dir, wait_minutes=10):
     wait_start_ts = time.time()
     frame_idx = 0
     POLL_EVERY_FRAMES = 30  # 30 × 100ms ≈ 3s (matches previous poll cadence)
-    while time.time() < link_deadline and linked_uid is None:
-        # Poll Firestore on frame 0 of each window
-        if frame_idx % POLL_EVERY_FRAMES == 0:
-            try:
-                doc = _firebase_db.collection("research_tokens").document(token).get()
-                if doc.exists:
-                    data = doc.to_dict() or {}
-                    _uid = data.get("linkedUid") or ""
-                    _email = data.get("linkedEmail") or ""
-                    _at = data.get("linkedAt")
-                    # linkedAt is a Firestore Timestamp — convert to ms-since-epoch.
-                    _at_ms = 0
-                    if _at is not None:
-                        try:
-                            _at_ms = int(_at.timestamp() * 1000)
-                        except Exception:
-                            _at_ms = 0
-                    # Accept the link only when all three fields are present AND
-                    # the claim is newer than this --pair started (prevents a
-                    # cached pre-run claim from auto-advancing). 30s skew tolerance
-                    # for server/client clock drift.
-                    if _uid and _email and _at_ms >= setup_started_ms - 30_000:
-                        linked_uid = _uid
-                        linked_email = _email
-                        break
-            except Exception as e:
-                if not first_err_logged:
-                    log(f"    Link poll error (continuing): {e}", "WARN")
-                    first_err_logged = True
-        # Advance spinner
-        frame = _SPINNER_FRAMES[frame_idx % len(_SPINNER_FRAMES)]
-        elapsed = int(time.time() - wait_start_ts)
-        mm, ss = divmod(elapsed, 60)
-        sys.stdout.write(
-            f"\r  {_c(_ACCENT, frame)}  {_c(_DIM, 'waiting for the app to pair…')}   "
-            f"{_c(_DIM, f'{mm:d}:{ss:02d}')}   {_c(_DIM, '(Ctrl+C to cancel)')}    "
-        )
-        sys.stdout.flush()
-        frame_idx += 1
-        await asyncio.sleep(0.1)
+    aborted_by_user = False
+
+    def _rollback_unclaimed_token():
+        """Delete the Firestore token doc we minted this run. Only called
+        from the abort/timeout paths when no link has been confirmed, so
+        there's no device doc or paired UID to worry about — the token
+        doc is the only Firestore state --pair has written so far."""
+        if not (new_token_minted and _firebase_db):
+            return
+        try:
+            _firebase_db.collection("research_tokens").document(token).delete()
+            log(f"Rolled back unclaimed token doc in Firestore: {token[:8]}…", "INFO")
+        except Exception as e:
+            log(f"Cleanup of unclaimed token doc failed (non-fatal): {e}", "WARN")
+
+    try:
+        while time.time() < link_deadline and linked_uid is None:
+            # Poll Firestore on frame 0 of each window
+            if frame_idx % POLL_EVERY_FRAMES == 0:
+                try:
+                    doc = _firebase_db.collection("research_tokens").document(token).get()
+                    if doc.exists:
+                        data = doc.to_dict() or {}
+                        _uid = data.get("linkedUid") or ""
+                        _email = data.get("linkedEmail") or ""
+                        _at = data.get("linkedAt")
+                        # linkedAt is a Firestore Timestamp — convert to ms-since-epoch.
+                        _at_ms = 0
+                        if _at is not None:
+                            try:
+                                _at_ms = int(_at.timestamp() * 1000)
+                            except Exception:
+                                _at_ms = 0
+                        # Accept the link only when all three fields are present AND
+                        # the claim is newer than this --pair started (prevents a
+                        # cached pre-run claim from auto-advancing). 30s skew tolerance
+                        # for server/client clock drift.
+                        if _uid and _email and _at_ms >= setup_started_ms - 30_000:
+                            linked_uid = _uid
+                            linked_email = _email
+                            break
+                except Exception as e:
+                    if not first_err_logged:
+                        log(f"    Link poll error (continuing): {e}", "WARN")
+                        first_err_logged = True
+            # Advance spinner
+            frame = _SPINNER_FRAMES[frame_idx % len(_SPINNER_FRAMES)]
+            elapsed = int(time.time() - wait_start_ts)
+            mm, ss = divmod(elapsed, 60)
+            sys.stdout.write(
+                f"\r  {_c(_ACCENT, frame)}  {_c(_DIM, 'waiting for the app to pair…')}   "
+                f"{_c(_DIM, f'{mm:d}:{ss:02d}')}   {_c(_DIM, '(Ctrl+C to cancel)')}    "
+            )
+            sys.stdout.flush()
+            frame_idx += 1
+            await asyncio.sleep(0.1)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # User Ctrl+C'd mid-wait. Swallow so we can run cleanup, then
+        # exit cleanly with a "cancelled" message instead of a noisy
+        # traceback. linked_uid is still None → rollback below handles it.
+        aborted_by_user = True
+
     # Clear the spinner line so the next print starts clean
     sys.stdout.write("\r" + " " * 78 + "\r")
     sys.stdout.flush()
 
     if linked_uid is None:
+        _rollback_unclaimed_token()
         print()
-        print(f"  {_c(_WARN, 'Timed out waiting for app pairing.')}")
+        if aborted_by_user:
+            print(f"  {_c(_WARN, 'Pair cancelled.')}")
+        else:
+            print(f"  {_c(_WARN, 'Timed out waiting for app pairing.')}")
+        if new_token_minted:
+            print(f"  {_c(_DIM, '     No token saved locally. Re-run to start fresh.')}")
+        else:
+            print(f"  {_c(_DIM, '     Your existing token is kept — re-run to try again.')}")
         print(f"  {_c(_DIM, 'Re-run when ready:')}  {_c(_BOLD, 'python research.py --pair')}")
         return
 
@@ -14010,6 +14058,11 @@ async def run_pair(profile_dir, wait_minutes=10):
         except Exception:
             linked_email = linked_uid[:8]
 
+    # Link confirmed — now safe to persist the token to research_config.json.
+    # Held off until this point so a mid-pair Ctrl+C / timeout leaves no
+    # researchToken on disk (the Firestore token doc is torn down by the
+    # abort path above when newly minted).
+    _persist_research_token_locally(token)
     # Pin the paired uid locally so --serve's heartbeat can mirror into the
     # device doc without re-reading Firestore. Also upsert the device doc so
     # the app's Account page + sidebar see this PC immediately.
