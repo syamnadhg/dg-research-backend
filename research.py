@@ -13817,27 +13817,19 @@ async def run_server(port=8000):
             except Exception:
                 pass
             _token_relink_watch = None
-        # Mark offline on shutdown. Stale heartbeat alone would tip the UI
-        # over to "offline" after ~20 min; touching status here lets the
-        # Account page reflect a clean shutdown immediately.
+        # Mark the token offline on shutdown as a hint — the authoritative
+        # online/offline signal is heartbeat age on the device doc, which
+        # ages past the 60s threshold naturally when the serve stops. We do
+        # NOT stamp a stale heartbeat on the device doc here: under
+        # daemon-loop supervision this finally block fires on every respawn
+        # cycle (e.g. port-bind crashloop), and the oscillation between
+        # fresh-heartbeat-on-start and stale-on-finally causes green↔red
+        # flicker in the UI.
         if _firebase_db and _research_token:
             try:
                 _firebase_db.collection("research_tokens").document(_research_token).update({"status": "offline"})
             except Exception:
                 pass
-            paired_uid = load_paired_uid()
-            device_id = load_device_id()
-            if paired_uid and device_id:
-                try:
-                    # Stamp a stale heartbeat (1 hour ago) so the UI treats
-                    # the device as offline instantly. Frontend status is
-                    # derived from heartbeat age, not a status field.
-                    _firebase_db.collection("users").document(paired_uid) \
-                        .collection("devices").document(device_id).update({
-                            "lastHeartbeat": int((time.time() - 3600) * 1000),
-                        })
-                except Exception:
-                    pass
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -13868,25 +13860,12 @@ async def run_pair(profile_dir, wait_minutes=10):
         return
 
     # ── Device display name ────────────────────────────────────────────────
-    # Ask what this PC should be called in the Account page / device
-    # selector. Default is the OS hostname (e.g. "SYAM-PC"). The chosen
-    # name is written to users/{uid}/devices/{deviceId}.name at the end
-    # of setup. On re-runs the user-edited name is preserved via the
-    # existing-field guard in write_device_doc — but a non-default choice
-    # here overrides it, matching the "setup takes the PC name" intent.
+    # Auto-named from the OS hostname (e.g. "SYAM-PC") and written to
+    # users/{uid}/devices/{deviceId}.name at the end of setup. The user
+    # renames it from the Account page if they want something else, so
+    # prompting for it in the terminal is redundant friction.
     import socket as _socket
-    _default_hostname = _socket.gethostname()
-    print("")
-    try:
-        _typed = await asyncio.to_thread(
-            input, f"  {_c(_DIM, 'Device name')} {_c(_DIM, '[')}{_c(_BOLD, _default_hostname)}{_c(_DIM, ']:')} ",
-        )
-    except (EOFError, KeyboardInterrupt):
-        _typed = ""
-    chosen_device_name = _typed.strip() or _default_hostname
-    if chosen_device_name != _default_hostname:
-        print(f"  {_c(_OK, '✓')}  Device will appear as {_c(_BOLD, chosen_device_name)}")
-    print("")
+    chosen_device_name = _socket.gethostname()
 
     existing = load_research_token()
     if existing:
@@ -14893,13 +14872,13 @@ def run_unpair():
     device_id = load_device_id()
     paired_email = _fetch_paired_email(paired_uid)
 
-    if not token and not paired_uid and not RESEARCH_CONFIG_PATH.exists():
-        print()
-        print(f"  {_c(_DIM, 'Nothing to unpair — this machine has no local pairing config.')}")
-        print(f"  {_c(_DIM, 'If the Super Research app still shows a stale device from this PC,')}")
-        print(f"  {_c(_DIM, 'remove it there via Account → Devices.')}")
-        print()
-        return
+    # NOTE: no "nothing to do" short-circuit here even when local config is
+    # missing. A prior --unpair (or manual config wipe) can leave orphan
+    # daemon-loop + serve processes and a scheduled task behind — those are
+    # the root cause of the "paired-but-serve-crash-looping" state. We want
+    # --unpair to ALWAYS run step 1 (process kill + schtasks removal) so
+    # re-running it is a guaranteed-clean cleanup. Steps 2-4 already no-op
+    # gracefully when the relevant state is missing.
 
     # Context strip — what's about to vanish.
     _render_context_strip([
