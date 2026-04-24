@@ -4338,88 +4338,26 @@ def stop_narrator():
     _narrator_task = None
 
 
-# ── Per-phase login probe (cookie-only, runs on every phase) ───────────
-# STEALTH-2026-04-19: each phase gates its entry on a cookie-level check
-# for the platforms it needs. Cookie check is free (no network, no tab
-# open, no CUA spend) so we run it on EVERY phase regardless of the
-# skipInitVerify preference — Phase 0 catches cold-start login gaps,
-# this catches mid-run session drift (~rare but real on multi-hour runs).
-# On miss: emit `login_required` + `fail_phase`; user resolves login on
-# their setup PC and taps Retry, we re-read cookies, move on.
+# ── Login URL negatives (shared between Phase 0 preflight + setup) ─────
+# Known login-wall host fragments. When the browser lands on one of
+# these after a navigation, the profile is not authenticated on that
+# platform. Cheap short-circuit before spending CUA.
 
-_PLATFORM_LABELS = {
-    "chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude",
-    "notebooklm": "NotebookLM", "youtube": "YouTube",
-    "gmail": "Gmail", "gdocs": "Google Docs",
-}
 _LOGIN_HOST_NEGATIVES = (
     "auth.openai.com", "accounts.google.com/signin",
     "login.live.com", "claude.ai/login", "claude.ai/signup",
 )
 
-
-async def await_phase_login_probe(
-    browser, cua_client, phase: int, platform_keys: list[str], pipeline_config,
-) -> str:
-    """Per-phase entry login gate — cookie-level only. Returns one of:
-        'ok'      — all platforms' session cookies present
-        'skip'    — user bypassed after seeing missing logins
-        'stop'    — user hit Stop on the alert
-        'timeout' — no user response within 1h
-
-    Runs on every phase, regardless of skipInitVerify. cookie_login_hit
-    is a pure read against the persistent profile's cookie store (no
-    navigation, no CUA), so the cost per phase entry is negligible.
-    On miss: emits `login_required` + `fail_phase` and awaits the
-    user's decision — matches the Phase 0 login_required UX.
-
-    `cua_client` and `pipeline_config` are unused here (kept in the
-    signature for call-site compat; vision-level verification only
-    happens in Phase 0 and in the --pair script)."""
-    del cua_client, pipeline_config  # unused — cookie-only probe
-    if not platform_keys:
-        return "ok"
-    attempt = 0
-    while True:
-        attempt += 1
-        missing_keys: list[str] = []
-        for key in platform_keys:
-            try:
-                if not await cookie_login_hit(browser, key):
-                    missing_keys.append(key)
-            except Exception:
-                missing_keys.append(key)
-        if not missing_keys:
-            if attempt > 1:
-                emit_event("pipeline_resumed", phase=phase, reason="login_cookie_pass")
-            return "ok"
-        missing_labels = [_PLATFORM_LABELS.get(k, k) for k in missing_keys]
-        emit_event(
-            "login_required",
-            phase=phase,
-            platforms=missing_keys,
-            platformLabels=missing_labels,
-            machineName=socket.gethostname(),
-            attempt=attempt,
-            message=f"Log into {', '.join(missing_labels)} on your setup PC, then tap Retry.",
-        )
-        fail_phase(
-            phase=phase,
-            error=f"Login required: {', '.join(missing_labels)}",
-            reason=(
-                f"Phase {phase} needs an active session cookie for {', '.join(missing_labels)}. "
-                "Log in on your setup PC (your existing browser) — once the session cookie is "
-                "written, tap Retry to re-check. Skip proceeds anyway; the phase will raise a "
-                "fresh alert if it hits a real login wall."
-            ),
-            agent="system",
-        )
-        decision = await _controls.await_phase_decision(phase)
-        if decision == "retry":
-            log(f"Phase {phase}: user retry on cookie probe — re-checking", "INFO")
-            emit_event("phase_restart", phase=phase, reason="user_retry_login_probe", attempt=attempt)
-            continue
-        return decision  # skip | stop | timeout
+# NOTE (2026-04-24): `await_phase_login_probe` used to live here as a
+# per-phase cookie-only gate called at the start of Phases 1-5. It
+# turned every transient cookie blip into a mid-run `login_required`
+# banner even when Phase 0 had just verified successfully. The layer
+# is deleted — Phase 0 is now the single source of truth for login
+# state. If a session really drifts mid-run, the phase's own driving
+# code (ChatGPT navigation, NotebookLM upload, etc.) will surface a
+# concrete failure through fail_phase with a specific reason, which
+# the existing PhaseAlertPanel handles without the generic
+# "Login required" noise.
 
 
 async def scrape_progress_chatgpt(page):
@@ -11891,17 +11829,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if _controls.skip_init_verify:
                     _global_skip = True
                     break
-                # FAST-PATH: cookie signature hit means trusted logged-in
-                # state — skip tab open + CUA entirely. ~80% wall-clock
-                # cut on warm profiles where sessions already persist.
+                # NOTE: the cookie-only fast path was removed (2026-04-24).
+                # Stale auth cookies stayed in the profile after a session
+                # had been invalidated server-side; cookie_login_hit returned
+                # True for those, Phase 0 checked "ok" without opening a tab,
+                # and Phase 1 then blew up trying to drive a logged-out
+                # ChatGPT. Phase 0 is the one source-of-truth gate for
+                # Phases 1-5 — it has to actually talk to the platform.
+                #
+                # The flow below still stays cheap for the warm-profile case:
+                #   - Cookie probe (free) informs a log line but doesn't
+                #     short-circuit the verification.
+                #   - Tab open + Playwright DOM check (strict positive
+                #     match) handles the common logged-in case without any
+                #     CUA spend.
+                #   - CUA only fires when DOM is ambiguous or the URL is on
+                #     a known login host.
+                _cookie_hit = False
                 try:
-                    if await cookie_login_hit(browser, key):
-                        log(f"Phase 0: {label} cookie hit — skipping CUA verify", "INFO")
-                        emit_event("agent_progress", phase=0, agent=key,
-                                   status="ok", progress=f"{label}: logged in ✓ (cookie)")
-                        break  # move to next platform
+                    _cookie_hit = await cookie_login_hit(browser, key)
                 except Exception:
-                    pass
+                    _cookie_hit = False
                 # STEALTH-2026-04-19: jitter between cold-start tab opens.
                 # Back-to-back opens in <2s are a strong robotic signal.
                 if _pf_opened > 0 and key not in _preflight_tabs:
@@ -11937,8 +11885,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         log(f"Phase 0: {label} on login URL ({current_url[:60]}) — not logged in", "INFO")
                         ok = False
                     else:
-                        # Primary gate: CUA vision verification.
-                        ok = await verify_login_cua(tab, key, cua_client)
+                        # Second cheap gate before spending CUA: Playwright
+                        # DOM check in strict mode. Returns True only on a
+                        # clear positive signal (platform-specific marker
+                        # like a "New chat" button). Ambiguity / negative
+                        # signals return False and we fall to CUA to
+                        # decide. Saves ~one CUA call per logged-in
+                        # platform on warm profiles.
+                        try:
+                            playwright_ok = await verify_login(tab, key, strict=True)
+                        except Exception:
+                            playwright_ok = False
+                        if playwright_ok:
+                            _source = "cookie+DOM" if _cookie_hit else "DOM"
+                            log(f"Phase 0: {label} DOM markers present — logged in via {_source}", "INFO")
+                            ok = True
+                        else:
+                            # DOM ambiguous or negative — escalate to CUA.
+                            ok = await verify_login_cua(tab, key, cua_client)
                 except CuaUnavailableError as cua_err:
                     # Structural Anthropic failure (billing cap / invalid
                     # key / 529). Surface a distinct alert so the user
@@ -12124,14 +12088,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
             _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
             _p1_start = time.time()
-            # STEALTH-2026-04-19: Per-phase cookie-level login probe. Runs on
-            # every phase (cheap — no tabs, no CUA). On miss, surfaces login_required +
-            # Retry/Skip so Phase 1 doesn't flail into a logged-out
-            # ChatGPT landing.
-            _p1_probe = await await_phase_login_probe(browser, cua_client, 1, ["chatgpt"], pipeline_config)
-            if _p1_probe in ("stop", "timeout"):
-                emit_event("pipeline_stopped", phase=1, reason=f"user_{_p1_probe}_login_probe")
-                return
+            # Per-phase login probe removed (2026-04-24). Phase 0 is now
+            # the single source of truth for login state — if Phase 0
+            # marked a platform "ok" (cookie + DOM or CUA verdict), we
+            # trust it and proceed. On real session drift mid-run, the
+            # phase's own navigation + scraping will surface a real
+            # failure through fail_phase, which the alert panel handles.
             # ARCHITECTURE 2026-04-18: Never-die retry loop. Any fail_phase
             # inside this block awaits the user's Retry/Skip/Stop decision
             # via _controls.await_phase_decision(1). Retry loops back; Skip
@@ -12366,12 +12328,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             for da in disabled_agents:
                 emit_event("agent_skipped", phase=2, agent=da)
             _p2_start = time.time()
-            # STEALTH-2026-04-19: Cookie-level login probe for each enabled agent.
-            # Runs on every phase regardless of skipInitVerify (cheap cookie read).
-            _p2_probe = await await_phase_login_probe(browser, cua_client, 2, list(enabled_agents), pipeline_config)
-            if _p2_probe in ("stop", "timeout"):
-                emit_event("pipeline_stopped", phase=2, reason=f"user_{_p2_probe}_login_probe")
-                return
+            # Per-phase login probe removed (2026-04-24) — Phase 0 is the
+            # single login gate. See the matching note in the Phase 1
+            # block above.
             fb2 = get_feedback(2)
             # Use BriefArtifact for full verified paste (never the "already_sent" heuristic)
             research_brief = (brief_artifact.text if brief_artifact else brief_text)
@@ -12757,12 +12716,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
             _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
             _p3_start = time.time()
-            # STEALTH-2026-04-19: Cookie-level login probe. Runs on every
-            # phase regardless of skipInitVerify (cheap cookie read).
-            _p3_probe = await await_phase_login_probe(browser, cua_client, 3, ["notebooklm"], pipeline_config)
-            if _p3_probe in ("stop", "timeout"):
-                emit_event("pipeline_stopped", phase=3, reason=f"user_{_p3_probe}_login_probe")
-                return
+            # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             if not results:
                 for md_file in md_files:
                     stem = md_file.stem.lower()
@@ -12887,12 +12841,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=4, description="Converting audio to video + YouTube upload", agents=["youtube"])
             _update_firestore_research({"phase": 4, "currentPhase": 4, "status": "ongoing"})
             _p4_start = time.time()
-            # STEALTH-2026-04-19: Cookie-level login probe. Runs on every
-            # phase regardless of skipInitVerify (cheap cookie read).
-            _p4_probe = await await_phase_login_probe(browser, cua_client, 4, ["youtube"], pipeline_config)
-            if _p4_probe in ("stop", "timeout"):
-                emit_event("pipeline_stopped", phase=4, reason=f"user_{_p4_probe}_login_probe")
-                return
+            # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             if audio_path:
                 p5 = await run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                                        links=links, notebook_url=notebook_url, verbose=verbose)
@@ -12991,12 +12940,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=5, description="Creating Google Doc hub + sending email notification", agents=["gdocs", "gmail"])
             _update_firestore_research({"phase": 5, "currentPhase": 5, "status": "ongoing"})
             _p5_start = time.time()
-            # STEALTH-2026-04-19: Cookie-level login probe for Gmail + Google Docs.
-            # Runs on every phase regardless of skipInitVerify (cheap cookie read).
-            _p5_probe = await await_phase_login_probe(browser, cua_client, 5, ["gdocs", "gmail"], pipeline_config)
-            if _p5_probe in ("stop", "timeout"):
-                emit_event("pipeline_stopped", phase=5, reason=f"user_{_p5_probe}_login_probe")
-                return
+            # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             # Use audio overview URL if extracted, else notebook URL as fallback
             _effective_audio_url = audio_overview_url if audio_overview_url else notebook_url
             p6 = await run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
