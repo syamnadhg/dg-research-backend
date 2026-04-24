@@ -575,6 +575,38 @@ RESEARCH_CONFIG_PATH = Path(__file__).parent / "research_config.json"
 _LEGACY_PIPE_CONFIG_PATH = Path(__file__).parent / "pipe_config.json"
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Atomic JSON dump: write to a sibling temp file, os.replace onto the
+    target. Guarantees readers in another process/thread never see a
+    partial or truncated file — os.replace is atomic on Windows + POSIX
+    when source and destination are on the same volume (which they are,
+    same directory). Prevents the "concurrent --pair + serve heartbeat +
+    daemon-loop respawn" race where a reader would catch mid-write garbage,
+    json.loads would throw, the reader's subsequent save_device_config
+    would write back with a default-{} config, wiping deviceId, and the
+    next write_device_doc call would mint a new deviceId → duplicate
+    device doc in Firestore."""
+    import tempfile
+    parent = str(path.parent)
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
 def load_research_token():
     """Load ResearchToken from local research_config.json (or RESEARCH_TOKEN env var).
     Returns the token string or None if not set up yet.
@@ -597,7 +629,7 @@ def load_research_token():
                 "machineName": legacy.get("machineName", ""),
             }
             if migrated["researchToken"]:
-                RESEARCH_CONFIG_PATH.write_text(json.dumps(migrated, indent=2), encoding="utf-8")
+                _atomic_write_json(RESEARCH_CONFIG_PATH, migrated)
                 log(f"Migrated pipe_config.json → research_config.json")
         except Exception as e:
             log(f"Migration of pipe_config.json failed: {e}", "WARN")
@@ -658,7 +690,7 @@ def _persist_research_token_locally(token: str):
             pass
     local_cfg["researchToken"] = token
     local_cfg["machineName"] = machine_name
-    RESEARCH_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
+    _atomic_write_json(RESEARCH_CONFIG_PATH, local_cfg)
     log(f"ResearchToken saved to {RESEARCH_CONFIG_PATH.name}")
 
 
@@ -719,7 +751,7 @@ def save_device_config(device_id: str | None = None, paired_uid: str | None = No
     if paired_uid:
         local_cfg["pairedUid"] = paired_uid
         _device_paired_uid = paired_uid
-    RESEARCH_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
+    _atomic_write_json(RESEARCH_CONFIG_PATH, local_cfg)
 
 
 def clear_paired_uid():
@@ -741,7 +773,7 @@ def clear_paired_uid():
         return
     local_cfg.pop("pairedUid", None)
     try:
-        RESEARCH_CONFIG_PATH.write_text(json.dumps(local_cfg, indent=2), encoding="utf-8")
+        _atomic_write_json(RESEARCH_CONFIG_PATH, local_cfg)
     except Exception as e:
         log(f"Could not clear pairedUid from config: {e}", "WARN")
 
