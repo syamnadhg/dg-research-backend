@@ -568,7 +568,13 @@ def init_firebase():
 
 
 _start_listener = None  # Global start-command listener
-_heartbeat_task = None  # Async task: writes lastHeartbeat every 30s
+_heartbeat_task = None  # Async task: writes lastHeartbeat every 15s
+# Heartbeat cadence. Paired with the frontend's 35s offline threshold (at
+# `DEVICE_OFFLINE_THRESHOLD_MS` in web/src/lib/firestore.ts) so that
+# missing 2 consecutive ticks plus a 5s slack flips the UI to offline.
+# Tightened from 30s/60s to shrink the "device killed → tile reflects it"
+# gap (user-visible in Sidebar dot + Account tile + startPipeline gate).
+HEARTBEAT_INTERVAL_SEC = 15
 
 RESEARCH_CONFIG_PATH = Path(__file__).parent / "research_config.json"
 # Legacy path — auto-migrated on first load so existing users don't lose their token.
@@ -918,7 +924,7 @@ async def _heartbeat_loop():
                         pass
         except Exception as e:
             log(f"Heartbeat write failed: {e}", "WARN")
-        await asyncio.sleep(30)
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
 
 
 _token_relink_watch = None  # Firestore Watch handle; kept for lifetime cleanup
@@ -13722,7 +13728,7 @@ async def run_server(port=8000):
     heartbeat_task = None
     if token and _firebase_db:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
-        log("Heartbeat started (30s interval)")
+        log(f"Heartbeat started ({HEARTBEAT_INTERVAL_SEC}s interval)")
         # Refresh the paired device doc so the Account page sees this PC
         # online immediately on server start. If pairedUid isn't pinned yet
         # (pre-multi-device config), resolve it from the token's linkedUid.
@@ -13815,7 +13821,7 @@ async def run_server(port=8000):
         ("Paired to", _c(_BOLD, _paired_email or "(not paired)")),
         ("Token",     token_val),
         ("Local API", _c(_BOLD, f"http://0.0.0.0:{port}")),
-        ("Heartbeat", _c(_BOLD, "30s cadence")),
+        ("Heartbeat", _c(_BOLD, f"{HEARTBEAT_INTERVAL_SEC}s cadence")),
     ])
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
