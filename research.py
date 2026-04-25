@@ -5832,11 +5832,17 @@ async def verify_chatgpt_generating(page) -> bool:
                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
                 if (label.includes('stop')) return true;
             }
-            // Body-level DR keyword sweep — the host page shows "Researching"/
-            // "Sources found" banners even when the card lives in the iframe.
+            // Body-level DR keyword sweep — narrowed to present-progressive
+            // phrases that don't survive the finished response. Removed
+            // 'deep research' (the model badge persists), 'sources found'
+            // (appears in finished summary), 'researching' (could be in any
+            // narrative). Kept the unambiguous in-progress phrases.
             const bl = (document.body?.innerText || '').toLowerCase();
-            const hostKws = ['researching', 'sources found', 'sources and counting',
-                             'deep research', 'searching the web', 'reading sources'];
+            // Strong done signal: "Thought for X seconds" badge renders only
+            // AFTER the thinking phase completes. With no Stop button found
+            // above, its presence means the response is fully settled.
+            if (bl.includes('thought for ')) return false;
+            const hostKws = ['sources and counting', 'searching the web', 'reading sources'];
             if (hostKws.some(k => bl.includes(k))) return true;
             return !!document.querySelector('.result-streaming, [data-is-streaming="true"]');
         }""")
@@ -5870,14 +5876,22 @@ async def verify_chatgpt_generating(page) -> bool:
                                 '[role="progressbar"], [class*="progress"], [class*="spinner"], ' +
                                 '[class*="loading"], [data-is-streaming="true"]'
                             )) return true;
-                            // Active keywords
                             const bl = (document.body?.innerText || '').toLowerCase();
-                            const kws = ['researching', 'searching', 'reading sources',
-                                         'sources found', 'sources and counting',
-                                         'analyzing', 'browsing'];
+                            // Strong done signal: "Thought for X seconds" badge
+                            // renders only AFTER thinking completes. With no Stop
+                            // button or spinner detected above, its presence means
+                            // the response is settled — treat as definitively done.
+                            if (bl.includes('thought for ')) return false;
+                            // Active keywords (narrowed): the previous list matched
+                            // present and past tense alike (e.g. 'searching' in
+                            // "After searching the web…", 'browsing' in "browsed
+                            // 47 sources"). Kept only present-progressive phrases
+                            // that rarely appear in the finished response. Most
+                            // importantly: the old "length > 200" fallback is
+                            // gone — the rendered brief itself is well over 200
+                            // chars, which used to pin the detector True forever.
+                            const kws = ['reading sources', 'sources and counting'];
                             if (kws.some(k => bl.includes(k))) return true;
-                            // Non-trivial body content = the DR card rendered something
-                            if ((document.body?.innerText || '').length > 200) return true;
                             return false;
                         }""")
                         if active:
