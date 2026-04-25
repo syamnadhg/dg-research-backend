@@ -47,7 +47,13 @@ API_HEIGHT = int(os.environ.get("CUA_SCREEN_HEIGHT", "800"))
 
 # Polling intervals (override via env for testing with shorter waits)
 POLL_PRO = int(os.environ.get("POLL_PRO", "30"))                 # seconds
-POLL_DEEP_RESEARCH = int(os.environ.get("POLL_DEEP_RESEARCH", "30"))  # seconds
+# 2026-04-25: P2 round-robin completion-check cadence. Bumped from 30→120s
+# to reduce bot-flag risk (rapid tab-switching at 30s intervals can look
+# bot-like to ChatGPT/Gemini/Claude) and to give the BE more time to scrape
+# rich state per cycle. Narration cadence is independent (Gemini Flash
+# narrator runs every 6s during P1/P2 from the event ring buffer), so this
+# does NOT slow down the FE phase-dropdown narration.
+POLL_DEEP_RESEARCH = int(os.environ.get("POLL_DEEP_RESEARCH", "120"))  # seconds
 MAX_WAIT_PRO = int(os.environ.get("MAX_WAIT_PRO", "45"))         # minutes — Phase 1
 MAX_WAIT_DEEP = int(os.environ.get("MAX_WAIT_DEEP", "90"))       # minutes — Phase 2
 
@@ -4858,8 +4864,16 @@ SCRAPE_FNS = {
 
 async def detect_completion_chatgpt(page):
     """ChatGPT Deep Research completion detector. Playwright-only.
-    Returns (done, reason). Checks both host page and the cross-origin DR
-    iframe for Stop button + completion text."""
+    Returns (done, reason, snap) where snap = {text_len, sources, steps}.
+
+    2026-04-25 strictness rewrite: detector returns done=True ONLY when:
+      • Stop button is gone (host AND iframe)
+      • "Thought for X seconds" badge present (definitive done marker)
+    The previous `partial_len > 5000` fallback was a known false-positive
+    path (fired mid-stream during long research). Removed entirely. The
+    caller is responsible for the 2-cycle flatness gate (text/sources/steps
+    all flat across 2 polling cycles) before extracting — we only report
+    the snapshot here, never decide on flatness."""
     try:
         host = await page.evaluate("""() => {
             let hasStop = !!document.querySelector(
@@ -4874,19 +4888,27 @@ async def detect_completion_chatgpt(page):
                     }
                 }
             }
-            const bl = (document.body?.innerText || '').toLowerCase();
-            const doneKws = ['research completed', 'research complete',
-                             'finished research', 'deep research completed'];
-            const hasDoneText = doneKws.some(k => bl.includes(k));
+            const bl = (document.body?.innerText || '');
+            // "Thought for X seconds" badge — renders only AFTER thinking
+            // phase completes. With Stop button gone + this badge present,
+            // we're as confident as we can be that DR is fully settled.
+            const thoughtFor = /thought for\\s+\\d/i.test(bl);
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-            let hostLen = 0;
-            if (msgs.length > 0) hostLen = msgs[msgs.length-1].innerText.length;
-            return { hasStop, hasDoneText, hostLen };
+            const hostLen = msgs.length ? msgs[msgs.length-1].innerText.length : 0;
+            // Sources count: external citation links anywhere on the page
+            const sources = document.querySelectorAll('a[href^="http"][target="_blank"]').length;
+            // Steps: research card list items (the rotating step list)
+            const steps = document.querySelectorAll(
+                '[class*="research"] li, [class*="step"], [class*="task"]'
+            ).length;
+            return { hasStop, thoughtFor, hostLen, sources, steps };
         }""")
 
         iframe_stop = False
-        iframe_done = False
+        iframe_thought = False
         iframe_len = 0
+        iframe_sources = 0
+        iframe_steps = 0
         try:
             for frame in page.frames:
                 try:
@@ -4905,19 +4927,22 @@ async def detect_completion_chatgpt(page):
                                 if (t === 'stop' || t === 'stop research' ||
                                     al.includes('stop')) { hasStop = true; break; }
                             }
-                            const bl = (document.body?.innerText || '').toLowerCase();
-                            const doneKws = ['research completed', 'finished research',
-                                             'deep research completed'];
-                            return {
-                                hasStop,
-                                done: doneKws.some(k => bl.includes(k)),
-                                len:  (document.body?.innerText || '').length
-                            };
+                            const bl = (document.body?.innerText || '');
+                            const thoughtFor = /thought for\\s+\\d/i.test(bl);
+                            const sources = document.querySelectorAll(
+                                'a[href^="http"][target="_blank"]'
+                            ).length;
+                            const steps = document.querySelectorAll(
+                                '[class*="research"] li, [class*="step"], [class*="task"]'
+                            ).length;
+                            return { hasStop, thoughtFor, len: bl.length, sources, steps };
                         }""")
                         if data:
                             iframe_stop = bool(data.get("hasStop"))
-                            iframe_done = bool(data.get("done"))
+                            iframe_thought = bool(data.get("thoughtFor"))
                             iframe_len = int(data.get("len") or 0)
+                            iframe_sources = int(data.get("sources") or 0)
+                            iframe_steps = int(data.get("steps") or 0)
                     except Exception:
                         pass
                     break
@@ -4925,23 +4950,31 @@ async def detect_completion_chatgpt(page):
             pass
 
         has_stop = host["hasStop"] or iframe_stop
-        partial_len = max(host["hostLen"], iframe_len)
-        has_done = host["hasDoneText"] or iframe_done
+        has_thought_for = bool(host.get("thoughtFor")) or iframe_thought
+        partial_len = max(int(host.get("hostLen") or 0), iframe_len)
+        sources = max(int(host.get("sources") or 0), iframe_sources)
+        steps = max(int(host.get("steps") or 0), iframe_steps)
+        snap = {"text_len": partial_len, "sources": sources, "steps": steps}
 
         if has_stop:
-            return (False, f"stop_btn_present (partial_len={partial_len}, iframe_stop={iframe_stop})")
-        if has_done:
-            return (True, f"no_stop + done_text (partial_len={partial_len})")
-        if partial_len > 5000:
-            return (True, f"no_stop + partial_len={partial_len}>5000")
-        return (False, f"no_stop but partial_len={partial_len}<=5000")
+            return (False, f"stop_btn_present (text={partial_len}, src={sources}, st={steps})", snap)
+        if not has_thought_for:
+            return (False, f"no_done_marker (Thought-for badge missing)", snap)
+        return (True, f"no_stop + thought_for_badge", snap)
     except Exception as e:
-        return (False, f"detect_error: {e}")
+        return (False, f"detect_error: {e}", {})
 
 
 async def detect_completion_claude(page):
     """Claude Research completion detector. Playwright-only.
-    Returns (done, reason). Uses 2-artifact signal + text markers + heading check."""
+    Returns (done, reason, snap) where snap = {text_len, sources, steps}.
+
+    2026-04-25 strictness rewrite: detector returns done=True ONLY when:
+      • Stop button gone + no live "sources and counting" indicator
+      • "research completed" text present OR research-card status='complete'
+    Removed: artifacts>=2 fallback (Claude legitimately produces 2 artifacts
+    pre-final), text_len>8000+heading fallback (mid-stream summary headings
+    can match). Caller handles 2-cycle flatness."""
     try:
         data = await page.evaluate("""() => {
             let hasStop = false;
@@ -4958,29 +4991,12 @@ async def detect_completion_claude(page):
             )) hasStop = true;
 
             const bodyText = document.body?.innerText || '';
-            const doneM = bodyText.match(/research\\s+completed(?:\\s+in\\s+[\\dhms]+)?/i);
-            const researchDone = !!doneM;
-            const liveM = bodyText.match(/\\d[\\d,]*\\s+sources?\\s+and\\s+counting/i);
-            const liveActive = !!liveM;
-
-            let artifactCount = 0;
-            const sels = [
-                'button[data-testid*="artifact"]',
-                '[data-testid*="artifact-preview"]',
-                '.artifact-card', '.artifact-preview',
-                'button[data-artifact-id]',
-                '[class*="artifact"][role="button"]',
-            ];
-            for (const sel of sels) {
-                const f = document.querySelectorAll(sel);
-                if (f.length > 0) { artifactCount = f.length; break; }
-            }
-            if (artifactCount === 0) {
-                artifactCount = document.querySelectorAll(
-                    '.font-claude-message button[class*="block"], ' +
-                    '.font-claude-message [class*="artifact"]'
-                ).length;
-            }
+            const researchDone = /research\\s+completed(?:\\s+in\\s+[\\dhms]+)?/i.test(bodyText);
+            const liveActive = /\\d[\\d,]*\\s+sources?\\s+and\\s+counting/i.test(bodyText);
+            // Claude's research card flips status when streaming ends.
+            const researchCardDone = !!document.querySelector(
+                '[data-research-status="complete"], [data-research-state="done"]'
+            );
 
             let textLen = 0;
             const msgs = document.querySelectorAll('.font-claude-message, .contents .prose');
@@ -4994,43 +5010,42 @@ async def detect_completion_claude(page):
             );
             if (researchCard) textLen = Math.max(textLen, (researchCard.innerText || '').length);
 
-            const hs = Array.from(document.querySelectorAll(
-                '.font-claude-message h1, .font-claude-message h2, .font-claude-message h3, ' +
-                'aside h1, aside h2, aside h3, ' +
-                '[class*="artifact"] h1, [class*="artifact"] h2'
-            )).map(h => (h.innerText || '').trim().toLowerCase());
-            const hasSummaryHeading = hs.some(h =>
-                h.includes('summary') || h.includes('conclusion') ||
-                h.includes('executive') || h.includes('overview')
-            );
-            return { hasStop, researchDone, liveActive, artifactCount, textLen, hasSummaryHeading };
+            const sources = document.querySelectorAll(
+                '.font-claude-message a[href^="http"], aside a[href^="http"]'
+            ).length;
+            const steps = document.querySelectorAll(
+                '[class*="research"] li, [class*="step"]'
+            ).length;
+            return { hasStop, researchDone, researchCardDone, liveActive,
+                     textLen, sources, steps };
         }""")
 
-        if data["liveActive"]:
-            return (False, f"live_sources_counting (artifacts={data['artifactCount']}, partial_len={data['textLen']})")
-        if data["hasStop"]:
-            return (False, f"stop_btn_present (artifacts={data['artifactCount']}, partial_len={data['textLen']})")
+        text_len = int(data.get("textLen") or 0)
+        sources = int(data.get("sources") or 0)
+        steps = int(data.get("steps") or 0)
+        snap = {"text_len": text_len, "sources": sources, "steps": steps}
 
-        artifacts = int(data["artifactCount"])
-        text_len = int(data["textLen"])
-        done_text = bool(data["researchDone"])
-        has_heading = bool(data["hasSummaryHeading"])
-
-        if artifacts >= 2:
-            return (True, f"no_stop + artifacts={artifacts}>=2 (partial_len={text_len})")
-        if done_text:
-            return (True, f"no_stop + done_text (partial_len={text_len}, artifacts={artifacts})")
-        if text_len > 8000 and has_heading:
-            return (True, f"no_stop + partial_len={text_len}>8000 + summary_heading (artifacts={artifacts})")
-        return (False, f"no_stop insufficient (artifacts={artifacts}, partial_len={text_len}, heading={has_heading})")
+        if data.get("liveActive"):
+            return (False, f"live_sources_counting", snap)
+        if data.get("hasStop"):
+            return (False, f"stop_btn_present (text={text_len})", snap)
+        if not (data.get("researchDone") or data.get("researchCardDone")):
+            return (False, f"no_done_marker (no research_complete text/card)", snap)
+        return (True, f"no_stop + research_complete_marker", snap)
     except Exception as e:
-        return (False, f"detect_error: {e}")
+        return (False, f"detect_error: {e}", {})
 
 
 async def detect_completion_gemini(page):
     """Gemini Deep Research completion detector. Playwright-only.
-    Returns (done, reason). Honors the planning gate — Start-research button
-    visible → NOT started yet → never complete."""
+    Returns (done, reason, snap) where snap = {text_len, sources, steps}.
+
+    2026-04-25 strictness rewrite: done=True ONLY when:
+      • Stop button gone + Start-research button gone (post-planning)
+      • Share & Export button visible (definitive done — only renders
+        after research finishes)
+    Removed: text_len>5000+!active_kw fallback (transient no-active-keyword
+    windows mid-stream caused false positives). Caller handles 2-cycle flat."""
     try:
         data = await page.evaluate("""() => {
             let hasStop = false;
@@ -5075,32 +5090,29 @@ async def detect_completion_gemini(page):
             const responses = document.querySelectorAll('message-content, .model-response-text');
             if (responses.length > 0) textLen = responses[responses.length-1].innerText.length;
 
-            const bl = (document.body?.innerText || '').toLowerCase();
-            const activeKws = ['researching', 'searching the web', 'analyzing sources',
-                               'reading sources', 'browsing the web', 'gathering sources'];
-            const hasActiveKw = activeKws.some(k => bl.includes(k));
-
-            return { hasStop, hasStartBtn, hasShareExport, textLen, hasActiveKw };
+            const sources = document.querySelectorAll(
+                'message-content a[href^="http"]'
+            ).length;
+            const steps = document.querySelectorAll(
+                '[class*="research-step"], [class*="thought"]'
+            ).length;
+            return { hasStop, hasStartBtn, hasShareExport, textLen, sources, steps };
         }""")
 
-        if data["hasStartBtn"]:
-            return (False, "start_research_btn_visible (pre-research)")
-        if data["hasStop"]:
-            return (False, f"stop_btn_present (partial_len={data['textLen']})")
+        text_len = int(data.get("textLen") or 0)
+        sources = int(data.get("sources") or 0)
+        steps = int(data.get("steps") or 0)
+        snap = {"text_len": text_len, "sources": sources, "steps": steps}
 
-        text_len = int(data["textLen"])
-        has_share = bool(data["hasShareExport"])
-        active_kw = bool(data["hasActiveKw"])
-
-        if has_share:
-            return (True, f"no_stop + share/export_visible (partial_len={text_len})")
-        if text_len > 5000 and not active_kw:
-            return (True, f"no_stop + partial_len={text_len}>5000 + no_active_kw")
-        if text_len > 5000 and active_kw:
-            return (False, f"no_stop but active_kw present (partial_len={text_len})")
-        return (False, f"no_stop insufficient (partial_len={text_len}, active_kw={active_kw})")
+        if data.get("hasStartBtn"):
+            return (False, "start_research_btn_visible (pre-research)", snap)
+        if data.get("hasStop"):
+            return (False, f"stop_btn_present (text={text_len})", snap)
+        if not data.get("hasShareExport"):
+            return (False, f"no_done_marker (Share/Export button missing)", snap)
+        return (True, f"no_stop + share_export_visible", snap)
     except Exception as e:
-        return (False, f"detect_error: {e}")
+        return (False, f"detect_error: {e}", {})
 
 
 DETECT_FNS = {
@@ -6167,16 +6179,19 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     consecutive_not_generating = 0
     cua_checked = False
     last_heartbeat = time.time()
-    # Stall detector: catches "ChatGPT alive but no new text" mid-stream
-    # freezes. The deadline ceiling (`_await_phase_with_active_deadline`)
-    # is the ultimate net but burns the full PHASE_*_MAX_MIN budget on a
-    # frozen agent. By tracking text-length growth we can surface the
-    # recoverable [Retry, Skip] alert ~25 min sooner. Fires only when the
-    # detector still claims "generating" — a genuinely-done response is
+    # Stall detector — multi-signal (2026-04-25 strictness rewrite):
+    # tracks text + sources + steps. ChatGPT DR's "researching" phase
+    # legitimately produces zero text growth for 5-15 min while sources
+    # and steps accumulate, so a text-only stall detector false-fired
+    # during normal in-progress work. Now stall fires only when ALL
+    # THREE signals flatline for 20 min (was 10 min text-only) AND the
+    # detector still says "generating" — a genuinely-done response is
     # caught earlier by the verify_fn=False completion path.
     last_seen_len = 0
-    stall_window_start = None  # time.time() when growth first stopped
-    STALL_THRESHOLD_SEC = 600  # 10 min of no text growth → likely stuck
+    last_seen_sources = 0
+    last_seen_steps_sig = 0
+    stall_window_start = None  # time.time() when ALL signals stopped growing
+    STALL_THRESHOLD_SEC = 1200  # 20 min of multi-signal flatness → likely stuck
 
     # Subtract paused_total from elapsed so a long user pause doesn't make
     # this inner timer falsely fire after resume. Without this, a user who
@@ -6228,11 +6243,22 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 _obs_preview = _obs.get("observer_preview", "") or ""
                 # partialTextLen is max of DOM scrape + observer (observer is usually fresher)
                 _merged_partial_len = max(progress.get("partial_text_len", 0) or 0, _obs_len)
-                # Stall tracking: stamp time when growth stops, reset on growth.
-                if _merged_partial_len > last_seen_len:
-                    last_seen_len = _merged_partial_len
+                # Multi-signal stall tracking (2026-04-25): stamp time when
+                # ALL signals stop growing; reset on any growth in any
+                # signal. ChatGPT DR's researching phase produces no text
+                # growth but sources and steps continue — text-only stall
+                # detection false-fired during legit in-progress work.
+                _p1_sources = int(progress.get("sources", 0) or 0)
+                _p1_steps_sig = len(progress.get("steps", []) or [])
+                _grew = (_merged_partial_len > last_seen_len
+                         or _p1_sources > last_seen_sources
+                         or _p1_steps_sig > last_seen_steps_sig)
+                if _grew:
+                    last_seen_len = max(last_seen_len, _merged_partial_len)
+                    last_seen_sources = max(last_seen_sources, _p1_sources)
+                    last_seen_steps_sig = max(last_seen_steps_sig, _p1_steps_sig)
                     stall_window_start = None
-                elif _merged_partial_len > 0 and stall_window_start is None:
+                elif (_merged_partial_len > 0 or _p1_sources > 0) and stall_window_start is None:
                     stall_window_start = time.time()
                 # Deduplicate: only emit if data actually changed
                 progress_key = json.dumps({
@@ -6394,20 +6420,25 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
         else:
             consecutive_not_generating = 0
             cua_checked = False  # Reset so CUA can check again if needed
-            # Stall surface: detector still says "running" but text stopped
-            # growing for STALL_THRESHOLD_SEC. Catches the "ChatGPT alive but
-            # frozen mid-stream" case proactively — raises into the phase
-            # retry-loop's `except asyncio.TimeoutError:` so the user gets
-            # the [Retry, Skip] alert ~25 min before the hard ceiling.
+            # Stall surface: detector still says "running" but ALL three
+            # signals (text + sources + steps) stopped growing for
+            # STALL_THRESHOLD_SEC. Catches the "ChatGPT alive but frozen
+            # mid-stream" case proactively — raises into the phase retry-
+            # loop's `except asyncio.TimeoutError:` so the user gets the
+            # [Retry, Skip] alert. Multi-signal makes false alarms
+            # vanishingly rare: ChatGPT DR's researching phase always
+            # grows sources/steps even when text doesn't.
             if (stall_window_start is not None
                     and (time.time() - stall_window_start) > STALL_THRESHOLD_SEC):
                 _stall = int(time.time() - stall_window_start)
-                log(f"[{label}] Stall detected: {_merged_partial_len} chars, "
-                    f"no growth for {_stall}s while detector says generating "
+                log(f"[{label}] Stall detected: text={last_seen_len}, "
+                    f"sources={last_seen_sources}, steps={last_seen_steps_sig} — "
+                    f"all flat for {_stall}s while detector says generating "
                     f"→ surfacing for user decision (Retry/Skip)", "WARN")
                 raise asyncio.TimeoutError(
-                    f"phase {phase} response stalled at {_merged_partial_len} chars "
-                    f"(no text growth for {_stall}s)"
+                    f"phase {phase} response stalled "
+                    f"(text={last_seen_len}, sources={last_seen_sources}, "
+                    f"steps={last_seen_steps_sig}; flat for {_stall}s)"
                 )
 
         elapsed_min = int(time.time() - wait_start) // 60
@@ -6522,9 +6553,22 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
 
 async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                                     elapsed_sec=0, verbose=False):
-    """Per-agent extract + save + link + emit ladder. Returns a result dict
+    """Per-agent extract + save + emit ladder. Returns a result dict
     the caller drops into results[]. Never raises — on any internal failure
-    returns status='failed' so the poll loop can decide whether to retry."""
+    returns status='failed' so the poll loop can decide whether to retry.
+
+    2026-04-25: Markdown-as-primary architecture (mirrors P1).
+    The moment markdown lands in Firestore, the function emits link_extracted
+    (in-app /documents URL, primary=True, verified=True) + agent_progress
+    complete. Share-link extraction is REMOVED from P2 entirely — Phase 5's
+    Google Doc creation uses Phase 3's link extraction instead. The in-app
+    /documents?open=… link is the only link FE renders in PhaseDropdown.
+
+    Result dict semantics:
+      url          — conversation URL (page.url) for downstream resume
+      _in_app_url  — /documents?open=… for the FE primary link
+      verified     — True if MD text > 0 (the in-app primary IS verified)
+    """
     agent_key = name.lower().replace(" ", "")
 
     # Step 1 — Emit extracting so the frontend can show "Extracting…" spinner
@@ -6560,6 +6604,7 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
     n_chars = len(text)
 
     # Step 2b — Save MD to disk + Firestore mirror (only if content is real)
+    md_saved = False
     if text and queue_dir:
         try:
             documents_dir = queue_dir / "documents"
@@ -6569,110 +6614,74 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             (documents_dir / fname).write_text(md_content, encoding="utf-8")
             try:
                 save_document_to_firestore(agent_key, md_content, f"{name} Deep Research")
+                md_saved = True
             except Exception as _fs_e:
                 log(f"[{name}] Firestore document sync failed: {_fs_e}", "WARN")
+                md_saved = True  # local file is enough for FE-on-device fallback
             log(f"[{name}] Saved {n_chars} chars to documents/{fname}")
         except Exception as e:
             log(f"[{name}] MD save failed: {e}", "WARN")
 
-    # Step 3 — Public share link (ChatGPT gets iframe short-circuit: single
-    # fast attempt; Gemini/Claude use the full 2-retry path since their share
-    # flows live in the host DOM and benefit from retries).
-    extractor_map = {
-        "ChatGPT": extract_share_link_chatgpt,
-        "Gemini":  extract_share_link_gemini,
-        "Claude":  extract_share_link_claude,
-    }
-    max_retries = 1 if name == "ChatGPT" else 2
-
-    public_url = ""
-    verified = False
-    fallback = None
-    link_error = ""
-
-    extractor = extractor_map.get(name)
-    if extractor:
-        try:
-            link_res = await extract_with_retry(
-                phase=2, agent=agent_key, browser=browser, cua_client=cua_client,
-                extractor_fn=extractor,
-                max_retries=max_retries, retry_delay=2.0,
-                label=f"{name} Research", verbose=verbose,
-            )
-            if link_res.verified and link_res.url:
-                public_url = link_res.url
-                verified = True
-            else:
-                link_error = link_res.error or ""
-        except Exception as e:
-            link_error = f"{type(e).__name__}: {e}"
-            log(f"[{name}] Link extraction exception: {link_error}", "WARN")
-
-    # Step 4 — Fallback to chat URL if public link didn't land. This is the
-    # honest always-available link (user's own conversation in their account).
-    # We still emit link_extracted so the frontend clears any "extracting…"
-    # state and shows the fallback URL.
-    if not verified:
-        chat_url = ""
-        try:
-            chat_url = (page.url or "") if page else ""
-        except Exception:
-            chat_url = ""
-        chat_markers = {
-            "ChatGPT": ["chatgpt.com/c/"],
-            "Gemini":  ["gemini.google.com/app", "gemini.google.com/chat"],
-            "Claude":  ["claude.ai/chat", "claude.ai/new"],
-        }
-        if chat_url and any(m in chat_url for m in chat_markers.get(name, [])):
-            public_url = chat_url
-            fallback = "chat_url"
-            log(f"[{name}] Public share unavailable — using chat URL: {chat_url}")
-            try:
-                emit_event("link_extracted", phase=2, agent=agent_key,
-                           url=chat_url, label=f"{name} Research",
-                           verified=False, fallback="chat_url")
-            except Exception:
-                pass
-        else:
-            log(f"[{name}] No chat URL match either — leaving url blank", "WARN")
-
-    # Close any stray share modal (Escape is a no-op if nothing's open)
+    # Conversation URL — captured NOW because the page may navigate during the
+    # parallel share-link worker (Gemini's Share & Export modal can redirect).
+    conversation_url = ""
     try:
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.3)
+        conversation_url = (page.url or "") if page else ""
     except Exception:
-        pass
+        conversation_url = ""
 
-    # Step 5 — Final agent_progress. Status rules:
-    #   done     — content extracted (text len > 0)
-    #   partial  — link extracted but no content (rare; usually timeout path)
-    #   failed   — neither content nor link
+    # Step 3 — Markdown-as-primary emit (P1 mirror).
+    # The moment MD is on disk + in Firestore, the FE /documents viewer can
+    # render it. Emit link_extracted (verified=True, primary=True) + agent_progress
+    # complete IMMEDIATELY so the FE flips to "done" without waiting on share.
+    _in_app_url = (f"/documents?open={_fb_research_id}:{agent_key}"
+                   if _fb_research_id else "/documents")
+    _in_app_label = f"Read {name} report"
     if n_chars > 0:
-        status = "done"
-    elif public_url:
-        status = "partial"
+        try:
+            emit_event("link_extracted", phase=2, agent=agent_key,
+                       url=_in_app_url, label=_in_app_label,
+                       verified=True, primary=True)
+        except Exception:
+            pass
+        try:
+            emit_event("agent_progress", phase=2, agent=agent_key,
+                       status="complete",
+                       progress=f"Content extracted: {n_chars} chars ({elapsed_sec}s)",
+                       partialTextLen=n_chars,
+                       elapsedSec=int(elapsed_sec or 0),
+                       links=[{"label": _in_app_label, "url": _in_app_url,
+                               "verified": True, "primary": True}])
+        except Exception:
+            pass
     else:
-        status = "failed"
+        # No content extracted — emit failed (no in-app primary to surface).
+        try:
+            emit_event("agent_progress", phase=2, agent=agent_key,
+                       status="failed",
+                       progress=f"Content extraction returned 0 chars ({elapsed_sec}s)",
+                       partialTextLen=0,
+                       elapsedSec=int(elapsed_sec or 0))
+        except Exception:
+            pass
 
-    try:
-        emit_event("agent_progress", phase=2, agent=agent_key,
-                   status="complete" if status == "done" else status,
-                   progress=f"Content extracted: {n_chars} chars ({elapsed_sec}s)",
-                   partialTextLen=n_chars,
-                   elapsedSec=int(elapsed_sec or 0),
-                   links=[{"label": f"{name} Research", "url": public_url}] if public_url else [])
-    except Exception:
-        pass
+    # 2026-04-25: Share-link extraction REMOVED from P2.
+    # The in-app /documents?open=… primary is the only link that matters
+    # for FE display in PhaseDropdown (opens DocumentViewer modal in-place).
+    # Phase 5 (Google Doc creation) does its own share-link extraction via
+    # Phase 3's run_phase3_upload — independent of P2. The share-link
+    # extractor functions (extract_share_link_*) are kept for Phase 5 but
+    # no longer called from P2.
 
     return {
-        "status": status,
+        "status": "done" if n_chars > 0 else "failed",
         "text": text,
-        "url": public_url,
-        "verified": verified,
-        "fallback": fallback,
+        "url": conversation_url,        # conversation URL — for resume reconnect
+        "_in_app_url": _in_app_url,     # in-app /documents primary — FE link
+        "verified": (n_chars > 0),
         "page": page,
         "elapsed_sec": int(elapsed_sec or 0),
-        "link_error": link_error,
+        "md_saved": md_saved,
     }
 
 
@@ -6689,8 +6698,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         "Gemini": extract_gemini_response,
         "Claude": extract_claude_response,
     }
-    # CUA completion check: first at 20 min (MIN_WAIT), then every 5 min
-    _min_agent_wait = int(os.environ.get("MIN_AGENT_WAIT_MIN", "20")) * 60
+    # CUA completion check: first at 5 min (MIN_WAIT), then every 5 min.
+    # 2026-04-25: dropped from 20→5 to mirror P1 cadence (catches fast finishers).
+    _min_agent_wait = int(os.environ.get("MIN_AGENT_WAIT_MIN", "5")) * 60
     MIN_WAIT = {"ChatGPT": _min_agent_wait, "Gemini": _min_agent_wait, "Claude": _min_agent_wait}
     CUA_CHECK_INTERVAL = 300   # 5 min between CUA completion checks
     ARTIFACT_SCRAPE_INTERVAL = 180  # 3 min between Claude artifact tracking scrapes
@@ -7370,108 +7380,131 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 emit_event("heartbeat", phase=2, agent=agent_key)
                 p["last_heartbeat"] = time.time()
 
-            # ── Playwright-primary completion check (2026-04 overhaul) ─────
-            # Every tick: run the tight Playwright detector. On 2 consecutive
-            # positive readings, go straight to content-first extraction +
-            # link-second assembly via extract_and_record_agent. CUA is now a
-            # fallback only — skipped entirely when the detector is confident.
-            # Minimizes CUA spend and keeps backend/frontend in sync: the
-            # `agent_progress status=complete` event only fires after MD is
-            # saved and link_extracted has been emitted.
+            # ── Playwright-primary completion check (2026-04-25 strict) ─────
+            # The detect_completion_* functions return (done, reason, snap)
+            # where snap = {text_len, sources, steps}. They report done=True
+            # ONLY when the platform's definitive done-marker is present
+            # (Stop button gone + "Thought for X" / Share & Export visible /
+            # research_complete card). Caller-side 2-cycle gate confirms
+            # text + sources + steps are all flat across 2 polling cycles
+            # before extracting — eliminates the partial_len>5000,
+            # artifacts>=2, transient-keyword false positives.
             detect_fn = DETECT_FNS.get(name)
             if detect_fn and elapsed >= MIN_WAIT.get(name, 180):
                 try:
-                    dom_done, dom_reason = await detect_fn(p["page"])
+                    dom_done, dom_reason, snap = await detect_fn(p["page"])
                 except Exception as _de:
                     log(f"[{name}] detect_completion error: {_de}", "WARN")
-                    dom_done, dom_reason = (False, f"detect_error: {_de}")
-                p.setdefault("dom_done_count", 0)
+                    dom_done, dom_reason, snap = (False, f"detect_error: {_de}", {})
+                p.setdefault("flat_history", [])
+                p.setdefault("done_marker_first_at", 0.0)
                 p.setdefault("extraction_attempts", 0)
-                if dom_done:
-                    p["dom_done_count"] += 1
-                    log(f"[{name}] DOM completion signal {p['dom_done_count']}/2 — {dom_reason}")
-                    if p["dom_done_count"] >= 2:
-                        p["extraction_attempts"] += 1
-                        log(f"[{name}] Playwright-confirmed done — starting extract_and_record "
-                            f"(attempt {p['extraction_attempts']}/3)")
-                        _queue_dir = (Path(__file__).parent / "queues" / _tracks_dir.name) \
-                                     if _tracks_dir else None
-                        res = await extract_and_record_agent(
-                            name, p["page"], browser, cua_client,
-                            queue_dir=_queue_dir,
-                            elapsed_sec=int(elapsed),
-                            verbose=verbose,
-                        )
-                        if res["status"] == "done" or (res["text"] and res["url"]) or \
-                           (res["verified"] and res["url"]):
-                            _runtime.unregister_page(
-                                name.lower().replace(" ", ""),
-                                final_status="done",
-                            )
-                            _runtime.agent_chat_urls[
-                                name.lower().replace(" ", "")
-                            ] = res["url"] or ""
-                            results[name] = res
-                            del pending[name]
-                            log(f"[{name}] Extraction complete — "
-                                f"{len(res['text'])} chars, "
-                                f"url={(res['url'] or '')[:80] or '(none)'}, "
-                                f"verified={res['verified']}")
-                            continue
-                        if res["status"] == "partial" and (res["text"] or res["url"]):
-                            _runtime.unregister_page(
-                                name.lower().replace(" ", ""),
-                                final_status="done",
-                            )
-                            _runtime.agent_chat_urls[
-                                name.lower().replace(" ", "")
-                            ] = res["url"] or ""
-                            results[name] = res
-                            del pending[name]
-                            log(f"[{name}] Partial extraction accepted — moving on")
-                            continue
-                        # Extraction produced nothing usable. Reset the
-                        # consecutive-done counter so we re-confirm before
-                        # another attempt. After 3 failed attempts surface a
-                        # pipeline_error with Retry/Skip so the user decides.
-                        log(f"[{name}] Extraction attempt {p['extraction_attempts']}/3 "
-                            f"returned no content or link — reverting to polling", "WARN")
-                        p["dom_done_count"] = 0
-                        if p["extraction_attempts"] >= 3:
-                            emit_event("pipeline_error", phase=2, agent=agent_key,
-                                       error=f"{name} extraction failed after 3 confirmed-done attempts",
-                                       details=(f"The Playwright detector confirmed {name} was done, "
-                                                "but 3 extraction attempts returned no content. "
-                                                "Retry runs the extraction pipeline again. "
-                                                "Skip drops this agent from the results."),
-                                       actions=[
-                                           {"id": "retry", "label": "Retry extraction",
-                                            "style": "primary"},
-                                           {"id": "skip",  "label": "Skip agent",
-                                            "style": "default"},
-                                       ])
-                            decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
-                            log(f"[{name}] Extraction-failed decision: {decision}")
-                            if decision == "retry":
-                                p["extraction_attempts"] = 0
-                                p["dom_done_count"] = 0
-                                continue
-                            if decision == "skip":
-                                results[name] = {"status": "skipped_by_user",
-                                                 "text": "", "url": "",
-                                                 "page": p["page"],
-                                                 "elapsed_sec": int(elapsed)}
-                                del pending[name]
-                                emit_event("agent_skipped", phase=2, agent=agent_key,
-                                           reason="extraction_failure_skip")
-                                continue
-                            if decision == "stop":
-                                break
-                        continue
+                if not dom_done:
+                    # Definitive done-marker absent — discard any flat history.
+                    if p["flat_history"]:
+                        log(f"[{name}] Done-marker lost — clearing flat_history ({dom_reason})")
+                    p["flat_history"] = []
+                    p["done_marker_first_at"] = 0.0
                 else:
-                    if p.get("dom_done_count", 0) > 0:
-                        log(f"[{name}] DOM completion signal reset — {dom_reason}")
-                    p["dom_done_count"] = 0
+                    # Done-marker present — append snapshot. Need 3 snapshots
+                    # over ≥240s (2 polling cycles at 120s) all flat to extract.
+                    if p["done_marker_first_at"] == 0.0:
+                        p["done_marker_first_at"] = time.time()
+                    p["flat_history"].append((
+                        int(snap.get("text_len", 0) or 0),
+                        int(snap.get("sources", 0) or 0),
+                        int(snap.get("steps", 0) or 0),
+                    ))
+                    p["flat_history"] = p["flat_history"][-3:]
+                    log(f"[{name}] Done-marker confirmed #{len(p['flat_history'])} — "
+                        f"{dom_reason}; snap={snap}")
+                    elapsed_done = time.time() - p["done_marker_first_at"]
+                    if len(p["flat_history"]) < 3 or elapsed_done < 240:
+                        # Not enough samples yet — keep polling.
+                        continue
+                    t0, s0, st0 = p["flat_history"][0]
+                    t1, s1, st1 = p["flat_history"][1]
+                    t2, s2, st2 = p["flat_history"][2]
+                    flat = (t0 == t1 == t2 and s0 == s1 == s2 and st0 == st1 == st2)
+                    if not flat:
+                        log(f"[{name}] Done-marker present but signals still moving — "
+                            f"text {t0}→{t1}→{t2}, sources {s0}→{s1}→{s2}, "
+                            f"steps {st0}→{st1}→{st2}; keep polling")
+                        # Trim history so we re-anchor on the next snapshot —
+                        # if a single late mutation slipped through, the next
+                        # tick's snapshot becomes the new baseline.
+                        p["flat_history"] = p["flat_history"][-1:]
+                        continue
+                    p["extraction_attempts"] += 1
+                    log(f"[{name}] CONFIRMED DONE — done-marker + 2 cycles flat "
+                        f"(text={t2}, sources={s2}, steps={st2}, "
+                        f"elapsed_since_marker={int(elapsed_done)}s). "
+                        f"Starting extract_and_record (attempt {p['extraction_attempts']}/3)")
+                    _queue_dir = (Path(__file__).parent / "queues" / _tracks_dir.name) \
+                                 if _tracks_dir else None
+                    res = await extract_and_record_agent(
+                        name, p["page"], browser, cua_client,
+                        queue_dir=_queue_dir,
+                        elapsed_sec=int(elapsed),
+                        verbose=verbose,
+                    )
+                    # 2026-04-25: markdown-as-primary. "done" means text>0 +
+                    # in-app primary emitted. res["url"] is the conversation
+                    # URL (page.url) for resume; res["_in_app_url"] is the
+                    # FE primary /documents?open=… link.
+                    if res["status"] == "done":
+                        _runtime.unregister_page(
+                            name.lower().replace(" ", ""),
+                            final_status="done",
+                        )
+                        _runtime.agent_chat_urls[
+                            name.lower().replace(" ", "")
+                        ] = res.get("url") or ""
+                        results[name] = res
+                        del pending[name]
+                        log(f"[{name}] Extraction complete — "
+                            f"{len(res['text'])} chars, "
+                            f"in_app={(res.get('_in_app_url') or '')[:60]}, "
+                            f"convo={(res.get('url') or '')[:60]}")
+                        continue
+                    # Extraction produced nothing usable. Reset state so
+                    # we re-confirm before another attempt. After 3 failed
+                    # attempts surface a pipeline_error with Retry/Skip.
+                    log(f"[{name}] Extraction attempt {p['extraction_attempts']}/3 "
+                        f"returned no content — reverting to polling", "WARN")
+                    p["flat_history"] = []
+                    p["done_marker_first_at"] = 0.0
+                    if p["extraction_attempts"] >= 3:
+                        emit_event("pipeline_error", phase=2, agent=agent_key,
+                                   error=f"{name} extraction failed after 3 confirmed-done attempts",
+                                   details=(f"The Playwright detector confirmed {name} was done, "
+                                            "but 3 extraction attempts returned no content. "
+                                            "Retry runs the extraction pipeline again. "
+                                            "Skip drops this agent from the results."),
+                                   actions=[
+                                       {"id": "retry", "label": "Retry extraction",
+                                        "style": "primary"},
+                                       {"id": "skip",  "label": "Skip agent",
+                                        "style": "default"},
+                                   ])
+                        decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
+                        log(f"[{name}] Extraction-failed decision: {decision}")
+                        if decision == "retry":
+                            p["extraction_attempts"] = 0
+                            p["flat_history"] = []
+                            continue
+                        if decision == "skip":
+                            results[name] = {"status": "skipped_by_user",
+                                             "text": "", "url": "",
+                                             "page": p["page"],
+                                             "elapsed_sec": int(elapsed)}
+                            del pending[name]
+                            emit_event("agent_skipped", phase=2, agent=agent_key,
+                                       reason="extraction_failure_skip")
+                            continue
+                        if decision == "stop":
+                            break
+                    continue
 
             # Check completion — CUA-primary fallback (only if Playwright was
             # not confident within the MIN_WAIT + budget window). CUA checks
@@ -7725,272 +7758,94 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         p["cua_confirmed"] = False
                         continue
 
-                # Extract content (use cached text from link-retry if available)
-                text = p.pop("_cached_text", "")
-                if not text:
-                    try:
-                        await browser.switch_to_page(p["page"])
-                        text = await extract_fns[name](p["page"], browser=browser,
-                            cua_client=cua_client, label=name, verbose=verbose)
-                    except Exception as e:
-                        log(f"[{name}] Extraction failed: {e}", "ERROR")
-                        text = ""
-
-                # ── Revert on empty extraction ────────────────────────────
-                # If CUA confirmed "complete" but extraction yields
-                # little/nothing, the CUA verdict was likely premature — the
-                # agent is actually still researching. Instead of marking the
-                # agent empty and skipping it (the old behavior — gave up at
-                # 23m on ChatGPT while the research was still at 397
-                # searches), revert to polling so the agent gets a proper
-                # chance to finish within its time budget.
-                #
-                # Bounds:
-                #   • Only revert if we're still well within max_wait_min
-                #     (don't keep looping forever).
-                #   • Cap retries (empty_retries < 3) so we eventually give
-                #     up if extraction truly can't recover the content.
-                if (not text or len(text) < 100) and elapsed < (max_wait_min * 60 * 0.95):
-                    p.setdefault("empty_retries", 0)
-                    p["empty_retries"] += 1
-                    if p["empty_retries"] < 3:
-                        log(f"[{name}] Extraction came back empty at {int(elapsed/60)}m "
-                            f"but budget still available — CUA likely misread completion. "
-                            f"Reverting to polling (empty retry {p['empty_retries']}/3).", "WARN")
-                        p["done_count"] = 0
-                        p["cua_confirmed"] = False
-                        p["last_cua_check"] = time.time() + 60  # back off 1m before next CUA check
-                        emit_event("agent_progress", phase=2,
-                                   agent=name.lower().replace(" ", ""),
-                                   status="still_researching",
-                                   progress=f"Still working — CUA thought it was done but extraction came back empty. Retrying.",
-                                   elapsedSec=int(elapsed),
-                                   expectedMinutes=get_expected_minutes(2))
-                        continue
-                    log(f"[{name}] 3 empty extractions — giving up at {int(elapsed/60)}m", "ERROR")
-                    # Ask the user what to do: retry with a follow-up, accept
-                    # the empty/short result, or skip this agent.
-                    ag_key_empty = name.lower().replace(" ", "")
-                    try:
-                        emit_event("pipeline_warning", phase=2, agent=ag_key_empty,
-                                   message=f"{name} finished but no readable text was extracted",
-                                   details=("CUA says the agent is done, but 3 extraction attempts came "
-                                            "back empty. Retry sends a follow-up asking for the complete "
-                                            "report. Skip drops this agent and proceeds with the others."),
-                                   alertType="warn",
-                                   actions=[
-                                       {"id": "retry", "label": "Retry",
-                                        "style": "primary",
-                                        "command": {"action": "retry_agent", "agent": ag_key_empty}},
-                                       {"id": "skip", "label": "Skip",
-                                        "style": "default",
-                                        "command": {"action": "skip_agent", "agent": ag_key_empty}},
-                                   ])
-                    except Exception:
-                        pass
-                    empty_decision = await _controls.await_agent_decision(ag_key_empty, timeout=300.0)
-                    log(f"[{name}] Empty-final user decision: {empty_decision}")
-                    if empty_decision == "stop":
-                        break
-                    if empty_decision == "skip":
-                        continue
-                    if empty_decision == "retry":
-                        followup = (
-                            "It looks like your final response didn't come through. Please output "
-                            "the complete research report now — include all sources, sections, and findings. "
-                            "No preamble or post-amble."
-                        )
-                        try:
-                            emit_event("pipeline_warning", phase=2, agent=ag_key_empty,
-                                       message=f"Retrying {name} — asking for the complete report",
-                                       alertType="retrying")
-                            await browser.switch_to_page(p["page"])
-                            await paste_followup(p["page"], followup, name.lower(), label=f"{name}-retry-empty")
-                        except Exception as e:
-                            log(f"[{name}] Retry follow-up failed: {e}", "WARN")
-                        # Give the agent another 15 min to regenerate
-                        p["start_time"] = time.time() - max(0, int(elapsed) - (15 * 60))
-                        p["done_count"] = 0
-                        p["cua_confirmed"] = False
-                        p["last_cua_check"] = time.time()
-                        p["empty_retries"] = 0
-                        p.pop("_cached_text", None)
-                        continue
-                    # 'continue_partial' / 'timeout' → fall through to finalize
-                    #  with whatever short/empty text we have
-
-                agent_key_lc = name.lower().replace(" ", "")
-                agent_url = p["page"].url
-
-                # Extract shareable link NOW — agents MUST have a verified public
-                # link before they can be declared "done". Without this, the
-                # frontend shows broken/private links.
-                link_verified = False
-                extractor_map = {"chatgpt": extract_share_link_chatgpt,
-                                 "gemini": extract_share_link_gemini,
-                                 "claude": extract_share_link_claude}
-                for _link_attempt in range(3):
-                    try:
-                        await browser.switch_to_page(p["page"])
-                        if agent_key_lc in extractor_map:
-                            link_result = await extractor_map[agent_key_lc](
-                                browser, cua_client=cua_client, verbose=verbose)
-                            if link_result.success:
-                                agent_url = link_result.url
-                                link_verified = link_result.verified
-                                if link_verified:
-                                    break
-                                else:
-                                    log(f"[{name}] Link attempt {_link_attempt+1}: got URL but not verified, retrying...", "WARN")
-                    except Exception as e:
-                        log(f"[{name}] Link extraction attempt {_link_attempt+1} error: {e}", "WARN")
-                    if _link_attempt < 2:
-                        await asyncio.sleep(2)
-
-                # ── Gate: require BOTH content AND verified link to declare done ──
-                has_content = text and len(text) > 100
-                status = "done" if has_content and link_verified else (
-                    "done_no_link" if has_content else "empty")
-                if has_content and not link_verified and elapsed < (max_wait_min * 60 * 0.9):
-                    # Content extracted but no public link — revert and retry later
-                    p.setdefault("link_retries", 0)
-                    p["link_retries"] += 1
-                    if p["link_retries"] <= 2:
-                        log(f"[{name}] Content extracted ({len(text)} chars) but no verified "
-                            f"public link. Retrying link extraction ({p['link_retries']}/2).", "WARN")
-                        p["done_count"] = 0
-                        p["cua_confirmed"] = False
-                        p["last_cua_check"] = time.time() + 30
-                        # Store the text so we don't re-extract
-                        p["_cached_text"] = text
-                        emit_event("agent_progress", phase=2, agent=agent_key_lc,
-                                   status="extracting_link",
-                                   progress=f"Research complete ({len(text)} chars) — getting public share link...",
-                                   partialTextLen=len(text), elapsedSec=int(elapsed))
-                        continue
-
-                # ── Public-share-only hard-fail for Gemini + Claude ──
-                # User rule (2026-04-19): Gemini/Claude/NotebookLM MUST have a
-                # public share link. Conversation URLs don't count. When all
-                # retries fail, surface an AgentAlert with Retry · Skip rather
-                # than silently emitting an unverified private link.
-                if has_content and not link_verified and agent_key_lc in ("gemini", "claude"):
-                    # ── C2: one-shot auto-nudge before the hard-fail modal ──
-                    # Ask the agent directly to surface the public link. Gemini:
-                    # Share & Export flow. Claude: publish the report artifact.
-                    # After the wait, rewind state so the next main-loop tick
-                    # re-runs extraction against the nudged UI. Fires once per
-                    # agent per phase (p["nudged_public"]).
-                    if not p.get("nudged_public"):
-                        p["nudged_public"] = True
-                        if agent_key_lc == "gemini":
-                            nudge_pub = (
-                                "Please make the share link public so it's accessible. "
-                                "Click Share & Export → Create public link → Anyone with "
-                                "the link → Copy."
-                            )
-                            wait_pub = 60
-                        else:  # claude
-                            nudge_pub = (
-                                "Please publish your final research report artifact so it "
-                                "has a public link. Open the second artifact (the "
-                                "comprehensive report, not the references list) and click "
-                                "Publish."
-                            )
-                            wait_pub = 90
-                        try:
-                            emit_event("agent_progress", phase=2, agent=agent_key_lc,
-                                       status="nudging",
-                                       progress=f"Nudging {name} to surface the public link ({wait_pub}s)…")
-                            await browser.switch_to_page(p["page"])
-                            await paste_followup(p["page"], nudge_pub, agent_key_lc,
-                                                 label=f"{name}-nudge-public")
-                            log(f"[{name}] Sent public-link nudge — waiting {wait_pub}s")
-                            await asyncio.sleep(wait_pub)
-                        except Exception as _ne:
-                            log(f"[{name}] Public-link nudge failed: {_ne}", "WARN")
-                        # Rewind so next tick re-runs CUA + extraction against
-                        # the post-nudge DOM. If the nudge worked we pick up a
-                        # verified link and skip this branch entirely.
-                        p["done_count"] = 0
-                        p["cua_confirmed"] = False
-                        p["last_cua_check"] = time.time()
-                        p["link_retries"] = 0
-                        p.pop("_cached_text", None)
-                        continue
-                    log(f"[{name}] Public share extraction failed after all retries — "
-                        f"hard-fail (no private fallback for {name})", "ERROR")
-                    # Emit agent_link_failed so the frontend renders the per-agent
-                    # AgentLinkFailedBanner with Retry · Skip buttons (Phase 2 B1
-                    # gate). pipeline_warning lands on a different surface and
-                    # was silently ignored by the user in E2E #3.
-                    try:
-                        emit_event("agent_link_failed", phase=2, agent=agent_key_lc,
-                                   attempts=3,
-                                   lastError=f"{name} requires a public share link — private URL rejected")
-                    except Exception:
-                        pass
-                    # Track how many times this hard-fail has timed out without a
-                    # user decision. After 2 timeouts, auto-skip so the loop
-                    # doesn't keep firing hard-fails indefinitely.
-                    p.setdefault("hf_timeouts", 0)
-                    hf_decision = await _controls.await_agent_decision(agent_key_lc, timeout=300.0)
-                    log(f"[{name}] Public-share hard-fail decision: {hf_decision}")
-                    if hf_decision == "stop":
-                        break
-                    if hf_decision == "skip":
-                        continue
-                    if hf_decision == "retry":
-                        p["hf_timeouts"] = 0
-                        p["link_retries"] = 0
-                        p.pop("_cached_text", None)
-                        p["done_count"] = 0
-                        p["cua_confirmed"] = False
-                        p["last_cua_check"] = time.time() + 30
-                        continue
-                    # wait_longer / timeout → extend budget ONCE; on the second
-                    # unanswered timeout, auto-skip so the pipeline advances
-                    # instead of looping hard-fails forever.
-                    p["hf_timeouts"] += 1
-                    if p["hf_timeouts"] >= 2:
-                        log(f"[{name}] Hard-fail timed out {p['hf_timeouts']}× "
-                            f"without a user decision — auto-skipping agent", "WARN")
-                        _controls.skipped_agents.add(agent_key_lc)
-                        continue
-                    p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
-                    p["link_retries"] = 0
-                    p.pop("_cached_text", None)
+                # 2026-04-25: CUA-confirmed done → run the same extract +
+                # emit ladder used by the Playwright-confirmed path. Single
+                # source of truth for save+emit (extract_and_record_agent),
+                # no inline duplication. Empty extractions still revert to
+                # polling (CUA likely misread completion).
+                _queue_dir = (Path(__file__).parent / "queues" / _tracks_dir.name) \
+                             if _tracks_dir else None
+                res = await extract_and_record_agent(
+                    name, p["page"], browser, cua_client,
+                    queue_dir=_queue_dir, elapsed_sec=int(elapsed),
+                    verbose=verbose,
+                )
+                if res["status"] == "done":
+                    _runtime.unregister_page(name.lower().replace(" ", ""),
+                                              final_status="done")
+                    _runtime.agent_chat_urls[name.lower().replace(" ", "")] = res.get("url") or ""
+                    results[name] = res
+                    del pending[name]
+                    log(f"[{name}] CUA-confirmed extraction complete — "
+                        f"{len(res['text'])} chars, "
+                        f"in_app={(res.get('_in_app_url') or '')[:60]}")
+                    continue
+                # Empty extraction → revert to polling. After 3 attempts, ask
+                # the user (retry with follow-up / skip / stop). Same UX as
+                # the previous inline empty-retries flow.
+                p.setdefault("empty_retries", 0)
+                p["empty_retries"] += 1
+                if p["empty_retries"] < 3 and elapsed < (max_wait_min * 60 * 0.95):
+                    log(f"[{name}] CUA said done but extraction empty "
+                        f"(retry {p['empty_retries']}/3) — reverting to polling", "WARN")
                     p["done_count"] = 0
                     p["cua_confirmed"] = False
+                    p["last_cua_check"] = time.time() + 60
+                    emit_event("agent_progress", phase=2,
+                               agent=name.lower().replace(" ", ""),
+                               status="still_researching",
+                               progress="Still working — extraction came back empty, retrying.",
+                               elapsedSec=int(elapsed),
+                               expectedMinutes=get_expected_minutes(2))
                     continue
-
-                # Emit link — ChatGPT allows conversation URL fallback (the
-                # conversation is not public-shareable by design, so the chat
-                # URL is the honest link). Gemini/Claude only reach here with
-                # verified=true (hard-fail branch above catches the rest).
-                if validate_link(agent_key_lc, agent_url):
-                    emit_validated_link(2, agent_key_lc, agent_url, f"{name} Research")
-                else:
-                    emit_event("link_extracted", phase=2, agent=agent_key_lc,
-                               url=agent_url, label=f"{name} Research",
-                               verified=False)
-                    log(f"[{name}] Fallback link (unverified): {agent_url}")
-
-                results[name] = {"status": status, "text": text or "",
-                                 "url": agent_url, "page": p["page"],
-                                 "elapsed_sec": int(elapsed)}
-                # Unregister from dispatcher — this agent is done
-                _runtime.unregister_page(name.lower().replace(" ", ""),
-                                          final_status="done" if status == "done" else status)
-                _runtime.agent_chat_urls[name.lower().replace(" ", "")] = agent_url
-                log(f"[{name}] {status.upper()} — {len(text or '')} chars ({int(elapsed)}s)")
-                # Emit completion event for this agent
-                agent_key = name.lower().replace(" ", "")
-                emit_event("agent_progress", phase=2, agent=agent_key,
-                    status="complete" if status == "done" else status,
-                    progress=f"Content extracted: {len(text or '')} chars ({int(elapsed)}s)",
-                    partialTextLen=len(text or ''), elapsedSec=int(elapsed),
-                    links=[{"label": f"{name} Research", "url": agent_url}] if agent_url else [])
+                # 3 empty extractions — ask the user.
+                ag_key_empty = name.lower().replace(" ", "")
+                try:
+                    emit_event("pipeline_warning", phase=2, agent=ag_key_empty,
+                               message=f"{name} finished but no readable text was extracted",
+                               details=("CUA says the agent is done, but 3 extraction attempts came "
+                                        "back empty. Retry sends a follow-up asking for the complete "
+                                        "report. Skip drops this agent and proceeds with the others."),
+                               alertType="warn",
+                               actions=[
+                                   {"id": "retry", "label": "Retry", "style": "primary",
+                                    "command": {"action": "retry_agent", "agent": ag_key_empty}},
+                                   {"id": "skip", "label": "Skip", "style": "default",
+                                    "command": {"action": "skip_agent", "agent": ag_key_empty}},
+                               ])
+                except Exception:
+                    pass
+                empty_decision = await _controls.await_agent_decision(ag_key_empty, timeout=300.0)
+                log(f"[{name}] Empty-final user decision: {empty_decision}")
+                if empty_decision == "stop":
+                    break
+                if empty_decision == "skip":
+                    continue
+                if empty_decision == "retry":
+                    followup = (
+                        "It looks like your final response didn't come through. Please output "
+                        "the complete research report now — include all sources, sections, and findings. "
+                        "No preamble or post-amble."
+                    )
+                    try:
+                        emit_event("pipeline_warning", phase=2, agent=ag_key_empty,
+                                   message=f"Retrying {name} — asking for the complete report",
+                                   alertType="retrying")
+                        await browser.switch_to_page(p["page"])
+                        await paste_followup(p["page"], followup, name.lower(), label=f"{name}-retry-empty")
+                    except Exception as e:
+                        log(f"[{name}] Retry follow-up failed: {e}", "WARN")
+                    p["start_time"] = time.time() - max(0, int(elapsed) - (15 * 60))
+                    p["done_count"] = 0
+                    p["cua_confirmed"] = False
+                    p["last_cua_check"] = time.time()
+                    p["empty_retries"] = 0
+                    continue
+                # timeout / continue_partial → fall through and accept the empty result.
+                results[name] = {"status": "empty", "text": "",
+                                 "url": p["page"].url if p["page"] else "",
+                                 "page": p["page"], "elapsed_sec": int(elapsed)}
+                _runtime.unregister_page(name.lower().replace(" ", ""), final_status="empty")
                 del pending[name]
             else:
                 p["done_count"] = 0
@@ -10094,13 +9949,17 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     # order matches the original submission: ChatGPT → Claude → Gemini.
     # Gemini's planning-gate inside scrape_progress_gemini keeps its status
     # pinned to 'planning' while the Start-research button is still visible.
-    log("\n--- 2 first-wave (60s sequential per agent): ChatGPT → Claude → Gemini ---")
+    # 2026-04-25: First-wave dwell DROPPED from 60s/agent (180s total) to 0s.
+    # Round-robin starts immediately and emits agent_progress live as it
+    # observes each tab; the dwell delayed real round-robin start without
+    # adding signal the round-robin couldn't deliver itself.
+    log("\n--- 2 first-wave (skipped — round-robin starts immediately) ---")
     _scrape_targets = [
         ("chatgpt", "ChatGPT", chatgpt_page, scrape_progress_chatgpt),
         ("claude",  "Claude",  claude_page,  scrape_progress_claude),
         ("gemini",  "Gemini",  gemini_page,  scrape_progress_gemini),
     ]
-    _FIRST_WAVE_SEC = 60
+    _FIRST_WAVE_SEC = 0
     _FIRST_WAVE_TICK = 15
     for _ag_key, _ag_name, _ag_page, _scrape_fn in _scrape_targets:
         if _ag_page is None:
@@ -12667,130 +12526,57 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     data["sourceRefs"] = refs
                 meta["agents"] = agents
                 meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            # ── B1: Link-first phase_complete — per-agent 3× retry, modal on fail ──
-            extractor_map = {"chatgpt": extract_share_link_chatgpt,
-                             "gemini":  extract_share_link_gemini,
-                             "claude":  extract_share_link_claude}
-            _share_markers = {
-                "ChatGPT": ["chatgpt.com/share"],
-                "Gemini":  ["gemini.google.com/share", "g.co/gemini"],
-                "Claude":  ["claude.site/artifacts", "claude.site/"],
-            }
+            # ── 2026-04-25: Markdown-as-primary phase_complete (P1 mirror) ──
+            # extract_and_record_agent already emitted link_extracted with the
+            # in-app /documents primary the moment each agent's MD landed.
+            # Share-link extraction is removed from P2; Phase 5's Doc creation
+            # uses Phase 3's link extraction. So phase_complete just builds
+            # _p2_links from the in-app primaries we already have.
+            # Build _p2_links from per-agent in-app primaries — always present
+            # when MD landed. Public share URLs (when the workers got them)
+            # have already been emitted via link_extracted and the FE has
+            # merged them into the agent's links list independently.
             _p2_links: list[dict] = []
             _p2_skipped_agents: list[str] = []
             for name, r in results.items():
-                agent_key = name.lower().replace(" ", "")
-                if agent_key not in extractor_map:
-                    continue
-                # Fast-path: round-robin already captured a verified link.
-                round_url = r.get("url", "")
-                markers = _share_markers.get(name, [])
-                if round_url and any(m in round_url for m in markers) and validate_link(agent_key, round_url):
-                    _p2_links.append({"label": f"{name} Research", "url": round_url, "verified": True})
-                    emit_event("link_extracted", phase=2, agent=agent_key,
-                               url=round_url, label=f"{name} Research", verified=True)
-                    continue
-                # Switch to the agent's page and try link extraction up to 3× with user decision.
-                page_obj = r.get("page")
-                if not page_obj:
-                    log(f"[{name}] No page handle — skipping link extraction", "WARN")
-                    emit_event("link_extraction_failed", phase=2, agent=agent_key,
-                               error="no page handle")
+                in_app = r.get("_in_app_url") or ""
+                if in_app and r.get("text"):
+                    _p2_links.append({
+                        "label": f"Read {name} report",
+                        "url": in_app,
+                        "verified": True,
+                        "primary": True,
+                    })
+                else:
                     _p2_skipped_agents.append(name)
-                    continue
-                # Decision loop: each round = 3× retry → agent_link_failed → user decides
-                while True:
-                    try:
-                        await browser.switch_to_page(page_obj)
-                        await asyncio.sleep(1)
-                    except Exception as e:
-                        log(f"[{name}] switch_to_page failed: {e}", "WARN")
-                    link_res = await extract_with_retry(
-                        phase=2, agent=agent_key, browser=browser, cua_client=cua_client,
-                        extractor_fn=extractor_map[agent_key],
-                        label=f"{name} Research", verbose=verbose,
-                    )
-                    if link_res.verified:
-                        _p2_links.append({"label": f"{name} Research",
-                                          "url": link_res.url, "verified": True})
-                        break
-                    # ── Unified chat-URL fallback (ChatGPT/Gemini/Claude) ──
-                    # Rule (2026-04-20): link-extraction failure is NOT a phase-
-                    # level failure. The agent's own chat URL is the honest,
-                    # always-available fallback — it's the user's own conversation,
-                    # accessible in their own account. We emit link_extracted with
-                    # verified=False so the frontend knows it's a fallback (the
-                    # UI can render it differently, e.g. without the "public" tag).
-                    # The tight public-link gate in extract_share_link_{claude,gemini}
-                    # means Gemini/Claude now also land here when the Publish /
-                    # Share & Export flow can't produce a public URL — matches the
-                    # user's B2/B3 pivot (silent fallback instead of hard-fail modal).
-                    _chat_url = ""
-                    try:
-                        _chat_url = (page_obj.url or "") if page_obj else ""
-                    except Exception:
-                        _chat_url = ""
-                    _chat_url_markers = {
-                        "chatgpt": ["chatgpt.com/c/"],
-                        "gemini":  ["gemini.google.com/app", "gemini.google.com/chat"],
-                        "claude":  ["claude.ai/chat", "claude.ai/new"],
-                    }
-                    if _chat_url and any(m in _chat_url for m in _chat_url_markers.get(agent_key, [])):
-                        log(f"[{name}] Public share unavailable — using chat URL: {_chat_url}")
-                        emit_event("link_extracted", phase=2, agent=agent_key,
-                                   url=_chat_url, label=f"{name} Research",
-                                   verified=False, fallback="chat_url")
-                        _p2_links.append({"label": f"{name} Research",
-                                          "url": _chat_url, "verified": False})
-                        break
-                    # Ask the user: retry / skip / stop
-                    decision = await wait_for_agent_decision(
-                        agent=agent_key, phase=2,
-                        reason=f"Could not extract verified {name} share link after 3 retries: {link_res.error}",
-                    )
-                    if decision == "retry":
-                        log(f"[{name}] User chose RETRY — re-running extraction")
-                        continue
-                    if decision == "stop":
-                        log("User chose STOP after Phase 2 link failure", "WARN")
-                        emit_event("pipeline_stopped", phase=2,
-                                   reason="user_stop_on_agent_link_failed", agent=agent_key)
-                        _update_firestore_research({"status": "stopped", "phase": 2})
-                        return
-                    # skip → record best-effort URL (unverified) and move on
-                    log(f"[{name}] User chose SKIP — continuing without verified link", "WARN")
-                    _p2_skipped_agents.append(name)
-                    if round_url:
-                        _p2_links.append({"label": f"{name} Research",
-                                          "url": round_url, "verified": False})
-                    break
             done_count = sum(1 for r in results.values() if r["status"] == "done")
             total_chars = sum(len(r.get("text", "")) for r in results.values())
-            verified_count = sum(1 for l in _p2_links if l.get("verified"))
-            any_link_count = len(_p2_links)
-            log(f"Phase 2 links: {verified_count} verified, "
-                f"{any_link_count - verified_count} unverified-fallback, "
-                f"{len(_p2_skipped_agents)} skipped")
+            log(f"[Phase 2] Built {len(_p2_links)} in-app primary links, "
+                f"{len(_p2_skipped_agents)} agents skipped (no MD)")
             # ── C8: phase_complete invariant — every non-skipped enabled agent ──
-            # ── should have a link entry (public share OR ChatGPT conv URL).    ──
-            # Decision loops that flow into this block always append to _p2_links
-            # on success, conv-URL fallback, or skip-with-round_url. Missing
-            # entries here mean a code path bypassed the link collection —
-            # log loudly so regressions surface in the next E2E instead of
-            # silently emitting phase_complete with a missing agent.
-            _linked_agents = {(l.get("label") or "").split(" ")[0] for l in _p2_links}
+            # ── should have an in-app primary link entry. With the markdown-as- ──
+            # ── primary architecture (2026-04-25), the in-app /documents URL is ──
+            # ── always present when MD landed. Missing entries mean MD save     ──
+            # ── itself failed for that agent — surface loudly so it's caught.   ──
+            # Match by extracting the agent name from "Read {name} report" labels.
+            _linked_agents = set()
+            for _l in _p2_links:
+                _lbl = _l.get("label") or ""
+                # "Read ChatGPT report" → "ChatGPT"
+                _parts = _lbl.split(" ")
+                if len(_parts) >= 2 and _parts[0] == "Read":
+                    _linked_agents.add(_parts[1])
             _expected_agents = set(results.keys()) - set(_p2_skipped_agents)
             _missing_links = _expected_agents - _linked_agents
             if _missing_links:
                 log(f"[Phase 2] phase_complete invariant breach: {sorted(_missing_links)} "
-                    f"are non-skipped but have no link entry. Emitting phase_complete "
-                    f"anyway so the pipeline advances — these agents will render as "
-                    f"unlinked on the frontend. Investigate the path that skipped "
-                    f"the link append.", "ERROR")
+                    f"are non-skipped but have no in-app primary link. Emitting "
+                    f"phase_complete anyway — these agents will render as unlinked. "
+                    f"Investigate why MD save / in-app URL build skipped them.", "ERROR")
             emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
                 skippedAgents=_p2_skipped_agents,
                 summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — "
-                        f"{verified_count} verified + {any_link_count - verified_count} fallback links")
+                        f"{len(_p2_links)} in-app primary links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
         else:
             log("Phase 2: Loading existing research files")
@@ -12837,8 +12623,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     combined_brief = (brief_artifact.text if brief_artifact else brief_text) + \
                                       "\n\nADDITIONAL USER CONTEXT:\n" + resume_input
                     enabled_agents_now = [a for a, on in agents_cfg.items() if on]
-                    results = await run_phase2(browser, cua_client, combined_brief, verbose,
-                                                enabled_agents=enabled_agents_now)
+                    results = await run_phase2(
+                        browser, cua_client, combined_brief, verbose,
+                        enabled_agents=enabled_agents_now)
                     # Rewrite documents
                     for name, r in results.items():
                         if r.get("text"):
@@ -12846,9 +12633,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             _regen_md = f"# {name} Deep Research (regenerated)\n\n{r['text']}"
                             (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
                             save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
-                    # Build links from round-robin results (per-agent pages, not browser.page)
-                    _p2_links = [{"label": f"{n} Research", "url": r.get("url", ""), "verified": True}
-                                 for n, r in results.items() if r.get("url")]
+                    # Build links from round-robin results — prefer in-app primary
+                    # (always present when MD landed) over conversation URL.
+                    _p2_links = []
+                    for n, r in results.items():
+                        in_app = r.get("_in_app_url") or ""
+                        if in_app and r.get("text"):
+                            _p2_links.append({"label": f"Read {n} report", "url": in_app,
+                                              "verified": True, "primary": True})
                     emit_event("phase_complete", phase=2, links=_p2_links,
                                summary=f"Phase 2 regenerated with user input")
 
@@ -12887,8 +12679,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     pass
                 _retry_brief_text = (brief_artifact.text if brief_artifact else brief_text) or ""
                 _retry_enabled = [a for a, on in agents_cfg.items() if on]
-                results = await run_phase2(browser, cua_client, _retry_brief_text, verbose,
-                                            enabled_agents=_retry_enabled)
+                results = await run_phase2(
+                    browser, cua_client, _retry_brief_text, verbose,
+                    enabled_agents=_retry_enabled)
                 # Rewrite documents from the fresh results
                 for name, r in results.items():
                     if r.get("text"):
