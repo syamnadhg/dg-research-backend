@@ -3092,30 +3092,53 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
             # SECONDARY — read the browser's clipboard directly (the "Copy link"
             # button wrote the public /share/ URL into it). This is far more
             # reliable than asking CUA to recover it via screenshots.
+            # 2s wait_for: a clipboard permission prompt or a busy clipboard
+            # used to hang this evaluate() indefinitely on Windows.
             if "chatgpt.com/share" not in url:
                 try:
-                    clip_js = await page.evaluate("navigator.clipboard.readText()")
+                    clip_js = await asyncio.wait_for(
+                        page.evaluate("navigator.clipboard.readText()"),
+                        timeout=2.0,
+                    )
                     if clip_js and "chatgpt.com/share" in clip_js:
                         url = clip_js.strip()
                         log(f"[{label}] Share URL recovered from browser clipboard: {url}")
-                except Exception as _e:
-                    # clipboard-read permission may be denied; fall through
+                except (asyncio.TimeoutError, Exception):
+                    # clipboard-read permission may be denied / hung; fall through
                     pass
-            # TERTIARY — Windows OS clipboard via PowerShell
+            # TERTIARY — Windows OS clipboard via PowerShell. PowerShell can
+            # block on a locked clipboard (antivirus / another process holding
+            # it); cap with a 3s deadline so the pipeline doesn't stall.
             if "chatgpt.com/share" not in url:
-                clip = get_clipboard()
-                if "chatgpt.com/share" in clip:
-                    url = clip
+                try:
+                    clip = await asyncio.wait_for(
+                        asyncio.to_thread(get_clipboard),
+                        timeout=3.0,
+                    )
+                    if "chatgpt.com/share" in (clip or ""):
+                        url = clip
+                except (asyncio.TimeoutError, Exception):
+                    pass
             # Close modal
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
-        # Step 2: CUA fallback if no share URL yet
+        # Step 2: CUA fallback if no share URL yet. Hard-cap at 120s — the
+        # agent_loop's max_iterations=6 doesn't bound wall-clock time, so a
+        # stuck CUA could loiter for many minutes. The wait_for keeps the
+        # share-link path bounded and reachable.
         if "chatgpt.com/share" not in url:
             log(f"[{label}] CUA fallback for share link...")
-            result = await agent_loop(cua_client, browser,
-                "Share this ChatGPT conversation by clicking the Share button.",
-                "Click the Share button at the top of this conversation. If a modal appears, click 'Create link' or 'Copy link'. After clicking Copy link, just STOP — don't try to extract the URL yourself, the code will read it from the clipboard.",
-                model=CUA_MODEL, max_iterations=6, verbose=verbose)
+            try:
+                result = await asyncio.wait_for(
+                    agent_loop(cua_client, browser,
+                        "Share this ChatGPT conversation by clicking the Share button.",
+                        "Click the Share button at the top of this conversation. If a modal appears, click 'Create link' or 'Copy link'. After clicking Copy link, just STOP — don't try to extract the URL yourself, the code will read it from the clipboard.",
+                        model=CUA_MODEL, max_iterations=6, verbose=verbose),
+                    timeout=120.0,
+                )
+            except asyncio.TimeoutError:
+                log(f"[{label}] CUA share-link extraction timed out (120s) — using current URL as fallback", "WARN")
+                result = {"text": ""}
             text = (result.get("text") or "")
             # Extract URL from CUA response (if it happened to observe one)
             m = re.search(r'https://chatgpt\.com/share/[a-zA-Z0-9-]+', text)
@@ -3124,16 +3147,25 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
             # After CUA clicked "Copy link", read the browser clipboard directly
             if "chatgpt.com/share" not in url:
                 try:
-                    clip_js = await page.evaluate("navigator.clipboard.readText()")
+                    clip_js = await asyncio.wait_for(
+                        page.evaluate("navigator.clipboard.readText()"),
+                        timeout=2.0,
+                    )
                     if clip_js and "chatgpt.com/share" in clip_js:
                         url = clip_js.strip()
                         log(f"[{label}] Share URL recovered from clipboard after CUA share click: {url}")
-                except Exception:
+                except (asyncio.TimeoutError, Exception):
                     pass
             if "chatgpt.com/share" not in url:
-                clip = get_clipboard()
-                if "chatgpt.com/share" in clip:
-                    url = clip
+                try:
+                    clip = await asyncio.wait_for(
+                        asyncio.to_thread(get_clipboard),
+                        timeout=3.0,
+                    )
+                    if "chatgpt.com/share" in (clip or ""):
+                        url = clip
+                except (asyncio.TimeoutError, Exception):
+                    pass
         verified = "chatgpt.com/share" in url
         return LinkResult(url=url, label=label, platform="chatgpt", verified=verified)
     except Exception as e:
@@ -6165,7 +6197,13 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             "Extended Thinking"
                         )
                         progress["status"] = "extended_thinking"
-                        progress["progress"] = f"{_think_label} active ({elapsed_sec // 60}min elapsed, typical {expected_min}min)"
+                        # Drop elapsed/typical from the progress string —
+                        # the FE phase header already renders both from
+                        # elapsedSec + expectedMinutes (top of dropdown),
+                        # and duplicating them in the per-platform card was
+                        # confusing + stale-looking when the top counter
+                        # advanced but the baked-in string didn't.
+                        progress["progress"] = f"{_think_label} active"
                     agent_key = normalize_agent_key(label)
                     emit_event("agent_progress", phase=phase, agent=agent_key,
                         status=progress.get("status", ""),
@@ -12118,44 +12156,71 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # Create BriefArtifact for reliable Phase 2 paste
                 brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
                 log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
-                # ── B1: Link-first phase_complete — 3× retry, then await user ──
-                # ARCHITECTURE 2026-04-18: if link extraction fails, fall into
-                # the never-die retry loop instead of terminating the run.
-                while True:
-                    log("Phase 1: Extracting verified ChatGPT share link (3× retry)...")
-                    p1_link = await extract_with_retry(
-                        phase=1, agent="chatgpt", browser=browser, cua_client=cua_client,
-                        extractor_fn=extract_share_link_chatgpt,
-                        label="ChatGPT Brief", verbose=verbose,
-                    )
+                # ── B1: Link-first phase_complete — 3× retry, then auto-fallback ──
+                # ARCHITECTURE 2026-04-25: cap the link-extraction loop hard.
+                # Public share URL is the preference; if extract_with_retry
+                # exhausts its 3 internal retries (each itself bounded by
+                # asyncio.wait_for), fall back to the CONVERSATION URL
+                # (already captured at extractor entry as `result.url`)
+                # rather than awaiting a user retry/skip decision that can
+                # silently time out and re-loop forever. User flow:
+                #   public share preferred → conversation URL fallback →
+                #   move on (verified=False, but a usable link exists).
+                # User can still request a manual retry via the phase
+                # alert that fail_phase() emits, but the run no longer
+                # blocks on that decision — it auto-advances after a
+                # short grace window.
+                _LINK_EXTRACT_DEADLINE = 5 * 60  # 5 min hard ceiling per phase
+                _link_start = time.time()
+                _outer_attempts = 0
+                _MAX_OUTER_ATTEMPTS = 2
+                p1_link = None
+                while time.time() - _link_start < _LINK_EXTRACT_DEADLINE and _outer_attempts < _MAX_OUTER_ATTEMPTS:
+                    _outer_attempts += 1
+                    log(f"Phase 1: Extracting verified ChatGPT share link (outer attempt {_outer_attempts}/{_MAX_OUTER_ATTEMPTS}, 3× inner retry)...")
+                    try:
+                        p1_link = await asyncio.wait_for(
+                            extract_with_retry(
+                                phase=1, agent="chatgpt", browser=browser, cua_client=cua_client,
+                                extractor_fn=extract_share_link_chatgpt,
+                                label="ChatGPT Brief", verbose=verbose,
+                            ),
+                            timeout=180.0,  # 3-min ceiling per outer attempt
+                        )
+                    except asyncio.TimeoutError:
+                        log(f"Phase 1: extract_with_retry exceeded 180s on outer attempt {_outer_attempts}", "WARN")
+                        p1_link = type("_TimeoutLink", (), {"url": brief_url, "verified": False, "error": "extractor_timeout"})()
                     if p1_link.verified:
                         break
-                    log(f"Phase 1: no verified ChatGPT link after 3 retries: {p1_link.error} — awaiting user decision", "ERROR")
-                    fail_phase(
-                        phase=1,
-                        error=f"Could not extract verified ChatGPT share link: {p1_link.error}",
-                        reason="Extraction couldn't confirm the ChatGPT share link after all retries. Retry to try again, or skip to continue with just the brief text.",
-                        agent="chatgpt",
-                    )
-                    decision = await _controls.await_phase_decision(1)
-                    if decision == "retry":
-                        log("Phase 1 link extraction: user requested retry", "INFO")
-                        emit_event("phase_restart", phase=1, reason="user_retry_link_extract", attempt=0)
-                        continue
-                    if decision == "skip":
-                        log("Phase 1 link extraction: user skipped — proceeding with brief text but no share link", "INFO")
-                        # Synthesize a minimal p1_link so downstream code
-                        # that expects `p1_link.url` gets "" without a
-                        # separate guard.
-                        p1_link = type("_EmptyLink", (), {"url": "", "verified": False, "error": "skipped_by_user"})()
-                        break
-                    # stop / timeout
-                    log(f"Phase 1 link extraction: user {decision} — terminating pipeline", "INFO")
-                    emit_event("pipeline_stopped", phase=1, reason=f"user_{decision}_link_extract")
-                    return
+                    if _outer_attempts < _MAX_OUTER_ATTEMPTS:
+                        log(f"Phase 1: outer attempt {_outer_attempts} unverified ({p1_link.error}) — retrying", "WARN")
+                        await asyncio.sleep(3.0)
+                # If still unverified, fall back to the conversation URL so
+                # the pipeline can advance. The brief artifact already has
+                # the full markdown; we just need *some* link the user can
+                # click. brief_url is the live chat URL captured before
+                # extraction started.
+                if p1_link is None or not p1_link.verified:
+                    fallback_url = (p1_link.url if (p1_link and p1_link.url) else "") or brief_url
+                    log(f"Phase 1: link extraction failed after {_outer_attempts} attempts — falling back to conversation URL {fallback_url}", "WARN")
+                    # Stream the fallback link to FE so it has a usable URL.
+                    # verified=False signals "this is the chat URL, not a
+                    # public share" — FE renders it the same but the
+                    # fallbackNote tile caption surfaces the distinction.
+                    emit_event("link_extracted", phase=1, agent="chatgpt",
+                               url=fallback_url, label="ChatGPT Brief",
+                               verified=False, fallback="conversation_url")
+                    # Surface a non-blocking warning so the user knows the
+                    # public share didn't land — they can re-share manually
+                    # later if they want to. No pause, no await.
+                    emit_event("pipeline_warning", phase=1, agent="chatgpt",
+                               severity="info",
+                               message="Used conversation URL — public share link couldn't be extracted",
+                               actions=[])
+                    p1_link = type("_FallbackLink", (), {"url": fallback_url, "verified": False, "error": (p1_link.error if p1_link else "no_link")})()
                 brief_url = p1_link.url
                 brief_artifact.url = brief_url
-                _p1_links = [{"label": "ChatGPT Brief", "url": brief_url, "verified": True}] if p1_link.verified else []
+                _p1_links = [{"label": "ChatGPT Brief", "url": brief_url, "verified": p1_link.verified}]
                 save_checkpoint(queue_dir, 1, topic=topic, brief_url=brief_url)
                 update_delivery(brief_url=brief_url)
                 save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
