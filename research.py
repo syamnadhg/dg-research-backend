@@ -5882,16 +5882,16 @@ async def verify_chatgpt_generating(page) -> bool:
                             // button or spinner detected above, its presence means
                             // the response is settled — treat as definitively done.
                             if (bl.includes('thought for ')) return false;
-                            // Active keywords (narrowed): the previous list matched
-                            // present and past tense alike (e.g. 'searching' in
-                            // "After searching the web…", 'browsing' in "browsed
-                            // 47 sources"). Kept only present-progressive phrases
-                            // that rarely appear in the finished response. Most
-                            // importantly: the old "length > 200" fallback is
-                            // gone — the rendered brief itself is well over 200
-                            // chars, which used to pin the detector True forever.
-                            const kws = ['reading sources', 'sources and counting'];
-                            if (kws.some(k => bl.includes(k))) return true;
+                            // Removed keyword fallthrough entirely. Inside the DR
+                            // iframe, body text IS the rendered brief itself —
+                            // the brief can legitimately contain phrases like
+                            // "after reading sources" or "searching the web", and
+                            // any keyword match would re-introduce the same
+                            // false-positive class as the deleted length>200
+                            // fallback. Visual markers above (stop button,
+                            // progressbar/spinner/streaming) are reliable signals
+                            // for "still active" inside the iframe; keywords add
+                            // risk without unique coverage.
                             return false;
                         }""")
                         if active:
@@ -6167,6 +6167,16 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     consecutive_not_generating = 0
     cua_checked = False
     last_heartbeat = time.time()
+    # Stall detector: catches "ChatGPT alive but no new text" mid-stream
+    # freezes. The deadline ceiling (`_await_phase_with_active_deadline`)
+    # is the ultimate net but burns the full PHASE_*_MAX_MIN budget on a
+    # frozen agent. By tracking text-length growth we can surface the
+    # recoverable [Retry, Skip] alert ~25 min sooner. Fires only when the
+    # detector still claims "generating" — a genuinely-done response is
+    # caught earlier by the verify_fn=False completion path.
+    last_seen_len = 0
+    stall_window_start = None  # time.time() when growth first stopped
+    STALL_THRESHOLD_SEC = 600  # 10 min of no text growth → likely stuck
 
     # Subtract paused_total from elapsed so a long user pause doesn't make
     # this inner timer falsely fire after resume. Without this, a user who
@@ -6184,7 +6194,13 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             emit_event("pipeline_paused", phase=phase)
             _pause_t0 = time.monotonic()
             await _controls.wait_if_paused()
-            paused_total += time.monotonic() - _pause_t0
+            _this_pause = time.monotonic() - _pause_t0
+            paused_total += _this_pause
+            # Don't count user pause time toward stall — push the stall
+            # window forward so a long pause doesn't false-fire on the
+            # next post-resume tick.
+            if stall_window_start is not None:
+                stall_window_start += _this_pause
             if _controls.is_stop():
                 log(f"[{label}] STOP after pause — aborting poll")
                 return False
@@ -6212,6 +6228,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 _obs_preview = _obs.get("observer_preview", "") or ""
                 # partialTextLen is max of DOM scrape + observer (observer is usually fresher)
                 _merged_partial_len = max(progress.get("partial_text_len", 0) or 0, _obs_len)
+                # Stall tracking: stamp time when growth stops, reset on growth.
+                if _merged_partial_len > last_seen_len:
+                    last_seen_len = _merged_partial_len
+                    stall_window_start = None
+                elif _merged_partial_len > 0 and stall_window_start is None:
+                    stall_window_start = time.time()
                 # Deduplicate: only emit if data actually changed
                 progress_key = json.dumps({
                     "status": progress.get("status", ""),
@@ -6372,6 +6394,21 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
         else:
             consecutive_not_generating = 0
             cua_checked = False  # Reset so CUA can check again if needed
+            # Stall surface: detector still says "running" but text stopped
+            # growing for STALL_THRESHOLD_SEC. Catches the "ChatGPT alive but
+            # frozen mid-stream" case proactively — raises into the phase
+            # retry-loop's `except asyncio.TimeoutError:` so the user gets
+            # the [Retry, Skip] alert ~25 min before the hard ceiling.
+            if (stall_window_start is not None
+                    and (time.time() - stall_window_start) > STALL_THRESHOLD_SEC):
+                _stall = int(time.time() - stall_window_start)
+                log(f"[{label}] Stall detected: {_merged_partial_len} chars, "
+                    f"no growth for {_stall}s while detector says generating "
+                    f"→ surfacing for user decision (Retry/Skip)", "WARN")
+                raise asyncio.TimeoutError(
+                    f"phase {phase} response stalled at {_merged_partial_len} chars "
+                    f"(no text growth for {_stall}s)"
+                )
 
         elapsed_min = int(time.time() - wait_start) // 60
         log(f"[{label}] Still generating... ({elapsed_min}m elapsed)")
@@ -11815,6 +11852,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             except asyncio.CancelledError:
                 run_task.cancel()
                 raise
+            # User-Stop short-circuit: the deadline loop used to ignore the
+            # Stop button and only react when the phase coroutine itself
+            # noticed the stop flag — which could be deep inside a long
+            # CUA call. Now we cancel-and-propagate immediately, so user
+            # Stop during a stuck phase exits within one tick (5s) instead
+            # of waiting up to `max_min` for the deadline.
+            if _controls.is_stop():
+                run_task.cancel()
+                try: await run_task
+                except BaseException: pass
+                raise asyncio.CancelledError(f"phase {phase} stopped by user")
             if not _controls.is_pause():
                 active_sec += tick
             if active_sec >= deadline_sec and not run_task.done():
@@ -11823,17 +11871,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # CancelledError inherits from BaseException (not Exception)
                 # since Python 3.8, so `except Exception: pass` did NOT catch
                 # the post-cancel re-raise — and the `raise TimeoutError`
-                # below was never reached. The CancelledError unwound past
-                # the phase retry-loop's `except asyncio.TimeoutError:` and
-                # the runner's `except Exception:`, landing in the `finally:`
-                # block that just closes the browser. Result: the entire
-                # recoverable-timeout pipeline (fail_phase → request_pause →
-                # await_phase_decision with [Retry, Skip]) silently never
-                # ran. Catching BaseException (or asyncio.CancelledError
-                # explicitly) lets us convert the cancel into the
-                # TimeoutError the retry loop expects.
+                # below was never reached. Catching BaseException converts
+                # the cancel into the TimeoutError the retry loop expects.
                 try: await run_task
-                except BaseException: pass
+                except BaseException as _drained:
+                    # DEBUG-log the drained class so any future regression
+                    # where something unexpected leaks (custom exception,
+                    # SystemExit, etc.) doesn't go silent.
+                    log(f"Phase {phase}: drained {type(_drained).__name__} post-cancel", "DEBUG")
                 raise asyncio.TimeoutError(
                     f"phase {phase} exceeded {max_min}-min active-time budget"
                 )
