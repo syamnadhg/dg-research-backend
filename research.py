@@ -11820,8 +11820,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if active_sec >= deadline_sec and not run_task.done():
                 log(f"Phase {phase}: active-time {active_sec:.0f}s exceeded {deadline_sec:.0f}s — cancelling for user decision", "WARN")
                 run_task.cancel()
+                # CancelledError inherits from BaseException (not Exception)
+                # since Python 3.8, so `except Exception: pass` did NOT catch
+                # the post-cancel re-raise — and the `raise TimeoutError`
+                # below was never reached. The CancelledError unwound past
+                # the phase retry-loop's `except asyncio.TimeoutError:` and
+                # the runner's `except Exception:`, landing in the `finally:`
+                # block that just closes the browser. Result: the entire
+                # recoverable-timeout pipeline (fail_phase → request_pause →
+                # await_phase_decision with [Retry, Skip]) silently never
+                # ran. Catching BaseException (or asyncio.CancelledError
+                # explicitly) lets us convert the cancel into the
+                # TimeoutError the retry loop expects.
                 try: await run_task
-                except Exception: pass
+                except BaseException: pass
                 raise asyncio.TimeoutError(
                     f"phase {phase} exceeded {max_min}-min active-time budget"
                 )
