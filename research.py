@@ -12143,101 +12143,89 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _update_firestore_research({"phase": 1, "status": "ongoing"})
             elif _brief_from_file:
                 # Phase 1 bypassed via --brief-file (or frontend briefText).
-                # Persist to disk + Firestore but DO NOT try to extract a
-                # ChatGPT share link — there's no ChatGPT brief session to
-                # share from. The brief is the user-supplied text; they can
-                # link to it from the frontend documents page instead.
+                # Persist to disk + Firestore. The user supplied the text;
+                # there's no ChatGPT session to share from. Link to the
+                # in-app document viewer (FE Documents page renders the
+                # markdown in app theme).
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
                 save_document_to_firestore("brief", _brief_md, "Research Brief")
-                brief_artifact = BriefArtifact(text=brief_text, url="")
+                _in_app_brief_url = f"/documents?open={_fb_research_id}:brief" if _fb_research_id else "/documents"
+                brief_artifact = BriefArtifact(text=brief_text, url=_in_app_brief_url)
                 log(f"BriefArtifact (from file): {brief_artifact.chars} chars, "
                     f"{len(brief_artifact.sections)} sections")
-                save_checkpoint(queue_dir, 1, topic=topic, brief_url="")
+                _p1_links = [{"label": "Read brief", "url": _in_app_brief_url, "verified": True, "primary": True}]
+                save_checkpoint(queue_dir, 1, topic=topic, brief_url=_in_app_brief_url)
                 save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
                 emit_event("phase_complete", phase=1,
-                    durationSec=int(time.time() - _p1_start),
+                    durationSec=int(time.time() - _p1_start), links=_p1_links,
                     summary=f"Research brief loaded from file ({brief_artifact.chars} chars)")
-                _update_firestore_research({"phase": 1, "status": "ongoing"})
+                _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
             else:
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
-                # Sync to Firestore documents subcollection for Vercel Documents page
+                # Sync to Firestore documents subcollection — this is the
+                # source of truth the FE Documents page renders. Phase 2
+                # uses brief_artifact.text for paste; the URL is purely for
+                # display in the phase dropdown + chat.
                 save_document_to_firestore("brief", _brief_md, "Research Brief")
-                # Create BriefArtifact for reliable Phase 2 paste
-                brief_artifact = BriefArtifact(text=brief_text, url=brief_url)
+                # ── Markdown-as-primary architecture (2026-04-25) ──
+                # phase_complete fires as SOON as the brief markdown is
+                # in Firestore. The primary link points at the in-app
+                # Documents viewer — guaranteed to work, no platform
+                # share-link scraping required. Share-link extraction
+                # runs AFTER as a best-effort secondary (90s budget,
+                # conversation URL fallback) and lands via link_extracted.
+                # Goals: (a) phase_complete is no longer gated on a
+                # flaky CUA share-modal flow; (b) the chat/dropdown link
+                # always works; (c) the run advances even if ChatGPT's
+                # share UI changes overnight.
+                _in_app_brief_url = f"/documents?open={_fb_research_id}:brief" if _fb_research_id else "/documents"
+                brief_artifact = BriefArtifact(text=brief_text, url=_in_app_brief_url)
                 log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
-                # ── B1: Link-first phase_complete — 3× retry, then auto-fallback ──
-                # ARCHITECTURE 2026-04-25: cap the link-extraction loop hard.
-                # Public share URL is the preference; if extract_with_retry
-                # exhausts its 3 internal retries (each itself bounded by
-                # asyncio.wait_for), fall back to the CONVERSATION URL
-                # (already captured at extractor entry as `result.url`)
-                # rather than awaiting a user retry/skip decision that can
-                # silently time out and re-loop forever. User flow:
-                #   public share preferred → conversation URL fallback →
-                #   move on (verified=False, but a usable link exists).
-                # User can still request a manual retry via the phase
-                # alert that fail_phase() emits, but the run no longer
-                # blocks on that decision — it auto-advances after a
-                # short grace window.
-                _LINK_EXTRACT_DEADLINE = 5 * 60  # 5 min hard ceiling per phase
-                _link_start = time.time()
-                _outer_attempts = 0
-                _MAX_OUTER_ATTEMPTS = 2
-                p1_link = None
-                while time.time() - _link_start < _LINK_EXTRACT_DEADLINE and _outer_attempts < _MAX_OUTER_ATTEMPTS:
-                    _outer_attempts += 1
-                    log(f"Phase 1: Extracting verified ChatGPT share link (outer attempt {_outer_attempts}/{_MAX_OUTER_ATTEMPTS}, 3× inner retry)...")
-                    try:
-                        p1_link = await asyncio.wait_for(
-                            extract_with_retry(
-                                phase=1, agent="chatgpt", browser=browser, cua_client=cua_client,
-                                extractor_fn=extract_share_link_chatgpt,
-                                label="ChatGPT Brief", verbose=verbose,
-                            ),
-                            timeout=180.0,  # 3-min ceiling per outer attempt
-                        )
-                    except asyncio.TimeoutError:
-                        log(f"Phase 1: extract_with_retry exceeded 180s on outer attempt {_outer_attempts}", "WARN")
-                        p1_link = type("_TimeoutLink", (), {"url": brief_url, "verified": False, "error": "extractor_timeout"})()
-                    if p1_link.verified:
-                        break
-                    if _outer_attempts < _MAX_OUTER_ATTEMPTS:
-                        log(f"Phase 1: outer attempt {_outer_attempts} unverified ({p1_link.error}) — retrying", "WARN")
-                        await asyncio.sleep(3.0)
-                # If still unverified, fall back to the conversation URL so
-                # the pipeline can advance. The brief artifact already has
-                # the full markdown; we just need *some* link the user can
-                # click. brief_url is the live chat URL captured before
-                # extraction started.
-                if p1_link is None or not p1_link.verified:
-                    fallback_url = (p1_link.url if (p1_link and p1_link.url) else "") or brief_url
-                    log(f"Phase 1: link extraction failed after {_outer_attempts} attempts — falling back to conversation URL {fallback_url}", "WARN")
-                    # Stream the fallback link to FE so it has a usable URL.
-                    # verified=False signals "this is the chat URL, not a
-                    # public share" — FE renders it the same but the
-                    # fallbackNote tile caption surfaces the distinction.
-                    emit_event("link_extracted", phase=1, agent="chatgpt",
-                               url=fallback_url, label="ChatGPT Brief",
-                               verified=False, fallback="conversation_url")
-                    # Surface a non-blocking warning so the user knows the
-                    # public share didn't land — they can re-share manually
-                    # later if they want to. No pause, no await.
-                    emit_event("pipeline_warning", phase=1, agent="chatgpt",
-                               severity="info",
-                               message="Used conversation URL — public share link couldn't be extracted",
-                               actions=[])
-                    p1_link = type("_FallbackLink", (), {"url": fallback_url, "verified": False, "error": (p1_link.error if p1_link else "no_link")})()
-                brief_url = p1_link.url
-                brief_artifact.url = brief_url
-                _p1_links = [{"label": "ChatGPT Brief", "url": brief_url, "verified": p1_link.verified}]
-                save_checkpoint(queue_dir, 1, topic=topic, brief_url=brief_url)
-                update_delivery(brief_url=brief_url)
+                _p1_links = [{"label": "Read brief", "url": _in_app_brief_url, "verified": True, "primary": True}]
+                save_checkpoint(queue_dir, 1, topic=topic, brief_url=_in_app_brief_url)
+                update_delivery(brief_url=_in_app_brief_url)
                 save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
-                emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start), links=_p1_links,
+                emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),
+                    links=_p1_links,
                     summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
                 _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
+                # ── Best-effort secondary link (share/conversation URL) ──
+                # Tightened to 1 outer attempt × 90s — this is no longer
+                # blocking phase advancement, just a nice-to-have "view
+                # original ChatGPT conversation" link beside the in-app
+                # markdown. If we fail, fall back to the conversation URL
+                # silently (no warning, no pause).
+                _share_url = brief_url  # conversation URL captured before extraction
+                try:
+                    p1_link = await asyncio.wait_for(
+                        extract_with_retry(
+                            phase=1, agent="chatgpt", browser=browser, cua_client=cua_client,
+                            extractor_fn=extract_share_link_chatgpt,
+                            label="ChatGPT conversation", verbose=verbose,
+                        ),
+                        timeout=90.0,
+                    )
+                    if p1_link.verified and p1_link.url:
+                        _share_url = p1_link.url
+                        log(f"Phase 1: secondary share link extracted: {_share_url}")
+                    else:
+                        log(f"Phase 1: secondary share link unverified ({p1_link.error}) — using conversation URL", "INFO")
+                except asyncio.TimeoutError:
+                    log("Phase 1: secondary share-link extraction timed out (90s) — using conversation URL", "INFO")
+                except Exception as _e:
+                    log(f"Phase 1: secondary share-link extraction errored ({_e}) — using conversation URL", "INFO")
+                # Always emit a secondary link_extracted so FE can show
+                # "View on ChatGPT" beside "Read brief". verified=True
+                # only when the public share URL succeeded; otherwise the
+                # conversation URL is unverified-but-usable.
+                if _share_url:
+                    emit_event("link_extracted", phase=1, agent="chatgpt",
+                               url=_share_url,
+                               label="View on ChatGPT",
+                               verified=("chatgpt.com/share" in _share_url),
+                               fallback=None if "chatgpt.com/share" in _share_url else "conversation_url")
         else:
             # Load brief from documents/ (new location) or root (old location)
             for bp in [queue_dir / "documents" / "brief.md", queue_dir / "brief.md"]:
