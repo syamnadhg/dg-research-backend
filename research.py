@@ -2018,17 +2018,25 @@ class PipelineControls:
             await asyncio.sleep(0.5)
         return "timeout"
 
-    async def await_phase_decision(self, phase: int, timeout: float = 3600.0) -> str:
+    async def await_phase_decision(self, phase: int, timeout: float = 86400.0) -> str:
         """Wait for the user to resolve a phase-level pipeline_error. Returns:
             'retry' — Retry clicked (consume_retry_phase)
             'skip'  — Skip clicked (consume_phase_skip)
             'stop'  — Stop clicked (stop_event)
-            'timeout' — 1-hour wait expired (caller should default to stop)
+            'timeout' — wait expired (24h default — effectively never)
 
         Used by all phase callers after fail_phase(...) to honor the
         never-die contract (ARCHITECTURE CHANGE 2026-04-18). Polls every
         0.5s; pause_event is also checked so an indefinite HV pause
-        doesn't starve the decision."""
+        doesn't starve the decision.
+
+        Default bumped 1h → 24h (2026-04-25) — a 1h timeout falling
+        through to "timeout" → fall-through-to-stop violates the
+        never-die contract: the user being AFK shouldn't terminate
+        their run. The FE watchdog T3 catches genuinely-dead runs via
+        silence detection; this timeout is now effectively a no-op
+        backstop. BE keeps heartbeating in the await loop so the
+        watchdog stays alive while paused for user decision."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
@@ -6253,12 +6261,16 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
         if not generating:
             consecutive_not_generating += 1
 
-            # First few "not generating" could be a DOM selector issue
-            if consecutive_not_generating <= 2:
+            # First "not generating" could be a DOM selector issue or a
+            # split-second between tokens. Drop to 2-consecutive (was 3)
+            # — saves 30s of slack per phase. The DOM selectors are tight
+            # post-2026-04 overhaul; false-positive risk is low. CUA is
+            # still the visual fallback after 2 consecutive.
+            if consecutive_not_generating <= 1:
                 await asyncio.sleep(5)
                 continue
 
-            # After 3 consecutive "not generating" — warn user + ask CUA to verify
+            # After 2 consecutive "not generating" — warn user + ask CUA to verify
             if not cua_checked and browser and cua_client:
                 agent_key = normalize_agent_key(label)
                 emit_event("agent_warning", phase=phase, agent=agent_key,
@@ -10522,9 +10534,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         if not verified:
             log("Could not verify audio generation started", "WARN")
 
-        # Minimum 5 minute wait — audio generation takes at least 5-10 minutes
-        log("Waiting 5 minutes before first audio check (generation takes ~10-20 min)...")
-        interrupt = await _controls.interruptible_sleep(5 * 60, check_interval=10)
+        # Minimum 2 minute wait — audio generation typically starts within 1-2 min;
+        # waiting 5 min was burning slack for no reason. First poll at 2 min is
+        # safe (NotebookLM has reliably emitted progress signals by then).
+        log("Waiting 2 minutes before first audio check (generation takes ~10-20 min)...")
+        interrupt = await _controls.interruptible_sleep(2 * 60, check_interval=10)
         if interrupt == "stop":
             log("[Phase4] STOP during initial wait — aborting", "WARN")
             return {"audio_path": None}
@@ -10572,7 +10586,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
             log(f"[Phase4] Audio still generating... ({elapsed_min}m total)")
             save_track("Phase4", {"status": "generating", "elapsed_min": elapsed_min})
-            interrupt = await _controls.interruptible_sleep(175, check_interval=10)
+            interrupt = await _controls.interruptible_sleep(90, check_interval=10)
             if interrupt == "stop":
                 log("[Phase4] STOP during poll wait — aborting")
                 break
@@ -11715,35 +11729,69 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             except Exception:
                 pass
 
-    def _handle_phase_timeout(phase: int, max_min: int):
-        """Common termination path when a phase exceeds its hard wall-clock
-        ceiling (per-phase MAX_MIN constants). Persists status="stopped" to
-        delivery.json BEFORE emitting pipeline_stopped + Firestore update —
-        the auto-retry block at the outer runner reads delivery.json
-        directly and short-circuits when status=="stopped", so writing to
-        delivery first is what actually prevents the run from looping.
-        FE renders a red X badge + reason in the phase dropdown via the
-        usePipeline pipeline_stopped handler (type="error" alert)."""
-        log(f"Phase {phase} exceeded {max_min}-min ceiling — terminating run", "ERROR")
-        try: save_meta(queue_dir, topic, phase, status="stopped")
-        except Exception: pass
-        try: update_delivery(status="stopped")
-        except Exception: pass
-        emit_event("pipeline_stopped", phase=phase, reason="phase_timeout",
-                   timeout_min=max_min,
-                   error=f"Phase {phase} exceeded {max_min}-minute ceiling without completing")
-        _update_firestore_research({"status": "stopped", "phase": phase})
+    async def _phase_timeout_decision(phase: int, max_min: int, agent: str | None = None) -> str:
+        """Recoverable response to a per-phase active-time ceiling. Per the
+        never-die contract, BE-detected stuck phases do NOT terminate the
+        run — they emit pipeline_error with [Retry, Skip] actions and pause
+        for the user's call. User decides:
+          - retry → restore from checkpoint, rerun the phase (fresh deadline)
+          - skip  → mark phase done, advance to next
+          - stop  → only fires if user explicitly hit Stop (chat input button)
+                    while the alert was up; await_phase_decision picks that up
+                    via _controls.is_stop()
+        Returns the user's decision string. Does NOT write delivery.json
+        status="stopped" — that's reserved for terminal stop paths only."""
+        log(f"Phase {phase}: active-time ceiling {max_min}min hit — surfacing to user as recoverable error", "WARN")
+        actions = [
+            {"id": "retry", "label": "Retry from checkpoint", "style": "primary",
+             "command": {"action": "retry_phase", "phase": phase}},
+            {"id": "skip", "label": "Skip phase", "style": "default",
+             "command": {"action": "skip_phase", "phase": phase}},
+        ]
+        try:
+            fail_phase(
+                phase=phase,
+                error=f"Phase {phase} exceeded {max_min}-minute active-time ceiling",
+                reason=(
+                    f"This phase has been running for {max_min} minutes of active work "
+                    "without completing — likely stuck on a CUA loop, frozen Playwright "
+                    "operation, or a platform UI hiccup. Retry restores from the last "
+                    "checkpoint and reruns this phase with a fresh budget. Skip moves "
+                    "past this phase and continues with whatever artifacts are on disk. "
+                    "You can also Stop the pipeline from the chat input bar."
+                ),
+                agent=agent,
+                actions=actions,
+            )
+        except Exception as _e:
+            # fail_phase signature mismatch → fall back to direct emit
+            log(f"_phase_timeout_decision: fail_phase fallback ({_e})", "WARN")
+            emit_event("pipeline_error", phase=phase, agent=agent,
+                       error=f"Phase {phase} exceeded {max_min}-minute active-time ceiling",
+                       reason=f"Stuck — Retry from checkpoint or Skip the phase.",
+                       actions=actions)
+        # Pause flag freezes the active-time clock during the user's
+        # decision wait, so a 20-min decision delay doesn't burn budget
+        # against the next retry. Also flips the FE chat input to paused.
+        _controls.request_pause()
+        emit_event("pipeline_paused", phase=phase, reason="phase_timeout")
+        decision = await _controls.await_phase_decision(phase)
+        emit_event("pipeline_resumed", phase=phase, reason=f"phase_timeout_{decision}")
+        return decision
 
-    async def _await_phase_with_active_deadline(phase: int, max_min: int, coro):
-        """Run a phase coroutine with an ACTIVE-TIME wall-clock deadline.
-        Time spent while `_controls.is_pause()` is True does NOT count
-        toward the budget — so a user who pauses for an hour during a
-        35-min Phase 1 doesn't return to a dead run. Cancels the coro
-        when active-time exhausts and raises asyncio.TimeoutError so the
-        caller can route through `_handle_phase_timeout`. Tick is 5s
-        which is fine-grained enough for any phase budget but cheap
-        enough to not introduce noticeable load."""
-        run_task = asyncio.ensure_future(coro)
+    async def _await_phase_with_active_deadline(phase: int, max_min: int, coro_factory):
+        """Run a phase coroutine factory with an ACTIVE-TIME wall-clock
+        deadline. Time spent while `_controls.is_pause()` is True does NOT
+        count toward the budget — so a user pausing for an hour doesn't
+        kill a healthy phase. Cancels the coroutine when active-time
+        exhausts and raises asyncio.TimeoutError. The caller catches it,
+        runs `_phase_timeout_decision` to give the user Retry/Skip, and
+        on Retry calls this helper AGAIN (factory creates a fresh coro).
+
+        coro_factory is `Callable[[], Coroutine]` — must produce a fresh
+        coroutine on each call so retry doesn't await an already-awaited
+        coroutine. Tick is 5s — fine-grained enough for any budget."""
+        run_task = asyncio.ensure_future(coro_factory())
         active_sec = 0.0
         deadline_sec = float(max_min * 60)
         tick = 5.0
@@ -11756,7 +11804,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if not _controls.is_pause():
                 active_sec += tick
             if active_sec >= deadline_sec and not run_task.done():
-                log(f"Phase {phase}: active-time {active_sec:.0f}s exceeded {deadline_sec:.0f}s — cancelling", "WARN")
+                log(f"Phase {phase}: active-time {active_sec:.0f}s exceeded {deadline_sec:.0f}s — cancelling for user decision", "WARN")
                 run_task.cancel()
                 try: await run_task
                 except Exception: pass
@@ -12156,14 +12204,33 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 current_topic = topic
                 for _p1_attempt in range(3):
                     _runtime.restart_requested = False
-                    try:
-                        p1 = await _await_phase_with_active_deadline(
-                            1, PHASE_1_MAX_MIN,
-                            run_phase1(browser, cua_client, current_topic, pdf_paths, verbose, feedback=fb1),
-                        )
-                    except asyncio.TimeoutError:
-                        _handle_phase_timeout(1, PHASE_1_MAX_MIN)
-                        return
+                    # Inner timeout-retry loop: if the active-time ceiling
+                    # fires, surface to user with [Retry, Skip] (recoverable),
+                    # NOT terminate the run. lambda factory creates a fresh
+                    # coroutine on each retry — can't await an already-awaited
+                    # coroutine, so the helper takes a factory now.
+                    while True:
+                        try:
+                            p1 = await _await_phase_with_active_deadline(
+                                1, PHASE_1_MAX_MIN,
+                                lambda: run_phase1(browser, cua_client, current_topic, pdf_paths, verbose, feedback=fb1),
+                            )
+                            break  # success — exit inner retry loop
+                        except asyncio.TimeoutError:
+                            _decision = await _phase_timeout_decision(1, PHASE_1_MAX_MIN, agent="chatgpt")
+                            if _decision == "retry":
+                                emit_event("phase_restart", phase=1, reason="user_retry_after_timeout")
+                                continue  # rerun via factory with fresh deadline
+                            if _decision == "skip":
+                                emit_event("phase_skipped", phase=1, reason="user_skip_after_timeout")
+                                _p1_skipped_after_error = True
+                                p1 = None
+                                break
+                            # stop / fall-through (user explicitly hit Stop)
+                            emit_event("pipeline_stopped", phase=1, reason=f"user_{_decision}_after_timeout")
+                            return
+                    if _p1_skipped_after_error:
+                        break  # exit outer for _p1_attempt loop too
                     if fb1:
                         clear_feedback(1)
                         fb1 = ""  # only feed in on first attempt
@@ -12406,17 +12473,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # the new context into the brief and rerun the whole phase. Cap at
             # 3 restarts to prevent infinite loops if something goes sideways.
             results = {}
+            _p2_user_skipped = False
             for _p2_attempt in range(3):
                 _runtime.restart_requested = False
-                try:
-                    results = await _await_phase_with_active_deadline(
-                        2, PHASE_2_MAX_MIN,
-                        run_phase2(browser, cua_client, research_brief, verbose,
-                                   enabled_agents=enabled_agents),
-                    )
-                except asyncio.TimeoutError:
-                    _handle_phase_timeout(2, PHASE_2_MAX_MIN)
-                    return
+                while True:  # timeout-retry loop
+                    try:
+                        results = await _await_phase_with_active_deadline(
+                            2, PHASE_2_MAX_MIN,
+                            lambda: run_phase2(browser, cua_client, research_brief, verbose,
+                                               enabled_agents=enabled_agents),
+                        )
+                        break  # success
+                    except asyncio.TimeoutError:
+                        _decision = await _phase_timeout_decision(2, PHASE_2_MAX_MIN)
+                        if _decision == "retry":
+                            emit_event("phase_restart", phase=2, reason="user_retry_after_timeout")
+                            results = {}
+                            continue
+                        if _decision == "skip":
+                            emit_event("phase_skipped", phase=2, reason="user_skip_after_timeout")
+                            _p2_user_skipped = True
+                            results = {}
+                            break
+                        emit_event("pipeline_stopped", phase=2, reason=f"user_{_decision}_after_timeout")
+                        return
+                if _p2_user_skipped:
+                    break  # exit outer for loop too
                 if not _runtime.restart_requested:
                     break
                 extra_ctx_retry = _controls.pop_extra_context()
@@ -12793,14 +12875,26 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     results[name] = {"status": "done", "text": md_file.read_text(encoding="utf-8"),
                                      "url": "", "page": None}
             # Sub-step 3a: Upload to NotebookLM
-            try:
-                p3 = await _await_phase_with_active_deadline(
-                    3, PHASE_3_UPLOAD_MAX_MIN,
-                    run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose),
-                )
-            except asyncio.TimeoutError:
-                _handle_phase_timeout(3, PHASE_3_UPLOAD_MAX_MIN)
-                return
+            _p3a_user_skipped = False
+            while True:  # timeout-retry loop
+                try:
+                    p3 = await _await_phase_with_active_deadline(
+                        3, PHASE_3_UPLOAD_MAX_MIN,
+                        lambda: run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose),
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    _decision = await _phase_timeout_decision(3, PHASE_3_UPLOAD_MAX_MIN, agent="notebooklm")
+                    if _decision == "retry":
+                        emit_event("phase_restart", phase=3, reason="user_retry_after_timeout")
+                        continue
+                    if _decision == "skip":
+                        emit_event("phase_skipped", phase=3, reason="user_skip_after_timeout")
+                        _p3a_user_skipped = True
+                        p3 = {"links": {}, "notebook_url": ""}
+                        break
+                    emit_event("pipeline_stopped", phase=3, reason=f"user_{_decision}_after_timeout")
+                    return
             links = p3.get("links", {})
             notebook_url = p3.get("notebook_url", "")
             # B1: Link-first — retry notebook URL extraction on validation failure.
@@ -12846,14 +12940,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Sub-step 3b: Generate audio overview
             audio_overview_url = ""
             if notebook_url:
-                try:
-                    p4 = await _await_phase_with_active_deadline(
-                        3, PHASE_3_AUDIO_MAX_MIN,
-                        run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
-                    )
-                except asyncio.TimeoutError:
-                    _handle_phase_timeout(3, PHASE_3_AUDIO_MAX_MIN)
-                    return
+                while True:  # timeout-retry loop
+                    try:
+                        p4 = await _await_phase_with_active_deadline(
+                            3, PHASE_3_AUDIO_MAX_MIN,
+                            lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        _decision = await _phase_timeout_decision(3, PHASE_3_AUDIO_MAX_MIN, agent="notebooklm")
+                        if _decision == "retry":
+                            emit_event("phase_restart", phase=3, reason="user_retry_audio_timeout")
+                            continue
+                        if _decision == "skip":
+                            emit_event("phase_skipped", phase=3, reason="user_skip_audio_timeout")
+                            p4 = {"audio_path": None, "audio_overview_url": ""}
+                            break
+                        emit_event("pipeline_stopped", phase=3, reason=f"user_{_decision}_audio_timeout")
+                        return
                 audio_path = p4.get("audio_path")
                 audio_overview_url = p4.get("audio_overview_url", "")
                 save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
@@ -12927,15 +13031,31 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Active-time ceiling — paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             if audio_path:
-                try:
-                    p5 = await _await_phase_with_active_deadline(
-                        4, PHASE_4_MAX_MIN,
-                        run_phase4(browser, cua_client, audio_path, topic, queue_dir,
-                                   links=links, notebook_url=notebook_url, verbose=verbose),
-                    )
-                except asyncio.TimeoutError:
-                    _handle_phase_timeout(4, PHASE_4_MAX_MIN)
-                    return
+                _p4_user_skipped = False
+                while True:  # timeout-retry loop
+                    try:
+                        p5 = await _await_phase_with_active_deadline(
+                            4, PHASE_4_MAX_MIN,
+                            lambda: run_phase4(browser, cua_client, audio_path, topic, queue_dir,
+                                               links=links, notebook_url=notebook_url, verbose=verbose),
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        # Phase 4 retry has an idempotency note: re-running ffmpeg
+                        # is fine, but YouTube upload is NOT idempotent —
+                        # retry-after-partial may produce a duplicate video.
+                        # Document via fail_phase reason; user accepts the risk.
+                        _decision = await _phase_timeout_decision(4, PHASE_4_MAX_MIN, agent="youtube")
+                        if _decision == "retry":
+                            emit_event("phase_restart", phase=4, reason="user_retry_after_timeout")
+                            continue
+                        if _decision == "skip":
+                            emit_event("phase_skipped", phase=4, reason="user_skip_after_timeout")
+                            _p4_user_skipped = True
+                            p5 = {"youtube_url": ""}
+                            break
+                        emit_event("pipeline_stopped", phase=4, reason=f"user_{_decision}_after_timeout")
+                        return
                 youtube_url = p5.get("youtube_url", "")
                 # B1: Link-first — retry YouTube URL extraction on validation failure.
                 # ARCHITECTURE 2026-04-18 (never-die): wrap the retry in a
@@ -13035,16 +13155,31 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             # Use audio overview URL if extracted, else notebook URL as fallback
             _effective_audio_url = audio_overview_url if audio_overview_url else notebook_url
-            try:
-                p6 = await _await_phase_with_active_deadline(
-                    5, PHASE_5_MAX_MIN,
-                    run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
-                               brief_url=brief_url, audio_url=_effective_audio_url,
-                               email=email, verbose=verbose),
-                )
-            except asyncio.TimeoutError:
-                _handle_phase_timeout(5, PHASE_5_MAX_MIN)
-                return
+            _p5_user_skipped = False
+            while True:  # timeout-retry loop
+                try:
+                    p6 = await _await_phase_with_active_deadline(
+                        5, PHASE_5_MAX_MIN,
+                        lambda: run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
+                                           brief_url=brief_url, audio_url=_effective_audio_url,
+                                           email=email, verbose=verbose),
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    # Phase 5 retry caveat: GDoc creation is idempotent (creates
+                    # a fresh doc), but Gmail send is NOT — retry may send a
+                    # duplicate email if prior attempt got that far.
+                    _decision = await _phase_timeout_decision(5, PHASE_5_MAX_MIN)
+                    if _decision == "retry":
+                        emit_event("phase_restart", phase=5, reason="user_retry_after_timeout")
+                        continue
+                    if _decision == "skip":
+                        emit_event("phase_skipped", phase=5, reason="user_skip_after_timeout")
+                        _p5_user_skipped = True
+                        p6 = {"doc_url": ""}
+                        break
+                    emit_event("pipeline_stopped", phase=5, reason=f"user_{_decision}_after_timeout")
+                    return
             doc_url = p6.get("doc_url", "")
             # B1: Link-first — retry Google Doc URL extraction on validation failure.
             # ARCHITECTURE 2026-04-18 (never-die): wrap retries in a
