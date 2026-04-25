@@ -51,6 +51,18 @@ POLL_DEEP_RESEARCH = int(os.environ.get("POLL_DEEP_RESEARCH", "30"))  # seconds
 MAX_WAIT_PRO = int(os.environ.get("MAX_WAIT_PRO", "45"))         # minutes — Phase 1
 MAX_WAIT_DEEP = int(os.environ.get("MAX_WAIT_DEEP", "90"))       # minutes — Phase 2
 
+# Per-phase wall-clock ceilings (2026-04-25). If a phase exceeds these,
+# the orchestrator emits pipeline_stopped + reason="phase_timeout" and
+# terminates the run. Without these caps a dead laptop or stalled CUA
+# could keep the run going indefinitely (user reported a run continuing
+# overnight). Override via env for E2E with shorter ceilings.
+PHASE_1_MAX_MIN = int(os.environ.get("PHASE_1_MAX_MIN", "35"))   # brief gen typical 21-27m
+PHASE_2_MAX_MIN = int(os.environ.get("PHASE_2_MAX_MIN", "90"))   # 3 agents in parallel
+PHASE_3_UPLOAD_MAX_MIN = int(os.environ.get("PHASE_3_UPLOAD_MAX_MIN", "15"))
+PHASE_3_AUDIO_MAX_MIN = int(os.environ.get("PHASE_3_AUDIO_MAX_MIN", "20"))   # observed 15-20m, gated on NotebookLM opaque audio gen
+PHASE_4_MAX_MIN = int(os.environ.get("PHASE_4_MAX_MIN", "15"))   # ffmpeg + YouTube
+PHASE_5_MAX_MIN = int(os.environ.get("PHASE_5_MAX_MIN", "10"))   # GDoc + email
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -6129,18 +6141,28 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
     wait_start = time.time()
     max_wait = max_wait_min * 60
+    paused_total = 0.0  # accumulator: time spent in wait_if_paused (pause-aware)
     consecutive_not_generating = 0
     cua_checked = False
     last_heartbeat = time.time()
 
-    while (time.time() - wait_start) < max_wait:
+    # Subtract paused_total from elapsed so a long user pause doesn't make
+    # this inner timer falsely fire after resume. Without this, a user who
+    # pauses for an hour during P1 would return to a poll loop that thinks
+    # MAX_WAIT_PRO=45min has elapsed and aborts before checking if the brief
+    # actually completed server-side. The outer active-time deadline
+    # (_await_phase_with_active_deadline) is the ultimate safety net but
+    # this inner check should also be pause-aware so it doesn't false-fire.
+    while (time.time() - wait_start - paused_total) < max_wait:
         # ── Stop/Pause check ──
         if _controls.is_stop():
             log(f"[{label}] STOP requested — aborting poll")
             return False
         if _controls.is_pause():
             emit_event("pipeline_paused", phase=phase)
+            _pause_t0 = time.monotonic()
             await _controls.wait_if_paused()
+            paused_total += time.monotonic() - _pause_t0
             if _controls.is_stop():
                 log(f"[{label}] STOP after pause — aborting poll")
                 return False
@@ -11693,6 +11715,56 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             except Exception:
                 pass
 
+    def _handle_phase_timeout(phase: int, max_min: int):
+        """Common termination path when a phase exceeds its hard wall-clock
+        ceiling (per-phase MAX_MIN constants). Persists status="stopped" to
+        delivery.json BEFORE emitting pipeline_stopped + Firestore update —
+        the auto-retry block at the outer runner reads delivery.json
+        directly and short-circuits when status=="stopped", so writing to
+        delivery first is what actually prevents the run from looping.
+        FE renders a red X badge + reason in the phase dropdown via the
+        usePipeline pipeline_stopped handler (type="error" alert)."""
+        log(f"Phase {phase} exceeded {max_min}-min ceiling — terminating run", "ERROR")
+        try: save_meta(queue_dir, topic, phase, status="stopped")
+        except Exception: pass
+        try: update_delivery(status="stopped")
+        except Exception: pass
+        emit_event("pipeline_stopped", phase=phase, reason="phase_timeout",
+                   timeout_min=max_min,
+                   error=f"Phase {phase} exceeded {max_min}-minute ceiling without completing")
+        _update_firestore_research({"status": "stopped", "phase": phase})
+
+    async def _await_phase_with_active_deadline(phase: int, max_min: int, coro):
+        """Run a phase coroutine with an ACTIVE-TIME wall-clock deadline.
+        Time spent while `_controls.is_pause()` is True does NOT count
+        toward the budget — so a user who pauses for an hour during a
+        35-min Phase 1 doesn't return to a dead run. Cancels the coro
+        when active-time exhausts and raises asyncio.TimeoutError so the
+        caller can route through `_handle_phase_timeout`. Tick is 5s
+        which is fine-grained enough for any phase budget but cheap
+        enough to not introduce noticeable load."""
+        run_task = asyncio.ensure_future(coro)
+        active_sec = 0.0
+        deadline_sec = float(max_min * 60)
+        tick = 5.0
+        while not run_task.done():
+            try:
+                await asyncio.sleep(tick)
+            except asyncio.CancelledError:
+                run_task.cancel()
+                raise
+            if not _controls.is_pause():
+                active_sec += tick
+            if active_sec >= deadline_sec and not run_task.done():
+                log(f"Phase {phase}: active-time {active_sec:.0f}s exceeded {deadline_sec:.0f}s — cancelling", "WARN")
+                run_task.cancel()
+                try: await run_task
+                except Exception: pass
+                raise asyncio.TimeoutError(
+                    f"phase {phase} exceeded {max_min}-min active-time budget"
+                )
+        return await run_task
+
     # Create delivery.json immediately (frontend can see the run from the start)
     if not (queue_dir / "delivery.json").exists():
         update_delivery()
@@ -12047,6 +12119,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
             _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
             _p1_start = time.time()
+            # Active-time ceiling for Phase 1 — paused seconds don't count.
+            # If the user pauses for lunch, the budget is preserved.
+            # Enforced via _await_phase_with_active_deadline at each call
+            # below; budget is shared across the for _p1_attempt restart loop.
+            # PHASE_1_MAX_MIN is the cap (env-overridable).
             # Per-phase login probe removed (2026-04-24). Phase 0 is now
             # the single source of truth for login state — if Phase 0
             # marked a platform "ok" (cookie + DOM or CUA verdict), we
@@ -12079,7 +12156,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 current_topic = topic
                 for _p1_attempt in range(3):
                     _runtime.restart_requested = False
-                    p1 = await run_phase1(browser, cua_client, current_topic, pdf_paths, verbose, feedback=fb1)
+                    try:
+                        p1 = await _await_phase_with_active_deadline(
+                            1, PHASE_1_MAX_MIN,
+                            run_phase1(browser, cua_client, current_topic, pdf_paths, verbose, feedback=fb1),
+                        )
+                    except asyncio.TimeoutError:
+                        _handle_phase_timeout(1, PHASE_1_MAX_MIN)
+                        return
                     if fb1:
                         clear_feedback(1)
                         fb1 = ""  # only feed in on first attempt
@@ -12302,6 +12386,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             for da in disabled_agents:
                 emit_event("agent_skipped", phase=2, agent=da)
             _p2_start = time.time()
+            # Active-time ceiling for Phase 2 — paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — Phase 0 is the
             # single login gate. See the matching note in the Phase 1
             # block above.
@@ -12323,8 +12408,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             results = {}
             for _p2_attempt in range(3):
                 _runtime.restart_requested = False
-                results = await run_phase2(browser, cua_client, research_brief, verbose,
-                                           enabled_agents=enabled_agents)
+                try:
+                    results = await _await_phase_with_active_deadline(
+                        2, PHASE_2_MAX_MIN,
+                        run_phase2(browser, cua_client, research_brief, verbose,
+                                   enabled_agents=enabled_agents),
+                    )
+                except asyncio.TimeoutError:
+                    _handle_phase_timeout(2, PHASE_2_MAX_MIN)
+                    return
                 if not _runtime.restart_requested:
                     break
                 extra_ctx_retry = _controls.pop_extra_context()
@@ -12690,6 +12782,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
             _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
             _p3_start = time.time()
+            # Phase 3 has two sub-steps (upload, audio) with independent
+            # active-time ceilings — see PHASE_3_UPLOAD_MAX_MIN and
+            # PHASE_3_AUDIO_MAX_MIN. Paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             if not results:
                 for md_file in md_files:
@@ -12698,7 +12793,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     results[name] = {"status": "done", "text": md_file.read_text(encoding="utf-8"),
                                      "url": "", "page": None}
             # Sub-step 3a: Upload to NotebookLM
-            p3 = await run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose)
+            try:
+                p3 = await _await_phase_with_active_deadline(
+                    3, PHASE_3_UPLOAD_MAX_MIN,
+                    run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose),
+                )
+            except asyncio.TimeoutError:
+                _handle_phase_timeout(3, PHASE_3_UPLOAD_MAX_MIN)
+                return
             links = p3.get("links", {})
             notebook_url = p3.get("notebook_url", "")
             # B1: Link-first — retry notebook URL extraction on validation failure.
@@ -12744,7 +12846,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Sub-step 3b: Generate audio overview
             audio_overview_url = ""
             if notebook_url:
-                p4 = await run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose)
+                try:
+                    p4 = await _await_phase_with_active_deadline(
+                        3, PHASE_3_AUDIO_MAX_MIN,
+                        run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                    )
+                except asyncio.TimeoutError:
+                    _handle_phase_timeout(3, PHASE_3_AUDIO_MAX_MIN)
+                    return
                 audio_path = p4.get("audio_path")
                 audio_overview_url = p4.get("audio_overview_url", "")
                 save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
@@ -12815,10 +12924,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=4, description="Converting audio to video + YouTube upload", agents=["youtube"])
             _update_firestore_research({"phase": 4, "currentPhase": 4, "status": "ongoing"})
             _p4_start = time.time()
+            # Active-time ceiling — paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             if audio_path:
-                p5 = await run_phase4(browser, cua_client, audio_path, topic, queue_dir,
-                                       links=links, notebook_url=notebook_url, verbose=verbose)
+                try:
+                    p5 = await _await_phase_with_active_deadline(
+                        4, PHASE_4_MAX_MIN,
+                        run_phase4(browser, cua_client, audio_path, topic, queue_dir,
+                                   links=links, notebook_url=notebook_url, verbose=verbose),
+                    )
+                except asyncio.TimeoutError:
+                    _handle_phase_timeout(4, PHASE_4_MAX_MIN)
+                    return
                 youtube_url = p5.get("youtube_url", "")
                 # B1: Link-first — retry YouTube URL extraction on validation failure.
                 # ARCHITECTURE 2026-04-18 (never-die): wrap the retry in a
@@ -12914,12 +13031,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=5, description="Creating Google Doc hub + sending email notification", agents=["gdocs", "gmail"])
             _update_firestore_research({"phase": 5, "currentPhase": 5, "status": "ongoing"})
             _p5_start = time.time()
+            # Active-time ceiling — paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             # Use audio overview URL if extracted, else notebook URL as fallback
             _effective_audio_url = audio_overview_url if audio_overview_url else notebook_url
-            p6 = await run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
-                                  brief_url=brief_url, audio_url=_effective_audio_url,
-                                  email=email, verbose=verbose)
+            try:
+                p6 = await _await_phase_with_active_deadline(
+                    5, PHASE_5_MAX_MIN,
+                    run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
+                               brief_url=brief_url, audio_url=_effective_audio_url,
+                               email=email, verbose=verbose),
+                )
+            except asyncio.TimeoutError:
+                _handle_phase_timeout(5, PHASE_5_MAX_MIN)
+                return
             doc_url = p6.get("doc_url", "")
             # B1: Link-first — retry Google Doc URL extraction on validation failure.
             # ARCHITECTURE 2026-04-18 (never-die): wrap retries in a
