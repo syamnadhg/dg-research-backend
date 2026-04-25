@@ -139,7 +139,7 @@ The server runs on port 8000 with:
 - A **30s heartbeat** → updates `research_tokens/{token}.lastHeartbeat` AND the paired `users/{uid}/devices/{deviceId}.lastHeartbeat` so the app's Account page and sidebar device switcher both show the right online/offline dot.
 - A **token-doc watcher** for sub-second relink: if you unlink this device from the app and paste the token back, the device tile reappears in well under a second instead of waiting up to 30s for the next heartbeat to self-heal it.
 - A **Firestore queue listener** — picks up jobs from `research_tokens/{token}/queue/`. Single-worker per backend: if you fire a second topic on the same PC while the first is running, the second lands in an explicit `queued` state (with a chat banner + Cancel button in the app) until the first finishes.
-- A **command listener** for stop / pause / resume / config / add_context / agent_decision / **continue_anyway** / **skip_audio** / **skip_email**.
+- A **command listener** for stop / pause / resume / config / add_context / agent_decision / **continue_anyway** / **retry_phase** / **skip_phase**.
 - A **local HTTP API** on `http://localhost:8000` for the CLI + any direct calls.
 
 Keep `--serve` running while you use the app. If the server stops, the web app's 60s watchdog detects it, marks running tiles as stopped, and prevents a reload from resurrecting the pipeline.
@@ -203,7 +203,7 @@ Times based on real run analytics. Total: ~1h 50m for a full pipeline.
 Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. Apr 19 added a two-tier narration system so there's always a visible human-language pulse:
 
 - **Backend (Gemini 2.0 Flash inside `research.py`)** — every active phase has a narrator worker that reads a bounded ring buffer of recent events (~40) and emits a `phase_narration` event about every 45s. Narrator warms on `phase_start`, stays quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Cost envelope: ~200 input / 30 output tokens per narration → <$0.02 per full pipeline run.
-- **Frontend fallback (Gemini 2.0 Flash via `/api/narrate`)** — if the backend narrator goes silent for >15s on the currently-running phase AND the watchdog considers the backend alive, the frontend writes a speculative sentence into the same dropdown slot, rendered italic with a **"Likely: …"** prefix so the user sees it's a guess. Budget-capped at 20 calls per research. Disabled when the watchdog says the backend is actually dead (PokeNote owns that surface).
+- **Frontend fallback (Gemini 2.0 Flash via `/api/narrate`)** — if the backend narrator goes silent for >15s on the currently-running phase AND the watchdog considers the backend alive, the frontend writes a speculative sentence into the same dropdown slot, rendered italic with a **"Likely: …"** prefix so the user sees it's a guess. Budget-capped at 20 calls per research. Disabled when the watchdog says the backend is actually dead — backend-down state surfaces via the LivenessEye title swap in the phase header and, after 30 min, a unified phase-alert banner with Retry/Skip.
 
 ## Phase 0 verification (sequential, Apr 19)
 
@@ -243,7 +243,7 @@ Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, s
 - **Phase 5** — ffmpeg disk-full / not-found / generic, YouTube URL extract fail, Google Doc creation fail, email bad-address / auth / SMTP, email skip via command
 - **Cross-cutting** — Anthropic 429/529 narrate as retrying; other API errors surface as `pipeline_warning` on the current phase
 
-Default action on every alert is `[Skip]` (advance past the failure). Phase-specific alerts offer extra actions: `HV Resume`, `continue_anyway`, `skip_audio`, `skip_email`. **Stop is NOT a per-phase action** — pause/stop/resume stay global in the app's chat input bar.
+Default action on every alert is `[Retry] [Skip]`. Skip writes the unified `skip_phase phase=N` command, replacing the old `skip_audio` / `skip_email` verbs (removed in U2). Phase-specific alerts may add `HV Resume` or `continue_anyway`. **Stop is NOT a per-phase action** — pause/stop/resume stay global in the app's chat input bar.
 
 ### Error matrix (normalized, Apr 19 late-late)
 
@@ -313,9 +313,9 @@ research-automate/
 
 **Anthropic 429 / 529 (rate-limit or overload)** — Retries automatically with narration in the current phase dropdown; usually self-resolves within one or two attempts.
 
-**Phase 4 audio failed but Phase 5 still matters** — Hit `[skip_audio]` on the Phase 4 alert; Phase 5 YouTube + Email proceed normally.
+**Phase 4 audio failed but Phase 5 still matters** — Hit `[Skip]` on the Phase 4 alert (writes `skip_phase phase=4`); Phase 5 YouTube + Email proceed normally.
 
-**Phase 5 email not sending** — Alert surfaces with the specific cause (bad address / auth / SMTP). Hit `[skip_email]` to skip email but still get the Google Doc link.
+**Phase 5 email not sending** — Alert surfaces with the specific cause (bad address / auth / SMTP). Hit `[Skip]` (writes `skip_phase phase=5`) to skip email but still get the Google Doc link.
 
 ---
 

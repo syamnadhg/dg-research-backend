@@ -1705,17 +1705,6 @@ def _start_command_listener(uid, research_id, loop):
                     log(f"Command received: WAIT_LONGER_AGENT agent={_ag}")
                 else:
                     log("Command received: WAIT_LONGER_AGENT rejected — no agent", "WARN")
-            elif action == "skip_audio":
-                # Phase 4 audio generation is slow (~15-25 min). Lets user
-                # bail on audio and let Phase 5/6 produce the report-only
-                # artifacts (Doc + email) on whatever's already there.
-                loop.call_soon_threadsafe(_controls.request_skip_audio)
-                log("Command received: SKIP_AUDIO — Phase 4 will skip audio gen")
-            elif action == "skip_email":
-                # User opted to skip the Gmail send step at Phase 5. Google
-                # Doc creation still runs — just no notification email.
-                loop.call_soon_threadsafe(_controls.request_skip_email)
-                log("Command received: SKIP_EMAIL — Phase 5 will skip Gmail send")
             elif action == "agent_decision":
                 # Frontend response to agent_link_failed modal.
                 decision = (data.get("decision", "") or "").lower()
@@ -1787,14 +1776,6 @@ class PipelineControls:
         # that emit the warning check+clear this flag to decide whether to
         # halt or proceed. One-shot — consumed on read.
         self.continue_anyway: bool = False
-        # Skip-audio: user opted to skip the Phase 4 audio generation step.
-        # Phase 4 entry checks this and returns early with audio_path=None;
-        # Phase 5 (YouTube) then skips too since it has no audio, but Phase
-        # 5/6 (Doc + email) still run on whatever's available.
-        self.skip_audio: bool = False
-        # Skip-email: user opted to skip the Phase 5 email send step. Phase
-        # 5 still creates the Google Doc — just doesn't email it.
-        self.skip_email: bool = False
         # Retry-phase: user clicked "Retry Phase N" on a pipeline_warning
         # (e.g. brief-short, stuck agent). Set holds phase numbers that
         # the phase coroutine should restart. Each phase's short-output
@@ -1922,8 +1903,6 @@ class PipelineControls:
         self.skipped_agents.clear()
         self.skipped_phases.clear()
         self.continue_anyway = False
-        self.skip_audio = False
-        self.skip_email = False
         self.retry_phase_requested.clear()
         self.retry_agents.clear()
         self.retry_agents_hard.clear()
@@ -1983,26 +1962,6 @@ class PipelineControls:
         self.continue_anyway = False
         return v
 
-    def request_skip_audio(self):
-        """User picked 'Skip audio' on a Phase 4 dropdown. Phase 4 entry
-        checks is_audio_skip_requested() and returns early with no audio.
-        Phases 5/6 still run on whatever artifacts exist."""
-        self.skip_audio = True
-        self.pause_event.clear()
-        self.resume_event.set()
-
-    def is_audio_skip_requested(self) -> bool:
-        return self.skip_audio
-
-    def request_skip_email(self):
-        """User picked 'Skip email' on a Phase 5 dropdown. Phase 5 still
-        creates the Google Doc — just skips the Gmail send step."""
-        self.skip_email = True
-        self.pause_event.clear()
-        self.resume_event.set()
-
-    def is_email_skip_requested(self) -> bool:
-        return self.skip_email
 
     def request_retry_phase(self, phase: int):
         """User clicked 'Retry Phase N' on a pipeline_warning. Phase coroutine
@@ -10430,16 +10389,6 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     log("PHASE 4: Audio Overview Generation")
     log("=" * 60)
 
-    # Early bail if the user already requested skip_audio from the dropdown
-    # before we even got here. Lets Phase 5/6 proceed on whatever's available.
-    if _controls.is_audio_skip_requested():
-        log("Phase 4: SKIP_AUDIO requested — returning without generating audio", "INFO")
-        emit_event("pipeline_warning", phase=4, agent="notebooklm",
-                   message="Audio generation skipped by user",
-                   details="Phase 5 (YouTube) will also be skipped since there's no audio; Phase 6 (Doc + email) still runs on whatever artifacts exist.",
-                   alertType="warn")
-        return {"audio_path": None}
-
     if not notebook_url:
         log("No NotebookLM notebook — skipping Phase 4", "WARN")
         return {"audio_path": None}
@@ -10467,7 +10416,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     p4_max_retries = 1
     p4_attempt = 0
 
-    while p4_attempt <= p4_max_retries and not audio_done and not _controls.is_stop() and not _controls.is_audio_skip_requested():
+    while p4_attempt <= p4_max_retries and not audio_done and not _controls.is_stop():
         if p4_attempt > 0:
             log(f"Phase 4: Retrying audio generation (attempt {p4_attempt + 1}/{p4_max_retries + 1})")
             try:
@@ -10552,15 +10501,6 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
             log(f"[Phase4] Audio still generating... ({elapsed_min}m total)")
             save_track("Phase4", {"status": "generating", "elapsed_min": elapsed_min})
-            # Also honour mid-poll skip_audio requests so users don't have to
-            # wait for the next phase boundary to bail.
-            if _controls.is_audio_skip_requested():
-                log("[Phase4] SKIP_AUDIO requested mid-poll — aborting audio generation")
-                emit_event("pipeline_warning", phase=4, agent="notebooklm",
-                           message="Audio generation skipped mid-poll by user",
-                           details=f"Aborted after {elapsed_min} min. Phase 5 (YouTube) will be skipped too — no audio.",
-                           alertType="warn")
-                break
             interrupt = await _controls.interruptible_sleep(175, check_interval=10)
             if interrupt == "stop":
                 log("[Phase4] STOP during poll wait — aborting")
@@ -10573,11 +10513,12 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
         # End of inner poll loop. If we broke out due to completion, exit
         # the retry loop too. Otherwise (timeout without done), offer retry.
-        if audio_done or _controls.is_stop() or _controls.is_audio_skip_requested():
+        if audio_done or _controls.is_stop():
             break
 
-        # Timeout: offer user [Retry audio] / [Skip audio]. Skip uses the
-        # existing skip_audio command; retry restarts generation from scratch.
+        # Timeout: offer user [Retry audio] / [Skip audio]. Skip routes
+        # through the standard skip_phase command; retry restarts generation
+        # from scratch.
         retries_left = max(0, p4_max_retries - p4_attempt)
         p4_actions = []
         if retries_left > 0:
@@ -10587,9 +10528,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 "command": {"action": "retry_phase", "phase": 4},
             })
         p4_actions.append({
-            "id": "skip_audio", "label": "Skip audio",
+            "id": "skip_phase", "label": "Skip audio",
             "style": "default" if retries_left > 0 else "primary",
-            "command": {"action": "skip_audio"},
+            "command": {"action": "skip_phase", "phase": 4},
         })
         try:
             emit_event("pipeline_warning", phase=4, agent="notebooklm",
@@ -10688,9 +10629,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 emit_event("pipeline_error", phase=4, agent="notebooklm",
                            error="Audio file downloaded by NotebookLM but we couldn't locate it on disk (Playwright event didn't fire and Downloads folder scan found nothing). Phase 5 will be skipped.",
                            actions=[
-                               {"id": "skip_audio", "label": "Skip audio — proceed to report",
+                               {"id": "skip_phase", "label": "Skip audio — proceed to report",
                                 "style": "primary",
-                                "command": {"action": "skip_audio"}},
+                                "command": {"action": "skip_phase", "phase": 4}},
                            ])
             except Exception:
                 pass
@@ -11284,18 +11225,7 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
 
     # Send email
     email_sent = False
-    # Check skip_email flag — user may have opted out mid-pipeline. Doc is
-    # already created above; just bail on the Gmail step.
-    if _controls.is_email_skip_requested():
-        log("Phase 5: SKIP_EMAIL requested — skipping Gmail send")
-        try:
-            emit_event("pipeline_warning", phase=5, agent="gmail",
-                       message="Email send skipped by user",
-                       details="The Google Doc still shipped; you're just not getting the notification email this run.",
-                       alertType="warn")
-        except Exception:
-            pass
-    elif email:
+    if email:
         log(f"Sending email to {email}...")
         emit_event("agent_progress", phase=5, agent="gmail",
                    status="composing",

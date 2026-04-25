@@ -74,7 +74,7 @@ Frontend polls `GET /api/runs/{id}/events?offset=N` or connects via `WS /ws/{run
 ### Phase narration (Apr 19)
 | Type | Phase | Description |
 |------|-------|-------------|
-| phase_narration | 1-5 | Backend Gemini 2.0 Flash narrator emits one human-readable sentence describing what's happening in the current phase. Fed by a bounded ring buffer (~40 recent events). Cadence ~45s; warms on `phase_start`, tears down on `phase_complete` / `pipeline_stopped` / `pipeline_paused`. Frontend renders inside the active phase dropdown (above PokeNote). Payload: `{text, timestamp, speculative: false}`. Speculative entries with `speculative: true` come from the frontend's `/api/narrate` fallback route when the backend narrator has been silent >15s. |
+| phase_narration | 1-5 | Backend Gemini 2.0 Flash narrator emits one human-readable sentence describing what's happening in the current phase. Fed by a bounded ring buffer (~40 recent events). Cadence ~45s; warms on `phase_start`, tears down on `phase_complete` / `pipeline_stopped` / `pipeline_paused`. Frontend renders inside the active phase dropdown. Payload: `{text, timestamp, speculative: false}`. (The frontend speculative `/api/narrate` fallback was removed in U2 — `speculative: true` no longer appears.) |
 
 ### Infra + misc
 | Type | Phase | Description |

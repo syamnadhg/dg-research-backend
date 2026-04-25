@@ -58,8 +58,8 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 | `pipeline_stopped` | N | `{phase: number, reason}` | User requested stop OR backend watchdog detected disconnect |
 | `pipeline_error` | N? | `{error: string, agent?: string}` | Fatal or agent error |
 | `pipeline_warning` | N? | `{agent?, message}` | Non-fatal warning (e.g., post-P2 `add_context` dropped, residual extra_context at phase boundary) |
-| `phase_alert` | 0-5 | `{phase, type, title, details?, actions?: string[]}` | Routed to the per-phase `PhaseAlertPanel` in the phase dropdown (all non-Phase-2 failures now surface here instead of as chat bubbles). `actions` declares extra buttons beyond default `[Skip]` — e.g. `["HV Resume"]`, `["continue_anyway"]`, `["skip_audio"]`, `["skip_email"]`. Dedup key on frontend: `type + title + details` |
-| `phase_alert_clear` | 0-5 | `{phase}` | Clears the alert for that phase (replaces the old `RECOVERY_MSG` / "Recovered ✓" chat mutation) |
+| ~~`phase_alert`~~ | — | — | **Frontend-synthesized, never emitted by backend.** The FE derives `PhaseAlertPanel` state from `pipeline_error` / `pipeline_warning` / `login_required` / `phase_restart` / `pipeline_stopped` / watchdog escalation, then calls `setPhaseAlert(researchId, phase, …)` on the store. Backends should NOT emit `phase_alert` events — they're consumed nowhere. |
+| ~~`phase_alert_clear`~~ | — | — | **Frontend-only.** FE clears panels via `clearPhaseAlert(researchId, phase)` on `phase_complete` / `phase_skipped` / pong recovery / user action acknowledgement. Not a wire event. |
 | `heartbeat` | N | `{phase, ts}` | Emitted ~60s during long waits so frontend liveness watchdog stays green |
 | `login_required` | 0-5 | `{platforms: string[], platformLabels: string[], envErrors?: string[], attempt, message}` | **Phase 0 (Apr 19): sequential — fired with `platforms: [key]` scoped to the ONE platform currently being verified, one at a time until all pass. Phases 1-5: cookie-only probe at phase entry fires this with the missing platforms for that phase regardless of `skipInitVerify`.** |
 | `phase_narration` | 1-5 | `{text: string, timestamp: int}` | **Gemini 2.0 Flash narrator (Apr 19).** Emits one human-readable sentence describing what's happening in the active phase, every ~45s. Fed by a bounded ring buffer (~40 recent events). Warms on `phase_start`, quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Frontend stores in `phaseNarrations[researchId][phase]` and renders inside the phase dropdown. Speculative counterpart emitted by the frontend's `/api/narrate` fallback route carries `speculative: true` and renders italic with a "Likely: …" prefix. |
@@ -119,8 +119,7 @@ Frontend writes commands to `users/{uid}/research_commands/{researchId}` (or equ
 |  |  | • **Paused** — on resume, `peek_extra_context()` sets `restart_requested=True`, current phase reruns with combined topic/brief (up to 3× per phase) |
 | `agent_decision` | `{agent, decision: "retry" \| "skip" \| "stop"}` | Frontend response to `agent_link_failed` modal. Retry loops back to extraction; Skip records best-effort unverified URL and moves on; Stop terminates pipeline |
 | `continue_anyway` | `{phase?}` | Frontend response to a `phase_alert` that exposed `continue_anyway` (e.g. brief-short). Backend `_controls.set_continue_anyway()` fires; orchestrator accepts the short/partial output and advances |
-| `skip_audio` | — | Frontend response to a Phase 4 `phase_alert`. Backend `_controls.set_skip_audio()` fires; Phase 4 audio generation is skipped but Phase 5 YouTube+Email still run |
-| `skip_email` | — | Frontend response to a Phase 5 `phase_alert`. Backend `_controls.set_skip_email()` fires; Phase 5 email is skipped (Google Doc still created) |
+| `skip_phase` | `{phase}` | Frontend's default Skip action on every `phase_alert`. Backend's phase coroutine consumes the request and advances past the failing step. For Phase 4, this replaces the old `skip_audio` verb (removed U2); Phase 5 likewise replaces `skip_email`. `_controls.skip_audio` / `skip_email` flags remain as internal-only state read by Phase 4/5 polling logic, but no FE command toggles them anymore |
 | `feedback` | `{phase, message}` | User feedback injection. Stored per-phase, injected into next phase rerun |
 | `retry_phase` | `{phase}` | Frontend response to a phase-level warning (brief-short, brief-timeout, NotebookLM failure, audio timeout, Phase 3 gate). Backend's phase coroutine polls `consume_retry_phase(N)` + loops back to restart |
 | `retry_agent` | `{agent}` | Frontend response to a Phase 2 agent warning (timeout, empty-final, send-fallback, session-expiry). Phase 2 polling consumes + submits a follow-up prompt via `paste_followup` |
@@ -166,48 +165,36 @@ Phase 2 agents are declared "done" only when BOTH conditions are met:
 
 ## Per-phase Alert Narration
 
-Every failure category emits a `phase_alert` event that the frontend routes to the corresponding phase's `PhaseAlertPanel` (inside the phase dropdown). No phase failure renders as a chat bubble anymore.
+`PhaseAlertPanel` (the alert UI inside each phase dropdown) is **frontend-synthesized**. The backend never emits a `phase_alert` event. Instead, the FE listens for these wire events and calls `setPhaseAlert(researchId, phase, …)` on the Zustand store:
 
-**Emit points per phase:**
+**FE writers that populate `phaseAlerts`:**
 
-| Phase | Failure category | Emit shape | Extra action |
-|-------|------------------|------------|--------------|
-| 0 | Browser launch failed | `phase_alert {type:"browser_launch_failed"}` | — |
-| 0 | Chromium binary missing | `phase_alert {type:"chromium_missing"}` | — |
-| 0 | Playwright profile locked | `phase_alert {type:"profile_locked"}` | — |
-| 1 | Brief timeout | `phase_alert {type:"brief_timeout"}` | `retry_phase(1)` · `continue_anyway` |
-| 1 | Brief paste retry (per attempt) | `phase_alert {type:"brief_paste_retry", attempt, max}` | — |
-| 1 | Brief short/partial output | `phase_alert {type:"brief_short", details}` | `retry_phase(1)` · `continue_anyway` |
-| 1 | Brief model error | `phase_alert {type:"brief_model_error", error}` | — |
-| 2 | 90-min poll timeout | `phase_alert {type:"phase2_timeout", sources}` | `retry_agent` · `skip_agent` · `wait_longer_agent` (Apr 19 late-late: Wait extends budget 15 min; Poke removed) |
-| 2 | Workspace cap hit | `phase_alert {type:"workspace_cap"}` | **End research only** (`stop`) — no retry; other phases keep Retry/Skip |
-| 2 | Empty-final (3× CUA done + extract empty) | `phase_alert {type:"agent_empty_final"}` | `retry_agent` · `skip_agent` |
-| 2 | Send-button CUA fallback | `phase_alert {type:"send_button_fallback"}` | `retry_agent` · `skip_agent` |
-| 2 | Claude <2 artifacts at ≥80% wait | `phase_alert {type:"claude_two_artifact_fail"}` | `retry_agent` · `skip_agent` (Apr 19 late-late hard-fail — no silent half-answer) |
-| 2 | Stuck-agent (no growth 20 min + non-active status) | `phase_alert {type:"stuck_agent"}` | `retry_agent` · `wait_longer_agent` · `skip_agent` (Apr 19 late-late: relabeled from Poke/Wait longer/Skip) |
-| 2 | Session expired mid-run (2× confirmed) | `pipeline_error {type:"session_expiry"}` | `retry_agent` (= relogin retry) · `skip_agent` |
-| 2 | Paste outer-retry | `phase_alert {type:"paste_outer_retry"}` | — |
-| 2 | HV detected / auto-clear / cooldown / success / fail | `phase_alert {type:"hv_*", stage}` — detected → auto 1/2 → cooldown 180s → retry 2/2 → success/fail | `HV Resume` (fail) |
-| 3 | Per-agent share-link extract fail | `phase_alert {type:"share_link_fail", agent}` | — |
-| 3 | NotebookLM login expired | `phase_alert {type:"nlm_login_expired"}` | `retry_phase(3)` (= relogin retry) · `skip_phase(3)` |
-| 3 | NotebookLM generic upload fail | `phase_alert {type:"nlm_upload_failed", error}` | `retry_phase(3)` · `skip_phase(3)` |
-| 3 | No MD files to upload | `phase_alert {type:"no_md_files"}` | — |
-| 3 | Inter-phase gate (P2 produced no docs) | `phase_alert {type:"p2_empty"}` | `retry_phase(2)` · `stop` |
-| 4 | Audio skip via command | `phase_alert {type:"audio_skipped"}` | — |
-| 4 | Poll-budget timeout | `phase_alert {type:"audio_poll_timeout"}` | `retry_phase(4)` · `skip_audio` |
-| 4 | Download-event timeout + fallback + final fail | `phase_alert {type:"audio_download_*"}` | `skip_audio` |
-| 4 | Firebase Storage upload (best-effort) | `phase_alert {type:"audio_storage_warn"}` | — |
-| 5 | ffmpeg disk-full / not-found / generic | `phase_alert {type:"ffmpeg_*"}` | — |
-| 5 | YouTube URL extract fail | `phase_alert {type:"youtube_url_fail"}` | — |
-| 5 | Google Doc creation fail | `phase_alert {type:"gdoc_fail"}` | — |
-| 5 | Email bad-address / auth / SMTP | `phase_alert {type:"email_*"}` | `skip_email` |
-| 5 | Email skip via command | `phase_alert {type:"email_skipped"}` | — |
-| cross-cutting | Anthropic 429/529 | `phase_alert {type:"anthropic_retry", code, attempt}` | — |
-| cross-cutting | Other API errors | `pipeline_warning {agent?, message}` (not a phase_alert) | — |
+| Source event | FE handler in `usePipeline.ts` | Resulting alert |
+|--------------|--------------------------------|-----------------|
+| `pipeline_error` | `pipeline_error` branch | warn/error panel with backend-supplied `actions: [Retry, Skip, …]` |
+| `pipeline_warning` | `pipeline_warning` branch | info/warn panel with the `actions` payload (e.g. `[Retry, Continue anyway]`) |
+| `login_required` | `login_required` branch | warn panel: "Log into X on Y", actions `[Retry, Skip verification]` |
+| `phase_restart` | `phase_restart` branch | quiet info panel: "Phase N restarted with your additional context" |
+| `pipeline_stopped` | `pipeline_stopped` branch (legacy paired event) | error panel with humanized error text |
+| `human_verification_required` | `human_verification_required` branch | per-AGENT (not phase) alert via `setAgentAlert` — listed here because it's part of the same alert system |
+| `agent_link_failed` | `agent_link_failed` branch | per-AGENT alert with `[Retry, Skip]` actions |
+| watchdog 30-min auto-pause | `startFirestoreListener` watchdog interval | warn panel: "Backend silent for 30 min — pipeline auto-paused" with `[Retry (ping), Skip phase]` |
+| watchdog reviving (supervised) | same | quiet info panel: "Reviving backend…" |
+| `ChatContainer.tsx` paused_backend_restart recovery | onMount Firestore read | warn panel: "Backend restarted mid-run — resume from the last checkpoint?" |
+| pre-Phase-0 start failure | `startPipelineViaFirestore` ack timeout in `startPipeline` | warn panel with `[Retry, Skip]` (`retry_start` / `skip_start`) |
 
-Each alert carries a `phase` field so the frontend can dedup on `(phase, type, title, details)` and place it in the right dropdown. Clearing an alert fires `phase_alert_clear {phase}`.
+**FE writers that clear `phaseAlerts`:**
 
-**Action semantics recap:** default `[Skip]` always advances past the failing step. Extra actions are declared in the event's `actions` array and wired to the corresponding Firestore command: `HV Resume` → HV resume dispatch, `continue_anyway` / `skip_audio` / `skip_email` → their named commands.
+| Trigger | Handler |
+|---------|---------|
+| `phase_complete` | `clearPhaseAlert(researchId, phase)` after the message update |
+| `phase_skipped` | same |
+| watchdog passive recovery (events flowing again) | `clearPhaseAlert` for current phase |
+| watchdog explicit pong recovery | same |
+| user taps a panel button (Retry/Skip/etc.) | `PhaseDropdown.tsx` action handler clears after the Firestore command writes |
+| `pipeline_resumed` | resumes paused state but doesn't clear panels — the next phase event clears them |
+
+**Action semantics recap:** action buttons in a panel come from the source event's `actions` array. The FE renders them via `PhaseAlertPanel` / `AgentAlertPanel`; tapping a button writes the embedded `command` (`{action, …}`) to the research's `commands` subcollection. Phase 4/5 use the unified `skip_phase phase=N` verb (legacy `skip_audio` / `skip_email` were removed in U2).
 
 ### Normalized error matrix (Apr 19 late-late)
 
