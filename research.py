@@ -8457,15 +8457,26 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             log("Phase 1: HV gate could not be cleared — aborting phase", "ERROR")
             return None
 
-    # Select Pro model via CUA
+    # Select Pro model via CUA. Hard 180s ceiling — max_iterations=15 is
+    # generous enough that a stuck CUA could loiter for many minutes
+    # without this wait_for. If timed out, log + assume Pro is unavailable
+    # so the rest of Phase 1 falls through gracefully (the pipeline still
+    # gets an Extended Thinking attempt without the Pro model upgrade).
     if cua_client:
         log("Selecting Pro + Extended Thinking...")
         emit_event("agent_progress", phase=1, agent="chatgpt",
                    status="selecting_model",
                    progress="Selecting ChatGPT Pro with Extended Thinking…")
-        result = await agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
-            "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
-            model=CUA_MODEL, max_iterations=15, verbose=verbose)
+        try:
+            result = await asyncio.wait_for(
+                agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
+                    "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
+                    model=CUA_MODEL, max_iterations=15, verbose=verbose),
+                timeout=180.0,
+            )
+        except asyncio.TimeoutError:
+            log("Phase 1: Pro+Extended Thinking selection timed out (180s) — proceeding without explicit Pro upgrade", "WARN")
+            result = {"text": "no pro available (cua_timeout)"}
         last = (result.get("text") or "").lower()
         if "no pro" in last or "not available" in last:
             log("Pro mode not available", "WARN")
