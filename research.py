@@ -4783,7 +4783,7 @@ async def scrape_progress_chatgpt(page):
                     # default so we don't perturb the DR UI mid-run; flip on
                     # once stable. Wrapped in try/except so any failure
                     # silently keeps the partial result we already collected.
-                    if os.environ.get("DG_SOURCE_PANEL_EXPAND", "").lower() in ("1", "true", "yes"):
+                    if os.environ.get("DG_SOURCE_PANEL_EXPAND", "1").lower() not in ("0", "false", "no"):
                         try:
                             click_res = await frame.evaluate("""() => {
                                 const candidates = document.querySelectorAll('button, [role="button"]');
@@ -4840,72 +4840,83 @@ async def scrape_progress_chatgpt(page):
                                     log(f"ChatGPT sources-panel re-scrape skipped: {_re2}", "DEBUG")
                         except Exception as _se:
                             log(f"ChatGPT sources-panel expand skipped: {_se}", "DEBUG")
-                    # ── 2026-04-26: Click the LIVE plan-item to harvest URLs ──
-                    # ChatGPT Pro DR shows a checklist of plan items inside the
-                    # report modal — mostly checked, with the LIVE one (e.g.
-                    # "Checking openshell agents and sandboxes...") spinning.
-                    # Sub-references for that live item only render when the
-                    # user clicks/expands it. Default scrape misses those URLs
-                    # entirely, so the FE undercounts during polling.
-                    #
-                    # Mirror of the Claude artifact-tracking pattern: click
-                    # the live item, sleep ~1s for lazy render, union new URLs
-                    # into the existing result.source_urls. ENABLED by default
-                    # (additive, reversible — clicking a different item just
-                    # collapses the previous one). Gate via DG_PLAN_ITEM_EXPAND=0
-                    # to opt out.
+                    # ── 2026-04-26 (v2): plan-checklist DOM walker + live-row click ──
+                    # ChatGPT DR's plan checklist uses Tailwind <div>s (not role=checkbox /
+                    # data-testid=task / bare <li>) so the v1 selectors missed iteration 1.
+                    # v2: walk the checklist via verb-prefix + svg[class*=check|spin] heuristic,
+                    # populate result.steps[] (full plan list, last 15) and result.progress
+                    # (active-row label) directly. Click the live row IF NOT already
+                    # aria-expanded, then re-scrape URLs scoped to the expanded subtree
+                    # (no global host-page sweep). Opt out via DG_PLAN_ITEM_EXPAND=0.
                     if os.environ.get("DG_PLAN_ITEM_EXPAND", "1").lower() not in ("0", "false", "no"):
                         try:
-                            click_live = await frame.evaluate("""() => {
-                                const all = document.querySelectorAll(
-                                    '[role="checkbox"], [data-testid*="task"], li, [class*="task"] > div'
-                                );
-                                const live = Array.from(all).find(el => {
-                                    const t = (el.textContent || '').trim();
-                                    if (!t || t.length < 4 || t.length > 200) return false;
-                                    // Skip already-checked items.
-                                    if (el.getAttribute('aria-checked') === 'true') return false;
-                                    if (el.querySelector('svg[class*="check"], svg[data-icon="check"]')) return false;
-                                    if (/^[\\u2713\\u2714\\u221A]/.test(t)) return false;
-                                    // Live signal: prefix verb OR aria-busy OR italic style.
-                                    if (/^(checking|searching|looking|investigating|analyzing|reading|browsing|exploring)/i.test(t)) return true;
-                                    if (el.getAttribute('aria-busy') === 'true') return true;
-                                    try {
-                                        const cs = getComputedStyle(el);
-                                        if (cs.fontStyle === 'italic') return true;
-                                    } catch (e) {}
-                                    return false;
-                                });
-                                if (live) { live.click(); return { clicked: true, label: (live.textContent || '').trim().slice(0, 60) }; }
-                                return { clicked: false };
+                            walk = await frame.evaluate("""() => {
+                                const out = { steps: [], live_label: '', clicked: false, already_expanded: false };
+                                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring)\\b/i;
+                                const all = Array.from(document.querySelectorAll('div, li, [role="listitem"], button, [role="button"]'));
+                                const rows = [];
+                                for (const el of all) {
+                                    const t = (el.innerText || '').trim();
+                                    if (!t || t.length < 4 || t.length > 220) continue;
+                                    const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"]');
+                                    const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"]');
+                                    const verbHit  = VERB.test(t);
+                                    if (!verbHit && !hasCheck && !hasSpin) continue;
+                                    const key = t.slice(0, 60);
+                                    if (rows.find(r => r.key === key)) continue;
+                                    rows.push({ el, t, hasCheck, hasSpin, verbHit, key });
+                                }
+                                out.steps = rows.map(r => r.t.slice(0, 200)).slice(-15);
+                                const live = rows.find(r => r.hasSpin) ||
+                                             rows.find(r => r.verbHit && !r.hasCheck);
+                                if (live) {
+                                    out.live_label = live.t.slice(0, 160);
+                                    const expanded = live.el.getAttribute('aria-expanded');
+                                    if (expanded === 'true') {
+                                        out.already_expanded = true;
+                                    } else {
+                                        live.el.click();
+                                        out.clicked = true;
+                                    }
+                                }
+                                return out;
                             }""")
-                            if click_live and click_live.get("clicked"):
-                                await asyncio.sleep(1.0)
-                                try:
-                                    dr3 = await frame.evaluate("""() => {
-                                        const srcSet = new Set();
-                                        document.querySelectorAll('a[href^="http"]').forEach(a => {
-                                            const h = a.href || '';
-                                            if (h.length < 500 &&
-                                                !h.includes('chatgpt.com') && !h.includes('openai.com') &&
-                                                !h.includes('oaiusercontent')) srcSet.add(h);
-                                        });
-                                        return { source_urls: Array.from(srcSet).slice(0, 50) };
-                                    }""")
-                                    if dr3 and dr3.get("source_urls"):
-                                        seen3 = set(result.get("source_urls") or [])
-                                        unioned3 = list(result.get("source_urls") or [])
-                                        for u in dr3["source_urls"]:
-                                            if u not in seen3:
-                                                seen3.add(u)
-                                                unioned3.append(u)
-                                        if len(unioned3) > len(result.get("source_urls") or []):
-                                            result["source_urls"] = unioned3[:30]
-                                            result["sources"] = len(result["source_urls"])
-                                except Exception as _re3:
-                                    log(f"ChatGPT plan-item re-scrape skipped: {_re3}", "DEBUG")
+                            if walk:
+                                if walk.get("steps"):
+                                    result["steps"] = walk["steps"]
+                                if walk.get("live_label"):
+                                    result["progress"] = walk["live_label"]
+                                if walk.get("clicked"):
+                                    log(f'[ChatGPT] plan-item live-row clicked: "{walk.get("live_label","")}"')
+                                    await asyncio.sleep(1.0)
+                                if walk.get("clicked") or walk.get("already_expanded"):
+                                    try:
+                                        dr3 = await frame.evaluate("""() => {
+                                            const expanded = document.querySelector('[aria-expanded="true"]');
+                                            const root = expanded || document;
+                                            const srcSet = new Set();
+                                            root.querySelectorAll('a[href^="http"]').forEach(a => {
+                                                const h = a.href || '';
+                                                if (h.length < 500 &&
+                                                    !h.includes('chatgpt.com') && !h.includes('openai.com') &&
+                                                    !h.includes('oaiusercontent')) srcSet.add(h);
+                                            });
+                                            return { source_urls: Array.from(srcSet).slice(0, 50) };
+                                        }""")
+                                        if dr3 and dr3.get("source_urls"):
+                                            seen3 = set(result.get("source_urls") or [])
+                                            unioned3 = list(result.get("source_urls") or [])
+                                            for u in dr3["source_urls"]:
+                                                if u not in seen3:
+                                                    seen3.add(u)
+                                                    unioned3.append(u)
+                                            if len(unioned3) > len(result.get("source_urls") or []):
+                                                result["source_urls"] = unioned3[:30]
+                                                result["sources"] = len(result["source_urls"])
+                                    except Exception as _re3:
+                                        log(f"ChatGPT plan-item re-scrape skipped: {_re3}", "DEBUG")
                         except Exception as _pe:
-                            log(f"ChatGPT plan-item live-click skipped: {_pe}", "DEBUG")
+                            log(f"ChatGPT plan-item walker skipped: {_pe}", "DEBUG")
                     break
         except Exception as _fe:
             log(f"ChatGPT frames iteration skipped: {_fe}", "DEBUG")
@@ -5664,27 +5675,69 @@ async def _close_claude_artifact_panel(page):
         pass
 
 
-async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None, verbose=False):
+async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
+                                          verbose=False, keep_open=False,
+                                          already_open=False):
     """Scrape Claude's FIRST artifact for tracking/progress data during active research.
-    DOM-first with CUA fallback. Returns enriched progress dict or None."""
+    DOM-first with CUA fallback. Returns enriched progress dict or None.
+    keep_open=True: don't close the panel after read (re-used across polls).
+    already_open=True: skip the click step (panel already open from prior poll)."""
     artifact_count = await _count_claude_artifacts(page)
     if artifact_count == 0:
         return None
 
     content = ""
+    walker = {"steps": [], "sections": [], "source_urls": []}
 
-    # Layer 1: DOM probe — click first artifact, read panel, close panel
+    # Layer 1: DOM probe — open panel (if not already), read panel + DOM walker
     try:
-        clicked = await _click_claude_artifact(page, index=0)
-        if clicked:
-            await asyncio.sleep(1.5)  # Wait for panel to render
-            content = await _read_claude_artifact_panel(page)
+        if not already_open:
+            clicked = await _click_claude_artifact(page, index=0)
+            if clicked:
+                await asyncio.sleep(1.5)  # Wait for panel to render
+        content = await _read_claude_artifact_panel(page)
+        # Structured DOM walker — cheaper + more accurate than regex on plain text.
+        # Reads the live artifact's checklist headings + section list + URL anchors
+        # so steps[]/sections[]/source_urls[] reflect Claude's running outline.
+        try:
+            walker = await page.evaluate("""() => {
+                const out = { steps: [], sections: [], source_urls: [] };
+                const root = document.querySelector(
+                    '[data-testid="artifact-content"], aside, [class*="artifact-panel"]'
+                ) || document;
+                root.querySelectorAll(
+                    'li, [role="listitem"], [class*="step"], [class*="checklist"] > div, ' +
+                    '[class*="task"] > div, [class*="activity"]'
+                ).forEach(e => {
+                    const t = (e.innerText || '').trim();
+                    if (t && t.length > 4 && t.length < 240) out.steps.push(t.slice(0, 220));
+                });
+                root.querySelectorAll('h1, h2, h3').forEach(h => {
+                    const t = (h.innerText || '').trim();
+                    if (t && t.length > 1 && t.length < 120) out.sections.push(t);
+                });
+                const seen = new Set();
+                root.querySelectorAll('a[href^="http"]').forEach(a => {
+                    const h = a.href || '';
+                    if (h && h.length < 500 && !h.includes('claude.ai') &&
+                        !h.includes('anthropic.com') && !seen.has(h)) {
+                        seen.add(h); out.source_urls.push(h);
+                    }
+                });
+                out.steps = out.steps.slice(-15);
+                out.sections = out.sections.slice(0, 20);
+                out.source_urls = out.source_urls.slice(0, 50);
+                return out;
+            }""")
+        except Exception as _we:
+            log(f"[Claude] artifact DOM walker skipped: {_we}", "DEBUG")
+        if not keep_open:
             await _close_claude_artifact_panel(page)
     except Exception as e:
         log(f"[Claude] Artifact DOM tracking failed: {e}", "WARN")
 
     # Layer 2: CUA fallback if DOM yielded nothing
-    if not content and browser and cua_client:
+    if not content and not walker.get("source_urls") and browser and cua_client:
         try:
             result = await agent_loop(cua_client, browser,
                 PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING,
@@ -5695,24 +5748,19 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None, v
         except Exception as e:
             log(f"[Claude] Artifact CUA tracking failed: {e}", "WARN")
 
-    if not content or len(content) < 30:
+    # Lowered gate: 5 chars (was 30) — accept partials. Walker URLs alone count.
+    if (not content or len(content) < 5) and not walker.get("source_urls"):
         return None
 
-    # Parse structured data from artifact content
-    urls = re.findall(r'https?://[^\s)>\]"]+', content)
-    unique_urls = list(dict.fromkeys(urls))[:20]  # Dedup, cap at 20
-
-    # Extract steps (numbered items, bullets)
-    steps = re.findall(r'(?:^|\n)\s*(?:\d+[\.\)]\s*|[-•]\s+)(.{10,200})', content)
-
-    # Extract section headers (markdown-style or all-caps lines)
-    sections = re.findall(r'(?:^|\n)#{1,3}\s+(.{3,80})', content)
+    # Prefer DOM-walker output; fall back to regex on plain text only when walker empty.
+    urls = walker["source_urls"] or list(dict.fromkeys(re.findall(r'https?://[^\s)>\]"]+', content or "")))[:30]
+    steps = walker["steps"] or re.findall(r'(?:^|\n)\s*(?:\d+[\.\)]\s*|[-•]\s+)(.{10,200})', content or "")
+    sections = walker["sections"] or re.findall(r'(?:^|\n)#{1,3}\s+(.{3,80})', content or "")
     if not sections:
-        sections = re.findall(r'(?:^|\n)([A-Z][A-Z\s&]{5,60})(?:\n|$)', content)
+        sections = re.findall(r'(?:^|\n)([A-Z][A-Z\s&]{5,60})(?:\n|$)', content or "")
 
-    # Source domain count
     domains = set()
-    for u in unique_urls:
+    for u in urls:
         try:
             from urllib.parse import urlparse
             domains.add(urlparse(u).netloc)
@@ -5722,13 +5770,13 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None, v
     return {
         "status": "generating",
         "phase": "researching",
-        "progress": steps[-1] if steps else f"Tracking {len(unique_urls)} sources from artifact",
-        "sources": len(domains),
-        "source_urls": unique_urls,
+        "progress": (steps[-1] if steps else f"Tracking {len(urls)} sources from artifact"),
+        "sources": max(len(domains), len(urls)),
+        "source_urls": urls[:30],
         "sections": sections[:15],
-        "steps": steps[:10],
+        "steps": steps[:15],
         "tool_uses": [f"Analyzing: {s[:80]}" for s in sections[:5]],
-        "partial_text_len": len(content),
+        "partial_text_len": len(content or ""),
         "artifact_tracking": True,
         "artifact_count": artifact_count,
     }
@@ -7219,7 +7267,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     _min_agent_wait = int(os.environ.get("MIN_AGENT_WAIT_MIN", "5")) * 60
     MIN_WAIT = {"ChatGPT": _min_agent_wait, "Gemini": _min_agent_wait, "Claude": _min_agent_wait}
     CUA_CHECK_INTERVAL = 300   # 5 min between CUA completion checks
-    ARTIFACT_SCRAPE_INTERVAL = 180  # 3 min between Claude artifact tracking scrapes
+    ARTIFACT_SCRAPE_INTERVAL = 60   # 1 min between Claude artifact-tracking scrapes (was 180; iteration #1 must pass — see init at last_artifact_scrape=0 below)
 
     pending = {}
     results = {}
@@ -7259,7 +7307,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "cua_confirmed": False,
             "last_heartbeat": _research_t,
             "last_cua_check": _research_t,       # CUA check gate — MIN_WAIT from research start
-            "last_artifact_scrape": _research_t,
+            "last_artifact_scrape": 0,           # 0 → iteration #1 always passes the gate (Claude opens artifact ASAP)
             "observer_text_len": 0,              # MutationObserver sets this (see B2)
         }
         # Register for mid-run input dispatcher
@@ -7371,7 +7419,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "done_count": 0, "cua_confirmed": False,
                                              "last_heartbeat": time.time(),
                                              "last_cua_check": time.time(),
-                                             "last_artifact_scrape": time.time(),
+                                             "last_artifact_scrape": 0,
                                              "observer_text_len": 0}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
@@ -7456,7 +7504,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "cua_confirmed": False,
                     "last_heartbeat": time.time(),
                     "last_cua_check": time.time(),
-                    "last_artifact_scrape": time.time(),
+                    "last_artifact_scrape": 0,
                     "observer_text_len": 0,
                     "empty_retries": 0,
                     "hard_retry_count": 0,
@@ -7548,7 +7596,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "cua_confirmed": False,
                 "last_heartbeat": _now,
                 "last_cua_check": _now,
-                "last_artifact_scrape": _now,
+                "last_artifact_scrape": 0,
                 "observer_text_len": 0,
                 "empty_retries": 0,
                 "hard_retry_count": _hard_count,
@@ -7778,25 +7826,29 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # Don't mask scrape failures — tell frontend the scrape degraded
                     log(f"[{name}] DOM scrape failed: {_scrape_err}", "WARN")
 
-            # Claude artifact tracking — scrape intermediate artifact periodically
-            # This enriches progress data with URLs, steps, and sections from the artifact
+            # Claude artifact tracking — open the FIRST artifact ASAP and keep it open
+            # so subsequent polls re-read live (URLs / steps / sections) without
+            # re-clicking. Auto-close removed: the second artifact (final report) is
+            # detected/opened separately by extract_claude_response at completion.
+            # 120s warmup deleted — iteration #1 must try (last_artifact_scrape=0 above).
             if name == "Claude" and (time.time() - p.get("last_artifact_scrape", 0)) > ARTIFACT_SCRAPE_INTERVAL:
-                if elapsed > 120:  # Warmup: artifacts may not exist in first 2 min
-                    try:
-                        artifact_data = await scrape_claude_artifact_tracking(
-                            p["page"], browser=browser, cua_client=cua_client, verbose=verbose)
-                        if artifact_data and artifact_data.get("source_urls"):
-                            # Merge artifact data into progress — artifact is richer than DOM scrape
-                            # for URLs/steps/sections since it reads the actual document content
+                try:
+                    artifact_data = await scrape_claude_artifact_tracking(
+                        p["page"], browser=browser, cua_client=cua_client,
+                        verbose=verbose, keep_open=True,
+                        already_open=p.get("artifact_panel_open", False))
+                    if artifact_data:
+                        if not p.get("artifact_panel_open"):
+                            log(f"[Claude] artifact panel opened (first time) at elapsed={int(elapsed)}s")
+                        p["artifact_panel_open"] = True
+                        if artifact_data.get("source_urls"):
                             for key in ("source_urls", "steps", "sections", "tool_uses"):
                                 if artifact_data.get(key):
                                     existing = progress.get(key, []) or []
                                     merged = list(dict.fromkeys(existing + artifact_data[key]))
                                     progress[key] = merged
-                            # Use artifact source count if higher
                             if artifact_data.get("sources", 0) > progress.get("sources", 0):
                                 progress["sources"] = artifact_data["sources"]
-                            # Use artifact text len if higher
                             if artifact_data.get("partial_text_len", 0) > progress.get("partial_text_len", 0):
                                 progress["partial_text_len"] = artifact_data["partial_text_len"]
                             progress["artifact_count"] = artifact_data.get("artifact_count", 0)
@@ -7805,10 +7857,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             log(f"[Claude] Artifact tracking: {len(artifact_data.get('source_urls', []))} URLs, "
                                 f"{len(artifact_data.get('steps', []))} steps, "
                                 f"{len(artifact_data.get('sections', []))} sections")
-                        p["last_artifact_scrape"] = time.time()
-                    except Exception as e:
-                        log(f"[Claude] Artifact tracking scrape failed: {e}", "WARN")
-                        p["last_artifact_scrape"] = time.time()  # Don't retry immediately
+                    p["last_artifact_scrape"] = time.time()
+                except Exception as e:
+                    log(f"[Claude] Artifact tracking scrape failed: {e}", "WARN")
+                    p["last_artifact_scrape"] = time.time()  # Don't retry immediately
 
             # Emit agent_progress to frontend (critical for real-time UI)
             agent_key = normalize_agent_key(name)
