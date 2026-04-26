@@ -1,0 +1,656 @@
+"""Vision tier-2 layer for Super Research.
+
+Architecture: Playwright (primary, fast) → Vision (this file, smart) → CUA (fallback).
+
+Vision is invoked when Playwright fails or hits a flaky DOM. It accepts a
+`flow_context` describing what workflow we're in and what just failed, reads
+a screenshot, and proposes the next browser action. Caller executes the
+action and either resumes Playwright (if successful) or escalates to CUA.
+
+Public surface:
+    VisionClient          — stateful client (one Anthropic conn pool, metrics ledger)
+    default_client()      — process-wide lazily-constructed singleton
+    ImgMeta               — screenshot metadata (viewport + DPR)
+    ActionResult          — typed return from ask()/act()
+    VisionMetrics         — call counts, tokens, cost, p95 latency
+    with_vision_fallback  — wrapper used by Playwright sites at hotspots
+    execute_action        — runs an ActionResult against a Playwright page
+
+Design source: scratch/vision_hotspots.md (8 hotspots + 4 generic capabilities)
+              + V1 advisor `a29c1dcf8b2ec8059` (perfection-grade spec).
+
+V1 = standalone, no production wiring. V2 = post-action gates. V3 = wire-in.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Literal
+
+import anthropic
+
+logger = logging.getLogger("vision")
+
+
+ActionVerb = Literal[
+    "click", "type", "scroll", "key", "wait",
+    "escalate_to_cua", "declare_success", "declare_failure",
+]
+
+# Sonnet is the default. Opus is the high-stakes / retry-after-failure model.
+# Haiku confirmed too weak by V1 advisor — never used.
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_OPUS = "claude-opus-4-7"
+
+# Per-call hard timeout — matches the user-perceived stall threshold. Above
+# this, the user sees a frozen UI. asyncio.wait_for around the SDK call.
+DEFAULT_TIMEOUT_S = 8.0
+
+# Single transport retry on network/5xx/429. Two retries pushes p95 over budget.
+TRANSPORT_RETRY_DELAY_S = 1.5
+
+# Confidence below this is flagged for caller to escalate. NOT auto-retried —
+# auto-retry on low confidence inflates cost without changing the model's mind.
+LOW_CONFIDENCE_THRESHOLD = 0.6
+
+# Pessimistic per-pipeline-run circuit breaker. Stops a flaky hotspot from
+# burning the budget. Caller surfaces as pipeline_warning when raised.
+DEFAULT_CALL_BUDGET = 50
+
+# Cost coefficients for rough $/run estimates ($/Mtok). Anthropic pricing
+# as of 2026-04 — refresh annually. Used by VisionMetrics.estimated_cost_usd
+# for surfacing in run analytics, not for billing.
+_COST_PER_MTOK_INPUT = {MODEL_SONNET: 3.00, MODEL_OPUS: 15.00}
+_COST_PER_MTOK_OUTPUT = {MODEL_SONNET: 15.00, MODEL_OPUS: 75.00}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Dataclasses
+# ─────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ImgMeta:
+    """Captured at screenshot time. Coordinate ratios in ActionResult are
+    multiplied by (width_css, height_css) before page.mouse.click() — that's
+    why we use ratios end-to-end and never raw image pixels."""
+    width_css: int
+    height_css: int
+    dpr: float
+    captured_at: float
+
+
+@dataclass(frozen=True)
+class ActionResult:
+    """Typed return from vision calls. Coordinates are 0–1 ratios — they
+    survive image resize, DPR, and viewport changes. Convert to CSS pixels
+    inside execute_action() right before the Playwright call."""
+    action: ActionVerb
+    reason: str
+    confidence: float
+    next_expected_state: str
+    x_ratio: float | None = None
+    y_ratio: float | None = None
+    text: str | None = None
+    key: str | None = None
+    scroll_dy_ratio: float | None = None
+    duration_ms: int | None = None
+    # Internal flags — not part of the model's JSON schema. Caller-visible
+    # but set by VisionClient based on call outcome.
+    low_confidence: bool = False
+    model_used: str = ""
+    latency_ms: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
+class VisionMetrics:
+    """Per-pipeline-run counters. Reset via reset() between runs.
+    V3 wire-in dumps this into the run's status JSON for analytics."""
+    call_count: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    latencies_ms: list[float] = field(default_factory=list)
+    failures_by_reason: Counter = field(default_factory=Counter)
+    by_model: Counter = field(default_factory=Counter)
+
+    def record(self, result: ActionResult) -> None:
+        self.call_count += 1
+        self.total_input_tokens += result.input_tokens
+        self.total_output_tokens += result.output_tokens
+        self.latencies_ms.append(result.latency_ms)
+        if result.model_used:
+            self.by_model[result.model_used] += 1
+        if result.action == "declare_failure":
+            self.failures_by_reason[result.reason[:80]] += 1
+
+    def p95(self) -> float:
+        if not self.latencies_ms:
+            return 0.0
+        s = sorted(self.latencies_ms)
+        return s[max(0, int(len(s) * 0.95) - 1)]
+
+    def estimated_cost_usd(self) -> float:
+        # Aggregates across models. Approximate — pricing changes; treat as
+        # an indicator, not an invoice.
+        cost = 0.0
+        for model, count in self.by_model.items():
+            in_rate = _COST_PER_MTOK_INPUT.get(model, 5.0) / 1_000_000
+            out_rate = _COST_PER_MTOK_OUTPUT.get(model, 25.0) / 1_000_000
+            avg_in = self.total_input_tokens / max(self.call_count, 1)
+            avg_out = self.total_output_tokens / max(self.call_count, 1)
+            cost += count * (avg_in * in_rate + avg_out * out_rate)
+        return cost
+
+    def reset(self) -> None:
+        self.call_count = 0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.latencies_ms.clear()
+        self.failures_by_reason.clear()
+        self.by_model.clear()
+
+
+class BudgetExceeded(RuntimeError):
+    """Raised when VisionMetrics.call_count exceeds the per-run budget.
+    Caller should surface as pipeline_warning and stop trying Vision for
+    the rest of this run (fall through to CUA)."""
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tool schema — forced output via Anthropic tool-use
+# ─────────────────────────────────────────────────────────────────────────
+
+# We force the model to call this tool. Guarantees valid JSON without a
+# parse-retry loop. Anthropic's response_format=json is less strict; tool-use
+# enforces the input_schema.
+_PROPOSE_ACTION_TOOL = {
+    "name": "propose_action",
+    "description": (
+        "Propose the next browser action to advance the workflow described "
+        "in the user message. Choose ONE action. Coordinates are 0–1 ratios "
+        "of the viewport width/height. Confidence is your honest assessment "
+        "from 0 (guessing) to 1 (certain)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "click", "type", "scroll", "key", "wait",
+                    "escalate_to_cua", "declare_success", "declare_failure",
+                ],
+                "description": (
+                    "click: click at (x_ratio, y_ratio). "
+                    "type: type `text` into the currently focused field. "
+                    "scroll: scroll by `scroll_dy_ratio` viewport heights. "
+                    "key: press `key` (e.g. Tab, Enter, Escape). "
+                    "wait: wait `duration_ms` milliseconds. "
+                    "escalate_to_cua: page is unreadable / captcha / unknown — "
+                    "let the CUA fallback take over. "
+                    "declare_success: workflow goal is met (read it from the screen). "
+                    "declare_failure: workflow definitely failed; no further action would help."
+                ),
+            },
+            "x_ratio": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "y_ratio": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "text": {"type": "string"},
+            "key": {"type": "string"},
+            "scroll_dy_ratio": {"type": "number"},
+            "duration_ms": {"type": "integer", "minimum": 0},
+            "reason": {
+                "type": "string",
+                "description": (
+                    "WHY this action — a short sentence. Used for logs and "
+                    "becomes the next call's last_action breadcrumb."
+                ),
+            },
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "next_expected_state": {
+                "type": "string",
+                "description": (
+                    "What the screen should look like AFTER your action. V2 "
+                    "post-action gates use this to verify the action landed."
+                ),
+            },
+        },
+        "required": ["action", "reason", "confidence", "next_expected_state"],
+    },
+}
+
+
+_SYSTEM_PROMPT = (
+    "You guide browser automation as the smart tier-2 layer. Playwright "
+    "(tier-1) already tried and failed at the current step; CUA (tier-3) "
+    "is the fallback if you can't make sense of the screen. "
+    "\n\n"
+    "RULES:\n"
+    "1. Coordinates are 0–1 ratios of the viewport — never pixels. Center of "
+    "screen is (0.5, 0.5).\n"
+    "2. Return confidence honestly. Below 0.6, the caller will escalate to "
+    "CUA — that's better than a confident-but-wrong click.\n"
+    "3. If you see a captcha (reCAPTCHA, hCaptcha, Cloudflare), return "
+    "action='escalate_to_cua' immediately. Never attempt to solve.\n"
+    "4. If the workflow goal is already visible on screen (e.g. the share "
+    "URL is rendered), return action='declare_success' with the URL or key "
+    "info in `reason`.\n"
+    "5. One action per response. Sequencing across multiple screens is the "
+    "caller's job.\n"
+    "6. Always populate next_expected_state — it's how V2 verifies your "
+    "action worked.\n"
+    "\n"
+    "Use the propose_action tool for your response. Do not write prose."
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# VisionClient
+# ─────────────────────────────────────────────────────────────────────────
+
+class VisionClient:
+    """One client per process. Holds the AsyncAnthropic connection pool, the
+    metrics ledger, and the model-routing logic. Stateless across calls —
+    flow state lives in the caller's flow_context."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        default_model: str = MODEL_SONNET,
+        call_budget: int = DEFAULT_CALL_BUDGET,
+        on_action: Callable[[ActionResult, dict], Awaitable[None]] | None = None,
+    ) -> None:
+        key = api_key or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CUA_API_KEY")
+        if not key:
+            raise RuntimeError(
+                "VisionClient: no API key. Pass api_key= or set ANTHROPIC_API_KEY."
+            )
+        self._client = anthropic.AsyncAnthropic(api_key=key)
+        self._default_model = default_model
+        self._call_budget = call_budget
+        self._on_action = on_action
+        self.metrics = VisionMetrics()
+
+    # ── Step 1: screenshot + ImgMeta ────────────────────────────────────
+    async def screenshot(self, page: Any, *, full_page: bool = False) -> tuple[bytes, ImgMeta]:
+        """Capture a viewport screenshot + the metadata needed to map
+        action ratios back to CSS pixels."""
+        png = await page.screenshot(full_page=full_page, type="png")
+        try:
+            dpr = float(await page.evaluate("window.devicePixelRatio") or 1.0)
+        except Exception:
+            dpr = 1.0
+        viewport = page.viewport_size or {"width": 1280, "height": 800}
+        return png, ImgMeta(
+            width_css=int(viewport["width"]),
+            height_css=int(viewport["height"]),
+            dpr=dpr,
+            captured_at=time.time(),
+        )
+
+    # ── Step 2: ask (forced tool-use, Sonnet/Opus routing) ──────────────
+    async def ask(
+        self,
+        image: bytes,
+        img_meta: ImgMeta,
+        flow_context: dict,
+        *,
+        prompt: str | None = None,
+        high_stakes: bool = False,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> ActionResult:
+        """Send screenshot + flow_context to the vision model, force tool-use,
+        return a typed ActionResult. Never raises — failures return action=
+        'declare_failure'. Callers can chain into CUA without try/except."""
+        if self.metrics.call_count >= self._call_budget:
+            raise BudgetExceeded(
+                f"Vision call budget {self._call_budget} exceeded — escalate to CUA"
+            )
+
+        model = self._pick_model(flow_context, high_stakes)
+        user_text = self._build_user_message(flow_context, prompt, img_meta)
+        t0 = time.time()
+
+        for attempt in range(2):  # 1 try + 1 transport retry
+            try:
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(
+                        model=model,
+                        max_tokens=512,
+                        system=_SYSTEM_PROMPT,
+                        tools=[_PROPOSE_ACTION_TOOL],
+                        tool_choice={"type": "tool", "name": "propose_action"},
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _b64(image),
+                                    },
+                                },
+                                {"type": "text", "text": user_text},
+                            ],
+                        }],
+                    ),
+                    timeout=timeout_s,
+                )
+                latency_ms = (time.time() - t0) * 1000.0
+                result = self._parse_response(resp, model, latency_ms)
+                self.metrics.record(result)
+                if self._on_action:
+                    try:
+                        await self._on_action(result, flow_context)
+                    except Exception as e:
+                        logger.warning("on_action hook raised: %s", e)
+                self._log_call(result, flow_context)
+                return result
+            except asyncio.TimeoutError:
+                # Timeout doesn't retry — already over budget on latency.
+                latency_ms = (time.time() - t0) * 1000.0
+                logger.warning(
+                    "vision: timeout after %.0fms (model=%s, workflow=%s)",
+                    latency_ms, model, flow_context.get("workflow_name", "?"),
+                )
+                return self._failure(
+                    f"vision timeout after {timeout_s}s",
+                    model, latency_ms,
+                )
+            except (anthropic.APIConnectionError, anthropic.RateLimitError,
+                    anthropic.InternalServerError) as e:
+                if attempt == 0:
+                    logger.info("vision: transport error, retrying once: %s", e)
+                    await asyncio.sleep(TRANSPORT_RETRY_DELAY_S)
+                    continue
+                latency_ms = (time.time() - t0) * 1000.0
+                return self._failure(
+                    f"transport error after retry: {type(e).__name__}: {e}",
+                    model, latency_ms,
+                )
+            except Exception as e:
+                # Anything else (auth, schema) → failure. Don't raise.
+                latency_ms = (time.time() - t0) * 1000.0
+                logger.exception("vision: unexpected error")
+                return self._failure(
+                    f"unexpected error: {type(e).__name__}: {e}",
+                    model, latency_ms,
+                )
+
+        # Unreachable — both attempt branches return. Defensive.
+        return self._failure("unreachable retry branch exhausted", model, 0.0)
+
+    # ── Step 3: act (screenshot + ask, the common path) ──────────────────
+    async def act(
+        self,
+        page: Any,
+        flow_context: dict,
+        *,
+        prompt: str | None = None,
+        high_stakes: bool = False,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> ActionResult:
+        """Convenience: screenshot the page then ask the model. The bread-
+        and-butter call from with_vision_fallback()."""
+        image, meta = await self.screenshot(page)
+        # Inject viewport into flow_context — vision needs this to reason
+        # about coords. Caller doesn't have to remember.
+        ctx = dict(flow_context)
+        ctx.setdefault("viewport", {
+            "w": meta.width_css, "h": meta.height_css, "dpr": meta.dpr,
+        })
+        return await self.ask(
+            image, meta, ctx,
+            prompt=prompt, high_stakes=high_stakes, timeout_s=timeout_s,
+        )
+
+    # ── Internals ────────────────────────────────────────────────────────
+
+    def _pick_model(self, flow_context: dict, high_stakes: bool) -> str:
+        """Sonnet by default. Opus when login flow, captcha, retry-after-
+        failure, or caller forces high_stakes."""
+        if high_stakes:
+            return MODEL_OPUS
+        if flow_context.get("phase") == 0:
+            return MODEL_OPUS
+        wf = flow_context.get("workflow_name", "")
+        if wf in ("phase0_login_verify", "captcha_detect"):
+            return MODEL_OPUS
+        if int(flow_context.get("attempts") or 0) >= 2:
+            return MODEL_OPUS
+        return self._default_model
+
+    def _build_user_message(
+        self, flow_context: dict, prompt: str | None, img_meta: ImgMeta,
+    ) -> str:
+        """Pack the flow_context as YAML-style for token efficiency, then
+        the explicit task prompt, then a viewport reminder."""
+        # YAML is denser than JSON for prompts. We don't use a yaml lib —
+        # this is a hand-rolled flat dump good enough for the model.
+        parts: list[str] = ["# Workflow context"]
+        for k in (
+            "workflow_name", "phase", "current_step", "last_action",
+            "expected_outcome", "attempts", "platform", "context_hint",
+            "forbidden_actions", "success_signals",
+        ):
+            if k in flow_context and flow_context[k] not in (None, "", [], {}):
+                v = flow_context[k]
+                if isinstance(v, (list, dict)):
+                    v = json.dumps(v)
+                parts.append(f"{k}: {v}")
+        parts.append("")
+        parts.append(
+            f"# Viewport\n"
+            f"{img_meta.width_css}×{img_meta.height_css} CSS pixels (DPR {img_meta.dpr:.1f})"
+        )
+        parts.append("")
+        parts.append("# Task")
+        if prompt:
+            parts.append(prompt)
+        else:
+            parts.append(
+                f"Advance the {flow_context.get('workflow_name', 'workflow')} "
+                f"workflow. Current step: {flow_context.get('current_step', 'unknown')}. "
+                f"Goal: {flow_context.get('expected_outcome', 'see workflow_name above')}."
+            )
+        return "\n".join(parts)
+
+    def _parse_response(
+        self, resp: Any, model: str, latency_ms: float,
+    ) -> ActionResult:
+        """Extract the propose_action tool call from the response.
+        Forced tool-use guarantees this exists, but we defend anyway."""
+        usage = getattr(resp, "usage", None)
+        in_tok = getattr(usage, "input_tokens", 0) if usage else 0
+        out_tok = getattr(usage, "output_tokens", 0) if usage else 0
+
+        for block in (resp.content or []):
+            if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == "propose_action":
+                inp = block.input or {}
+                conf = float(inp.get("confidence", 0.0))
+                return ActionResult(
+                    action=inp.get("action", "declare_failure"),
+                    reason=str(inp.get("reason", "")),
+                    confidence=conf,
+                    next_expected_state=str(inp.get("next_expected_state", "")),
+                    x_ratio=_opt_float(inp.get("x_ratio")),
+                    y_ratio=_opt_float(inp.get("y_ratio")),
+                    text=_opt_str(inp.get("text")),
+                    key=_opt_str(inp.get("key")),
+                    scroll_dy_ratio=_opt_float(inp.get("scroll_dy_ratio")),
+                    duration_ms=_opt_int(inp.get("duration_ms")),
+                    low_confidence=(conf < LOW_CONFIDENCE_THRESHOLD),
+                    model_used=model,
+                    latency_ms=latency_ms,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                )
+        # No tool_use block — schema-invalid response. Failure.
+        return self._failure(
+            "model did not return propose_action tool call",
+            model, latency_ms,
+            in_tok=in_tok, out_tok=out_tok,
+        )
+
+    def _failure(
+        self, reason: str, model: str, latency_ms: float,
+        in_tok: int = 0, out_tok: int = 0,
+    ) -> ActionResult:
+        result = ActionResult(
+            action="declare_failure",
+            reason=reason,
+            confidence=0.0,
+            next_expected_state="",
+            model_used=model,
+            latency_ms=latency_ms,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+        )
+        self.metrics.record(result)
+        return result
+
+    def _log_call(self, result: ActionResult, flow_context: dict) -> None:
+        logger.info(
+            "vision: action=%s confidence=%.2f workflow=%s phase=%s "
+            "model=%s latency_ms=%.0f tokens=%d/%d reason=%s",
+            result.action, result.confidence,
+            flow_context.get("workflow_name", "?"),
+            flow_context.get("phase", "?"),
+            result.model_used, result.latency_ms,
+            result.input_tokens, result.output_tokens,
+            result.reason[:80],
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Module-level singleton
+# ─────────────────────────────────────────────────────────────────────────
+
+_default: VisionClient | None = None
+
+
+def default_client() -> VisionClient:
+    """Lazy process-wide singleton. Constructed from env on first call.
+    V3 wire-in uses this so callers don't have to plumb the client through."""
+    global _default
+    if _default is None:
+        _default = VisionClient()
+    return _default
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# execute_action — runs an ActionResult against a Playwright page.
+# Lives in vision.py (not the caller) so V3 wire-in is one import.
+# ─────────────────────────────────────────────────────────────────────────
+
+async def execute_action(page: Any, result: ActionResult, img_meta: ImgMeta) -> None:
+    """Translate an ActionResult into a Playwright operation. Coords are
+    ratios → CSS pixels via img_meta. No-op for declare_success /
+    declare_failure / escalate_to_cua — those signal the caller, not the page.
+    Raises only on Playwright errors; vision failures already short-circuited."""
+    a = result.action
+    if a in ("declare_success", "declare_failure", "escalate_to_cua"):
+        return
+    if a == "click":
+        if result.x_ratio is None or result.y_ratio is None:
+            raise ValueError("click action requires x_ratio + y_ratio")
+        x = result.x_ratio * img_meta.width_css
+        y = result.y_ratio * img_meta.height_css
+        await page.mouse.click(x, y)
+    elif a == "type":
+        if result.text is None:
+            raise ValueError("type action requires text")
+        await page.keyboard.type(result.text, delay=20)
+    elif a == "scroll":
+        dy_ratio = result.scroll_dy_ratio or 0.5
+        dy = dy_ratio * img_meta.height_css
+        await page.mouse.wheel(0, dy)
+    elif a == "key":
+        if result.key is None:
+            raise ValueError("key action requires key")
+        await page.keyboard.press(result.key)
+    elif a == "wait":
+        ms = result.duration_ms or 500
+        await asyncio.sleep(ms / 1000.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# with_vision_fallback — the V3 wire-in pattern. Lives here for caller ease.
+# ─────────────────────────────────────────────────────────────────────────
+
+async def with_vision_fallback(
+    page: Any,
+    primary_fn: Callable[[], Awaitable[Any]],
+    *,
+    flow_context: dict,
+    cua_fallback: Callable[[Any, dict, str], Awaitable[Any]] | None = None,
+    vision: VisionClient | None = None,
+    high_stakes: bool = False,
+) -> Any:
+    """Run `primary_fn` (Playwright). On failure, ask Vision; if Vision
+    proposes an action, execute it then re-enter `primary_fn` once. If
+    Vision escalates or `primary_fn` fails again, fall through to CUA.
+
+    `primary_fn` MUST be re-entrant (idempotent reads OK; idempotent writes
+    handled by the underlying workflow's resume logic). The existing
+    extract_share_link_* extractors satisfy this.
+    """
+    vc = vision or default_client()
+    try:
+        return await primary_fn()
+    except Exception as e:
+        flow_context = dict(flow_context)
+        flow_context["context_hint"] = (
+            f"playwright failed: {type(e).__name__}: {str(e)[:200]}"
+        )
+        result = await vc.act(page, flow_context, high_stakes=high_stakes)
+        if result.action == "declare_success":
+            return result
+        if result.action in ("escalate_to_cua", "declare_failure") or result.low_confidence:
+            if cua_fallback:
+                return await cua_fallback(page, flow_context, result.reason)
+            raise  # no CUA — re-raise the original Playwright error
+        # Vision proposed a concrete action — execute and resume primary.
+        _, meta = await vc.screenshot(page)  # refresh meta in case viewport changed
+        await execute_action(page, result, meta)
+        return await primary_fn()  # one resume attempt; further failures re-raise
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+def _b64(data: bytes) -> str:
+    import base64
+    return base64.standard_b64encode(data).decode("ascii")
+
+
+def _opt_float(v: Any) -> float | None:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_int(v: Any) -> int | None:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_str(v: Any) -> str | None:
+    if v is None or v == "":
+        return None
+    return str(v)
