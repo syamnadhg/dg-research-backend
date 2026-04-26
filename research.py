@@ -1695,11 +1695,29 @@ def _start_command_listener(uid, research_id, loop):
                 #   "hard"           — polling closes the tab and re-runs the
                 #                      full setup (fresh session, no partial)
                 # Hard retry is capped at 2/agent/phase by the polling loop.
+                #
+                # 2026-04-25: when the agent failed BEFORE entering the
+                # round-robin (setup/paste failure → not in `pending`), soft
+                # retry is a no-op because there's no in-flight session to
+                # paste into. Auto-promote to hard so the agent gets a fresh
+                # tab + fresh setup attempt. The hard-retry consumer at
+                # ~line 7271 also seeds `pending` for missing agents.
                 _ag = (data.get("agent") or "").strip()
                 _mode = (data.get("mode") or "soft").strip().lower()
-                if _ag and _mode == "hard":
+                _ag_norm = _ag.lower()
+                _agent_pre_failed = _ag_norm in (_controls.skipped_agents or set())
+                if _ag and (_mode == "hard" or _agent_pre_failed):
                     loop.call_soon_threadsafe(_controls.request_retry_agent_hard, _ag)
-                    log(f"Command received: RETRY_AGENT agent={_ag} mode=hard")
+                    if _agent_pre_failed:
+                        # Drop the pre-fail skip marker so the hard-retry path
+                        # doesn't see Gemini as still-skipped.
+                        try:
+                            _controls.skipped_agents.discard(_ag_norm)
+                        except Exception:
+                            pass
+                        log(f"Command received: RETRY_AGENT agent={_ag} mode=hard (auto-promoted — agent had pre-pending setup failure)")
+                    else:
+                        log(f"Command received: RETRY_AGENT agent={_ag} mode=hard")
                 elif _ag:
                     loop.call_soon_threadsafe(_controls.request_retry_agent, _ag)
                     log(f"Command received: RETRY_AGENT agent={_ag} mode=soft")
@@ -6725,13 +6743,16 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
     submit). For a single-agent restart, ordering doesn't matter: run the
     agent's own setup in isolation.
 
-    Returns `(new_page, verified_bool)` or `None` on hard failure."""
+    Returns `(new_page, verified_bool)` or `None` on hard failure (including
+    paste/setup failure where start_agent_no_gemini_wait returned ok=False)."""
     if name == "ChatGPT":
-        new_page = await start_agent_no_gemini_wait(
+        new_page, _setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://chatgpt.com",
             PROMPT_CHATGPT_DEEP_RESEARCH,
             "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
             brief_text, "2A-retry", "ChatGPT", verbose, brief_path=brief_path)
+        if not _setup_ok:
+            return (new_page, False)
         verified = await wait_until_verified(
             verify_chatgpt_generating, new_page, "2A-retry",
             browser=browser, cua_client=cua_client,
@@ -6739,11 +6760,13 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         return (new_page, verified)
 
     if name == "Claude":
-        new_page = await start_agent_no_gemini_wait(
+        new_page, _setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://claude.ai/new",
             PROMPT_CLAUDE_DEEP_RESEARCH,
             "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
             brief_text, "2C-retry", "Claude", verbose, brief_path=brief_path)
+        if not _setup_ok:
+            return (new_page, False)
         verified = await wait_until_verified(
             verify_claude_generating, new_page, "2C-retry",
             browser=browser, cua_client=cua_client,
@@ -6751,11 +6774,13 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         return (new_page, verified)
 
     if name == "Gemini":
-        new_page = await start_agent_no_gemini_wait(
+        new_page, _setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
             "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
             brief_text, "2B-retry", "Gemini", verbose, brief_path=brief_path)
+        if not _setup_ok:
+            return (new_page, False)
         await browser.switch_to_page(new_page)
         await asyncio.sleep(2)
 
@@ -7268,8 +7293,28 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if not _controls.consume_retry_agent_hard(_agent_key):
                 continue
             _agent_name = _hard_name_map.get(_agent_key)
-            if not _agent_name or _agent_name not in pending:
+            if not _agent_name:
                 continue
+            # 2026-04-25: when an agent failed pre-pending (setup/paste
+            # failed during initial Phase 2 startup), `pending` won't have
+            # an entry for it. Seed a stub so the hard-retry codepath below
+            # can run from scratch. hard_retry_count starts at 0 since
+            # there was no prior attempt counted.
+            if _agent_name not in pending:
+                log(f"[{_agent_name}] Hard retry requested for agent that failed pre-pending — seeding pending stub", "INFO")
+                pending[_agent_name] = {
+                    "page": None,
+                    "url": "",
+                    "start_time": time.time(),
+                    "done_count": 0,
+                    "cua_confirmed": False,
+                    "last_heartbeat": time.time(),
+                    "last_cua_check": time.time(),
+                    "last_artifact_scrape": time.time(),
+                    "observer_text_len": 0,
+                    "empty_retries": 0,
+                    "hard_retry_count": 0,
+                }
             p = pending[_agent_name]
             _hard_count = int(p.get("hard_retry_count", 0)) + 1
             # Cap: 2 hard retries per agent per phase. Above the cap,
@@ -7332,6 +7377,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                          "url": "", "page": None, "elapsed_sec": 0}
                 continue
             new_page, verified_h = restart
+            # If the restart's setup/paste failed (verified_h False AND we
+            # got a non-verified page back from start_agent_no_gemini_wait
+            # ok=False), the helper already emitted pipeline_error with
+            # Retry/Skip actions. Drop the agent from pending so the user's
+            # next Retry click cleanly re-seeds via the pre-pending path
+            # above.
+            if not verified_h:
+                # verified_h could legitimately be False if generation
+                # verification didn't land within the window — that's the
+                # benign case the WARN below handles. But if start_agent
+                # itself returned ok=False, the page was set up but paste
+                # failed — `_restart_phase2_agent` would have returned
+                # (page, False) and emitted pipeline_error already. Either
+                # way, we keep `pending` populated so polling can retry,
+                # but emit a clear status.
+                pass
             _now = time.time()
             pending[_agent_name] = {
                 "page": new_page,
