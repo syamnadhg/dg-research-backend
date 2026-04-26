@@ -4328,6 +4328,66 @@ def emit_event(event_type, phase=None, agent=None, **data):
         pass
 
 
+def start_narration_ticker(phase, agent, narration, interval=30, expected_minutes=None):
+    """Spawn a background task that emits agent_progress every `interval`s
+    with `narration` + elapsed time. Returns the (stop_event, task) pair —
+    caller must call stop_event.set() and await task to clean up.
+
+    Used to keep P3/P4/P5 dropdowns alive during long CUA agent_loop calls
+    so the narration matches P2's ~30s round-robin cadence. Without this,
+    long CUA waypoints leave the FE sitting on a stale pre-call string.
+
+    Usage:
+        stop, task = start_narration_ticker(4, "youtube",
+                                            "Uploading video to YouTube Studio")
+        try:
+            await agent_loop(...)
+        finally:
+            stop.set()
+            await task
+    """
+    stop = asyncio.Event()
+
+    async def _tick():
+        elapsed = 0
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                elapsed += interval
+                try:
+                    mm, ss = divmod(elapsed, 60)
+                    label = (f"{narration}… ({mm}m {ss}s elapsed)" if mm
+                             else f"{narration}… ({ss}s elapsed)")
+                    kw = {"phase": phase, "agent": agent,
+                          "status": "working", "progress": label,
+                          "elapsedSec": elapsed}
+                    if expected_minutes:
+                        kw["expectedMinutes"] = expected_minutes
+                    emit_event("agent_progress", **kw)
+                except Exception:
+                    pass
+
+    task = asyncio.create_task(_tick())
+    return stop, task
+
+
+async def stop_narration_ticker(stop, task):
+    """Companion to start_narration_ticker — sets the stop event and awaits
+    the ticker task. Safe to call when stop/task are None (no-op)."""
+    if stop is None or task is None:
+        return
+    try:
+        stop.set()
+    except Exception:
+        pass
+    try:
+        await task
+    except Exception:
+        pass
+
+
 def fail_phase(phase, error, reason=None, agent=None, actions=None, **extra):
     """Soft-pause a phase on an unrecoverable error. Emits pipeline_error
     ONLY — never pipeline_stopped, never Firestore status=failed. The
@@ -6813,20 +6873,34 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     stall_window_start = None
                 elif (_merged_partial_len > 0 or _p1_sources > 0) and stall_window_start is None:
                     stall_window_start = time.time()
-                # Deduplicate: only emit if data actually changed
+                # Deduplicate: emit if data changed OR every 30s (elapsed_bucket).
+                # Without elapsed_bucket, P1's Extended Thinking window (5-15 min
+                # of zero text/source growth) would suppress every emit for the
+                # whole window, leaving the FE stuck on "Opening ChatGPT…". The
+                # 30s tick guarantees the dropdown narration stays alive — same
+                # pattern P2's round-robin polling uses.
+                elapsed_sec = int(time.time() - wait_start)
                 progress_key = json.dumps({
                     "status": progress.get("status", ""),
                     "sources": progress.get("sources", 0),
                     "partialTextLen": _merged_partial_len,
                     "sections_len": len(progress.get("sections", [])),
+                    "steps_len": len(progress.get("steps", []) or []),
                     # Coarse-bucket the observer length so small bumps don't spam Firestore
                     "obs_bucket": _merged_partial_len // 200,
+                    # 30s tick keeps narration live during long ET windows
+                    "elapsed_bucket": elapsed_sec // 30,
                 }, sort_keys=True)
                 if _last_progress.get(label) != progress_key:
                     _last_progress[label] = progress_key
-                    elapsed_sec = int(time.time() - wait_start)
                     expected_min = get_expected_minutes(phase)
-                    is_et = (progress.get("status") == "generating"
+                    # Loosen ET gate: P1 brief mode (Pro + Extended Thinking, NOT
+                    # Deep Research) returns status="idle" pre-stream because
+                    # scrape_progress_chatgpt has no DR signals + zero tokens.
+                    # We're inside poll_until_done so by definition the agent
+                    # IS working — show "Extended Thinking active" rather than
+                    # the stale pre-poll string ("Opening ChatGPT…").
+                    is_et = (progress.get("status") in ("generating", "idle")
                              and progress.get("sources", 0) == 0
                              and _merged_partial_len < 500)
                     if is_et:
@@ -11188,14 +11262,21 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                            progress=f"Uploading source {i+1}/{len(md_files)}: {md_path.name}")
                 browser.set_upload_file(str(md_path))
 
-                if i == 0:
-                    await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
-                        "Create a new notebook and upload the first file. File dialog is auto-handled.",
-                        model=CUA_MODEL, max_iterations=15, verbose=verbose)
-                else:
-                    await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
-                        f"Add another source (file {i+1}). Click 'Add source' or '+'. File dialog is auto-handled.",
-                        model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                _stop, _task = start_narration_ticker(
+                    3, "notebooklm",
+                    f"NotebookLM uploading source {i+1}/{len(md_files)}: {md_path.name}",
+                    interval=20)
+                try:
+                    if i == 0:
+                        await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
+                            "Create a new notebook and upload the first file. File dialog is auto-handled.",
+                            model=CUA_MODEL, max_iterations=15, verbose=verbose)
+                    else:
+                        await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
+                            f"Add another source (file {i+1}). Click 'Add source' or '+'. File dialog is auto-handled.",
+                            model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                finally:
+                    await stop_narration_ticker(_stop, _task)
 
                 browser.clear_upload_file()
                 await asyncio.sleep(3)
@@ -11366,9 +11447,16 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             log("Audio already generating — skipping Generate click")
         else:
             log("Starting audio generation (Long + Deep dive)...")
-            await agent_loop(cua_client, browser, PROMPT_AUDIO_GENERATE,
-                "Generate ONE audio overview. Select all sources, set Long + Deep dive, click Generate ONCE. Say 'generating' when started.",
-                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+            _stop, _task = start_narration_ticker(
+                4, "notebooklm",
+                "Configuring audio overview (Long + Deep dive) and clicking Generate",
+                interval=20)
+            try:
+                await agent_loop(cua_client, browser, PROMPT_AUDIO_GENERATE,
+                    "Generate ONE audio overview. Select all sources, set Long + Deep dive, click Generate ONCE. Say 'generating' when started.",
+                    model=CUA_MODEL, max_iterations=15, verbose=verbose)
+            finally:
+                await stop_narration_ticker(_stop, _task)
 
         # Verify it started
         verified = await wait_until_verified(
@@ -11431,6 +11519,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
             log(f"[Phase4] Audio still generating... ({elapsed_min}m total)")
             save_track("Phase4", {"status": "generating", "elapsed_min": elapsed_min})
+            # Live narration tick — without this the FE dropdown sits on the
+            # last pre-poll string ("Setting notebook to…") for the full 45-min
+            # audio window. Match the P2 round-robin cadence.
+            try:
+                emit_event("agent_progress", phase=4, agent="notebooklm",
+                           status="generating",
+                           progress=f"NotebookLM still generating audio overview… "
+                                    f"({elapsed_min}m total / ~15m typical)",
+                           elapsedSec=elapsed_min * 60,
+                           expectedMinutes=15)
+            except Exception:
+                pass
             interrupt = await _controls.interruptible_sleep(90, check_interval=10)
             if interrupt == "stop":
                 log("[Phase4] STOP during poll wait — aborting")
@@ -11511,8 +11611,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
         browser.page.on("download", _on_download)
 
-        await agent_loop(cua_client, browser, PROMPT_AUDIO_DOWNLOAD,
-            "Download the audio file.", model=CUA_MODEL, max_iterations=8, verbose=verbose)
+        emit_event("agent_progress", phase=4, agent="notebooklm",
+                   status="downloading",
+                   progress="Downloading audio file from NotebookLM…")
+        _stop_d, _task_d = start_narration_ticker(
+            4, "notebooklm",
+            "Downloading audio overview .m4a from NotebookLM",
+            interval=20)
+        try:
+            await agent_loop(cua_client, browser, PROMPT_AUDIO_DOWNLOAD,
+                "Download the audio file.", model=CUA_MODEL, max_iterations=8, verbose=verbose)
+        finally:
+            await stop_narration_ticker(_stop_d, _task_d)
 
         # Wait up to 30s for download event
         try:
@@ -11881,10 +11991,17 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     emit_event("agent_progress", phase=4, agent="youtube",
                status="uploading",
                progress=f"Uploading video '{title}' to YouTube (unlisted)…")
-    result = await agent_loop(cua_client, browser, PROMPT_YOUTUBE_UPLOAD,
-        f'Upload video. Title: "{title}"\nDescription:\n{description}\n\n'
-        f'All file dialogs are auto-handled (video first, then thumbnail).',
-        model=CUA_MODEL, max_iterations=35, verbose=verbose)
+    _stop, _task = start_narration_ticker(
+        4, "youtube",
+        f"Uploading '{title}' to YouTube Studio (unlisted)",
+        interval=20, expected_minutes=8)
+    try:
+        result = await agent_loop(cua_client, browser, PROMPT_YOUTUBE_UPLOAD,
+            f'Upload video. Title: "{title}"\nDescription:\n{description}\n\n'
+            f'All file dialogs are auto-handled (video first, then thumbnail).',
+            model=CUA_MODEL, max_iterations=35, verbose=verbose)
+    finally:
+        await stop_narration_ticker(_stop, _task)
 
     browser.clear_upload_file()
 
@@ -11896,10 +12013,20 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     if "uploaded:" not in _upload_text and "https://youtu.be/" not in _upload_text:
         try:
             log("[YouTube] Primary upload didn't confirm 'uploaded:' — running blocker recovery")
-            recovery = await agent_loop(cua_client, browser, PROMPT_RECOVER_YOUTUBE_BLOCKER,
-                f'The prior upload attempt for "{title}" did not confirm success. '
-                f'Diagnose what is blocking, recover if possible, or declare blocked.',
-                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+            emit_event("agent_progress", phase=4, agent="youtube",
+                       status="recovering",
+                       progress="YouTube upload didn't confirm — running blocker recovery…")
+            _stop_r, _task_r = start_narration_ticker(
+                4, "youtube",
+                "Diagnosing & recovering from YouTube upload blocker",
+                interval=20)
+            try:
+                recovery = await agent_loop(cua_client, browser, PROMPT_RECOVER_YOUTUBE_BLOCKER,
+                    f'The prior upload attempt for "{title}" did not confirm success. '
+                    f'Diagnose what is blocking, recover if possible, or declare blocked.',
+                    model=CUA_MODEL, max_iterations=15, verbose=verbose)
+            finally:
+                await stop_narration_ticker(_stop_r, _task_r)
             _rec_text = (recovery.get("text") or "") if isinstance(recovery, dict) else ""
             if "uploaded:" in _rec_text.lower() or "https://youtu.be/" in _rec_text.lower():
                 log("[YouTube] Blocker recovery succeeded — upload completed")
@@ -12173,9 +12300,16 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         emit_event("agent_progress", phase=5, agent="gdocs",
                    status="writing",
                    progress=f"Writing research hub ({len(doc_content)} chars, {len(doc_lines)} lines)…")
-        await agent_loop(cua_client, browser, PROMPT_CREATE_DOC,
-            f"Type this content into the doc, then share with 'Anyone with link' as Editor:\n\n{doc_content}",
-            model=CUA_MODEL, max_iterations=20, verbose=verbose)
+        _stop, _task = start_narration_ticker(
+            5, "gdocs",
+            f"Writing & sharing Google Doc hub ({len(doc_lines)} lines)",
+            interval=20, expected_minutes=4)
+        try:
+            await agent_loop(cua_client, browser, PROMPT_CREATE_DOC,
+                f"Type this content into the doc, then share with 'Anyone with link' as Editor:\n\n{doc_content}",
+                model=CUA_MODEL, max_iterations=20, verbose=verbose)
+        finally:
+            await stop_narration_ticker(_stop, _task)
         await asyncio.sleep(2)
 
         # C5: DOM safety net — ensure the doc is public even if CUA missed the share step
@@ -12238,9 +12372,16 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
                 body_parts.append(f"YouTube: {youtube_url}")
             body = "\n".join(body_parts) + "\n"
 
-            await agent_loop(cua_client, browser, PROMPT_SEND_EMAIL,
-                f"Send email to: {email}\nSubject: {subject}\nBody:\n{body}",
-                model=CUA_MODEL, max_iterations=12, verbose=verbose)
+            _stop, _task = start_narration_ticker(
+                5, "gmail",
+                f"Composing & sending notification email to {email}",
+                interval=20)
+            try:
+                await agent_loop(cua_client, browser, PROMPT_SEND_EMAIL,
+                    f"Send email to: {email}\nSubject: {subject}\nBody:\n{body}",
+                    model=CUA_MODEL, max_iterations=12, verbose=verbose)
+            finally:
+                await stop_narration_ticker(_stop, _task)
 
             email_sent = True
             log("Email sent ✓")
