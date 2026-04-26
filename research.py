@@ -1118,7 +1118,7 @@ def save_audio_to_firestore(audio_id: str, name: str, duration_sec: int, audio_u
         log(f"Failed to sync audio to Firestore: {e}", "WARN")
 
 
-def save_document_to_firestore(doc_type: str, content: str, name: str | None = None):
+def save_document_to_firestore(doc_type: str, content: str, name: str | None = None) -> bool:
     """Upsert a research document (brief/chatgpt/gemini/claude/consolidated)
     into the user's Firestore documents subcollection so the Documents page
     on Vercel can render it without direct access to this local backend.
@@ -1128,11 +1128,16 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
     Upsert semantics: doc_type is used as the Firestore doc ID, so re-runs
     or re-extractions for the same research overwrite in place instead of
     creating duplicates.
+
+    Returns True iff the Firestore write committed; False otherwise (no
+    Firestore client, blank content, or API error). Callers gate the
+    `link_extracted` emit on this so an unsynced doc never gets a "Read
+    report" button that would open an empty modal.
     """
     if not _firebase_db or not _fb_uid or not _fb_research_id:
-        return
+        return False
     if not content or not content.strip():
-        return
+        return False
     try:
         _firebase_db.collection("users").document(_fb_uid) \
             .collection("researches").document(_fb_research_id) \
@@ -1145,8 +1150,10 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
                 "size": f"{len(content) / 1024:.0f} KB",
                 "createdAt": int(time.time() * 1000),
             })
+        return True
     except Exception as e:
         log(f"Failed to sync {doc_type}.md to Firestore: {e}", "WARN")
+        return False
 
 
 def start_firestore_start_listener(job_queue, loop):
@@ -1602,12 +1609,14 @@ def _start_command_listener(uid, research_id, loop):
                         except Exception: pass
             elif action == "add_context":
                 text = data.get("text", "")
-                # Only Phase 1 + Phase 2 accept add_context. Post-P2, input is
-                # a no-op so downstream artifacts (NotebookLM / YouTube / Doc)
-                # aren't disrupted mid-flight. Frontend disables the input
-                # field during P3+; this is the belt-and-suspenders guard.
-                if _runtime.phase >= 3:
-                    log(f"Command received: ADD_CONTEXT IGNORED (phase={_runtime.phase} — post-P2 input disabled)", "WARN")
+                # Only Phase 1 (brief generation) accepts add_context. Phase 2
+                # agents are deep-research tools (ChatGPT Pro, Gemini Deep
+                # Research, Claude with tools) that can't ingest mid-stream
+                # input — and Phase 3+ artifacts (NotebookLM / YouTube / Doc)
+                # don't take input either. Frontend locks the chat input from
+                # Phase 2 onward; this listener is the belt-and-suspenders.
+                if _runtime.phase >= 2:
+                    log(f"Command received: ADD_CONTEXT IGNORED (phase={_runtime.phase} — input disabled from Phase 2 onward)", "WARN")
                 elif text:
                     loop.call_soon_threadsafe(_controls.add_context, text)
                     log(f"Command received: ADD_CONTEXT ({len(text)} chars)")
@@ -6857,8 +6866,15 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             text = ""
     n_chars = len(text)
 
-    # Step 2b — Save MD to disk + Firestore mirror (only if content is real)
+    # Step 2b — Save MD to disk (Phase 3 input) + Firestore mirror (FE doc).
+    # md_saved tracks the FIRESTORE write because that's what gates the FE's
+    # `docReachable` accordion check. A successful local-only save is not
+    # enough — without the subcollection write, the FE accordion would sit
+    # in `isAgentSyncing` until the run ends. Retry once (transient quota /
+    # network blips) before accepting the failure.
+    local_saved = False
     md_saved = False
+    md_content = ""
     if text and queue_dir:
         try:
             documents_dir = queue_dir / "documents"
@@ -6866,15 +6882,21 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             fname = agent_key + ".md"
             md_content = f"# {name} Deep Research\n\n{text}"
             (documents_dir / fname).write_text(md_content, encoding="utf-8")
-            try:
-                save_document_to_firestore(agent_key, md_content, f"{name} Deep Research")
-                md_saved = True
-            except Exception as _fs_e:
-                log(f"[{name}] Firestore document sync failed: {_fs_e}", "WARN")
-                md_saved = True  # local file is enough for FE-on-device fallback
+            local_saved = True
             log(f"[{name}] Saved {n_chars} chars to documents/{fname}")
         except Exception as e:
-            log(f"[{name}] MD save failed: {e}", "WARN")
+            log(f"[{name}] Local MD save failed: {e}", "WARN")
+        if local_saved:
+            for _attempt in range(2):
+                if save_document_to_firestore(agent_key, md_content, f"{name} Deep Research"):
+                    md_saved = True
+                    break
+                if _attempt == 0:
+                    log(f"[{name}] Firestore document sync attempt 1 failed — retrying in 2s", "WARN")
+                    await asyncio.sleep(2.0)
+                else:
+                    log(f"[{name}] Firestore document sync FAILED after retry — agent will be marked failed "
+                        f"(FE doc-reachable gate would never flip without the subcollection write).", "ERROR")
 
     # Conversation URL — captured NOW because the page may navigate during the
     # parallel share-link worker (Gemini's Share & Export modal can redirect).
@@ -6896,7 +6918,7 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
     _in_app_url = (f"/documents?open={_fb_research_id}:{agent_key}"
                    if has_anchor else "/documents")
     _in_app_label = f"Read {name} report"
-    if n_chars > 0 and has_anchor:
+    if n_chars > 0 and has_anchor and md_saved:
         try:
             emit_event("link_extracted", phase=2, agent=agent_key,
                        url=_in_app_url, label=_in_app_label,
@@ -6914,9 +6936,11 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         except Exception:
             pass
     else:
-        # No content extracted OR no anchor — emit failed (FE keeps spinner,
-        # never flips ✓ without a reachable doc).
-        _why = ("0 chars" if n_chars <= 0 else "no research anchor (_fb_research_id missing)")
+        # No content extracted OR no anchor OR Firestore write failed — emit
+        # failed (FE keeps spinner, never flips ✓ without a reachable doc).
+        _why = ("0 chars" if n_chars <= 0
+                else "no research anchor (_fb_research_id missing)" if not has_anchor
+                else "Firestore document sync failed after retry — FE doc-reachable would never flip")
         try:
             emit_event("agent_progress", phase=2, agent=agent_key,
                        status="failed",
@@ -11824,12 +11848,29 @@ def detect_resume_phase(queue_dir):
     # Phase 2 done but no audio → resume from Phase 3: check if links/notebook exist
     if (queue_dir / "links.json").exists():
         return 3, "Links exist — resuming from Phase 3 (NotebookLM)"
-    # Phase 2 done → resume from Phase 3: check if research MDs exist
+    # Phase 2 done → resume from Phase 3 ONLY if the Phase-2 completion
+    # marker is present. The marker is written after the round-robin poller
+    # returned (i.e. all agents reached a terminal state). Without the
+    # marker, "any non-brief MD >100 bytes" was too coarse — a backend crash
+    # mid-P2 with only one agent's MD on disk would falsely jump to Phase 3,
+    # silently skipping the agents that hadn't finished yet.
+    marker = queue_dir / "phase2_complete.marker"
+    if marker.exists():
+        return 3, "Phase 2 complete marker present — resuming from Phase 3"
+    # No marker but some MDs on disk → P2 was interrupted. Restart Phase 2
+    # so the unfinished agents complete. NOTE: re-running P2 re-extracts
+    # ALL enabled agents from scratch (`run_phase2` doesn't currently scan
+    # disk to skip already-finished agents). Existing MDs are overwritten
+    # via the Firestore upsert in `save_document_to_firestore`. Wasteful
+    # on time but safe — the only correctness cost is a few extra minutes
+    # of agent work; data-wise the new MDs are at least as good as the
+    # old. An idempotency guard ("if documents/{agent}.md exists, skip
+    # launching") would be a real refactor, not landed here.
     research_dir = queue_dir / "documents"
-    has_research = research_dir.exists() and any(
+    has_partial_research = research_dir.exists() and any(
         f for f in research_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief")
-    if has_research:
-        return 3, "Research MDs exist — Phase 2 done, resuming from Phase 3"
+    if has_partial_research:
+        return 2, "Phase 2 partial MDs present without completion marker — re-running Phase 2 (all agents)"
     # Phase 1 done → resume from Phase 2: check if brief exists
     brief = queue_dir / "documents" / "brief.md"
     if not brief.exists():
@@ -12904,6 +12945,35 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — "
                         f"{len(_p2_links)} in-app primary links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
+            # Phase-2 completion marker for resume safety. The marker tells
+            # detect_resume_phase that Phase 2 actually finished — without
+            # it, the previous "any non-brief MD >100 bytes → Phase 3" rule
+            # would falsely jump to Phase 3 after a crash that killed 2/3
+            # agents mid-research with only one MD on disk.
+            #
+            # CRITICAL: only write the marker on a CLEAN P2 finish — every
+            # attempted agent reached a terminal state AND the user didn't
+            # request stop/pause. Stop/pause flow through this same code
+            # path (poll_all_agents_round_robin returns whatever it had),
+            # and writing the marker there would silently drop unfinished
+            # agents on resume. A legit "failed" status counts as terminal
+            # (resume won't re-run an agent that already failed cleanly).
+            _p2_clean_finish = (not _controls.is_stop_or_pause())
+            if _p2_clean_finish:
+                try:
+                    (queue_dir / "phase2_complete.marker").write_text(
+                        json.dumps({
+                            "completedAt": int(time.time() * 1000),
+                            "doneCount": done_count,
+                            "totalAgents": len(results),
+                            "skippedAgents": list(_p2_skipped_agents),
+                        }),
+                        encoding="utf-8",
+                    )
+                except Exception as _mk_e:
+                    log(f"[Phase 2] failed to write phase2_complete.marker: {_mk_e}", "WARN")
+            else:
+                log("[Phase 2] stop/pause detected — skipping phase2_complete.marker so resume re-runs P2", "INFO")
         else:
             log("Phase 2: Loading existing research files")
 
@@ -13753,6 +13823,7 @@ async def run_server(port=8000):
     @app.post("/api/runs/{run_id}/add_context")
     async def add_context(run_id: str, request_data: dict):
         """Add context to running pipeline WITHOUT pausing. Context is injected at next opportunity.
+        Only valid during Phase 1; Phase 2+ rejects (matches FE input lock + Firestore listener).
         Body: {text: "Also look at biotech angle"}"""
         queue = queues_root / run_id
         if not queue.exists():
@@ -13760,6 +13831,9 @@ async def run_server(port=8000):
         text = request_data.get("text", "")
         if not text:
             return JSONResponse({"error": "text is required"}, 400)
+        if _runtime.phase >= 2:
+            log(f"REST add_context REJECTED (phase={_runtime.phase} — input disabled from Phase 2 onward)", "WARN")
+            return JSONResponse({"error": f"context rejected — phase {_runtime.phase} does not accept input"}, 409)
         _controls.add_context(text)
         log(f"Context added ({len(text)} chars) — will be injected at next phase boundary")
         return {"status": "context_added", "chars": len(text)}
