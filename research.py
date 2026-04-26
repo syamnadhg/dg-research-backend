@@ -2274,6 +2274,12 @@ class PipelineRuntime:
         # extra_context. Caller coroutines check this and bail out early so the
         # orchestrator can re-run the phase with the combined input.
         self.restart_requested = False
+        # 2026-04-26: Claude artifact panel kept-open flag (commit d45807f).
+        # Polling sets True after first artifact open; extract_claude_response
+        # reads via getattr to decide whether to close-first before clicking the
+        # final artifact. Initialized here so reset() always lands at False
+        # (otherwise an attribute set externally would leak across runs).
+        self.claude_artifact_panel_open = False
 
     def reset(self):
         self.__init__()
@@ -5285,6 +5291,11 @@ async def detect_completion_chatgpt(page):
             // phase completes. With Stop button gone + this badge present,
             // we're as confident as we can be that DR is fully settled.
             const thoughtFor = /thought for\\s+\\d/i.test(bl);
+            // 2026-04-26 backup: same modern marker Claude uses. Covers the case
+            // where ChatGPT renames the badge or runs a non-thinking-mode DR
+            // variant where "Thought for X" never appears. Either signal counts.
+            const researchDone = /research\\s+complete(?:d)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?/i.test(bl);
+            const doneMarker = thoughtFor || researchDone;
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
             const hostLen = msgs.length ? msgs[msgs.length-1].innerText.length : 0;
             // Sources count: external citation links anywhere on the page
@@ -5293,7 +5304,7 @@ async def detect_completion_chatgpt(page):
             const steps = document.querySelectorAll(
                 '[class*="research"] li, [class*="step"], [class*="task"]'
             ).length;
-            return { hasStop, thoughtFor, hostLen, sources, steps };
+            return { hasStop, thoughtFor, researchDone, doneMarker, hostLen, sources, steps };
         }""")
 
         iframe_stop = False
@@ -5321,17 +5332,19 @@ async def detect_completion_chatgpt(page):
                             }
                             const bl = (document.body?.innerText || '');
                             const thoughtFor = /thought for\\s+\\d/i.test(bl);
+                            const researchDone = /research\\s+complete(?:d)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?/i.test(bl);
+                            const doneMarker = thoughtFor || researchDone;
                             const sources = document.querySelectorAll(
                                 'a[href^="http"][target="_blank"]'
                             ).length;
                             const steps = document.querySelectorAll(
                                 '[class*="research"] li, [class*="step"], [class*="task"]'
                             ).length;
-                            return { hasStop, thoughtFor, len: bl.length, sources, steps };
+                            return { hasStop, thoughtFor, researchDone, doneMarker, len: bl.length, sources, steps };
                         }""")
                         if data:
                             iframe_stop = bool(data.get("hasStop"))
-                            iframe_thought = bool(data.get("thoughtFor"))
+                            iframe_thought = bool(data.get("doneMarker"))
                             iframe_len = int(data.get("len") or 0)
                             iframe_sources = int(data.get("sources") or 0)
                             iframe_steps = int(data.get("steps") or 0)
@@ -5342,7 +5355,12 @@ async def detect_completion_chatgpt(page):
             pass
 
         has_stop = host["hasStop"] or iframe_stop
-        has_thought_for = bool(host.get("thoughtFor")) or iframe_thought
+        # done_marker = ("Thought for X seconds" badge OR "Research complete · N sources" text).
+        # Either is enough — non-thinking DR variants don't produce the badge,
+        # and renamed-badge variants don't match /thought for \d+/.
+        has_done_marker = bool(host.get("doneMarker")) or iframe_thought
+        which_marker = ("thought_for" if host.get("thoughtFor") or iframe_thought
+                        else "research_complete" if host.get("researchDone") else "")
         partial_len = max(int(host.get("hostLen") or 0), iframe_len)
         sources = max(int(host.get("sources") or 0), iframe_sources)
         steps = max(int(host.get("steps") or 0), iframe_steps)
@@ -5350,9 +5368,9 @@ async def detect_completion_chatgpt(page):
 
         if has_stop:
             return (False, f"stop_btn_present (text={partial_len}, src={sources}, st={steps})", snap)
-        if not has_thought_for:
-            return (False, f"no_done_marker (Thought-for badge missing)", snap)
-        return (True, f"no_stop + thought_for_badge", snap)
+        if not has_done_marker:
+            return (False, f"no_done_marker (Thought-for badge AND Research-complete text both missing)", snap)
+        return (True, f"no_stop + done_marker={which_marker}", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
 
@@ -7078,11 +7096,27 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
     text = ""
     if extract_fn:
         try:
+            # Claude: poll-loop kept artifact-1 panel open via scrape_claude_artifact_tracking
+            # (commit d45807f). Pass that signal so the extractor closes-1 before clicking
+            # the LAST card (which opens artifact-2, the final report). Without this hand-off,
+            # the LAST-card click can no-op (artifact_count==1) or race the panel swap.
+            extra_kw = {}
+            if name == "Claude":
+                extra_kw["artifact_panel_open"] = bool(getattr(_runtime, "claude_artifact_panel_open", False))
             text = await extract_fn(page, browser=browser, cua_client=cua_client,
-                                     label=name, verbose=verbose) or ""
+                                     label=name, verbose=verbose, **extra_kw) or ""
         except Exception as e:
             log(f"[{name}] Content extraction error: {e}", "WARN")
             text = ""
+        # Panel state mutated: extract_claude_response (when it ran) opened artifact-2,
+        # so the polling-loop's "panel 1 is open" signal is no longer accurate. Clear
+        # it so a subsequent retry/poke doesn't make scrape_claude_artifact_tracking
+        # skip the click (already_open=True) and read artifact-2 into the running tracker.
+        if name == "Claude":
+            try:
+                _runtime.claude_artifact_panel_open = False
+            except Exception:
+                pass
     n_chars = len(text)
 
     # Step 2b — Save MD to disk (Phase 3 input) + Firestore mirror (FE doc).
@@ -7841,6 +7875,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         if not p.get("artifact_panel_open"):
                             log(f"[Claude] artifact panel opened (first time) at elapsed={int(elapsed)}s")
                         p["artifact_panel_open"] = True
+                        # Mirror onto runtime singleton so extract_and_record_agent
+                        # (which has no `p` handle) can close-1 before clicking the
+                        # final artifact card. See extract_claude_response signature.
+                        try:
+                            _runtime.claude_artifact_panel_open = True
+                        except Exception:
+                            pass
                         if artifact_data.get("source_urls"):
                             for key in ("source_urls", "steps", "sections", "tool_uses"):
                                 if artifact_data.get(key):
@@ -8673,7 +8714,8 @@ async def _try_copy_button(page, browser, cua_client, label, verbose=False):
 
 
 async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
-    """Extract ChatGPT response — CUA artifact copy (primary) → JS fallback.
+    """Extract ChatGPT response — CUA artifact copy (primary) → Playwright ENLARGE
+    + DOM scrape (fallback) → JS innerText (last resort).
     ChatGPT Deep Research outputs a document/artifact card, not regular chat text."""
     # Clear clipboard first so stale brief text doesn't get returned
     try:
@@ -8684,6 +8726,58 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
+
+    # ── Step 0 (NEW, 2026-04-26): EXPLICIT artifact-open via Playwright ──
+    # Post-completion the DR artifact card is rendered but the FULL canvas/document
+    # only mounts AFTER the user clicks ENLARGE/Open. Doing this BEFORE CUA means:
+    #   (a) CUA's job becomes "just copy the open canvas" — much more reliable.
+    #   (b) DOM/JS fallbacks (Method 3/4) below now have actual canvas content
+    #       to scrape instead of the chat preamble.
+    # Tries every selector variant we've seen + a text-content fallback that's
+    # scoped to artifact/canvas/research ancestors so we don't accidentally click
+    # an unrelated "Open Sidebar" button.
+    try:
+        opened = await page.evaluate("""() => {
+            const selectors = [
+                'button[aria-label*="Open the artifact" i]',
+                'button[aria-label*="Open canvas" i]',
+                'button[aria-label*="Enlarge" i]',
+                'button[aria-label*="Expand" i]',
+                'button[aria-label*="View artifact" i]',
+                'button[data-testid*="artifact"]',
+                'button[data-testid*="canvas"]',
+                'a[href*="/canvas/"]',
+                '[role="button"][aria-label*="Open" i]'
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+                    el.click();
+                    return { clicked: true, selector: sel };
+                }
+            }
+            // Text-content fallback — scoped to artifact/canvas/research ancestors only
+            for (const b of document.querySelectorAll('button, [role="button"]')) {
+                const t = (b.textContent || '').trim().toLowerCase();
+                if (t !== 'open' && t !== 'view' && t !== 'enlarge' && t !== 'expand') continue;
+                const inArtifact = b.closest(
+                    '[class*="artifact"], [class*="canvas"], [class*="research"], article'
+                );
+                if (inArtifact) {
+                    b.click(); return { clicked: true, selector: 'text:'+t+'+scoped' };
+                }
+            }
+            return { clicked: false };
+        }""")
+        if opened and opened.get("clicked"):
+            log(f"[{label}] Post-completion: opened document artifact via Playwright "
+                f"({opened.get('selector')}) — canvas mounting…")
+            await asyncio.sleep(2.0)
+        else:
+            log(f"[{label}] Post-completion: no Playwright-clickable artifact-open button found "
+                f"(CUA will try via PROMPT_COPY_ARTIFACT_CHATGPT)", "DEBUG")
+    except Exception as _oe:
+        log(f"[{label}] Post-completion artifact-open skipped: {_oe}", "DEBUG")
 
     # Method 1 (PRIMARY): CUA opens the artifact/document and copies it
     if browser and cua_client:
@@ -8699,28 +8793,36 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
             return clipboard
         log(f"[{label}] CUA copy got {len(clipboard or '')} chars — trying fallbacks", "WARN")
 
-    # Method 2: HTML→MD from any large content block
+    # Method 2: HTML→MD from the now-opened canvas / artifact content block.
+    # 2000-char gate (was 500): a 500-char preamble could pass; 2000 ensures we
+    # have an actual report, not just the chat acknowledgement preamble.
     md = await _extract_html_to_md(page, [
         '.canvas-content', '.artifact-content', '[data-testid="canvas-content"]',
+        '[role="dialog"] .markdown', '[role="dialog"] .prose',
         '[data-message-author-role="assistant"]:last-of-type .markdown',
     ], label)
-    if md and len(md) > 500:
+    if md and len(md) > 2000:
+        log(f"[{label}] Extracted via HTML→MD (canvas/artifact): {len(md)} chars")
         return md
 
-    # Method 3: JS — last assistant message (regular chat mode, not Deep Research)
+    # Method 3: JS — last assistant message (regular chat mode, not Deep Research).
+    # 2000-char gate same rationale as Method 2.
     try:
         text = await page.evaluate("""() => {
+            // Prefer dialog-scoped content (open canvas) over chat preamble.
+            const dlg = document.querySelector('[role="dialog"] .markdown, [role="dialog"] .prose');
+            if (dlg && dlg.innerText && dlg.innerText.length > 2000) return dlg.innerText;
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
             if (msgs.length > 0) return msgs[msgs.length - 1].innerText;
             return '';
         }""")
-        if text and len(text) > 200:
-            log(f"[{label}] Extracted via JS: {len(text)} chars")
+        if text and len(text) > 2000:
+            log(f"[{label}] Extracted via JS innerText: {len(text)} chars")
             return text
     except Exception:
         pass
 
-    log(f"[{label}] All extraction methods failed", "WARN")
+    log(f"[{label}] All extraction methods failed (canvas may not have opened)", "WARN")
     return ""
 
 
@@ -8779,10 +8881,19 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     return clip
 
 
-async def extract_claude_response(page, browser=None, cua_client=None, label="Claude", verbose=False):
+async def extract_claude_response(page, browser=None, cua_client=None, label="Claude", verbose=False,
+                                   artifact_panel_open=False):
     """Extract Claude response — artifact-aware extraction.
-    Claude Deep Research produces 2 artifacts: first = intermediate tracking, second = final report.
-    Targets the LAST artifact for extraction, with multiple fallback methods."""
+    Claude Deep Research produces 2 artifacts: first = intermediate tracking
+    (kept open during polling for live source streaming), second = final report.
+    Targets the LAST artifact for extraction, with multiple fallback methods.
+
+    artifact_panel_open: poll-loop signal that artifact 1's panel is currently
+    open (commit d45807f keeps it open across polls via keep_open=True). When
+    True we explicitly CLOSE artifact-1 first so the subsequent LAST-card click
+    definitely opens a fresh panel onto artifact-2 (final report) — without
+    this, relying on a panel-swap can race or no-op (artifact_count==1 case)
+    and silently extract artifact-1's references instead of the final report."""
     # Clear clipboard first so stale brief text doesn't get returned
     try:
         subprocess.run(["powershell.exe", "-NoProfile", "-Command", "Set-Clipboard ''"],
@@ -8793,13 +8904,31 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
-    # Step 1: Count artifacts and target the LAST one
-    artifact_count = await _count_claude_artifacts(page)
-    log(f"[{label}] Found {artifact_count} artifact(s)")
+    # ── Step 0: Close artifact 1 (kept open by polling) ──
+    # Commit d45807f leaves artifact-1's panel open across polls for live source
+    # streaming. We MUST close it now so the LAST-card click below opens a fresh
+    # panel onto artifact-2 (final report) — without this, the click can no-op
+    # (artifact_count==1 case) or race the panel swap and silently grab artifact-1.
+    if artifact_panel_open:
+        log(f"[{label}] Closing artifact-1 panel (kept open by polling) before final extract")
+        try:
+            await _close_claude_artifact_panel(page)
+            await asyncio.sleep(0.6)
+        except Exception as _ce:
+            log(f"[{label}] artifact-1 close before extract failed (continuing): {_ce}", "DEBUG")
 
-    # Method 1 (PRIMARY): DOM-click the last artifact + read panel content
+    # ── Step 1: Count artifacts so we know which index = final report ──
+    artifact_count = await _count_claude_artifacts(page)
+    log(f"[{label}] Post-completion: found {artifact_count} artifact(s)")
+
+    # ── Step 2 — EXPLICITLY open the LAST artifact card (= final report) ──
+    # Method 1 (PRIMARY): DOM-click the LAST artifact card + read panel content.
+    # The "LAST" artifact is the final research report. For 2-artifact runs this
+    # is artifact-2 (after Step 0's close-1, panel is now closed → click opens
+    # fresh onto artifact-2). For 1-artifact runs this is just the one artifact.
     if artifact_count > 0:
-        target_idx = max(0, artifact_count - 1)  # Last artifact
+        target_idx = max(0, artifact_count - 1)  # Last artifact = final report
+        log(f"[{label}] Post-completion: opening artifact[{target_idx}] (final report)")
         clicked = await _click_claude_artifact(page, index=target_idx)
         if clicked:
             await asyncio.sleep(2)  # Wait for panel render
