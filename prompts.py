@@ -8,14 +8,21 @@ Imported by research.py — edit prompts here, logic stays in research.py.
 SYSTEM_BASE = (
     "You are an expert browser automation agent. You control a browser via mouse clicks, "
     "keyboard input, and screenshots. Be precise with clicks. Always verify actions with "
-    "screenshots. Work efficiently — don't repeat failed actions, try alternatives."
+    "screenshots. Work efficiently — don't repeat failed actions, try alternatives.\n\n"
+    "POST-ACTION VERIFY: After every click/type, take a screenshot and confirm the screen "
+    "changed as expected. If the screen state did NOT change, do NOT repeat the same action — "
+    "describe what you see and try a different approach.\n\n"
+    "BLOCKED-GATE STOP: If you see a CAPTCHA, login wall, 2FA prompt, quota notice, "
+    "'Try again later' banner, or any other human-verification gate, IMMEDIATELY say "
+    "'blocked: <describe what you see>' and STOP. Do NOT attempt to solve it; the orchestrator "
+    "handles human escalation."
 )
 
 # ── Phase 1: ChatGPT Brief Generation ─────────────────────────────────────────
 
 PROMPT_SELECT_PRO = SYSTEM_BASE + """
 
-Task: Select ChatGPT Pro (or "o1 pro") in the model selector. If an Extended Thinking toggle is visible, enable it. Do NOT type a message. When Pro is confirmed selected, say "Pro mode selected"."""
+Task: Select ChatGPT Pro (or "GPT-5 Pro" / "Pro mode") in the model selector. If an Extended Thinking toggle is visible, enable it. Do NOT type a message. When Pro is confirmed selected, say "Pro mode selected"."""
 
 PROMPT_SUBMIT_FALLBACK = SYSTEM_BASE + """
 
@@ -48,7 +55,7 @@ Your task: Enable Deep Research mode in ChatGPT. Nothing else.
 
 Steps:
 1. Look at the ChatGPT page.
-2. Find "Deep research" — in the "+" menu, sidebar, or model selector.
+2. Find "Deep research" — try in this order: (a) the tools dropdown in the composer (newer UI, look for a Tools / wrench / sliders icon next to the input), (b) the "+" menu next to the input area, (c) the sidebar, (d) the model selector.
 3. Click to activate Deep Research mode.
 4. Click the message input area to focus it.
 5. Say "ready for paste" and STOP.
@@ -227,7 +234,9 @@ CONCLUSION: DONE
 CONCLUSION: NEEDS_CLICK
 CONCLUSION: ERROR
 
-No quotes, no trailing punctuation. This line is parsed programmatically."""
+No quotes, no trailing punctuation. This line is parsed programmatically.
+
+Also include a plain-English line such as 'still generating' or 'response complete' BEFORE the CONCLUSION line — legacy callers (research.py:6509, 6848) parse for those substrings rather than the CONCLUSION marker."""
 
 PROMPT_FIX_ISSUE = SYSTEM_BASE + """
 
@@ -325,27 +334,30 @@ Your task: Make this ChatGPT conversation shareable via link.
 Steps:
 1. Look for a "Share" button (usually top-right of the conversation).
 2. Click it.
-3. If there's an option to make it accessible to "Anyone with the link", enable it.
-4. Click "Create link" or "Copy link".
-5. The link should now be in your clipboard or visible on screen.
-6. Say "shared" with the URL if you can see it."""
+3. If the share dialog has a visibility selector (e.g. "Only people in this conversation" / "Anyone with the link" / "Unlisted"), pick the most public option (typically "Anyone with the link") BEFORE generating.
+4. If there's a separate "Make accessible to anyone with the link" toggle, enable it.
+5. Click "Create link" or "Copy link".
+6. The link should now be in your clipboard or visible on screen.
+7. Say "shared" with the URL if you can see it (must contain chatgpt.com/share/)."""
 
 PROMPT_SHARE_GEMINI = SYSTEM_BASE + """
 
 Your task: Make this Gemini conversation shareable via a PUBLIC link.
 
 Steps:
-1. Look for a "Share" button (usually top area or menu).
-2. Click it to open the share dialog.
-3. CRITICAL: In the share dialog, look for an access/visibility dropdown. It may say "Restricted" or "Only people added".
-4. If you see "Restricted" — click the dropdown and select "Anyone with the link".
-5. If you see a toggle for "Enable sharing" or "Create public link" — enable it.
+1. Look for a "Share" button or a "Share & Export" / "Export & save" submenu (top area or 3-dots menu).
+2. Click it to open the share dialog or submenu.
+3. If a submenu appears, click "Create public link" or "Public link" if visible — that's the modern flow and there's no visibility dropdown to set.
+4. If a share DIALOG opens with an access/visibility dropdown (legacy flow — usually shows "Restricted" or "Only people added"), click the dropdown and select "Anyone with the link".
+5. If you see a toggle for "Enable sharing" / "Create public link" — enable it.
 6. Once set to public, copy the shareable link (click "Copy link" button if available).
 7. Say "shared" with the EXACT URL (should contain g.co/gemini or gemini.google.com/share).
 
 IMPORTANT: The link MUST be PUBLIC ("Anyone with the link"), not restricted to specific people."""
 
 PROMPT_PUBLISH_CLAUDE = SYSTEM_BASE + """
+
+PREREQUISITE (post-2026-04-26 BE): A Playwright pre-step may have ALREADY opened the LAST artifact in the right panel. If you see a long research document (multiple section headers, paragraphs, citations) currently open in the right panel, skip directly to the Publish click — do NOT re-click the artifact card (re-click toggles the panel closed).
 
 Your task: Publish the Claude research ARTIFACT to get a public URL. Claude's Research tool often produces TWO artifacts — typically a SHORT intermediate one first, then a LARGER final report below it. You want the SECOND/BOTTOM one (the full report), NOT the first.
 
@@ -438,6 +450,11 @@ Flow (4-page dialog):
 4. CHECKS page — click NEXT (resolve any blockers first).
 5. VISIBILITY page — select "Unlisted" (not Public, not Private). Click the blue SAVE/PUBLISH at the bottom-right.
 
+ERROR HANDLING:
+- If a quota / age-restriction / 2FA / channel-not-monetized banner appears, say "upload blocked: <describe>" and STOP — do not retry.
+- If a copyright/Content-ID claim banner appears, say "upload blocked: copyright claim" and STOP.
+- If an "Upload failed, retry?" dialog appears, click Retry ONCE; if it fails a second time, say "upload failed: <describe>" and STOP.
+
 After save, the confirmation dialog shows a https://youtu.be/XXXXXXXXXXX link. Copy the real URL and reply exactly: "uploaded: <real url>".
 
 Non-negotiable: "No, it's not made for kids" + "Unlisted" + SAVE clicked. Never stop before Save. Never report the studio.youtube.com URL — always the short youtu.be URL from the confirmation.
@@ -458,7 +475,13 @@ Steps:
 4. Confirm the role next to it is "Editor" (if not already).
 5. If there is a "Copy link" button, click it.
 6. Click "Done" to close the dialog.
-7. Say "created" when the doc is filled AND public."""
+7. Say "created" when the doc is filled AND public.
+
+ENTERPRISE-POLICY FALLBACK:
+- If the "Anyone with the link" option is GRAYED OUT / DISABLED with text like "This option is restricted by your organization" or similar admin-policy banner, do NOT keep clicking it. Instead:
+  (a) Try selecting "Distributed Global" or your workspace-domain option from the General access dropdown — that lets anyone in the workspace open the doc.
+  (b) If even that is unavailable, click "Add people and groups" and explicitly type the recipient email from the provided content, set their role to Editor, then send.
+  (c) Say "created (restricted_share: <reason>)" so the orchestrator knows the link isn't fully public — e.g. "created (restricted_share: workspace_only)" or "created (restricted_share: explicit_recipient_only)"."""
 
 PROMPT_SEND_EMAIL = SYSTEM_BASE + """
 
@@ -470,7 +493,13 @@ Steps:
 3. Enter the subject.
 4. Type the email body with the provided links.
 5. Click "Send".
-6. Say "sent" when done."""
+6. After clicking Send, verify: the Compose dialog should disappear and a "Message sent" toast should appear at the bottom. Say "sent: <recipient>" when you see the confirmation.
+
+ERROR HANDLING:
+- If a "Discard draft?" dialog appears, do NOT discard — click Cancel/Keep editing and re-click Send.
+- If Gmail rejects the recipient ("invalid email address" / "address not found"), say "send failed: invalid recipient" and STOP.
+- If Gmail rejects the send for any other reason (quota, attachment too large, "try again"), say "send failed: <reason>" and STOP — do not retry blindly.
+- If you cannot find the Send button, say "send failed: send button not visible" and STOP."""
 
 # ── Inline CUA Prompts (used as one-off fallbacks) ────────────────────────────
 
@@ -479,6 +508,42 @@ Steps:
 PROMPT_GEMINI_START_RESEARCH = SYSTEM_BASE + """
 
 Look at the Gemini page. If you see a 'Start research' button (blue button), click it. If the research plan is still being generated, wait a moment and check again. Click 'Start research' and say 'clicked'."""
+
+PROMPT_RECOVER_YOUTUBE_BLOCKER = SYSTEM_BASE + """
+
+CONTEXT: A prior CUA upload attempt failed to reach the "uploaded:" success state. Likely cause: an unexpected dialog or banner is sitting on top of the upload form (copyright/Content-ID claim, age-restriction prompt, "Upload failed - retry?" dialog, channel-not-monetized notice, quota error).
+
+Your task: Diagnose what's blocking and either RECOVER (proceed past it) or REPORT BLOCKED (declare an unrecoverable failure so the orchestrator can surface it).
+
+Steps:
+1. Take a careful look at the screen. Identify what's currently displayed:
+   - Are we on Details/Video Elements/Checks/Visibility page of the upload wizard?
+   - Is there a modal dialog covering the form?
+   - Is there a banner/toast at top or bottom of the page?
+   - What's the dominant text content on screen?
+
+2. Decide the recovery path:
+   (a) DISMISSIBLE (modal survey, "What's new" splash, generic toast): close it via X / Escape / Skip / Maybe later, then resume the upload from where we are. Say "recovered: dismissed <what>".
+   (b) RETRYABLE ("Upload failed, retry?" dialog): click Retry ONCE. If it offers retry again, do NOT retry a second time — say "upload blocked: retry exhausted" and STOP.
+   (c) RESOLVABLE-IN-FORM (e.g. "Audience required" banner because the kids checkbox isn't set): click into the form, set the missing field, return to the navigation flow. Say "recovered: filled <what>".
+   (d) BLOCKED (copyright claim, age-restriction, quota notice, 2FA, channel-not-monetized, login wall): say "upload blocked: <category>: <details>" and STOP. Examples:
+       - "upload blocked: copyright: Content-ID claim filed by <claimant>"
+       - "upload blocked: age_restricted: requires verification"
+       - "upload blocked: quota: daily upload limit reached"
+       - "upload blocked: channel: not monetized / not eligible for unlisted"
+       - "upload blocked: auth: 2FA required"
+
+3. If you successfully recover (paths a, b, c), continue the upload flow as needed:
+   - Set "No, it's not made for kids" if not already
+   - Click NEXT through any remaining steps
+   - On VISIBILITY page, select "Unlisted"
+   - Click SAVE/PUBLISH
+
+4. End-of-recovery state should be either:
+   - SUCCESS: "uploaded: <https://youtu.be/...>" (matching the original upload prompt's contract), OR
+   - BLOCKED: "upload blocked: <category>: <details>" (caller will surface to user)
+
+DO NOT silently retry failures. DO NOT click through unresponsive UIs. ALWAYS report a clear status."""
 
 
 # ── Claude Artifact Tracking & Extraction ────────────────────────────────────
@@ -533,7 +598,12 @@ PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT = SYSTEM_BASE + """
 
 Your task: Navigate to and open the FINAL (last/bottom) artifact in the Claude conversation.
 
+CONTEXT (post-2026-04-26 BE): A Playwright pre-step has likely ALREADY closed any prior artifact panel and clicked the LAST artifact card. Verify state BEFORE acting:
+- If the right-side panel is OPEN and shows a long research document (multiple section headers, paragraphs, citations) — the LAST artifact is already open. Skip to step 4 and just verify.
+- If the right-side panel is CLOSED, or shows a short tracking checklist rather than a full report — proceed from step 1.
+
 Steps:
+0. Look at the right side first. If a panel is already open showing a long final research report (multiple sections + citations), say "final artifact already open" and STOP — do NOT re-click the card (re-click toggles the panel closed).
 1. Scroll to the BOTTOM of the Claude conversation (left panel) to find all artifact preview cards.
 2. Count the artifact cards. There should be 2 or more.
 3. Click the LAST (bottom-most) artifact card — this is the final research report.
@@ -543,7 +613,9 @@ Steps:
 4. The artifact opens in the right panel. Verify it looks like a complete research document (has headers, paragraphs, citations).
 5. Say "final artifact open" and describe its title and approximate length.
 
-CRITICAL: Click the LAST artifact, not the first. The first is often an intermediate tracking document."""
+CRITICAL:
+- Step 0 is a state-check guard, not a click — don't act if the panel is already on the final report.
+- Click the LAST artifact, not the first. The first is often an intermediate tracking document."""
 
 PROMPT_PUBLISH_CLAUDE_ARTIFACT = SYSTEM_BASE + """
 

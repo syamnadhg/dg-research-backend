@@ -11804,6 +11804,30 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
 
     browser.clear_upload_file()
 
+    # ── C3.5: Blocker recovery — fires only if the primary upload didn't reach
+    # "uploaded:" state. Tries to dismiss/retry/fill obstructing dialogs OR
+    # declares a clear "upload blocked: <category>" status the orchestrator can
+    # surface. Skipped on success so we don't burn CUA budget on clean runs.
+    _upload_text = (result.get("text") or "").lower() if isinstance(result, dict) else ""
+    if "uploaded:" not in _upload_text and "https://youtu.be/" not in _upload_text:
+        try:
+            log("[YouTube] Primary upload didn't confirm 'uploaded:' — running blocker recovery")
+            recovery = await agent_loop(cua_client, browser, PROMPT_RECOVER_YOUTUBE_BLOCKER,
+                f'The prior upload attempt for "{title}" did not confirm success. '
+                f'Diagnose what is blocking, recover if possible, or declare blocked.',
+                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+            _rec_text = (recovery.get("text") or "") if isinstance(recovery, dict) else ""
+            if "uploaded:" in _rec_text.lower() or "https://youtu.be/" in _rec_text.lower():
+                log("[YouTube] Blocker recovery succeeded — upload completed")
+                result = recovery
+            elif "upload blocked:" in _rec_text.lower():
+                log(f"[YouTube] Blocker recovery declared blocked — surfacing: "
+                    f"{_rec_text.split('upload blocked:', 1)[-1].strip()[:200]}", "WARN")
+            else:
+                log("[YouTube] Blocker recovery returned ambiguous status — falling through to DOM safety net", "WARN")
+        except Exception as _re:
+            log(f"[YouTube] Blocker recovery skipped: {_re}", "DEBUG")
+
     # ── C4: DOM safety net — ensure Unlisted + Not-for-kids before Save ──
     # CUA sometimes misses the radio clicks or the Save button. This block:
     #   1. Ticks "Unlisted" if visibility page is open and no radio is selected.
