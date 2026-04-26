@@ -9966,9 +9966,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     if blocked:
         cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
         if not cleared:
-            emit_event("pipeline_error", phase=2, agent=platform,
+            emit_event("pipeline_error", phase=2, agent=platform_l,
                        error=f"{platform.capitalize()} human verification unsolved — skipping this agent")
-            return page
+            return page, False
         # Settle after clearance — page often reloads to the real content
         await asyncio.sleep(2)
 
@@ -9989,9 +9989,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         if blocked:
             cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
             if not cleared:
-                emit_event("pipeline_error", phase=2, agent=platform,
+                emit_event("pipeline_error", phase=2, agent=platform_l,
                            error=f"{platform.capitalize()} human verification unsolved — skipping this agent")
-                return page
+                return page, False
             await asyncio.sleep(2)
             # Retry Playwright setup once, now that the challenge is gone
             if platform_l == "chatgpt":
@@ -10042,8 +10042,17 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
             if not paste_ok:
                 log(f"[{label}] CRITICAL: Both attach and paste failed — skipping this agent", "ERROR")
-                emit_event("pipeline_error", phase=2, agent=platform, error="Brief delivery failed (attach + paste)")
-                return page
+                emit_event("pipeline_error", phase=2, agent=platform_l,
+                           error="Brief delivery failed (attach + paste)",
+                           actions=[
+                               {"id": "retry", "label": "Retry",
+                                "style": "primary",
+                                "command": {"action": "retry_agent", "agent": platform_l}},
+                               {"id": "skip", "label": "Skip",
+                                "style": "default",
+                                "command": {"action": "skip_agent", "agent": platform_l}},
+                           ])
+                return page, False
     else:
         # Gemini always uses paste; legacy path also uses paste
         if is_gemini:
@@ -10065,8 +10074,17 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 log(f"[{label}] Reload+retry failed: {e}", "WARN")
         if not paste_ok:
             log(f"[{label}] CRITICAL: Brief paste completely failed — skipping this agent", "ERROR")
-            emit_event("pipeline_error", phase=2, agent=platform, error="Brief paste failed — could not inject research text")
-            return page
+            emit_event("pipeline_error", phase=2, agent=platform_l,
+                       error="Brief paste failed — could not inject research text",
+                       actions=[
+                           {"id": "retry", "label": "Retry",
+                            "style": "primary",
+                            "command": {"action": "retry_agent", "agent": platform_l}},
+                           {"id": "skip", "label": "Skip",
+                            "style": "default",
+                            "command": {"action": "skip_agent", "agent": platform_l}},
+                       ])
+            return page, False
 
     # ── Just-before-send: ensure the required mode is STILL active ──
     # Claude especially can silently drop Research tool / Extended model
@@ -10159,7 +10177,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 log(f"[{label}] Send-decision wait errored: {_e}", "WARN")
 
     await asyncio.sleep(3)
-    return page
+    return page, True
 
 
 async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_agents=None):
@@ -10210,23 +10228,46 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2A] Retrying ChatGPT (fresh tab)...", "WARN")
                 try: await chatgpt_page.close()
                 except Exception: pass
-            chatgpt_page = await start_agent_no_gemini_wait(
+            chatgpt_page, _chatgpt_setup_ok = await start_agent_no_gemini_wait(
                 browser, cua_client, "https://chatgpt.com",
                 PROMPT_CHATGPT_DEEP_RESEARCH,
                 "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
                 brief_text, "2A", "ChatGPT", verbose, brief_path=brief_path)
+            if not _chatgpt_setup_ok:
+                # Setup/paste failed — start_agent_no_gemini_wait already
+                # emitted pipeline_error with Retry/Skip actions. Don't try
+                # to verify — there's nothing to verify.
+                verified_a = False
+                break
             verified_a = await wait_until_verified(verify_chatgpt_generating, chatgpt_page, "2A",
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
             if verified_a:
                 break
-        agents["ChatGPT"] = {"page": chatgpt_page, "verified": verified_a, "url": chatgpt_page.url}
+        agents["ChatGPT"] = {"page": chatgpt_page, "verified": verified_a, "url": chatgpt_page.url if chatgpt_page else ""}
         if verified_a:
             emit_event("agent_progress", phase=2, agent="chatgpt", status="generating", progress="ChatGPT Deep Research started and verified")
             log("[2A] ChatGPT Deep Research is running ✓")
             await inject_agent_observer(chatgpt_page, "chatgpt")
         else:
             log("[2A] ChatGPT failed after 2 attempts", "ERROR")
-            emit_event("pipeline_error", phase=2, agent="chatgpt", error="Failed to start after 2 attempts")
+            # Mark as terminally failed so the round-robin doesn't sit on it
+            # forever waiting for events that will never arrive.
+            emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
+                       progress="ChatGPT setup/paste failed — agent did not start.")
+            emit_event("pipeline_error", phase=2, agent="chatgpt",
+                       error="Failed to start after 2 attempts",
+                       actions=[
+                           {"id": "retry", "label": "Retry",
+                            "style": "primary",
+                            "command": {"action": "retry_agent", "agent": "chatgpt"}},
+                           {"id": "skip", "label": "Skip",
+                            "style": "default",
+                            "command": {"action": "skip_agent", "agent": "chatgpt"}},
+                       ])
+            try:
+                _controls.skipped_agents.add("chatgpt")
+            except Exception:
+                pass
     else:
         log("\n--- 2A: ChatGPT SKIPPED (disabled in config) ---")
 
@@ -10248,23 +10289,41 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2B] Retrying Claude (fresh tab)...", "WARN")
                 try: await claude_page.close()
                 except Exception: pass
-            claude_page = await start_agent_no_gemini_wait(
+            claude_page, _claude_setup_ok = await start_agent_no_gemini_wait(
                 browser, cua_client, "https://claude.ai/new",
                 PROMPT_CLAUDE_DEEP_RESEARCH,
                 "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
                 brief_text, "2B", "Claude", verbose, brief_path=brief_path)
+            if not _claude_setup_ok:
+                verified_c = False
+                break
             verified_c = await wait_until_verified(verify_claude_generating, claude_page, "2B",
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
             if verified_c:
                 break
-        agents["Claude"] = {"page": claude_page, "verified": verified_c, "url": claude_page.url}
+        agents["Claude"] = {"page": claude_page, "verified": verified_c, "url": claude_page.url if claude_page else ""}
         if verified_c:
             emit_event("agent_progress", phase=2, agent="claude", status="generating", progress="Claude Adaptive Thinking started and verified")
             log("[2B] Claude is running ✓")
             await inject_agent_observer(claude_page, "claude")
         else:
             log("[2B] Claude failed after 2 attempts", "ERROR")
-            emit_event("pipeline_error", phase=2, agent="claude", error="Failed to start after 2 attempts")
+            emit_event("agent_progress", phase=2, agent="claude", status="failed",
+                       progress="Claude setup/paste failed — agent did not start.")
+            emit_event("pipeline_error", phase=2, agent="claude",
+                       error="Failed to start after 2 attempts",
+                       actions=[
+                           {"id": "retry", "label": "Retry",
+                            "style": "primary",
+                            "command": {"action": "retry_agent", "agent": "claude"}},
+                           {"id": "skip", "label": "Skip",
+                            "style": "default",
+                            "command": {"action": "skip_agent", "agent": "claude"}},
+                       ])
+            try:
+                _controls.skipped_agents.add("claude")
+            except Exception:
+                pass
     else:
         log("\n--- 2B: Claude SKIPPED (disabled in config) ---")
 
@@ -10274,16 +10333,30 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         await asyncio.sleep(30)
 
     # ── Step 3 (2C): Gemini — submit brief, let it generate plan (don't click Start yet) ──
+    gemini_setup_ok = False
     if enabled_agents is None or "gemini" in enabled_agents:
         log("\n--- 2C: Gemini Deep Research (submit + let it plan) ---")
         emit_event("agent_progress", phase=2, agent="gemini", status="starting", progress="Opening Gemini and submitting research brief...")
-        gemini_page = await start_agent_no_gemini_wait(
+        gemini_page, gemini_setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
             "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
             brief_text, "2C", "Gemini", verbose, brief_path=brief_path)
-        log("[2C] Gemini brief submitted — letting it generate research plan")
-        emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini generating research plan...")
+        if gemini_setup_ok:
+            log("[2C] Gemini brief submitted — letting it generate research plan")
+            emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini generating research plan...")
+        else:
+            # Setup or paste failed — start_agent_no_gemini_wait already emitted
+            # pipeline_error with Retry/Skip actions. Mark Gemini terminally
+            # failed so the [2D] wait loop is skipped and the round-robin
+            # poller treats it as done. No more lying about "generating plan".
+            log("[2C] Gemini setup/paste failed — marking agent failed, skipping [2D] plan wait", "ERROR")
+            emit_event("agent_progress", phase=2, agent="gemini", status="failed",
+                       progress="Gemini setup/paste failed — agent did not start.")
+            try:
+                _controls.skipped_agents.add("gemini")
+            except Exception:
+                pass
     else:
         log("\n--- 2C: Gemini SKIPPED (disabled in config) ---")
 
@@ -10356,7 +10429,17 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     # the OFFICIAL round-robin only begins after that click. ChatGPT/Claude
     # keep running in the background — their state from the first-wave dwell
     # is the last frontend update until the round-robin picks them up.
-    if gemini_page is not None:
+    #
+    # Skip the entire [2D] loop if Gemini's setup failed (setup_ok == False)
+    # OR was marked skipped (e.g. via Retry/Skip Skip path). Without this
+    # gate the loop sits 10 minutes waiting for a "Start research" button
+    # that will never appear because no plan was ever generated.
+    _gemini_skipped = False
+    try:
+        _gemini_skipped = "gemini" in (_controls.skipped_agents or set())
+    except Exception:
+        _gemini_skipped = False
+    if gemini_page is not None and gemini_setup_ok and not _gemini_skipped:
         log("\n--- 2D: Gemini — waiting for research plan + clicking 'Start research' (focused, no rotation) ---")
         await browser.switch_to_page(gemini_page)
         await asyncio.sleep(2)
