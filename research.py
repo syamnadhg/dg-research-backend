@@ -4985,6 +4985,66 @@ async def scrape_progress_chatgpt(page):
         return {"status": "scrape_error", "progress": "Selector mismatch — ChatGPT UI may have changed", "sources": 0, "partial_text_len": 0}
 
 
+async def _open_chatgpt_activity_panel(page):
+    """Click the collapsed activity strip (e.g. 'Looking into Hermes... 196 searches')
+    in ChatGPT Deep Research so the side panel with full step list and source URLs
+    slides out. Without this click, polling sees only the strip's truncated preview
+    text and undercounts sources. Idempotent: aria-expanded check skips re-click.
+
+    Strip lives in the DR sandbox iframe (oaiusercontent / web-sandbox), but we try
+    host page first as a safety net. Fingerprint is the trailing '\\d+ searches'
+    badge — uniquely identifies the strip; no other DR UI element shows it.
+    Returns dict {found, clicked|alreadyExpanded, label} or {found: False}."""
+    JS = """() => {
+        const COUNT = /\\b\\d+\\s+searches?\\b/i;
+        const cands = Array.from(document.querySelectorAll(
+            'button, [role="button"], [aria-expanded]'
+        ));
+        let best = null, bestY = -1;
+        for (const el of cands) {
+            const t = (el.innerText || '').trim();
+            if (!t || t.length > 300) continue;
+            if (!COUNT.test(t)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.top > bestY) { best = el; bestY = r.top; }
+        }
+        if (!best) return { found: false };
+        const btn = best.closest('button, [role="button"], [aria-expanded]') || best;
+        const expanded = btn.getAttribute('aria-expanded');
+        const label = (btn.innerText || '').trim().slice(0, 160);
+        if (expanded === 'true') return { found: true, alreadyExpanded: true, label };
+        try { btn.click(); } catch (e) {
+            return { found: true, clicked: false, label, error: String(e) };
+        }
+        return { found: true, clicked: true, label };
+    }"""
+    try:
+        res = await page.evaluate(JS)
+        if res and res.get("found"):
+            return res
+    except Exception:
+        pass
+    try:
+        for frame in page.frames:
+            try:
+                src = (frame.url or "").lower()
+            except Exception:
+                continue
+            if not src:
+                continue
+            if ("deep_research" in src or "oaiusercontent" in src or
+                    "web-sandbox.oaiusercontent" in src):
+                try:
+                    res = await frame.evaluate(JS)
+                    if res and res.get("found"):
+                        return res
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return {"found": False}
+
+
 async def scrape_progress_gemini(page):
     """Scrape Gemini's current research progress — rich data for web app.
     Selectors use multiple fallbacks — degrades gracefully on UI changes."""
@@ -7342,6 +7402,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "last_heartbeat": _research_t,
             "last_cua_check": _research_t,       # CUA check gate — MIN_WAIT from research start
             "last_artifact_scrape": 0,           # 0 → iteration #1 always passes the gate (Claude opens artifact ASAP)
+            "chatgpt_activity_panel_open": False,  # ChatGPT activity-strip click flag — mirror Claude pattern
             "observer_text_len": 0,              # MutationObserver sets this (see B2)
         }
         # Register for mid-run input dispatcher
@@ -7454,6 +7515,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "last_heartbeat": time.time(),
                                              "last_cua_check": time.time(),
                                              "last_artifact_scrape": 0,
+                                             "chatgpt_activity_panel_open": False,
                                              "observer_text_len": 0}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
@@ -7539,6 +7601,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "last_heartbeat": time.time(),
                     "last_cua_check": time.time(),
                     "last_artifact_scrape": 0,
+                    "chatgpt_activity_panel_open": False,
                     "observer_text_len": 0,
                     "empty_retries": 0,
                     "hard_retry_count": 0,
@@ -7631,6 +7694,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "last_heartbeat": _now,
                 "last_cua_check": _now,
                 "last_artifact_scrape": 0,
+                "chatgpt_activity_panel_open": False,
                 "observer_text_len": 0,
                 "empty_retries": 0,
                 "hard_retry_count": _hard_count,
@@ -7902,6 +7966,26 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as e:
                     log(f"[Claude] Artifact tracking scrape failed: {e}", "WARN")
                     p["last_artifact_scrape"] = time.time()  # Don't retry immediately
+
+            # ChatGPT activity-strip open — mirror Claude artifact pattern.
+            # ChatGPT DR renders a collapsed strip ("Looking into X... N searches")
+            # at the bottom of the chat thread. The side panel with the full step
+            # list and source URLs only mounts AFTER the strip is clicked. Without
+            # this click the polling scrape sees only the strip's preview text and
+            # undercounts sources. We click on the FIRST iteration where the strip
+            # is found (retries on subsequent iters until found), then never again
+            # — once expanded the panel persists across polls.
+            if name == "ChatGPT" and not p.get("chatgpt_activity_panel_open"):
+                try:
+                    res = await _open_chatgpt_activity_panel(p["page"])
+                    if res and res.get("found"):
+                        p["chatgpt_activity_panel_open"] = True
+                        log(f"[ChatGPT] activity panel opened (first time) at "
+                            f"elapsed={int(elapsed)}s — label: \"{res.get('label','')[:80]}\"")
+                        # Side panel needs a beat to mount its content tree.
+                        await asyncio.sleep(1.0)
+                except Exception as e:
+                    log(f"[ChatGPT] activity panel open failed: {e}", "WARN")
 
             # Emit agent_progress to frontend (critical for real-time UI)
             agent_key = normalize_agent_key(name)
