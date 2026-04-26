@@ -3113,6 +3113,22 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
     page = browser.page
     url = await browser.current_url() or ""
     try:
+        # 2026-04-26: close-first preamble — any open citations panel,
+        # plan-item drawer, or modal can intercept the Share button click.
+        # Mirror of Claude's pattern at the top of extract_share_link_claude.
+        try:
+            await page.evaluate("""() => {
+                const close = document.querySelector(
+                    '[role="dialog"] button[aria-label*="Close"], ' +
+                    '[role="dialog"] button[aria-label*="close"], ' +
+                    'button[aria-label*="Close panel"], ' +
+                    'button[aria-label*="Close sources"]'
+                );
+                if (close) close.click();
+            }""")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
         # Step 1: Try Playwright — find share button
         share_btn = None
         for sel in ['button[aria-label="Share"]', '[data-testid="share-chat-button"]',
@@ -3250,6 +3266,22 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
     url = await browser.current_url() or ""
     last_stage = "init"
     try:
+        # 2026-04-26: close-first preamble — close any open dialog/drawer
+        # that could intercept the Share & Export click. Same pattern as
+        # Claude (extract_share_link_claude) and ChatGPT.
+        try:
+            await page.evaluate("""() => {
+                const close = document.querySelector(
+                    '[role="dialog"] button[aria-label*="Close"], ' +
+                    '[role="dialog"] button[aria-label*="close"], ' +
+                    'button[aria-label*="Close panel"], ' +
+                    'mat-dialog-container button[aria-label*="Close"]'
+                );
+                if (close) close.click();
+            }""")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
         # ── Open the share/export dialog ──
         # Current Gemini Deep Research UI variants seen:
         #   - "Share & Export" (post-2025 redesign)
@@ -4808,6 +4840,72 @@ async def scrape_progress_chatgpt(page):
                                     log(f"ChatGPT sources-panel re-scrape skipped: {_re2}", "DEBUG")
                         except Exception as _se:
                             log(f"ChatGPT sources-panel expand skipped: {_se}", "DEBUG")
+                    # ── 2026-04-26: Click the LIVE plan-item to harvest URLs ──
+                    # ChatGPT Pro DR shows a checklist of plan items inside the
+                    # report modal — mostly checked, with the LIVE one (e.g.
+                    # "Checking openshell agents and sandboxes...") spinning.
+                    # Sub-references for that live item only render when the
+                    # user clicks/expands it. Default scrape misses those URLs
+                    # entirely, so the FE undercounts during polling.
+                    #
+                    # Mirror of the Claude artifact-tracking pattern: click
+                    # the live item, sleep ~1s for lazy render, union new URLs
+                    # into the existing result.source_urls. ENABLED by default
+                    # (additive, reversible — clicking a different item just
+                    # collapses the previous one). Gate via DG_PLAN_ITEM_EXPAND=0
+                    # to opt out.
+                    if os.environ.get("DG_PLAN_ITEM_EXPAND", "1").lower() not in ("0", "false", "no"):
+                        try:
+                            click_live = await frame.evaluate("""() => {
+                                const all = document.querySelectorAll(
+                                    '[role="checkbox"], [data-testid*="task"], li, [class*="task"] > div'
+                                );
+                                const live = Array.from(all).find(el => {
+                                    const t = (el.textContent || '').trim();
+                                    if (!t || t.length < 4 || t.length > 200) return false;
+                                    // Skip already-checked items.
+                                    if (el.getAttribute('aria-checked') === 'true') return false;
+                                    if (el.querySelector('svg[class*="check"], svg[data-icon="check"]')) return false;
+                                    if (/^[\\u2713\\u2714\\u221A]/.test(t)) return false;
+                                    // Live signal: prefix verb OR aria-busy OR italic style.
+                                    if (/^(checking|searching|looking|investigating|analyzing|reading|browsing|exploring)/i.test(t)) return true;
+                                    if (el.getAttribute('aria-busy') === 'true') return true;
+                                    try {
+                                        const cs = getComputedStyle(el);
+                                        if (cs.fontStyle === 'italic') return true;
+                                    } catch (e) {}
+                                    return false;
+                                });
+                                if (live) { live.click(); return { clicked: true, label: (live.textContent || '').trim().slice(0, 60) }; }
+                                return { clicked: false };
+                            }""")
+                            if click_live and click_live.get("clicked"):
+                                await asyncio.sleep(1.0)
+                                try:
+                                    dr3 = await frame.evaluate("""() => {
+                                        const srcSet = new Set();
+                                        document.querySelectorAll('a[href^="http"]').forEach(a => {
+                                            const h = a.href || '';
+                                            if (h.length < 500 &&
+                                                !h.includes('chatgpt.com') && !h.includes('openai.com') &&
+                                                !h.includes('oaiusercontent')) srcSet.add(h);
+                                        });
+                                        return { source_urls: Array.from(srcSet).slice(0, 50) };
+                                    }""")
+                                    if dr3 and dr3.get("source_urls"):
+                                        seen3 = set(result.get("source_urls") or [])
+                                        unioned3 = list(result.get("source_urls") or [])
+                                        for u in dr3["source_urls"]:
+                                            if u not in seen3:
+                                                seen3.add(u)
+                                                unioned3.append(u)
+                                        if len(unioned3) > len(result.get("source_urls") or []):
+                                            result["source_urls"] = unioned3[:30]
+                                            result["sources"] = len(result["source_urls"])
+                                except Exception as _re3:
+                                    log(f"ChatGPT plan-item re-scrape skipped: {_re3}", "DEBUG")
+                        except Exception as _pe:
+                            log(f"ChatGPT plan-item live-click skipped: {_pe}", "DEBUG")
                     break
         except Exception as _fe:
             log(f"ChatGPT frames iteration skipped: {_fe}", "DEBUG")
@@ -5001,7 +5099,9 @@ async def scrape_progress_claude(page):
             const srcCountM = bodyText.match(/(\\d[\\d,]*)\\s+sources?\\s+and\\s+counting/i);
             const liveSrcCount = srcCountM ? parseInt(srcCountM[1].replace(/,/g, ''), 10) : 0;
             // "Research completed in Xm" → research done
-            const doneM = bodyText.match(/research\\s+completed(?:\\s+in\\s+[\\dhms]+)?/i);
+            // 2026-04-26: matches BOTH "research completed in 5m" (legacy)
+            // AND "Research complete · 553 sources · 24m 41s" (modern 2026).
+            const doneM = bodyText.match(/research\\s+complete(?:d)?(?:\\s+in)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?(?:[\\s·•—\\-]+\\d+(?:[hms]|\\s*(?:hour|min|sec)))?/i);
             const researchDone = !!doneM;
 
             // ---- Tool uses (Research tool, web_search, browse, etc.)
@@ -5272,12 +5372,24 @@ async def detect_completion_claude(page):
             )) hasStop = true;
 
             const bodyText = document.body?.innerText || '';
-            const researchDone = /research\\s+completed(?:\\s+in\\s+[\\dhms]+)?/i.test(bodyText);
+            // 2026-04-26: regex now matches BOTH "research completed in 5m"
+            // (legacy) AND "Research complete · 553 sources · 24m 41s" (modern
+            // 2026 layout). The middle separators are unicode bullets/dots/
+            // hyphens. Sources/duration suffixes optional.
+            const researchDone = /research\\s+complete(?:d)?(?:\\s+in)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?(?:[\\s·•—\\-]+\\d+(?:[hms]|\\s*(?:hour|min|sec)))?/i.test(bodyText);
             const liveActive = /\\d[\\d,]*\\s+sources?\\s+and\\s+counting/i.test(bodyText);
             // Claude's research card flips status when streaming ends.
-            const researchCardDone = !!document.querySelector(
+            // 2026-04-26: also accept TEXT-CONTENT match — Claude's modern
+            // layout doesn't use [data-research-status]; the artifact card
+            // shows "Research complete · N sources · Xm Ys" as visible text.
+            let researchCardDone = !!document.querySelector(
                 '[data-research-status="complete"], [data-research-state="done"]'
             );
+            if (!researchCardDone) {
+                researchCardDone = !!Array.from(
+                    document.querySelectorAll('[class*="card"], [class*="artifact"], button, div[role="button"]')
+                ).find(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || ''));
+            }
 
             let textLen = 0;
             const msgs = document.querySelectorAll('.font-claude-message, .contents .prose');
@@ -5406,7 +5518,13 @@ DETECT_FNS = {
 # ── Claude Artifact DOM Helpers ──────────────────────────────────────────────
 
 async def _count_claude_artifacts(page):
-    """Count artifact preview cards in Claude conversation. Returns int."""
+    """Count artifact preview cards in Claude conversation. Returns int.
+    2026-04-26: extended selectors for the modern Research card layout —
+    aria-label="Open the artifact", a[href*="/artifacts/"] direct links,
+    role=button rounded card divs, plus a TEXT-content fallback that
+    finds buttons whose text contains "Research complete" or starts with
+    a research-card-style prefix (e.g. "OpenClaw and OpenShell research").
+    """
     try:
         return await page.evaluate("""() => {
             const selectors = [
@@ -5415,18 +5533,33 @@ async def _count_claude_artifacts(page):
                 '.artifact-card', '.artifact-preview',
                 'button[data-artifact-id]',
                 '[class*="artifact"][role="button"]',
+                'button[aria-label*="Open the artifact"]',
+                'button[aria-label*="research"]',
+                'a[href*="/artifacts/"]',
+                'div[role="button"][class*="rounded"][class*="border"]',
             ];
+            let total = 0;
             for (const sel of selectors) {
                 const found = document.querySelectorAll(sel);
-                if (found.length > 0) return found.length;
+                if (found.length > 0) { total = Math.max(total, found.length); }
             }
-            // Fallback: look for document-like inline cards in assistant messages
-            const cards = document.querySelectorAll(
-                '.font-claude-message button[class*="block"], ' +
-                '.font-claude-message [class*="artifact"], ' +
-                '[data-is-streaming] button[class*="w-full"]'
-            );
-            return cards.length;
+            // Text-content fallback: any clickable element that contains the
+            // modern "Research complete · N sources · Xm Ys" marker.
+            const textHits = Array.from(document.querySelectorAll(
+                '.font-claude-message button, .font-claude-message [role="button"], ' +
+                'button, [role="button"]'
+            )).filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || ''));
+            total = Math.max(total, textHits.length);
+            // Legacy fallback: document-like inline cards in assistant messages
+            if (total === 0) {
+                const cards = document.querySelectorAll(
+                    '.font-claude-message button[class*="block"], ' +
+                    '.font-claude-message [class*="artifact"], ' +
+                    '[data-is-streaming] button[class*="w-full"]'
+                );
+                total = cards.length;
+            }
+            return total;
         }""")
     except Exception as e:
         log(f"Artifact count failed: {e}", "WARN")
@@ -5434,7 +5567,8 @@ async def _count_claude_artifacts(page):
 
 
 async def _click_claude_artifact(page, index=0):
-    """Click the Nth artifact card (0-indexed). Returns True if clicked."""
+    """Click the Nth artifact card (0-indexed). Returns True if clicked.
+    2026-04-26: same modernized selectors as _count_claude_artifacts."""
     try:
         return await page.evaluate(f"""(idx) => {{
             const selectors = [
@@ -5443,11 +5577,23 @@ async def _click_claude_artifact(page, index=0):
                 '.artifact-card', '.artifact-preview',
                 'button[data-artifact-id]',
                 '[class*="artifact"][role="button"]',
+                'button[aria-label*="Open the artifact"]',
+                'button[aria-label*="research"]',
+                'a[href*="/artifacts/"]',
+                'div[role="button"][class*="rounded"][class*="border"]',
             ];
             let cards = [];
             for (const sel of selectors) {{
                 const found = document.querySelectorAll(sel);
                 if (found.length > 0) {{ cards = Array.from(found); break; }}
+            }}
+            if (!cards.length) {{
+                // Text-content fallback: clickable element with "Research complete · …"
+                const textHits = Array.from(document.querySelectorAll(
+                    '.font-claude-message button, .font-claude-message [role="button"], ' +
+                    'button, [role="button"]'
+                )).filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || ''));
+                if (textHits.length > 0) cards = textHits;
             }}
             if (!cards.length) {{
                 const fallback = document.querySelectorAll(
@@ -8054,21 +8200,40 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         pass
 
                 # Claude-specific: validate completion via artifact count.
-                # Research mode on Opus 4.7 with Adaptive Thinking produces
-                # TWO artifacts — (1) references, (2) the final report. We
-                # need BOTH before we trust the "done" verdict.
+                # Research mode on Opus 4.7 with Adaptive Thinking USED to
+                # produce TWO artifacts — (1) references, (2) the final
+                # report. The 2026 layout collapses to ONE artifact card
+                # whose text reads "Research complete · N sources · Xm Ys"
+                # AND contains the full report inline. So:
                 #
-                #   • < 80% budget + < 2 artifacts → revert to polling
-                #     (early done-verdict is almost always the planning phase)
-                #   • ≥ 80% budget + < 2 artifacts → hard-fail, ask user
-                #     (Retry with follow-up asking for the missing artifact,
-                #      Skip drops Claude, Wait extends budget by 15 min)
+                #   • If body-text matches the "Research complete" marker
+                #     → trust the done verdict regardless of artifact count
+                #     (the marker only appears when streaming ends).
+                #   • Else, fall through to the legacy artifact-count gate:
+                #     < 80% budget + < 2 → revert to polling; ≥ 80% + < 2 →
+                #     hard-fail with Retry/Skip/Wait modal.
                 if name == "Claude":
                     try:
                         _art_count = await _count_claude_artifacts(p["page"])
                     except Exception:
                         _art_count = 2  # on DOM query failure, trust extraction
-                    if _art_count < 2 and elapsed < (max_wait_min * 60 * 0.8):
+                    # 2026-04-26: bypass the artifact-count gate when the
+                    # modern "Research complete · N sources · Xm Ys" marker
+                    # is present. This lets the 1-artifact-card layout pass
+                    # without nudging or hard-failing.
+                    _claude_completion_marker = False
+                    try:
+                        _claude_completion_marker = bool(await p["page"].evaluate(
+                            """() => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]+\\d[\\d,]*\\s+sources?/i.test(
+                                document.body?.innerText || ''
+                            )"""
+                        ))
+                    except Exception:
+                        _claude_completion_marker = False
+                    if _claude_completion_marker:
+                        log(f"[Claude] Modern completion marker detected — accepting 1-artifact layout (art_count={_art_count})", "INFO")
+                        # Fall through to extraction (skip both gates below).
+                    elif _art_count < 2 and elapsed < (max_wait_min * 60 * 0.8):
                         log(f"[Claude] CUA says done but only {_art_count} artifact(s) at "
                             f"{int(elapsed/60)}m — likely still researching. Reverting.", "WARN")
                         p["done_count"] = 0
@@ -8079,7 +8244,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                    progress=f"Still researching — only {_art_count} artifact(s) so far",
                                    elapsedSec=int(elapsed))
                         continue
-                    if _art_count < 2:
+                    elif not _claude_completion_marker and _art_count < 2:
                         # ── C2: one-shot auto-nudge before the hard-fail modal ──
                         # Give Claude 90s to produce artifact 2 after an explicit
                         # ask, before interrupting the user. Fires once per agent
@@ -10610,6 +10775,22 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
     log("=" * 60)
     log("PHASE 3: Extract Links + NotebookLM Upload")
     log("=" * 60)
+
+    # 2026-04-26: log every MD on disk in queue_dir/documents/ at P3 entry.
+    # Makes P2→P3 handoff debugging trivial — we can see at a glance which
+    # of the 3 agent .md files made it to disk and at what size. If one is
+    # missing or 0 bytes, P3 NotebookLM upload will silently miss that
+    # source.
+    try:
+        _docs = queue_dir / "documents"
+        if _docs.exists():
+            _on_disk = [(f.name, f.stat().st_size) for f in sorted(_docs.glob("*.md"))]
+            log(f"Phase 3: queue MDs on disk: " +
+                (", ".join(f"{n}={s}b" for n, s in _on_disk) if _on_disk else "(none)"))
+        else:
+            log("Phase 3: queue_dir/documents does not exist — no MDs", "WARN")
+    except Exception as _de:
+        log(f"Phase 3: MD-on-disk audit failed: {_de}", "DEBUG")
 
     links = {}
     md_files = []
