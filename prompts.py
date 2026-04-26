@@ -213,6 +213,10 @@ CHECK 2 — Is there an active progress indicator near the response?
 
 CHECK 3 — Is the response complete?
   Counts: final paragraph is present, no trailing ellipsis/cursor, no "continue generating" prompt. For Claude specifically, a fully-rendered Research artifact (right-side panel or inline card with title + body) means complete.
+  Strong textual signals that mean DONE (any of these visible on screen):
+    - "Research complete" / "Research completed" (often followed by · N sources · time)
+    - "Thought for N seconds" badge (ChatGPT)
+    - A fully-rendered share/publish button next to the final response (Claude/Gemini)
   If complete → DONE.
 
 OTHER: If a "Start research" button is visible and must be clicked → NEEDS_CLICK. If an error banner or blocking popup is visible → ERROR. Otherwise default to GENERATING.
@@ -242,24 +246,64 @@ PROMPT_COPY_ARTIFACT_CHATGPT = SYSTEM_BASE + """
 
 Your task: Copy the ChatGPT research document content.
 
+CONTEXT: A Playwright pre-step may have ALREADY clicked ENLARGE/Open and the
+canvas/document panel may already be visible on screen as a large reading
+view (typically a dialog or full-screen overlay with the report content).
+If you see that overlay, the artifact is OPEN — skip straight to step 3.
+
 Steps:
-1. Scroll DOWN in the chat to find the research document card (it has an enlarge/expand button and a download button).
-2. Click the ENLARGE button to open the full document.
-3. Once the document is open, look for a "Copy" button at the top. Click it.
-4. If no Copy button, click inside the document text, press Ctrl+A (select all), then Ctrl+C (copy).
+1. Look at the screen. Is a canvas/document overlay (full-screen or dialog
+   showing the research report) ALREADY open?
+   - YES → skip to step 3.
+   - NO  → continue to step 2.
+2. Scroll DOWN in the chat to find the research document card (it has an
+   enlarge/expand button and a download button). Click the ENLARGE button
+   to open the full document.
+3. Once the document is open (or already open), look for a "Copy" button
+   at the top of the canvas. Click it.
+4. If no Copy button, click inside the document text, press Ctrl+A
+   (select all), then Ctrl+C (copy).
 5. Say "copied" when done.
 
-IMPORTANT: The document card is BELOW the user's message in the chat. Scroll down to find it."""
+IMPORTANT:
+- If Playwright pre-opened the canvas, you should NOT need to scroll or
+  click ENLARGE again — re-clicking can collapse the canvas. Verify the
+  current screen state BEFORE acting.
+- The document card (when not yet opened) is BELOW the user's message
+  in the chat. Scroll down to find it."""
 
 PROMPT_COPY_ARTIFACT_CLAUDE = SYSTEM_BASE + """
 
-Task: Open and copy the Claude research document.
+Task: Open and copy the Claude research document (the FINAL report, which
+is the LAST artifact in the conversation).
 
+CONTEXT: A Playwright pre-step may have ALREADY closed any prior artifact
+panel and clicked the LAST artifact card. If so, the right-side artifact
+panel is already showing the FINAL research report. Verify the current
+state BEFORE acting:
+- If the right panel shows a long research document with sections,
+  citations, headings — the LAST artifact is OPEN. Skip to step 3.
+- If the right panel is closed OR shows artifact-1 (the intermediate
+  tracking document — usually a checklist of sources being reviewed,
+  shorter than the final report) — proceed from step 1.
+
+Steps:
 1. Close the "Claude Code" tab if open.
-2. Scroll the chat (left panel) to the BOTTOM. Always click the LAST (bottom-most) artifact card — earlier ones are thinking traces or drafts.
-3. The document opens in the right panel. Click the "Copy" button at the top of the artifact panel.
-4. If no Copy button, click inside the document text, press Ctrl+A, then Ctrl+C.
-5. Say "copied" when done."""
+2. Scroll the chat (left panel) to the BOTTOM. Click the LAST
+   (bottom-most) artifact card — earlier ones are thinking traces
+   or intermediate tracking artifacts. This opens the FINAL research
+   report in the right panel.
+3. In the right panel, click the "Copy" button at the top of the
+   artifact panel.
+4. If no Copy button, click inside the document text, press Ctrl+A,
+   then Ctrl+C.
+5. Say "copied" when done.
+
+IMPORTANT:
+- ALWAYS the LAST artifact card. Re-clicking the wrong one (e.g. the
+  intermediate tracking artifact) silently grabs the wrong document.
+- If Playwright already opened the right panel onto the final report,
+  do NOT re-click the card — re-click can collapse the panel."""
 
 PROMPT_COPY_RESPONSE = SYSTEM_BASE + """
 
@@ -441,19 +485,35 @@ Look at the Gemini page. If you see a 'Start research' button (blue button), cli
 
 PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING = SYSTEM_BASE + """
 
-Your task: Open the FIRST artifact in the Claude conversation to read its tracking/progress content. Do NOT interfere with the ongoing research.
+Your task: Read the FIRST artifact's content from the Claude conversation
+to surface live tracking/progress data (URLs, sections, activity). Do NOT
+interfere with the ongoing research.
+
+CONTEXT: This prompt fires DURING active polling, NOT post-completion. The
+BE keeps the FIRST artifact's right-side panel OPEN across polls
+(commit d45807f) to avoid open/close churn. Most calls land on a panel
+that is already open — your job is mostly READ, not OPEN.
 
 Steps:
-1. Look at the Claude conversation in the LEFT panel. Scroll down to find artifact preview cards — these are rectangular inline cards with a document icon and title.
-2. Count how many artifact cards you see. If ZERO artifacts exist, say "no artifacts" and STOP.
-3. Click the FIRST (top-most) artifact card. It opens in the RIGHT panel.
+1. Look at the screen. Is the right-side artifact panel ALREADY open
+   (showing a document with headings/sources/checklist)?
+   - YES → skip to step 4 (just read it).
+   - NO  → proceed to step 2 to open the FIRST artifact.
+2. Look at the Claude conversation in the LEFT panel. Scroll down to
+   find artifact preview cards — rectangular inline cards with a
+   document icon and title.
+3. Count how many artifact cards you see. If ZERO artifacts exist,
+   say "no artifacts" and STOP. Otherwise click the FIRST (top-most)
+   artifact card. It opens in the RIGHT panel.
 4. Read the content in the right panel. Report ALL of the following:
    - Any URLs or links mentioned (full URLs starting with http)
    - Any numbered steps or bullet points describing analysis/research activity
    - Any section headers or topic areas being researched
    - Any source counts or progress indicators
    - The approximate length of the content (short/medium/long)
-5. After reading, close the artifact panel by pressing Escape or clicking the X button to return to the conversation view.
+5. **DO NOT close the artifact panel.** The polling loop expects it
+   to STAY OPEN across calls so subsequent polls can re-read without
+   click churn. The orchestrator handles closing at completion.
 6. Report what you found in a structured format:
    URLS: [list any URLs found]
    STEPS: [list any research steps/activity]
@@ -461,12 +521,13 @@ Steps:
    SOURCES: [approximate count of sources mentioned]
 
 CRITICAL RULES:
-- Do NOT click Send or type anything in the input area
-- Do NOT interact with any Stop button
-- Do NOT modify the research in any way
-- If the artifact panel is ALREADY open, just read its content — don't click a card
-- If you cannot find any artifacts, say "no artifacts" and STOP
-- Close the artifact panel when done reading"""
+- Do NOT click Send or type anything in the input area.
+- Do NOT interact with any Stop button.
+- Do NOT modify the research in any way.
+- Do NOT close the panel after reading — the polling loop reuses it.
+- If the FIRST artifact panel is already open (from a prior poll),
+  do NOT click any card; just read.
+- If you cannot find any artifacts, say "no artifacts" and STOP."""
 
 PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT = SYSTEM_BASE + """
 
