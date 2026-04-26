@@ -2228,7 +2228,15 @@ class PipelineRuntime:
         self.sub_state = ""
         self.active_pages: dict = {}  # platform → page object
         self.agent_statuses: dict = {}  # platform → 'generating'|'done'|'failed'
-        self.agent_chat_urls: dict = {}  # platform → URL
+        self.agent_chat_urls: dict = {}  # platform → URL (conversation/chat)
+        # Public share / canonical export URLs for each P2 agent — populated
+        # in extract_and_record_agent (Commit 11) by an inline best-effort
+        # extractor. Falls back silently to the conversation URL when public
+        # share extraction fails. Phase 5 (Google Doc) prefers this over
+        # agent_chat_urls so the doc carries proper shareable links.
+        # Shape: {platform: {"url": str, "kind": "public"|"conversation",
+        #                    "label": str, "verified": bool}}
+        self.agent_share_urls: dict = {}
         self.partial_text_lens: dict = {}
         self.original_inputs: dict = {}  # {'topic': str, 'brief': str, 'pdf_paths': []}
         self.queue_dir = None
@@ -3200,21 +3208,41 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
 
 
 async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Research", verbose=False):
-    """Extract shareable Gemini conversation link with public visibility."""
+    """Extract shareable Gemini conversation link with public visibility.
+
+    Hardened 2026-04-25:
+    - Added "Export & save" label variants (current Gemini Deep Research
+      UI sometimes uses this instead of "Share & Export").
+    - Wrapped the CUA fallback in a 90 s timeout so a stuck CUA loop can't
+      starve the inline 90 s outer budget at the call-site.
+    - Structured error attribution: errors are tagged in `LinkResult.error`
+      with a short stage tag (`open_dialog` / `public_toggle` / `link_lookup`
+      / `cua_fallback`) so operators can see *where* the flow failed.
+    """
     page = browser.page
     url = await browser.current_url() or ""
+    last_stage = "init"
     try:
-        # ── Open "Share & Export" dialog ──
-        # Current Gemini Deep Research UI uses "Share & Export" (not a plain
-        # "Share" aria-label). Try the new label first, then the older plain
-        # "Share" variants, then a text-content fallback for variants where
-        # aria-label is missing entirely.
+        # ── Open the share/export dialog ──
+        # Current Gemini Deep Research UI variants seen:
+        #   - "Share & Export" (post-2025 redesign)
+        #   - "Share and export" (a11y-label variant)
+        #   - "Export & save"   (newer 2026 redesign — added 2026-04-25)
+        #   - "Share"           (legacy)
+        # Try aria-label exact matches first, then partial matches, then
+        # fall through to a text-content scan for variants without an
+        # aria-label at all.
+        last_stage = "open_dialog"
         share_opened = False
         for sel in [
             'button[aria-label="Share & Export"]',
             'button[aria-label="Share and export"]',
+            'button[aria-label="Export & save"]',
+            'button[aria-label="Export and save"]',
             'button[aria-label*="Share & Export"]',
             'button[aria-label*="Share and export"]',
+            'button[aria-label*="Export & save"]',
+            'button[aria-label*="Export and save"]',
             'button[aria-label="Share"]',
             'button[aria-label*="Share"]',
         ]:
@@ -3233,7 +3261,9 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
                     const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
                     const target = btns.find(b => {
                         const t = (b.textContent || '').trim().toLowerCase();
-                        return t === 'share & export' || t === 'share and export' || t === 'share';
+                        return t === 'share & export' || t === 'share and export' ||
+                               t === 'export & save' || t === 'export and save' ||
+                               t === 'share';
                     });
                     if (target) { target.click(); return true; }
                     return false;
@@ -3244,9 +3274,11 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
             except Exception:
                 pass
         if share_opened:
-            # "Share & Export" opens a submenu (Create public link / Export
-            # to Docs / Copy). Click the public-link option before the link
-            # lookup, otherwise we land on the Export flow.
+            # "Share & Export" / "Export & save" opens a submenu (Create
+            # public link / Export to Docs / Copy). Click the public-link
+            # option before the link lookup, otherwise we land on the Export
+            # flow.
+            last_stage = "public_toggle"
             try:
                 await page.evaluate("""() => {
                     const items = [...document.querySelectorAll(
@@ -3319,6 +3351,7 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
                 log(f"[{label}] Visibility selection attempt: {e}", "WARN")
 
             # Look for shareable link in modal
+            last_stage = "link_lookup"
             link_el = await page.query_selector('input[value*="g.co/gemini"]')
             if not link_el:
                 link_el = await page.query_selector('input[value*="gemini.google.com/share"]')
@@ -3347,19 +3380,35 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
         if "share" not in url.lower():
-            # CUA fallback — explicit public sharing instructions
-            result = await agent_loop(cua_client, browser,
-                PROMPT_SHARE_GEMINI,
-                "Click the Share button for this Gemini conversation. "
-                "IMPORTANT: Change the access to 'Anyone with the link' (not Restricted). "
-                "Then copy the shareable link and tell me the EXACT URL (g.co/gemini/... or gemini.google.com/share/...).",
-                model=CUA_MODEL, max_iterations=12, verbose=verbose)
-            m = re.search(r'https://[^\s]+gemini[^\s]*share[^\s]*', (result.get("text") or ""))
-            if not m:
-                m = re.search(r'https://g\.co/gemini/[^\s]+', (result.get("text") or ""))
-            if m:
-                url = m.group(0)
-            else:
+            # CUA fallback — explicit public sharing instructions, capped at
+            # 90 s. Without the cap, an outer 90 s budget at the call-site
+            # (extract_and_record_agent inline share extraction) could be
+            # consumed entirely by a stuck CUA loop and still time out, with
+            # the page never getting to even check the clipboard.
+            last_stage = "cua_fallback"
+            try:
+                result = await asyncio.wait_for(
+                    agent_loop(cua_client, browser,
+                        PROMPT_SHARE_GEMINI,
+                        "Click the Share button for this Gemini conversation. "
+                        "IMPORTANT: Change the access to 'Anyone with the link' (not Restricted). "
+                        "Then copy the shareable link and tell me the EXACT URL "
+                        "(g.co/gemini/... or gemini.google.com/share/...).",
+                        model=CUA_MODEL, max_iterations=12, verbose=verbose),
+                    timeout=90.0,
+                )
+                m = re.search(r'https://[^\s]+gemini[^\s]*share[^\s]*', (result.get("text") or ""))
+                if not m:
+                    m = re.search(r'https://g\.co/gemini/[^\s]+', (result.get("text") or ""))
+                if m:
+                    url = m.group(0)
+                else:
+                    clip = get_clipboard()
+                    if clip and ("gemini" in clip or "g.co" in clip) and "share" in clip:
+                        url = clip
+            except asyncio.TimeoutError:
+                log(f"[{label}] CUA fallback exceeded 90s — using best-effort URL", "WARN")
+                # Salvage: maybe CUA copied to clipboard before the timeout.
                 clip = get_clipboard()
                 if clip and ("gemini" in clip or "g.co" in clip) and "share" in clip:
                     url = clip
@@ -3373,32 +3422,96 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
         verified = ("gemini.google.com/share" in _lu) or ("g.co/gemini" in _lu)
         return LinkResult(url=url, label=label, platform="gemini", verified=verified)
     except Exception as e:
-        return LinkResult(url=url, label=label, platform="gemini", error=str(e))
+        return LinkResult(url=url, label=label, platform="gemini",
+                          error=f"{last_stage}: {type(e).__name__}: {e}")
 
 
 async def extract_share_link_claude(browser, cua_client, label="Claude Deep Research", verbose=False):
-    """Extract shareable Claude artifact link. Tries publish_open_claude_artifact first
-    (artifact panel may still be open from extraction), falls back to full CUA flow."""
+    """Extract shareable Claude artifact link.
+
+    Hardened 2026-04-25:
+    - **Close first, open last**: Claude conversations with multiple
+      artifacts can leave a non-final artifact panel open after content
+      extraction (e.g. the early "research plan" artifact, with the real
+      deep-research output written to a SECOND artifact below it). The
+      `publish_open_claude_artifact` primary path publishes whatever's
+      open — if that's the wrong one, the URL we return points at the
+      plan, not the report. Explicit close-1st-then-open-last sequence
+      forces the correct selection before publishing.
+    - **90 s CUA cap**: the CUA fallback is wrapped in asyncio.wait_for so
+      a stuck CUA loop can't blow the inline 90 s outer budget.
+    - **Stage-tagged errors** for operator visibility.
+    """
     page = browser.page
     url = await browser.current_url() or ""
+    last_stage = "init"
     try:
-        # Primary: try publishing via the already-open artifact panel
+        # Step 1: close any currently-open artifact panel and open the
+        # LAST artifact in the conversation (the deep-research output).
+        last_stage = "select_last_artifact"
+        try:
+            await page.evaluate("""() => {
+                // Close any open artifact panel first.
+                const closeBtn = document.querySelector(
+                    'aside button[aria-label*="Close"], aside button[aria-label*="close"]'
+                );
+                if (closeBtn) closeBtn.click();
+            }""")
+            await asyncio.sleep(0.5)
+            opened = await page.evaluate("""() => {
+                // Find all artifact-preview tiles in the conversation, click the LAST one.
+                // Selectors target the inline cards that open the right-side artifact panel.
+                const candidates = document.querySelectorAll(
+                    '[data-testid*="artifact"], button[aria-label*="Open artifact"], ' +
+                    'button[aria-label*="open artifact"], a[href*="/artifacts/"], ' +
+                    '[class*="artifact-preview"], [class*="ArtifactPreview"]'
+                );
+                if (candidates.length === 0) return 'no_artifacts';
+                const last = candidates[candidates.length - 1];
+                // Some preview cards aren't directly clickable — fall through to
+                // a clickable ancestor (button or [role="button"]).
+                const target = last.closest('button, [role="button"]') || last;
+                target.click();
+                return 'opened_last';
+            }""")
+            if opened == 'opened_last':
+                # Let the artifact panel render before publish_open_claude_artifact
+                # tries to find its publish/share button.
+                await asyncio.sleep(1.5)
+        except Exception as _ce:
+            log(f"[{label}] artifact-select prelude skipped: {_ce}", "DEBUG")
+
+        # Primary: try publishing via the (now correctly-selected) artifact panel
+        last_stage = "publish_dom"
         published_url = await publish_open_claude_artifact(page, browser, cua_client, verbose=verbose)
         if published_url and 'claude.' in published_url:
             url = published_url
         else:
-            # Fallback: full CUA flow with PROMPT_PUBLISH_CLAUDE
-            result = await agent_loop(cua_client, browser,
-                PROMPT_PUBLISH_CLAUDE,
-                "Publish the research ARTIFACT in the right panel (not the conversation). "
-                "If two artifacts exist, open the SECOND/bottom one first. Click the Publish/Share icon on the artifact. "
-                "Get the published URL (claude.site/artifacts/... or claude.ai/...). Tell me the URL.",
-                model=CUA_MODEL, max_iterations=12, verbose=verbose)
-            text = (result.get("text") or "")
-            m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
-            if m:
-                url = m.group(0)
-            else:
+            # Fallback: full CUA flow, capped at 90s so a stuck loop doesn't
+            # blow the inline 90s outer budget at the call-site.
+            last_stage = "cua_fallback"
+            try:
+                result = await asyncio.wait_for(
+                    agent_loop(cua_client, browser,
+                        PROMPT_PUBLISH_CLAUDE,
+                        "Publish the research ARTIFACT in the right panel (not the conversation). "
+                        "If two artifacts exist, open the SECOND/bottom one first. "
+                        "Click the Publish/Share icon on the artifact. "
+                        "Get the published URL (claude.site/artifacts/... or claude.ai/...). "
+                        "Tell me the URL.",
+                        model=CUA_MODEL, max_iterations=12, verbose=verbose),
+                    timeout=90.0,
+                )
+                text = (result.get("text") or "")
+                m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
+                if m:
+                    url = m.group(0)
+                else:
+                    clip = get_clipboard()
+                    if clip and "claude." in clip:
+                        url = clip
+            except asyncio.TimeoutError:
+                log(f"[{label}] CUA fallback exceeded 90s — using best-effort URL", "WARN")
                 clip = get_clipboard()
                 if clip and "claude." in clip:
                     url = clip
@@ -3409,14 +3522,23 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
         verified = "claude.site" in url.lower()
         return LinkResult(url=url, label=label, platform="claude", verified=verified)
     except Exception as e:
-        return LinkResult(url=url, label=label, platform="claude", error=str(e))
+        return LinkResult(url=url, label=label, platform="claude",
+                          error=f"{last_stage}: {type(e).__name__}: {e}")
 
 
 async def _set_nlm_public_and_get_link(page, label):
     """Shared helper: inside an open NotebookLM share dialog,
     set Notebook access → 'Anyone with the link', copy/get the link, click Save.
-    Returns the extracted URL or ''."""
+
+    Returns a tuple (url, public_verified) — `public_verified` is True only
+    when the dialog DOM confirms the access dropdown reads "Anyone with the
+    link" before save. NotebookLM private and public URLs share the same
+    `/notebook/{id}` shape, so URL format alone can't tell them apart — DOM
+    verification is the only way to know the link is genuinely shareable.
+    Phase 3's caller treats `public_verified=False` as a soft failure (still
+    returns the URL so the run can continue, but logs prominently)."""
     url = ""
+    public_verified = False
     try:
         # Step 1: Find "Notebook access" section and change to public
         # NLM share dialog shows "Notebook access" with a dropdown (not "Restricted")
@@ -3497,7 +3619,55 @@ async def _set_nlm_public_and_get_link(page, label):
         elif link and "notebooklm.google.com" in link:
             url = link
 
-        # Step 3: Click Save/Done to apply the sharing change
+        # Step 3a: DOM-verify the access dropdown reads "Anyone with the
+        # link" BEFORE we save. We require a STRICT signal — either:
+        #   (a) the dropdown trigger's *own text node* (not its descendants)
+        #       contains "anyone with the link", OR
+        #   (b) an aria-selected/aria-checked element inside the dialog
+        #       contains "anyone with the link".
+        # Why so strict: Material-style dropdowns place the option list as a
+        # child of the trigger when open; reading `.innerText` on the trigger
+        # captures sibling option labels and would falsely match. Reading the
+        # trigger's directly-owned text only (childNodes Text nodes) avoids
+        # this. The body-only "soft accept" path was removed — too prone to
+        # false positives when the dropdown is left open. Better to undercount
+        # public-verifies (fall through to URL-shape recovery in the caller)
+        # than to falsely confirm a private link.
+        try:
+            public_verified = bool(await page.evaluate("""() => {
+                const PHRASE = 'anyone with the link';
+                // Read only the directly-owned text of an element (no descendants).
+                const ownText = (el) => {
+                    let s = '';
+                    for (const n of el.childNodes) {
+                        if (n.nodeType === 3 /* TEXT_NODE */) s += n.nodeValue || '';
+                    }
+                    return s.toLowerCase();
+                };
+                // Layer (a): dropdown trigger's own text node only.
+                const triggers = document.querySelectorAll(
+                    '[role="dialog"] [role="combobox"], [role="dialog"] [aria-haspopup="listbox"], ' +
+                    '[role="dialog"] button[aria-expanded]'
+                );
+                for (const t of triggers) {
+                    if (ownText(t).includes(PHRASE)) return true;
+                }
+                // Layer (b): explicit aria-selected/aria-checked element in the dialog.
+                const dlg = document.querySelector('[role="dialog"]');
+                if (dlg) {
+                    const active = dlg.querySelector(
+                        '[aria-selected="true"], [aria-checked="true"], [data-selected="true"]'
+                    );
+                    if (active && (active.innerText || '').toLowerCase().includes(PHRASE)) {
+                        return true;
+                    }
+                }
+                return false;
+            }"""))
+        except Exception as _ve:
+            log(f"[{label}] public-access DOM verify skipped: {_ve}", "DEBUG")
+
+        # Step 3b: Click Save/Done to apply the sharing change.
         await page.evaluate("""() => {
             const btns = document.querySelectorAll('button');
             for (const b of btns) {
@@ -3510,9 +3680,13 @@ async def _set_nlm_public_and_get_link(page, label):
             return '';
         }""")
         await asyncio.sleep(1)
+        if public_verified:
+            log(f"[{label}] Public share DOM-verified — link is shareable")
+        else:
+            log(f"[{label}] Public share NOT DOM-verified — returned link may be private", "WARN")
     except Exception as e:
         log(f"[{label}] NLM public share flow: {e}", "WARN")
-    return url
+    return url, public_verified
 
 
 async def _ensure_gdoc_public(page) -> bool:
@@ -3603,9 +3777,16 @@ async def _ensure_gdoc_public(page) -> bool:
 
 async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
     """Extract NotebookLM notebook URL after ensuring public sharing is enabled.
-    Flow: Share → Notebook access → public → get link → Save."""
+    Flow: Share → Notebook access → public → get link → Save.
+
+    `verified=True` requires BOTH a NotebookLM URL shape AND DOM-confirmed
+    public-share (Anyone with the link). Without DOM verification, the URL
+    could be a private notebook link, which would 404 or "Request access"
+    for anyone but the owner downstream in Phase 5's email/Doc.
+    """
     page = browser.page
     url = await browser.current_url() or ""
+    public_verified = False
     try:
         # Click Share button to open dialog
         share_btn = await page.query_selector(
@@ -3615,9 +3796,10 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
         if share_btn:
             await share_btn.click()
             await asyncio.sleep(2)
-            link = await _set_nlm_public_and_get_link(page, "NotebookLM")
+            link, dom_verified = await _set_nlm_public_and_get_link(page, "NotebookLM")
             if link:
                 url = link
+            public_verified = bool(dom_verified)
             # Close dialog
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
@@ -3637,12 +3819,17 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
                     clip = get_clipboard()
                     if clip and "notebooklm.google.com" in clip:
                         url = clip
+                # CUA path doesn't expose the share-state DOM, so we can't
+                # DOM-verify. Treat as unverified — the run still emits the
+                # link, but downstream consumers know it might be private.
     except Exception as e:
         log(f"[NotebookLM] Share dialog failed: {e}", "WARN")
     # Fallback to current tab URL
     if not url or "notebooklm.google.com/notebook" not in url:
         url = await browser.current_url() or ""
-    verified = "notebooklm.google.com/notebook" in url
+    # verified = NotebookLM URL shape + DOM-confirmed public access. URL
+    # alone is not sufficient since private/public share the same shape.
+    verified = ("notebooklm.google.com/notebook" in url) and public_verified
     return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm", verified=verified)
 
 
@@ -4527,6 +4714,73 @@ async def scrape_progress_chatgpt(page):
                                 result["dr_done_text"] = True
                     except Exception as _ie:
                         log(f"ChatGPT DR iframe evaluate skipped: {_ie}", "DEBUG")
+                    # ── Optional: actively expand the "Cited sources" panel ──
+                    # ChatGPT DR collapses the sources list by default — the
+                    # `<a href>` nodes inside it are NOT rendered until the
+                    # user clicks the panel. The default scrape above misses
+                    # those links and undercounts sources (often 0–3 instead
+                    # of 10–20). When DG_SOURCE_PANEL_EXPAND is set, we click
+                    # the toggle, wait for lazy render, and re-scrape. Off by
+                    # default so we don't perturb the DR UI mid-run; flip on
+                    # once stable. Wrapped in try/except so any failure
+                    # silently keeps the partial result we already collected.
+                    if os.environ.get("DG_SOURCE_PANEL_EXPAND", "").lower() in ("1", "true", "yes"):
+                        try:
+                            click_res = await frame.evaluate("""() => {
+                                const candidates = document.querySelectorAll('button, [role="button"]');
+                                for (const b of candidates) {
+                                    const t = (b.textContent || '').trim().toLowerCase();
+                                    const al = (b.getAttribute('aria-label') || '').toLowerCase();
+                                    const isSourcesLabel =
+                                        t === 'sources' || t === 'cited sources' ||
+                                        /^\\d+\\s+sources?$/.test(t) ||
+                                        al.includes('cited source') || al === 'sources';
+                                    if (!isSourcesLabel) continue;
+                                    const expanded = b.getAttribute('aria-expanded');
+                                    if (expanded === 'true') {
+                                        return { clicked: false, alreadyExpanded: true, label: t || al };
+                                    }
+                                    b.click();
+                                    return { clicked: true, label: t || al };
+                                }
+                                return { clicked: false, found: false };
+                            }""")
+                            if click_res and click_res.get("clicked"):
+                                # Lazy render needs a beat. 1.0s is generous —
+                                # the list either appears immediately or the
+                                # panel was already populated.
+                                await asyncio.sleep(1.0)
+                                try:
+                                    dr2 = await frame.evaluate("""() => {
+                                        const srcSet = new Set();
+                                        document.querySelectorAll('a[href^="http"]').forEach(a => {
+                                            const h = a.href || '';
+                                            if (h.length < 500 &&
+                                                !h.includes('chatgpt.com') && !h.includes('openai.com') &&
+                                                !h.includes('oaiusercontent')) srcSet.add(h);
+                                        });
+                                        return { source_urls: Array.from(srcSet).slice(0, 30) };
+                                    }""")
+                                    if dr2 and dr2.get("source_urls"):
+                                        # Union (preserve order) instead of replace —
+                                        # the panel may render different URLs than the
+                                        # pre-click DOM scrape (different ordering or
+                                        # subset). Strict `>` would skip cases where
+                                        # post-click count ties pre-click but the URLs
+                                        # are objectively different.
+                                        seen_u = set(result.get("source_urls") or [])
+                                        unioned = list(result.get("source_urls") or [])
+                                        for u in dr2["source_urls"]:
+                                            if u not in seen_u:
+                                                seen_u.add(u)
+                                                unioned.append(u)
+                                        if len(unioned) > result.get("sources", 0):
+                                            result["source_urls"] = unioned[:30]
+                                            result["sources"] = len(result["source_urls"])
+                                except Exception as _re2:
+                                    log(f"ChatGPT sources-panel re-scrape skipped: {_re2}", "DEBUG")
+                        except Exception as _se:
+                            log(f"ChatGPT sources-panel expand skipped: {_se}", "DEBUG")
                     break
         except Exception as _fe:
             log(f"ChatGPT frames iteration skipped: {_fe}", "DEBUG")
@@ -6630,14 +6884,19 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
     except Exception:
         conversation_url = ""
 
-    # Step 3 — Markdown-as-primary emit (P1 mirror).
-    # The moment MD is on disk + in Firestore, the FE /documents viewer can
-    # render it. Emit link_extracted (verified=True, primary=True) + agent_progress
-    # complete IMMEDIATELY so the FE flips to "done" without waiting on share.
+    # Step 3 — Markdown-as-primary emit (P1 mirror), STRICT gate.
+    # The FE flips an agent to ✓ only when it sees:
+    #   (a) link_extracted with primary=true + verified=true, AND
+    #   (b) the doc reachable via useResearches (subcollection sync).
+    # Therefore we must NOT emit `complete` unless both _fb_research_id (so the
+    # in-app URL has an anchor) AND n_chars > 0 (so a doc actually exists in
+    # Firestore for the FE to find). A bare /documents URL without anchor is
+    # not enough — it would let the FE flip ✓ without a real target.
+    has_anchor = bool(_fb_research_id)
     _in_app_url = (f"/documents?open={_fb_research_id}:{agent_key}"
-                   if _fb_research_id else "/documents")
+                   if has_anchor else "/documents")
     _in_app_label = f"Read {name} report"
-    if n_chars > 0:
+    if n_chars > 0 and has_anchor:
         try:
             emit_event("link_extracted", phase=2, agent=agent_key,
                        url=_in_app_url, label=_in_app_label,
@@ -6655,23 +6914,85 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         except Exception:
             pass
     else:
-        # No content extracted — emit failed (no in-app primary to surface).
+        # No content extracted OR no anchor — emit failed (FE keeps spinner,
+        # never flips ✓ without a reachable doc).
+        _why = ("0 chars" if n_chars <= 0 else "no research anchor (_fb_research_id missing)")
         try:
             emit_event("agent_progress", phase=2, agent=agent_key,
                        status="failed",
-                       progress=f"Content extraction returned 0 chars ({elapsed_sec}s)",
-                       partialTextLen=0,
+                       progress=f"Content extraction failed — {_why} ({elapsed_sec}s)",
+                       partialTextLen=max(int(n_chars), 0),
                        elapsedSec=int(elapsed_sec or 0))
         except Exception:
             pass
 
-    # 2026-04-25: Share-link extraction REMOVED from P2.
-    # The in-app /documents?open=… primary is the only link that matters
-    # for FE display in PhaseDropdown (opens DocumentViewer modal in-place).
-    # Phase 5 (Google Doc creation) does its own share-link extraction via
-    # Phase 3's run_phase3_upload — independent of P2. The share-link
-    # extractor functions (extract_share_link_*) are kept for Phase 5 but
-    # no longer called from P2.
+    # ── Step 4 — Inline share-link extraction (Option A, 2026-04-25) ──
+    # Best-effort, **NOT streamed to FE**. We call the extractor functions
+    # directly (no extract_with_retry) so we don't emit `link_extracting` /
+    # `link_extracted` / `link_extraction_failed` events into the FE event
+    # stream. The FE already showed `link_extracted primary=true` for the
+    # in-app /documents URL above; a second link_extracted for the share
+    # URL would land as a non-primary record (filtered out by P1+P2 strict
+    # rule) but would still bloat steps[] and dirty agentAlerts via the
+    # usePipeline link_extracted handler. Direct call keeps the FE clean.
+    #
+    # 90 s outer budget per agent. Public success → kind="public",
+    # verified=True. Public failure (timeout, error, unverified URL) →
+    # conversation URL, kind="conversation", verified=False. The run
+    # always advances; Phase 5 always has *some* URL.
+    if n_chars > 0:
+        share_extractor_map = {
+            "ChatGPT": extract_share_link_chatgpt,
+            "Gemini":  extract_share_link_gemini,
+            "Claude":  extract_share_link_claude,
+        }
+        share_extractor = share_extractor_map.get(name)
+        share_url = conversation_url
+        share_kind = "conversation"
+        share_verified = False
+        share_label = f"{name} conversation"
+        if share_extractor:
+            _share_t0 = time.time()
+            try:
+                link_res = await asyncio.wait_for(
+                    share_extractor(browser, cua_client=cua_client,
+                                    label=f"{name} public share", verbose=verbose),
+                    timeout=90.0,
+                )
+                _elapsed_share = time.time() - _share_t0
+                # Validate against the same rules extract_with_retry uses, so
+                # we don't pin a junk URL onto _runtime.agent_share_urls.
+                if (link_res and link_res.url and
+                        validate_link(agent_key, link_res.url)):
+                    share_url = link_res.url
+                    share_kind = "public"
+                    share_verified = True
+                    share_label = link_res.label or f"{name} public share"
+                    log(f"[{name}] Inline share-link extracted ({_elapsed_share:.1f}s): {share_url}")
+                else:
+                    err = (link_res.error if link_res else "no result")
+                    log(f"[{name}] Inline share-link unverified ({err}, {_elapsed_share:.1f}s) "
+                        f"— falling back to conversation URL silently", "INFO")
+            except asyncio.TimeoutError:
+                log(f"[{name}] Inline share-link timed out (90s) "
+                    f"— falling back to conversation URL silently", "INFO")
+            except Exception as _e:
+                log(f"[{name}] Inline share-link errored ({_e}) "
+                    f"— falling back to conversation URL silently", "INFO")
+        # Stash for Phase 5 — agent_chat_urls already has the conversation URL,
+        # but agent_share_urls carries kind/verified so the Doc builder can
+        # decide whether to label "Public share" or "Conversation".
+        try:
+            _runtime.agent_share_urls[name] = {
+                "url": share_url,
+                "kind": share_kind,
+                "label": share_label,
+                "verified": share_verified,
+            }
+        except Exception:
+            # _runtime is a process-level singleton — should always exist.
+            # If it doesn't, Phase 5's fallback (agent_chat_urls) still works.
+            pass
 
     return {
         "status": "done" if n_chars > 0 else "failed",
@@ -10691,8 +11012,15 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 }""")
                 await asyncio.sleep(2)
 
-            # Step 3: Use shared helper for NLM public access + get link + Save
-            audio_overview_url = await _set_nlm_public_and_get_link(page, "Audio")
+            # Step 3: Use shared helper for NLM public access + get link + Save.
+            # Helper returns (url, public_verified). Audio share doesn't have
+            # a separate downstream consumer that gates on public_verified —
+            # we still log it for diagnostic purposes and proceed.
+            audio_overview_url, audio_public_verified = await _set_nlm_public_and_get_link(page, "Audio")
+            if audio_public_verified:
+                log("[Audio] Public share DOM-verified")
+            else:
+                log("[Audio] Public share NOT DOM-verified — audio link may be private", "WARN")
 
             if not audio_overview_url:
                 # Fallback: use current URL
@@ -11139,7 +11467,17 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
     log("PHASE 5: Doc + Email Delivery")
     log("=" * 60)
 
-    # Build doc content — structured format matching PRD
+    # Build doc content — structured format matching PRD.
+    #
+    # 2026-04-25 (Commit 14): prefer _runtime.agent_share_urls[name] over the
+    # `links` arg. The inline share-link extractor in extract_and_record_agent
+    # (Commit 11) populates agent_share_urls with public-share URLs when the
+    # public toggle succeeded, or the conversation URL as a silent fallback.
+    # Either way, the URL stashed there is the one we want in the Doc — it's
+    # newer/canonical and carries verification state. The legacy `links` arg
+    # is the conversation URL captured at extraction time and is only used as
+    # a final fallback (e.g. for resumed runs where _runtime was reset
+    # between phases).
     short_topic = topic[:100] if len(topic) > 100 else topic
     doc_lines = [
         f"{short_topic}",
@@ -11149,8 +11487,26 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
     if brief_url:
         doc_lines.append(f"ChatGPT Brief: {brief_url}")
     for name in ["ChatGPT", "Gemini", "Claude"]:
-        url = links.get(name, "")
-        if url:
+        share = _runtime.agent_share_urls.get(name) or {}
+        share_url = share.get("url") or ""
+        share_kind = share.get("kind") or ""
+        # Fallback chain: _runtime public share → _runtime conversation →
+        # legacy `links` arg (conversation captured at extraction time).
+        url = share_url or links.get(name, "")
+        if not url:
+            continue
+        # Tag the line so the recipient knows whether the link is a real
+        # public share or just the agent's chat URL. Public links are
+        # readable by anyone; conversation URLs only by the original
+        # signed-in user — important context for an email recipient.
+        if share_kind == "public" and share.get("verified"):
+            doc_lines.append(f"{name} (public share): {url}")
+        elif share_url:
+            # _runtime knows this is a conversation-URL fallback.
+            doc_lines.append(f"{name} (conversation): {url}")
+        else:
+            # No _runtime entry — legacy `links` path. Treat as conversation
+            # since that's what the legacy arg has historically been.
             doc_lines.append(f"{name}: {url}")
     doc_lines.append("")
     if notebook_url:
@@ -12272,41 +12628,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     links=_p1_links,
                     summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
                 _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
-                # ── Best-effort secondary link (share/conversation URL) ──
-                # Tightened to 1 outer attempt × 90s — this is no longer
-                # blocking phase advancement, just a nice-to-have "view
-                # original ChatGPT conversation" link beside the in-app
-                # markdown. If we fail, fall back to the conversation URL
-                # silently (no warning, no pause).
-                _share_url = brief_url  # conversation URL captured before extraction
-                try:
-                    p1_link = await asyncio.wait_for(
-                        extract_with_retry(
-                            phase=1, agent="chatgpt", browser=browser, cua_client=cua_client,
-                            extractor_fn=extract_share_link_chatgpt,
-                            label="ChatGPT conversation", verbose=verbose,
-                        ),
-                        timeout=90.0,
-                    )
-                    if p1_link.verified and p1_link.url:
-                        _share_url = p1_link.url
-                        log(f"Phase 1: secondary share link extracted: {_share_url}")
-                    else:
-                        log(f"Phase 1: secondary share link unverified ({p1_link.error}) — using conversation URL", "INFO")
-                except asyncio.TimeoutError:
-                    log("Phase 1: secondary share-link extraction timed out (90s) — using conversation URL", "INFO")
-                except Exception as _e:
-                    log(f"Phase 1: secondary share-link extraction errored ({_e}) — using conversation URL", "INFO")
-                # Always emit a secondary link_extracted so FE can show
-                # "View on ChatGPT" beside "Read brief". verified=True
-                # only when the public share URL succeeded; otherwise the
-                # conversation URL is unverified-but-usable.
-                if _share_url:
-                    emit_event("link_extracted", phase=1, agent="chatgpt",
-                               url=_share_url,
-                               label="View on ChatGPT",
-                               verified=("chatgpt.com/share" in _share_url),
-                               fallback=None if "chatgpt.com/share" in _share_url else "conversation_url")
+                # 2026-04-25: P1 secondary "View on ChatGPT" link removed.
+                # The in-app /documents?open=…:brief primary is the only link
+                # surfaced to the FE. The conversation URL (brief_url, captured
+                # at line ~12209) still propagates to Phase 5 for the Google
+                # Doc — it just isn't streamed as a separate link_extracted.
         else:
             # Load brief from documents/ (new location) or root (old location)
             for bp in [queue_dir / "documents" / "brief.md", queue_dir / "brief.md"]:
@@ -12773,8 +13099,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         extractor_fn=extract_notebooklm_url,
                         label="NotebookLM Notebook", verbose=verbose,
                     )
-                    if nb_res.verified:
+                    # 2026-04-25 (Commit 9 follow-up): `verified` now requires
+                    # BOTH a NotebookLM URL shape AND a DOM-confirmed public
+                    # share. The DOM-verify can fail for benign reasons
+                    # (Material dropdown without aria-selected, transient
+                    # eval error, dialog already closed), so gating the
+                    # recovery loop on `verified` alone would starve fine
+                    # notebooks. Accept URL-shape-only here — the link still
+                    # works for the user even if not DOM-confirmed public.
+                    # If the link turns out to be private, downstream Doc/email
+                    # consumers will surface the auth error to the recipient,
+                    # which is the only context where it actually matters.
+                    if nb_res.verified or (nb_res.url and "notebooklm.google.com/notebook" in nb_res.url):
                         notebook_url = nb_res.url
+                        if not nb_res.verified:
+                            log("[NotebookLM] URL-shape OK but public-share NOT DOM-verified — "
+                                "downstream link may be private", "WARN")
                         break
                     log(f"Phase 3: no verified NotebookLM URL after retries — awaiting user decision ({nb_res.error})", "ERROR")
                     fail_phase(
