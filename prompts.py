@@ -261,25 +261,39 @@ view (typically a dialog or full-screen overlay with the report content).
 If you see that overlay, the artifact is OPEN — skip straight to step 3.
 
 Steps:
-1. Look at the screen. Is a canvas/document overlay (full-screen or dialog
-   showing the research report) ALREADY open?
-   - YES → skip to step 3.
-   - NO  → continue to step 2.
-2. Scroll DOWN in the chat to find the research document card (it has an
+1. CHECK FOR OPEN SOURCE PANEL FIRST: if a side panel is showing a list of
+   sources/citations (numbered URLs with site favicons, "Looking into X…"
+   header), it is BLOCKING the canvas. Click its X / close icon, OR press
+   Escape, BEFORE doing anything else. The canvas/document overlay is NOT
+   the source panel. If both are open, close the source panel first.
+2. Look at the screen. Is a canvas/document overlay (full-screen or dialog
+   showing the research report with multiple ## headings and prose) ALREADY
+   open?
+   - YES → skip to step 4.
+   - NO  → continue to step 3.
+3. Scroll DOWN in the chat to find the research document card (it has an
    enlarge/expand button and a download button). Click the ENLARGE button
    to open the full document.
-3. Once the document is open (or already open), look for a "Copy" button
+4. Once the document is open (or already open), look for a "Copy" button
    at the top of the canvas. Click it.
-4. If no Copy button, click inside the document text, press Ctrl+A
+5. If no Copy button, click inside the document text, press Ctrl+A
    (select all), then Ctrl+C (copy).
-5. Say "copied" when done.
+6. VERIFY CONTENT before saying done: clipboard MUST contain a long-form
+   research report (multiple ## headings, prose paragraphs, citations,
+   typically >3000 chars). If the copied text is a short list of URLs (the
+   source panel) or a chat acknowledgement preamble (~500-1500 chars), say
+   "wrong content: source-panel" or "wrong content: preamble" and STOP —
+   the orchestrator will retry. Otherwise say "copied".
 
 IMPORTANT:
 - If Playwright pre-opened the canvas, you should NOT need to scroll or
   click ENLARGE again — re-clicking can collapse the canvas. Verify the
   current screen state BEFORE acting.
 - The document card (when not yet opened) is BELOW the user's message
-  in the chat. Scroll down to find it."""
+  in the chat. Scroll down to find it.
+- The source panel is on the RIGHT and shows numbered URLs + favicons.
+  The canvas is a full-screen reading view with markdown rendering.
+  These are DIFFERENT UI elements — close source first, then open canvas."""
 
 PROMPT_COPY_ARTIFACT_CLAUDE = SYSTEM_BASE + """
 
@@ -302,17 +316,30 @@ Steps:
    (bottom-most) artifact card — earlier ones are thinking traces
    or intermediate tracking artifacts. This opens the FINAL research
    report in the right panel.
-3. In the right panel, click the "Copy" button at the top of the
+3. VERIFY THIS IS THE FINAL REPORT before copying: scan the right panel
+   content. The final report has multiple ## section headings (Executive
+   Summary, Findings, Sources, etc.) and dense prose. The intermediate
+   tracking artifact is a short checklist of bullet points like
+   "[x] Reading source 1" / "[ ] Analyzing X" — if you see that, you
+   opened the WRONG artifact. Close it (Escape or X), scroll to the LAST
+   card, click it. Do NOT proceed to copy until the right panel shows
+   multi-section prose.
+4. In the right panel, click the "Copy" button at the top of the
    artifact panel.
-4. If no Copy button, click inside the document text, press Ctrl+A,
+5. If no Copy button, click inside the document text, press Ctrl+A,
    then Ctrl+C.
-5. Say "copied" when done.
+6. VERIFY CONTENT before saying done: clipboard MUST contain a long-form
+   report (typically >5000 chars, multiple ## headings, prose paragraphs).
+   If it's the checklist (<2000 chars, only [x]/[ ] bullets, no real
+   headings), say "wrong content: checklist" and STOP — the orchestrator
+   will retry. Otherwise say "copied".
 
 IMPORTANT:
 - ALWAYS the LAST artifact card. Re-clicking the wrong one (e.g. the
   intermediate tracking artifact) silently grabs the wrong document.
 - If Playwright already opened the right panel onto the final report,
-  do NOT re-click the card — re-click can collapse the panel."""
+  do NOT re-click the card — re-click can collapse the panel.
+- Checklist content = WRONG artifact. Multi-section prose = correct."""
 
 PROMPT_COPY_RESPONSE = SYSTEM_BASE + """
 
@@ -636,3 +663,97 @@ IMPORTANT:
 - The URL format is: `https://claude.site/artifacts/{id}`
 - Don't close the artifact panel
 - If you cannot find the Publish button, describe what UI you see"""
+
+
+# ── Tier-3 panel-open fallbacks (used when DOM helpers miss 2x) ──────────────
+# These are short, hard-bounded prompts that ONLY click the activity strip /
+# first-artifact card and verify the side panel actually opened. They never
+# touch the composer, send button, model selector, or other artifacts. Caller
+# escalates here from research.py round-robin loop after 2 consecutive DOM
+# misses with `chatgpt_panel_dom_misses` / `claude_artifact_dom_misses`.
+
+PROMPT_OPEN_CHATGPT_SOURCE_PANEL = SYSTEM_BASE + """
+
+You are looking at a ChatGPT Deep Research conversation.
+
+GOAL: Click the collapsed activity strip at the bottom of the chat to open
+the side panel showing the full step list and source URLs.
+
+WHAT TO LOOK FOR:
+- A horizontal strip near the bottom of the conversation, BELOW the user's
+  prompt and ABOVE the composer.
+- Text pattern: "Looking into <topic>... <N> searches" or "Researching
+  <topic>... <N> sources". May also show "<N> results".
+- Often has a small spinner or progress indicator on the left and a count
+  badge ("196 searches", "47 sources") on the right.
+- It is a SINGLE horizontal bar, NOT a card. Width spans most of the chat
+  column.
+
+VERIFY STATE FIRST (do this BEFORE any click):
+- If a wide side panel is ALREADY visible on the right showing a numbered
+  step list with URLs — the panel is already open. Output exactly:
+  "panel: already_open". DO NOT CLICK.
+- If you cannot find the strip anywhere on screen — output exactly:
+  "panel: not_found". DO NOT CLICK.
+
+ACTION (only if strip is found AND panel is closed):
+- Click the strip ONCE. Single click only.
+- Wait ~1.5 seconds for the side panel to slide out from the right.
+- Verify: a panel now occupies the right ~40% of the screen showing
+  numbered steps and URL bullets.
+- If panel opened: output "panel: open".
+- If you clicked but the panel did NOT appear: output "panel: click_failed".
+
+HARD CONSTRAINTS:
+- DO NOT click the composer (text input at the bottom).
+- DO NOT click the send button.
+- DO NOT click the model selector at the top.
+- DO NOT click any source link, citation, or "View sources" button outside
+  the strip.
+- DO NOT scroll unless the strip is partially off-screen.
+- DO NOT click twice. ONE click only.
+- Stop after 5 iterations regardless of outcome."""
+
+
+PROMPT_OPEN_CLAUDE_SOURCE_ARTIFACT = SYSTEM_BASE + """
+
+You are looking at a Claude conversation that is running Research mode.
+
+GOAL: Click the FIRST artifact card (the research/sources tracking
+artifact) in the conversation so its content opens in the right side
+panel. This is NOT the final report — Claude posts the tracking artifact
+early and updates it live as it researches.
+
+WHAT TO LOOK FOR:
+- An artifact card embedded in the LEFT conversation column (Claude's
+  response area).
+- Title usually contains "Research", "Sources", "Tracking", or the topic
+  name with a checklist preview underneath.
+- It is the FIRST/EARLIEST artifact card if multiple exist — visually
+  higher up in the conversation.
+- DO NOT pick the last/bottom artifact card — that is the final report and
+  must NOT be opened by this step.
+
+VERIFY STATE FIRST (do this BEFORE any click):
+- If the right side panel is ALREADY showing artifact content with a
+  checklist of source URLs being reviewed — already open. Output exactly:
+  "panel: already_open". DO NOT CLICK.
+- If no artifact card is visible in the conversation — output exactly:
+  "panel: not_found". DO NOT CLICK.
+
+ACTION (only if first artifact found AND not already open):
+- Click the FIRST artifact card ONCE.
+- Wait ~1.5 seconds for the right panel to render the artifact content.
+- Verify: right panel now shows a checklist or step list with source URLs
+  (NOT prose paragraphs — that would mean wrong artifact opened).
+- If opened: output "panel: open".
+- If clicked but panel did NOT mount: output "panel: click_failed".
+
+HARD CONSTRAINTS:
+- DO NOT click the LAST artifact card. Only the FIRST.
+- DO NOT click the composer at the bottom.
+- DO NOT click the send button.
+- DO NOT click any source link inside an open artifact.
+- DO NOT click "Publish" or "Share".
+- ONE click only.
+- Stop after 5 iterations."""

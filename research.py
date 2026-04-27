@@ -5047,36 +5047,86 @@ async def scrape_progress_chatgpt(page):
 
 async def _open_chatgpt_activity_panel(page):
     """Click the collapsed activity strip (e.g. 'Looking into Hermes... 196 searches')
-    in ChatGPT Deep Research so the side panel with full step list and source URLs
-    slides out. Without this click, polling sees only the strip's truncated preview
-    text and undercounts sources. Idempotent: aria-expanded check skips re-click.
+    in ChatGPT Deep Research so the side panel with full step list + source URLs
+    slides out.
 
-    Strip lives in the DR sandbox iframe (oaiusercontent / web-sandbox), but we try
-    host page first as a safety net. Fingerprint is the trailing '\\d+ searches'
-    badge — uniquely identifies the strip; no other DR UI element shows it.
-    Returns dict {found, clicked|alreadyExpanded, label} or {found: False}."""
+    Robust selector (2026-04-26 v2): walks ALL elements (not just buttons —
+    ChatGPT renders the strip as a styled <div> with imperatively-bound click
+    handlers, so the v1 narrow `button, [role="button"]` selector matched 0
+    candidates and silently no-op'd across 3 user runs). Recurses into Shadow
+    DOM. Dispatches the full pointer/mouse event chain (pointerdown → mousedown
+    → pointerup → mouseup → click) instead of bare `.click()` so React's
+    synthetic listeners fire. Tries the leaf element then 5 ancestors.
+
+    Returns dict with `found`, `candidates` (count of text-matched nodes),
+    `clicked`, `alreadyExpanded`, `label`, `clickedTag`. Caller uses
+    `_verify_chatgpt_panel_open(page)` 2s post-click to confirm side panel
+    actually rendered (mitigates silent click failures)."""
     JS = """() => {
-        const COUNT = /\\b\\d+\\s+searches?\\b/i;
-        const cands = Array.from(document.querySelectorAll(
-            'button, [role="button"], [aria-expanded]'
-        ));
-        let best = null, bestY = -1;
-        for (const el of cands) {
-            const t = (el.innerText || '').trim();
-            if (!t || t.length > 300) continue;
-            if (!COUNT.test(t)) continue;
-            const r = el.getBoundingClientRect();
-            if (r.top > bestY) { best = el; bestY = r.top; }
+        // searches | sources | results — covers all observed badge wordings
+        const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?)\\b/i;
+        const seen = new WeakSet();
+        const hits = [];
+        function walk(root) {
+            if (!root || seen.has(root)) return;
+            seen.add(root);
+            let nodes;
+            try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
+            if (nodes.length > 8000) return;  // bail on absurd page sizes
+            for (const el of nodes) {
+                if (el.shadowRoot) walk(el.shadowRoot);
+                const t = (el.innerText || el.textContent || '').trim();
+                if (!t || t.length < 4 || t.length > 300) continue;
+                if (!COUNT.test(t)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                hits.push({ el, top: r.top, len: t.length });
+            }
         }
-        if (!best) return { found: false };
-        const btn = best.closest('button, [role="button"], [aria-expanded]') || best;
-        const expanded = btn.getAttribute('aria-expanded');
-        const label = (btn.innerText || '').trim().slice(0, 160);
-        if (expanded === 'true') return { found: true, alreadyExpanded: true, label };
-        try { btn.click(); } catch (e) {
-            return { found: true, clicked: false, label, error: String(e) };
+        walk(document);
+        if (!hits.length) return { found: false, candidates: 0 };
+        // lowest-on-page (the strip lives at the bottom), then shortest text
+        // (tightest match around the badge — disambiguates from outer wrappers)
+        hits.sort((a, b) => (b.top - a.top) || (a.len - b.len));
+        const target = hits[0].el;
+        const label = (target.innerText || target.textContent || '').trim().slice(0, 160);
+        // aria-expanded check up the chain — skip re-click if already open
+        let probe = target;
+        for (let i = 0; i < 6 && probe; i++) {
+            if (probe.getAttribute && probe.getAttribute('aria-expanded') === 'true') {
+                return { found: true, alreadyExpanded: true, label, candidates: hits.length };
+            }
+            probe = probe.parentElement;
         }
-        return { found: true, clicked: true, label };
+        // parent-chain dispatch loop — try leaf, then up to 5 ancestors
+        const tries = [];
+        let node = target;
+        for (let i = 0; i < 6 && node; i++) {
+            tries.push(node);
+            node = node.parentElement;
+        }
+        let clickedTag = '';
+        let lastErr = '';
+        for (const n of tries) {
+            try {
+                const r = n.getBoundingClientRect();
+                const x = r.left + r.width / 2, y = r.top + r.height / 2;
+                const opts = { bubbles: true, cancelable: true, view: window,
+                               clientX: x, clientY: y, button: 0 };
+                // Full event chain — covers React onPointerDown/onMouseDown/onClick
+                n.dispatchEvent(new MouseEvent('pointerdown', opts));
+                n.dispatchEvent(new MouseEvent('mousedown',  opts));
+                n.dispatchEvent(new MouseEvent('pointerup',  opts));
+                n.dispatchEvent(new MouseEvent('mouseup',    opts));
+                n.dispatchEvent(new MouseEvent('click',      opts));
+                clickedTag = (n.tagName || '') +
+                             (n.getAttribute && n.getAttribute('role')
+                                 ? `[${n.getAttribute('role')}]` : '');
+                break;
+            } catch (e) { lastErr = String(e); continue; }
+        }
+        return { found: true, clicked: !!clickedTag, label,
+                 candidates: hits.length, clickedTag, error: lastErr };
     }"""
     try:
         res = await page.evaluate(JS)
@@ -5102,7 +5152,61 @@ async def _open_chatgpt_activity_panel(page):
                     continue
     except Exception:
         pass
-    return {"found": False}
+    return {"found": False, "candidates": 0}
+
+
+async def _verify_chatgpt_panel_open(page):
+    """Returns True if a wide side panel is now visible on the right side of
+    the ChatGPT DR viewport. Used post-click to detect silent click failures.
+
+    Heuristic: an <aside> / [role="complementary"] / [aria-label*="source"i]
+    / [class*="panel"] element with width >= 280px and at least one URL or
+    numbered step row inside."""
+    JS = """() => {
+        const sels = [
+            'aside', '[role="complementary"]', '[role="region"]',
+            '[aria-label*="source" i]', '[aria-label*="research" i]',
+            '[class*="panel" i][class*="side" i]',
+            '[class*="research" i][class*="panel" i]'
+        ];
+        for (const sel of sels) {
+            try {
+                for (const el of document.querySelectorAll(sel)) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 280 || r.height < 200) continue;
+                    if (r.right < window.innerWidth * 0.55) continue;  // must be on right side
+                    const inner = (el.innerText || '').trim();
+                    if (inner.length < 50) continue;
+                    const hasUrl = !!el.querySelector('a[href*="http"]');
+                    const hasList = !!el.querySelector('ol > li, ul > li');
+                    if (hasUrl || hasList) return true;
+                }
+            } catch (e) {}
+        }
+        return false;
+    }"""
+    try:
+        ok = await page.evaluate(JS)
+        if ok:
+            return True
+    except Exception:
+        pass
+    try:
+        for frame in page.frames:
+            try:
+                src = (frame.url or "").lower()
+            except Exception:
+                continue
+            if "oaiusercontent" in src or "deep_research" in src:
+                try:
+                    ok = await frame.evaluate(JS)
+                    if ok:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
 
 
 async def scrape_progress_gemini(page):
@@ -7477,6 +7581,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "last_cua_check": _research_t,       # CUA check gate — MIN_WAIT from research start
             "last_artifact_scrape": 0,           # 0 → iteration #1 always passes the gate (Claude opens artifact ASAP)
             "chatgpt_activity_panel_open": False,  # ChatGPT activity-strip click flag — mirror Claude pattern
+            "poll_cycles": 0,                    # increments once per round-robin tick — gates iter-#3 panel-open
+            "chatgpt_panel_dom_misses": 0,       # consecutive DOM "found:false" — escalates to CUA after 2
+            "chatgpt_panel_cua_attempts": 0,     # capped at 1/agent/phase
+            "claude_artifact_dom_misses": 0,
+            "claude_artifact_cua_attempts": 0,
             "observer_text_len": 0,              # MutationObserver sets this (see B2)
         }
         # Register for mid-run input dispatcher
@@ -7590,6 +7699,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "last_cua_check": time.time(),
                                              "last_artifact_scrape": 0,
                                              "chatgpt_activity_panel_open": False,
+                                             "poll_cycles": 0,
+                                             "chatgpt_panel_dom_misses": 0,
+                                             "chatgpt_panel_cua_attempts": 0,
+                                             "claude_artifact_dom_misses": 0,
+                                             "claude_artifact_cua_attempts": 0,
                                              "observer_text_len": 0}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
@@ -7676,6 +7790,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "last_cua_check": time.time(),
                     "last_artifact_scrape": 0,
                     "chatgpt_activity_panel_open": False,
+                    "poll_cycles": 0,
+                    "chatgpt_panel_dom_misses": 0,
+                    "chatgpt_panel_cua_attempts": 0,
+                    "claude_artifact_dom_misses": 0,
+                    "claude_artifact_cua_attempts": 0,
                     "observer_text_len": 0,
                     "empty_retries": 0,
                     "hard_retry_count": 0,
@@ -7769,6 +7888,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "last_cua_check": _now,
                 "last_artifact_scrape": 0,
                 "chatgpt_activity_panel_open": False,
+                "poll_cycles": 0,
+                "chatgpt_panel_dom_misses": 0,
+                "chatgpt_panel_cua_attempts": 0,
+                "claude_artifact_dom_misses": 0,
+                "claude_artifact_cua_attempts": 0,
                 "observer_text_len": 0,
                 "empty_retries": 0,
                 "hard_retry_count": _hard_count,
@@ -7808,6 +7932,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         for name in _pending_keys:
             p = pending[name]
             elapsed = time.time() - p["start_time"]
+            # Per-agent cycle counter (used for "give research time to settle"
+            # gate before opening Claude/ChatGPT panels — see iter-#3 logic
+            # below). Increment ONCE per round-robin tick per agent.
+            p["poll_cycles"] = p.get("poll_cycles", 0) + 1
 
             # ── C6: cursor foreground + partial-content refresh ──
             # Bring this agent's tab to the front before any scrape/check so
@@ -7998,12 +8126,19 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # Don't mask scrape failures — tell frontend the scrape degraded
                     log(f"[{name}] DOM scrape failed: {_scrape_err}", "WARN")
 
-            # Claude artifact tracking — open the FIRST artifact ASAP and keep it open
+            # Claude artifact tracking — open the FIRST artifact and keep it open
             # so subsequent polls re-read live (URLs / steps / sections) without
             # re-clicking. Auto-close removed: the second artifact (final report) is
             # detected/opened separately by extract_claude_response at completion.
-            # 120s warmup deleted — iteration #1 must try (last_artifact_scrape=0 above).
-            if name == "Claude" and (time.time() - p.get("last_artifact_scrape", 0)) > ARTIFACT_SCRAPE_INTERVAL:
+            #
+            # 2026-04-26 (v3): iter-#3 settle gate — wait until ≥3 polling cycles
+            # OR ≥180s wall-clock (whichever first) so research is actually
+            # ongoing and the artifact card has spawned. Same gate applied to
+            # ChatGPT below for symmetry. After 2 consecutive DOM "no artifact"
+            # readings (after the gate clears), escalate to CUA tier-3 once.
+            _claude_gate_ok = (p.get("poll_cycles", 0) >= 3 or elapsed >= 180)
+            if (name == "Claude" and _claude_gate_ok and
+                    (time.time() - p.get("last_artifact_scrape", 0)) > ARTIFACT_SCRAPE_INTERVAL):
                 try:
                     artifact_data = await scrape_claude_artifact_tracking(
                         p["page"], browser=browser, cua_client=cua_client,
@@ -8011,8 +8146,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         already_open=p.get("artifact_panel_open", False))
                     if artifact_data:
                         if not p.get("artifact_panel_open"):
-                            log(f"[Claude] artifact panel opened (first time) at elapsed={int(elapsed)}s")
+                            log(f"[Claude] artifact panel opened (first time) at "
+                                f"elapsed={int(elapsed)}s, cycle={p.get('poll_cycles')}")
                         p["artifact_panel_open"] = True
+                        p["claude_artifact_dom_misses"] = 0  # reset on success
                         # Mirror onto runtime singleton so extract_and_record_agent
                         # (which has no `p` handle) can close-1 before clicking the
                         # final artifact card. See extract_claude_response signature.
@@ -8036,30 +8173,147 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             log(f"[Claude] Artifact tracking: {len(artifact_data.get('source_urls', []))} URLs, "
                                 f"{len(artifact_data.get('steps', []))} steps, "
                                 f"{len(artifact_data.get('sections', []))} sections")
+                    else:
+                        # No artifact detected — count as DOM miss for CUA escalation.
+                        if not p.get("artifact_panel_open"):
+                            p["claude_artifact_dom_misses"] = p.get("claude_artifact_dom_misses", 0) + 1
+                            log(f"[Claude] artifact DOM miss "
+                                f"#{p['claude_artifact_dom_misses']} at cycle={p.get('poll_cycles')}",
+                                "DEBUG")
                     p["last_artifact_scrape"] = time.time()
                 except Exception as e:
                     log(f"[Claude] Artifact tracking scrape failed: {e}", "WARN")
-                    p["last_artifact_scrape"] = time.time()  # Don't retry immediately
+                    p["last_artifact_scrape"] = time.time()
 
-            # ChatGPT activity-strip open — mirror Claude artifact pattern.
-            # ChatGPT DR renders a collapsed strip ("Looking into X... N searches")
-            # at the bottom of the chat thread. The side panel with the full step
-            # list and source URLs only mounts AFTER the strip is clicked. Without
-            # this click the polling scrape sees only the strip's preview text and
-            # undercounts sources. We click on the FIRST iteration where the strip
-            # is found (retries on subsequent iters until found), then never again
-            # — once expanded the panel persists across polls.
-            if name == "ChatGPT" and not p.get("chatgpt_activity_panel_open"):
+                # CUA tier-3 escalation — fires after 2 consecutive DOM misses,
+                # capped at 1/agent/phase. Tries to find + click the FIRST
+                # artifact card visually.
+                if (not p.get("artifact_panel_open")
+                        and p.get("claude_artifact_dom_misses", 0) >= 2
+                        and p.get("claude_artifact_cua_attempts", 0) == 0
+                        and cua_client):
+                    log(f"[Claude] DOM missed artifact 2x — escalating to CUA tier-3 "
+                        f"(cycle={p.get('poll_cycles')})")
+                    try:
+                        emit_event("tier_transition", phase=2, agent="claude",
+                                   op="open_artifact_1", from_tier="dom",
+                                   to_tier="cua", reason="dom_2_misses")
+                    except Exception:
+                        pass
+                    p["claude_artifact_cua_attempts"] = 1
+                    try:
+                        cua_res = await asyncio.wait_for(
+                            agent_loop(cua_client, browser,
+                                PROMPT_OPEN_CLAUDE_SOURCE_ARTIFACT,
+                                "Open the FIRST artifact card (research/sources tracking) "
+                                "in the Claude conversation. NEVER click the last artifact.",
+                                model=CUA_MODEL, max_iterations=5,
+                                verbose=verbose, target_page=p["page"]),
+                            timeout=120.0)
+                        out = ((cua_res or {}).get("text") or "").lower()
+                        if "panel: open" in out or "panel: already_open" in out:
+                            p["artifact_panel_open"] = True
+                            try:
+                                _runtime.claude_artifact_panel_open = True
+                            except Exception:
+                                pass
+                            log("[Claude] artifact panel opened via CUA tier-3")
+                        else:
+                            log(f"[Claude] CUA tier-3 didn't confirm panel open: {out[:120]}", "WARN")
+                    except asyncio.TimeoutError:
+                        log("[Claude] CUA tier-3 timed out after 120s", "WARN")
+                    except Exception as _ce:
+                        log(f"[Claude] CUA tier-3 failed: {_ce}", "WARN")
+
+            # ChatGPT activity-strip open — DOM tier-1 → CUA tier-3 fallback.
+            # Strip rendered as styled <div> at bottom of chat thread reading
+            # "Looking into X... N searches". Side panel with full step list +
+            # source URLs only mounts AFTER click. Without it polling sees only
+            # the truncated preview.
+            #
+            # 2026-04-26 (v3) lessons from 3 failed runs:
+            #  - v1 narrow selector (button/[role="button"]) matched 0
+            #    candidates because strip is a bare <div> — fix: walk * with
+            #    full pointer/mouse event chain (see _open_chatgpt_activity_panel).
+            #  - Iter-#1 fired before strip rendered — fix: iter-#3 gate
+            #    (poll_cycles>=3 or elapsed>=180s — whichever first).
+            #  - DOM "click" silently swallowed — fix: post-click verifier
+            #    (`_verify_chatgpt_panel_open`) confirms side panel actually
+            #    rendered before flipping the flag.
+            #  - After 2 DOM misses → CUA tier-3 fallback (capped at 1/phase).
+            _cgpt_gate_ok = (p.get("poll_cycles", 0) >= 3 or elapsed >= 180)
+            if (name == "ChatGPT" and _cgpt_gate_ok and
+                    not p.get("chatgpt_activity_panel_open")):
                 try:
                     res = await _open_chatgpt_activity_panel(p["page"])
-                    if res and res.get("found"):
+                    cands = (res or {}).get("candidates", 0)
+                    if not res or not res.get("found"):
+                        p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
+                        log(f"[ChatGPT] panel DOM miss #{p['chatgpt_panel_dom_misses']} "
+                            f"(cycle={p.get('poll_cycles')}, walked_hits={cands}) — "
+                            f"strip not yet rendered or wording changed", "DEBUG")
+                    elif res.get("alreadyExpanded"):
                         p["chatgpt_activity_panel_open"] = True
-                        log(f"[ChatGPT] activity panel opened (first time) at "
+                        p["chatgpt_panel_dom_misses"] = 0
+                        log(f"[ChatGPT] activity panel already expanded at "
                             f"elapsed={int(elapsed)}s — label: \"{res.get('label','')[:80]}\"")
-                        # Side panel needs a beat to mount its content tree.
-                        await asyncio.sleep(1.0)
+                    elif res.get("clicked"):
+                        # Verify panel actually rendered (mitigates silent click failure).
+                        await asyncio.sleep(2.0)
+                        verified = await _verify_chatgpt_panel_open(p["page"])
+                        if verified:
+                            p["chatgpt_activity_panel_open"] = True
+                            p["chatgpt_panel_dom_misses"] = 0
+                            log(f"[ChatGPT] activity panel opened via DOM at "
+                                f"elapsed={int(elapsed)}s — label: \"{res.get('label','')[:80]}\" "
+                                f"clickedTag={res.get('clickedTag','?')}")
+                        else:
+                            p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
+                            log(f"[ChatGPT] DOM clicked but panel didn't render — "
+                                f"miss #{p['chatgpt_panel_dom_misses']}", "WARN")
+                    else:
+                        p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
+                        log(f"[ChatGPT] panel found but click failed — "
+                            f"label: \"{res.get('label','')[:80]}\" "
+                            f"err={res.get('error','?')}", "WARN")
                 except Exception as e:
                     log(f"[ChatGPT] activity panel open failed: {e}", "WARN")
+                    p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
+
+                # CUA tier-3 escalation after 2 DOM misses (capped at 1/phase).
+                if (not p.get("chatgpt_activity_panel_open")
+                        and p.get("chatgpt_panel_dom_misses", 0) >= 2
+                        and p.get("chatgpt_panel_cua_attempts", 0) == 0
+                        and cua_client):
+                    log(f"[ChatGPT] DOM missed strip 2x — escalating to CUA tier-3 "
+                        f"(cycle={p.get('poll_cycles')})")
+                    try:
+                        emit_event("tier_transition", phase=2, agent="chatgpt",
+                                   op="open_activity_panel", from_tier="dom",
+                                   to_tier="cua", reason="dom_2_misses")
+                    except Exception:
+                        pass
+                    p["chatgpt_panel_cua_attempts"] = 1
+                    try:
+                        cua_res = await asyncio.wait_for(
+                            agent_loop(cua_client, browser,
+                                PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
+                                "Open the activity strip at the bottom of this ChatGPT "
+                                "Deep Research conversation. ONE click only. Verify the "
+                                "side panel slides out before reporting.",
+                                model=CUA_MODEL, max_iterations=5,
+                                verbose=verbose, target_page=p["page"]),
+                            timeout=120.0)
+                        out = ((cua_res or {}).get("text") or "").lower()
+                        if "panel: open" in out or "panel: already_open" in out:
+                            p["chatgpt_activity_panel_open"] = True
+                            log("[ChatGPT] activity panel opened via CUA tier-3")
+                        else:
+                            log(f"[ChatGPT] CUA tier-3 didn't confirm panel open: {out[:120]}", "WARN")
+                    except asyncio.TimeoutError:
+                        log("[ChatGPT] CUA tier-3 timed out after 120s", "WARN")
+                    except Exception as _ce:
+                        log(f"[ChatGPT] CUA tier-3 failed: {_ce}", "WARN")
 
             # Emit agent_progress to frontend (critical for real-time UI)
             agent_key = normalize_agent_key(name)
@@ -8885,6 +9139,48 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
+    # ── Step -1 (NEW, 2026-04-26 v3): close ANY open right-side panel ──
+    # The activity/source panel kept open during polling occupies the same
+    # right-side real estate as the canvas/document overlay. Without closing
+    # it, ENLARGE click is captured by the source panel's z-index and the
+    # canvas never mounts → CUA copies the wrong content (sources panel
+    # preview, ~800-3000 chars, looks like a final report length-wise).
+    # Try DOM close-X selectors first, then Escape as a fallback.
+    try:
+        closed = await page.evaluate("""() => {
+            const sels = [
+                'aside button[aria-label*="Close" i]',
+                '[role="complementary"] button[aria-label*="Close" i]',
+                '[class*="panel" i] button[aria-label*="Close" i]',
+                '[class*="source" i] button[aria-label*="Close" i]',
+                'aside button[aria-label*="close" i]',
+            ];
+            for (const s of sels) {
+                try {
+                    const b = document.querySelector(s);
+                    if (b && (b.offsetWidth > 0 || b.offsetHeight > 0)) {
+                        b.click();
+                        return s;
+                    }
+                } catch (e) {}
+            }
+            return '';
+        }""")
+        if closed:
+            log(f"[{label}] Closed source panel before ENLARGE via {closed}")
+            await asyncio.sleep(0.6)
+        else:
+            # Blur composer first so Escape isn't swallowed by textarea focus.
+            try:
+                await page.evaluate(
+                    "document.activeElement && document.activeElement.blur && document.activeElement.blur()")
+            except Exception:
+                pass
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
     # ── Step 0 (NEW, 2026-04-26): EXPLICIT artifact-open via Playwright ──
     # Post-completion the DR artifact card is rendered but the FULL canvas/document
     # only mounts AFTER the user clicks ENLARGE/Open. Doing this BEFORE CUA means:
@@ -9062,14 +9358,42 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
-    # ── Step 0: Close artifact 1 (kept open by polling) ──
-    # Commit d45807f leaves artifact-1's panel open across polls for live source
-    # streaming. We MUST close it now so the LAST-card click below opens a fresh
-    # panel onto artifact-2 (final report) — without this, the click can no-op
-    # (artifact_count==1 case) or race the panel swap and silently grab artifact-1.
-    if artifact_panel_open:
-        log(f"[{label}] Closing artifact-1 panel (kept open by polling) before final extract")
+    # ── Step 0 (BROADENED 2026-04-26 v3): probe DOM directly, not just flag ──
+    # Polling sets artifact_panel_open=True, but if extract is reached via a
+    # different path (Phase-2 timeout, hard-retry recovery, manual continue) the
+    # flag may be stale or False while the panel IS still visually open. Directly
+    # probe the DOM for any visible side artifact panel (>200px wide). Close it
+    # if present — without this, the LAST-card click silently opens the wrong
+    # artifact (the still-foregrounded artifact-1 / sources checklist).
+    panel_visible_dom = False
+    try:
+        panel_visible_dom = await page.evaluate("""() => {
+            const sels = [
+                'aside',
+                '[class*="artifact-panel" i]',
+                '[class*="side-panel" i]',
+                '[role="complementary"]'
+            ];
+            for (const s of sels) {
+                for (const el of document.querySelectorAll(s)) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 200 && r.height > 200) return true;
+                }
+            }
+            return false;
+        }""")
+    except Exception:
+        pass
+    if panel_visible_dom or artifact_panel_open:
+        log(f"[{label}] Closing artifact panel (visible_dom={panel_visible_dom}, "
+            f"flag={artifact_panel_open}) before final extract")
         try:
+            # Blur composer first so Escape isn't swallowed by textarea focus.
+            try:
+                await page.evaluate(
+                    "document.activeElement && document.activeElement.blur && document.activeElement.blur()")
+            except Exception:
+                pass
             await _close_claude_artifact_panel(page)
             await asyncio.sleep(0.6)
         except Exception as _ce:
