@@ -31,6 +31,16 @@ from pathlib import Path
 from prompts import *
 from datetime import datetime
 
+# Vision tier-2 module (shadow-eval today, tier-2 promotion per hotspot
+# after telemetry proves agreement). Wrapped in try/except so a vision.py
+# import error never breaks the pipeline — shadow mode is opt-in via
+# DG_VISION_TIER=shadow and default-off.
+try:
+    import vision as _vision  # type: ignore
+except Exception as _ve:
+    _vision = None  # noqa: N816 — fallthrough; shadow path no-ops below.
+    print(f"[vision] import failed (shadow disabled): {_ve}", flush=True)
+
 # Windows UTF-8 fix
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -4388,6 +4398,54 @@ async def stop_narration_ticker(stop, task):
         pass
 
 
+async def _shadow_observed_cua(
+    page, *, hotspot_id, phase, platform, current_step,
+    context_hint, cua_coro_factory, expected_outcome="",
+):
+    """Run a CUA call, optionally shadowed by Vision (DG_VISION_TIER=shadow).
+
+    Default behavior (flag off / module unavailable): just runs CUA. Shadow
+    mode: Vision runs in PARALLEL with CUA via asyncio.gather, logs Vision's
+    proposed action to logs/vision_shadow.jsonl, but CUA's output is what's
+    returned. Vision NEVER touches the page — zero pipeline risk.
+
+    cua_coro_factory: a no-arg async function returning the CUA result.
+    Defining it as a closure at the call site lets us reuse the existing
+    asyncio.wait_for + agent_loop wrapping per-site.
+
+    Failure modes (Vision side) are silently logged — never re-raised.
+    Hotspot ids match scratch/vision_hotspots.md (#7c, #7c-p1, #7d, #2c, #2d).
+    """
+    if _vision is None:
+        return await cua_coro_factory()
+    try:
+        if _vision.is_vision_enabled() != "shadow":
+            return await cua_coro_factory()
+    except Exception:
+        return await cua_coro_factory()
+
+    flow_ctx = {
+        "workflow_name": hotspot_id,
+        "phase": phase,
+        "platform": platform,
+        "current_step": current_step,
+        "expected_outcome": expected_outcome,
+        "context_hint": context_hint,
+        "attempts": 1,
+    }
+    try:
+        return await _vision.shadow_observe_then_cua(
+            page, cua_coro_factory,
+            flow_context=flow_ctx,
+            hotspot_id=hotspot_id,
+            run_id=os.environ.get("DG_RUN_ID"),
+        )
+    except Exception as _se:
+        log(f"[shadow:{hotspot_id}] shadow path failed, falling back to direct CUA: {_se}",
+            "WARN")
+        return await cua_coro_factory()
+
+
 def fail_phase(phase, error, reason=None, agent=None, actions=None, **extra):
     """Soft-pause a phase on an unrecoverable error. Emits pipeline_error
     ONLY — never pipeline_stopped, never Firestore status=failed. The
@@ -7023,8 +7081,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         except Exception:
                             pass
                         _panel_cua_attempts = 1
-                        try:
-                            cua_res = await asyncio.wait_for(
+                        async def _cgpt_p1_cua():
+                            return await asyncio.wait_for(
                                 agent_loop(cua_client, browser,
                                     PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
                                     "Open the activity strip at the bottom of this ChatGPT "
@@ -7033,6 +7091,13 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                     model=CUA_MODEL, max_iterations=5,
                                     verbose=verbose, target_page=page),
                                 timeout=120.0)
+                        try:
+                            cua_res = await _shadow_observed_cua(
+                                page, hotspot_id="7c-p1", phase=phase, platform="chatgpt",
+                                current_step="open_activity_panel_p1",
+                                context_hint=f"P1 brief poll DOM 2-miss at elapsed={elapsed_sec}s",
+                                expected_outcome="side panel mounts on right with step list",
+                                cua_coro_factory=_cgpt_p1_cua)
                             out = ((cua_res or {}).get("text") or "").lower()
                             if "panel: open" in out or "panel: already_open" in out:
                                 _panel_open_done = True
@@ -8291,8 +8356,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     except Exception:
                         pass
                     p["claude_artifact_cua_attempts"] = 1
-                    try:
-                        cua_res = await asyncio.wait_for(
+                    async def _claude_p2_cua():
+                        return await asyncio.wait_for(
                             agent_loop(cua_client, browser,
                                 PROMPT_OPEN_CLAUDE_SOURCE_ARTIFACT,
                                 "Open the FIRST artifact card (research/sources tracking) "
@@ -8300,6 +8365,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 model=CUA_MODEL, max_iterations=5,
                                 verbose=verbose, target_page=p["page"]),
                             timeout=120.0)
+                    try:
+                        cua_res = await _shadow_observed_cua(
+                            p["page"], hotspot_id="7d", phase=2, platform="claude",
+                            current_step="open_artifact_1",
+                            context_hint=f"DOM 2-miss at cycle={p.get('poll_cycles')}",
+                            expected_outcome="right panel mounts artifact-1 checklist",
+                            cua_coro_factory=_claude_p2_cua)
                         out = ((cua_res or {}).get("text") or "").lower()
                         if "panel: open" in out or "panel: already_open" in out:
                             p["artifact_panel_open"] = True
@@ -8384,8 +8456,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     except Exception:
                         pass
                     p["chatgpt_panel_cua_attempts"] = 1
-                    try:
-                        cua_res = await asyncio.wait_for(
+                    async def _cgpt_p2_cua():
+                        return await asyncio.wait_for(
                             agent_loop(cua_client, browser,
                                 PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
                                 "Open the activity strip at the bottom of this ChatGPT "
@@ -8394,6 +8466,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 model=CUA_MODEL, max_iterations=5,
                                 verbose=verbose, target_page=p["page"]),
                             timeout=120.0)
+                    try:
+                        cua_res = await _shadow_observed_cua(
+                            p["page"], hotspot_id="7c", phase=2, platform="chatgpt",
+                            current_step="open_activity_panel",
+                            context_hint=f"DOM 2-miss at cycle={p.get('poll_cycles')}",
+                            expected_outcome="side panel mounts on right with step list",
+                            cua_coro_factory=_cgpt_p2_cua)
                         out = ((cua_res or {}).get("text") or "").lower()
                         if "panel: open" in out or "panel: already_open" in out:
                             p["chatgpt_activity_panel_open"] = True

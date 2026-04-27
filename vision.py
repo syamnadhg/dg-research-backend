@@ -585,6 +585,177 @@ async def execute_action(page: Any, result: ActionResult, img_meta: ImgMeta) -> 
 # with_vision_fallback — the V3 wire-in pattern. Lives here for caller ease.
 # ─────────────────────────────────────────────────────────────────────────
 
+def is_vision_enabled() -> Literal["off", "shadow", "tier2", "tier3"]:
+    """Process-wide env flag for Vision wiring mode.
+
+    - "off"    — Vision module not invoked at any wire-in site (default).
+    - "shadow" — Vision runs in PARALLEL with CUA at tier-2 escalation
+                 sites; logs Vision's proposed action but CUA's output is
+                 what acts. Used for promotion-criterion telemetry.
+    - "tier2"  — Vision runs BEFORE CUA at escalation sites (with_vision_
+                 fallback semantics). For per-hotspot promotion after
+                 shadow proves agreement.
+    - "tier3"  — Vision runs only AFTER CUA also fails. Reserved.
+    """
+    val = (os.environ.get("DG_VISION_TIER") or "off").strip().lower()
+    if val in ("off", "shadow", "tier2", "tier3"):
+        return val  # type: ignore[return-value]
+    return "off"
+
+
+def _shadow_log_path() -> str:
+    """Per-run shadow-eval JSONL log path. Honors DG_VISION_SHADOW_LOG env
+    or falls back to logs/vision_shadow.jsonl in the cwd."""
+    return os.environ.get("DG_VISION_SHADOW_LOG") or os.path.join(
+        "logs", "vision_shadow.jsonl"
+    )
+
+
+def _append_shadow_record(rec: dict) -> None:
+    """Append a single shadow-eval record to the JSONL log. Lockless,
+    crash-safe: each line is its own JSON object so partial writes are
+    skippable. Caller never raises out of this — telemetry must not break
+    the pipeline."""
+    try:
+        path = _shadow_log_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception as exc:
+        logger.debug("shadow log append failed: %s", exc)
+
+
+async def _harvest_fixture(
+    image_bytes: bytes, hotspot_id: str, run_id: str | None
+) -> str | None:
+    """Optionally save the shadow-eval screenshot as a fixture for the
+    smoke harness. Off by default (set DG_VISION_FIXTURE_AUTO=1 to enable).
+    Returns the saved path or None."""
+    if (os.environ.get("DG_VISION_FIXTURE_AUTO") or "").strip() not in ("1", "true", "yes"):
+        return None
+    try:
+        base = os.path.join("tests", "fixtures", "vision", "auto", hotspot_id)
+        os.makedirs(base, exist_ok=True)
+        name = f"{run_id or 'run'}_{int(time.time())}.png"
+        full = os.path.join(base, name)
+        with open(full, "wb") as f:
+            f.write(image_bytes)
+        return full
+    except Exception as exc:
+        logger.debug("fixture harvest failed: %s", exc)
+        return None
+
+
+async def shadow_observe_then_cua(
+    page: Any,
+    cua_fn: Callable[[], Awaitable[Any]],
+    *,
+    flow_context: dict,
+    hotspot_id: str,
+    vision: VisionClient | None = None,
+    run_id: str | None = None,
+    high_stakes: bool = False,
+) -> Any:
+    """Tier-3 SHADOW MODE: run Vision in parallel with CUA, log Vision's
+    proposed action for offline comparison, but ONLY return CUA's result.
+    Vision NEVER touches the page. Zero risk to pipeline.
+
+    Promotion criterion (per scratch/vision_v3_plan.md): a hotspot flips
+    from this helper to with_vision_fallback() once N >= 10 events show
+    >= 80% action-class agreement and >= 70% coord proximity within 0.10.
+
+    Caller must enable via DG_VISION_TIER=shadow. Default off — caller
+    should check is_vision_enabled() before calling.
+
+    Failure modes (Vision side) are silently logged, never raised:
+    - Vision exception:    log {"vision": {"error": "..."}}
+    - Vision timeout:      log {"vision": {"timeout": true}}
+    - asyncio.gather throw: caught via return_exceptions=True
+    """
+    vc = vision or default_client()
+
+    async def _vision_observe() -> dict:
+        t0 = time.time()
+        try:
+            img, meta = await vc.screenshot(page)
+            await _harvest_fixture(img, hotspot_id, run_id)
+            result = await asyncio.wait_for(
+                vc.act(page, flow_context, image=img, img_meta=meta,
+                       high_stakes=high_stakes),
+                timeout=DEFAULT_TIMEOUT_S,
+            )
+            return {
+                "action": result.action,
+                "reason": result.reason,
+                "confidence": result.confidence,
+                "next_expected_state": result.next_expected_state,
+                "x_ratio": result.x_ratio,
+                "y_ratio": result.y_ratio,
+                "model": result.model_used,
+                "latency_ms": result.latency_ms,
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "low_confidence": result.low_confidence,
+            }
+        except asyncio.TimeoutError:
+            return {"timeout": True, "elapsed_ms": int((time.time() - t0) * 1000)}
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                    "elapsed_ms": int((time.time() - t0) * 1000)}
+
+    async def _cua_run() -> tuple[Any, float]:
+        t0 = time.time()
+        result = await cua_fn()
+        return result, (time.time() - t0) * 1000.0
+
+    # Run both in parallel. return_exceptions=True so one branch's failure
+    # doesn't take down the other; the cua-fn returns whatever the caller
+    # wants (typically the agent_loop dict).
+    results = await asyncio.gather(
+        _vision_observe(), _cua_run(), return_exceptions=True,
+    )
+
+    vision_record = results[0] if not isinstance(results[0], Exception) else {
+        "error": f"gather: {type(results[0]).__name__}: {str(results[0])[:200]}",
+    }
+
+    cua_result: Any
+    cua_latency_ms: float
+    if isinstance(results[1], Exception):
+        # CUA broke — propagate, but log it anyway.
+        _append_shadow_record({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_id": run_id, "hotspot_id": hotspot_id,
+            "phase": flow_context.get("phase"),
+            "agent": flow_context.get("platform"),
+            "vision": vision_record,
+            "cua": {"error": f"{type(results[1]).__name__}: {str(results[1])[:200]}"},
+        })
+        raise results[1]
+    cua_result, cua_latency_ms = results[1]
+
+    # Best-effort outcome inference: caller (research.py) parses cua_result
+    # for "panel: open" / "panel: already_open" — record those as outcome.
+    cua_text = ""
+    try:
+        if isinstance(cua_result, dict):
+            cua_text = str(cua_result.get("text") or "")[:400]
+    except Exception:
+        pass
+
+    _append_shadow_record({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "run_id": run_id, "hotspot_id": hotspot_id,
+        "phase": flow_context.get("phase"),
+        "agent": flow_context.get("platform"),
+        "vision": vision_record,
+        "cua": {"latency_ms": int(cua_latency_ms),
+                "text_head": cua_text[:200]},
+    })
+
+    return cua_result
+
+
 async def with_vision_fallback(
     page: Any,
     primary_fn: Callable[[], Awaitable[Any]],
