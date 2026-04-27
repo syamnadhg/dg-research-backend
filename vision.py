@@ -679,9 +679,11 @@ async def shadow_observe_then_cua(
         try:
             img, meta = await vc.screenshot(page)
             await _harvest_fixture(img, hotspot_id, run_id)
+            # act() takes its own screenshot internally; the one above is
+            # solely for fixture harvest. act() signature: (page, ctx, *,
+            # prompt, high_stakes, timeout_s) — no image/img_meta kwargs.
             result = await asyncio.wait_for(
-                vc.act(page, flow_context, image=img, img_meta=meta,
-                       high_stakes=high_stakes),
+                vc.act(page, flow_context, high_stakes=high_stakes),
                 timeout=DEFAULT_TIMEOUT_S,
             )
             return {
