@@ -307,24 +307,32 @@ def _battery_state() -> str:
         out = (ps.stdout or "").strip()
     except Exception:
         out = ""
+    def _bat_glyph(pct_int: int) -> str:
+        # Quarter-phase moon glyphs by remaining charge.
+        if pct_int <= 25:  return "◓"
+        if pct_int <= 50:  return "◒"
+        if pct_int <= 75:  return "◑"
+        return "◐"
+
     if out == "NONE":
-        result = "Plugged in (no battery)"
+        result = "▰ Plugged in (no battery)"
     elif ":" in out:
         status, _, pct = out.partition(":")
         try:
             status_i = int(status)
+            pct_i = int(pct) if pct.isdigit() else 100
             pct_s = f" ({pct}%)" if pct.isdigit() else ""
             # Win32_Battery.BatteryStatus: 1=Discharging, 2=AC, 3=Fully charged,
             # 4=Low, 5=Critical, 6=Charging, 7=Charging+High, 8=Charging+Low,
             # 9=Charging+Critical, 10=Undefined, 11=Partially charged
             if status_i == 1:
-                result = f"On battery{pct_s}"
+                result = f"{_bat_glyph(pct_i)} On battery{pct_s}"
             elif status_i in (2, 3, 11):
-                result = f"On AC{pct_s}"
+                result = f"⚡ On AC{pct_s}"
             elif status_i in (6, 7, 8, 9):
-                result = f"Charging{pct_s}"
+                result = f"⚡ Charging{pct_s}"
             else:
-                result = f"AC/battery state {status_i}{pct_s}"
+                result = f"⚡ AC/battery state {status_i}{pct_s}"
         except ValueError:
             result = ""
     else:
@@ -355,6 +363,40 @@ def _local_api_health(port: int = 8000, timeout_s: float = 3.0) -> "tuple[bool, 
         return False, f"HTTP {out or '<no output>'}"
     except Exception as e:
         return False, f"probe error: {e}"
+
+
+def _print_with_flourish(line: str, fade_to_color: str | None = None,
+                         hold_s: float = 0.5) -> None:
+    """Print a final-line flourish at the tail of a subcommand. If
+    fade_to_color is None, prints once and returns. If set, prints `line`
+    raw, sleeps hold_s, then \\r-overwrites the same line wrapped in
+    fade_to_color so the eye sees a soft settle from bright → dim.
+    Skipped (plain print) when stdout isn't a TTY or color is off, so
+    CI/log-capture stays clean."""
+    import time as _time
+    print(line)
+    if fade_to_color is None or not _USE_COLOR or not sys.stdout.isatty():
+        return
+    import re as _re
+    plain = _re.sub(r"\x1b\[[0-9;]*m", "", line)
+    _time.sleep(hold_s)
+    sys.stdout.write("\033[F\r\033[2K")  # cursor up, col 0, erase line
+    sys.stdout.write(_c(fade_to_color, plain) + "\n")
+    sys.stdout.flush()
+
+
+def _aegis_rune(supervised: bool, transition_to: str | None = None) -> str:
+    """Render the supervised-state cell for context strips with manuscript
+    runes instead of plain "on"/"off". Filled diamond = aegis vigilans
+    (watching); hollow diamond = quiescens (resting). Optional transition
+    arrow shows an about-to-arm state."""
+    if supervised:
+        return _c(_OK, "◆ vigilans")
+    if transition_to == "on":
+        return _c(_DIM, "◇ quiescens → ") + _c(_OK, "vigilans")
+    if transition_to == "nothing-to-undo":
+        return _c(_DIM, "◇ quiescens — nothing to undo")
+    return _c(_DIM, "◇ quiescens")
 
 
 def _render_context_strip(items: list[tuple[str, str]]):
@@ -15891,6 +15933,23 @@ async def run_server(port=8000):
     if token and _firebase_db:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
         log(f"Heartbeat started ({HEARTBEAT_INTERVAL_SEC}s interval)")
+
+        # Aegis pulse — slow standing-watch heartbeat in the log every 60s
+        # while the queue is idle. Alternates ◆/◇ glyph so a tail of the
+        # log shows a faint pulse instead of flat repetition. Suppressed
+        # during active pipeline runs (the job worker is already chatty).
+        async def _aegis_pulse_loop():
+            glyphs = ("◆", "◇")
+            i = 0
+            try:
+                while True:
+                    await asyncio.sleep(60)
+                    if not _queue_running:
+                        log(f"[aegis] {glyphs[i % 2]} standing watch")
+                        i += 1
+            except asyncio.CancelledError:
+                return
+        asyncio.create_task(_aegis_pulse_loop())
         # Refresh the paired device doc so the Account page sees this PC
         # online immediately on server start. If pairedUid isn't pinned yet
         # (pre-multi-device config), resolve it from the token's linkedUid.
@@ -16551,6 +16610,13 @@ async def run_pair(profile_dir, wait_minutes=10):
             print(f"  {_c(_BOLD + _ACCENT, '  The bond is forged.')}  {_c(_DIM, 'Start the backend in this terminal to accept jobs:')}")
             print()
             print(f"       {_c(_BOLD, 'python research.py --serve')}")
+            print()
+            print(
+                f"  {_c(_BOLD + _BRIGHT, '◇')}  "
+                f"{_c(_BOLD + _ACCENT, 'vinctus est')}  "
+                f"{_c(_BOLD + _BRIGHT, '◇')}    "
+                f"{_c(_DIM, 'Bound. Backend listening on this machine.')}"
+            )
             _render_next_actions([
                 ("python research.py --resurrect", "enable On Startup (auto-start in background)"),
                 ("python research.py --unpair", "fully disconnect this machine"),
@@ -17009,7 +17075,7 @@ def run_resurrect():
     _ctx_rows = [
         ("Device",    _c(_BOLD, device_id or "(not paired)")),
         ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
-        ("On Startup", _c(_OK, "on") if currently_supervised else _c(_DIM, "off → enabling")),
+        ("On Startup", _aegis_rune(currently_supervised, transition_to="on")),
     ]
     _bat = _battery_state()
     if _bat:
@@ -17152,7 +17218,12 @@ def run_resurrect():
                 print(f"  {_c(_DIM, '     The scheduled task still fires at next login as a fallback.')}")
 
     print()
-    print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  {_c(_DIM, '--serve respawns on any exit.')}")
+    _print_with_flourish(
+        f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  "
+        f"{_c(_DIM, '--serve respawns on any exit.')}",
+        fade_to_color=_BOLD + _ACCENT,
+        hold_s=0.3,
+    )
     _render_next_actions([
         ("python research.py --retire", "disable On Startup"),
     ])
@@ -17195,7 +17266,7 @@ def run_retire():
     _ctx_rows_r = [
         ("Device",     _c(_BOLD, device_id or "(not paired)")),
         ("Paired to",  _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
-        ("On Startup", _c(_OK, "on") if currently_supervised else _c(_DIM, "off — nothing to undo")),
+        ("On Startup", _aegis_rune(currently_supervised, transition_to="nothing-to-undo")),
     ]
     _bat_r = _battery_state()
     if _bat_r:
@@ -17315,7 +17386,12 @@ def run_retire():
             print(f"       {_c(_BOLD, f'PID {pid}')}  ({role})")
         print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --retire.')}")
     else:
-        print(f"  {_c(_BOLD + _RED, '  Silence.')}  {_c(_DIM, 'No research.py process remains.')}")
+        _print_with_flourish(
+            f"  {_c(_BOLD + _RED, '  Silence.')}  "
+            f"{_c(_DIM, 'No research.py process remains.')}",
+            fade_to_color=_DIM + _RED,
+            hold_s=0.5,
+        )
     _render_next_actions([
         ("python research.py --resurrect", "re-enable On Startup"),
     ])
