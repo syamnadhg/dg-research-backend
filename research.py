@@ -4741,6 +4741,11 @@ def start_narrator(phase: int):
     except Exception:
         pass
     try:
+        import vision_narrate as _vn
+        _vn.reset_phase_budget()
+    except Exception:
+        pass
+    try:
         _narrator_task = asyncio.create_task(_narrator_loop(phase))
     except RuntimeError:
         # No running event loop (pre-startup / CLI paths). Skip.
@@ -4917,24 +4922,35 @@ async def scrape_progress_chatgpt(page):
                 }
                 if (!root) return out;
                 out.panel_found = true;
-                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning)\\b/i;
-                const rowEls = Array.from(root.querySelectorAll('div, li, [role="listitem"], button, [role="button"], p'));
+                // 2026-04-26 v5: structure-only gate. Old VERB+check+spin
+                // gate dropped Extended Thinking reasoning paragraphs and
+                // Deep Research source-title rows because they often have
+                // no spin/check icon AND no verb prefix. New gate accepts
+                // any leaf-row (no nested listitems) with substantial text.
+                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing)\\b/i;
+                const rowEls = Array.from(root.querySelectorAll('li, [role="listitem"], div, p, button, [role="button"]'));
                 const seenKey = new Set();
                 const rows = [];
                 for (const el of rowEls) {
                     const t = (el.innerText || '').trim();
-                    if (!t || t.length < 4 || t.length > 220) continue;
-                    const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"]');
-                    const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"]');
+                    if (!t || t.length < 12 || t.length > 240) continue;
+                    if (el.querySelector('li, [role="listitem"]')) continue;
+                    if (t === t.toUpperCase() && t.length < 30) continue;
+                    const wordChars = t.replace(/[^A-Za-z]/g, '').length;
+                    if (wordChars < 8) continue;
+                    if ((t.match(/\\n/g) || []).length > 3) continue;
+                    const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"], [aria-label*="completed" i]');
+                    const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"], [aria-busy="true"]');
                     const verbHit  = VERB.test(t);
-                    if (!verbHit && !hasCheck && !hasSpin) continue;
-                    const key = t.slice(0, 60);
+                    const key = t.slice(0, 80);
                     if (seenKey.has(key)) continue;
                     seenKey.add(key);
-                    rows.push({ t: t.slice(0, 200), hasSpin, hasCheck, verbHit });
+                    rows.push({ t: t.slice(0, 220), hasSpin, hasCheck, verbHit });
                 }
                 out.steps = rows.map(r => r.t).slice(-15);
-                const live = rows.find(r => r.hasSpin) || rows.find(r => r.verbHit && !r.hasCheck);
+                const live = rows.find(r => r.hasSpin)
+                           || rows.find(r => r.verbHit && !r.hasCheck)
+                           || (rows.length ? rows[rows.length - 1] : null);
                 if (live) out.progress = live.t.slice(0, 160);
                 else if (out.steps.length) out.progress = out.steps[out.steps.length - 1];
                 const srcSet = new Set();
@@ -5648,32 +5664,36 @@ async def scrape_progress_claude(page):
                 }
             } catch(e) {}
 
-            // ---- 2026-04-26 v4: live panel walker — after the artifact panel
-            // opens (aside / artifact-panel mount), the panel root contains the
-            // full live checklist. Wide-net VERB+check+spin walker matches the
-            // ChatGPT P1 host-panel pattern; rows from the panel beat the card
-            // preview (panel is fresher) and the spinner row drives r.progress.
+            // ---- 2026-04-26 v5: live panel walker — after the artifact panel
+            // opens (aside / artifact-panel / research-panel mount), the panel
+            // root contains the full live checklist. Structure-only gate
+            // (no VERB/icon requirement) matches the ChatGPT P1 walker so
+            // Reading-source rows and Searched-the-web rows both register.
             try {
-                const VERB2 = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning)\\b/i;
-                const panelRoots = document.querySelectorAll('aside, [class*="artifact-panel"], [class*="research-panel"]');
+                const VERB2 = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing)\\b/i;
+                const panelRoots = document.querySelectorAll('aside, [role="complementary"], [role="dialog"], [data-state="open"], [class*="artifact-panel"], [class*="research-panel"], [class*="side-panel" i], [class*="sidebar" i], [class*="drawer" i], [aria-label*="research" i], [aria-label*="sources" i], [aria-label*="activity" i]');
                 const panelSeen = new Set();
                 const panelRows = [];
                 let panelLive = '';
                 for (const root of panelRoots) {
                     const pr = root.getBoundingClientRect();
-                    if (pr.width < 280 || pr.height < 200) continue;
-                    const rowEls = Array.from(root.querySelectorAll('div, li, [role="listitem"], button, [role="button"], p'));
+                    if (pr.width < 220 || pr.height < 150) continue;
+                    const rowEls = Array.from(root.querySelectorAll('li, [role="listitem"], div, p, button, [role="button"]'));
                     for (const el of rowEls) {
                         const t = (el.innerText || '').trim();
-                        if (!t || t.length < 4 || t.length > 220) continue;
-                        const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"]');
-                        const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"]');
+                        if (!t || t.length < 12 || t.length > 240) continue;
+                        if (el.querySelector('li, [role="listitem"]')) continue;
+                        if (t === t.toUpperCase() && t.length < 30) continue;
+                        const wordChars = t.replace(/[^A-Za-z]/g, '').length;
+                        if (wordChars < 8) continue;
+                        if ((t.match(/\\n/g) || []).length > 3) continue;
+                        const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"], [aria-label*="completed" i]');
+                        const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"], [aria-busy="true"]');
                         const verbHit  = VERB2.test(t);
-                        if (!verbHit && !hasCheck && !hasSpin) continue;
-                        const key = t.slice(0, 60);
+                        const key = t.slice(0, 80);
                         if (panelSeen.has(key)) continue;
                         panelSeen.add(key);
-                        panelRows.push({ t: t.slice(0, 200), hasSpin, hasCheck, verbHit });
+                        panelRows.push({ t: t.slice(0, 220), hasSpin, hasCheck, verbHit });
                         if (hasSpin && !panelLive) panelLive = t.slice(0, 160);
                     }
                 }
@@ -5681,7 +5701,11 @@ async def scrape_progress_claude(page):
                     const panelSteps = panelRows.map(x => x.t).slice(-15);
                     r.steps = panelSteps.concat(r.steps);
                     if (panelLive) r.progress = panelLive;
-                    else r.progress = panelRows[panelRows.length - 1].t.slice(0, 160);
+                    else {
+                        const verbLive = panelRows.find(x => x.verbHit && !x.hasCheck);
+                        r.progress = verbLive ? verbLive.t.slice(0, 160)
+                                              : panelRows[panelRows.length - 1].t.slice(0, 160);
+                    }
                 }
             } catch(e) {}
 
@@ -7405,6 +7429,72 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     stall_window_start = None
                 elif (_merged_partial_len > 0 or _p1_sources > 0) and stall_window_start is None:
                     stall_window_start = time.time()
+                # Vision fallback merge (Gemini Flash) — fills gaps when the
+                # DOM walker returns empty + provides richer narration. Cooldown
+                # / budget enforced inside vision_narrate.narrate_panel. Two
+                # triggers: (a) walker is empty/ET-state past the 60s warmup,
+                # or (b) every Nth poll for a fresh narration sentence even
+                # when the walker IS producing data.
+                _vn_steps_n = len(progress.get("steps", []) or [])
+                _vn_progress_str = (progress.get("progress") or "").strip()
+                _vn_sources = int(progress.get("sources", 0) or 0)
+                _vn_should_call = (
+                    elapsed_sec > 60
+                    and _vn_steps_n < 2
+                    and _vn_sources == 0
+                )
+                _vn_force_every_n = int(os.environ.get("DG_VISION_NARRATE_FORCE_EVERY_N", "4"))
+                if _vn_force_every_n > 0 and elapsed_sec > 0:
+                    try:
+                        _poll_interval = max(int(POLL_PRO if phase == 1 else POLL_DEEP_RESEARCH), 1)
+                    except Exception:
+                        _poll_interval = 30
+                    _poll_tick = elapsed_sec // _poll_interval
+                    if _poll_tick > 0 and _poll_tick % _vn_force_every_n == 0:
+                        _vn_should_call = True
+                _vision_data = None
+                _scrape_source = "dom"
+                _vision_narration = ""
+                if _vn_should_call:
+                    try:
+                        import vision_narrate as _vn
+                        _vision_data = await _vn.narrate_panel(
+                            page,
+                            agent=normalize_agent_key(label),
+                            phase=phase,
+                            workflow_name=label,
+                            last_dom_progress=_vn_progress_str,
+                            last_dom_sources=_vn_sources,
+                            last_dom_steps_n=_vn_steps_n,
+                        )
+                    except Exception as _vne:
+                        log(f"[{label}] vision_narrate failed: {_vne}", "DEBUG")
+                        _vision_data = None
+                if _vision_data and float(_vision_data.get("confidence", 0)) >= 0.4:
+                    _scrape_source = "vision"
+                    _vision_narration = _vision_data.get("narration", "")
+                    _v_progress = _vision_data.get("progress", "")
+                    if _v_progress and len(_v_progress) > len(_vn_progress_str):
+                        progress["progress"] = _v_progress
+                    _v_steps = _vision_data.get("steps") or []
+                    if _v_steps:
+                        _seen = set(s[:80] for s in (progress.get("steps") or []))
+                        _merged = list(progress.get("steps") or [])
+                        for s in _v_steps:
+                            k = s[:80]
+                            if k not in _seen:
+                                _seen.add(k); _merged.append(s)
+                        progress["steps"] = _merged[-15:]
+                    if (not progress.get("sections")) and _vision_data.get("sections"):
+                        progress["sections"] = _vision_data["sections"]
+                    if int(progress.get("sources", 0) or 0) == 0:
+                        _so = int(_vision_data.get("sources_observed") or 0)
+                        if _so > 0:
+                            progress["sources"] = _so
+                    log(f"[{label}] vision_narrate hit: phase_signal={_vision_data.get('phase_signal')} "
+                        f"conf={_vision_data.get('confidence',0):.2f} steps+={len(_v_steps)} "
+                        f"narration=\"{_vision_narration[:80]}\"", "INFO")
+
                 # Deduplicate: emit if data changed OR every 30s (elapsed_bucket).
                 # Without elapsed_bucket, P1's Extended Thinking window (5-15 min
                 # of zero text/source growth) would suppress every emit for the
@@ -7422,6 +7512,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     "obs_bucket": _merged_partial_len // 200,
                     # 30s tick keeps narration live during long ET windows
                     "elapsed_bucket": elapsed_sec // 30,
+                    # Vision narration changes should also break the dedupe
+                    "vision_n": _vision_narration[:60] if _vision_narration else "",
                 }, sort_keys=True)
                 if _last_progress.get(label) != progress_key:
                     _last_progress[label] = progress_key
@@ -7448,13 +7540,14 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             "Extended Thinking"
                         )
                         progress["status"] = "extended_thinking"
-                        # Drop elapsed/typical from the progress string —
-                        # the FE phase header already renders both from
-                        # elapsedSec + expectedMinutes (top of dropdown),
-                        # and duplicating them in the per-platform card was
-                        # confusing + stale-looking when the top counter
-                        # advanced but the baked-in string didn't.
-                        progress["progress"] = f"{_think_label} active"
+                        # Prefer vision's rich narration over the generic
+                        # "<X> active" fallback when vision gave us a
+                        # confident reading. Otherwise keep the fallback so
+                        # the dropdown isn't blank.
+                        if _vision_narration:
+                            progress["progress"] = _vision_narration
+                        else:
+                            progress["progress"] = f"{_think_label} active"
                     agent_key = normalize_agent_key(label)
                     emit_event("agent_progress", phase=phase, agent=agent_key,
                         status=progress.get("status", ""),
@@ -7471,6 +7564,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         toolUses=progress.get("tool_uses", []),
                         title=progress.get("title", ""),
                         scrapeHealth="limited" if is_et else "full",
+                        scrapeSource=_scrape_source,
+                        visionNarration=_vision_narration,
                         elapsedSec=elapsed_sec,
                         expectedMinutes=expected_min,
                     )
