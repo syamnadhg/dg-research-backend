@@ -16738,6 +16738,12 @@ def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
         "$t.Settings.RestartCount = 3; "
         "$t.Settings.RestartInterval = 'PT1M'; "
         "$t.Settings.StartWhenAvailable = $true; "
+        # Vista compat-mode defaults gate task start/run on AC power. On a
+        # laptop, this means the supervisor goes "Queued" forever the moment
+        # the cable is unplugged. Disable both so the supervisor stays alive
+        # whether the user is on battery or on AC.
+        "$t.Settings.DisallowStartIfOnBatteries = $false; "
+        "$t.Settings.StopIfGoingOnBatteries = $false; "
         f"Set-ScheduledTask -TaskName '{_SUPERVISOR_TASK_NAME}' "
         "-Trigger $t.Triggers[0] -Settings $t.Settings | Out-Null"
     )
