@@ -5066,6 +5066,10 @@ async def _open_chatgpt_activity_panel(page):
     JS = """() => {
         // searches | sources | results — covers all observed badge wordings
         const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?)\\b/i;
+        // Verb-only fallback for Pro+ET strips that haven't materialized a count yet.
+        // Includes "thinking"/"reasoning" because Pro+ET shows those before swapping
+        // to site-fetch verbs ("Reading <site>", "Visiting <url>") mid-stream.
+        const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching)\\b/i;
         const seen = new WeakSet();
         const hits = [];
         function walk(root) {
@@ -5078,17 +5082,19 @@ async def _open_chatgpt_activity_panel(page):
                 if (el.shadowRoot) walk(el.shadowRoot);
                 const t = (el.innerText || el.textContent || '').trim();
                 if (!t || t.length < 4 || t.length > 300) continue;
-                if (!COUNT.test(t)) continue;
+                const matchesCount = COUNT.test(t);
+                const matchesVerb  = VERB_ONLY.test(t);
+                if (!matchesCount && !matchesVerb) continue;
                 const r = el.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
-                hits.push({ el, top: r.top, len: t.length });
+                // count-badge matches rank ahead of verb-only (more specific)
+                hits.push({ el, top: r.top, len: t.length, hasCount: matchesCount });
             }
         }
         walk(document);
         if (!hits.length) return { found: false, candidates: 0 };
-        // lowest-on-page (the strip lives at the bottom), then shortest text
-        // (tightest match around the badge — disambiguates from outer wrappers)
-        hits.sort((a, b) => (b.top - a.top) || (a.len - b.len));
+        // count-badge wins (more specific), then lowest-on-page, then shortest text
+        hits.sort((a, b) => (b.hasCount - a.hasCount) || (b.top - a.top) || (a.len - b.len));
         const target = hits[0].el;
         const label = (target.innerText || target.textContent || '').trim().slice(0, 160);
         // aria-expanded check up the chain — skip re-click if already open
@@ -6935,6 +6941,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     _panel_open_done = False
     _panel_dom_misses = 0
     _panel_cua_attempts = 0
+    _panel_poll_cycles = 0  # ticks once per ChatGPT P1 poll while panel still closed
     # Stall detector — multi-signal (2026-04-25 strictness rewrite):
     # tracks text + sources + steps. ChatGPT DR's "researching" phase
     # legitimately produces zero text growth for 5-15 min while sources
@@ -7004,8 +7011,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # a styled <div>). Gate: 180s wall-clock. After 2 DOM misses
                 # → CUA tier-3 (capped 1/call). Only fires for ChatGPT P1
                 # entry points; Gemini/Claude have own paths.
+                if label in ("Phase1", "Phase1-followup") and not _panel_open_done:
+                    _panel_poll_cycles += 1
                 if (label in ("Phase1", "Phase1-followup")
-                        and elapsed_sec >= 180
+                        and (_panel_poll_cycles >= 2 or elapsed_sec >= 60)
                         and not _panel_open_done):
                     try:
                         res = await _open_chatgpt_activity_panel(page)
@@ -16247,6 +16256,43 @@ def _write_supervised_flag(enabled: bool):
         log(f"Could not update supervised flag: {e}", "WARN")
 
 
+def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
+    """Layer recurring trigger + restart-on-failure onto an existing
+    SuperResearchBackend Scheduled Task. schtasks /SC ONLOGON does not
+    expose Repetition or RestartCount via command-line, so we shell out
+    to PowerShell once the task is created to set them.
+
+    PT5M repetition + MultipleInstances=IgnoreNew → max ~5-min offline
+    gap if daemon-loop dies for any reason (clean exit, Ctrl+C, crash).
+    RestartCount=3 + RestartInterval=PT1M backstops non-zero failure
+    exits with up to 3 retries spaced 1 minute apart.
+
+    Returns (ok, msg). Best-effort: failure leaves the bare /SC ONLOGON
+    behavior intact (one-shot at logon, no auto-respawn mid-session).
+    """
+    import subprocess as _subprocess
+    ps = (
+        "$ErrorActionPreference='Stop'; "
+        f"$t = Get-ScheduledTask -TaskName '{_SUPERVISOR_TASK_NAME}'; "
+        "$t.Triggers[0].Repetition.Interval = 'PT5M'; "
+        "$t.Settings.RestartCount = 3; "
+        "$t.Settings.RestartInterval = 'PT1M'; "
+        "$t.Settings.StartWhenAvailable = $true; "
+        f"Set-ScheduledTask -TaskName '{_SUPERVISOR_TASK_NAME}' "
+        "-Trigger $t.Triggers[0] -Settings $t.Settings | Out-Null"
+    )
+    try:
+        result = _subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return False, (result.stderr or result.stdout or "PS exit non-zero").strip()
+        return True, "applied"
+    except Exception as e:
+        return False, f"PS error: {e}"
+
+
 def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
     """Install the SuperResearchBackend scheduled task AND spawn a detached
     daemon-loop. No terminal narration — callers do their own.
@@ -16296,6 +16342,10 @@ def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
         return False, None, f"schtasks error: {e}", 0
     if result.returncode != 0:
         return False, None, (result.stderr or result.stdout or "schtasks returned non-zero").strip(), 0
+
+    # Layer respawn policy (PT5M repetition + restart-on-failure) onto the
+    # freshly-created task — best-effort; failure leaves bare /SC ONLOGON.
+    _apply_supervisor_respawn_policy()
 
     procs = _enumerate_research_py_procs()
     daemon_pid = next((pid for pid, _cmd, role in procs if role == "daemon-loop"), None)
@@ -16456,6 +16506,14 @@ def run_resurrect():
 
     print(f"  {_c(_OK, '✓')}  Scheduled Task pinned to login ({_SUPERVISOR_TASK_NAME})")
     print(f"  {_c(_DIM, '     Executes:')} {task_run}")
+
+    # Layer respawn policy onto the task — PT5M repetition + restart-on-failure.
+    _ok, _msg = _apply_supervisor_respawn_policy()
+    if _ok:
+        print(f"  {_c(_OK, '✓')}  Respawn policy applied (5-min repetition + restart-on-failure)")
+    else:
+        print(f"  {_c(_WARN, '⚠')}  Could not apply respawn policy: {_msg}")
+        print(f"  {_c(_DIM, '     Backend still spawns at next login as a fallback.')}")
 
     # ── [3/4] Firestore sync ──
     _setup_step(3, 4, "Firestore sync")

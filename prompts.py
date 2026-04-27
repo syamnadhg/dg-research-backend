@@ -674,43 +674,82 @@ IMPORTANT:
 
 PROMPT_OPEN_CHATGPT_SOURCE_PANEL = SYSTEM_BASE + """
 
-You are looking at a ChatGPT Deep Research conversation.
+You are looking at a ChatGPT conversation. The model may be in Deep Research
+mode (P2) OR Pro + Extended Thinking mode (P1). The target looks slightly
+different in each, but the click behavior and goal are identical.
 
-GOAL: Click the collapsed activity strip at the bottom of the chat to open
-the side panel showing the full step list and source URLs.
+GOAL: Click the collapsed activity affordance attached to the most recent
+ChatGPT response so the side panel opens, revealing the full step list and
+source URLs.
 
-WHAT TO LOOK FOR:
-- A horizontal strip near the bottom of the conversation, BELOW the user's
-  prompt and ABOVE the composer.
-- Text pattern: "Looking into <topic>... <N> searches" or "Researching
-  <topic>... <N> sources". May also show "<N> results".
-- Often has a small spinner or progress indicator on the left and a count
-  badge ("196 searches", "47 sources") on the right.
-- It is a SINGLE horizontal bar, NOT a card. Width spans most of the chat
-  column.
+WHERE IT IS:
+- Attached to the TRAILING EDGE of the latest ChatGPT assistant message —
+  i.e., immediately AFTER the last paragraph the model has streamed so far,
+  flush-left with that message's content.
+- It is INLINE with the conversation flow, not a separate bottom bar. As
+  the response keeps streaming, this affordance moves down with it.
+- It is NOT pinned to the bottom of the screen. It is NOT inside the
+  composer. It is NOT the model selector at the top.
+
+WHAT IT LOOKS LIKE (two valid shapes — either is the target):
+
+Shape A — glowing inline label (P1 / Pro + Extended Thinking, most common):
+- A SHORT inline-flow text element — a single line, often hugging its own
+  text width like a pill or chip (NOT a full-width bar).
+- It is animated: a soft shine/shimmer/glow sweeps across the text. It
+  looks like it is pulsing or has a moving gradient highlight. THIS IS THE
+  PRIMARY VISUAL CUE — find the shimmering line attached to the response.
+- Text content evolves over the response lifecycle. ANY of these is a
+  valid trigger phrase:
+    * "Thinking" / "Thinking…" / "Pro thinking" / "Extended thinking"
+    * "Reasoning" / "Reasoning…"
+    * "Searching <query>" / "Searched the web"
+    * "Reading <site>" / "Read <url>"
+    * "Visiting <url>" / "Visited <site>"
+    * "Browsing" / "Browsing the web"
+    * "Looking into <topic>" / "Looking up <thing>"
+    * "Investigating <topic>" / "Researching <topic>"
+    * "Analyzing" / "Exploring" / "Checking <source>"
+- IMPORTANT: in this mode "Thinking" / "Pro thinking" IS the correct
+  click target. Do NOT skip it as a "show reasoning" toggle.
+
+Shape B — count-badge strip (P2 / Deep Research):
+- A wider horizontal strip, still attached to the bottom of the latest
+  response, with a small spinner or progress dot on the left and a count
+  badge ("196 searches", "47 sources", "12 results") on the right.
+- Text pattern: "Looking into <topic>… <N> searches" or "Researching
+  <topic>… <N> sources" or "<N> results".
+
+Either shape is a valid target. They behave the same on click.
 
 VERIFY STATE FIRST (do this BEFORE any click):
-- If a wide side panel is ALREADY visible on the right showing a numbered
-  step list with URLs — the panel is already open. Output exactly:
+- If a wide side panel is ALREADY visible on the RIGHT showing a numbered
+  step list with URL bullets — the panel is already open. Output exactly:
   "panel: already_open". DO NOT CLICK.
-- If you cannot find the strip anywhere on screen — output exactly:
-  "panel: not_found". DO NOT CLICK.
+- If you cannot find ANY shimmering inline label OR count-badge strip
+  attached to the latest response — output exactly: "panel: not_found".
+  DO NOT CLICK.
 
-ACTION (only if strip is found AND panel is closed):
-- Click the strip ONCE. Single click only.
+ACTION (only if target is found AND panel is closed):
+- Click the shimmering label / strip ONCE, on its visible text. Single
+  click only.
 - Wait ~1.5 seconds for the side panel to slide out from the right.
-- Verify: a panel now occupies the right ~40% of the screen showing
-  numbered steps and URL bullets.
+- Verify: a panel now occupies the right ~30–40% of the screen showing
+  numbered/bulleted steps and URL rows.
 - If panel opened: output "panel: open".
-- If you clicked but the panel did NOT appear: output "panel: click_failed".
+- If you clicked but no panel appeared: output "panel: click_failed".
 
 HARD CONSTRAINTS:
-- DO NOT click the composer (text input at the bottom).
-- DO NOT click the send button.
-- DO NOT click the model selector at the top.
-- DO NOT click any source link, citation, or "View sources" button outside
-  the strip.
-- DO NOT scroll unless the strip is partially off-screen.
+- DO NOT click the composer / "Follow up" text input.
+- DO NOT click the send button or microphone icon.
+- DO NOT click the model selector or "ChatGPT" header at the top.
+- DO NOT click the Share button at the top-right.
+- DO NOT click any source link, citation chip, or "View sources" button
+  inside an already-opened side panel.
+- DO NOT click links, headings, or footnotes that are part of the rendered
+  response prose itself — the shimmer animation is what distinguishes the
+  activity affordance from regular text.
+- DO NOT scroll unless the latest response's trailing edge is off-screen.
 - DO NOT click twice. ONE click only.
 - Stop after 5 iterations regardless of outcome."""
 
