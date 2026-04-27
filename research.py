@@ -4765,6 +4765,101 @@ async def scrape_progress_chatgpt(page):
             return r;
         }""")
 
+        # ---- Host-page side-panel scrape (P1 Pro+ET, also catches P2 host-side panel)
+        # P1 mode renders the activity panel inline on the host page (no DR
+        # sandbox iframe). After _open_chatgpt_activity_panel clicks the strip,
+        # the side panel mounts as <aside>/[role=complementary]/panel-class div
+        # on the right ~30-40% of viewport. The iframe block below only matches
+        # P2 DR; this block fills the P1 gap with a Gemini-style wide-net sweep
+        # of the panel root: VERB-prefixed step rows, generic a[href] sources
+        # with chatgpt.com redirector unwrap + chrome filter, h1/h2/h3 sections.
+        # Returns panel_found:false when no host-side panel exists (e.g. P2 DR
+        # where panel is iframe-rooted) → no-op merge, iframe block runs next.
+        try:
+            hp = await page.evaluate("""() => {
+                const out = { steps: [], source_urls: [], sections: [], progress: '', panel_found: false };
+                const sels = [
+                    'aside', '[role="complementary"]', '[role="region"]',
+                    '[aria-label*="source" i]', '[aria-label*="research" i]',
+                    '[aria-label*="activity" i]',
+                    '[class*="panel" i][class*="side" i]',
+                    '[class*="research" i][class*="panel" i]',
+                    '[class*="activity" i][class*="panel" i]'
+                ];
+                let root = null;
+                for (const sel of sels) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        const rc = el.getBoundingClientRect();
+                        if (rc.width < 280 || rc.height < 200) continue;
+                        if (rc.right < window.innerWidth * 0.55) continue;
+                        const inner = (el.innerText || '').trim();
+                        if (inner.length < 50) continue;
+                        root = el; break;
+                    }
+                    if (root) break;
+                }
+                if (!root) return out;
+                out.panel_found = true;
+                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning)\\b/i;
+                const rowEls = Array.from(root.querySelectorAll('div, li, [role="listitem"], button, [role="button"], p'));
+                const seenKey = new Set();
+                const rows = [];
+                for (const el of rowEls) {
+                    const t = (el.innerText || '').trim();
+                    if (!t || t.length < 4 || t.length > 220) continue;
+                    const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"]');
+                    const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"]');
+                    const verbHit  = VERB.test(t);
+                    if (!verbHit && !hasCheck && !hasSpin) continue;
+                    const key = t.slice(0, 60);
+                    if (seenKey.has(key)) continue;
+                    seenKey.add(key);
+                    rows.push({ t: t.slice(0, 200), hasSpin, hasCheck, verbHit });
+                }
+                out.steps = rows.map(r => r.t).slice(-15);
+                const live = rows.find(r => r.hasSpin) || rows.find(r => r.verbHit && !r.hasCheck);
+                if (live) out.progress = live.t.slice(0, 160);
+                else if (out.steps.length) out.progress = out.steps[out.steps.length - 1];
+                const srcSet = new Set();
+                root.querySelectorAll('a[href^="http"]').forEach(a => {
+                    let h = a.href || '';
+                    if (!h || h.length >= 500) return;
+                    try {
+                        if (h.includes('chatgpt.com/') && h.includes('url=')) {
+                            const u = new URL(h);
+                            const real = u.searchParams.get('url');
+                            if (real && real.startsWith('http')) h = decodeURIComponent(real);
+                        }
+                    } catch(e) {}
+                    if (h.includes('chatgpt.com') || h.includes('openai.com') ||
+                        h.includes('oaiusercontent') || h.includes('chat.openai')) return;
+                    srcSet.add(h);
+                });
+                out.source_urls = Array.from(srcSet).slice(0, 30);
+                out.sections = Array.from(root.querySelectorAll('h1, h2, h3'))
+                    .map(h => (h.innerText || '').trim().slice(0, 80))
+                    .filter(s => s.length > 1);
+                return out;
+            }""")
+            if hp and hp.get("panel_found"):
+                if hp.get("source_urls"):
+                    seen_h = set(result.get("source_urls") or [])
+                    unioned_h = list(result.get("source_urls") or [])
+                    for u in hp["source_urls"]:
+                        if u not in seen_h:
+                            seen_h.add(u); unioned_h.append(u)
+                    if len(unioned_h) > result.get("sources", 0):
+                        result["source_urls"] = unioned_h[:30]
+                        result["sources"] = len(result["source_urls"])
+                if hp.get("steps") and len(hp["steps"]) > len(result.get("steps") or []):
+                    result["steps"] = hp["steps"]
+                if hp.get("progress"):
+                    result["progress"] = hp["progress"]
+                if hp.get("sections") and len(hp["sections"]) > len(result.get("sections") or []):
+                    result["sections"] = hp["sections"]
+        except Exception as _hpe:
+            log(f"ChatGPT host-panel scrape skipped: {_hpe}", "DEBUG")
+
         # ---- Iframe scrape (Deep Research content lives here as of 2026)
         try:
             for frame in page.frames:
@@ -5433,6 +5528,43 @@ async def scrape_progress_claude(page):
                 cardLines.slice(0, 6).forEach(ln => r.steps.push(ln));
                 if (cardLines.length > 0 && !r.progress) {
                     r.progress = cardLines[cardLines.length - 1];
+                }
+            } catch(e) {}
+
+            // ---- 2026-04-26 v4: live panel walker — after the artifact panel
+            // opens (aside / artifact-panel mount), the panel root contains the
+            // full live checklist. Wide-net VERB+check+spin walker matches the
+            // ChatGPT P1 host-panel pattern; rows from the panel beat the card
+            // preview (panel is fresher) and the spinner row drives r.progress.
+            try {
+                const VERB2 = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning)\\b/i;
+                const panelRoots = document.querySelectorAll('aside, [class*="artifact-panel"], [class*="research-panel"]');
+                const panelSeen = new Set();
+                const panelRows = [];
+                let panelLive = '';
+                for (const root of panelRoots) {
+                    const pr = root.getBoundingClientRect();
+                    if (pr.width < 280 || pr.height < 200) continue;
+                    const rowEls = Array.from(root.querySelectorAll('div, li, [role="listitem"], button, [role="button"], p'));
+                    for (const el of rowEls) {
+                        const t = (el.innerText || '').trim();
+                        if (!t || t.length < 4 || t.length > 220) continue;
+                        const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"]');
+                        const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"]');
+                        const verbHit  = VERB2.test(t);
+                        if (!verbHit && !hasCheck && !hasSpin) continue;
+                        const key = t.slice(0, 60);
+                        if (panelSeen.has(key)) continue;
+                        panelSeen.add(key);
+                        panelRows.push({ t: t.slice(0, 200), hasSpin, hasCheck, verbHit });
+                        if (hasSpin && !panelLive) panelLive = t.slice(0, 160);
+                    }
+                }
+                if (panelRows.length > 0) {
+                    const panelSteps = panelRows.map(x => x.t).slice(-15);
+                    r.steps = panelSteps.concat(r.steps);
+                    if (panelLive) r.progress = panelLive;
+                    else r.progress = panelRows[panelRows.length - 1].t.slice(0, 160);
                 }
             } catch(e) {}
 
