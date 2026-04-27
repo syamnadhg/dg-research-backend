@@ -4789,6 +4789,32 @@ async def scrape_progress_chatgpt(page):
                           'searching the web', 'reading sources', 'analyzing',
                           'deep research', 'looking into', 'investigating'];
             r.dr_active = drKws.some(kw => bodyLower.includes(kw));
+
+            // 2026-04-26 v3: extract the COLLAPSED activity strip BEFORE the
+            // side panel opens. Strip wording: "Looking into Hermes memory
+            // system... 196 searches". Without this, FE per-platform card
+            // shows empty narration for the first 3 min (gate is 180s).
+            // Verb regex constrained to start-of-string + count badge so
+            // stale chat text (user prompts, prior responses) won't match.
+            try {
+                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring)\\b/i;
+                const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?)\\b/i;
+                let stripText = '';
+                let stripTop = -1;
+                const cands = document.querySelectorAll('div, button, [role="button"], li');
+                for (const el of cands) {
+                    const t = (el.innerText || '').trim();
+                    if (!t || t.length < 6 || t.length > 220) continue;
+                    if (!(VERB.test(t) && COUNT.test(t))) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
+                    if (rect.top > stripTop) { stripText = t.slice(0, 200); stripTop = rect.top; }
+                }
+                if (stripText) {
+                    r.progress = stripText;
+                    r.steps.push(stripText);
+                }
+            } catch(e) {}
             // Completion indicators
             const doneKws = ['research completed', 'research complete',
                              'finished research', 'deep research completed'];
@@ -5458,6 +5484,34 @@ async def scrape_progress_claude(page):
             const researchCard = document.querySelector('[class*="research-card"], [data-testid*="research"], [class*="research-report"]');
             if (researchCard) textLen = Math.max(textLen, (researchCard.innerText || '').length);
             r.partial_text_len = textLen;
+
+            // ---- 2026-04-26 v3: extract artifact-1 CARD preview text BEFORE
+            // the side panel opens. The card sits in the assistant message in
+            // the conversation column with class containing "artifact" — title
+            // + first ~5 visible checklist rows are visible here. Currently the
+            // existing scrape only reads <a href> links from these wrappers;
+            // we now also extract the card body text so steps[] / progress
+            // populate from the first poll, not just after iter-#3 panel-open.
+            try {
+                const artifactCards = document.querySelectorAll(
+                    '.font-claude-message [class*="artifact"]'
+                );
+                const cardLines = [];
+                let cardTitle = '';
+                for (const c of artifactCards) {
+                    const t = (c.innerText || '').trim();
+                    if (!t || t.length < 10) continue;
+                    const lines = t.split('\\n').map(s => s.trim())
+                                   .filter(s => s.length > 3 && s.length < 200);
+                    if (!cardTitle && lines.length) cardTitle = lines[0];
+                    for (const ln of lines.slice(1, 8)) cardLines.push(ln);
+                }
+                if (cardTitle && !r.title) r.title = cardTitle.slice(0, 100);
+                cardLines.slice(0, 6).forEach(ln => r.steps.push(ln));
+                if (cardLines.length > 0 && !r.progress) {
+                    r.progress = cardLines[cardLines.length - 1];
+                }
+            } catch(e) {}
 
             // ---- Steps: synthesize from tool_uses + live markers + sources
             if (r.thinking) r.steps.push('Extended Thinking: ' + r.thinking.substring(0, 100));
