@@ -84,6 +84,17 @@ Frontend polls `GET /api/runs/{id}/events?offset=N` or connects via `WS /ws/{run
 | cua_action | N | CUA vision call taken (debug audit) |
 | user_input_dispatched | N | User's chat input merged into the active phase's context |
 
+### Vision shadow-eval telemetry (Apr 26)
+| Type | Phase | Description |
+|------|-------|-------------|
+| tier_transition | 0-5 | Tier escalation (DOM→CUA, Vision→CUA, etc). Persisted to `events.jsonl` AND to `logs/vision_shadow.jsonl` when `DG_VISION_TIER=shadow`. Fed to `scripts/vision_shadow_report.py` for per-hotspot agreement metrics. |
+| wrong_artifact_rejected | 2 | `_is_sources_not_document` rejected a finalize-copy result. Tier ∈ {cua, dom_html_md, dom_js, dom_panel}. Drives the retry-cap-2 loop on hotspots #2c and #2d. |
+| extract_failed | 2 | All retry attempts on hotspots #2c / #2d exhausted. Pairs with a `pipeline_error` for FE phase-alert routing. |
+
+### `agent_progress` field additions (Apr 26)
+- `scrapeSource: "dom" | "vision"` — which tier produced the polling data. "dom" = DOM walker scraped the side panel structurally; "vision" = Gemini Flash narrator (`vision_narrate.py`) read a screenshot of the panel directly.
+- `visionNarration` — the human-readable sentence the FE renders verbatim in the agent dropdown when scrapeSource is "vision". Hard caps inside the narrator: 30 calls per phase, 90s minimum gap per agent.
+
 ### Never-die contract (2026-04-18)
 `pipeline_error` no longer terminates the pipeline. It emits actions like `[Retry, Skip]` that map to commands the backend picks up via `_controls.await_phase_decision(phase)`. The ONLY events that end a run are `pipeline_stopped` (user Stop) and `pipeline_complete` (natural finish). Everything else is recoverable.
 

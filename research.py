@@ -12590,6 +12590,32 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             except Exception:
                 pass
 
+            # Mid-poll auth check — NotebookLM session can expire during the
+            # 45-min audio window. Without this, CUA keeps clicking on a
+            # logged-out page until PHASE_3_AUDIO_MAX_MIN exhausts. URL-only
+            # check (no tabs, no CUA) per the P0 sequential pattern.
+            try:
+                current_url = (browser.page.url or "").lower()
+                if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
+                    log(f"[Phase3] NotebookLM session expired mid-audio-poll: {current_url}")
+                    emit_event("login_required", phase=3,
+                               platforms=["notebooklm"],
+                               platformLabels=["NotebookLM"],
+                               message="NotebookLM session expired during audio generation. Sign back in to resume.",
+                               attempt=1)
+                    emit_event("pipeline_paused", phase=3, reason="notebooklm_login_expired")
+                    await _controls.wait_if_paused()
+                    if _controls.is_stop():
+                        break
+                    # User logged back in: reload + continue polling.
+                    try:
+                        await browser.page.reload(wait_until="domcontentloaded", timeout=15000)
+                        await asyncio.sleep(3)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             # CUA check — strict: only "audio complete" counts
             diag = await agent_loop(cua_client, browser, PROMPT_AUDIO_CHECK,
                 "Check: Has audio generation FINISHED? Is there a completed audio player "
@@ -12974,7 +13000,8 @@ def generate_thumbnail(topic, output_path):
 
 
 async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
-                     links=None, notebook_url="", verbose=False):
+                     links=None, notebook_url="", verbose=False,
+                     existing_youtube_url=""):
     """Phase 4: Convert audio to video + upload to YouTube (unlisted, not-for-kids)."""
     log("=" * 60)
     log("PHASE 5: Video + YouTube Upload")
@@ -12983,6 +13010,22 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     if not audio_path or not Path(audio_path).exists():
         log("No audio file — skipping Phase 5", "WARN")
         return {"youtube_url": ""}
+
+    # Idempotency: if a prior run already uploaded a video and we have a
+    # validated URL on hand, skip the rerender + reupload. Prevents
+    # duplicate YouTube videos on outer retry paths
+    # (orchestrator _phase_timeout_decision calls run_phase4 again).
+    video_path_check = queue_dir / "video" / "research_overview.mp4"
+    if existing_youtube_url and video_path_check.exists():
+        try:
+            if validate_link("youtube", existing_youtube_url):
+                log(f"[Phase4] Re-using existing YouTube upload: {existing_youtube_url}")
+                emit_event("agent_progress", phase=4, agent="youtube",
+                           status="reused",
+                           progress=f"Re-using prior YouTube upload (no duplicate created)")
+                return {"youtube_url": existing_youtube_url}
+        except Exception:
+            pass
 
     video_dir = queue_dir / "video"
     video_dir.mkdir(exist_ok=True)
@@ -13096,6 +13139,18 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     # declares a clear "upload blocked: <category>" status the orchestrator can
     # surface. Skipped on success so we don't burn CUA budget on clean runs.
     _upload_text = (result.get("text") or "").lower() if isinstance(result, dict) else ""
+    # Auth-failure short-circuit: if the upload returned text matching
+    # known sign-in / sign-out / login phrases, surface as login_required
+    # rather than burning blocker-recovery iterations on a sign-in wall.
+    if any(sig in _upload_text for sig in ("sign in", "log in", "login", "sign-in",
+                                            "you signed out", "session expired")):
+        log("[YouTube] Upload returned auth-failure signal — emitting login_required")
+        emit_event("login_required", phase=4,
+                   platforms=["youtube"],
+                   platformLabels=["YouTube Studio"],
+                   message="YouTube Studio session expired during upload. Sign back in to retry.",
+                   attempt=1)
+        return {"youtube_url": ""}
     if "uploaded:" not in _upload_text and "https://youtu.be/" not in _upload_text:
         try:
             log("[YouTube] Primary upload didn't confirm 'uploaded:' — running blocker recovery")
@@ -13312,8 +13367,14 @@ Do NOT report studio.youtube.com URLs — those are NOT video links.""",
 # ── Phase 6: Google Doc + Gmail Delivery ─────────────────────────────────────
 
 async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
-                     brief_url="", audio_url="", email=None, verbose=False):
-    """Phase 5: Create + fill + publicly share Google Doc, then send email with Open Gmail link."""
+                     brief_url="", audio_url="", email=None, verbose=False,
+                     existing_doc_url=""):
+    """Phase 5: Create + fill + publicly share Google Doc, then send email with Open Gmail link.
+
+    If `existing_doc_url` is supplied AND validates as a real Google Doc, the
+    function reuses it instead of creating a fresh `/document/create` tab —
+    prevents duplicate docs on outer-orchestrator retry paths.
+    """
     log("=" * 60)
     log("PHASE 5: Doc + Email Delivery")
     log("=" * 60)
@@ -13379,9 +13440,33 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
                status="creating",
                progress="Opening a new Google Doc…")
     doc_url = ""
+    # Idempotency: if a prior run already created a doc and we have a
+    # validated URL on hand, reuse it instead of creating a fresh
+    # `/document/create` tab. Prevents duplicate docs on outer
+    # _phase_timeout_decision retries.
+    if existing_doc_url:
+        try:
+            if validate_link("gdocs", existing_doc_url):
+                log(f"[Phase5] Re-using existing Google Doc: {existing_doc_url}")
+                emit_event("agent_progress", phase=5, agent="gdocs",
+                           status="reused",
+                           progress=f"Re-using prior Google Doc (no duplicate created)")
+                return {"doc_url": existing_doc_url}
+        except Exception:
+            pass
     try:
         page = await browser.new_tab("https://docs.google.com/document/create")
         await asyncio.sleep(5)
+
+        # HV gate — Google account-challenge interstitials can land here
+        # after fingerprint drift. Without this, CUA burns 20 iterations
+        # clicking on a sign-in wall. Pattern matches P3/P4 entry checks.
+        cleared = await check_hv_gate(browser, cua_client, "gdocs", "Google Docs",
+                                       phase=5, max_iterations=2)
+        if not cleared:
+            emit_event("pipeline_warning", phase=5,
+                       message="Google Docs HV not cleared — orchestrator will retry")
+            return {"doc_url": ""}
 
         emit_event("agent_progress", phase=5, agent="gdocs",
                    status="writing",
@@ -13442,6 +13527,15 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         try:
             page = await browser.new_tab("https://mail.google.com")
             await asyncio.sleep(4)
+
+            # HV gate — same risk as Google Docs. Catch sign-in walls
+            # before CUA burns iterations clicking on them.
+            cleared = await check_hv_gate(browser, cua_client, "gmail", "Gmail",
+                                           phase=5, max_iterations=2)
+            if not cleared:
+                emit_event("pipeline_warning", phase=5,
+                           message="Gmail HV not cleared — skipping email send")
+                return {"doc_url": doc_url}
 
             # Subject uses the smart title so it matches NotebookLM + YouTube.
             subject = f"Research Complete: {smart_title(topic)}"
@@ -13840,6 +13934,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # ── Preload data from previous phases (for resume) ──
     brief_text, brief_url = "", cp.get("brief_url", "")
     links, notebook_url, youtube_url = {}, cp.get("notebook_url", ""), cp.get("youtube_url", "")
+    # CRITICAL: audio_overview_url must be initialized at module scope so
+    # P5 (line ~15272 _effective_audio_url) doesn't NameError when resuming
+    # past P3 (start_phase >= 4). The P3 sub-step normally assigns this
+    # inside its `elif start_phase <= 3` branch; on resume, we restore it
+    # from checkpoint. P4 path also sets `audio_overview_url = ""` so the
+    # variable is always defined regardless of which branch P3 takes.
+    audio_overview_url = cp.get("audio_overview_url", "")
 
     # ── Helper: update delivery.json incrementally (frontend reads this for live links) ──
     def update_delivery(**new_fields):
@@ -15152,7 +15253,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         p5 = await _await_phase_with_active_deadline(
                             4, PHASE_4_MAX_MIN,
                             lambda: run_phase4(browser, cua_client, audio_path, topic, queue_dir,
-                                               links=links, notebook_url=notebook_url, verbose=verbose),
+                                               links=links, notebook_url=notebook_url, verbose=verbose,
+                                               existing_youtube_url=youtube_url or cp.get("youtube_url", "")),
                         )
                         break
                     except asyncio.TimeoutError:
@@ -15277,7 +15379,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         5, PHASE_5_MAX_MIN,
                         lambda: run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
                                            brief_url=brief_url, audio_url=_effective_audio_url,
-                                           email=email, verbose=verbose),
+                                           email=email, verbose=verbose,
+                                           existing_doc_url=cp.get("doc_url", "")),
                     )
                     break
                 except asyncio.TimeoutError:

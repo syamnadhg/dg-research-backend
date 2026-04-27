@@ -21,12 +21,16 @@ python research.py --serve
 # 3a. (Optional, recommended) Survive reboots + crashes.
 python research.py --resurrect
 
-# 3b. (Undo 3a) Clean full-reset — kills supervisor + serve, removes
-#     the Scheduled Task, syncs the Firestore flag.
-python research.py --exorcise
+# 3b. (Undo 3a) Disable On Startup — kills supervisor + serve, removes
+#     the Scheduled Task, syncs the Firestore flag. Pairing stays.
+python research.py --retire
+
+# 3c. (Full disconnect) Clean teardown — also wipes pairing/device
+#     registry. Use this when you're done with this PC entirely.
+python research.py --unpair
 ```
 
-That's it. Four commands to a hands-off always-on backend — plus `--exorcise` when you need a clean teardown.
+That's it. Four commands to a hands-off always-on backend — plus `--retire` to disable On Startup or `--unpair` to fully disconnect this PC.
 
 ## Firebase Admin Key (required) — `firebase-service-account.json`
 
@@ -146,7 +150,7 @@ Keep `--serve` running while you use the app. If the server stops, the web app's
 
 **Queue persistence across restarts** — on `--serve` startup, the backend re-enqueues any `status:"queued"` researches from Firestore, so the queue survives a `--daemon-loop` respawn. Anything that was `status:"ongoing"` when the previous process died is flipped to `stopped` with a "Backend restarted mid-run" message, instead of appearing live-but-frozen.
 
-### Step 5a (optional, recommended): Make it indestructible
+### Step 5a (optional, recommended): Enable On Startup (supervised auto-restart)
 
 ```bash
 python research.py --resurrect
@@ -156,22 +160,38 @@ Registers a Windows Scheduled Task that runs a **daemon-loop wrapper** — a tin
 
 The Account page's **Indestructible** toggle reflects the real scheduled task state (`schtasks /Query`), so the toggle survives unlink+relink. Turn it off from the same page if you ever want to stop auto-restart.
 
-### Step 5b (undo Step 5a): `--exorcise`
+### Step 5b (disable On Startup): `--retire`
 
 ```bash
-python research.py --exorcise
+python research.py --retire
 ```
 
-The opposite of `--resurrect` — a clean full-reset of everything indestructible. Four-step:
+The opposite of `--resurrect` — disables auto-restart while keeping this PC paired with your account. Three-step:
 
 1. **Deletes the Windows Scheduled Task** so `--daemon-loop` won't auto-start at next logon / reboot.
 2. **Kills every running `--daemon-loop` AND `--serve` process**, looping for up to 8s so a mid-enumeration respawn still gets caught (the supervisor respawns `--serve` every ~5s between deaths, so a single-shot kill misses any `--serve` that happened to be respawning at the wrong moment).
-3. **Flips the Firestore `indestructible` flag to `false`** so the Account toggle matches reality instantly.
-4. **Final-state verification** — if anything survived, prints the surviving PIDs so you can nuke them from Task Manager (or re-run `--exorcise`).
+3. **Flips the Firestore `supervised` flag to `false`** so the Account toggle matches reality instantly.
 
-Idempotent: works whether or not the task/loop was installed. After `--exorcise` the system is back to "nothing research.py-related is running" — any in-flight pipeline under the supervised `--serve` aborts (the deliberate cost of a clean undo). To bring the backend back, re-run `--serve` yourself; to re-enable supervision, run `--resurrect` again.
+Idempotent: works whether or not the task/loop was installed. Manual one-off `python research.py --serve` runs (role="other" in process discovery) within `DG_ORPHAN_MAX_AGE_HOURS` (default 4h) are NOT touched — only supervisor-spawned procs.
 
-Turning off the **Indestructible** toggle in the app → Account page runs the same teardown remotely.
+Turning off the **On Startup** toggle in the app → Account page runs the same teardown remotely.
+
+### Step 5c (full disconnect): `--unpair`
+
+```bash
+python research.py --unpair
+```
+
+The "I'm done with this PC" command — wipes everything `--retire` wipes, AND removes the device from the registry. After `--unpair`, this PC appears NOWHERE in the Super Research app's device list.
+
+Four-step:
+
+1. **Process kill + Scheduled Task removal** (always runs Step 1 regardless of pairing state, so partial-pairing scenarios clean up correctly).
+2. **Removes the device doc** from `users/{uid}/devices/{deviceId}`.
+3. **Wipes `research_config.json` + `device_config.json`** locally.
+4. **Final-state verification** — if anything survived, prints the surviving PIDs so you can taskkill manually.
+
+To bring this PC back: re-run `--setup` to mint a fresh ResearchToken and re-pair with your account.
 
 ### Step 6: Fire a research topic in the app
 
@@ -198,12 +218,13 @@ Multiple people can also share one backend. Share your ResearchToken — they pa
 
 Times based on real run analytics. Total: ~1h 50m for a full pipeline.
 
-## Phase narration (backend Gemini Flash + frontend fallback)
+## Phase + per-agent narration (backend Gemini Flash, two layers)
 
-Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. Apr 19 added a two-tier narration system so there's always a visible human-language pulse:
+Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. Apr 19 + Apr 26 ship a two-layer narration system so there's always a visible human-language pulse:
 
-- **Backend (Gemini 2.0 Flash inside `research.py`)** — every active phase has a narrator worker that reads a bounded ring buffer of recent events (~40) and emits a `phase_narration` event about every 45s. Narrator warms on `phase_start`, stays quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Cost envelope: ~200 input / 30 output tokens per narration → <$0.02 per full pipeline run.
-- **Frontend fallback (Gemini 2.0 Flash via `/api/narrate`)** — if the backend narrator goes silent for >15s on the currently-running phase AND the watchdog considers the backend alive, the frontend writes a speculative sentence into the same dropdown slot, rendered italic with a **"Likely: …"** prefix so the user sees it's a guess. Budget-capped at 20 calls per research. Disabled when the watchdog says the backend is actually dead — backend-down state surfaces via the LivenessEye title swap in the phase header and, after 30 min, a unified phase-alert banner with Retry/Skip.
+- **Phase narrator (Gemini 2.0 Flash inside `research.py`)** — every active phase has a narrator worker that reads a bounded ring buffer of recent events (~40) and emits a `phase_narration` event about every 45s. Narrator warms on `phase_start`, stays quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Cost envelope: ~200 input / 30 output tokens per narration → <$0.02 per full pipeline run.
+- **Per-agent narrator (Gemini 2.0 Flash inside `vision_narrate.py`)** — separate module, separate cadence. Each Phase 1/2 agent has a narrator that reads the right-side activity panel directly via Gemini 2.0 Flash vision (screenshot-and-OCR). DOM-walker output is the primary; vision narrator fires when the walker yields nothing AND the panel is non-empty (typical case: ChatGPT Pro "Extended Thinking active" gap), or every 4th poll for a richer rolling sentence. New `agent_progress` fields: `scrapeSource: "dom" | "vision"` records which tier produced the data; `visionNarration` carries the human-readable sentence rendered verbatim in the agent dropdown. Hard caps: 30 calls per phase, 90s minimum gap per agent.
+- **Backend-down detection** — the LivenessEye title swap in the phase header signals quiet-but-alive vs. potentially-dead. After 30 min of true backend silence the watchdog escalates to a unified phase alert with Retry/Skip. (The U2 cleanup removed the older `/api/narrate` speculative-fallback hook.)
 
 ## Phase 0 verification (sequential, Apr 19)
 
@@ -288,11 +309,19 @@ python research.py --resume queue_name                 # Resume stopped run
 research-automate/
 ├── research.py                 # Pipeline + FastAPI server
 ├── prompts.py                  # CUA prompts for each phase
+├── vision.py                   # Anthropic Sonnet vision client (tier-2 acting): take_screenshot, vision_action, with_vision_fallback, shadow_observe_then_cua
+├── vision_narrate.py           # Gemini Flash agent-side-panel narrator (tier-2 observing): narrate_panel reads the AI activity panel directly via screenshot
+├── vision_test.py              # Fixture replay tool: --capture saves PNG+JSON, --fixtures replays + asserts action-class agreement + bbox containment
 ├── requirements.txt            # Python dependencies
 ├── firebase-service-account.json  # Firebase connection (not committed)
 ├── research_config.json        # Your ResearchToken (generated by --setup)
 ├── run_analytics.json          # Historical phase durations (auto-updated)
 ├── ARCHITECTURE.md             # Backend architecture + Frontend ↔ Backend API contract
+├── scratch/                    # (gitignored) Vision hotspot map + Track A/B/C wire-in plan
+├── scripts/
+│   ├── run_supervisor.cmd      # CMD wrapper for the daemon-loop (env-var inheritance + Scheduled Task entry point)
+│   └── vision_shadow_report.py # Per-hotspot agreement table from logs/vision_shadow.jsonl
+├── tests/fixtures/vision/      # V1 Vision fixtures (PNG + JSON pairs); auto/ subdir is gitignored
 ├── queues/                     # Active/completed pipeline runs (per-topic dirs)
 │   └── {topic}_{timestamp}/    # meta.json, config.json, delivery.json, documents/, podcasts/
 └── tracks/                     # Real-time progress data (events.jsonl + per-agent scrapes)
