@@ -16562,6 +16562,27 @@ def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
     return results
 
 
+def _proc_age_seconds(pid: int) -> float | None:
+    """Return seconds since process creation, or None if unknown.
+    Best-effort via wmic CreationDate (yyyymmddHHMMSS.ffffff±zzz)."""
+    try:
+        r = subprocess.run(
+            ["wmic", "process", "where", f"ProcessId={pid}",
+             "get", "CreationDate", "/format:list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in (r.stdout or "").splitlines():
+            if line.startswith("CreationDate="):
+                stamp = line.split("=", 1)[1].strip()[:14]
+                if len(stamp) == 14:
+                    import datetime as _dt
+                    created = _dt.datetime.strptime(stamp, "%Y%m%d%H%M%S")
+                    return (_dt.datetime.now() - created).total_seconds()
+    except Exception:
+        return None
+    return None
+
+
 def _kill_pids(pids: list[int]) -> int:
     """taskkill /F each PID. Returns count that successfully terminated.
     Silent on individual failures — caller can re-enumerate to confirm."""
@@ -16609,6 +16630,38 @@ def run_daemon_loop(port: int = 8000):
     _log_dir = Path(script_path).parent
     _serve_log = _log_dir / "backend.log"
     _serve_err = _log_dir / "backend.err.log"
+
+    # Pre-flight orphan sweep — runs once at wrapper startup. Catches:
+    #   (a) other daemon-loop PIDs (only one wrapper at a time; PT5M task
+    #       repetition with MultipleInstances=IgnoreNew should prevent this,
+    #       but defend in depth in case of manual --daemon-loop alongside),
+    #   (b) stale --serve PIDs from a prior wrapper death — port 8000 must
+    #       belong to the --serve we're about to spawn,
+    #   (c) one-off `python research.py "<topic>"` runs older than
+    #       DG_ORPHAN_MAX_AGE_HOURS (default 4h) — manual smoke tests that
+    #       were never reaped. Set =0 to disable, =24 for safety on long runs.
+    self_pid = os.getpid()
+    try:
+        max_age_h = float(os.environ.get("DG_ORPHAN_MAX_AGE_HOURS", "4"))
+    except ValueError:
+        max_age_h = 4.0
+    sweep_pids: list[int] = []
+    try:
+        for pid, _cmd, role in _enumerate_research_py_procs():
+            if pid == self_pid:
+                continue
+            if role in ("daemon-loop", "serve"):
+                sweep_pids.append(pid)
+            elif role == "other" and max_age_h > 0:
+                age_s = _proc_age_seconds(pid)
+                if age_s is not None and age_s > max_age_h * 3600:
+                    sweep_pids.append(pid)
+    except Exception as _se:
+        log(f"[daemon-loop] Pre-flight sweep enumeration failed: {_se}", "WARN")
+    if sweep_pids:
+        killed = _kill_pids(sweep_pids)
+        log(f"[daemon-loop] Pre-flight sweep: killed {killed}/{len(sweep_pids)} stale research.py procs ({sweep_pids})")
+
     restarts = 0
     while True:
         try:
