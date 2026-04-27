@@ -16530,17 +16530,23 @@ def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
         )
     except Exception:
         return []
+    # wmic /format:list emits blank lines BETWEEN fields of the same entry
+    # (CommandLine=...\n\nProcessId=...\n\n\n\n) on Windows 10/11. The old
+    # parser treated any blank line as an entry boundary, splitting each
+    # process into two single-field entries — silently broke this function
+    # on real systems. New parser flushes only when BOTH expected fields
+    # have been collected.
     entries: list[dict[str, str]] = []
     cur: dict[str, str] = {}
     for line in (ps.stdout or "").splitlines():
         line = line.strip()
         if not line:
-            if cur:
-                entries.append(cur); cur = {}
             continue
         if "=" in line:
             k, _, v = line.partition("=")
             cur[k.strip()] = v.strip()
+            if "CommandLine" in cur and "ProcessId" in cur:
+                entries.append(cur); cur = {}
     if cur:
         entries.append(cur)
     results: list[tuple[int, str, str]] = []
