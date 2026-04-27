@@ -282,6 +282,81 @@ def _setup_step(n: int, total: int, title: str):
     print(f"  {_c(_DIM, '─' * 58)}")
 
 
+def _battery_state() -> str:
+    """Return a short display string for the machine's power state.
+    "On AC" / "On battery (N%)" / "Plugged in (no battery)" / ""
+    Empty string = caller should skip the row (non-Windows or PS error).
+    Result cached for ~10s so multiple context-strip renders in the same
+    command don't re-spawn PowerShell."""
+    import platform as _platform
+    import time as _time
+    if _platform.system() != "Windows":
+        return ""
+    cache_key = "_battery_state_cache"
+    g = globals()
+    cached = g.get(cache_key)
+    if cached and (_time.time() - cached[0]) < 10:
+        return cached[1]
+    try:
+        ps = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "$b = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1; "
+             "if ($b -eq $null) { 'NONE' } else { \"$($b.BatteryStatus):$($b.EstimatedChargeRemaining)\" }"],
+            capture_output=True, text=True, timeout=8,
+        )
+        out = (ps.stdout or "").strip()
+    except Exception:
+        out = ""
+    if out == "NONE":
+        result = "Plugged in (no battery)"
+    elif ":" in out:
+        status, _, pct = out.partition(":")
+        try:
+            status_i = int(status)
+            pct_s = f" ({pct}%)" if pct.isdigit() else ""
+            # Win32_Battery.BatteryStatus: 1=Discharging, 2=AC, 3=Fully charged,
+            # 4=Low, 5=Critical, 6=Charging, 7=Charging+High, 8=Charging+Low,
+            # 9=Charging+Critical, 10=Undefined, 11=Partially charged
+            if status_i == 1:
+                result = f"On battery{pct_s}"
+            elif status_i in (2, 3, 11):
+                result = f"On AC{pct_s}"
+            elif status_i in (6, 7, 8, 9):
+                result = f"Charging{pct_s}"
+            else:
+                result = f"AC/battery state {status_i}{pct_s}"
+        except ValueError:
+            result = ""
+    else:
+        result = ""
+    g[cache_key] = (_time.time(), result)
+    return result
+
+
+def _local_api_health(port: int = 8000, timeout_s: float = 3.0) -> "tuple[bool, str]":
+    """Probe http://localhost:<port>/api/health. Returns (ok, detail).
+    detail is a short status string for printing (e.g. "200 OK" / "no
+    connection" / "timeout"). Used by --resurrect Step 4 to confirm the
+    backend is actually responding before declaring success."""
+    try:
+        ps = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"try {{ $r = Invoke-WebRequest -Uri http://localhost:{port}/api/health "
+             f"-UseBasicParsing -TimeoutSec {int(timeout_s)}; "
+             "Write-Output $r.StatusCode } "
+             "catch { Write-Output \"ERR:$($_.Exception.Message)\" }"],
+            capture_output=True, text=True, timeout=timeout_s + 5,
+        )
+        out = (ps.stdout or "").strip()
+        if out.startswith("ERR:"):
+            return False, out[4:120]
+        if out == "200":
+            return True, "200 OK"
+        return False, f"HTTP {out}"
+    except Exception as e:
+        return False, f"probe error: {e}"
+
+
 def _render_context_strip(items: list[tuple[str, str]]):
     """Print a 'metadata strip' of (label, preformatted_value) pairs right
     after _branded_header, before any [n/total] step counters fire. Gives
@@ -16931,11 +17006,15 @@ def run_resurrect():
     device_id = load_device_id()
     paired_email = _fetch_paired_email(paired_uid)
     currently_supervised = _detect_supervised()
-    _render_context_strip([
+    _ctx_rows = [
         ("Device",    _c(_BOLD, device_id or "(not paired)")),
         ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
         ("On Startup", _c(_OK, "on") if currently_supervised else _c(_DIM, "off → enabling")),
-    ])
+    ]
+    _bat = _battery_state()
+    if _bat:
+        _ctx_rows.append(("Power", _c(_DIM, _bat)))
+    _render_context_strip(_ctx_rows)
 
     # ── [1/4] Pre-flight ──
     _setup_step(1, 4, "Pre-flight")
@@ -17004,6 +17083,24 @@ def run_resurrect():
     daemon_pid = next((pid for pid, _cmd, role in procs if role == "daemon-loop"), None)
     plain_serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
 
+    # Pre-flight orphan visibility: count what's about to be reaped before
+    # the daemon-loop starts, so the user sees the sweep working rather
+    # than just a silent kill. Same enumeration the daemon-loop wrapper
+    # would do; we mirror it here so it's surfaced at install time too.
+    _self_pid_r = os.getpid()
+    _stale_daemons = [pid for pid, _c, role in procs
+                      if role == "daemon-loop" and pid != _self_pid_r]
+    _other_procs = [(pid, cmd) for pid, cmd, role in procs if role == "other"]
+    if _stale_daemons or plain_serve_pids or _other_procs:
+        bits = []
+        if _stale_daemons:
+            bits.append(f"{len(_stale_daemons)} stale daemon-loop")
+        if plain_serve_pids:
+            bits.append(f"{len(plain_serve_pids)} stale --serve")
+        if _other_procs:
+            bits.append(f"{len(_other_procs)} manual one-off run(s) preserved")
+        print(f"  {_c(_DIM, '     Pre-flight: ' + ', '.join(bits))}")
+
     if daemon_pid is not None:
         print(f"  {_c(_OK, '✓')}  Backend already running (PID {daemon_pid}) — nothing to spawn")
     else:
@@ -17039,6 +17136,17 @@ def run_resurrect():
                         break
             if spawned_pid is not None:
                 print(f"  {_c(_OK, '✓')}  Backend started (PID {spawned_pid}, running in background)")
+                # Health probe — confirm the API is actually responding before
+                # declaring success. Catches the case where daemon-loop is
+                # alive but --serve crashed on bind (e.g., port 8000 squatter)
+                # and is restart-looping.
+                _time.sleep(2)  # let uvicorn finish startup
+                _api_ok, _api_detail = _local_api_health()
+                if _api_ok:
+                    print(f"  {_c(_OK, '✓')}  API responding ({_api_detail})")
+                else:
+                    print(f"  {_c(_WARN, '⚠')}  API not responding yet: {_api_detail}")
+                    print(f"  {_c(_DIM, '     daemon-loop may still be initializing — give it ~30s, then curl /api/health.')}")
             else:
                 print(f"  {_c(_WARN, '⚠')}  Backend did not appear within 5s — check backend.err.log.")
                 print(f"  {_c(_DIM, '     The scheduled task still fires at next login as a fallback.')}")
@@ -17084,11 +17192,15 @@ def run_retire():
     device_id = load_device_id()
     paired_email = _fetch_paired_email(paired_uid)
     currently_supervised = _detect_supervised()
-    _render_context_strip([
+    _ctx_rows_r = [
         ("Device",     _c(_BOLD, device_id or "(not paired)")),
         ("Paired to",  _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
         ("On Startup", _c(_OK, "on") if currently_supervised else _c(_DIM, "off — nothing to undo")),
-    ])
+    ]
+    _bat_r = _battery_state()
+    if _bat_r:
+        _ctx_rows_r.append(("Power", _c(_DIM, _bat_r)))
+    _render_context_strip(_ctx_rows_r)
 
     # Short-circuit: if nothing is armed and nothing is running, there's
     # nothing to retire. Walking through all 3 steps just to print "Nothing
@@ -17173,6 +17285,22 @@ def run_retire():
         print(f"  {_c(_OK, '✓')}  Stopped {killed_serve_total} --serve process{plural}")
     else:
         print(f"  {_c(_DIM, '     No --serve processes were running.')}")
+
+    # Manual one-off runs (role="other") are NOT killed by --retire — those
+    # are user-launched `python research.py "<topic>"` invocations. Surface
+    # them so the user knows what's still alive on their box.
+    other_procs = [(pid, cmd) for pid, cmd, role in last_survivors if role == "other"]
+    if other_procs:
+        plural = "s" if len(other_procs) != 1 else ""
+        print(f"  {_c(_DIM, f'     Preserved {len(other_procs)} manual run{plural} (not touched by --retire):')}")
+        for pid, cmd in other_procs[:3]:
+            age = _proc_age_seconds(pid)
+            age_s = f"{int(age/3600)}h" if (age and age >= 3600) else (f"{int(age/60)}m" if age else "?")
+            cmd_short = cmd.split('research.py', 1)[-1][:60] if 'research.py' in cmd else cmd[:60]
+            print(f"       {_c(_DIM, f'PID {pid}  age {age_s}  research.py{cmd_short}')}")
+        if len(other_procs) > 3:
+            print(f"       {_c(_DIM, f'... and {len(other_procs) - 3} more')}")
+        print(f"       {_c(_DIM, 'Stop manually with: taskkill /F /PID <pid>')}")
 
     # ── [3/3] Firestore sync + verification ──
     _setup_step(3, 3, "Firestore sync")
