@@ -6896,6 +6896,16 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     consecutive_not_generating = 0
     cua_checked = False
     last_heartbeat = time.time()
+    # ── ChatGPT activity-strip open state (P1 only — Phase1 / Phase1-followup) ──
+    # Mirrors the per-agent dict P2 round-robin uses, scoped to this single
+    # poll call. Flips _panel_open_done True on first verified open. DOM
+    # misses count both "found:false" AND "clicked but verify:false". CUA
+    # tier-3 capped at 1/call. The same robust helper (research.py:5048)
+    # works regardless of phase — Pro+ET in P1 produces the same React-
+    # rendered styled <div> strip that DR in P2 does.
+    _panel_open_done = False
+    _panel_dom_misses = 0
+    _panel_cua_attempts = 0
     # Stall detector — multi-signal (2026-04-25 strictness rewrite):
     # tracks text + sources + steps. ChatGPT DR's "researching" phase
     # legitimately produces zero text growth for 5-15 min while sources
@@ -6954,6 +6964,86 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             try:
                 progress = await scrape_fn(page)
                 save_track(label, progress)
+                # Hoisted from dedupe block — needed by panel-open gate below.
+                elapsed_sec = int(time.time() - wait_start)
+
+                # ── ChatGPT activity-strip open (P1 mirror of P2 round-robin) ──
+                # Pro+ET sometimes does mid-thinking web searches → "Looking
+                # into X… N searches" strip at bottom of chat. Same robust
+                # DOM helper (walks * + dispatches full event chain — v1
+                # narrow selector matched 0 candidates because the strip is
+                # a styled <div>). Gate: 180s wall-clock. After 2 DOM misses
+                # → CUA tier-3 (capped 1/call). Only fires for ChatGPT P1
+                # entry points; Gemini/Claude have own paths.
+                if (label in ("Phase1", "Phase1-followup")
+                        and elapsed_sec >= 180
+                        and not _panel_open_done):
+                    try:
+                        res = await _open_chatgpt_activity_panel(page)
+                        cands = (res or {}).get("candidates", 0)
+                        if not res or not res.get("found"):
+                            _panel_dom_misses += 1
+                            log(f"[{label}] panel DOM miss #{_panel_dom_misses} "
+                                f"(elapsed={elapsed_sec}s, walked_hits={cands}) — "
+                                f"strip not yet rendered or wording changed", "DEBUG")
+                        elif res.get("alreadyExpanded"):
+                            _panel_open_done = True
+                            log(f"[{label}] activity panel already expanded at "
+                                f"elapsed={elapsed_sec}s — label: \"{res.get('label','')[:80]}\"")
+                        elif res.get("clicked"):
+                            await asyncio.sleep(2.0)
+                            verified = await _verify_chatgpt_panel_open(page)
+                            if verified:
+                                _panel_open_done = True
+                                log(f"[{label}] activity panel opened via DOM at "
+                                    f"elapsed={elapsed_sec}s — clickedTag={res.get('clickedTag','?')}")
+                            else:
+                                _panel_dom_misses += 1
+                                log(f"[{label}] DOM clicked but panel didn't render — "
+                                    f"miss #{_panel_dom_misses}", "WARN")
+                        else:
+                            _panel_dom_misses += 1
+                            log(f"[{label}] panel found but click failed — "
+                                f"err={res.get('error','?')}", "WARN")
+                    except Exception as _pe:
+                        log(f"[{label}] activity panel open failed: {_pe}", "WARN")
+                        _panel_dom_misses += 1
+
+                    # CUA tier-3 escalation after 2 DOM misses (capped at 1/call).
+                    if (not _panel_open_done
+                            and _panel_dom_misses >= 2
+                            and _panel_cua_attempts == 0
+                            and cua_client and browser):
+                        log(f"[{label}] DOM missed strip 2x — escalating to CUA tier-3 "
+                            f"(elapsed={elapsed_sec}s)")
+                        try:
+                            emit_event("tier_transition", phase=phase, agent="chatgpt",
+                                       op="open_activity_panel_p1", from_tier="dom",
+                                       to_tier="cua", reason="dom_2_misses")
+                        except Exception:
+                            pass
+                        _panel_cua_attempts = 1
+                        try:
+                            cua_res = await asyncio.wait_for(
+                                agent_loop(cua_client, browser,
+                                    PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
+                                    "Open the activity strip at the bottom of this ChatGPT "
+                                    "Pro/Thinking conversation. ONE click only. Verify the "
+                                    "side panel slides out before reporting.",
+                                    model=CUA_MODEL, max_iterations=5,
+                                    verbose=verbose, target_page=page),
+                                timeout=120.0)
+                            out = ((cua_res or {}).get("text") or "").lower()
+                            if "panel: open" in out or "panel: already_open" in out:
+                                _panel_open_done = True
+                                log(f"[{label}] activity panel opened via CUA tier-3")
+                            else:
+                                log(f"[{label}] CUA tier-3 didn't confirm panel: {out[:120]}", "WARN")
+                        except asyncio.TimeoutError:
+                            log(f"[{label}] CUA tier-3 timed out after 120s", "WARN")
+                        except Exception as _ce:
+                            log(f"[{label}] CUA tier-3 failed: {_ce}", "WARN")
+
                 # Enrich with MutationObserver data (token-level stream)
                 _obs = get_observer_state(page)
                 _obs_len = _obs.get("observer_text_len", 0) or 0
@@ -6983,7 +7073,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # whole window, leaving the FE stuck on "Opening ChatGPT…". The
                 # 30s tick guarantees the dropdown narration stays alive — same
                 # pattern P2's round-robin polling uses.
-                elapsed_sec = int(time.time() - wait_start)
+                # elapsed_sec hoisted to top of try block for panel-open gate.
                 progress_key = json.dumps({
                     "status": progress.get("status", ""),
                     "sources": progress.get("sources", 0),
