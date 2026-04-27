@@ -6022,6 +6022,15 @@ async def _click_claude_artifact(page, index=0):
                 );
                 cards = Array.from(fallback);
             }}
+            // 2026-04-26: visibility + dialog-modal filter — a publish/share
+            // dialog left over from a prior turn can match the same selectors;
+            // skip zero-bbox elements and anything inside [role="dialog"].
+            cards = cards.filter(c => {{
+                const r = c.getBoundingClientRect();
+                if (r.width < 20 || r.height < 20) return false;
+                if (c.closest('[role="dialog"], [aria-modal="true"]')) return false;
+                return true;
+            }});
             if (cards.length > idx) {{ cards[idx].click(); return true; }}
             return false;
         }}""", index)
@@ -6056,6 +6065,41 @@ async def _read_claude_artifact_panel(page):
     except Exception as e:
         log(f"Artifact panel read failed: {e}", "WARN")
         return ""
+
+
+def _is_sources_not_document(text, *, platform="generic"):
+    """Strict invariant guard for Phase 2 finalize extraction:
+    extract_*_response must return the DOCUMENT (final report markdown),
+    NEVER the SOURCES tracking checklist or right-side source-panel URL list.
+    Errs toward LETTING DOCUMENTS THROUGH — a wrongly rejected report would
+    force a retry on a correct extract.
+
+    Heuristics (a doc passes if prose check holds; a source artifact must
+    trip checklist OR url-list signals AND lack prose):
+      DOC POSITIVE  : >=3 markdown headings AND >=5 paragraphs >100 chars
+      CHECKLIST NEG : >=4 [x]/[ ] OR >=4 "Reading source N" lines AND
+                      heading count <2 AND length < 5000
+      URL-LIST NEG  : >=8 numbered-URL/bare-hostname lines AND headings <2
+                      AND length 800-3000
+    """
+    if not text or len(text) < 200:
+        return False
+    headings = len(re.findall(r'(?m)^#{1,3}\s+\S', text))
+    paragraphs = [p for p in text.split('\n\n') if len(p) > 100]
+    if headings >= 3 and len(paragraphs) >= 5:
+        return False
+    checkbox_lines = len(re.findall(r'(?m)^\s*[-*]?\s*\[[ xX]\]\s+\S', text))
+    reading_lines = len(re.findall(
+        r'(?im)^\s*(?:reading|checking|analyzing|searching)\s+(?:source\s+)?\d+', text))
+    if (checkbox_lines >= 4 or reading_lines >= 4) and headings < 2 and len(text) < 5000:
+        return True
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    url_only = sum(
+        1 for l in lines
+        if re.match(r'^\d+[\.\)]?\s*(?:https?://|[a-z0-9.-]+\.[a-z]{2,}/)', l, re.I))
+    if url_only >= 8 and headings < 2 and 800 <= len(text) <= 3000:
+        return True
+    return False
 
 
 async def _close_claude_artifact_panel(page):
@@ -9517,7 +9561,14 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
                     '[class*="artifact"], [class*="canvas"], [class*="research"], article'
                 );
                 if (inArtifact) {
-                    b.click(); return { clicked: true, selector: 'text:'+t+'+scoped' };
+                    // 2026-04-26: bottom-40%-viewport check on text fallback
+                    // — artifact cards live at the latest assistant turn,
+                    // never in the page header/sidebar. Skips false positives
+                    // like "Open Sidebar" buttons in shared chrome.
+                    const r = b.getBoundingClientRect();
+                    const vh = window.innerHeight || document.documentElement.clientHeight;
+                    if (r.top < vh * 0.4) continue;
+                    b.click(); return { clicked: true, selector: 'text:'+t+'+scoped+bottom' };
                 }
             }
             return { clicked: false };
@@ -9532,19 +9583,70 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     except Exception as _oe:
         log(f"[{label}] Post-completion artifact-open skipped: {_oe}", "DEBUG")
 
-    # Method 1 (PRIMARY): CUA opens the artifact/document and copies it
-    if browser and cua_client:
-        log(f"[{label}] CUA: Opening and copying Deep Research artifact...")
+    # Method 1 (PRIMARY): CUA opens the artifact/document and copies it.
+    # 2026-04-26: shadow-wrapped (#2c) and content-validated. Retry cap 1.
+    # Granularity choice: ONE shadow-wrap covering the CUA copy step only —
+    # Step 0 ENLARGE is pure DOM, no Vision benefit. Single observation per
+    # finalize keeps shadow-log volume sane (~1 event per agent per run).
+    _cgpt_2c_attempts = 0
+    while _cgpt_2c_attempts < 2 and browser and cua_client:
+        _cgpt_2c_attempts += 1
+        log(f"[{label}] CUA: Opening and copying Deep Research artifact "
+            f"(attempt {_cgpt_2c_attempts}/2)...")
         await browser.switch_to_page(page)
-        await agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CHATGPT,
-            "Open the research report document and copy its full content to clipboard.",
-            model=CUA_MODEL, max_iterations=12, verbose=verbose)
+        async def _cgpt_finalize_cua():
+            return await asyncio.wait_for(
+                agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CHATGPT,
+                    "Open the research report document and copy its full "
+                    "content to clipboard.",
+                    model=CUA_MODEL,
+                    max_iterations=12 if _cgpt_2c_attempts == 1 else 16,
+                    verbose=verbose, target_page=page),
+                timeout=180.0)
+        try:
+            await _shadow_observed_cua(
+                page, hotspot_id="2c", phase=2, platform="chatgpt",
+                current_step="copy_open_artifact",
+                context_hint=f"finalize attempt {_cgpt_2c_attempts}; step0 enlarge already tried",
+                expected_outcome="canvas overlay visible, copy succeeded, "
+                                 "clipboard holds long-form report markdown",
+                cua_coro_factory=_cgpt_finalize_cua)
+        except asyncio.TimeoutError:
+            log(f"[{label}] CUA finalize timed out after 180s "
+                f"(attempt {_cgpt_2c_attempts})", "WARN")
+            continue
+        except Exception as _e:
+            log(f"[{label}] CUA finalize raised: {_e}", "WARN")
+            continue
         await asyncio.sleep(1)
         clipboard = get_clipboard()
-        if clipboard and len(clipboard) > 500:
-            log(f"[{label}] Extracted via CUA artifact copy: {len(clipboard)} chars")
-            return clipboard
-        log(f"[{label}] CUA copy got {len(clipboard or '')} chars — trying fallbacks", "WARN")
+        if not clipboard or len(clipboard) <= 500:
+            log(f"[{label}] CUA copy got {len(clipboard or '')} chars "
+                f"(attempt {_cgpt_2c_attempts})", "WARN")
+            continue
+        if _is_sources_not_document(clipboard, platform="chatgpt"):
+            log(f"[{label}] CUA copy returned WRONG ARTIFACT "
+                f"(source-panel/preview, {len(clipboard)} chars) — rejecting "
+                f"(attempt {_cgpt_2c_attempts}/2)", "WARN")
+            try:
+                emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                           op="finalize_copy", attempt=_cgpt_2c_attempts,
+                           length=len(clipboard), tier="cua")
+            except Exception:
+                pass
+            if _cgpt_2c_attempts < 2:
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.4)
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(0.6)
+                    subprocess.run(["powershell.exe", "-NoProfile", "-Command",
+                                    "Set-Clipboard ''"], capture_output=True, timeout=5)
+                except Exception:
+                    pass
+            continue
+        log(f"[{label}] Extracted via CUA artifact copy: {len(clipboard)} chars")
+        return clipboard
 
     # Method 2: HTML→MD from the now-opened canvas / artifact content block.
     # 2000-char gate (was 500): a 500-char preamble could pass; 2000 ensures we
@@ -9555,8 +9657,17 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         '[data-message-author-role="assistant"]:last-of-type .markdown',
     ], label)
     if md and len(md) > 2000:
-        log(f"[{label}] Extracted via HTML→MD (canvas/artifact): {len(md)} chars")
-        return md
+        if _is_sources_not_document(md, platform="chatgpt"):
+            log(f"[{label}] HTML→MD wrong-artifact ({len(md)} chars source-panel-shape) "
+                f"— skipping", "WARN")
+            try:
+                emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                           op="finalize_copy", length=len(md), tier="dom_html_md")
+            except Exception:
+                pass
+        else:
+            log(f"[{label}] Extracted via HTML→MD (canvas/artifact): {len(md)} chars")
+            return md
 
     # Method 3: JS — last assistant message (regular chat mode, not Deep Research).
     # 2000-char gate same rationale as Method 2.
@@ -9570,11 +9681,26 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
             return '';
         }""")
         if text and len(text) > 2000:
-            log(f"[{label}] Extracted via JS innerText: {len(text)} chars")
-            return text
+            if _is_sources_not_document(text, platform="chatgpt"):
+                log(f"[{label}] JS innerText wrong-artifact ({len(text)} chars "
+                    f"source-panel-shape) — skipping", "WARN")
+                try:
+                    emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                               op="finalize_copy", length=len(text), tier="dom_js")
+                except Exception:
+                    pass
+            else:
+                log(f"[{label}] Extracted via JS innerText: {len(text)} chars")
+                return text
     except Exception:
         pass
 
+    try:
+        emit_event("extract_failed", phase=2, agent="chatgpt",
+                   op="finalize_copy",
+                   reason="all_methods_returned_empty_or_wrong_artifact")
+    except Exception:
+        pass
     log(f"[{label}] All extraction methods failed (canvas may not have opened)", "WARN")
     return ""
 
@@ -9699,6 +9825,16 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             log(f"[{label}] artifact-1 close before extract failed (continuing): {_ce}", "DEBUG")
 
     # ── Step 1: Count artifacts so we know which index = final report ──
+    # 2026-04-26: scroll-to-bottom warmup forces lazy-load of latest turn —
+    # without this, an early-rendered DOM may report artifact_count=1 when
+    # artifact-2 (final report) is in the not-yet-mounted bottom portion →
+    # target_idx=0 clicks artifact-1 (tracking checklist).
+    try:
+        for _ in range(2):
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(0.5)
+    except Exception:
+        pass
     artifact_count = await _count_claude_artifacts(page)
     log(f"[{label}] Post-completion: found {artifact_count} artifact(s)")
 
@@ -9715,53 +9851,154 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             await asyncio.sleep(2)  # Wait for panel render
             panel_text = await _read_claude_artifact_panel(page)
             if panel_text and len(panel_text) > 500:
-                log(f"[{label}] Extracted via DOM artifact panel ({target_idx}): {len(panel_text)} chars")
-                # Try to also get clipboard copy for higher fidelity
-                try:
-                    await page.evaluate("""() => {
-                        const copyBtn = document.querySelector(
-                            'aside button[aria-label*="Copy"], ' +
-                            '[class*="artifact-panel"] button[aria-label*="Copy"], ' +
-                            'button[data-testid="copy-artifact"]'
-                        );
-                        if (copyBtn) copyBtn.click();
-                    }""")
-                    await asyncio.sleep(1)
-                    clipboard = get_clipboard()
-                    if clipboard and len(clipboard) > len(panel_text) * 0.8:
-                        log(f"[{label}] Upgraded to clipboard copy: {len(clipboard)} chars")
-                        return clipboard
-                except Exception:
-                    pass
-                return panel_text
+                if _is_sources_not_document(panel_text, platform="claude"):
+                    log(f"[{label}] DOM panel wrong-artifact "
+                        f"(checklist, {len(panel_text)} chars) — fall through to CUA",
+                        "WARN")
+                    try:
+                        emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                                   op="finalize_copy", length=len(panel_text),
+                                   tier="dom_panel")
+                    except Exception:
+                        pass
+                    try:
+                        await _close_claude_artifact_panel(page)
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+                else:
+                    log(f"[{label}] Extracted via DOM artifact panel ({target_idx}): "
+                        f"{len(panel_text)} chars")
+                    # Try to also get clipboard copy for higher fidelity
+                    try:
+                        await page.evaluate("""() => {
+                            const copyBtn = document.querySelector(
+                                'aside button[aria-label*="Copy"], ' +
+                                '[class*="artifact-panel"] button[aria-label*="Copy"], ' +
+                                'button[data-testid="copy-artifact"]'
+                            );
+                            if (copyBtn) copyBtn.click();
+                        }""")
+                        await asyncio.sleep(1)
+                        clipboard = get_clipboard()
+                        if (clipboard and len(clipboard) > len(panel_text) * 0.8
+                                and not _is_sources_not_document(clipboard, platform="claude")):
+                            log(f"[{label}] Upgraded to clipboard copy: {len(clipboard)} chars")
+                            return clipboard
+                    except Exception:
+                        pass
+                    return panel_text
 
-    # Method 2: CUA opens the correct artifact and copies it
-    if browser and cua_client:
-        log(f"[{label}] CUA: Navigating to final artifact...")
+    # Method 2: CUA opens the correct artifact and copies it.
+    # 2026-04-26: split into TWO shadow-eval hotspots — `2d-nav` wraps the
+    # NAVIGATE call (action class: click_last_artifact_card), `2d-copy` wraps
+    # the COPY call (action class: copy_open_artifact). Separate hotspots so
+    # Vision agreement metrics stay distinct per action class. Retry cap 1.
+    _claude_2d_attempts = 0
+    while _claude_2d_attempts < 2 and browser and cua_client:
+        _claude_2d_attempts += 1
+        log(f"[{label}] CUA: Navigating to final artifact "
+            f"(attempt {_claude_2d_attempts}/2)...")
         await browser.switch_to_page(page)
-        # Use the new targeted prompt if 2+ artifacts, else original
         if artifact_count >= 2:
-            await agent_loop(cua_client, browser, PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
-                f"There are {artifact_count} artifacts in this conversation. "
-                "Open the LAST (bottom) artifact — that's the final research report.",
-                model=CUA_MODEL, max_iterations=8, verbose=verbose)
+            async def _claude_2d_nav_cua():
+                return await asyncio.wait_for(
+                    agent_loop(cua_client, browser,
+                        PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                        f"There are {artifact_count} artifacts in this "
+                        f"conversation. Open the LAST (bottom) artifact — "
+                        f"that's the final research report.",
+                        model=CUA_MODEL,
+                        max_iterations=8 if _claude_2d_attempts == 1 else 12,
+                        verbose=verbose, target_page=page),
+                    timeout=180.0)
+            try:
+                await _shadow_observed_cua(
+                    page, hotspot_id="2d-nav", phase=2, platform="claude",
+                    current_step="click_last_artifact_card",
+                    context_hint=f"finalize nav attempt {_claude_2d_attempts}; "
+                                 f"artifact_count={artifact_count}",
+                    expected_outcome="right-panel mounts final report "
+                                     "(multi-section prose, NOT checklist)",
+                    cua_coro_factory=_claude_2d_nav_cua)
+            except asyncio.TimeoutError:
+                log(f"[{label}] CUA nav timed out after 180s "
+                    f"(attempt {_claude_2d_attempts})", "WARN")
+                continue
+            except Exception as _ne:
+                log(f"[{label}] CUA nav raised: {_ne}", "WARN")
+                continue
             await asyncio.sleep(1)
-        await agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
-            "Copy the full content of the artifact currently open in the right panel to clipboard.",
-            model=CUA_MODEL, max_iterations=12, verbose=verbose)
+        async def _claude_2d_copy_cua():
+            return await asyncio.wait_for(
+                agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
+                    "Copy the full content of the artifact currently open "
+                    "in the right panel to clipboard.",
+                    model=CUA_MODEL,
+                    max_iterations=12 if _claude_2d_attempts == 1 else 16,
+                    verbose=verbose, target_page=page),
+                timeout=180.0)
+        try:
+            await _shadow_observed_cua(
+                page, hotspot_id="2d-copy", phase=2, platform="claude",
+                current_step="copy_open_artifact",
+                context_hint=f"finalize copy attempt {_claude_2d_attempts}; "
+                             f"artifact_count={artifact_count}",
+                expected_outcome="clipboard holds long-form report markdown "
+                                 "(>=2 headings, prose, no [x]/[ ] checklist)",
+                cua_coro_factory=_claude_2d_copy_cua)
+        except asyncio.TimeoutError:
+            log(f"[{label}] CUA copy timed out after 180s "
+                f"(attempt {_claude_2d_attempts})", "WARN")
+            continue
+        except Exception as _ce:
+            log(f"[{label}] CUA copy raised: {_ce}", "WARN")
+            continue
         await asyncio.sleep(1)
         clipboard = get_clipboard()
-        if clipboard and len(clipboard) > 500:
-            log(f"[{label}] Extracted via CUA artifact copy: {len(clipboard)} chars")
-            return clipboard
-        log(f"[{label}] CUA copy got {len(clipboard or '')} chars — trying fallbacks", "WARN")
+        if not clipboard or len(clipboard) <= 500:
+            log(f"[{label}] CUA copy got {len(clipboard or '')} chars "
+                f"(attempt {_claude_2d_attempts})", "WARN")
+            continue
+        if _is_sources_not_document(clipboard, platform="claude"):
+            log(f"[{label}] CUA copy returned WRONG ARTIFACT "
+                f"(checklist/tracking, {len(clipboard)} chars) — rejecting "
+                f"(attempt {_claude_2d_attempts}/2)", "WARN")
+            try:
+                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                           op="finalize_copy", attempt=_claude_2d_attempts,
+                           length=len(clipboard), tier="cua")
+            except Exception:
+                pass
+            if _claude_2d_attempts < 2:
+                try:
+                    await _close_claude_artifact_panel(page)
+                    await asyncio.sleep(0.6)
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(0.6)
+                    artifact_count = await _count_claude_artifacts(page)
+                    subprocess.run(["powershell.exe", "-NoProfile", "-Command",
+                                    "Set-Clipboard ''"], capture_output=True, timeout=5)
+                except Exception:
+                    pass
+            continue
+        log(f"[{label}] Extracted via CUA artifact copy: {len(clipboard)} chars")
+        return clipboard
 
     # Method 3: HTML→MD
     md = await _extract_html_to_md(page, [
         '[data-is-streaming="false"] .markdown', '.font-claude-message', '.contents .prose',
     ], label)
     if md and len(md) > 100:
-        return md
+        if _is_sources_not_document(md, platform="claude"):
+            log(f"[{label}] HTML→MD wrong-artifact ({len(md)} chars) — skipping", "WARN")
+            try:
+                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                           op="finalize_copy", length=len(md), tier="dom_html_md")
+            except Exception:
+                pass
+        else:
+            return md
 
     # Method 4: JS fallback
     try:
@@ -9771,11 +10008,25 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             return '';
         }""")
         if text and len(text) > 100:
-            log(f"[{label}] Extracted via JS: {len(text)} chars")
-            return text
+            if _is_sources_not_document(text, platform="claude"):
+                log(f"[{label}] JS wrong-artifact ({len(text)} chars) — skipping", "WARN")
+                try:
+                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                               op="finalize_copy", length=len(text), tier="dom_js")
+                except Exception:
+                    pass
+            else:
+                log(f"[{label}] Extracted via JS: {len(text)} chars")
+                return text
     except Exception:
         pass
 
+    try:
+        emit_event("extract_failed", phase=2, agent="claude",
+                   op="finalize_copy",
+                   reason="all_methods_returned_empty_or_wrong_artifact")
+    except Exception:
+        pass
     log(f"[{label}] All extraction methods failed", "WARN")
     return ""
 
