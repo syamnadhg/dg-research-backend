@@ -8403,6 +8403,24 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # ongoing and the artifact card has spawned. Same gate applied to
             # ChatGPT below for symmetry. After 2 consecutive DOM "no artifact"
             # readings (after the gate clears), escalate to CUA tier-3 once.
+            # One-shot Claude page refresh at cycle 2 — unstick prophylaxis.
+            # Claude.ai sometimes hangs DOM mid-research even though server-side
+            # generation continues. A single reload mid-research re-mounts the
+            # conversation + artifact card from server state without losing any
+            # research progress (research is server-side; refresh is DOM-only).
+            # Runs BEFORE the artifact-open gate clears at cycle 3, so iter 3's
+            # first DOM probe meets a fresh DOM.
+            if (name == "Claude"
+                    and p.get("poll_cycles", 0) == 2
+                    and not p.get("claude_refreshed_once")):
+                try:
+                    log("[Claude] one-shot page refresh at cycle=2 (unstick prophylaxis)")
+                    await p["page"].reload(wait_until="domcontentloaded", timeout=20000)
+                    await asyncio.sleep(3.0)
+                except Exception as _re:
+                    log(f"[Claude] refresh failed: {_re}", "WARN")
+                p["claude_refreshed_once"] = True
+
             _claude_gate_ok = (p.get("poll_cycles", 0) >= 3 or elapsed >= 180)
             if (name == "Claude" and _claude_gate_ok and
                     (time.time() - p.get("last_artifact_scrape", 0)) > ARTIFACT_SCRAPE_INTERVAL):
