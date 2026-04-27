@@ -352,7 +352,7 @@ def _local_api_health(port: int = 8000, timeout_s: float = 3.0) -> "tuple[bool, 
             return False, out[4:120]
         if out == "200":
             return True, "200 OK"
-        return False, f"HTTP {out}"
+        return False, f"HTTP {out or '<no output>'}"
     except Exception as e:
         return False, f"probe error: {e}"
 
