@@ -2172,29 +2172,6 @@ class PipelineControls:
             return True
         return False
 
-    async def await_stuck_decision(self, agent: str, timeout: float = 600.0) -> str:
-        """Wait for user decision on a stuck-agent pipeline_warning offering
-        [Poke] / [Wait longer] / [Skip]. Returns:
-            'poke'         — send a mild "please continue" follow-up
-            'wait_longer'  — reset the no-growth timer, keep polling
-            'skip'         — drop this agent
-            'stop'         — pipeline stopped
-            'timeout'      — no decision (default: wait_longer)"""
-        key = (agent or "").strip().lower()
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
-        while loop.time() < deadline:
-            if self.stop_event.is_set():
-                return "stop"
-            if self.consume_poke_agent(key):
-                return "poke"
-            if self.consume_wait_longer_agent(key):
-                return "wait_longer"
-            if key in self.skipped_agents:
-                return "skip"
-            await asyncio.sleep(0.5)
-        return "timeout"
-
     async def await_agent_decision(self, agent: str, timeout: float = 300.0) -> str:
         """Wait for user decision on a Phase 2 agent pipeline_warning
         offering [Retry] / [Wait] / [Skip]. Returns:
@@ -2904,65 +2881,6 @@ async def run_input_dispatcher(poll_interval=2.0):
     except asyncio.CancelledError:
         log("[dispatcher] Cancelled")
         raise
-
-
-# ── NotebookLM addendum source upload ───────────────────────────────────
-
-async def upload_source_to_notebook(browser, page, file_path, label="addendum"):
-    """Upload an extra source document to an existing NotebookLM notebook.
-    Returns True on success."""
-    try:
-        await browser.switch_to_page(page)
-        await asyncio.sleep(1)
-        # Click "Add source" button
-        clicked = False
-        for sel in ['button[aria-label*="Add source"]',
-                    'button[aria-label*="Add"]',
-                    'button:has-text("Add source")',
-                    '[data-test*="add-source"]']:
-            try:
-                btn = await page.query_selector(sel)
-                if btn:
-                    await btn.click()
-                    clicked = True
-                    break
-            except Exception:
-                continue
-        if not clicked:
-            try:
-                clicked = await page.evaluate("""() => {
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        if ((b.textContent || '').toLowerCase().includes('add source')) {
-                            b.click(); return true;
-                        }
-                    }
-                    return false;
-                }""")
-            except Exception:
-                pass
-        if not clicked:
-            log(f"[notebook-addendum] 'Add source' button not found", "WARN")
-            return False
-        await asyncio.sleep(2)
-        # File chooser should appear — queue the upload
-        browser.set_upload_file(file_path)
-        # Try clicking a file-upload entry if modal shows tabs
-        for sel in ['input[type="file"]']:
-            try:
-                inp = await page.query_selector(sel)
-                if inp:
-                    await inp.set_input_files(str(file_path))
-                    break
-            except Exception:
-                continue
-        # Wait for ingestion
-        await asyncio.sleep(10)
-        log(f"[notebook-addendum] Uploaded {label}")
-        return True
-    except Exception as e:
-        log(f"[notebook-addendum] Upload failed: {e}", "WARN")
-        return False
 
 
 # ── Pause/Resume: Close browser + relaunch ──────────────────────────────
@@ -4923,16 +4841,15 @@ async def scrape_progress_chatgpt(page):
                                 result["dr_done_text"] = True
                     except Exception as _ie:
                         log(f"ChatGPT DR iframe evaluate skipped: {_ie}", "DEBUG")
-                    # ── Optional: actively expand the "Cited sources" panel ──
+                    # ── Actively expand the "Cited sources" panel ──
                     # ChatGPT DR collapses the sources list by default — the
                     # `<a href>` nodes inside it are NOT rendered until the
                     # user clicks the panel. The default scrape above misses
                     # those links and undercounts sources (often 0–3 instead
-                    # of 10–20). When DG_SOURCE_PANEL_EXPAND is set, we click
-                    # the toggle, wait for lazy render, and re-scrape. Off by
-                    # default so we don't perturb the DR UI mid-run; flip on
-                    # once stable. Wrapped in try/except so any failure
-                    # silently keeps the partial result we already collected.
+                    # of 10–20). On by default — opt out via
+                    # DG_SOURCE_PANEL_EXPAND=0/false/no. Wrapped in try/except
+                    # so any failure silently keeps the partial result we
+                    # already collected.
                     if os.environ.get("DG_SOURCE_PANEL_EXPAND", "1").lower() not in ("0", "false", "no"):
                         try:
                             click_res = await frame.evaluate("""() => {
