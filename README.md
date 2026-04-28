@@ -12,27 +12,32 @@ Automates multi-agent deep research across 6 platforms using Claude Computer Use
 ## Quick Start
 
 ```bash
-# 0. You need a Firebase Admin key file. See "Firebase Admin Key" below.
-
 # 1. Install
-git clone <repo-url>
-cd research-automate
+git clone https://github.com/dg-eng/super-research-backend.git
+cd super-research-backend
 pip install -r requirements.txt
 
-# 2. Setup (one-time: mints ResearchToken, renders QR, waits for logins)
+# 2. Drop in the Firebase Admin key (emailed to you by Sammy).
+#    The email attachment will have an auto-generated name like
+#    "super-research-492814-firebase-adminsdk-fbsvc-XXXXX.json".
+#    Save it into THIS directory and RENAME it exactly:
+#       firebase-service-account.json
+#    Step-by-step + verify command in "Firebase Admin Key" below.
+
+# 3. Setup (one-time: mints ResearchToken, renders QR, waits for logins)
 python research.py --setup
 
-# 3. Start the server (keep it running)
+# 4. Start the server (keep it running)
 python research.py --serve
 
-# 3a. (Optional, recommended) Survive reboots + crashes.
+# 4a. (Optional, recommended) Survive reboots + crashes.
 python research.py --resurrect
 
-# 3b. (Undo 3a) Disable On Startup — kills supervisor + serve, removes
+# 4b. (Undo 4a) Disable On Startup — kills supervisor + serve, removes
 #     the Scheduled Task, syncs the Firestore flag. Pairing stays.
 python research.py --retire
 
-# 3c. (Full disconnect) Clean teardown — also wipes pairing/device
+# 4c. (Full disconnect) Clean teardown — also wipes pairing/device
 #     registry. Use this when you're done with this PC entirely.
 python research.py --unpair
 ```
@@ -43,15 +48,76 @@ That's it. Four commands to a hands-off always-on backend — plus `--retire` to
 
 The backend needs a Firebase Admin SDK key to read the queue, write heartbeats, and stream events. **This file is NOT committed to git and never will be.**
 
-**How to get it:** Sammy (sammy.guli@distributedglobal.com) will email you the JSON file directly. One file per person.
+### How to get it
 
-**Where it goes (exact path):**
+Sammy (sammy.guli@distributedglobal.com) will email you the JSON file directly. One file per person. The attachment will have an auto-generated name from the Firebase Console — typically:
 
 ```
-research-automate/firebase-service-account.json
+super-research-492814-firebase-adminsdk-fbsvc-XXXXX.json
 ```
 
-That's it — same directory as `research.py`. The `.gitignore` is pre-configured so you can never accidentally commit it. If Python can't find the file, `--setup` / `--serve` will fail loudly with a clear path in the error.
+You **must rename it** to exactly `firebase-service-account.json` (the BE looks for that exact filename — no auto-detect) and place it in the **repo root** (the directory that contains `research.py`).
+
+### Where it goes (exact path)
+
+The repo root is whatever directory you `cd` into after `git clone`. For the org repo it's:
+
+```
+super-research-backend/firebase-service-account.json
+```
+
+Same directory as `research.py`. If you ever forked or renamed the directory, the file simply needs to be next to `research.py` — nothing else matters.
+
+### Step-by-step (after `git clone` + `cd super-research-backend`)
+
+**macOS / Linux:**
+```bash
+mv ~/Downloads/super-research-492814-firebase-adminsdk-fbsvc-*.json \
+   ./firebase-service-account.json
+ls -lh firebase-service-account.json   # should show ~2 KB
+```
+
+**Windows (PowerShell):**
+```powershell
+Move-Item "$HOME\Downloads\super-research-492814-firebase-adminsdk-fbsvc-*.json" `
+          ".\firebase-service-account.json"
+Get-Item .\firebase-service-account.json | Format-List Name,Length
+```
+
+**Windows (Git Bash / WSL):**
+```bash
+mv "/c/Users/$USER/Downloads/super-research-492814-firebase-adminsdk-fbsvc-"*.json \
+   ./firebase-service-account.json
+ls -lh firebase-service-account.json
+```
+
+If you have multiple matching files in Downloads (you may have re-downloaded), the wildcard might match >1 — copy the most recent one explicitly instead.
+
+### Verify it landed correctly
+
+```bash
+# From the repo root:
+ls firebase-service-account.json
+# OR on Windows PowerShell:
+Test-Path .\firebase-service-account.json
+```
+
+Open the file in any editor — it should be valid JSON starting with `{ "type": "service_account", ...`. If the file is HTML or empty, the email attachment didn't save correctly.
+
+### Safety
+
+- The `.gitignore` is pre-configured: this filename can never accidentally land in a commit, even with `git add -A`.
+- Don't email the file onward, don't commit it, don't paste it into Slack. One file per person.
+- If you suspect the key is compromised, email Sammy — keys can be rotated in the Firebase Console.
+
+### What happens if it's missing or wrong
+
+Both `--setup` and `--serve` fail loudly on startup with the path they tried to load:
+
+```
+[FATAL] firebase-service-account.json not found at /path/to/super-research-backend/firebase-service-account.json
+        Email Sammy (sammy.guli@distributedglobal.com) for the file. See README → "Firebase Admin Key".
+```
 
 > **Coming in the next update:** a proper pairing-time token exchange so new users self-onboard without the admin key at all. Until then, email flow stays.
 
