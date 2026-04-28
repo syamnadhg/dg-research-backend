@@ -2,6 +2,13 @@
 
 Automates multi-agent deep research across 6 platforms using Claude Computer Use API.
 
+> **Jira:** [DGOPS-6933](https://distributedglobal.atlassian.net/browse/DGOPS-6933)
+> **Repo (this one):** github.com/dg-eng/super-research-backend
+> **Owner:** Sammy Guli — `sammy.guli@distributedglobal.com`
+>
+> The Firebase Admin SDK key (`firebase-service-account.json`) is **gitignored**
+> and emailed separately — see ["Firebase Admin Key" below](#firebase-admin-key-required--firebase-service-accountjson).
+
 ## Quick Start
 
 ```bash
