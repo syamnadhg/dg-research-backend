@@ -9558,8 +9558,19 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             _active_statuses = ("planning", "thinking", "researching", "searching")
             status_is_active = (_status_val or "").lower() in _active_statuses
             # Require: elapsed >20min, no-growth >20min, no active-status
-            # signal, at least 120s since last warn (avoid spam on dedup miss).
-            if elapsed > 1200 and no_growth_secs > 1200 and since_warn > 900 and not status_is_active:
+            # signal, at least 120s since last warn (avoid spam on dedup miss),
+            # AND CUA tier-3 hasn't successfully checked in within the last
+            # 20 min. The CUA-recency gate is the load-bearing one — it
+            # eliminates the false-positive class observed in 2026-04-28
+            # where a 1,289-source ChatGPT DR was alerted as stalled because
+            # the gemini narrator (404) and DR-iframe DOM scrape (cross-
+            # origin) both reported 0/0, even though CUA tier-3 reads at the
+            # same instant saw "1,289 sources and counting" in the panel.
+            # If CUA confirmed activity recently, the agent is alive — the
+            # streaming layer is the broken signal, not the agent.
+            _cua_check_age = time.time() - p.get("last_cua_check", 0)
+            if (elapsed > 1200 and no_growth_secs > 1200 and since_warn > 900
+                    and not status_is_active and _cua_check_age > 1200):
                 p["stuck_warned_at"] = time.time()
                 fail_agent(agent_key_stuck,
                            (f"{name} stalled — no growth for {int(no_growth_secs/60)} min "
