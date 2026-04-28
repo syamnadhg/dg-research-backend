@@ -4910,7 +4910,12 @@ async def _narrator_loop(phase: int):
                         "agent is doing RIGHT NOW in the Super Research Phase 2 (deep "
                         "research) run. CITE the real numbers (sources, chars, sections) "
                         "when they appear in the events. Output exactly ONE sentence, "
-                        "<= 100 chars. No markdown. No prefix. No em-dashes."
+                        "<= 100 chars. No markdown. No prefix. No em-dashes. "
+                        f"STRICT SCOPE: Discuss ONLY {akey.upper()}'s own progress. "
+                        "Do not mention, infer, or compare against the other agents. "
+                        "If the events are sparse, say something like "
+                        f"'{akey.upper()} is still working on its research.' — never "
+                        "borrow context from other agents to fill the sentence."
                     )
                     a_user = (
                         f"Recent events for {akey.upper()} (newest last):\n"
