@@ -29,8 +29,11 @@ import requests
 logger = logging.getLogger("gemini_narrate")
 
 
-GEMINI_MODEL_PRIMARY = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.0-flash")
-GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
+GEMINI_MODEL_PRIMARY = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash")
+# 2.0-flash was the prior fallback but was deprecated for new users (404).
+# Use 2.5-pro as the fallback so we hedge against flash-specific outages
+# with a different model family rather than retrying the same one.
+GEMINI_MODEL_FALLBACK = "gemini-2.5-pro"
 GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_NARRATE_TIMEOUT", "8.0"))
 PHASE_BUDGET = int(os.environ.get("GEMINI_NARRATE_BUDGET", "30"))
 MIN_GAP_S = float(os.environ.get("GEMINI_NARRATE_MIN_GAP_S", "90"))

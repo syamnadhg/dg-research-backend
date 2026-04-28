@@ -4780,10 +4780,15 @@ async def _narrator_loop(phase: int):
         import requests as _requests
     except Exception:
         return
+    # gemini-2.0-flash was deprecated for new users (returns 404). Default to
+    # 2.5-flash; respect GEMINI_NARRATE_MODEL override so future bumps don't
+    # require a code change.
+    _model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash")
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        f"{_model}:generateContent?key={GEMINI_API_KEY}"
     )
+    _err_logged = False  # one-shot — avoid log spam if Gemini stays broken
 
     def _call_gemini(system: str, user_msg: str, max_tokens: int = 80):
         payload = {
@@ -4844,7 +4849,19 @@ async def _narrator_loop(phase: int):
                 backoff_ticks_left = 3
                 continue
             if not text or status_code >= 400:
+                # One-shot diagnostic — without this, a deprecated model or bad
+                # API key produces a completely silent failure (the gemini-2.0
+                # → 2.5 deprecation went unnoticed because every tick just
+                # `continue`d). Log the first failure per phase so the operator
+                # can act; subsequent failures stay quiet to avoid log spam.
+                if not _err_logged:
+                    log(f"[narrator] Gemini call failed (status={status_code}, "
+                        f"model={_model}) — phase narration silent until "
+                        f"resolved. Set GEMINI_NARRATE_MODEL or check key.", "WARN")
+                    _err_logged = True
                 continue
+            # Reset the err flag once we recover so a later regression re-logs.
+            _err_logged = False
             text = text.strip().strip('"').strip("`").strip()
             if text and text != last_narration:
                 last_narration = text
@@ -7578,7 +7595,8 @@ async def extract_source_urls_via_vision(page, agent_key: str,
         "Extract every additional source URL visible in the side panel."
     )
 
-    model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.0-flash")
+    # 2.0-flash deprecated for new users — default to 2.5-flash, override via env.
+    model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash")
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{model}:generateContent?key={api_key}")
     payload = {
