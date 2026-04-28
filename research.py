@@ -4925,7 +4925,15 @@ async def _narrator_loop(phase: int):
                     continue
             except Exception:
                 pass
-            recent = _recent_events_window(30.0)
+            # Phase-scope filter — the ring buffer is process-global, so a
+            # Phase 2 `agent_progress` from 28s ago can leak into Phase 3's
+            # narrator and produce "Still working on Phase 2: generating
+            # the agent reports..." emitted under phase=3 (observed in the
+            # FE Phase 3 dropdown 2026-04-28). Filter to the current phase
+            # only, plus any events without a phase tag (system events).
+            recent_raw = _recent_events_window(30.0)
+            recent = [e for e in recent_raw
+                      if e.get("phase") in (phase, None)]
             phase_ctx = PHASE_FLOW_CONTEXT.get(phase, "")
             data_rich = phase in (1, 2)
             style_note = (
@@ -5137,7 +5145,7 @@ async def scrape_progress_chatgpt(page):
                 sources: 0, source_urls: [], sections: [], steps: [],
                 partial_text_len: 0, plan: '', model: '', title: '',
                 dr_active: false, dr_done_text: false, has_stop_btn: false,
-                panel_open: false
+                panel_open: false, searches: 0
             };
             // Model info
             const modelEl = document.querySelector('[data-testid="model-selector"], .model-label');
@@ -5187,6 +5195,14 @@ async def scrape_progress_chatgpt(page):
                 if (stripText) {
                     r.progress = stripText;
                     r.steps.push(stripText);
+                    // Searches count — pull the integer from the strip badge
+                    // (e.g., "Summarizing X · 133 searches"). Tracked
+                    // separately from r.sources (URL-derived) because a
+                    // single search yields many sources and the user cares
+                    // about both: how many web queries were issued vs how
+                    // many citations made it into the report.
+                    const sm = stripText.match(/(\\d+)\\s+searches?/i);
+                    if (sm) r.searches = parseInt(sm[1], 10) || 0;
                 }
             } catch(e) {}
             // Completion indicators
@@ -5678,16 +5694,16 @@ async def _open_chatgpt_activity_panel(page):
         // Includes "thinking"/"reasoning" because Pro+ET shows those before swapping
         // to site-fetch verbs ("Reading <site>", "Visiting <url>") mid-stream.
         const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching)\\b/i;
-        const seen = new WeakSet();
-        const hits = [];
-        function walk(root) {
-            if (!root || seen.has(root)) return;
-            seen.add(root);
+
+        function findHitsIn(root) {
+            // Local accumulator — kept narrow so caller can priority-rank
+            // dialog hits ahead of host-page hits.
+            const out = [];
+            if (!root) return out;
             let nodes;
-            try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
-            if (nodes.length > 8000) return;  // bail on absurd page sizes
+            try { nodes = root.querySelectorAll('*'); } catch (e) { return out; }
+            if (nodes.length > 8000) return out;
             for (const el of nodes) {
-                if (el.shadowRoot) walk(el.shadowRoot);
                 const t = (el.innerText || el.textContent || '').trim();
                 if (!t || t.length < 4 || t.length > 300) continue;
                 const matchesCount = COUNT.test(t);
@@ -5695,53 +5711,95 @@ async def _open_chatgpt_activity_panel(page):
                 if (!matchesCount && !matchesVerb) continue;
                 const r = el.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
-                // count-badge matches rank ahead of verb-only (more specific)
-                hits.push({ el, top: r.top, len: t.length, hasCount: matchesCount });
+                out.push({ el, top: r.top, len: t.length, hasCount: matchesCount });
             }
+            return out;
+        }
+
+        function clickAndReturn(target, candidatesCount, scope) {
+            const label = (target.innerText || target.textContent || '').trim().slice(0, 160);
+            // aria-expanded check up the chain — skip re-click if already open
+            let probe = target;
+            for (let i = 0; i < 6 && probe; i++) {
+                if (probe.getAttribute && probe.getAttribute('aria-expanded') === 'true') {
+                    return { found: true, alreadyExpanded: true, label,
+                             candidates: candidatesCount, scope };
+                }
+                probe = probe.parentElement;
+            }
+            // parent-chain dispatch loop — try leaf, then up to 5 ancestors
+            const tries = [];
+            let node = target;
+            for (let i = 0; i < 6 && node; i++) { tries.push(node); node = node.parentElement; }
+            let clickedTag = '';
+            let lastErr = '';
+            for (const n of tries) {
+                try {
+                    const r = n.getBoundingClientRect();
+                    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+                    const opts = { bubbles: true, cancelable: true, view: window,
+                                   clientX: x, clientY: y, button: 0 };
+                    // Full event chain — covers React onPointerDown/onMouseDown/onClick
+                    n.dispatchEvent(new MouseEvent('pointerdown', opts));
+                    n.dispatchEvent(new MouseEvent('mousedown',  opts));
+                    n.dispatchEvent(new MouseEvent('pointerup',  opts));
+                    n.dispatchEvent(new MouseEvent('mouseup',    opts));
+                    n.dispatchEvent(new MouseEvent('click',      opts));
+                    clickedTag = (n.tagName || '') +
+                                 (n.getAttribute && n.getAttribute('role')
+                                     ? `[${n.getAttribute('role')}]` : '');
+                    break;
+                } catch (e) { lastErr = String(e); continue; }
+            }
+            return { found: true, clicked: !!clickedTag, label,
+                     candidates: candidatesCount, clickedTag, scope, error: lastErr };
+        }
+
+        // 2026-04-28: PASS 1 — dialog-scoped search FIRST. The DR plan
+        // dialog (role="dialog" / aria-modal / report-plan class) renders
+        // the activity-strip pill ("Summarizing X · 133 searches") pinned
+        // at its bottom — clicking THAT is what mounts the sources sub-
+        // panel. The host page ALSO renders a presentational footer with
+        // the same wording, and clicking that does nothing. Without
+        // searching dialog-scoped first, the global walker found the
+        // host-page footer, scored it, clicked it, and silently no-op'd
+        // — leaving narration stuck at "0 sources, 0 chars".
+        const dialogs = document.querySelectorAll(
+            '[role="dialog"], [aria-modal="true"], ' +
+            '[class*="report-plan" i], [class*="research-plan" i]'
+        );
+        let dialogHits = [];
+        for (const d of dialogs) {
+            const r = d.getBoundingClientRect();
+            if (r.width < 200 || r.height < 100) continue;
+            const found = findHitsIn(d);
+            for (const h of found) dialogHits.push(h);
+        }
+        if (dialogHits.length > 0) {
+            dialogHits.sort((a, b) => (b.hasCount - a.hasCount) || (b.top - a.top) || (a.len - b.len));
+            return clickAndReturn(dialogHits[0].el, dialogHits.length, 'dialog');
+        }
+
+        // PASS 2 — global walk (existing logic). Recurses into Shadow DOM.
+        const seen = new WeakSet();
+        const hits = [];
+        function walk(root) {
+            if (!root || seen.has(root)) return;
+            seen.add(root);
+            const found = findHitsIn(root);
+            for (const h of found) hits.push(h);
+            // Recurse into shadow roots.
+            try {
+                for (const el of root.querySelectorAll('*')) {
+                    if (el.shadowRoot) walk(el.shadowRoot);
+                }
+            } catch (e) {}
         }
         walk(document);
         if (!hits.length) return { found: false, candidates: 0 };
         // count-badge wins (more specific), then lowest-on-page, then shortest text
         hits.sort((a, b) => (b.hasCount - a.hasCount) || (b.top - a.top) || (a.len - b.len));
-        const target = hits[0].el;
-        const label = (target.innerText || target.textContent || '').trim().slice(0, 160);
-        // aria-expanded check up the chain — skip re-click if already open
-        let probe = target;
-        for (let i = 0; i < 6 && probe; i++) {
-            if (probe.getAttribute && probe.getAttribute('aria-expanded') === 'true') {
-                return { found: true, alreadyExpanded: true, label, candidates: hits.length };
-            }
-            probe = probe.parentElement;
-        }
-        // parent-chain dispatch loop — try leaf, then up to 5 ancestors
-        const tries = [];
-        let node = target;
-        for (let i = 0; i < 6 && node; i++) {
-            tries.push(node);
-            node = node.parentElement;
-        }
-        let clickedTag = '';
-        let lastErr = '';
-        for (const n of tries) {
-            try {
-                const r = n.getBoundingClientRect();
-                const x = r.left + r.width / 2, y = r.top + r.height / 2;
-                const opts = { bubbles: true, cancelable: true, view: window,
-                               clientX: x, clientY: y, button: 0 };
-                // Full event chain — covers React onPointerDown/onMouseDown/onClick
-                n.dispatchEvent(new MouseEvent('pointerdown', opts));
-                n.dispatchEvent(new MouseEvent('mousedown',  opts));
-                n.dispatchEvent(new MouseEvent('pointerup',  opts));
-                n.dispatchEvent(new MouseEvent('mouseup',    opts));
-                n.dispatchEvent(new MouseEvent('click',      opts));
-                clickedTag = (n.tagName || '') +
-                             (n.getAttribute && n.getAttribute('role')
-                                 ? `[${n.getAttribute('role')}]` : '');
-                break;
-            } catch (e) { lastErr = String(e); continue; }
-        }
-        return { found: true, clicked: !!clickedTag, label,
-                 candidates: hits.length, clickedTag, error: lastErr };
+        return clickAndReturn(hits[0].el, hits.length, 'global');
     }"""
     try:
         res = await page.evaluate(JS)
@@ -5833,7 +5891,7 @@ async def scrape_progress_gemini(page):
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], steps: [],
                 partial_text_len: 0, plan: '', title: '', model: '',
-                panel_open: false, observed_sources: 0
+                panel_open: false, observed_sources: 0, searches: 0
             };
             // Conversation title (Gemini sets it once the chat has a topic)
             const gtitle = document.querySelector('[data-conversation-title], .conversation-title, bard-sidenav-mini-content [aria-current="true"]');
@@ -5920,6 +5978,22 @@ async def scrape_progress_gemini(page):
                         // We'll union with the global srcSet below.
                         r._panel_sources = Array.from(panelSrcSet);
                     }
+                    // Searches count — Gemini DR's activity panel typically
+                    // surfaces an aggregate "Searched N websites" / "N sites"
+                    // line. Pick the largest number across the four common
+                    // wordings so a transient lower count doesn't shrink the
+                    // chip mid-run. Tracked separately from r.sources
+                    // (URL-derived) for the unified FE chip.
+                    try {
+                        const panelText = (panelMatched.innerText || '');
+                        const re = /(\\d+)\\s+(?:websites?|sources?|searches?|sites?)\\b/gi;
+                        let mm; let best = 0;
+                        while ((mm = re.exec(panelText)) !== null) {
+                            const n = parseInt(mm[1], 10) || 0;
+                            if (n > best) best = n;
+                        }
+                        if (best > 0) r.searches = best;
+                    } catch(e) {}
                 }
             } catch(e) {}
             // Research plan (shown before "Start research")
@@ -6024,7 +6098,7 @@ async def scrape_progress_claude(page):
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], steps: [],
                 tool_uses: [], partial_text_len: 0, plan: '', model: '', title: '',
-                panel_open: false
+                panel_open: false, searches: 0
             };
             // Conversation title
             const ctitle = document.querySelector('[data-conversation-title], .conversation-title, header h1, h1.truncate, [data-testid="conversation-title"]');
@@ -6086,6 +6160,11 @@ async def scrape_progress_claude(page):
             // this split, the chip "5 src" disagreed with the empty URL list.
             // The watchdog can still consume r.observed_sources for liveness.
             r.observed_sources = liveSrcCount;
+            // Mirror onto the unified `searches` field so the FE has one
+            // consistent name across all three agents. Claude's UI conflates
+            // searches and sources ("N sources and counting") but the FE
+            // chip still reads from r.searches for visual consistency.
+            r.searches = liveSrcCount;
 
             // ---- Sections — headings across conversation, artifact, and research card
             const headings = document.querySelectorAll(
@@ -8338,6 +8417,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         phaseSignal=_vision_phase_signal,
                         panelOpen=bool(progress.get("panel_open", False)),
                         observedSources=int(progress.get("observed_sources", 0) or 0),
+                        searches=int(progress.get("searches", 0) or 0),
                         elapsedSec=elapsed_sec,
                         expectedMinutes=expected_min,
                     )
@@ -9931,6 +10011,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     phaseSignal=_vision_phase_signal_p2,
                     panelOpen=bool(progress.get("panel_open", False)),
                     observedSources=int(progress.get("observed_sources", 0) or 0),
+                    searches=int(progress.get("searches", 0) or 0),
                     elapsedSec=elapsed_sec,
                     expectedMinutes=get_expected_minutes(2),
                     scrapeOk=scrape_ok)
@@ -9983,42 +10064,37 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         int(snap.get("sources", 0) or 0),
                         int(snap.get("steps", 0) or 0),
                     ))
-                    p["flat_history"] = p["flat_history"][-3:]
+                    p["flat_history"] = p["flat_history"][-2:]
                     log(f"[{name}] Done-marker confirmed #{len(p['flat_history'])} — "
                         f"{dom_reason}; snap={snap}")
                     elapsed_done = time.time() - p["done_marker_first_at"]
-                    # 2026-04-28: tolerance gate. Strict equality
-                    # (t0==t1==t2 AND s0==s1==s2) NEVER converges for
-                    # ChatGPT — the source-panel auto-expand
-                    # (DG_SOURCE_PANEL_EXPAND), plan-item live-row click
-                    # (DG_PLAN_ITEM_EXPAND), and activity-panel open all
-                    # mutate the iframe innerText / source counts every
-                    # poll, so flat_history kept getting trimmed back to
-                    # [-1:] indefinitely. The new gate accepts "no growth"
-                    # rather than "perfect equality" — none of the three
-                    # signals may grow over the window. Sources/steps
-                    # are monotonic check (allow tiny shrink from dedupe);
-                    # text_len within 5% (citation tooltips, late hovers).
-                    # Wall-clock floor lowered from 240s → 90s to match
-                    # the new gate's tighter convergence.
-                    if len(p["flat_history"]) < 3 or elapsed_done < 90:
+                    # 2026-04-28 v2: tightened gate — 2 snapshots over ≥30s
+                    # (was 3 snapshots over ≥90s). Reason: at the default
+                    # 120s POLL_DEEP_RESEARCH cadence, "3 snapshots" needed
+                    # 240s of wall-clock minimum even when the agent was
+                    # visibly done — that 4-minute gate was the dominant
+                    # contributor to the user-reported "gap before phase
+                    # end starts" (advisor 2026-04-28). The tolerance gate
+                    # below already prevents false-positives on signal
+                    # jitter from auto-expand mutators, so 2 snapshots are
+                    # enough confirmation. Saves ~120-240s per agent.
+                    if len(p["flat_history"]) < 2 or elapsed_done < 30:
                         # Not enough samples yet — keep polling.
                         continue
                     t0, s0, st0 = p["flat_history"][0]
                     t1, s1, st1 = p["flat_history"][1]
-                    t2, s2, st2 = p["flat_history"][2]
-                    def _stable(a, b, c, tol=0.05):
-                        hi = max(a, b, c); lo = min(a, b, c)
+                    def _stable(a, b, tol=0.05):
+                        hi = max(a, b); lo = min(a, b)
                         return hi == 0 or (hi - lo) <= max(2, hi * tol)
                     flat = (
-                        _stable(t0, t1, t2)
-                        and s2 <= int(s1 * 1.02) + 1
-                        and st2 <= st1 + 1
+                        _stable(t0, t1)
+                        and s1 <= int(s0 * 1.02) + 1
+                        and st1 <= st0 + 1
                     )
                     if not flat:
                         log(f"[{name}] Done-marker present but signals still moving — "
-                            f"text {t0}→{t1}→{t2}, sources {s0}→{s1}→{s2}, "
-                            f"steps {st0}→{st1}→{st2}; keep polling")
+                            f"text {t0}→{t1}, sources {s0}→{s1}, "
+                            f"steps {st0}→{st1}; keep polling")
                         # Trim history so we re-anchor on the next snapshot —
                         # if a single late mutation slipped through, the next
                         # tick's snapshot becomes the new baseline.
@@ -10026,7 +10102,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         continue
                     p["extraction_attempts"] += 1
                     log(f"[{name}] CONFIRMED DONE — done-marker + 2 cycles flat "
-                        f"(text={t2}, sources={s2}, steps={st2}, "
+                        f"(text={t1}, sources={s1}, steps={st1}, "
                         f"elapsed_since_marker={int(elapsed_done)}s). "
                         f"Starting extract_and_record (attempt {p['extraction_attempts']}/3)")
                     _queue_dir = (Path(__file__).parent / "queues" / _tracks_dir.name) \
@@ -10479,7 +10555,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 m = int((time.time() - p["start_time"]) / 60)
                 parts.append(f"{n}:{m}m")
             log(f"Still polling: {', '.join(parts)}")
-            await asyncio.sleep(poll_interval)
+            # 2026-04-28: speed up the poll cycle ONCE any pending agent
+            # has hit its done-marker. Default poll_interval is 120s
+            # (POLL_DEEP_RESEARCH) — fine while agents are mid-run, but
+            # the 2-snapshot tolerance gate above wants a quick second
+            # confirmation tick. Drop to 30s when at least one agent is
+            # in done-marker-confirmed state (they finish at unrelated
+            # times, so the cycle is gated by the slowest pending). Save
+            # ~60-90s on the post-completion gap (advisor 2026-04-28 R2).
+            _any_done_marker = any(
+                p.get("done_marker_first_at", 0.0) > 0.0 for p in pending.values()
+            )
+            await asyncio.sleep(30 if _any_done_marker else poll_interval)
 
     return results
 
@@ -12078,8 +12165,7 @@ async def type_short_inline_prompt(page, platform, label):
     prompt = (
         "Please perform deep research on the topic described in the attached brief. "
         "Use the brief as the complete context — objectives, scope, sections, sources to target. "
-        "Produce a comprehensive research report with citations. "
-        "Stay in Deep Research mode for this entire response."
+        "Produce a comprehensive research report with citations."
     )
     try:
         # Find the composer input (contenteditable or textarea) and type
