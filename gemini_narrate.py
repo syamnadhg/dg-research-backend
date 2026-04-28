@@ -223,6 +223,11 @@ def _call_gemini(api_key: str, model: str, png: bytes, user_msg: str) -> dict:
             "maxOutputTokens": 600,
             "responseMimeType": "application/json",
             "responseSchema": _RESPONSE_SCHEMA,
+            # Disable thinking — for narration we want all 600 tokens to go
+            # to the structured JSON output, not internal reasoning. With
+            # thinking ON (Gemini 2.5 default), JSON output sometimes gets
+            # truncated mid-field, returning partial responses.
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
     t0 = time.time()

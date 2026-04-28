@@ -4730,6 +4730,45 @@ PHASE_FLOW_CONTEXT = {
         "Gmail."),
 }
 
+# Per-agent typical timeline used by Tier 3 realistic-fallback narration.
+# When real data (DOM scrape + vision) is sparse for an agent past the 60s
+# warmup, the narrator passes this timeline + elapsed minutes to Gemini so
+# the produced sentence FEELS REAL — referencing what the agent is *likely*
+# doing at this point in the run (planning vs searching vs synthesizing)
+# instead of a generic "still working" template. Times are approximate
+# ranges drawn from production runs 2026-04-15..2026-04-28.
+AGENT_PHASE_FLOWS: dict[tuple[str, int], list[str]] = {
+    ("chatgpt", 1): [
+        "0-30s: Opening ChatGPT, clicking the model selector",
+        "30-90s: Pasting the topic, selecting Pro + Extended Thinking",
+        "90s-3m: Extended Thinking active — internal reasoning visible in the UI",
+        "3-15m: Drafting the research brief with structured sections",
+        "15-25m: Finalizing brief and validating sources to target",
+    ],
+    ("chatgpt", 2): [
+        "0-60s: Opening ChatGPT and starting Deep Research mode",
+        "60s-3m: Reading the brief and planning the research approach",
+        "3-10m: Initial searches across the web — sources panel populating",
+        "10-30m: Reading sources and refining sub-topic searches",
+        "30-50m: Synthesizing findings and drafting report sections",
+        "50m+: Finalizing the report with citations",
+    ],
+    ("claude", 2): [
+        "0-60s: Opening Claude with Opus 4.7 Adaptive + Research tools",
+        "60s-3m: Loading the brief and planning the research scope",
+        "3-15m: Conducting web searches and reading sources, artifact preview building",
+        "15-40m: Building the artifact with research findings and citations",
+        "40m+: Refining the artifact and structuring the final report",
+    ],
+    ("gemini", 2): [
+        "0-60s: Opening Gemini and selecting Deep Research from the Tools menu",
+        "60s-2m: Pasting the brief and submitting the research request",
+        "2-10m: Gemini planning research strategy and sub-questions",
+        "10-25m: Active searching — sources stream into the activity panel",
+        "25-40m: Synthesizing findings into a structured report",
+    ],
+}
+
 _narrator_task = None  # type: asyncio.Task | None
 
 
@@ -4775,6 +4814,8 @@ async def _narrator_loop(phase: int):
     cadence = _narrator_cadence_for_phase(phase)
     last_narration = ""
     last_agent_lines: dict[str, str] = {}
+    last_known_status_for_agent: dict[str, str] = {}
+    phase_started_ts = time.time()
     backoff_ticks_left = 0
     try:
         import requests as _requests
@@ -4798,11 +4839,22 @@ async def _narrator_loop(phase: int):
     )
     _err_logged = False  # one-shot — avoid log spam if Gemini stays broken
 
-    def _call_gemini(system: str, user_msg: str, max_tokens: int = 80):
+    def _call_gemini(system: str, user_msg: str, max_tokens: int = 200):
+        # Gemini 2.5 Flash/Pro have thinking ON by default and the
+        # `maxOutputTokens` cap covers thinking + visible output COMBINED.
+        # With a small budget (e.g. 60), thinking eats ~50 tokens and the
+        # actual sentence gets truncated to 2-3 words ("GEMINI is" stub
+        # observed 2026-04-28). Disabling thinking dedicates the full budget
+        # to visible output — narration doesn't need reasoning, just a
+        # one-line summary of recent events.
         payload = {
             "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
             "systemInstruction": {"parts": [{"text": system}]},
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": max_tokens,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
         }
 
         def _post(_url):
@@ -4829,6 +4881,39 @@ async def _narrator_loop(phase: int):
             if text_fb and status_fb < 400:
                 return text_fb, status_fb
         return text, status_code
+
+    async def _realistic_fallback(akey: str, ph: int, elapsed_sec: float,
+                                   last_status: str = "") -> str:
+        """Tier 3 fallback narration — when real data (DOM + vision) is sparse
+        or absent for an agent, ask Gemini to produce ONE realistic sentence
+        describing what the agent is *likely* doing right now based on phase
+        + elapsed time + the typical timeline. The output cites the actual
+        timeline stage (planning vs searching vs synthesizing), so it feels
+        real rather than a generic 'still working' template."""
+        timeline = AGENT_PHASE_FLOWS.get((akey, ph))
+        if not timeline:
+            return ""
+        elapsed_min = elapsed_sec / 60.0
+        timeline_text = "\n".join(f"- {t}" for t in timeline)
+        fb_system = (
+            f"You are narrating what the {akey.upper()} agent is likely doing "
+            f"right now in Phase {ph} of a Super Research pipeline. "
+            f"It's been {elapsed_min:.1f} minutes since the phase started. "
+            f"Last known status: {last_status or 'unknown'}.\n\n"
+            f"TYPICAL TIMELINE for {akey.upper()} in Phase {ph}:\n"
+            f"{timeline_text}\n\n"
+            "Output ONE realistic sentence in present tense (<= 110 chars) "
+            "describing what's likely happening right now, based on the "
+            f"timeline position at {elapsed_min:.1f} min. No markdown, no "
+            "prefix, no em-dashes. Be specific to the current stage rather "
+            "than generic. Start the sentence with the agent name."
+        )
+        fb_text, fb_status = await asyncio.to_thread(
+            _call_gemini, fb_system, "", 200
+        )
+        if fb_status >= 400 or not fb_text:
+            return ""
+        return fb_text.strip().strip('"').strip("`").strip()[:140]
 
     try:
         while True:
@@ -4890,38 +4975,71 @@ async def _narrator_loop(phase: int):
                 except Exception:
                     pass
 
-            # ── Phase 2: per-agent narration ──
-            # Filter the recent window per agent and emit one
-            # `agent_narration` per active agent so the accordion row
-            # carries live context scoped to that platform.
-            if phase == 2:
+            # ── Per-agent narration (P1 + P2) ──
+            # Filter the recent window per agent and emit one `agent_narration`
+            # per active agent so the per-agent card carries live context.
+            # Phase 1 has only ChatGPT (Pro + Extended Thinking); Phase 2 has
+            # all three. When an agent has no events in the window AND we're
+            # past the 60s warmup, fall back to Tier 3 realistic narration
+            # (Gemini + typical timeline) so the card never goes blank during
+            # long Extended-Thinking or planning windows where DOM and vision
+            # both produce nothing for minutes at a stretch.
+            if phase == 1:
+                agent_keys = ("chatgpt",)
+            elif phase == 2:
                 agent_keys = ("chatgpt", "gemini", "claude")
+            else:
+                agent_keys = ()
+            if agent_keys:
+                elapsed_in_phase = time.time() - phase_started_ts
                 for akey in agent_keys:
                     a_events = [e for e in recent
                                 if (e.get("agent") or "").lower() == akey
-                                or (e.get("data", {}) or {}).get("agent", "").lower() == akey]
+                                or ((e.get("data", {}) or {}).get("agent") or "").lower() == akey]
                     if not a_events:
+                        # Tier 3 fallback — only after 60s warmup so we don't
+                        # produce bogus narration during the brief window where
+                        # DOM scrape is settling and vision hasn't run yet.
+                        if elapsed_in_phase < 60:
+                            continue
+                        last_status = last_known_status_for_agent.get(akey, "")
+                        fb_text = await _realistic_fallback(
+                            akey, phase, elapsed_in_phase, last_status
+                        )
+                        if fb_text and fb_text != last_agent_lines.get(akey):
+                            last_agent_lines[akey] = fb_text
+                            try:
+                                emit_event("agent_narration", phase=phase,
+                                           agent=akey, text=fb_text,
+                                           fallback=True)
+                            except Exception:
+                                pass
                         continue
+                    # Track latest status so a future fallback (after events
+                    # stop arriving) can reference it for richer context.
+                    for _e in reversed(a_events):
+                        _d = _e.get("data", {}) or {}
+                        if _d.get("status"):
+                            last_known_status_for_agent[akey] = str(_d["status"])
+                            break
                     a_lines = "\n".join(
                         f"- {_compact_event_for_narration(e)}" for e in a_events[-12:]
                     )
                     a_system = (
                         f"You narrate ONE human sentence about what the {akey.upper()} "
-                        "agent is doing RIGHT NOW in the Super Research Phase 2 (deep "
-                        "research) run. CITE the real numbers (sources, chars, sections) "
-                        "when they appear in the events. Output exactly ONE sentence, "
+                        f"agent is doing RIGHT NOW in Super Research Phase {phase}. "
+                        "CITE the real numbers (sources, chars, sections) when they "
+                        "appear in the events. Output exactly ONE sentence, "
                         "<= 100 chars. No markdown. No prefix. No em-dashes. "
                         f"STRICT SCOPE: Discuss ONLY {akey.upper()}'s own progress. "
                         "Do not mention, infer, or compare against the other agents. "
-                        "If the events are sparse, say something like "
-                        f"'{akey.upper()} is still working on its research.' — never "
-                        "borrow context from other agents to fill the sentence."
+                        "Start the sentence with the agent name."
                     )
                     a_user = (
                         f"Recent events for {akey.upper()} (newest last):\n"
                         f"{a_lines or '[none]'}"
                     )
-                    a_text, a_status = await asyncio.to_thread(_call_gemini, a_system, a_user, 60)
+                    a_text, a_status = await asyncio.to_thread(_call_gemini, a_system, a_user, 200)
                     if a_status == 429:
                         backoff_ticks_left = 3
                         break
@@ -4931,7 +5049,7 @@ async def _narrator_loop(phase: int):
                     if a_text and a_text != last_agent_lines.get(akey):
                         last_agent_lines[akey] = a_text
                         try:
-                            emit_event("agent_narration", phase=2,
+                            emit_event("agent_narration", phase=phase,
                                        agent=akey, text=a_text)
                         except Exception:
                             pass
@@ -5018,7 +5136,8 @@ async def scrape_progress_chatgpt(page):
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], steps: [],
                 partial_text_len: 0, plan: '', model: '', title: '',
-                dr_active: false, dr_done_text: false, has_stop_btn: false
+                dr_active: false, dr_done_text: false, has_stop_btn: false,
+                panel_open: false
             };
             // Model info
             const modelEl = document.querySelector('[data-testid="model-selector"], .model-label');
@@ -5190,6 +5309,7 @@ async def scrape_progress_chatgpt(page):
                 return out;
             }""")
             if hp and hp.get("panel_found"):
+                result["panel_open"] = True
                 if hp.get("source_urls"):
                     seen_h = set(result.get("source_urls") or [])
                     unioned_h = list(result.get("source_urls") or [])
@@ -5712,7 +5832,8 @@ async def scrape_progress_gemini(page):
             const r = {
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], steps: [],
-                partial_text_len: 0, plan: '', title: '', model: ''
+                partial_text_len: 0, plan: '', title: '', model: '',
+                panel_open: false, observed_sources: 0
             };
             // Conversation title (Gemini sets it once the chat has a topic)
             const gtitle = document.querySelector('[data-conversation-title], .conversation-title, bard-sidenav-mini-content [aria-current="true"]');
@@ -5722,6 +5843,85 @@ async def scrape_progress_gemini(page):
             const steps = document.querySelectorAll('.research-step, .step-content, [data-research-step], .activity-item');
             r.steps = Array.from(steps).map(s => s.innerText.substring(0, 150));
             if (r.steps.length > 0) r.progress = r.steps[r.steps.length - 1];
+
+            // 2026-04-28 v6: structure-only panel walker — when Gemini's
+            // Deep Research activity panel opens, the canonical class
+            // selectors (.research-step, .activity-item) may not match the
+            // current build. This walker mirrors Claude's panel walker:
+            // any aside/role=complementary/role=region container > 220px
+            // wide with substantial text content gets walked for leaf
+            // rows with VERB-prefix or check/spin icons. Always runs as
+            // an additive merge so brittle class-based scrape above keeps
+            // working when it does.
+            try {
+                const VERBG = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing)\\b/i;
+                const panelRoots = document.querySelectorAll(
+                    'aside, [role="complementary"], [role="region"], ' +
+                    '[aria-label*="research" i], [aria-label*="sources" i], ' +
+                    '[aria-label*="activity" i], [class*="research-panel" i], ' +
+                    '[class*="side-panel" i], [class*="drawer" i]'
+                );
+                const seenRow = new Set();
+                const rows = [];
+                let live = '';
+                let panelMatched = null;
+                for (const root of panelRoots) {
+                    const pr = root.getBoundingClientRect();
+                    if (pr.width < 220 || pr.height < 150) continue;
+                    if (pr.right < window.innerWidth * 0.45) continue;
+                    panelMatched = root;
+                    const rowEls = Array.from(root.querySelectorAll('li, [role="listitem"], div, p, button, [role="button"]'));
+                    for (const el of rowEls) {
+                        const t = (el.innerText || '').trim();
+                        if (!t || t.length < 12 || t.length > 240) continue;
+                        if (el.querySelector('li, [role="listitem"]')) continue;
+                        if (t === t.toUpperCase() && t.length < 30) continue;
+                        const wordChars = t.replace(/[^A-Za-z]/g, '').length;
+                        if (wordChars < 8) continue;
+                        if ((t.match(/\\n/g) || []).length > 3) continue;
+                        const hasCheck = !!el.querySelector('svg[class*="check"], svg[data-icon*="check"], [aria-label*="completed" i]');
+                        const hasSpin  = !!el.querySelector('svg[class*="spin"], svg[class*="loader"], [class*="animate-spin"], [aria-busy="true"]');
+                        const verbHit  = VERBG.test(t);
+                        const key = t.slice(0, 80);
+                        if (seenRow.has(key)) continue;
+                        seenRow.add(key);
+                        rows.push({ t: t.slice(0, 220), hasSpin, hasCheck, verbHit });
+                        if (hasSpin && !live) live = t.slice(0, 160);
+                    }
+                }
+                if (rows.length > 0) {
+                    // NOTE: Gemini's research progress is shown INLINE in the
+                    // chat, not in a side panel — so we do NOT set panel_open
+                    // here (would be semantically wrong + would mis-trigger
+                    // panel-aware vision logic downstream). The walker still
+                    // runs as a structural fallback if Gemini renames the
+                    // .research-step/.activity-item classes.
+                    const panelSteps = rows.map(x => x.t).slice(-15);
+                    r.steps = r.steps.concat(panelSteps).slice(-15);
+                    if (live) r.progress = live;
+                    else {
+                        const verbLive = rows.find(x => x.verbHit && !x.hasCheck);
+                        if (verbLive) r.progress = verbLive.t.slice(0, 160);
+                        else if (rows.length) r.progress = rows[rows.length - 1].t.slice(0, 160);
+                    }
+                }
+                // Also pull source URLs from the matched panel — Gemini's
+                // panel includes sourced citations as a[href] entries.
+                if (panelMatched) {
+                    const panelSrcSet = new Set();
+                    panelMatched.querySelectorAll('a[href^="http"]').forEach(a => {
+                        const h = a.href || '';
+                        if (h.length < 500 &&
+                            !h.includes('google.com/gemini') &&
+                            !h.includes('accounts.google') &&
+                            !h.includes('gemini.google')) panelSrcSet.add(h);
+                    });
+                    if (panelSrcSet.size > 0) {
+                        // We'll union with the global srcSet below.
+                        r._panel_sources = Array.from(panelSrcSet);
+                    }
+                }
+            } catch(e) {}
             // Research plan (shown before "Start research")
             const plan = document.querySelector('.research-plan, .plan-content');
             if (plan) r.plan = plan.innerText.substring(0, 1000);
@@ -5739,6 +5939,12 @@ async def scrape_progress_gemini(page):
                 // be clicked and would inflate r.sources beyond what the FE
                 // filtered URL list shows.
             });
+            // Union with the panel-walker's URL haul (above) so URLs found
+            // only inside the right-side research panel still flow through.
+            if (r._panel_sources) {
+                for (const u of r._panel_sources) srcSet.add(u);
+                delete r._panel_sources;
+            }
             r.source_urls = Array.from(srcSet).slice(0, 50);
             r.sources = r.source_urls.length;
             // Response sections
@@ -5817,7 +6023,8 @@ async def scrape_progress_claude(page):
             const r = {
                 status: 'unknown', phase: '', progress: '', thinking: '',
                 sources: 0, source_urls: [], sections: [], steps: [],
-                tool_uses: [], partial_text_len: 0, plan: '', model: '', title: ''
+                tool_uses: [], partial_text_len: 0, plan: '', model: '', title: '',
+                panel_open: false
             };
             // Conversation title
             const ctitle = document.querySelector('[data-conversation-title], .conversation-title, header h1, h1.truncate, [data-testid="conversation-title"]');
@@ -5963,6 +6170,7 @@ async def scrape_progress_claude(page):
                     }
                 }
                 if (panelRows.length > 0) {
+                    r.panel_open = true;
                     const panelSteps = panelRows.map(x => x.t).slice(-15);
                     r.steps = panelSteps.concat(r.steps);
                     if (panelLive) r.progress = panelLive;
@@ -6446,16 +6654,51 @@ async def _click_claude_artifact(page, index=0):
 
 
 async def _read_claude_artifact_panel(page):
-    """Read content from the currently open artifact panel (right side)."""
+    """Read content from the currently open artifact panel (right side).
+
+    Returns clean markdown when possible (innerHTML → markdownify) so the
+    saved Claude report keeps its headings, lists, bold/italic, code blocks,
+    and links. Falls back to innerText only when HTML extraction fails — the
+    fallback flattens markdown structure to plain text, so a sentinel log is
+    emitted to make the degradation visible (the FE would otherwise render
+    a wall-of-text and we'd never know which extraction path produced it).
+    """
     try:
-        return await page.evaluate("""() => {
+        # Step 1: try innerHTML → markdownify on each candidate panel.
+        html_blob = await page.evaluate("""() => {
             const panelSelectors = [
                 '[data-testid="artifact-content"]',
                 '.artifact-content',
                 '.artifact-panel .contents',
                 'aside .prose', 'aside .markdown',
                 '[class*="artifact-panel"] [class*="content"]',
-                // Claude often renders artifact in a right-side panel with these
+                '[class*="artifact"] .ProseMirror',
+                '[class*="artifact"] [class*="rendered"]',
+            ];
+            for (const sel of panelSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText.length > 50) return el.innerHTML;
+            }
+            const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
+            if (aside && aside.innerText.length > 200) return aside.innerHTML;
+            return '';
+        }""")
+        if html_blob and len(html_blob) > 200:
+            md = html_to_markdown(html_blob)
+            if md and len(md) > 100:
+                return md
+            # markdownify returned empty/short — fall through to innerText.
+
+        # Step 2: innerText fallback (preserves prior behavior). Markdown
+        # structure is lost here — log a sentinel so the operator knows the
+        # saved doc is plain text rather than properly formatted markdown.
+        text = await page.evaluate("""() => {
+            const panelSelectors = [
+                '[data-testid="artifact-content"]',
+                '.artifact-content',
+                '.artifact-panel .contents',
+                'aside .prose', 'aside .markdown',
+                '[class*="artifact-panel"] [class*="content"]',
                 '[class*="artifact"] .ProseMirror',
                 '[class*="artifact"] [class*="rendered"]',
             ];
@@ -6463,11 +6706,14 @@ async def _read_claude_artifact_panel(page):
                 const el = document.querySelector(sel);
                 if (el && el.innerText.length > 50) return el.innerText;
             }
-            // Broader fallback: any right-side panel with substantial content
             const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
             if (aside && aside.innerText.length > 200) return aside.innerText;
             return '';
         }""")
+        if text:
+            log("[Claude] Artifact panel innerText fallback fired — markdown "
+                "structure lost. Saved doc will render as plain text.", "WARN")
+        return text
     except Exception as e:
         log(f"Artifact panel read failed: {e}", "WARN")
         return ""
@@ -7939,10 +8185,19 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 _vn_steps_n = len(progress.get("steps", []) or [])
                 _vn_progress_str = (progress.get("progress") or "").strip()
                 _vn_sources = int(progress.get("sources", 0) or 0)
+                _vn_panel_open = bool(progress.get("panel_open", False))
+                # Trigger vision when:
+                #   (a) DOM is empty (no steps + no sources) past 60s warmup, OR
+                #   (b) the right-side panel is detected as OPEN past 90s —
+                #       vision's panel-aware screenshot extraction pulls
+                #       narration quality (one-sentence panel summary +
+                #       sectioned headings) the DOM walker often can't.
                 _vn_should_call = (
                     elapsed_sec > 60
                     and _vn_steps_n < 2
                     and _vn_sources == 0
+                ) or (
+                    elapsed_sec > 90 and _vn_panel_open
                 )
                 _vn_force_every_n = int(os.environ.get("GEMINI_NARRATE_FORCE_EVERY_N", "4"))
                 if _vn_force_every_n > 0 and elapsed_sec > 0:
@@ -7956,6 +8211,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 _vision_data = None
                 _scrape_source = "dom"
                 _vision_narration = ""
+                _vision_phase_signal = ""
                 if _vn_should_call:
                     try:
                         import gemini_narrate as _vn
@@ -7974,6 +8230,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 if _vision_data and float(_vision_data.get("confidence", 0)) >= 0.4:
                     _scrape_source = "vision"
                     _vision_narration = _vision_data.get("narration", "")
+                    _vision_phase_signal = _vision_data.get("phase_signal", "") or ""
                     _v_progress = _vision_data.get("progress", "")
                     if _v_progress and len(_v_progress) > len(_vn_progress_str):
                         progress["progress"] = _v_progress
@@ -8078,6 +8335,9 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         scrapeHealth="limited" if is_et else "full",
                         scrapeSource=_scrape_source,
                         visionNarration=_vision_narration,
+                        phaseSignal=_vision_phase_signal,
+                        panelOpen=bool(progress.get("panel_open", False)),
+                        observedSources=int(progress.get("observed_sources", 0) or 0),
                         elapsedSec=elapsed_sec,
                         expectedMinutes=expected_min,
                     )
@@ -9435,10 +9695,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             _vn_steps_n = len(progress.get("steps", []) or [])
             _vn_progress_str = (progress.get("progress") or "").strip()
             _vn_sources = int(progress.get("sources", 0) or 0)
+            _vn_panel_open = bool(progress.get("panel_open", False))
+            # Trigger vision when:
+            #   (a) DOM is empty (no steps + no sources) past 60s warmup, OR
+            #   (b) the right-side panel is detected as OPEN past 90s —
+            #       vision's panel-aware screenshot extraction pulls
+            #       narration quality DOM walker often can't.
             _vn_should_call = (
                 _elapsed_sec_now > 60
                 and _vn_steps_n < 2
                 and _vn_sources == 0
+            ) or (
+                _elapsed_sec_now > 90 and _vn_panel_open
             )
             _vn_force_every_n = int(os.environ.get("GEMINI_NARRATE_FORCE_EVERY_N", "4"))
             if _vn_force_every_n > 0 and _elapsed_sec_now > 0:
@@ -9450,6 +9718,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if _poll_tick > 0 and _poll_tick % _vn_force_every_n == 0:
                     _vn_should_call = True
             _vision_narration_p2 = ""
+            _vision_phase_signal_p2 = ""
             if _vn_should_call:
                 _vision_data_p2 = None
                 try:
@@ -9468,6 +9737,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _vision_data_p2 = None
                 if _vision_data_p2 and float(_vision_data_p2.get("confidence", 0)) >= 0.4:
                     _vision_narration_p2 = _vision_data_p2.get("narration", "")
+                    _vision_phase_signal_p2 = _vision_data_p2.get("phase_signal", "") or ""
                     _v_progress = _vision_data_p2.get("progress", "")
                     if _v_progress and len(_v_progress) > len(_vn_progress_str):
                         progress["progress"] = _v_progress
@@ -9657,6 +9927,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     plan=progress.get("plan", ""),
                     toolUses=progress.get("tool_uses", []),
                     title=progress.get("title", ""),
+                    visionNarration=_vision_narration_p2,
+                    phaseSignal=_vision_phase_signal_p2,
+                    panelOpen=bool(progress.get("panel_open", False)),
+                    observedSources=int(progress.get("observed_sources", 0) or 0),
                     elapsedSec=elapsed_sec,
                     expectedMinutes=get_expected_minutes(2),
                     scrapeOk=scrape_ok)
@@ -9676,7 +9950,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # before extracting — eliminates the partial_len>5000,
             # artifacts>=2, transient-keyword false positives.
             detect_fn = DETECT_FNS.get(name)
-            if detect_fn and elapsed >= MIN_WAIT.get(name, 180):
+            # 2026-04-28: drop the MIN_WAIT shadow on completion detection.
+            # MIN_WAIT was a CUA-cost gate (the CUA fallback at the bottom
+            # of this loop still respects it). detect_completion_* is
+            # cheap Playwright scraping with strict done-markers, so it's
+            # safe to run from t=0 — and ChatGPT can finish in 54s flat
+            # for some prompts, which the 5-min MIN_WAIT was hiding from
+            # the FE entirely (agent stayed "generating" until MIN_WAIT
+            # cleared, ~5 min after the BE could SEE it was done).
+            if detect_fn:
                 try:
                     dom_done, dom_reason, snap = await detect_fn(p["page"])
                 except Exception as _de:
@@ -9705,13 +9987,34 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] Done-marker confirmed #{len(p['flat_history'])} — "
                         f"{dom_reason}; snap={snap}")
                     elapsed_done = time.time() - p["done_marker_first_at"]
-                    if len(p["flat_history"]) < 3 or elapsed_done < 240:
+                    # 2026-04-28: tolerance gate. Strict equality
+                    # (t0==t1==t2 AND s0==s1==s2) NEVER converges for
+                    # ChatGPT — the source-panel auto-expand
+                    # (DG_SOURCE_PANEL_EXPAND), plan-item live-row click
+                    # (DG_PLAN_ITEM_EXPAND), and activity-panel open all
+                    # mutate the iframe innerText / source counts every
+                    # poll, so flat_history kept getting trimmed back to
+                    # [-1:] indefinitely. The new gate accepts "no growth"
+                    # rather than "perfect equality" — none of the three
+                    # signals may grow over the window. Sources/steps
+                    # are monotonic check (allow tiny shrink from dedupe);
+                    # text_len within 5% (citation tooltips, late hovers).
+                    # Wall-clock floor lowered from 240s → 90s to match
+                    # the new gate's tighter convergence.
+                    if len(p["flat_history"]) < 3 or elapsed_done < 90:
                         # Not enough samples yet — keep polling.
                         continue
                     t0, s0, st0 = p["flat_history"][0]
                     t1, s1, st1 = p["flat_history"][1]
                     t2, s2, st2 = p["flat_history"][2]
-                    flat = (t0 == t1 == t2 and s0 == s1 == s2 and st0 == st1 == st2)
+                    def _stable(a, b, c, tol=0.05):
+                        hi = max(a, b, c); lo = min(a, b, c)
+                        return hi == 0 or (hi - lo) <= max(2, hi * tol)
+                    flat = (
+                        _stable(t0, t1, t2)
+                        and s2 <= int(s1 * 1.02) + 1
+                        and st2 <= st1 + 1
+                    )
                     if not flat:
                         log(f"[{name}] Done-marker present but signals still moving — "
                             f"text {t0}→{t1}→{t2}, sources {s0}→{s1}→{s2}, "
