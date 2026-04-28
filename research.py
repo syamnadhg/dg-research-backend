@@ -1359,6 +1359,23 @@ def start_firestore_start_listener(job_queue, loop):
                 current = _QUEUE_STATE.get("current_job") or {}
                 if current.get("research_id") == target_rid:
                     log(f"Cancel: target {target_rid} is actively running — skipping queue surgery", "INFO")
+                    # Tell the FE the cancel raced with worker pickup. The FE
+                    # has already optimistically written status="stopped" to
+                    # Firestore — without this signal, the BE's subsequent
+                    # status="ongoing" + phase events clobber the FE state and
+                    # the user sees the run continue silently. Writing
+                    # cancelTooLate to the research doc lets the FE detect
+                    # the race and roll back its optimistic teardown.
+                    if _firebase_db:
+                        try:
+                            _firebase_db.collection("users").document(target_uid) \
+                                .collection("researches").document(target_rid) \
+                                .update({
+                                    "cancelTooLate": True,
+                                    "cancelTooLateAt": int(time.time() * 1000),
+                                })
+                        except Exception:
+                            pass
                     try:
                         doc.reference.delete()
                     except Exception:

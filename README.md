@@ -4,10 +4,9 @@ Automates multi-agent deep research across 6 platforms using Claude Computer Use
 
 > **Jira:** [DGOPS-6933](https://distributedglobal.atlassian.net/browse/DGOPS-6933)
 > **Repo (this one):** github.com/dg-eng/super-research-backend
-> **Owner:** Sammy Guli — `sammy.guli@distributedglobal.com`
 >
 > The Firebase Admin SDK key (`firebase-service-account.json`) is **gitignored**
-> and emailed separately — see ["Firebase Admin Key" below](#firebase-admin-key-required--firebase-service-accountjson).
+> and emailed separately by the dev — see ["Firebase Admin Key" below](#firebase-admin-key-required--firebase-service-accountjson).
 
 ## Quick Start
 
@@ -17,7 +16,7 @@ git clone https://github.com/dg-eng/super-research-backend.git
 cd super-research-backend
 pip install -r requirements.txt
 
-# 2. Drop in the Firebase Admin key (emailed to you by Sammy).
+# 2. Drop in the Firebase Admin key (emailed to you by the dev).
 #    The email attachment will have an auto-generated name like
 #    "super-research-492814-firebase-adminsdk-fbsvc-XXXXX.json".
 #    Save it into THIS directory and RENAME it exactly:
@@ -50,7 +49,7 @@ The backend needs a Firebase Admin SDK key to read the queue, write heartbeats, 
 
 ### How to get it
 
-Sammy (sammy.guli@distributedglobal.com) will email you the JSON file directly. One file per person. The attachment will have an auto-generated name from the Firebase Console — typically:
+The dev will email you the JSON file directly. One file per person. The attachment will have an auto-generated name from the Firebase Console — typically:
 
 ```
 super-research-492814-firebase-adminsdk-fbsvc-XXXXX.json
@@ -108,7 +107,7 @@ Open the file in any editor — it should be valid JSON starting with `{ "type":
 
 - The `.gitignore` is pre-configured: this filename can never accidentally land in a commit, even with `git add -A`.
 - Don't email the file onward, don't commit it, don't paste it into Slack. One file per person.
-- If you suspect the key is compromised, email Sammy — keys can be rotated in the Firebase Console.
+- If you suspect the key is compromised, email the dev — keys can be rotated in the Firebase Console.
 
 ### What happens if it's missing or wrong
 
@@ -116,7 +115,7 @@ Both `--pair` and `--serve` fail loudly on startup with the path they tried to l
 
 ```
 [FATAL] firebase-service-account.json not found at /path/to/super-research-backend/firebase-service-account.json
-        Email Sammy (sammy.guli@distributedglobal.com) for the file. See README → "Firebase Admin Key".
+        Email the dev for the file. See README → "Firebase Admin Key".
 ```
 
 > **Coming in the next update:** a proper pairing-time token exchange so new users self-onboard without the admin key at all. Until then, email flow stays.
@@ -421,4 +420,4 @@ research-automate/
 
 ---
 
-Built by Sammy for Distributed Global.
+Built for Distributed Global.
