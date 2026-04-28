@@ -4671,6 +4671,10 @@ def fail_agent(agent_key: str, title: str, details: str = "",
 
     Every alert carries `dismissible: True` + a unique
     `alert_id = agent_<key>_error` so the FE store can dedupe dismiss."""
+    # Dismiss button removed 2026-04-28 — the alert's corner ✕ already
+    # records the alertId in dismissedAlertIds and clears the visible
+    # alert (PhaseDropdown.tsx:2062-2069), so an in-action Dismiss button
+    # was a duplicate path that just added noise.
     actions = [
         {"id": "retry", "label": "Retry (hard)", "style": "primary",
          "command": {"action": "retry_agent", "agent": agent_key, "mode": "hard"}},
@@ -4678,12 +4682,8 @@ def fail_agent(agent_key: str, title: str, details: str = "",
     if include_wait:
         actions.append({"id": "wait", "label": "Wait", "style": "default",
                         "command": {"action": "wait_longer_agent", "agent": agent_key}})
-    actions.extend([
-        {"id": "skip", "label": "Skip", "style": "default",
-         "command": {"action": "skip_agent", "agent": agent_key}},
-        {"id": "dismiss", "label": "Dismiss", "style": "default",
-         "command": {"action": "dismiss_alert"}},
-    ])
+    actions.append({"id": "skip", "label": "Skip", "style": "default",
+                    "command": {"action": "skip_agent", "agent": agent_key}})
     emit_event("pipeline_error", phase=2, agent=agent_key,
                error=title, details=details, actions=actions,
                dismissible=True, alert_id=f"agent_{agent_key}_error")
@@ -4782,11 +4782,19 @@ async def _narrator_loop(phase: int):
         return
     # gemini-2.0-flash was deprecated for new users (returns 404). Default to
     # 2.5-flash; respect GEMINI_NARRATE_MODEL override so future bumps don't
-    # require a code change.
+    # require a code change. On 5xx (saw 12+ overload responses on
+    # 2026-04-28) fall back to 2.5-pro for one retry — different model
+    # family hedges against flash-specific outages instead of retrying
+    # the same overloaded endpoint.
     _model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash")
+    _model_fallback = "gemini-2.5-pro"
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{_model}:generateContent?key={GEMINI_API_KEY}"
+    )
+    url_fallback = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{_model_fallback}:generateContent?key={GEMINI_API_KEY}"
     )
     _err_logged = False  # one-shot — avoid log spam if Gemini stays broken
 
@@ -4796,19 +4804,31 @@ async def _narrator_loop(phase: int):
             "systemInstruction": {"parts": [{"text": system}]},
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
         }
-        try:
-            resp = _requests.post(url, json=payload, timeout=5)
-        except Exception:
-            return None, 0
-        try:
-            j = resp.json()
-            text = (j.get("candidates", [{}])[0]
-                     .get("content", {})
-                     .get("parts", [{}])[0]
-                     .get("text", ""))
-        except Exception:
-            return None, resp.status_code
-        return (text or "").strip(), resp.status_code
+
+        def _post(_url):
+            try:
+                resp = _requests.post(_url, json=payload, timeout=5)
+            except Exception:
+                return None, 0
+            try:
+                j = resp.json()
+                text = (j.get("candidates", [{}])[0]
+                         .get("content", {})
+                         .get("parts", [{}])[0]
+                         .get("text", ""))
+            except Exception:
+                return None, resp.status_code
+            return (text or "").strip(), resp.status_code
+
+        text, status_code = _post(url)
+        # On 5xx (overloaded / transient outage), retry once on the
+        # fallback model. Don't retry 4xx — those are auth/quota/bad-input
+        # and won't change between primary and fallback.
+        if status_code >= 500:
+            text_fb, status_fb = _post(url_fallback)
+            if text_fb and status_fb < 400:
+                return text_fb, status_fb
+        return text, status_code
 
     try:
         while True:
@@ -9825,10 +9845,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 diag_text,
             )
 
+            is_error = False
             if verdict_match:
                 verdict = verdict_match.group(1)
                 is_done = verdict == "done"
                 is_generating = verdict == "generating"
+                is_error = verdict == "error"
             else:
                 still_running_phrases = (
                     "still in progress", "still running", "still researching",
@@ -9861,6 +9883,39 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     is_done = False
                 log(f"[{name}] CUA diag missing CONCLUSION line — heuristic verdict: "
                     f"{'generating' if is_generating else 'done' if is_done else 'unknown'}", "WARN")
+
+            # ── Agent-side error verdict (e.g. ChatGPT "Research failed") ──
+            # Without this branch the polling loop spins forever — neither
+            # is_done nor is_generating fires and the agent gets stuck in
+            # pending. Salvage whatever's on the page, fire fail_agent
+            # once, drop the agent from rotation.
+            if is_error:
+                agent_key_err = normalize_agent_key(name)
+                log(f"[{name}] CUA reported CONCLUSION: ERROR — agent UI shows a failure state. "
+                    f"Salvaging partial output and dropping from rotation.", "WARN")
+                _err_text = ""
+                try:
+                    _err_text = await extract_fns[name](
+                        p["page"], browser=browser, cua_client=cua_client,
+                        label=name, verbose=verbose) or ""
+                except Exception as _e_err:
+                    log(f"[{name}] Salvage extract during error verdict failed: {_e_err}", "WARN")
+                if not p.get("failed_alert_emitted"):
+                    fail_agent(agent_key_err,
+                               f"{name} reported a failure mid-run",
+                               (f"The {name} UI surfaced an error (e.g. 'Research failed'). "
+                                f"Salvaged {len(_err_text)} chars of partial output. "
+                                "Retry re-runs the agent fresh; Skip drops it."))
+                    p["failed_alert_emitted"] = True
+                results[name] = {
+                    "status": "agent_error",
+                    "text": _err_text,
+                    "url": p.get("url", ""),
+                    "page": p["page"],
+                    "elapsed_sec": int(elapsed),
+                }
+                del pending[name]
+                continue
 
             if is_generating and not is_done:
                 log(f"[{name}] CUA: still generating ({int(elapsed/60)}m)")
@@ -11303,35 +11358,82 @@ async def setup_chatgpt_dr(page) -> bool:
 
 
 async def setup_gemini_dr(page) -> bool:
-    """Enable Gemini Deep Research pill via direct selectors. Returns True on success.
+    """Enable Gemini Deep Research via the Tools menu. Returns True on success.
 
-    Step-by-step logs emit on every branch so next run's log tells us
-    whether the pill was missing, the model-dropdown fallback fired, or
-    verification couldn't find the active pill afterwards.
+    Gemini routes Deep Research through Tools → Deep Research (user
+    confirmed 2026-04-28). The previous direct-pill / model-dropdown
+    paths never matched the actual UI — they only worked during brief
+    A/B windows where Google exposed DR as a composer pill. Today the
+    Tools menu is the only reliable path, so we try it first and keep
+    the legacy paths only as last-resort fallbacks.
     """
     try:
         await asyncio.sleep(2)
 
-        # Step 1: try the direct Deep Research pill/button in the composer
-        direct_clicked = await page.evaluate("""() => {
-            const candidates = document.querySelectorAll('button, [role="button"], [role="menuitem"]');
+        # ── Step 1: open the Tools menu and click "Deep Research" ─────
+        # The Tools button lives next to the composer's attach (+) control
+        # and is exposed via text "Tools" or an aria-label containing
+        # "tools" / a title="Tools" tooltip.
+        direct_clicked = False
+        tools_opened = await page.evaluate("""() => {
+            const candidates = document.querySelectorAll('button, [role="button"]');
             for (const b of candidates) {
                 if (!b.offsetParent) continue;
                 const t = (b.textContent || '').trim().toLowerCase();
                 const a = (b.getAttribute('aria-label') || '').toLowerCase();
-                if (t === 'deep research' || a === 'deep research' || t.startsWith('deep research')) {
+                const tt = (b.getAttribute('title') || '').toLowerCase();
+                if (t === 'tools' || a === 'tools' ||
+                    a.includes('tools') || tt.includes('tools') ||
+                    t.startsWith('tools')) {
                     b.click();
                     return true;
                 }
             }
             return false;
         }""")
-        if direct_clicked:
-            log("[setup_gemini_dr] Step 1 OK: clicked DR pill directly in composer")
+        if tools_opened:
+            await asyncio.sleep(0.8)
+            log("[setup_gemini_dr] Step 1 OK: opened Tools menu")
+            direct_clicked = await page.evaluate("""() => {
+                const items = document.querySelectorAll('[role="menuitem"], [role="option"], button, a, li');
+                for (const el of items) {
+                    if (!el.offsetParent) continue;
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                    if (t === 'deep research' || a === 'deep research' ||
+                        t.startsWith('deep research') || a.startsWith('deep research')) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if direct_clicked:
+                log("[setup_gemini_dr] Step 1 OK: clicked Deep Research inside Tools menu")
+            else:
+                log("[setup_gemini_dr] Step 1: Tools menu opened but Deep Research item missing — falling back", "WARN")
         else:
-            log("[setup_gemini_dr] Step 1: DR pill not directly visible — trying model-dropdown fallback", "INFO")
+            log("[setup_gemini_dr] Step 1: Tools button not visible — trying legacy paths", "INFO")
 
-        # Step 2 (fallback): DR may live inside the model/tools dropdown
+        # ── Step 2 (legacy fallback): direct DR pill in the composer ──
+        if not direct_clicked:
+            direct_clicked = await page.evaluate("""() => {
+                const candidates = document.querySelectorAll('button, [role="button"], [role="menuitem"]');
+                for (const b of candidates) {
+                    if (!b.offsetParent) continue;
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                    if (t === 'deep research' || a === 'deep research' || t.startsWith('deep research')) {
+                        b.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if direct_clicked:
+                log("[setup_gemini_dr] Step 2 OK (legacy): clicked DR pill directly in composer")
+
+        # ── Step 3 (legacy fallback): DR inside the model dropdown ────
         if not direct_clicked:
             for sel in ['button[aria-label*="model"]', 'button[data-test-id*="model"]']:
                 try:
@@ -11339,7 +11441,7 @@ async def setup_gemini_dr(page) -> bool:
                     if btn:
                         await btn.click()
                         await asyncio.sleep(0.8)
-                        log(f"[setup_gemini_dr] Step 2: opened {sel}")
+                        log(f"[setup_gemini_dr] Step 3 (legacy): opened {sel}")
                         direct_clicked = await page.evaluate("""() => {
                             const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
                             for (const el of items) {
@@ -11349,16 +11451,16 @@ async def setup_gemini_dr(page) -> bool:
                             return false;
                         }""")
                         if direct_clicked:
-                            log(f"[setup_gemini_dr] Step 2 OK: DR selected via {sel} dropdown")
+                            log(f"[setup_gemini_dr] Step 3 OK (legacy): DR selected via {sel} dropdown")
                             break
                         else:
-                            log(f"[setup_gemini_dr] Step 2 {sel}: dropdown opened but DR option absent", "WARN")
+                            log(f"[setup_gemini_dr] Step 3 {sel}: dropdown opened but DR option absent", "WARN")
                 except Exception as e:
-                    log(f"[setup_gemini_dr] Step 2 {sel} errored: {e}", "WARN")
+                    log(f"[setup_gemini_dr] Step 3 {sel} errored: {e}", "WARN")
                     continue
 
         if not direct_clicked:
-            log("[setup_gemini_dr] FAIL: neither direct pill nor dropdown fallback landed DR — selectors likely rotated", "WARN")
+            log("[setup_gemini_dr] FAIL: Tools menu, direct pill, and model-dropdown fallback all missed DR — selectors likely rotated", "WARN")
             return False
 
         await asyncio.sleep(1.5)
