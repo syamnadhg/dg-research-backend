@@ -434,17 +434,14 @@ Steps:
 
 PROMPT_AUDIO_GENERATE = SYSTEM_BASE + """
 
-Your task: Generate ONE long-form "Deep dive" audio overview in NotebookLM.
-The podcast MUST be configured as Deep dive + Long before clicking Generate.
+Your task: Generate ONE Deep Dive Long audio overview in NotebookLM.
 
 Steps:
-1. Make sure ALL sources are selected/checked in the Sources panel (tick "Select all" if present).
-2. In the Studio panel (right side), click "Audio Overview" to open options.
-3. In the options/customize panel, set FORMAT to "Deep dive" (not Brief / Critique).
-4. Set LENGTH/DURATION to "Long" (not Default / Short).
-5. Only ONCE those two options are confirmed, click "Generate".
-6. Do NOT click Generate more than once — double-clicks create duplicate audios.
-7. Say "generating" once the generation has started (progress indicator visible)."""
+1. Confirm all sources are checked in the Sources panel ("Select all" if present).
+2. In the Studio panel, open Audio Overview customize/settings (gear icon,
+   "Customize" link, or three-dot menu — NOT the bare tile body). Set
+   FORMAT="Deep Dive" and LENGTH="Long".
+3. Click Generate once. Say "generating" when the progress indicator appears."""
 
 PROMPT_AUDIO_CHECK = SYSTEM_BASE + """
 

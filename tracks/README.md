@@ -92,7 +92,7 @@ Frontend polls `GET /api/runs/{id}/events?offset=N` or connects via `WS /ws/{run
 | extract_failed | 2 | All retry attempts on hotspots #2c / #2d exhausted. Pairs with a `pipeline_error` for FE phase-alert routing. |
 
 ### `agent_progress` field additions (Apr 26)
-- `scrapeSource: "dom" | "vision"` — which tier produced the polling data. "dom" = DOM walker scraped the side panel structurally; "vision" = Gemini Flash narrator (`vision_narrate.py`) read a screenshot of the panel directly.
+- `scrapeSource: "dom" | "vision"` — which tier produced the polling data. "dom" = DOM walker scraped the side panel structurally; "vision" = Gemini Flash narrator (`gemini_narrate.py`) read a screenshot of the panel directly.
 - `visionNarration` — the human-readable sentence the FE renders verbatim in the agent dropdown when scrapeSource is "vision". Hard caps inside the narrator: 30 calls per phase, 90s minimum gap per agent.
 
 ### Never-die contract (2026-04-18)

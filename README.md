@@ -223,7 +223,7 @@ Times based on real run analytics. Total: ~1h 50m for a full pipeline.
 Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. Apr 19 + Apr 26 ship a two-layer narration system so there's always a visible human-language pulse:
 
 - **Phase narrator (Gemini 2.0 Flash inside `research.py`)** — every active phase has a narrator worker that reads a bounded ring buffer of recent events (~40) and emits a `phase_narration` event about every 45s. Narrator warms on `phase_start`, stays quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Cost envelope: ~200 input / 30 output tokens per narration → <$0.02 per full pipeline run.
-- **Per-agent narrator (Gemini 2.0 Flash inside `vision_narrate.py`)** — separate module, separate cadence. Each Phase 1/2 agent has a narrator that reads the right-side activity panel directly via Gemini 2.0 Flash vision (screenshot-and-OCR). DOM-walker output is the primary; vision narrator fires when the walker yields nothing AND the panel is non-empty (typical case: ChatGPT Pro "Extended Thinking active" gap), or every 4th poll for a richer rolling sentence. New `agent_progress` fields: `scrapeSource: "dom" | "vision"` records which tier produced the data; `visionNarration` carries the human-readable sentence rendered verbatim in the agent dropdown. Hard caps: 30 calls per phase, 90s minimum gap per agent.
+- **Per-agent narrator (Gemini 2.0 Flash inside `gemini_narrate.py`)** — separate module, separate cadence. Each Phase 1/2 agent has a narrator that reads the right-side activity panel directly via Gemini 2.0 Flash vision (screenshot-and-OCR). DOM-walker output is the primary; vision narrator fires when the walker yields nothing AND the panel is non-empty (typical case: ChatGPT Pro "Extended Thinking active" gap), or every 4th poll for a richer rolling sentence. New `agent_progress` fields: `scrapeSource: "dom" | "vision"` records which tier produced the data; `visionNarration` carries the human-readable sentence rendered verbatim in the agent dropdown. Hard caps: 30 calls per phase, 90s minimum gap per agent.
 - **Backend-down detection** — the LivenessEye title swap in the phase header signals quiet-but-alive vs. potentially-dead. After 30 min of true backend silence the watchdog escalates to a unified phase alert with Retry/Skip. (The U2 cleanup removed the older `/api/narrate` speculative-fallback hook.)
 
 ## Phase 0 verification (sequential, Apr 19)
@@ -310,7 +310,7 @@ research-automate/
 ├── research.py                 # Pipeline + FastAPI server
 ├── prompts.py                  # CUA prompts for each phase
 ├── vision.py                   # Anthropic Sonnet vision client (tier-2 acting): take_screenshot, vision_action, with_vision_fallback, shadow_observe_then_cua
-├── vision_narrate.py           # Gemini Flash agent-side-panel narrator (tier-2 observing): narrate_panel reads the AI activity panel directly via screenshot
+├── gemini_narrate.py           # Gemini Flash agent-side-panel narrator (tier-2 observing): narrate_panel reads the AI activity panel directly via screenshot
 ├── vision_test.py              # Fixture replay tool: --capture saves PNG+JSON, --fixtures replays + asserts action-class agreement + bbox containment
 ├── requirements.txt            # Python dependencies
 ├── firebase-service-account.json  # Firebase connection (not committed)

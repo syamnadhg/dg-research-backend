@@ -1,8 +1,10 @@
-"""Gemini Flash vision narrator for the agent side-panel.
+"""Gemini Flash narrator for the agent side-panel.
 
-Sits next to vision.py but is its own module:
-  - vision.py = Anthropic, tier-2 ACTING (click/scroll/type)
-  - vision_narrate.py = Gemini, tier-2 OBSERVING (read panel, narrate state)
+A standalone OBSERVING module — reads screenshots of the research panel
+(ChatGPT, Claude, or Gemini) via Gemini Flash and reports what the agent
+is doing right now. Sits next to vision.py (Anthropic Sonnet, ACTING tier
+that clicks/scrolls/types) and is intentionally separate so the
+narrate-vs-act split is unambiguous in logs and call sites.
 
 Public surface:
   narrate_panel(page, *, agent, phase, last_dom_progress=None) -> dict | None
@@ -24,15 +26,15 @@ from typing import Any
 
 import requests
 
-logger = logging.getLogger("vision_narrate")
+logger = logging.getLogger("gemini_narrate")
 
 
-GEMINI_MODEL_PRIMARY = os.environ.get("DG_VISION_NARRATE_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL_PRIMARY = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.0-flash")
 GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
-GEMINI_TIMEOUT_S = float(os.environ.get("DG_VISION_NARRATE_TIMEOUT", "8.0"))
-PHASE_BUDGET = int(os.environ.get("DG_VISION_NARRATE_BUDGET", "30"))
-MIN_GAP_S = float(os.environ.get("DG_VISION_NARRATE_MIN_GAP_S", "90"))
-PANEL_CROP_RIGHT_FRACTION = float(os.environ.get("DG_VISION_NARRATE_CROP", "0.45"))
+GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_NARRATE_TIMEOUT", "8.0"))
+PHASE_BUDGET = int(os.environ.get("GEMINI_NARRATE_BUDGET", "30"))
+MIN_GAP_S = float(os.environ.get("GEMINI_NARRATE_MIN_GAP_S", "90"))
+PANEL_CROP_RIGHT_FRACTION = float(os.environ.get("GEMINI_NARRATE_CROP", "0.45"))
 
 
 _RESPONSE_SCHEMA = {
@@ -122,7 +124,7 @@ async def narrate_panel(
 ) -> dict | None:
     """Take a screenshot of the agent page, ask Gemini Flash to extract
     panel state. Returns a dict matching the JSON schema, or None on
-    skip/failure (caller treats None as "vision didn't help, fall through").
+    skip/failure (caller treats None as "narrator didn't help, fall through").
 
     Throttling rules (in order):
       1. cooldown -- never within MIN_GAP_S of the last call.
@@ -143,7 +145,7 @@ async def narrate_panel(
     if _M.calls_this_phase >= PHASE_BUDGET:
         _M.skipped_budget += 1
         if _M.calls_this_phase == PHASE_BUDGET:
-            logger.warning("vision_narrate: phase budget %d exhausted", PHASE_BUDGET)
+            logger.warning("gemini_narrate: phase budget %d exhausted", PHASE_BUDGET)
         return None
 
     try:
@@ -169,18 +171,22 @@ async def narrate_panel(
 
     for model in (GEMINI_MODEL_PRIMARY, GEMINI_MODEL_FALLBACK):
         result = await asyncio.to_thread(
-            _call_gemini_vision, api_key, model, png, user_msg
+            _call_gemini, api_key, model, png, user_msg
         )
         if result.get("ok"):
             _M.successes += 1
             _M.by_model[model] = _M.by_model.get(model, 0) + 1
             _M.last_latency_ms = result.get("latency_ms", 0.0)
             data = result["data"]
+            # _source is the technique tag (visual-scrape vs DOM-scrape) read
+            # by research.py to label the analytics payload — not the module
+            # name. Kept as "vision" intentionally; downstream consumers
+            # branch on this string.
             data["_source"] = "vision"
             data["_model"] = model
             return data
         if result.get("status") == 429 and model == GEMINI_MODEL_PRIMARY:
-            logger.info("vision_narrate: 429 on primary, retrying on fallback")
+            logger.info("gemini_narrate: 429 on primary, retrying on fallback")
             continue
         _M.failures += 1
         _M.last_error = result.get("error", "unknown")
@@ -190,8 +196,8 @@ async def narrate_panel(
     return None
 
 
-def _call_gemini_vision(api_key: str, model: str, png: bytes, user_msg: str) -> dict:
-    """Synchronous Gemini vision call (run in to_thread). Returns
+def _call_gemini(api_key: str, model: str, png: bytes, user_msg: str) -> dict:
+    """Synchronous Gemini call (run in to_thread). Returns
     {"ok": bool, "data": {...}, "status": int, "latency_ms": float, "error": str}."""
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"

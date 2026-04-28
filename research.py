@@ -74,8 +74,9 @@ MAX_WAIT_DEEP = int(os.environ.get("MAX_WAIT_DEEP", "90"))       # minutes — P
 # overnight). Override via env for E2E with shorter ceilings.
 PHASE_1_MAX_MIN = int(os.environ.get("PHASE_1_MAX_MIN", "35"))   # brief gen typical 21-27m
 PHASE_2_MAX_MIN = int(os.environ.get("PHASE_2_MAX_MIN", "90"))   # 3 agents in parallel
-PHASE_3_UPLOAD_MAX_MIN = int(os.environ.get("PHASE_3_UPLOAD_MAX_MIN", "15"))
-PHASE_3_AUDIO_MAX_MIN = int(os.environ.get("PHASE_3_AUDIO_MAX_MIN", "20"))   # observed 15-20m, gated on NotebookLM opaque audio gen
+# Phase 3 is a single 40-min wall-clock guard wrapping upload + audio gen
+# (was two sub-step ceilings of 15m + 20m). One ceiling, one alert.
+PHASE_3_MAX_MIN = int(os.environ.get("PHASE_3_MAX_MIN", "40"))
 PHASE_4_MAX_MIN = int(os.environ.get("PHASE_4_MAX_MIN", "15"))   # ffmpeg + YouTube
 PHASE_5_MAX_MIN = int(os.environ.get("PHASE_5_MAX_MIN", "10"))   # GDoc + email
 
@@ -1162,7 +1163,10 @@ def load_analytics():
 
 
 def record_phase_duration(phase: int, duration_sec: float, agent: str = ""):
-    """Append a phase completion record to run_analytics.json."""
+    """Append a phase completion record to run_analytics.json. Recomputes
+    in-memory averages from the same in-process data — avoids the redundant
+    file read that load_analytics() would do."""
+    global _phase_averages
     try:
         data = {"runs": []}
         if ANALYTICS_PATH.exists():
@@ -1174,8 +1178,14 @@ def record_phase_duration(phase: int, duration_sec: float, agent: str = ""):
             "timestamp": int(time.time()),
         })
         ANALYTICS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        # Refresh in-memory averages
-        load_analytics()
+        from collections import defaultdict
+        buckets: dict[int, list[float]] = defaultdict(list)
+        for r in data["runs"]:
+            p = r.get("phase")
+            d = r.get("durationSec", 0)
+            if isinstance(p, int) and d > 0:
+                buckets[p].append(d)
+        _phase_averages = {p: sum(ds) / len(ds) for p, ds in buckets.items() if ds}
     except Exception as e:
         log(f"Failed to record analytics: {e}", "WARN")
 
@@ -1323,11 +1333,11 @@ def start_firestore_start_listener(job_queue, loop):
             if isinstance(_ts, (int, float)) and _ts > 0:
                 _age_ms = int(time.time() * 1000) - int(_ts)
                 if _age_ms > STALE_QUEUE_AGE_MS:
+                    log(f"Queue: skipped stale doc (age={_age_ms // 1000}s, action={data.get('action', 'start')})", "INFO")
                     try:
-                        doc.reference.update({"processed": True, "staleSkipped": True})
+                        doc.reference.delete()
                     except Exception:
                         pass
-                    log(f"Queue: skipped stale doc (age={_age_ms // 1000}s, action={data.get('action', 'start')})", "INFO")
                     continue
             action = data.get("action", "start")
             # Handle cancel-queued: remove the target research from the job
@@ -1338,8 +1348,9 @@ def start_firestore_start_listener(job_queue, loop):
                 target_rid = data.get("researchId", "")
                 target_uid = data.get("uid", "")
                 if not target_rid or not target_uid:
+                    log("Cancel: missing researchId/uid", "WARN")
                     try:
-                        doc.reference.update({"processed": True, "error": "missing researchId/uid"})
+                        doc.reference.delete()
                     except Exception:
                         pass
                     continue
@@ -1349,7 +1360,7 @@ def start_firestore_start_listener(job_queue, loop):
                 if current.get("research_id") == target_rid:
                     log(f"Cancel: target {target_rid} is actively running — skipping queue surgery", "INFO")
                     try:
-                        doc.reference.update({"processed": True, "note": "actively running; use stop"})
+                        doc.reference.delete()
                     except Exception:
                         pass
                     continue
@@ -1375,8 +1386,12 @@ def start_firestore_start_listener(job_queue, loop):
                             fn = _QUEUE_STATE.get("recompute_fn")
                             if fn:
                                 fn()
+                        # Log the outcome (was: persisted on doc as `cancelled`
+                        # field). Doc absence = success signal for any FE
+                        # listener; the bool was never read elsewhere.
+                        log(f"Cancel: rid={rid[:8]}... removed_from_queue={removed}", "INFO")
                         try:
-                            dref.update({"processed": True, "cancelled": removed})
+                            dref.delete()
                         except Exception:
                             pass
                     except Exception as ex:
@@ -1394,7 +1409,7 @@ def start_firestore_start_listener(job_queue, loop):
             if not topic or not uid or not research_id:
                 log(f"Firestore start request missing fields: uid={uid}, rid={research_id}, topic={topic[:30]}", "WARN")
                 try:
-                    doc.reference.update({"processed": True, "error": "missing fields"})
+                    doc.reference.delete()
                 except Exception:
                     pass
                 continue
@@ -1413,14 +1428,14 @@ def start_firestore_start_listener(job_queue, loop):
                     if not linked_uid:
                         log(f"Rejecting start: token unlinked (linkedUid empty). uid={uid[:8]} topic={topic[:40]}", "WARN")
                         try:
-                            doc.reference.update({"processed": True, "error": "token unlinked"})
+                            doc.reference.delete()
                         except Exception:
                             pass
                         continue
                     if uid != linked_uid:
                         log(f"Rejecting start: uid mismatch (linked={linked_uid[:8]} req={uid[:8]})", "WARN")
                         try:
-                            doc.reference.update({"processed": True, "error": "uid mismatch"})
+                            doc.reference.delete()
                         except Exception:
                             pass
                         continue
@@ -1440,8 +1455,7 @@ def start_firestore_start_listener(job_queue, loop):
                 if not research_doc.exists:
                     log(f"Queue: skipped — research doc {research_id} no longer exists (user deleted chat?)", "INFO")
                     try:
-                        doc.reference.update({"processed": True, "staleSkipped": True,
-                                              "reason": "research doc deleted"})
+                        doc.reference.delete()
                     except Exception:
                         pass
                     continue
@@ -1495,9 +1509,12 @@ def start_firestore_start_listener(job_queue, loop):
                         .set(status_payload, merge=True)
                 except Exception:
                     pass
-            # Mark processed
+            # Delete the queue doc (was: mark processed). Queue subcollection
+            # accumulated forever before this — every start request a permanent
+            # entry. The success path doesn't need to surface run_id back via
+            # the queue doc; it's already written to the research doc above.
             try:
-                doc.reference.update({"processed": True, "run_id": run_id})
+                doc.reference.delete()
             except Exception:
                 pass
             # Queue the job (default-arg capture avoids lambda-in-loop closure bug)
@@ -1648,6 +1665,20 @@ def _start_command_listener(uid, research_id, loop):
         .collection("researches").document(research_id) \
         .collection("commands")
 
+    # Startup sweep — delete any `processed:true` docs left by a prior session
+    # that crashed before its tail-delete flushed. Without this, the
+    # subcollection grows unbounded across runs and the next listener attach
+    # replays every doc as ADDED. The 30s staleness gate below covers the
+    # in-flight window between sweep completion and listener attach.
+    try:
+        for d in col_ref.where("processed", "==", True).stream():
+            try:
+                d.reference.delete()
+            except Exception:
+                pass
+    except Exception as _sweep_err:
+        log(f"[commands] startup sweep failed: {_sweep_err}", "DEBUG")
+
     def on_snapshot(col_snapshot, changes, read_time):
         for change in changes:
             if change.type.name != 'ADDED':
@@ -1747,6 +1778,31 @@ def _start_command_listener(uid, research_id, loop):
                 elif text:
                     loop.call_soon_threadsafe(_controls.add_context, text)
                     log(f"Command received: ADD_CONTEXT ({len(text)} chars)")
+            elif action == "dismiss_alert":
+                # No-op on the BE side: the FE clears its alert slice locally
+                # and records the alert_id in dismissedAlertIds so future
+                # re-emits with the same id are suppressed. We just log so
+                # the bus has an audit trail of which alerts the user closed.
+                _aid = data.get("alert_id", "?")
+                log(f"Command received: DISMISS_ALERT id={_aid}")
+            elif action == "discard_run":
+                # Watchdog T3 "Discard" button: clean terminate keeping any
+                # partial results. Emits pipeline_complete with a distinct
+                # status so the FE doesn't conflate it with stopped_by_watchdog.
+                _aid = data.get("alert_id", "?")
+                log(f"Command received: DISCARD_RUN id={_aid} — terminating with partial results preserved")
+                try:
+                    emit_event("pipeline_complete",
+                               phase=getattr(_runtime, "phase", 0),
+                               status="terminated_by_user_discard",
+                               reason="user_discard_after_watchdog_t3")
+                except Exception:
+                    pass
+                loop.call_soon_threadsafe(_controls.request_stop)
+                if _tracks_dir:
+                    try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
+                    except Exception: pass
+                _schedule_server_exit("firestore-command-discard")
             elif action == "config":
                 cfg = data.get("config", {})
                 if cfg:
@@ -1904,9 +1960,15 @@ def _start_command_listener(uid, research_id, loop):
                     # Release the pause so the phase coroutine can consume the decision
                     loop.call_soon_threadsafe(_controls.request_resume)
                     log(f"Command received: AGENT_DECISION agent={agent} decision={decision}")
-            # Mark processed
+            # Delete the doc (was: mark processed). Deletion stops the
+            # subcollection from growing across runs and prevents the next
+            # listener attach from replaying old commands. The early
+            # update({"processed": True}) writes inside stop/agent_decision-stop
+            # branches stay — they're pre-exit-schedule guards needed because
+            # os._exit may kill the buffered delete. Ping action also keeps
+            # update() because pingBackendForResearch reads pongedAt back.
             try:
-                doc.reference.update({"processed": True})
+                doc.reference.delete()
             except Exception:
                 pass
 
@@ -2102,10 +2164,14 @@ class PipelineControls:
     def request_skip_agent(self, agent: str):
         """User hit the Skip button on a stuck Phase 2 agent. The polling
         loop checks this set on every tick and drops any listed agent from
-        `pending`, keeping the rest of the phase running."""
+        `pending`, keeping the rest of the phase running. Also releases any
+        active pause so a poll-loop blocked in wait_if_paused exits and the
+        skip_agents handler runs on the next tick."""
         key = (agent or "").strip().lower()
         if key:
             self.skipped_agents.add(key)
+            self.pause_event.clear()
+            self.resume_event.set()
 
     def request_skip_phase(self, phase: int):
         """User picked "Skip phase" from the 45-min backend-silent banner.
@@ -2384,9 +2450,18 @@ class PipelineRuntime:
         # final artifact. Initialized here so reset() always lands at False
         # (otherwise an attribute set externally would leak across runs).
         self.claude_artifact_panel_open = False
+        # P2 → P3 handoff state. Populated at end of P2 (and as resume-safety
+        # fallback at start of P3) by _build_phase2_to_phase3_handoff. P3
+        # consumes these instead of doing its own per-agent reconciliation —
+        # keeping all share-URL/MD work scoped to P2.
+        self.p2_links_for_p3: dict = {}
+        self.p2_md_files_for_p3: list = []
 
     def reset(self):
         self.__init__()
+        # Clear module-level page-keyed stream observers — entries are keyed by
+        # id(page) and would alias new pages once Python recycles ids.
+        _agent_streams.clear()
 
     def register_page(self, platform, page, url=None):
         self.active_pages[platform] = page
@@ -3056,8 +3131,9 @@ async def resume_browser_from_checkpoint(browser, queue_dir):
                 await check_auth(page, platform)
             except SessionExpiredError as e:
                 log(f"[resume] {e}", "ERROR")
-                emit_event("pipeline_error", phase=_runtime.phase,
-                           agent=platform, error=str(e))
+                fail_agent(platform,
+                           "Session expired — re-authenticate to retry",
+                           f"{e}")
                 continue
             restored[platform] = page
             _runtime.register_page(platform, page, url)
@@ -3067,6 +3143,21 @@ async def resume_browser_from_checkpoint(browser, queue_dir):
     # Reset dedup cache
     global _last_progress
     _last_progress = {}
+    # Crash-recovery alert (Template C, blue/info): announce we restored
+    # from a checkpoint AFTER a previous run was interrupted. Renders in
+    # the recovered phase's dropdown via the FE pipeline_recovered handler.
+    # [Dismiss] only — no retry/skip; the auto-recover already happened.
+    if cp:
+        emit_event("pipeline_recovered",
+                   phase=cp.get("phase", 0),
+                   reason="auto_recover_after_crash",
+                   message="Recovered from previous run — resuming from checkpoint.",
+                   details=(f"Phase {cp.get('phase', '?')} was interrupted; the orchestrator "
+                            "restored the saved state and is continuing."),
+                   actions=[{"id": "dismiss", "label": "Dismiss", "style": "default",
+                             "command": {"action": "dismiss_alert"}}],
+                   dismissible=True,
+                   alert_id=f"recovered_p{cp.get('phase', 0)}")
     emit_event("pipeline_resumed", phase=_runtime.phase,
                restored=list(restored.keys()))
     clear_pause_checkpoint(queue_dir)
@@ -3124,8 +3215,6 @@ def emit_validated_link(phase: int, agent: str, url: str, label: str):
     verified = validate_link(agent, url)
     if not verified:
         log(f"[{label}] Link REJECTED — not a valid public link: {url[:80]}", "WARN")
-        emit_event("link_extraction_failed", phase=phase, agent=agent,
-                   error=f"URL is not a valid public link: {url[:60]}")
         return False
     emit_event("link_extracted", phase=phase, agent=agent,
                url=url, label=label, verified=True)
@@ -3254,16 +3343,32 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
         # agent_loop's max_iterations=6 doesn't bound wall-clock time, so a
         # stuck CUA could loiter for many minutes. The wait_for keeps the
         # share-link path bounded and reachable.
+        # Shadow-wrapped (Track A telemetry on the "p2-share" hotspot) so
+        # Vision tier-2 observes in parallel and accumulates agreement data
+        # for autonomous promotion.
         if "chatgpt.com/share" not in url:
             log(f"[{label}] CUA fallback for share link...")
             try:
-                result = await asyncio.wait_for(
+                emit_event("tier_transition", phase=2, agent="chatgpt",
+                           op="p2_share_extract", from_tier="dom",
+                           to_tier="cua", reason="iframe_share_intercept")
+            except Exception:
+                pass
+            async def _chatgpt_share_cua():
+                return await asyncio.wait_for(
                     agent_loop(cua_client, browser,
                         "Share this ChatGPT conversation by clicking the Share button.",
                         "Click the Share button at the top of this conversation. If a modal appears, click 'Create link' or 'Copy link'. After clicking Copy link, just STOP — don't try to extract the URL yourself, the code will read it from the clipboard.",
                         model=CUA_MODEL, max_iterations=6, verbose=verbose),
                     timeout=120.0,
                 )
+            try:
+                result = await _shadow_observed_cua(
+                    page, hotspot_id="p2-share", phase=2, platform="chatgpt",
+                    current_step="open_share_menu_and_create_link",
+                    context_hint=f"P2 ChatGPT share-link extraction (DR iframe path)",
+                    expected_outcome="public-share URL on clipboard",
+                    cua_coro_factory=_chatgpt_share_cua)
             except asyncio.TimeoutError:
                 log(f"[{label}] CUA share-link extraction timed out (120s) — using current URL as fallback", "WARN")
                 result = {"text": ""}
@@ -4029,9 +4134,7 @@ async def extract_with_retry(
     # after N attempts") instead of the raw event name, and so the agent
     # alert panel has content to render if a caller routes this as a
     # terminal failure rather than proceeding to wait_for_agent_decision.
-    emit_event("link_extraction_failed", phase=phase, agent=agent,
-               error=last_err, attempts=max_retries,
-               description=f"Couldn't extract a verified link after {max_retries} attempts")
+    log(f"[link_extract] {agent}: failed after {max_retries} attempts ({last_err})", "WARN")
     return LinkResult(url="", label=kwargs.get("label", ""),
                       platform=agent, verified=False, error=last_err)
 
@@ -4093,13 +4196,10 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=3)
         # so we emit once per outer attempt with a "retrying" badge. First
         # attempt is silent; retries appear as "X: paste retry N/M…".
         if attempt > 1:
-            try:
-                emit_event("pipeline_warning", phase=2, agent=platform_key or None,
-                           message=f"{label}: paste retry {attempt}/{max_retries}…",
-                           details=f"Previous paste attempt didn't land the brief in the composer. Retrying with a fresh strategy cycle.",
-                           alertType="retrying")
-            except Exception:
-                pass
+            # Per-strategy emits would be too noisy. Inline retries are
+            # silent — the round-robin's agent_progress narration shows the
+            # higher-level state and fail_agent surfaces if all retries fail.
+            log(f"[{label}] paste retry {attempt}/{max_retries}", "INFO")
         # Claude: before retry, delete any existing attachments to prevent duplicates
         if is_claude and attempt > 1:
             try:
@@ -4372,6 +4472,14 @@ def emit_event(event_type, phase=None, agent=None, **data):
     except Exception:
         pass
 
+    # Note: a terminal-event prune of pipeline_events used to live here. It
+    # was reverted because completed/stopped runs MUST preserve their full
+    # event timeline for replay/post-mortem. Cleanup happens only when the
+    # user explicitly deletes a research — see deleteResearch cascade in
+    # firestore.ts and the BE orphan-sweep in startup. The FE seq filter at
+    # firestore.ts:925 (where("seq", ">", lastSeq) + localStorage) keeps
+    # cold-start reads bounded regardless of subcollection size.
+
 
 def start_narration_ticker(phase, agent, narration, interval=30, expected_minutes=None):
     """Spawn a background task that emits agent_progress every `interval`s
@@ -4481,39 +4589,75 @@ async def _shadow_observed_cua(
         return await cua_coro_factory()
 
 
-def fail_phase(phase, error, reason=None, agent=None, actions=None, **extra):
-    """Soft-pause a phase on an unrecoverable error. Emits pipeline_error
-    ONLY — never pipeline_stopped, never Firestore status=failed. The
-    pipeline sits alive awaiting the user's decision, which the caller
-    picks up with `await _controls.await_phase_decision(phase)`.
+def fail_phase(phase: int, title: str = "", details: str = "",
+               agent: str | None = None, can_retry: bool = True,
+               error: str | None = None, reason: str | None = None,
+               actions=None, **extra):
+    """Template A: phase-level error alert with [Retry, Skip, Dismiss]
+    (Retry omitted when can_retry=False). NO Stop — Stop lives only in
+    the chat input.
 
-    ARCHITECTURE CHANGE 2026-04-18 (never-die contract): Previously this
-    helper also emitted pipeline_stopped + marked the run as failed, which
-    tore the pipeline down as soon as a phase hit an issue. New contract:
-    the pipeline only terminates on an explicit user Stop click. Every
-    other failure surfaces as a phase alert with Retry/Skip/Stop buttons
-    and waits for the user.
+    Backwards-compat: legacy callers pass `error=` (machine tag) and
+    `reason=` (human copy). When supplied, they map to title/details so
+    older call sites keep working without edits. New callers pass
+    title/details directly.
 
-    Every event carries phase + (optional) agent so the frontend can route
-    to the right alert panel without guessing. `reason` is human copy shown
-    in the alert details; `error` stays as a short machine-tag. `actions`
-    defaults to ['retry','skip'] — callers can override when a retry path
-    isn't meaningful (rare)."""
-    payload = {"error": error}
-    if reason:
-        payload["reason"] = reason
-    # PhaseAlertPanel expects action objects, not bare ids. Default to
-    # [Retry, Skip] tied to the retry_phase / skip_phase command listener.
-    # Callers can override with their own shape when specific semantics
-    # are required (e.g. resume_from_checkpoint).
-    payload["actions"] = actions if actions else [
-        {"id": "retry", "label": "Retry", "style": "primary",
-         "command": {"action": "retry_phase", "phase": phase}},
-        {"id": "skip", "label": "Skip", "style": "default",
-         "command": {"action": "skip_phase", "phase": phase}},
-    ]
+    Every alert carries `dismissible: True` + a unique `alert_id` so the
+    FE store can short-circuit re-render after dismiss."""
+    if title == "" and error:
+        title = error
+    if details == "" and reason:
+        details = reason
+    if actions is None:
+        actions = []
+        if can_retry:
+            actions.append({"id": "retry", "label": "Retry", "style": "primary",
+                            "command": {"action": "retry_phase", "phase": phase}})
+        actions.append({"id": "skip", "label": "Skip", "style": "default",
+                        "command": {"action": "skip_phase", "phase": phase}})
+        actions.append({"id": "dismiss", "label": "Dismiss", "style": "default",
+                        "command": {"action": "dismiss_alert"}})
+    payload = {"error": title or "phase error",
+               "details": details,
+               "actions": actions,
+               "dismissible": True,
+               "alert_id": f"phase{phase}_error"}
+    if agent:
+        payload["agent"] = agent
     payload.update(extra)
-    emit_event("pipeline_error", phase=phase, agent=agent, **payload)
+    emit_event("pipeline_error", phase=phase, **payload)
+
+
+def fail_agent(agent_key: str, title: str, details: str = "",
+               include_wait: bool = False):
+    """Template B: Phase 2 per-agent error alert. Emits pipeline_error
+    scoped to one agent with [Retry (hard), Skip, Dismiss]. NO Stop.
+    Retry uses mode=hard (close tab + re-run setup) — the more recoverable
+    branch for genuine agent failures.
+
+    `include_wait=True` adds a Wait button between Retry and Skip — used by
+    stall/timeout sites where extending the agent's budget by 15 min is a
+    valid alternative to abandoning its progress. The BE handler is
+    `wait_longer_agent` (research.py request_wait_longer_agent + consume).
+
+    Every alert carries `dismissible: True` + a unique
+    `alert_id = agent_<key>_error` so the FE store can dedupe dismiss."""
+    actions = [
+        {"id": "retry", "label": "Retry (hard)", "style": "primary",
+         "command": {"action": "retry_agent", "agent": agent_key, "mode": "hard"}},
+    ]
+    if include_wait:
+        actions.append({"id": "wait", "label": "Wait", "style": "default",
+                        "command": {"action": "wait_longer_agent", "agent": agent_key}})
+    actions.extend([
+        {"id": "skip", "label": "Skip", "style": "default",
+         "command": {"action": "skip_agent", "agent": agent_key}},
+        {"id": "dismiss", "label": "Dismiss", "style": "default",
+         "command": {"action": "dismiss_alert"}},
+    ])
+    emit_event("pipeline_error", phase=2, agent=agent_key,
+               error=title, details=details, actions=actions,
+               dismissible=True, alert_id=f"agent_{agent_key}_error")
 
 
 # ── T2: Phase narration (Gemini Flash — one human sentence per tick) ─────────
@@ -4741,7 +4885,7 @@ def start_narrator(phase: int):
     except Exception:
         pass
     try:
-        import vision_narrate as _vn
+        import gemini_narrate as _vn
         _vn.reset_phase_budget()
     except Exception:
         pass
@@ -4873,7 +5017,7 @@ async def scrape_progress_chatgpt(page):
                 if (href.startsWith('http') && !href.includes('chatgpt.com') && !href.includes('openai.com') && !href.includes('chat.openai') && !href.includes('oaiusercontent') && href.length < 500)
                     srcSet.add(href);
             });
-            r.source_urls = Array.from(srcSet).slice(0, 30);
+            r.source_urls = Array.from(srcSet).slice(0, 50);
             r.sources = r.source_urls.length;
             // Response sections (host page headings)
             const headings = document.querySelectorAll('[data-message-author-role="assistant"] h1, [data-message-author-role="assistant"] h2, [data-message-author-role="assistant"] h3');
@@ -4968,7 +5112,7 @@ async def scrape_progress_chatgpt(page):
                         h.includes('oaiusercontent') || h.includes('chat.openai')) return;
                     srcSet.add(h);
                 });
-                out.source_urls = Array.from(srcSet).slice(0, 30);
+                out.source_urls = Array.from(srcSet).slice(0, 50);
                 out.sections = Array.from(root.querySelectorAll('h1, h2, h3'))
                     .map(h => (h.innerText || '').trim().slice(0, 80))
                     .filter(s => s.length > 1);
@@ -4982,7 +5126,7 @@ async def scrape_progress_chatgpt(page):
                         if u not in seen_h:
                             seen_h.add(u); unioned_h.append(u)
                     if len(unioned_h) > result.get("sources", 0):
-                        result["source_urls"] = unioned_h[:30]
+                        result["source_urls"] = unioned_h[:50]
                         result["sources"] = len(result["source_urls"])
                 if hp.get("steps") and len(hp["steps"]) > len(result.get("steps") or []):
                     result["steps"] = hp["steps"]
@@ -5027,7 +5171,7 @@ async def scrape_progress_chatgpt(page):
                                     !h.includes('chatgpt.com') && !h.includes('openai.com') &&
                                     !h.includes('oaiusercontent')) srcSet.add(h);
                             });
-                            d.source_urls = Array.from(srcSet).slice(0, 30);
+                            d.source_urls = Array.from(srcSet).slice(0, 50);
                             // 3. Headings in the DR report
                             const hs = document.querySelectorAll('h1, h2, h3');
                             d.sections = Array.from(hs).map(h => (h.innerText || '').trim().substring(0, 80))
@@ -5048,20 +5192,51 @@ async def scrape_progress_chatgpt(page):
                             return d;
                         }""")
                         if dr:
-                            # Merge: iframe data is authoritative for DR content
+                            # Additive merge: iframe data is rich for DR content,
+                            # but host-panel sweep above already collected steps/
+                            # sources from the host page side. Last-write-wins
+                            # would clobber 12 host-panel rows with 8 iframe rows.
                             if dr.get("partial_text_len", 0) > result.get("partial_text_len", 0):
                                 result["partial_text_len"] = dr["partial_text_len"]
+                            # Sources: union (preserve order, cap 50)
                             iframe_srcs = dr.get("source_urls") or []
-                            if len(iframe_srcs) > result.get("sources", 0):
-                                result["source_urls"] = iframe_srcs
-                                result["sources"] = len(iframe_srcs)
+                            if iframe_srcs:
+                                seen_i = set(result.get("source_urls") or [])
+                                unioned_i = list(result.get("source_urls") or [])
+                                for u in iframe_srcs:
+                                    if u not in seen_i:
+                                        seen_i.add(u); unioned_i.append(u)
+                                if len(unioned_i) > len(result.get("source_urls") or []):
+                                    result["source_urls"] = unioned_i[:50]
+                                    result["sources"] = len(result["source_urls"])
+                            # Steps: union by [:80] dedupe key (keep last 15)
                             if dr.get("steps"):
-                                result["steps"] = dr["steps"]
+                                existing_steps = result.get("steps") or []
+                                seen_s = set(s[:80] for s in existing_steps)
+                                merged_steps = list(existing_steps)
+                                for s in dr["steps"]:
+                                    k = s[:80]
+                                    if k not in seen_s:
+                                        seen_s.add(k); merged_steps.append(s)
+                                result["steps"] = merged_steps[-15:]
                                 if dr.get("progress"):
-                                    result["progress"] = dr["progress"]
+                                    # Keep richer existing progress; only swap
+                                    # to iframe progress if it's substantially
+                                    # longer (avoids "Researching" clobbering
+                                    # a rich host-panel sentence).
+                                    cur = result.get("progress") or ""
+                                    if not cur or len(dr["progress"]) > len(cur) * 0.5:
+                                        result["progress"] = dr["progress"]
+                            # Sections: union (exact-string dedup since headings)
                             if dr.get("sections"):
-                                # prefer iframe sections (the actual DR report)
-                                result["sections"] = dr["sections"]
+                                existing_sec = result.get("sections") or []
+                                seen_sec = set(existing_sec)
+                                merged_sec = list(existing_sec)
+                                for s in dr["sections"]:
+                                    if s not in seen_sec:
+                                        seen_sec.add(s); merged_sec.append(s)
+                                if len(merged_sec) > len(existing_sec):
+                                    result["sections"] = merged_sec
                             # Status override from iframe signals
                             if dr.get("is_active"):
                                 result["dr_active"] = True
@@ -5113,7 +5288,7 @@ async def scrape_progress_chatgpt(page):
                                                 !h.includes('chatgpt.com') && !h.includes('openai.com') &&
                                                 !h.includes('oaiusercontent')) srcSet.add(h);
                                         });
-                                        return { source_urls: Array.from(srcSet).slice(0, 30) };
+                                        return { source_urls: Array.from(srcSet).slice(0, 50) };
                                     }""")
                                     if dr2 and dr2.get("source_urls"):
                                         # Union (preserve order) instead of replace —
@@ -5129,7 +5304,7 @@ async def scrape_progress_chatgpt(page):
                                                 seen_u.add(u)
                                                 unioned.append(u)
                                         if len(unioned) > result.get("sources", 0):
-                                            result["source_urls"] = unioned[:30]
+                                            result["source_urls"] = unioned[:50]
                                             result["sources"] = len(result["source_urls"])
                                 except Exception as _re2:
                                     log(f"ChatGPT sources-panel re-scrape skipped: {_re2}", "DEBUG")
@@ -5177,10 +5352,24 @@ async def scrape_progress_chatgpt(page):
                                 return out;
                             }""")
                             if walk:
+                                # Additive: union plan-item steps with whatever
+                                # the iframe walker + host-panel sweep already
+                                # collected. live_label is the active row, so
+                                # it typically wins for `progress` but only if
+                                # richer than what's there.
                                 if walk.get("steps"):
-                                    result["steps"] = walk["steps"]
+                                    existing_steps = result.get("steps") or []
+                                    seen_s = set(s[:80] for s in existing_steps)
+                                    merged_steps = list(existing_steps)
+                                    for s in walk["steps"]:
+                                        k = s[:80]
+                                        if k not in seen_s:
+                                            seen_s.add(k); merged_steps.append(s)
+                                    result["steps"] = merged_steps[-15:]
                                 if walk.get("live_label"):
-                                    result["progress"] = walk["live_label"]
+                                    cur = result.get("progress") or ""
+                                    if not cur or len(walk["live_label"]) > len(cur) * 0.5:
+                                        result["progress"] = walk["live_label"]
                                 if walk.get("clicked"):
                                     log(f'[ChatGPT] plan-item live-row clicked: "{walk.get("live_label","")}"')
                                     await asyncio.sleep(1.0)
@@ -5206,7 +5395,7 @@ async def scrape_progress_chatgpt(page):
                                                     seen3.add(u)
                                                     unioned3.append(u)
                                             if len(unioned3) > len(result.get("source_urls") or []):
-                                                result["source_urls"] = unioned3[:30]
+                                                result["source_urls"] = unioned3[:50]
                                                 result["sources"] = len(result["source_urls"])
                                     except Exception as _re3:
                                         log(f"ChatGPT plan-item re-scrape skipped: {_re3}", "DEBUG")
@@ -5475,9 +5664,11 @@ async def scrape_progress_gemini(page):
                 const a = s.querySelector ? s.querySelector('a') : s;
                 const href = a?.href || '';
                 if (href.startsWith('http') && href.length < 500) srcSet.add(href);
-                else if (!href && s.innerText) srcSet.add(s.innerText.substring(0, 150));
+                // No innerText fallback: titles like "Read on Bloomberg" can't
+                // be clicked and would inflate r.sources beyond what the FE
+                // filtered URL list shows.
             });
-            r.source_urls = Array.from(srcSet).slice(0, 30);
+            r.source_urls = Array.from(srcSet).slice(0, 50);
             r.sources = r.source_urls.length;
             // Response sections
             const headings = document.querySelectorAll(
@@ -5610,10 +5801,13 @@ async def scrape_progress_claude(page):
             document.querySelectorAll('[class*="research"] a[href*="http"], [data-testid*="research"] a[href*="http"]').forEach(a => {
                 if (a.href?.startsWith('http') && !a.href.includes('claude.')) srcSet.add(a.href);
             });
-            r.source_urls = Array.from(srcSet).slice(0, 30);
+            r.source_urls = Array.from(srcSet).slice(0, 50);
             r.sources = r.source_urls.length;
-            // If DOM didn't surface individual source links but Claude shows "N sources" text, trust the text count
-            if (r.sources === 0 && liveSrcCount > 0) r.sources = liveSrcCount;
+            // Text-derived count from "N sources and counting" — kept SEPARATE
+            // from r.sources because there are no URLs to attribute. Without
+            // this split, the chip "5 src" disagreed with the empty URL list.
+            // The watchdog can still consume r.observed_sources for liveness.
+            r.observed_sources = liveSrcCount;
 
             // ---- Sections — headings across conversation, artifact, and research card
             const headings = document.querySelectorAll(
@@ -6347,7 +6541,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
         return None
 
     # Prefer DOM-walker output; fall back to regex on plain text only when walker empty.
-    urls = walker["source_urls"] or list(dict.fromkeys(re.findall(r'https?://[^\s)>\]"]+', content or "")))[:30]
+    urls = walker["source_urls"] or list(dict.fromkeys(re.findall(r'https?://[^\s)>\]"]+', content or "")))[:50]
     steps = walker["steps"] or re.findall(r'(?:^|\n)\s*(?:\d+[\.\)]\s*|[-•]\s+)(.{10,200})', content or "")
     sections = walker["sections"] or re.findall(r'(?:^|\n)#{1,3}\s+(.{3,80})', content or "")
     if not sections:
@@ -6366,7 +6560,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
         "phase": "researching",
         "progress": (steps[-1] if steps else f"Tracking {len(urls)} sources from artifact"),
         "sources": max(len(domains), len(urls)),
-        "source_urls": urls[:30],
+        "source_urls": urls[:50],
         "sections": sections[:15],
         "steps": steps[:15],
         "tool_uses": [f"Analyzing: {s[:80]}" for s in sections[:5]],
@@ -6732,77 +6926,30 @@ async def agent_loop(client, browser, system_prompt, user_message,
             low = err.lower()
             if "rate_limit" in low or "429" in err:
                 log("Rate limited — waiting 30s", "WARN")
-                try:
-                    emit_event("pipeline_warning", phase=_phase, agent=_agent,
-                               message="Anthropic API rate-limited — retrying in 30s…",
-                               details="Claude API returned HTTP 429 for a CUA call. Backing off automatically.",
-                               alertType="retrying")
-                except Exception:
-                    pass
                 await asyncio.sleep(30); continue
             elif "overloaded" in low or "529" in err:
                 log("API overloaded — waiting 60s", "WARN")
-                try:
-                    emit_event("pipeline_warning", phase=_phase, agent=_agent,
-                               message="Anthropic API overloaded — retrying in 60s…",
-                               details="Claude API returned HTTP 529 for a CUA call. Backing off automatically.",
-                               alertType="retrying")
-                except Exception:
-                    pass
                 await asyncio.sleep(60); continue
             elif "workspace api usage limits" in low or ("400" in err and "usage limit" in low):
-                # Non-recoverable: workspace cap is hit, retrying won't help
-                # until the cap is raised in the Anthropic Console or the
-                # reset date passes. Surface as a pipeline_error with an
-                # actionable reason and bail out of the loop — callers can
-                # decide whether to fall back or fail the phase.
                 log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
-                # Phase 2 NEEDS CUA for polling — no fallback possible, so
-                # the only honest option is to end the research. Other phases
-                # (0/5) can still skip CUA gracefully.
-                try:
-                    if _phase == 2:
-                        emit_event("pipeline_error", phase=_phase, agent=_agent,
-                                   error="claude_api_cap",
-                                   reason="Claude API hit the workspace usage cap. Phase 2 cannot run without CUA — raise the cap in the Anthropic Console or end the research.",
-                                   details=err[:200],
-                                   actions=[
-                                       {"id": "stop", "label": "End research", "style": "danger",
-                                        "command": {"action": "stop"}},
-                                   ])
-                    else:
-                        emit_event("pipeline_error", phase=_phase, agent=_agent,
-                                   error="claude_api_cap",
-                                   reason="Claude API hit the workspace usage cap. Raise it in the Anthropic Console or wait until the reset date, then retry.",
-                                   details=err[:200],
-                                   actions=[
-                                       {"id": "retry", "label": "Retry", "style": "primary",
-                                        "command": {"action": "retry_phase", "phase": _phase}},
-                                       {"id": "skip", "label": "Skip", "style": "default",
-                                        "command": {"action": "skip_phase", "phase": _phase}},
-                                   ])
-                except Exception:
-                    pass
+                if _phase == 2 and _agent:
+                    fail_agent(_agent, "Claude API workspace cap hit",
+                               err[:200] or "Raise the cap in the Anthropic Console or wait for reset.")
+                else:
+                    fail_phase(_phase, "Claude API workspace cap hit",
+                               err[:200] or "Raise the cap in the Anthropic Console or wait for reset.")
                 return {"status": "error", "text": str(e)}
             elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
                 log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
-                try:
-                    emit_event("pipeline_error", phase=_phase, agent=_agent,
-                               error="claude_api_unauthorized",
-                               reason="Claude API key was rejected. Update CUA_API_KEY and restart the backend.",
-                               details=err[:200])
-                except Exception:
-                    pass
+                if _phase == 2 and _agent:
+                    fail_agent(_agent, "Claude API key rejected",
+                               "Update CUA_API_KEY and restart the backend.")
+                else:
+                    fail_phase(_phase, "Claude API key rejected",
+                               "Update CUA_API_KEY and restart the backend.")
                 return {"status": "error", "text": str(e)}
             else:
                 log(f"API error: {e}", "ERROR")
-                try:
-                    emit_event("pipeline_warning", phase=_phase, agent=_agent,
-                               message="Anthropic API error — CUA call failed",
-                               details=f"{err[:200]}",
-                               alertType="error")
-                except Exception:
-                    pass
                 return {"status": "error", "text": str(e)}
 
         assistant_content = response.content
@@ -7230,6 +7377,103 @@ async def inject_agent_observer(page, agent_key: str):
         return False
 
 
+async def inject_chatgpt_dr_iframe_observer(page) -> bool:
+    """Inject MutationObserver INSIDE the cross-origin DR iframe (Block 1b).
+
+    The host-page observer (inject_agent_observer) cannot see iframe content
+    because the iframe is cross-origin. Without this, partial_text_len
+    flatlines while the DR iframe is actively streaming the report.
+
+    Mirrors host-page observer state into the same _agent_streams[id(page)]
+    entry by taking max(host_len, iframe_len), so get_observer_state(page)
+    naturally reads the combined value.
+
+    Gated by DG_CHATGPT_IFRAME_OBSERVER=1 (off by default — opt-in).
+    Returns True if injected, False if no DR iframe found / inject failed.
+    """
+    target_frame = None
+    for frame in page.frames:
+        try:
+            src = (frame.url or "").lower()
+        except Exception:
+            continue
+        if not src:
+            continue
+        if ("deep_research" in src or "oaiusercontent" in src
+                or "web-sandbox.oaiusercontent" in src):
+            target_frame = frame
+            break
+    if not target_frame:
+        return False
+
+    page_id = id(page)
+    _agent_streams.setdefault(page_id, {
+        "observer_text_len": 0, "observer_preview": "", "last_update": 0.0,
+    })
+
+    def _iframe_cb(data):
+        try:
+            iframe_len = int(data.get("len", 0) or 0)
+            iframe_preview = str(data.get("text", "") or "")[:500]
+            st = _agent_streams.setdefault(page_id, {})
+            # Take max — host and iframe observers may both fire
+            if iframe_len > int(st.get("observer_text_len", 0) or 0):
+                st["observer_text_len"] = iframe_len
+                st["observer_preview"] = iframe_preview
+                st["last_update"] = time.time()
+        except Exception:
+            pass
+
+    try:
+        await target_frame.expose_function("onStreamIframe", _iframe_cb)
+    except Exception:
+        # Already exposed — safe to ignore
+        pass
+
+    iframe_selectors = ['main', 'article', '[class*="report"]', 'body']
+    script = """
+    (selectors) => {
+        if (window.__agentObserverIframe) {
+            try { window.__agentObserverIframe.disconnect(); } catch(e) {}
+        }
+        let container = null;
+        for (const sel of selectors) {
+            try { container = document.querySelector(sel); } catch(e) {}
+            if (container) break;
+        }
+        if (!container) {
+            window.__agentObserverIframeActive = false;
+            return false;
+        }
+        let lastLen = 0;
+        let timer = null;
+        const mo = new MutationObserver(() => {
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+                const text = container.innerText || '';
+                if (text.length === lastLen) return;
+                lastLen = text.length;
+                try {
+                    window.onStreamIframe({ text: text.slice(-500), len: text.length, ts: Date.now() });
+                } catch(e) {}
+            }, 500);
+        });
+        mo.observe(container, {childList: true, subtree: true, characterData: true});
+        window.__agentObserverIframe = mo;
+        window.__agentObserverIframeActive = true;
+        return true;
+    }
+    """
+    try:
+        ok = await target_frame.evaluate(script, iframe_selectors)
+        if ok:
+            log("[observer-chatgpt-iframe] injected into DR iframe", "INFO")
+        return bool(ok)
+    except Exception as e:
+        log(f"[observer-chatgpt-iframe] inject failed: {e}", "WARN")
+        return False
+
+
 def get_observer_state(page) -> dict:
     """Read the latest MutationObserver snapshot for this page.
     Returns {} if observer hasn't been injected or hasn't fired yet."""
@@ -7237,6 +7481,143 @@ def get_observer_state(page) -> dict:
         return _agent_streams.get(id(page), {}) or {}
     except Exception:
         return {}
+
+
+_VISION_URL_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "urls": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "confidence": {"type": "NUMBER"},
+    },
+    "required": ["urls", "confidence"],
+}
+
+_VISION_URL_PROMPT = (
+    "Extract every source URL visible in this screenshot of an AI research "
+    "panel (ChatGPT/Claude/Gemini side panel showing cited sources).\n"
+    "RULES:\n"
+    "1. Output only http:// or https:// URLs, verbatim.\n"
+    "2. Skip platform chrome: chatgpt.com, openai.com, oaiusercontent, "
+    "claude.ai, anthropic.com, gemini.google.com, accounts.google.com.\n"
+    "3. If a URL is truncated with '...', skip it entirely. Never invent.\n"
+    "4. confidence: 0.7+ if URLs read clearly, 0.4-0.7 partial, <0.4 if "
+    "no URLs visible (return empty list)."
+)
+
+_VISION_URL_SKIP_DOMAINS = (
+    "chatgpt.com", "openai.com", "oaiusercontent",
+    "claude.ai", "anthropic.com",
+    "gemini.google.com", "accounts.google.com",
+)
+
+
+async def extract_source_urls_via_vision(page, agent_key: str,
+                                          last_dom_count: int = 0) -> list:
+    """Vision-extract source URLs from the agent's side panel (Block 3).
+
+    Used as a supplementary signal when DOM scraping misses URLs (collapsed
+    rows, popovers, lazy-loaded content, anchor-less click targets). Returns
+    list of validated http(s) URLs (deduped, length-capped, platform-chrome
+    filtered). Empty list on any failure — caller treats as no-op union.
+
+    Disabled by setting DG_VISION_URL_EXTRACT=0.
+    """
+    api_key = (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+    )
+    if not api_key:
+        return []
+
+    try:
+        png = await page.screenshot(type="png", full_page=False)
+    except Exception as e:
+        log(f"[{agent_key}] vision-urls screenshot failed: {e}", "DEBUG")
+        return []
+
+    # Crop heuristic: ChatGPT/Gemini panels are right ~45%; Claude artifact
+    # panel can be center/right depending on layout — keep full frame.
+    try:
+        from gemini_narrate import _crop_right_fraction
+        if agent_key in ("chatgpt", "gemini"):
+            png = _crop_right_fraction(png, 0.45)
+    except Exception:
+        pass
+
+    user_msg = (
+        f"Agent: {agent_key}. DOM scrape found {last_dom_count} URLs. "
+        "Extract every additional source URL visible in the side panel."
+    )
+
+    model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.0-flash")
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={api_key}")
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inlineData": {
+                    "mimeType": "image/png",
+                    "data": base64.standard_b64encode(png).decode("ascii"),
+                }},
+                {"text": user_msg},
+            ],
+        }],
+        "systemInstruction": {"parts": [{"text": _VISION_URL_PROMPT}]},
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 800,
+            "responseMimeType": "application/json",
+            "responseSchema": _VISION_URL_SCHEMA,
+        },
+    }
+
+    def _sync_call():
+        try:
+            import requests as _req
+            resp = _req.post(url, json=payload, timeout=10.0)
+            if resp.status_code != 200:
+                log(f"[{agent_key}] vision-urls http {resp.status_code}: "
+                    f"{resp.text[:140]}", "WARN")
+                return [], 0.0
+            j = resp.json()
+            text = (j.get("candidates", [{}])[0]
+                      .get("content", {}).get("parts", [{}])[0]
+                      .get("text", ""))
+            data = json.loads(text)
+            return (data.get("urls") or []), float(data.get("confidence", 0) or 0)
+        except Exception as e:
+            log(f"[{agent_key}] vision-urls call/parse error: {e}", "WARN")
+            return [], 0.0
+
+    try:
+        raw_urls, conf = await asyncio.to_thread(_sync_call)
+    except Exception as e:
+        log(f"[{agent_key}] vision-urls call failed: {e}", "WARN")
+        return []
+
+    if conf < 0.4 or not raw_urls:
+        return []
+
+    # Validate + filter — drop anything that isn't a real http(s) URL or
+    # references platform chrome.
+    filtered = []
+    seen = set()
+    for u in raw_urls:
+        if not isinstance(u, str):
+            continue
+        u = u.strip()
+        if not (u.startswith("http://") or u.startswith("https://")):
+            continue
+        if len(u) > 500:
+            continue
+        if u in seen:
+            continue
+        if any(d in u.lower() for d in _VISION_URL_SKIP_DOMAINS):
+            continue
+        seen.add(u)
+        filtered.append(u)
+    return filtered[:50]
 
 
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
@@ -7281,9 +7662,50 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     # (_await_phase_with_active_deadline) is the ultimate safety net but
     # this inner check should also be pause-aware so it doesn't false-fire.
     while (time.time() - wait_start - paused_total) < max_wait:
+        # ── Browser-crash detection ──
+        # If the underlying tab closed unexpectedly (Chromium crash, OOM,
+        # user closed it, profile lock fight) every page op below will
+        # raise. Emit Template A/B alert and return False so the caller
+        # advances to the await_*_decision path.
+        try:
+            if page.is_closed():
+                log(f"[{label}] Browser tab closed unexpectedly", "WARN")
+                _ag_norm_crash = normalize_agent_key(label)
+                if phase == 2 and _ag_norm_crash:
+                    fail_agent(_ag_norm_crash,
+                               "Browser tab crashed",
+                               "The agent's browser tab closed unexpectedly. Retry to relaunch.")
+                else:
+                    fail_phase(phase,
+                               "Browser crashed",
+                               "The browser tab closed unexpectedly during this phase.")
+                return False
+        except Exception:
+            # is_closed() itself can throw if the page handle is already
+            # garbage; treat that as a crash too.
+            log(f"[{label}] Page handle invalid — treating as crash", "WARN")
+            _ag_norm_crash = normalize_agent_key(label)
+            if phase == 2 and _ag_norm_crash:
+                fail_agent(_ag_norm_crash, "Browser tab crashed",
+                           "The agent's browser tab closed unexpectedly. Retry to relaunch.")
+            else:
+                fail_phase(phase, "Browser crashed",
+                           "The browser tab closed unexpectedly during this phase.")
+            return False
         # ── Stop/Pause check ──
         if _controls.is_stop():
             log(f"[{label}] STOP requested — aborting poll")
+            return False
+        # ── Skip checks (agent-level + phase-level) ──
+        # Honor the same skip set the round-robin uses, so a user "Skip"
+        # tap inside a P1 brief poll exits cleanly (poll loops historically
+        # ignored skipped_agents and ran until the wall-clock cap).
+        _ag_norm = normalize_agent_key(label)
+        if _ag_norm and _ag_norm in (_controls.skipped_agents or set()):
+            log(f"[{label}] SKIP requested for agent — aborting poll")
+            return False
+        if _controls.consume_phase_skip(phase):
+            log(f"[{label}] SKIP requested for phase {phase} — aborting poll")
             return False
         if _controls.is_pause():
             emit_event("pipeline_paused", phase=phase)
@@ -7417,7 +7839,14 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # signal. ChatGPT DR's researching phase produces no text
                 # growth but sources and steps continue — text-only stall
                 # detection false-fired during legit in-progress work.
-                _p1_sources = int(progress.get("sources", 0) or 0)
+                # observed_sources (Claude text count, ChatGPT vision count)
+                # captures growth that URL extraction can't see. Treat as
+                # liveness signal so the stall window doesn't open during
+                # legit URL-light progress.
+                _p1_sources = max(
+                    int(progress.get("sources", 0) or 0),
+                    int(progress.get("observed_sources", 0) or 0),
+                )
                 _p1_steps_sig = len(progress.get("steps", []) or [])
                 _grew = (_merged_partial_len > last_seen_len
                          or _p1_sources > last_seen_sources
@@ -7431,7 +7860,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     stall_window_start = time.time()
                 # Vision fallback merge (Gemini Flash) — fills gaps when the
                 # DOM walker returns empty + provides richer narration. Cooldown
-                # / budget enforced inside vision_narrate.narrate_panel. Two
+                # / budget enforced inside gemini_narrate.narrate_panel. Two
                 # triggers: (a) walker is empty/ET-state past the 60s warmup,
                 # or (b) every Nth poll for a fresh narration sentence even
                 # when the walker IS producing data.
@@ -7443,7 +7872,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     and _vn_steps_n < 2
                     and _vn_sources == 0
                 )
-                _vn_force_every_n = int(os.environ.get("DG_VISION_NARRATE_FORCE_EVERY_N", "4"))
+                _vn_force_every_n = int(os.environ.get("GEMINI_NARRATE_FORCE_EVERY_N", "4"))
                 if _vn_force_every_n > 0 and elapsed_sec > 0:
                     try:
                         _poll_interval = max(int(POLL_PRO if phase == 1 else POLL_DEEP_RESEARCH), 1)
@@ -7457,7 +7886,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 _vision_narration = ""
                 if _vn_should_call:
                     try:
-                        import vision_narrate as _vn
+                        import gemini_narrate as _vn
                         _vision_data = await _vn.narrate_panel(
                             page,
                             agent=normalize_agent_key(label),
@@ -7468,7 +7897,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             last_dom_steps_n=_vn_steps_n,
                         )
                     except Exception as _vne:
-                        log(f"[{label}] vision_narrate failed: {_vne}", "DEBUG")
+                        log(f"[{label}] gemini_narrate failed: {_vne}", "DEBUG")
                         _vision_data = None
                 if _vision_data and float(_vision_data.get("confidence", 0)) >= 0.4:
                     _scrape_source = "vision"
@@ -7487,11 +7916,14 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         progress["steps"] = _merged[-15:]
                     if (not progress.get("sections")) and _vision_data.get("sections"):
                         progress["sections"] = _vision_data["sections"]
-                    if int(progress.get("sources", 0) or 0) == 0:
-                        _so = int(_vision_data.get("sources_observed") or 0)
-                        if _so > 0:
-                            progress["sources"] = _so
-                    log(f"[{label}] vision_narrate hit: phase_signal={_vision_data.get('phase_signal')} "
+                    # Vision-derived source-count estimate. Kept SEPARATE from
+                    # progress["sources"] (URL-derived) so the chip count and
+                    # the expanded URL list never disagree. Watchdog can still
+                    # see this signal via observed_sources.
+                    _so = int(_vision_data.get("sources_observed") or 0)
+                    if _so > 0:
+                        progress["observed_sources"] = _so
+                    log(f"[{label}] gemini_narrate hit: phase_signal={_vision_data.get('phase_signal')} "
                         f"conf={_vision_data.get('confidence',0):.2f} steps+={len(_v_steps)} "
                         f"narration=\"{_vision_narration[:80]}\"", "INFO")
 
@@ -7514,9 +7946,17 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     "elapsed_bucket": elapsed_sec // 30,
                     # Vision narration changes should also break the dedupe
                     "vision_n": _vision_narration[:60] if _vision_narration else "",
+                    # Without progress_label + tool_uses, transitions like
+                    # "Reading source 3" → "Reading source 4" with no text-len /
+                    # source delta get suppressed and starve the watchdog.
+                    "progress_label": (progress.get("progress", "") or "")[:80],
+                    "tool_uses_len": len(progress.get("tool_uses", []) or []),
                 }, sort_keys=True)
-                if _last_progress.get(label) != progress_key:
-                    _last_progress[label] = progress_key
+                # Phase prefix: _last_progress is process-global, so without
+                # it a P1 entry could dedupe a P2 emit with the same key.
+                _dedupe_key = f"p{phase}:{label}"
+                if _last_progress.get(_dedupe_key) != progress_key:
+                    _last_progress[_dedupe_key] = progress_key
                     expected_min = get_expected_minutes(phase)
                     # Loosen ET gate: P1 brief mode (Pro + Extended Thinking, NOT
                     # Deep Research) returns status="idle" pre-stream because
@@ -7586,16 +8026,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 await asyncio.sleep(5)
                 continue
 
-            # After 2 consecutive "not generating" — warn user + ask CUA to verify
+            # After 2 consecutive "not generating" — ask CUA to verify
             if not cua_checked and browser and cua_client:
                 agent_key = normalize_agent_key(label)
-                emit_event("agent_warning", phase=phase, agent=agent_key,
-                    severity="stuck",
-                    message=f"DOM indicates not generating after {int(time.time() - wait_start)}s — CUA checking visually",
-                    elapsedSec=int(time.time() - wait_start),
-                    suggestion="CUA will verify the actual page state",
-                    actions=["skip", "stop"])
-                log(f"[{label}] DOM says not generating — scrolling to bottom + asking CUA to confirm...")
+                log(f"[{label}] DOM says not generating after {int(time.time() - wait_start)}s — scrolling + CUA visual confirm...")
                 await browser.switch_to_page(page)
                 try:
                     await page.evaluate("""() => {
@@ -8017,6 +8451,85 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             except Exception as _e:
                 log(f"[{name}] Inline share-link errored ({_e}) "
                     f"— falling back to conversation URL silently", "INFO")
+        # ── Step 4b — Inline CUA share fallback (Gemini/Claude only) ──
+        # If the DOM-tier extractor didn't return a verified public URL,
+        # try CUA on the same page (no tab switch, no revisit). Wrapped in
+        # _shadow_observed_cua so Vision (tier-2 shadow) observes in
+        # parallel and Track A telemetry accumulates on the new "p2-share"
+        # hotspot. ChatGPT is excluded here — extract_share_link_chatgpt
+        # already runs its own CUA pass internally (research.py:3340-3379)
+        # and is wrapped in shadow at that site, so a second pass would
+        # double the budget without new information.
+        if (not share_verified) and cua_client and n_chars > 0 and name != "ChatGPT":
+            cua_share_prompt = {
+                "Gemini": PROMPT_SHARE_GEMINI,
+                "Claude": PROMPT_PUBLISH_CLAUDE,
+            }.get(name)
+            if cua_share_prompt:
+                try:
+                    emit_event("tier_transition", phase=2, agent=agent_key,
+                               op="p2_share_extract", from_tier="dom",
+                               to_tier="cua",
+                               reason="dom_share_extractor_unverified")
+                except Exception:
+                    pass
+                _cua_t0 = time.time()
+                async def _p2_share_cua():
+                    return await asyncio.wait_for(
+                        agent_loop(cua_client, browser, cua_share_prompt,
+                            f"Make this {name} conversation shareable and get the link.",
+                            model=CUA_MODEL, max_iterations=10, verbose=verbose,
+                            target_page=page),
+                        timeout=75.0)
+                try:
+                    await _shadow_observed_cua(
+                        page, hotspot_id="p2-share", phase=2, platform=agent_key,
+                        current_step="open_share_menu_and_create_link",
+                        context_hint=f"P2 inline share fallback for {name}",
+                        expected_outcome="public-share URL on clipboard or visible in modal",
+                        cua_coro_factory=_p2_share_cua)
+                    # After CUA acted, recover the URL from clipboard / current URL.
+                    cand = ""
+                    try:
+                        cand = await asyncio.wait_for(
+                            page.evaluate("navigator.clipboard.readText()"),
+                            timeout=2.0)
+                    except (asyncio.TimeoutError, Exception):
+                        cand = ""
+                    if not (cand and "http" in cand and len(cand) < 500
+                            and validate_link(agent_key, cand)):
+                        try:
+                            cand2 = await asyncio.wait_for(
+                                asyncio.to_thread(get_clipboard),
+                                timeout=3.0)
+                            if cand2 and validate_link(agent_key, cand2):
+                                cand = cand2
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+                    if not (cand and validate_link(agent_key, cand)):
+                        try:
+                            cand3 = await browser.current_url() or ""
+                            if cand3 and validate_link(agent_key, cand3):
+                                cand = cand3
+                        except Exception:
+                            pass
+                    if cand and validate_link(agent_key, cand):
+                        share_url = cand
+                        share_kind = "public"
+                        share_verified = True
+                        share_label = f"{name} public share"
+                        log(f"[{name}] CUA share-link extracted "
+                            f"({time.time() - _cua_t0:.1f}s): {share_url[:80]}")
+                    else:
+                        log(f"[{name}] CUA share-link unverified "
+                            f"({time.time() - _cua_t0:.1f}s) — keeping "
+                            f"conversation URL", "INFO")
+                except asyncio.TimeoutError:
+                    log(f"[{name}] CUA share-link timed out (75s) — "
+                        f"keeping conversation URL", "INFO")
+                except Exception as _ce:
+                    log(f"[{name}] CUA share-link errored ({_ce}) — "
+                        f"keeping conversation URL", "INFO")
         # Stash for Phase 5 — agent_chat_urls already has the conversation URL,
         # but agent_share_urls carries kind/verified so the Doc builder can
         # decide whether to label "Public share" or "Conversation".
@@ -8081,16 +8594,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         if not agent["verified"]:
             log(f"[{name}] verify_{name.lower()}_generating returned False but page exists — "
                 f"keeping in round-robin (detectors will decide).", "WARN")
-            try:
-                emit_event("pipeline_warning", phase=2, agent=name.lower().replace(" ", ""),
-                           message=f"{name} verification uncertain — continuing to poll",
-                           details=(f"The DOM verifier couldn't confirm {name} is generating, but "
-                                    "the tab is open. Playwright + CUA detectors will monitor it "
-                                    "alongside the other agents. If nothing surfaces, the 90-min "
-                                    "hard timeout will release it."),
-                           alertType="warn")
-            except Exception:
-                pass
+            # No alert: the round-robin keeps polling and the wall-clock
+            # cap is what eventually surfaces fail_agent if no output.
         # Use research_started_at if available (e.g., Gemini waits for "Start research")
         # so elapsed/MIN_WAIT are computed from actual research start, not submission.
         _research_t = agent.get("research_started_at", time.time())
@@ -8136,6 +8641,29 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
 
     while pending:
         _tick_counter += 1
+        # ── Browser-crash sweep (per-tick, before any per-agent work) ──
+        # If any pending agent's tab crashed since the last tick, fail it
+        # via Template B and drop it from pending so the rotation isn't
+        # starved waiting on a dead handle.
+        for _crash_name in list(pending.keys()):
+            _crash_p = pending.get(_crash_name) or {}
+            _crash_page = _crash_p.get("page")
+            try:
+                _crashed = bool(_crash_page is None or _crash_page.is_closed())
+            except Exception:
+                _crashed = True
+            if _crashed:
+                _crash_key = normalize_agent_key(_crash_name)
+                log(f"[{_crash_name}] Browser tab crashed — failing agent", "WARN")
+                fail_agent(_crash_key,
+                           "Browser tab crashed",
+                           "The agent's browser tab closed unexpectedly. Retry to relaunch.")
+                results[_crash_name] = {"status": "browser_crashed", "text": "",
+                                        "url": _crash_p.get("url", ""),
+                                        "page": None,
+                                        "elapsed_sec": int(time.time() - _crash_p.get("start_time", time.time()))}
+                del pending[_crash_name]
+                continue
         # ── Stop/Pause check via asyncio Events ──
         if _controls.is_stop() or _controls.is_pause():
             is_stop = _controls.is_stop()
@@ -8328,23 +8856,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # fall through to soft retry (follow-up in same tab) instead
             # of looping forever through expensive tab restarts.
             if _hard_count > 2:
-                try:
-                    emit_event("pipeline_warning", phase=2, agent=_agent_key,
-                               message=f"{_agent_name} hit the 2-hard-retry cap — queuing a soft retry instead",
-                               details="Hard retry opens a fresh tab and resubmits the brief. Two attempts have already failed. Continuing with a soft follow-up in the existing tab; use Skip to drop the agent entirely.",
-                               alertType="warn")
-                except Exception:
-                    pass
+                log(f"[{_agent_name}] Hard retry cap hit — queuing soft retry", "WARN")
                 _controls.retry_agents.add(_agent_key)
                 continue
             log(f"[{_agent_name}] Hard retry #{_hard_count} — closing tab, re-running setup", "WARN")
-            try:
-                emit_event("pipeline_warning", phase=2, agent=_agent_key,
-                           message=f"Hard-retrying {_agent_name} — reopening tab and resubmitting brief",
-                           details=f"Attempt {_hard_count}/2. Any partial output in the closed tab is discarded.",
-                           alertType="retrying")
-            except Exception:
-                pass
             # Resolve the brief from runtime state (populated before Phase 2 kicks
             # off at line ~10050: `_runtime.original_inputs = {..., 'brief': ...}`).
             _brief_text_hr = _runtime.original_inputs.get("brief") or ""
@@ -8368,11 +8883,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _brief_text_hr, _brief_path_hr, verbose)
             except Exception as _e:
                 log(f"[{_agent_name}] Hard retry setup crashed: {_e}", "ERROR")
-                try:
-                    emit_event("pipeline_error", phase=2, agent=_agent_key,
-                               error=f"Hard retry failed: {_e}")
-                except Exception:
-                    pass
+                fail_agent(_agent_key, "Hard retry failed", str(_e)[:200])
                 del pending[_agent_name]
                 results[_agent_name] = {"status": "hard_retry_failed", "text": "",
                                          "url": "", "page": None, "elapsed_sec": 0}
@@ -8436,13 +8947,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 log(f"[{_agent_name}] Hard retry successful ✓")
             else:
                 log(f"[{_agent_name}] Hard retry tab opened but not verified yet — polling will re-check", "WARN")
-                try:
-                    emit_event("pipeline_warning", phase=2, agent=_agent_key,
-                               message=f"{_agent_name} reopened but not verified yet",
-                               details="The new tab loaded and the brief was resubmitted, but generation verification didn't land within the window. The round-robin will keep polling; verification often completes a few seconds later.",
-                               alertType="warn")
-                except Exception:
-                    pass
 
         # Rotate iteration order so no agent is always "first". With 3
         # agents, the order cycles A→B→C, B→C→A, C→A→B, A→B→C, ensuring
@@ -8495,27 +8999,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
                 _sources_note = f"{partial_sources} sources, " if partial_sources else ""
-                try:
-                    emit_event("pipeline_warning", phase=2, agent=agent_key_to,
-                               message=f"{name} timed out after {max_wait_min} min — {_sources_note}{partial_len} chars extracted",
-                               details=("The agent exceeded its research budget. "
-                                        "Retry sends a 'finish + regenerate' follow-up (adds ~15 min). "
-                                        "Wait grants another 15 min without nudging the agent. "
-                                        "Skip drops this agent entirely; others proceed."),
-                               alertType="warn",
-                               actions=[
-                                   {"id": "retry", "label": "Retry",
-                                    "style": "primary",
-                                    "command": {"action": "retry_agent", "agent": agent_key_to}},
-                                   {"id": "wait", "label": "Wait",
-                                    "style": "default",
-                                    "command": {"action": "wait_longer_agent", "agent": agent_key_to}},
-                                   {"id": "skip", "label": "Skip",
-                                    "style": "default",
-                                    "command": {"action": "skip_agent", "agent": agent_key_to}},
-                               ])
-                except Exception:
-                    pass
+                fail_agent(agent_key_to,
+                           f"{name} timed out after {max_wait_min} min — {_sources_note}{partial_len} chars extracted",
+                           ("The agent exceeded its research budget. "
+                            "Retry re-runs the agent from scratch. Wait grants another 15 min of budget. "
+                            "Skip drops this agent; others proceed."),
+                           include_wait=True)
                 # Wait up to 5 min for decision. Default (timeout) = wait_longer
                 # — keep polling rather than silently accepting partial output.
                 decision = await _controls.await_agent_decision(agent_key_to, timeout=300.0)
@@ -8529,12 +9018,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # status=skipped_by_user. Don't touch pending here.
                     continue
                 if decision == "retry":
-                    try:
-                        emit_event("pipeline_warning", phase=2, agent=agent_key_to,
-                                   message=f"Retrying {name} — sending follow-up to continue research",
-                                   alertType="retrying")
-                    except Exception:
-                        pass
+                    log(f"[{name}] Retry — sending follow-up to continue research", "INFO")
                     followup = (
                         "Your previous response hit our time budget. Please continue the research "
                         "and output the complete, thorough final report now — include every source, "
@@ -8556,12 +9040,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if decision in ("wait_longer", "timeout"):
                     # User picked "Wait" (or auto-default timeout) — grant
                     # another 15 min without pinging the agent. Keep polling.
-                    try:
-                        emit_event("pipeline_warning", phase=2, agent=agent_key_to,
-                                   message=f"Extending {name}'s budget by 15 min — still waiting for completion",
-                                   alertType="retrying")
-                    except Exception:
-                        pass
+                    log(f"[{name}] Extending budget by 15 min — still waiting for completion", "INFO")
                     p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
                     continue
                 # Legacy 'continue_partial' only — no button surfaces this
@@ -8595,23 +9074,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if expired:
                     log(f"[{name}] Session expired mid-run ({reason}) — confirmed by 2 consecutive checks", "WARN")
                     p["session_expiry_hits"] = 0  # reset for next time
-                    try:
-                        emit_event("pipeline_error", phase=2, agent=agent_key_auth,
-                                   error=f"{name} session expired mid-run — re-authenticate in the browser and tap Retry",
-                                   details=(f"The {name} tab drifted to a login page ({reason}). "
-                                            "This usually means your session cookie expired or the platform "
-                                            "forced a re-auth. Log in again in the browser on your PC, then "
-                                            "hit Retry. Skip drops this agent."),
-                                   actions=[
-                                       {"id": "retry", "label": "I've logged in — Retry",
-                                        "style": "primary",
-                                        "command": {"action": "retry_agent", "agent": agent_key_auth}},
-                                       {"id": "skip", "label": "Skip agent",
-                                        "style": "default",
-                                        "command": {"action": "skip_agent", "agent": agent_key_auth}},
-                                   ])
-                    except Exception:
-                        pass
+                    fail_agent(agent_key_auth,
+                               f"{name} session expired mid-run",
+                               (f"The {name} tab drifted to a login page ({reason}). "
+                                "Log in again in the browser, then Retry. Skip drops this agent."))
                     # Block this agent's polling until user decides. Other
                     # agents keep polling (they don't hit this await).
                     auth_decision = await _controls.await_agent_decision(agent_key_auth, timeout=1800.0)
@@ -8704,8 +9170,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                     existing = progress.get(key, []) or []
                                     merged = list(dict.fromkeys(existing + artifact_data[key]))
                                     progress[key] = merged
-                            if artifact_data.get("sources", 0) > progress.get("sources", 0):
-                                progress["sources"] = artifact_data["sources"]
+                            # Invariant: progress["sources"] == len(progress["source_urls"]).
+                            # Without this, the merge can grow source_urls past
+                            # artifact_data's count, leaving the chip stuck at
+                            # the smaller number while the URL list is longer.
+                            progress["sources"] = len(progress.get("source_urls", []) or [])
                             if artifact_data.get("partial_text_len", 0) > progress.get("partial_text_len", 0):
                                 progress["partial_text_len"] = artifact_data["partial_text_len"]
                             progress["artifact_count"] = artifact_data.get("artifact_count", 0)
@@ -8772,6 +9241,20 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         log("[Claude] CUA tier-3 timed out after 120s", "WARN")
                     except Exception as _ce:
                         log(f"[Claude] CUA tier-3 failed: {_ce}", "WARN")
+
+            # ── Block 1b: inject MutationObserver INSIDE DR iframe ──
+            # Host-page observer cannot see cross-origin iframe content;
+            # without this, partial_text_len flatlines while DR streams.
+            # Off by default — opt in via DG_CHATGPT_IFRAME_OBSERVER=1.
+            # Retried each cycle until iframe exists (returns False if not yet).
+            if (name == "ChatGPT"
+                    and os.environ.get("DG_CHATGPT_IFRAME_OBSERVER", "0") == "1"
+                    and not p.get("iframe_observer_injected")):
+                try:
+                    if await inject_chatgpt_dr_iframe_observer(p["page"]):
+                        p["iframe_observer_injected"] = True
+                except Exception as _ioe:
+                    log(f"[ChatGPT] iframe observer inject failed: {_ioe}", "WARN")
 
             # ChatGPT activity-strip open — DOM tier-1 → CUA tier-3 fallback.
             # Strip rendered as styled <div> at bottom of chat thread reading
@@ -8870,6 +9353,116 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     except Exception as _ce:
                         log(f"[ChatGPT] CUA tier-3 failed: {_ce}", "WARN")
 
+            # ── Block 2: per-agent vision narration (P2 mirror of P1) ──
+            # Same cooldown (90s) + budget (30/phase) enforced inside
+            # gemini_narrate. Two triggers: (a) DOM walker is empty past
+            # 60s warmup, or (b) every Nth poll for a fresh narration even
+            # when DOM IS producing data. Continuous narration throughout
+            # the phase — not one-shot at end.
+            _elapsed_sec_now = int(time.time() - p["start_time"])
+            _vn_steps_n = len(progress.get("steps", []) or [])
+            _vn_progress_str = (progress.get("progress") or "").strip()
+            _vn_sources = int(progress.get("sources", 0) or 0)
+            _vn_should_call = (
+                _elapsed_sec_now > 60
+                and _vn_steps_n < 2
+                and _vn_sources == 0
+            )
+            _vn_force_every_n = int(os.environ.get("GEMINI_NARRATE_FORCE_EVERY_N", "4"))
+            if _vn_force_every_n > 0 and _elapsed_sec_now > 0:
+                try:
+                    _poll_interval = max(int(POLL_DEEP_RESEARCH), 1)
+                except Exception:
+                    _poll_interval = 30
+                _poll_tick = _elapsed_sec_now // _poll_interval
+                if _poll_tick > 0 and _poll_tick % _vn_force_every_n == 0:
+                    _vn_should_call = True
+            _vision_narration_p2 = ""
+            if _vn_should_call:
+                _vision_data_p2 = None
+                try:
+                    import gemini_narrate as _vn
+                    _vision_data_p2 = await _vn.narrate_panel(
+                        p["page"],
+                        agent=normalize_agent_key(name),
+                        phase=2,
+                        workflow_name=name,
+                        last_dom_progress=_vn_progress_str,
+                        last_dom_sources=_vn_sources,
+                        last_dom_steps_n=_vn_steps_n,
+                    )
+                except Exception as _vne:
+                    log(f"[{name}] gemini_narrate failed: {_vne}", "DEBUG")
+                    _vision_data_p2 = None
+                if _vision_data_p2 and float(_vision_data_p2.get("confidence", 0)) >= 0.4:
+                    _vision_narration_p2 = _vision_data_p2.get("narration", "")
+                    _v_progress = _vision_data_p2.get("progress", "")
+                    if _v_progress and len(_v_progress) > len(_vn_progress_str):
+                        progress["progress"] = _v_progress
+                    _v_steps = _vision_data_p2.get("steps") or []
+                    if _v_steps:
+                        _seen = set(s[:80] for s in (progress.get("steps") or []))
+                        _merged = list(progress.get("steps") or [])
+                        for s in _v_steps:
+                            k = s[:80]
+                            if k not in _seen:
+                                _seen.add(k); _merged.append(s)
+                        progress["steps"] = _merged[-15:]
+                    if (not progress.get("sections")) and _vision_data_p2.get("sections"):
+                        progress["sections"] = _vision_data_p2["sections"]
+                    # Vision-derived source-count estimate kept SEPARATE from
+                    # progress["sources"] (URL-derived) per Group B fix.
+                    _so = int(_vision_data_p2.get("sources_observed") or 0)
+                    if _so > 0:
+                        progress["observed_sources"] = _so
+                    log(f"[{name}] gemini_narrate hit: phase_signal={_vision_data_p2.get('phase_signal')} "
+                        f"conf={_vision_data_p2.get('confidence',0):.2f} steps+={len(_v_steps)} "
+                        f"narration=\"{_vision_narration_p2[:80]}\"", "INFO")
+                    # Emit agent_narration so PhaseDropdown agent card updates
+                    # mid-phase (the dedicated event stream Block 6 wired up).
+                    if _vision_narration_p2:
+                        try:
+                            emit_event("agent_narration", phase=2,
+                                       agent=normalize_agent_key(name),
+                                       text=_vision_narration_p2[:140])
+                        except Exception as _en:
+                            log(f"[{name}] agent_narration emit failed: {_en}", "DEBUG")
+
+            # ── Block 3: vision-extract source URLs from side panel ──
+            # One-shot per agent. Gated on panel-open success so screenshot
+            # has real content. Supplements DOM scraping when URLs are in
+            # collapsed rows / popovers / non-anchor click handlers.
+            # Disabled by setting DG_VISION_URL_EXTRACT=0.
+            if (os.environ.get("DG_VISION_URL_EXTRACT", "1") == "1"
+                    and not p.get("vision_urls_done")):
+                _gate_ok = (
+                    (name == "ChatGPT" and p.get("chatgpt_activity_panel_open"))
+                    or (name == "Claude" and p.get("artifact_panel_open"))
+                    or (name == "Gemini" and elapsed > 120)
+                )
+                if _gate_ok:
+                    try:
+                        _vu = await extract_source_urls_via_vision(
+                            p["page"], normalize_agent_key(name),
+                            last_dom_count=int(progress.get("sources", 0) or 0))
+                        if _vu:
+                            existing = progress.get("source_urls") or []
+                            seen_v = set(existing)
+                            unioned_v = list(existing)
+                            for u in _vu:
+                                if u not in seen_v:
+                                    seen_v.add(u); unioned_v.append(u)
+                            if len(unioned_v) > len(existing):
+                                progress["source_urls"] = unioned_v[:50]
+                                progress["sources"] = len(progress["source_urls"])
+                                log(f"[{name}] vision-urls extracted {len(_vu)} URLs "
+                                    f"(DOM had {len(existing)}, union now "
+                                    f"{len(progress['source_urls'])})", "INFO")
+                        p["vision_urls_done"] = True
+                    except Exception as _vue:
+                        log(f"[{name}] vision-urls failed: {_vue}", "WARN")
+                        p["vision_urls_done"] = True  # don't retry on failure
+
             # Emit agent_progress to frontend (critical for real-time UI)
             agent_key = normalize_agent_key(name)
             # If scrape failed we don't know the agent's real status — keep
@@ -8897,7 +9490,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # These gates avoid false alarms on agents mid-research (planning
             # phases are often 10+ min with no text growth but active sources).
             agent_key_stuck = normalize_agent_key(name)
-            _src_count = int(progress.get("sources", 0) or 0)
+            # observed_sources (Claude text count, ChatGPT vision count)
+            # captures growth that URL extraction can't see. Treat as
+            # liveness signal so the stall watchdog doesn't false-fire
+            # during URL-light progress.
+            _src_count = max(
+                int(progress.get("sources", 0) or 0),
+                int(progress.get("observed_sources", 0) or 0),
+            )
             p.setdefault("last_growth_len", 0)
             p.setdefault("last_growth_sources", 0)
             p.setdefault("last_growth_time", p["start_time"])
@@ -8914,27 +9514,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # signal, at least 120s since last warn (avoid spam on dedup miss).
             if elapsed > 1200 and no_growth_secs > 1200 and since_warn > 900 and not status_is_active:
                 p["stuck_warned_at"] = time.time()
-                try:
-                    emit_event("pipeline_warning", phase=2, agent=agent_key_stuck,
-                               message=f"{name} stalled — no text or source growth for {int(no_growth_secs/60)} min (currently {_partial_text_len} chars, {_src_count} sources)",
-                               details=("The agent's output hasn't grown in a while. "
-                                        "Retry sends a 'please continue' follow-up. "
-                                        "Wait grants another 15 min of budget. "
-                                        "Skip drops this agent."),
-                               alertType="warn",
-                               actions=[
-                                   {"id": "retry", "label": "Retry",
-                                    "style": "primary",
-                                    "command": {"action": "poke_agent", "agent": agent_key_stuck}},
-                                   {"id": "wait", "label": "Wait",
-                                    "style": "default",
-                                    "command": {"action": "wait_longer_agent", "agent": agent_key_stuck}},
-                                   {"id": "skip", "label": "Skip",
-                                    "style": "default",
-                                    "command": {"action": "skip_agent", "agent": agent_key_stuck}},
-                               ])
-                except Exception:
-                    pass
+                fail_agent(agent_key_stuck,
+                           (f"{name} stalled — no growth for {int(no_growth_secs/60)} min "
+                            f"(currently {_partial_text_len} chars, {_src_count} sources)"),
+                           ("The agent's output hasn't grown in a while. "
+                            "Retry re-runs the agent from scratch. Wait grants another 20 min of no-growth budget. "
+                            "Skip drops this agent."),
+                           include_wait=True)
                 # Non-blocking: we don't await here since other agents are
                 # still healthy. The command bus applies the user's choice
                 # asynchronously — check on next tick.
@@ -8942,9 +9528,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if _controls.consume_poke_agent(agent_key_stuck):
                 log(f"[{name}] User poked — sending 'please continue' follow-up")
                 try:
-                    emit_event("pipeline_warning", phase=2, agent=agent_key_stuck,
-                               message=f"Poking {name} — sending 'please continue' prompt",
-                               alertType="retrying")
                     await browser.switch_to_page(p["page"])
                     await paste_followup(p["page"], "Please continue — output the rest of your research.",
                                          name.lower(), label=f"{name}-poke")
@@ -8952,7 +9535,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] Poke failed: {_e}", "WARN")
                 p["last_growth_time"] = time.time()
             if _controls.consume_wait_longer_agent(agent_key_stuck):
-                log(f"[{name}] User granted 10 more minutes")
+                log(f"[{name}] User granted another 20 min of no-growth budget")
                 p["last_growth_time"] = time.time()
 
             # Dedup: only emit when something meaningful changed (status / sources /
@@ -8966,9 +9549,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "steps_len": len(progress.get("steps", []) or []),
                 # Coarse elapsed bucket so slow-moving scrapes still re-emit occasionally
                 "elapsed_bucket": elapsed_sec // 30,
+                # Without progress_label + tool_uses, transitions like
+                # "Reading source 3" → "Reading source 4" with no text-len /
+                # source delta get suppressed and starve the watchdog.
+                "progress_label": (_progress_val or "")[:80],
+                "tool_uses_len": len(progress.get("tool_uses", []) or []),
             }, sort_keys=True)
-            if _last_progress.get(agent_key) != progress_key:
-                _last_progress[agent_key] = progress_key
+            # Phase prefix: _last_progress is process-global, so without it
+            # a P1 entry could dedupe a P2 emit with the same key.
+            _dedupe_key = f"p2:{agent_key}"
+            if _last_progress.get(_dedupe_key) != progress_key:
+                _last_progress[_dedupe_key] = progress_key
                 emit_event("agent_progress", phase=2, agent=agent_key,
                     status=_status_val or "generating",
                     progress=_progress_val,
@@ -9087,18 +9678,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     p["flat_history"] = []
                     p["done_marker_first_at"] = 0.0
                     if p["extraction_attempts"] >= 3:
-                        emit_event("pipeline_error", phase=2, agent=agent_key,
-                                   error=f"{name} extraction failed after 3 confirmed-done attempts",
-                                   details=(f"The Playwright detector confirmed {name} was done, "
-                                            "but 3 extraction attempts returned no content. "
-                                            "Retry runs the extraction pipeline again. "
-                                            "Skip drops this agent from the results."),
-                                   actions=[
-                                       {"id": "retry", "label": "Retry extraction",
-                                        "style": "primary"},
-                                       {"id": "skip",  "label": "Skip agent",
-                                        "style": "default"},
-                                   ])
+                        fail_agent(agent_key,
+                                   f"{name} extraction failed after 3 confirmed-done attempts",
+                                   ("Playwright confirmed done, but 3 extraction attempts returned "
+                                    "no content. Retry re-runs extraction; Skip drops this agent."))
                         decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
                         log(f"[{name}] Extraction-failed decision: {decision}")
                         if decision == "retry":
@@ -9431,21 +10014,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     continue
                 # 3 empty extractions — ask the user.
                 ag_key_empty = name.lower().replace(" ", "")
-                try:
-                    emit_event("pipeline_warning", phase=2, agent=ag_key_empty,
-                               message=f"{name} finished but no readable text was extracted",
-                               details=("CUA says the agent is done, but 3 extraction attempts came "
-                                        "back empty. Retry sends a follow-up asking for the complete "
-                                        "report. Skip drops this agent and proceeds with the others."),
-                               alertType="warn",
-                               actions=[
-                                   {"id": "retry", "label": "Retry", "style": "primary",
-                                    "command": {"action": "retry_agent", "agent": ag_key_empty}},
-                                   {"id": "skip", "label": "Skip", "style": "default",
-                                    "command": {"action": "skip_agent", "agent": ag_key_empty}},
-                               ])
-                except Exception:
-                    pass
+                fail_agent(ag_key_empty,
+                           f"{name} finished but no readable text was extracted",
+                           ("CUA says the agent is done, but 3 extraction attempts came back empty. "
+                            "Retry runs the agent fresh; Skip drops this agent."))
                 empty_decision = await _controls.await_agent_decision(ag_key_empty, timeout=300.0)
                 log(f"[{name}] Empty-final user decision: {empty_decision}")
                 if empty_decision == "stop":
@@ -9459,9 +10031,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "No preamble or post-amble."
                     )
                     try:
-                        emit_event("pipeline_warning", phase=2, agent=ag_key_empty,
-                                   message=f"Retrying {name} — asking for the complete report",
-                                   alertType="retrying")
                         await browser.switch_to_page(p["page"])
                         await paste_followup(p["page"], followup, name.lower(), label=f"{name}-retry-empty")
                     except Exception as e:
@@ -10464,16 +11033,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
     if not verified:
         log("Phase 1: Could not verify ChatGPT is generating", "ERROR")
-        # Most common cause: ChatGPT threw a "Something went wrong" banner
-        # mid-submission or the Pro+Thinking model hit an internal error.
-        # Surface a clear message so the user knows it wasn't a silent hang.
-        try:
-            emit_event("pipeline_warning", phase=1, agent="chatgpt",
-                       message="ChatGPT didn't start generating the brief",
-                       details="After submit, no streaming response was detected. Most likely ChatGPT's Pro + Thinking model threw an error or the Send click didn't land. The orchestrator will retry up to 2 more times.",
-                       alertType="warn")
-        except Exception:
-            pass
+        # No alert: orchestrator's outer retry loop handles re-attempts; if
+        # it exhausts retries, fail_phase fires upstream.
         return None
 
     # Register brief page with dispatcher for mid-run user input.
@@ -10495,28 +11056,13 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # case; this emit just explains the timeout.
     if not completed:
         retries_left_p1t = max(0, 2 - _retry_count)
-        p1t_actions = []
+        fail_phase(1,
+                   f"Brief generation timed out after {MAX_WAIT_PRO} min",
+                   "ChatGPT Pro + Thinking was still running at the wall-clock cap. Retry re-submits a fresh brief request. Skip drops Phase 1 and asks for a manual brief.",
+                   agent="chatgpt",
+                   can_retry=retries_left_p1t > 0)
         if retries_left_p1t > 0:
-            p1t_actions.append({
-                "id": "retry", "label": f"Retry brief ({retries_left_p1t} left)",
-                "style": "primary",
-                "command": {"action": "retry_phase", "phase": 1},
-            })
-        p1t_actions.append({
-            "id": "continue_anyway", "label": "Continue with partial",
-            "style": "default" if retries_left_p1t > 0 else "primary",
-            "command": {"action": "continue_anyway"},
-        })
-        try:
-            emit_event("pipeline_warning", phase=1, agent="chatgpt",
-                       message=f"Brief generation timed out after {MAX_WAIT_PRO} min",
-                       details=f"ChatGPT's Pro + Thinking model was still running at the {MAX_WAIT_PRO}-minute cap. Retry re-submits a fresh brief request. Continue with partial extracts whatever text streamed so far and proceeds to Phase 2.",
-                       alertType="warn",
-                       actions=p1t_actions)
-        except Exception:
-            pass
-        if retries_left_p1t > 0:
-            p1t_decision = await _controls.await_retry_or_continue(phase=1, timeout=600.0)
+            p1t_decision = await _controls.await_phase_decision(1)
             log(f"Phase 1 brief-timeout decision: {p1t_decision}")
             if p1t_decision == "stop":
                 return None
@@ -10531,7 +11077,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 return await run_phase1(browser, cua_client, topic, pdf_paths,
                                         verbose=verbose, feedback=feedback,
                                         _retry_count=_retry_count + 1)
-            # continue_anyway / timeout → fall through and extract partial
+            # skip / timeout → fall through and extract whatever streamed
 
     # ── Mid-Phase-1 injection: if user sent context while brief was generating,
     #    submit it as a follow-up to ChatGPT and wait for the updated brief ──
@@ -10579,28 +11125,14 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     P1_MAX_USER_RETRIES = 2  # total attempts = 1 + P1_MAX_USER_RETRIES
     if brief_text and brief_len >= 100 and brief_len < 500:
         retries_left = max(0, P1_MAX_USER_RETRIES - _retry_count)
-        retry_label = f"Retry Phase 1 ({retries_left} left)" if retries_left > 0 else None
-        actions = []
+        fail_phase(1,
+                   f"Brief looks short ({brief_len} chars) — expected >1000",
+                   "ChatGPT returned a brief well below typical length. Retry regenerates from scratch.",
+                   agent="chatgpt",
+                   can_retry=retries_left > 0)
+        # Wait for the user's decision via the standard phase-decision bus.
         if retries_left > 0:
-            actions.append({"id": "retry", "label": retry_label,
-                            "style": "primary",
-                            "command": {"action": "retry_phase", "phase": 1}})
-        actions.append({"id": "continue_anyway", "label": "Continue anyway",
-                        "style": "default" if retries_left > 0 else "primary",
-                        "command": {"action": "continue_anyway"}})
-        try:
-            emit_event("pipeline_warning", phase=1, agent="chatgpt",
-                       message=f"Brief looks short ({brief_len} chars) — expected >1000",
-                       details="ChatGPT returned a brief well below typical length. Retry regenerates the brief from scratch — Phase 2 waits until the new brief is ready, then runs with the better version. Continue anyway uses what we have.",
-                       alertType="warn",
-                       actions=actions)
-        except Exception:
-            pass
-        # Wait for the user's decision. 10 min window — if they ignore the
-        # banner we default to continuing with the short brief rather than
-        # hanging the pipeline indefinitely.
-        if retries_left > 0:
-            decision = await _controls.await_retry_or_continue(phase=1, timeout=600.0)
+            decision = await _controls.await_phase_decision(1)
             log(f"Phase 1 brief-short decision: {decision}")
             if decision == "stop":
                 return None
@@ -11385,11 +11917,6 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     user_prompt = "Click the single human-verification checkbox if one is visible. Otherwise stop and say 'blocked'."
     try:
         log(f"[{label}] Verification detected ({reason or 'unknown'}) — CUA fallback (3 iter, in place)…")
-        # Dropdown narration: "trying auto-clear (1/2)…" with a spinning badge.
-        emit_event("pipeline_warning", phase=phase, agent=platform_key,
-                   message=f"{label} hit a human-verification challenge — trying auto-clear (attempt 1/2)…",
-                   details=f"Reason: {reason or 'unknown challenge'}. Running CUA first pass.",
-                   alertType="retrying")
         await browser.switch_to_page(page)
         result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
             model=CUA_MODEL, max_iterations=3, verbose=verbose)
@@ -11415,14 +11942,6 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     try:
         original_url = page.url
         log(f"[{label}] CUA fallback retry: blank → 3 min cooldown → reload → CUA (5 iter)…")
-        # Dropdown narration: "cooling down 3 min…" with a spinning badge. The
-        # user knows we haven't given up — we're giving Cloudflare's bot-score
-        # decay more room before retrying. 3 min is conservative; shorter
-        # windows sometimes still got flagged.
-        emit_event("pipeline_warning", phase=phase, agent=platform_key,
-                   message=f"{label} auto-clear 1 didn't work — cooling down 3 min, then retrying…",
-                   details="Cloudflare bot scores decay with time. Giving the session breathing room.",
-                   alertType="retrying")
         try:
             await page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
         except Exception:
@@ -11437,10 +11956,6 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         blocked, _ = await detect_human_verification(page, platform, label)
         if blocked:
             log(f"[{label}] Turnstile still present after cooldown — CUA 5-iter retry")
-            emit_event("pipeline_warning", phase=phase, agent=platform_key,
-                       message=f"{label} still blocked after cooldown — retrying auto-clear (attempt 2/2)…",
-                       details="Running CUA second pass with 5 iterations.",
-                       alertType="retrying")
             await browser.switch_to_page(page)
             await agent_loop(cua_client, browser, sys_prompt, user_prompt,
                 model=CUA_MODEL, max_iterations=5, verbose=verbose)
@@ -11478,10 +11993,6 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     try:
         original_url = page.url
         log(f"[{label}] CUA exhausted — killing the tab and re-opening for a clean slate")
-        emit_event("pipeline_warning", phase=phase, agent=platform_key,
-                   message=f"{label} still blocked — closing & re-opening the tab as a last auto-attempt…",
-                   details="Fresh tab with a clean document context — sometimes defuses a stubborn bot flag.",
-                   alertType="retrying")
         try:
             await page.close()
         except Exception:
@@ -11617,8 +12128,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     if blocked:
         cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
         if not cleared:
-            emit_event("pipeline_error", phase=2, agent=platform_l,
-                       error=f"{platform.capitalize()} human verification unsolved — skipping this agent")
+            fail_agent(platform_l,
+                       f"Couldn't clear human verification for {platform.capitalize()}",
+                       "The human-verification challenge couldn't be cleared. Retry to relaunch the agent; Skip to drop it.")
             return page, False
         # Settle after clearance — page often reloads to the real content
         await asyncio.sleep(2)
@@ -11640,8 +12152,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         if blocked:
             cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
             if not cleared:
-                emit_event("pipeline_error", phase=2, agent=platform_l,
-                           error=f"{platform.capitalize()} human verification unsolved — skipping this agent")
+                fail_agent(platform_l,
+                           f"Couldn't clear human verification for {platform.capitalize()}",
+                           "The human-verification challenge couldn't be cleared. Retry to relaunch the agent; Skip to drop it.")
                 return page, False
             await asyncio.sleep(2)
             # Retry Playwright setup once, now that the challenge is gone
@@ -11665,8 +12178,6 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     cua_ok = await validate_setup_with_cua(browser, cua_client, page, platform, label, verbose)
     if not cua_ok:
         log(f"[{label}] CUA validation failed — proceeding anyway but agent may misbehave", "WARN")
-        emit_event("pipeline_warning", phase=2, agent=platform_l,
-                   message=f"{platform} setup validation failed — agent may not be fully configured")
 
     # ── Brief delivery ──
     # Gemini Deep Research ignores file attachments — it only processes text
@@ -11693,16 +12204,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
             if not paste_ok:
                 log(f"[{label}] CRITICAL: Both attach and paste failed — skipping this agent", "ERROR")
-                emit_event("pipeline_error", phase=2, agent=platform_l,
-                           error="Brief delivery failed (attach + paste)",
-                           actions=[
-                               {"id": "retry", "label": "Retry",
-                                "style": "primary",
-                                "command": {"action": "retry_agent", "agent": platform_l}},
-                               {"id": "skip", "label": "Skip",
-                                "style": "default",
-                                "command": {"action": "skip_agent", "agent": platform_l}},
-                           ])
+                fail_agent(platform_l, "Brief delivery failed",
+                           "Both file-attach and inline paste failed. Retry to relaunch the agent.")
                 return page, False
     else:
         # Gemini always uses paste; legacy path also uses paste
@@ -11725,16 +12228,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 log(f"[{label}] Reload+retry failed: {e}", "WARN")
         if not paste_ok:
             log(f"[{label}] CRITICAL: Brief paste completely failed — skipping this agent", "ERROR")
-            emit_event("pipeline_error", phase=2, agent=platform_l,
-                       error="Brief paste failed — could not inject research text",
-                       actions=[
-                           {"id": "retry", "label": "Retry",
-                            "style": "primary",
-                            "command": {"action": "retry_agent", "agent": platform_l}},
-                           {"id": "skip", "label": "Skip",
-                            "style": "default",
-                            "command": {"action": "skip_agent", "agent": platform_l}},
-                       ])
+            fail_agent(platform_l, "Brief paste failed",
+                       "All paste strategies + reload failed. Retry to relaunch the agent.")
             return page, False
 
     # ── Just-before-send: ensure the required mode is STILL active ──
@@ -11788,24 +12283,10 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         # [Skip agent] so they can course-correct without waiting 60s for the
         # agent to (maybe) start generating.
         ag_key_send = (platform or "").lower() or None
-        try:
-            emit_event("pipeline_warning", phase=2, agent=ag_key_send,
-                       message=f"{label}: Send button required CUA fallback — may not have submitted",
-                       details=("Playwright couldn't find the Send button via DOM selectors, so CUA "
-                                "clicked on what it thought was Send. Retry re-runs the CUA send. "
-                                "Skip drops this agent. If you do nothing, the poll continues assuming "
-                                "the click landed."),
-                       alertType="warn",
-                       actions=[
-                           {"id": "retry", "label": "Retry",
-                            "style": "primary",
-                            "command": {"action": "retry_agent", "agent": ag_key_send}},
-                           {"id": "skip", "label": "Skip",
-                            "style": "default",
-                            "command": {"action": "skip_agent", "agent": ag_key_send}},
-                       ])
-        except Exception:
-            pass
+        # No alert: round-robin proceeds assuming the CUA click landed.
+        # If the agent never produces output, fail_agent surfaces from
+        # the wall-clock or stall path. Avoiding a banner here keeps
+        # the per-agent dropdown clean during normal startup.
         # Wait up to 90s — agent startup is time-sensitive so don't block
         # polling long. Default (timeout) = continue (trust the CUA click).
         if ag_key_send:
@@ -11905,16 +12386,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # forever waiting for events that will never arrive.
             emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
                        progress="ChatGPT setup/paste failed — agent did not start.")
-            emit_event("pipeline_error", phase=2, agent="chatgpt",
-                       error="Failed to start after 2 attempts",
-                       actions=[
-                           {"id": "retry", "label": "Retry",
-                            "style": "primary",
-                            "command": {"action": "retry_agent", "agent": "chatgpt"}},
-                           {"id": "skip", "label": "Skip",
-                            "style": "default",
-                            "command": {"action": "skip_agent", "agent": "chatgpt"}},
-                       ])
+            fail_agent("chatgpt", "ChatGPT failed to start after 2 attempts",
+                       "Setup or brief paste failed twice. Retry to open a fresh tab.")
             try:
                 _controls.skipped_agents.add("chatgpt")
             except Exception:
@@ -11961,16 +12434,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             log("[2B] Claude failed after 2 attempts", "ERROR")
             emit_event("agent_progress", phase=2, agent="claude", status="failed",
                        progress="Claude setup/paste failed — agent did not start.")
-            emit_event("pipeline_error", phase=2, agent="claude",
-                       error="Failed to start after 2 attempts",
-                       actions=[
-                           {"id": "retry", "label": "Retry",
-                            "style": "primary",
-                            "command": {"action": "retry_agent", "agent": "claude"}},
-                           {"id": "skip", "label": "Skip",
-                            "style": "default",
-                            "command": {"action": "skip_agent", "agent": "claude"}},
-                       ])
+            fail_agent("claude", "Claude failed to start after 2 attempts",
+                       "Setup or brief paste failed twice. Retry to open a fresh tab.")
             try:
                 _controls.skipped_agents.add("claude")
             except Exception:
@@ -12063,7 +12528,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                                status=_snap.get("status", "generating"),
                                progress=_progress,
                                sources=_sources,
-                               source_urls=(_snap.get("source_urls", []) or [])[:10],
+                               source_urls=(_snap.get("source_urls", []) or [])[:50],
                                partial_text_len=_partial,
                                steps=_steps[-3:] if _steps else [],
                                thinking=(_snap.get("thinking") or "")[:300])
@@ -12133,7 +12598,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                                status=_gm_status,
                                progress=_gm.get("progress") or "Gemini drafting research plan...",
                                sources=int(_gm.get("sources", 0) or 0),
-                               source_urls=(_gm.get("source_urls", []) or [])[:10],
+                               source_urls=(_gm.get("source_urls", []) or [])[:50],
                                partial_text_len=int(_gm.get("partial_text_len", 0) or 0),
                                steps=(_gm.get("steps") or [])[-3:],
                                plan=(_gm.get("plan") or "")[:500])
@@ -12193,12 +12658,47 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     return results
 
 
-# ── Phase 3: Extract MDs + Shareable Links + NotebookLM Upload ───────────────
+# ── Phase 2 → Phase 3 handoff ────────────────────────────────────────────────
+
+def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
+    """Populate _runtime.p2_links_for_p3 + _runtime.p2_md_files_for_p3 from
+    P2 state (results + _runtime.agent_share_urls + on-disk MDs). Idempotent.
+
+    Called at end of P2 (the canonical population point) and as a no-op
+    safety net at start of P3 (only does real work if _runtime was wiped
+    on a process restart between P2 and P3 — i.e. resume-from-P3 case).
+
+    P2 owns all share-URL extraction (DOM + CUA fallback + vision shadow).
+    P3 just consumes this state and uploads to NotebookLM. No browser
+    activity, no agent re-visits, no CUA in P3.
+    """
+    p3_links: dict[str, str] = {}
+    p3_md_files: list = []
+    for _name, _r in (results or {}).items():
+        _md_name = _name.lower().replace(" ", "") + ".md"
+        _md_path = Path(queue_dir) / "documents" / _md_name
+        _has_md = _md_path.exists() and _md_path.stat().st_size > 100
+        # Prefer the verified public share URL captured in P2's inline
+        # extractor (DOM tier) or CUA fallback. Fall back to the
+        # conversation URL captured at extraction time.
+        _share = _runtime.agent_share_urls.get(_name) or {}
+        _url = _share.get("url") or _r.get("url") or ""
+        if _url:
+            p3_links[_name] = _url
+        if _has_md:
+            p3_md_files.append(_md_path)
+    _runtime.p2_links_for_p3 = p3_links
+    _runtime.p2_md_files_for_p3 = p3_md_files
+    log(f"[Phase 2→3 handoff] {len(p3_links)} links, {len(p3_md_files)} MDs ready for NotebookLM")
+
+
+# ── Phase 3: NotebookLM Upload ───────────────────────────────────────────────
 
 async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose=False):
-    """Phase 3 (step a): Get shareable links + upload MDs to NotebookLM + make public."""
+    """Phase 3: upload P2-built MDs to NotebookLM and make notebook public.
+    Share-URL extraction lives entirely in P2 — this phase is pure NotebookLM."""
     log("=" * 60)
-    log("PHASE 3: Extract Links + NotebookLM Upload")
+    log("PHASE 3: NotebookLM Upload")
     log("=" * 60)
 
     # 2026-04-26: log every MD on disk in queue_dir/documents/ at P3 entry.
@@ -12217,100 +12717,14 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
     except Exception as _de:
         log(f"Phase 3: MD-on-disk audit failed: {_de}", "DEBUG")
 
-    links = {}
-    md_files = []
-
-    # Get shareable links for each platform
-    share_prompts = {
-        "ChatGPT": PROMPT_SHARE_CHATGPT,
-        "Gemini": PROMPT_SHARE_GEMINI,
-        "Claude": PROMPT_PUBLISH_CLAUDE,
-    }
-
-    # Markers for URLs that are already published/shared (extracted in Phase 2 round-robin)
-    _share_url_markers = {
-        "ChatGPT": ["chatgpt.com/share/", "/share/"],
-        "Gemini": ["gemini.google.com/share/", "/share/"],
-        "Claude": ["claude.site/artifacts/", "claude.site/", "/share/"],
-    }
-
-    for name, r in results.items():
-        # Include timeout agents with .md on disk (Phase 2 partial results count)
-        md_name = name.lower().replace(" ", "") + ".md"
-        md_path = Path(queue_dir) / "documents" / md_name
-        has_md = md_path.exists() and md_path.stat().st_size > 100
-        if r["status"] not in ("done", "timeout") and not has_md:
-            if r.get("url"):
-                links[name] = r["url"]
-                log(f"[{name}] Failed — saving chat URL: {r['url'][:60]}")
-            else:
-                log(f"[{name}] Skipping — no content, no URL, no .md on disk")
-            continue
-        if not r.get("text") and not has_md:
-            if r.get("url"):
-                links[name] = r["url"]
-            continue
-
-        page = r.get("page")
-        if not page:
-            links[name] = r.get("url", "")
-            continue
-
-        # Skip re-extraction if Phase 2 already captured a verified share link
-        existing_url = r.get("url", "")
-        markers = _share_url_markers.get(name, [])
-        if existing_url and any(m in existing_url for m in markers):
-            links[name] = existing_url
-            log(f"[{name}] Using Phase-2 share link: {existing_url[:80]}")
-            continue
-
-        # Get shareable link via CUA
-        log(f"[{name}] Getting shareable link...")
-        agent_key = name.lower().replace(" ", "")
-        try:
-            await browser.switch_to_page(page)
-            await asyncio.sleep(2)
-            result = await agent_loop(cua_client, browser, share_prompts.get(name, PROMPT_SHARE_CHATGPT),
-                f"Make this {name} conversation shareable and get the link.",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
-
-            # Try to get the link from clipboard or URL bar
-            await asyncio.sleep(1)
-            clipboard = get_clipboard()
-            current_url = await browser.current_url()
-
-            # Use clipboard if it looks like a URL, else use current URL
-            if clipboard and ("http" in clipboard) and len(clipboard) < 500:
-                links[name] = clipboard
-                log(f"[{name}] Shareable link: {clipboard[:80]}")
-            else:
-                links[name] = current_url
-                log(f"[{name}] Using current URL: {current_url[:80]}")
-            # Emit link immediately — don't wait for phase end
-            emit_validated_link(3, agent_key, links[name], f"{name} Research")
-        except Exception as e:
-            links[name] = r.get("url", "")
-            log(f"[{name}] Link error: {e} — using chat URL", "WARN")
-            if links[name]:
-                emit_event("link_extracted", phase=3, agent=agent_key,
-                           url=links[name], label=f"{name} Research", verified=False)
-            # Surface the extraction failure so the per-agent dropdown in
-            # Phase 3 shows WHY the share link is unverified. Warn (not
-            # error) because we still have the chat URL as a fallback and
-            # Phase 3 proceeds with NotebookLM upload regardless.
-            try:
-                emit_event("pipeline_warning", phase=3, agent=agent_key,
-                           message=f"{name}: couldn't extract verified share link — using chat URL as fallback",
-                           details=f"CUA couldn't get a public share link for this agent. Falling back to the raw chat URL (may require login to view). Error: {str(e)[:150]}",
-                           alertType="warn")
-            except Exception:
-                pass
-
-        # Check MD file exists in queue
-        fname = name.lower().replace(" ", "") + ".md"
-        md_path = queue_dir / "documents" / fname
-        if md_path.exists() and md_path.stat().st_size > 100:
-            md_files.append(md_path)
+    # Hydrate share links + MD files from P2's handoff (built at end of P2).
+    # Resume safety: if _runtime was wiped (process restart between P2 and P3
+    # — e.g. resume-from-P3 path), rebuild handoff state from results + disk.
+    if not _runtime.p2_links_for_p3 and not _runtime.p2_md_files_for_p3:
+        _build_phase2_to_phase3_handoff(results, queue_dir)
+    links: dict[str, str] = dict(_runtime.p2_links_for_p3 or {})
+    md_files: list = list(_runtime.p2_md_files_for_p3 or [])
+    log(f"Phase 3: hydrated {len(links)} share links + {len(md_files)} MDs from P2 handoff")
 
     # Save links
     links_file = queue_dir / "links.json"
@@ -12409,39 +12823,18 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             _low = _err_msg.lower()
             is_login_err = any(k in _low for k in ("login", "signin", "auth", "unauthor"))
             retries_left = max(0, p3_max_retries - p3_attempt)
-            p3_actions = []
-            if retries_left > 0:
-                if is_login_err:
-                    p3_actions.append({
-                        "id": "retry",
-                        "label": f"I've logged in — Retry ({retries_left} left)",
-                        "style": "primary",
-                        "command": {"action": "retry_phase", "phase": 3},
-                    })
-                else:
-                    p3_actions.append({
-                        "id": "retry",
-                        "label": f"Retry upload ({retries_left} left)",
-                        "style": "primary",
-                        "command": {"action": "retry_phase", "phase": 3},
-                    })
-            p3_actions.append({
-                "id": "skip", "label": "Skip NotebookLM",
-                "style": "default" if retries_left > 0 else "primary",
-                "command": {"action": "skip_phase", "phase": 3},
-            })
-            if is_login_err:
-                emit_event("pipeline_error", phase=3, agent="notebooklm",
-                           error=f"NotebookLM login appears expired — re-authenticate in the browser and hit Retry. Details: {_err_msg[:200]}",
-                           actions=p3_actions)
-            else:
-                emit_event("pipeline_error", phase=3, agent="notebooklm",
-                           error=f"NotebookLM upload failed: {_err_msg[:300]}",
-                           actions=p3_actions)
+            _title = ("NotebookLM login expired"
+                      if is_login_err else
+                      f"NotebookLM upload failed: {_err_msg[:200]}")
+            _details = ("Re-authenticate in the browser and Retry."
+                        if is_login_err else
+                        f"{_err_msg[:300]}")
+            fail_phase(3, _title, _details, agent="notebooklm",
+                       can_retry=retries_left > 0)
             # Wait up to 10 min for user decision. Retry → re-run upload; skip →
             # proceed without NotebookLM; timeout → skip (don't hang pipeline).
             if retries_left > 0:
-                p3_decision = await _controls.await_retry_or_continue(phase=3, timeout=600.0)
+                p3_decision = await _controls.await_phase_decision(3)
                 log(f"Phase 3 upload decision: {p3_decision}")
                 if p3_decision == "stop":
                     break
@@ -12468,10 +12861,6 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                 break
     if not md_files:
         log("No MD files to upload to NotebookLM", "WARN")
-        emit_event("pipeline_warning", phase=3, agent="notebooklm",
-                   message="No research documents to upload to NotebookLM",
-                   details="Phase 2 produced no .md files. NotebookLM needs at least one source. Check Phase 2 dropdowns for agent failures.",
-                   alertType="warn")
 
     return {"links": links, "notebook_url": notebook_url, "md_files": [str(p) for p in md_files]}
 
@@ -12592,7 +12981,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
             # Mid-poll auth check — NotebookLM session can expire during the
             # 45-min audio window. Without this, CUA keeps clicking on a
-            # logged-out page until PHASE_3_AUDIO_MAX_MIN exhausts. URL-only
+            # logged-out page until PHASE_3_MAX_MIN exhausts. URL-only
             # check (no tabs, no CUA) per the P0 sequential pattern.
             try:
                 current_url = (browser.page.url or "").lower()
@@ -12626,6 +13015,15 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             if "audio complete" in diag_text:
                 log("Audio generation complete ✓")
                 audio_done = True
+                # NLM new-Studio sometimes auto-fires a default audio when
+                # the Audio Overview tile is opened to expose the customize
+                # controls. Cleanup runs BEFORE share-link extraction so the
+                # share dialog opens against a single clean Deep Dive entry.
+                try:
+                    cleanup = await _cleanup_nlm_default_audio(browser.page)
+                    log(f"[Phase4] NLM cleanup: {cleanup}")
+                except Exception as _ce:
+                    log(f"[Phase4] NLM cleanup failed: {_ce}", "WARN")
                 break
 
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
@@ -12662,31 +13060,14 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # through the standard skip_phase command; retry restarts generation
         # from scratch.
         retries_left = max(0, p4_max_retries - p4_attempt)
-        p4_actions = []
-        if retries_left > 0:
-            p4_actions.append({
-                "id": "retry", "label": f"Retry audio ({retries_left} left)",
-                "style": "primary",
-                "command": {"action": "retry_phase", "phase": 4},
-            })
-        p4_actions.append({
-            "id": "skip_phase", "label": "Skip audio",
-            "style": "default" if retries_left > 0 else "primary",
-            "command": {"action": "skip_phase", "phase": 4},
-        })
-        try:
-            emit_event("pipeline_warning", phase=4, agent="notebooklm",
-                       message=f"NotebookLM audio generation timed out (45 min cap, attempt {p4_attempt + 1}/{p4_max_retries + 1})",
-                       details=("The audio overview didn't finish within the polling budget. "
-                                "Retry regenerates from scratch. Skip proceeds to Phase 5/6 with "
-                                "the written report + links (no audio, no YouTube)."),
-                       alertType="warn",
-                       actions=p4_actions)
-        except Exception:
-            pass
+        fail_phase(4,
+                   f"NotebookLM audio generation timed out (45 min cap, attempt {p4_attempt + 1}/{p4_max_retries + 1})",
+                   "Retry regenerates from scratch. Skip proceeds with the written report + links only.",
+                   agent="notebooklm",
+                   can_retry=retries_left > 0)
         if retries_left > 0:
             # Wait up to 10 min for user choice. Default = skip (don't hang).
-            p4_decision = await _controls.await_retry_or_continue(phase=4, timeout=600.0)
+            p4_decision = await _controls.await_phase_decision(4)
             log(f"Phase 4 timeout decision: {p4_decision}")
             if p4_decision == "retry":
                 p4_attempt += 1
@@ -12741,15 +13122,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             audio_path = await asyncio.wait_for(download_future, timeout=30)
         except asyncio.TimeoutError:
             log("Download event not received — checking common download dirs...", "WARN")
-            # Warn (not error) — we have a fallback that scans Downloads/.
-            # Only error-emit if the fallback also fails (see below).
-            try:
-                emit_event("pipeline_warning", phase=4, agent="notebooklm",
-                           message="Audio download timed out — scanning Downloads folder for fallback",
-                           details="Playwright's download event didn't fire within 30s. NotebookLM may have downloaded the file via its own handler; we'll check common Downloads locations next.",
-                           alertType="retrying")
-            except Exception:
-                pass
+            # Silent: the Downloads-folder scan below has its own fail_phase
+            # if it also turns up empty.
             # Fallback: scan common download locations
             for dl_dir in [Path.home() / "Downloads", Path("D:/Downloads")]:
                 if not dl_dir.exists():
@@ -12777,16 +13151,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # That's a real error — surface it so the user knows Phase 5 will
         # skip and can decide whether to re-run or accept report-only.
         if not audio_path:
-            try:
-                emit_event("pipeline_error", phase=4, agent="notebooklm",
-                           error="Audio file downloaded by NotebookLM but we couldn't locate it on disk (Playwright event didn't fire and Downloads folder scan found nothing). Phase 5 will be skipped.",
-                           actions=[
-                               {"id": "skip_phase", "label": "Skip audio — proceed to report",
-                                "style": "primary",
-                                "command": {"action": "skip_phase", "phase": 4}},
-                           ])
-            except Exception:
-                pass
+            fail_phase(4, "Audio file not located on disk",
+                       "NotebookLM finished but neither the Playwright download event nor the Downloads scan found the file.",
+                       agent="notebooklm")
 
     # ── Extract NotebookLM Audio Overview shareable link ──
     # Audio overview share: three-dots/menu → Share → Notebook access → public → get link → Save
@@ -12859,10 +13226,19 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 log("[Audio] Public share NOT DOM-verified — audio link may be private", "WARN")
 
             if not audio_overview_url:
-                # Fallback: use current URL
-                current_url = await browser.current_url()
-                if "notebooklm.google.com/notebook" in current_url:
-                    audio_overview_url = current_url
+                # Fallback: NLM emits the same /notebook/{id} URL whether
+                # you click "Share notebook" or the audio's three-dot Share,
+                # so falling back to current_url (or notebook_url) preserves
+                # public-link semantics — only the affordance differs (FE
+                # renders the audio row as a Play button + Open-in-NLM link).
+                try:
+                    current_url = await browser.current_url()
+                    if "notebooklm.google.com/notebook" in current_url:
+                        audio_overview_url = current_url
+                except Exception:
+                    pass
+                if not audio_overview_url and notebook_url:
+                    audio_overview_url = notebook_url
 
             await page.keyboard.press("Escape")  # Close any remaining dialog
             await asyncio.sleep(0.5)
@@ -12899,22 +13275,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # the backend, and Phase 5 can still upload to YouTube from the
             # local file. Warn (not error) if it failed.
             if not audio_url:
-                try:
-                    emit_event("pipeline_warning", phase=4, agent="notebooklm",
-                               message="Firebase Storage upload failed — audio still saved locally",
-                               details="The audio file couldn't be synced to Firebase Storage (used by the Podcasts page on the web app). Local pipeline is unaffected — Phase 5 can still upload to YouTube from the local file.",
-                               alertType="warn")
-                except Exception:
-                    pass
+                log("[Phase4] Firebase Storage upload failed — audio still saved locally", "WARN")
         except Exception as e:
             log(f"Audio Firestore/Storage sync failed: {e}", "WARN")
-            try:
-                emit_event("pipeline_warning", phase=4, agent="notebooklm",
-                           message="Firebase sync failed — audio still saved locally",
-                           details=f"{str(e)[:200]}",
-                           alertType="warn")
-            except Exception:
-                pass
 
     return {"audio_path": audio_path, "audio_overview_url": audio_overview_url}
 
@@ -12928,6 +13291,140 @@ async def _check_audio_generating(page):
         }""")
     except Exception:
         return False
+
+
+async def _cleanup_nlm_default_audio(page) -> dict:
+    """Delete any non-Deep-Dive audio entries from NLM Studio after our
+    Deep Dive Long generation completes. NotebookLM's redesigned Studio
+    occasionally auto-fires a default audio when the Audio Overview tile
+    is opened to expose customize controls — leaving us with two entries.
+
+    Idempotent + safe: refuses to delete anything if no Deep Dive entry is
+    visible (mis-classification safeguard — better one extra row than nuking
+    the real audio). All actions emit telemetry.
+    """
+    result = {"scanned": 0, "deleted": 0, "kept": 0, "skipped_reason": None}
+    try:
+        cards = await page.evaluate("""() => {
+            const panel = document.querySelector(
+                '[aria-label*="Studio" i], [data-testid*="studio" i], aside'
+            ) || document.body;
+            const candidates = panel.querySelectorAll(
+                '[role="article"], [role="listitem"], '
+                + '[class*="audio-card"], [class*="AudioCard"], '
+                + '[data-testid*="audio"], [data-testid*="overview-item"]'
+            );
+            const out = [];
+            candidates.forEach((el, i) => {
+                if (el.offsetParent === null) return;
+                const t = (el.innerText || '').toLowerCase();
+                const isDeepDive = t.includes('deep dive');
+                const isAudio = t.includes('audio overview')
+                    || t.includes('conversation') || t.includes('discussion')
+                    || t.includes('podcast');
+                if (isAudio) {
+                    el.setAttribute('data-cleanup-idx', String(i));
+                    out.push({idx: i, isDeepDive: isDeepDive, snippet: t.slice(0, 80)});
+                }
+            });
+            return out;
+        }""")
+        result["scanned"] = len(cards)
+        non_dd = [c for c in cards if not c["isDeepDive"]]
+        result["kept"] = sum(1 for c in cards if c["isDeepDive"])
+
+        if result["kept"] == 0 and non_dd:
+            result["skipped_reason"] = "no_deep_dive_visible"
+            try:
+                emit_event("nlm_cleanup_skipped", phase=4,
+                           reason="no_deep_dive_visible",
+                           scanned=result["scanned"])
+            except Exception:
+                pass
+            return result
+
+        for card in non_dd:
+            opened = await page.evaluate(f"""() => {{
+                const c = document.querySelector('[data-cleanup-idx="{card["idx"]}"]');
+                if (!c) return false;
+                const m = c.querySelector(
+                    'button[aria-label*="More" i], button[aria-label*="Options" i], '
+                    + 'button[aria-haspopup="menu"]'
+                );
+                if (!m) return false;
+                m.click(); return true;
+            }}""")
+            if not opened:
+                continue
+            await asyncio.sleep(0.6)
+
+            deleted = await page.evaluate("""() => {
+                const items = document.querySelectorAll(
+                    '[role="menuitem"], [role="menuitemradio"]'
+                );
+                for (const m of items) {
+                    const t = (m.innerText || '').trim().toLowerCase();
+                    if (t === 'delete' || t === 'remove' || t.startsWith('delete')) {
+                        m.click(); return true;
+                    }
+                }
+                return false;
+            }""")
+            if not deleted:
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                continue
+            await asyncio.sleep(0.5)
+
+            try:
+                await page.evaluate("""() => {
+                    const dlg = document.querySelector('[role="dialog"], [role="alertdialog"]');
+                    if (!dlg) return false;
+                    const btns = dlg.querySelectorAll('button');
+                    for (const b of btns) {
+                        const t = (b.innerText || '').trim().toLowerCase();
+                        if (t === 'delete' || t === 'remove' || t === 'confirm') {
+                            b.click(); return true;
+                        }
+                    }
+                    return false;
+                }""")
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+            result["deleted"] += 1
+            try:
+                emit_event("nlm_cleanup_deleted", phase=4,
+                           card_snippet=card["snippet"])
+            except Exception:
+                pass
+
+        # Defensive: close any lingering menu/dialog before share-link
+        # extraction runs. Without this, the share-three-dots probe at
+        # ~13165 may land on a stale menu from cleanup deletes.
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+        try:
+            emit_event("nlm_cleanup_done", phase=4,
+                       scanned=result["scanned"],
+                       deleted=result["deleted"],
+                       kept=result["kept"])
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        result["skipped_reason"] = f"{type(e).__name__}: {e}"
+        try:
+            emit_event("nlm_cleanup_error", phase=4, error=str(e)[:200])
+        except Exception:
+            pass
+        return result
 
 
 # ── Phase 5: Video Conversion + YouTube Upload ──────────────────────────────
@@ -13055,11 +13552,13 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
             # mentions it so the user knows to clear space.
             _err_tail = (r.stderr or "")[-300:]
             if "no space" in _err_tail.lower() or "disk full" in _err_tail.lower() or "enospc" in _err_tail.lower():
-                emit_event("pipeline_error", phase=4, agent="youtube",
-                           error=f"Disk full while writing video — free up space and resume. Details: {_err_tail[:200]}")
+                fail_phase(4, "Disk full while writing video",
+                           f"Free up space and Retry. Details: {_err_tail[:200]}",
+                           agent="youtube")
             else:
-                emit_event("pipeline_error", phase=4, agent="youtube",
-                           error=f"ffmpeg failed to build the video from audio+thumbnail. Phase 5 cannot proceed. Details: {_err_tail[:200]}")
+                fail_phase(4, "ffmpeg failed to build the video",
+                           f"Phase 4 video wrap step crashed. Details: {_err_tail[:200]}",
+                           agent="youtube")
             return {"youtube_url": ""}
         log(f"Video: {video_path} ({video_path.stat().st_size / 1024 / 1024:.1f}MB)")
         save_track("Phase5", {"status": "video_created", "size_mb": round(video_path.stat().st_size / 1024 / 1024, 1)})
@@ -13068,14 +13567,15 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
         _err_msg = str(e)
         _low = _err_msg.lower()
         if "no space" in _low or "enospc" in _low:
-            emit_event("pipeline_error", phase=4, agent="youtube",
-                       error=f"Disk full — can't write video file. Free up space and resume. Details: {_err_msg[:200]}")
+            fail_phase(4, "Disk full",
+                       f"Free up space and Retry. Details: {_err_msg[:200]}",
+                       agent="youtube")
         elif "executable" in _low or "not found" in _low or "winerror 2" in _low:
-            emit_event("pipeline_error", phase=4, agent="youtube",
-                       error=f"ffmpeg not found on PATH. Install ffmpeg and retry. Details: {_err_msg[:200]}")
+            fail_phase(4, "ffmpeg not on PATH",
+                       f"Install ffmpeg and Retry. Details: {_err_msg[:200]}",
+                       agent="youtube")
         else:
-            emit_event("pipeline_error", phase=4, agent="youtube",
-                       error=f"ffmpeg crashed: {_err_msg[:200]}")
+            fail_phase(4, "ffmpeg crashed", _err_msg[:200], agent="youtube")
         return {"youtube_url": ""}
 
     # Upload to YouTube
@@ -13094,9 +13594,9 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                                        phase=5, verbose=verbose)
         if not cleared:
             log("Phase 5: HV gate on YouTube Studio could not be cleared — aborting upload", "ERROR")
-            emit_event("pipeline_error", phase=5, agent="youtube",
-                       error="youtube_hv_unresolved",
-                       reason="YouTube Studio is showing a human-verification challenge we couldn't clear. Resolve it in the browser and retry.")
+            fail_phase(5, "YouTube Studio human-verification unresolved",
+                       "Resolve the challenge in the browser and Retry.",
+                       agent="youtube")
             return {"youtube_url": ""}
 
     # Queue video first, then thumbnail for sequential file dialogs
@@ -13344,17 +13844,8 @@ Do NOT report studio.youtube.com URLs — those are NOT video links.""",
         emit_validated_link(4, "youtube", youtube_url, "YouTube Video")
     else:
         log("[YouTube] Could not extract video URL — no link will be emitted", "WARN")
-        # Narrate the upload / URL-extract failure. Could be quota, auth
-        # (Studio re-login required), or just a rare DOM timing gap where
-        # CUA couldn't read the share dialog. extract_with_retry further
-        # upstream gets the final word (3× retry → pipeline_error halt).
-        try:
-            emit_event("pipeline_warning", phase=4, agent="youtube",
-                       message="YouTube upload completed but video URL couldn't be extracted",
-                       details="Possible causes: YouTube Studio auth expired, upload quota hit, or the publish dialog timed out. The orchestrator will run a 3× extractor retry next; if that also fails the pipeline halts with a clear error.",
-                       alertType="warn")
-        except Exception:
-            pass
+        # No alert: extract_with_retry's 3× pass either succeeds or fires
+        # a fail_phase upstream. Emitting here would only add noise.
     save_track("Phase5", {"status": "youtube_uploaded" if youtube_url else "youtube_url_failed",
                           "youtube_url": youtube_url})
 
@@ -13464,8 +13955,7 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         cleared = await check_hv_gate(browser, cua_client, "gdocs", "Google Docs",
                                        phase=5, max_iterations=2)
         if not cleared:
-            emit_event("pipeline_warning", phase=5,
-                       message="Google Docs HV not cleared — orchestrator will retry")
+            log("[Phase5] Google Docs HV not cleared — orchestrator will retry", "WARN")
             return {"doc_url": ""}
 
         emit_event("agent_progress", phase=5, agent="gdocs",
@@ -13504,18 +13994,7 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         log(f"Google Doc: {doc_url}")
         save_track("Phase5", {"status": "doc_created", "doc_url": doc_url})
     except Exception as e:
-        log(f"Google Doc error: {e}", "ERROR")
-        # Upstream orchestrator still runs extract_with_retry on the doc
-        # URL with 3 attempts; surface this as a warning so the user has
-        # context on which agent failed. If the retry also fails, the
-        # orchestrator emits pipeline_error phase=5 from its halt branch.
-        try:
-            emit_event("pipeline_warning", phase=5, agent="gdocs",
-                       message="Google Doc creation hit an error — orchestrator will retry",
-                       details=f"{str(e)[:200]}",
-                       alertType="warn")
-        except Exception:
-            pass
+        log(f"[Phase5] Google Doc creation error (orchestrator will retry): {str(e)[:200]}", "WARN")
 
     # Send email
     email_sent = False
@@ -13533,8 +14012,7 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
             cleared = await check_hv_gate(browser, cua_client, "gmail", "Gmail",
                                            phase=5, max_iterations=2)
             if not cleared:
-                emit_event("pipeline_warning", phase=5,
-                           message="Gmail HV not cleared — skipping email send")
+                log("[Phase5] Gmail HV not cleared — skipping email send", "WARN")
                 return {"doc_url": doc_url}
 
             # Subject uses the smart title so it matches NotebookLM + YouTube.
@@ -13586,11 +14064,7 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
             else:
                 _msg = "Email not sent — SMTP/Gmail error"
                 _det = f"{_err_msg[:200]}"
-            try:
-                emit_event("pipeline_warning", phase=5, agent="gmail",
-                           message=_msg, details=_det, alertType="warn")
-            except Exception:
-                pass
+            fail_phase(5, _msg, _det, agent="gmail")
     else:
         log("No email configured — skipping")
 
@@ -13682,20 +14156,11 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             # Extract source URLs from markdown links and references
             urls = re.findall(r'https?://[^\s\)\]\"\'>]+', content)
             unique_urls = list(dict.fromkeys(urls))[:50]  # Dedupe, cap at 50
-            # Extract domains
-            source_refs = []
-            for url in unique_urls:
-                try:
-                    domain = url.split("//")[1].split("/")[0].replace("www.", "")
-                    source_refs.append({"url": url, "domain": domain, "agent": platform})
-                except Exception:
-                    pass
-            # Build/update agent entry
+            # Build/update agent entry. unique_urls is already capped at 50.
             existing = agents.get(platform, {})
             agents[platform] = {
                 "sources": len(unique_urls),
-                "sourceUrls": unique_urls[:30],
-                "sourceRefs": source_refs[:30],
+                "sourceUrls": unique_urls,
                 "sections": sections[:15],
                 "outputChars": len(content),
                 "completionTimeSec": existing.get("completionTimeSec", 0),
@@ -14013,12 +14478,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 actions=actions,
             )
         except Exception as _e:
-            # fail_phase signature mismatch → fall back to direct emit
             log(f"_phase_timeout_decision: fail_phase fallback ({_e})", "WARN")
-            emit_event("pipeline_error", phase=phase, agent=agent,
-                       error=f"Phase {phase} exceeded {max_min}-minute active-time ceiling",
-                       reason=f"Stuck — Retry from checkpoint or Skip the phase.",
-                       actions=actions)
+            fail_phase(phase, f"Phase {phase} exceeded {max_min}-minute active-time ceiling",
+                       "Stuck — Retry from checkpoint or Skip the phase.",
+                       agent=agent, actions=actions)
         # Pause flag freezes the active-time clock during the user's
         # decision wait, so a 20-min decision delay doesn't burn budget
         # against the next retry. Also flips the FE chat input to paused.
@@ -14257,16 +14720,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # doesn't chase a phantom auth issue. Default actions:
                     # skip this platform (proceed with remaining) or stop.
                     log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
-                    emit_event("pipeline_error", phase=0, agent=key,
-                               error="cua_unavailable",
-                               reason=f"CUA vision check can't run: {str(cua_err)[:180]}",
-                               details="Raise the Anthropic workspace cap, swap CUA_API_KEY, or skip remaining verification.",
-                               actions=[
-                                   {"id": "skip", "label": "Skip verification", "style": "default",
-                                    "command": {"action": "skip_init_verify"}},
-                                   {"id": "retry", "label": "Retry", "style": "primary",
-                                    "command": {"action": "retry_phase", "phase": 0}},
-                               ])
+                    fail_phase(0, "CUA vision check can't run",
+                               (f"{str(cua_err)[:180]} — raise the Anthropic workspace cap, "
+                                "swap CUA_API_KEY, or skip remaining verification."),
+                               agent=key)
                     _controls.request_pause()
                     emit_event("pipeline_paused", phase=0, reason="cua_unavailable")
                     await _controls.wait_if_paused()
@@ -14527,11 +14984,31 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         emit_event("phase_restart", phase=1, reason="user_retry_after_error", attempt=0)
                         continue
                     if decision == "skip":
-                        log("Phase 1: user skipped after error — continuing with empty brief", "INFO")
+                        log("Phase 1: user skipped after error — switching to manual brief entry mode", "INFO")
                         emit_event("phase_skipped", phase=1, reason="user_skip_after_error")
-                        brief_text = ""
+                        # ── P1 skip → manual brief flow ──
+                        # Instead of proceeding with an empty brief, ask the
+                        # user to paste their own. Emit a Template-shape info
+                        # alert with [Dismiss] and block on extra_context
+                        # until the chat input lands a brief. On consume,
+                        # use the pasted text as the brief and continue.
+                        emit_event("manual_brief_required", phase=1,
+                                   message="Type your research brief into chat, then press Resume.",
+                                   actions=[{"id": "dismiss", "label": "Dismiss",
+                                             "style": "default",
+                                             "command": {"action": "dismiss_alert"}}],
+                                   dismissible=True,
+                                   alert_id="phase1_manual_brief_required")
+                        while not _controls.peek_extra_context() and not _controls.is_stop():
+                            await asyncio.sleep(0.5)
+                        if _controls.is_stop():
+                            log("Phase 1: stop pressed during manual brief wait", "INFO")
+                            emit_event("pipeline_stopped", phase=1, reason="user_stop_during_manual_brief")
+                            return
+                        brief_text = (_controls.pop_extra_context() or "").strip()
                         brief_url = ""
-                        _p1_skipped_after_error = True
+                        log(f"Phase 1: user supplied manual brief ({len(brief_text)} chars)")
+                        _p1_skipped_after_error = False
                         break
                     # stop / timeout — only way the pipeline actually ends
                     log(f"Phase 1: user {decision} after error — terminating pipeline", "INFO")
@@ -14683,7 +15160,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         elif start_phase <= 2:
             if not brief_text:
                 log("No brief text available — cannot run Phase 2", "ERROR")
-                emit_event("pipeline_error", phase=2, error="no brief text")
+                fail_phase(2, "No brief text available", "Phase 1 produced no brief; cannot run Phase 2.")
                 return
             enabled_agents = [a for a, on in agents_cfg.items() if on]
             disabled_agents = [a for a, on in agents_cfg.items() if not on]
@@ -14823,24 +15300,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                     agents[plat]["sections"] = secs
                     except Exception:
                         pass
-                # Rebuild sourceRefs from sourceUrls
-                for plat, data in agents.items():
-                    refs = []
-                    for url in data.get("sourceUrls", []):
-                        try:
-                            domain = url.split("//")[1].split("/")[0].replace("www.", "")
-                            refs.append({"url": url, "domain": domain, "agent": plat})
-                        except Exception:
-                            pass
-                    data["sourceRefs"] = refs
                 meta["agents"] = agents
                 meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             # ── 2026-04-25: Markdown-as-primary phase_complete (P1 mirror) ──
             # extract_and_record_agent already emitted link_extracted with the
             # in-app /documents primary the moment each agent's MD landed.
-            # Share-link extraction is removed from P2; Phase 5's Doc creation
-            # uses Phase 3's link extraction. So phase_complete just builds
-            # _p2_links from the in-app primaries we already have.
+            # Share-link extraction is now fully scoped to P2 (DOM tier +
+            # vision-shadow-wrapped CUA fallback inside extract_and_record_agent
+            # and extract_share_link_chatgpt). P3 just consumes _runtime.p2_*
+            # state and goes straight to NotebookLM.
+            # Build the P2→P3 handoff now so P3 starts clean. Idempotent —
+            # safe to call again as a fallback at start of P3 if needed.
+            try:
+                _build_phase2_to_phase3_handoff(results, queue_dir)
+            except Exception as _hoe:
+                log(f"[Phase 2→3 handoff] build failed (P3 will rebuild on entry): {_hoe}", "WARN")
             # Build _p2_links from per-agent in-app primaries — always present
             # when MD landed. Public share URLs (when the workers got them)
             # have already been emitted via link_extracted and the FE has
@@ -15066,9 +15540,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
             _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
             _p3_start = time.time()
-            # Phase 3 has two sub-steps (upload, audio) with independent
-            # active-time ceilings — see PHASE_3_UPLOAD_MAX_MIN and
-            # PHASE_3_AUDIO_MAX_MIN. Paused seconds don't count.
+            # Phase 3 has two sub-steps (upload, audio) — both gated by
+            # the single PHASE_3_MAX_MIN budget (40 min default). Paused
+            # seconds don't count toward the active-time ceiling.
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             if not results:
                 for md_file in md_files:
@@ -15081,12 +15555,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             while True:  # timeout-retry loop
                 try:
                     p3 = await _await_phase_with_active_deadline(
-                        3, PHASE_3_UPLOAD_MAX_MIN,
+                        3, PHASE_3_MAX_MIN,
                         lambda: run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose),
                     )
                     break
                 except asyncio.TimeoutError:
-                    _decision = await _phase_timeout_decision(3, PHASE_3_UPLOAD_MAX_MIN, agent="notebooklm")
+                    _decision = await _phase_timeout_decision(3, PHASE_3_MAX_MIN, agent="notebooklm")
                     if _decision == "retry":
                         emit_event("phase_restart", phase=3, reason="user_retry_after_timeout")
                         continue
@@ -15159,12 +15633,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 while True:  # timeout-retry loop
                     try:
                         p4 = await _await_phase_with_active_deadline(
-                            3, PHASE_3_AUDIO_MAX_MIN,
+                            3, PHASE_3_MAX_MIN,
                             lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
                         )
                         break
                     except asyncio.TimeoutError:
-                        _decision = await _phase_timeout_decision(3, PHASE_3_AUDIO_MAX_MIN, agent="notebooklm")
+                        _decision = await _phase_timeout_decision(3, PHASE_3_MAX_MIN, agent="notebooklm")
                         if _decision == "retry":
                             emit_event("phase_restart", phase=3, reason="user_retry_audio_timeout")
                             continue
@@ -15191,7 +15665,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _p3_links = []
             if notebook_url and validate_link("notebooklm", notebook_url):
                 _p3_links.append({"label": "NotebookLM Notebook", "url": notebook_url, "verified": True})
-            if audio_overview_url and audio_overview_url != notebook_url and validate_link("notebooklm", audio_overview_url):
+            # NLM emits the same /notebook/{id} URL for both notebook and
+            # audio share dialogs by design. Keep both rows so the FE can
+            # render the Audio Overview as a Play button + external
+            # Open-in-NotebookLM affordance (Option 3 hybrid). Dedup by
+            # label+url at FE allLinks lets the second row survive.
+            if audio_overview_url and validate_link("notebooklm", audio_overview_url):
                 _p3_links.append({"label": "Audio Overview", "url": audio_overview_url, "verified": True})
             emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
                 summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}{', audio link extracted' if audio_overview_url else ''}")
@@ -15601,6 +16080,91 @@ async def run_server(port=8000):
             log(f"[startup-sweep] purged {swept} stale run(s) older than 7 days", "INFO")
     except Exception as _se:
         log(f"[startup-sweep] failed: {_se}", "WARN")
+
+    # ── Periodic orphan sweep ──
+    # Complements the startup time-based sweep above. This one is
+    # existence-based: it iterates queues/, reads each owner.json, and
+    # nukes the local dirs IF the corresponding Firestore research doc
+    # has been deleted (e.g. by the FE deleteResearch cascade). Catches
+    # user-initiated deletes within ~5 min instead of waiting 7 days.
+    # Race protection:
+    #   1) Skip dirs younger than 5 min so a fresh run mid-creation is
+    #      never killed before delivery.json/owner.json are written.
+    #   2) Re-verify Firestore existence after a 250ms jitter just before
+    #      rmtree, in case the doc was created in the same window.
+    #   3) Defensive defaults: missing delivery.json/owner.json/status,
+    #      Firestore unreachable, or unknown status all SKIP delete.
+    ORPHAN_SWEEP_INTERVAL_SEC = 300
+    ORPHAN_SWEEP_MIN_AGE_SEC = 300
+    ORPHAN_SWEEP_IN_FLIGHT_STATUSES = {"ongoing", "queued"}
+
+    async def _orphan_sweep_loop():
+        import shutil as _shutil
+        while True:
+            try:
+                await asyncio.sleep(ORPHAN_SWEEP_INTERVAL_SEC)
+                if not _firebase_db or not queues_root.exists():
+                    continue
+                now_ts_inner = time.time()
+                swept_n = 0
+                for d in queues_root.iterdir():
+                    if not d.is_dir():
+                        continue
+                    try:
+                        if (now_ts_inner - d.stat().st_mtime) < ORPHAN_SWEEP_MIN_AGE_SEC:
+                            continue
+                    except Exception:
+                        continue
+                    delivery_path = d / "delivery.json"
+                    if not delivery_path.exists():
+                        continue
+                    try:
+                        status = json.loads(delivery_path.read_text(encoding="utf-8")).get("status", "")
+                    except Exception:
+                        continue
+                    if not status or status in ORPHAN_SWEEP_IN_FLIGHT_STATUSES:
+                        continue
+                    owner_path = d / "owner.json"
+                    if not owner_path.exists():
+                        continue
+                    try:
+                        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                        uid, rid = owner.get("uid"), owner.get("researchId")
+                    except Exception:
+                        continue
+                    if not uid or not rid:
+                        continue
+                    try:
+                        ref = _firebase_db.collection("users").document(uid) \
+                            .collection("researches").document(rid)
+                        if ref.get().exists:
+                            continue
+                    except Exception:
+                        continue
+                    await asyncio.sleep(0.25)
+                    try:
+                        if ref.get().exists:
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        _shutil.rmtree(d)
+                    except Exception as _e:
+                        log(f"[orphan-sweep] rmtree {d.name} failed: {_e}", "WARN")
+                        continue
+                    try:
+                        tdir = tracks_root / d.name
+                        if tdir.exists():
+                            _shutil.rmtree(tdir)
+                    except Exception as _e:
+                        log(f"[orphan-sweep] tracks rmtree {d.name} failed: {_e}", "WARN")
+                    swept_n += 1
+                if swept_n:
+                    log(f"[orphan-sweep] purged {swept_n} orphan(s) (Firestore research doc missing)", "INFO")
+            except asyncio.CancelledError:
+                return
+            except Exception as _e:
+                log(f"[orphan-sweep] iteration failed: {_e}", "WARN")
 
     @app.get("/api/runs")
     async def list_runs():
@@ -16148,6 +16712,10 @@ async def run_server(port=8000):
             except asyncio.CancelledError:
                 return
         asyncio.create_task(_aegis_pulse_loop())
+        # Periodic orphan sweep: existence-based cleanup of local queues/
+        # tracks/ dirs whose Firestore research doc has been deleted.
+        asyncio.create_task(_orphan_sweep_loop())
+        log(f"[orphan-sweep] started ({ORPHAN_SWEEP_INTERVAL_SEC}s interval)")
         # Refresh the paired device doc so the Account page sees this PC
         # online immediately on server start. If pairedUid isn't pinned yet
         # (pre-multi-device config), resolve it from the token's linkedUid.
