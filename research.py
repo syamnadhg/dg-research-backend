@@ -17612,29 +17612,40 @@ async def run_server(port=8000):
     def _recompute_queue_positions():
         """After a job finishes, shift remaining queued jobs' positions up by
         one and re-point their `queuedBehindRunId/Title` at the new head (or
-        clear if they're next). Reads `_job_queue._queue` as a snapshot."""
+        clear if they're next). Reads `_job_queue._queue` as a snapshot.
+
+        Uses a single Firestore WriteBatch so all N position updates land
+        atomically — the FE never sees an inconsistent intermediate state
+        where two queued runs both think they're #1 (Q4: cancel #1 →
+        positions #2,#3 must become #1,#2 in one render frame, no flicker).
+        WriteBatch caps at 500 ops; for typical N (single-digit queued runs)
+        this is one batch; safety chunk at 450 ops if ever exceeded."""
         if not _firebase_db:
             return
         try:
             pending = list(_job_queue._queue)
         except Exception:
             return
+        if not pending:
+            return
+        try:
+            from google.cloud.firestore import DELETE_FIELD
+        except Exception:
+            DELETE_FIELD = None  # pyright: ignore[reportConstantRedefinition]
+        # Build patch list first so we can chunk into 450-op batches if N
+        # ever exceeds Firestore's 500-op WriteBatch ceiling.
+        patches: list[tuple[str, str, dict]] = []
         for idx, qjob in enumerate(pending):
             uid_v = qjob.get("uid")
             rid_v = qjob.get("research_id")
             if not uid_v or not rid_v:
                 continue
             new_pos = idx + 1
-            # The head job (idx 0) waits behind nothing — it starts next.
-            # Others wait behind the job immediately before them.
             if idx == 0:
                 patch = {"queuePosition": new_pos}
-                try:
-                    from google.cloud.firestore import DELETE_FIELD
+                if DELETE_FIELD is not None:
                     patch["queuedBehindRunId"] = DELETE_FIELD
                     patch["queuedBehindTitle"] = DELETE_FIELD
-                except Exception:
-                    pass
             else:
                 prev = pending[idx - 1]
                 patch = {
@@ -17642,12 +17653,18 @@ async def run_server(port=8000):
                     "queuedBehindRunId": prev.get("research_id") or "",
                     "queuedBehindTitle": (prev.get("topic") or "")[:60],
                 }
+            patches.append((uid_v, rid_v, patch))
+        CHUNK = 450
+        for i in range(0, len(patches), CHUNK):
+            batch = _firebase_db.batch()
+            for uid_v, rid_v, patch in patches[i:i + CHUNK]:
+                ref = _firebase_db.collection("users").document(uid_v) \
+                    .collection("researches").document(rid_v)
+                batch.update(ref, patch)
             try:
-                _firebase_db.collection("users").document(uid_v) \
-                    .collection("researches").document(rid_v) \
-                    .update(patch)
+                batch.commit()
             except Exception as e:
-                log(f"Failed to recompute queue position for {rid_v}: {e}", "WARN")
+                log(f"Failed to commit queue-position batch [{i}:{i+CHUNK}]: {e}", "WARN")
 
     # Expose the recompute helper to the module-level Firestore listener so
     # the cancel-queued action can also trigger a position refresh.
