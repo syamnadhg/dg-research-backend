@@ -667,24 +667,14 @@ def normalize_agent_key(name):
 
 
 def save_track(platform, data):
-    """Save a timestamped progress entry — individual JSON + events.jsonl for streaming."""
-    if not _tracks_dir:
-        return
-    # Route to correct subfolder
-    plat_key = platform.lower().replace(" ", "")
-    route = _TRACK_ROUTES.get(plat_key, plat_key)
-    platform_dir = _tracks_dir / route
-    platform_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%H%M%S")
-    count = len(list(platform_dir.glob("*.json"))) + 1
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "platform": platform,
-        **data,
-    }
-    (platform_dir / f"{count:03d}_{ts}.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
-    # NOTE: do NOT append to events.jsonl here — only emit_event() writes typed events
-    # Raw scrape data stays in per-platform JSON files only
+    """No-op since 2026-04-29 — write-only telemetry with no live readers.
+
+    Was previously writing one JSON per scrape under tracks/{run_id}/{platform}/
+    for raw scrape preservation, but nothing in the BE or FE ever read these
+    files back. The retained call sites are kept so the function signature
+    stays stable; if we ever want raw-scrape archiving again, this is the
+    single point to wire it back."""
+    return
 
 
 # ── Firebase Bridge (Firestore real-time transport) ──────────────────────────
@@ -1937,6 +1927,51 @@ def _emit_to_firestore(event):
             .collection("pipeline_events").add(doc_data)
     except Exception as e:
         log(f"Firestore emit failed: {e}", "WARN")
+
+
+def update_link_in_firestore(kind: str, url: str, **fields):
+    """Atomically merge a single link into `users/{uid}/researches/{rid}.links.{kind}`.
+
+    Single source of truth for P5's Doc body composition — every successful
+    `emit_validated_link` call feeds this so the aggregate stays in sync with
+    the per-event log. P5 reads the map back at the start of run_phase5 so a
+    Phoenix-resumed run rebuilds doc content without replaying pipeline_events.
+
+    `kind` is the platform key (matches `emit_validated_link`'s `agent` arg):
+      - "brief" / "chatgpt" / "gemini" / "claude"  — research links
+      - "notebooklm" / "audio"                      — Phase 3
+      - "youtube"                                   — Phase 4
+      - "gdocs"                                     — Phase 5
+
+    Idempotent: same key + URL is a no-op merge.
+    """
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    if not kind or not url:
+        return
+    payload = {"url": url, **fields}
+    try:
+        _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id) \
+            .set({"links": {kind: payload}}, merge=True)
+    except Exception as e:
+        log(f"Firestore link update failed ({kind}): {e}", "WARN")
+
+
+def _read_links_map_from_firestore() -> dict:
+    """Read the aggregate links map from the research doc. Returns {} on
+    miss or error — caller falls back to in-memory state. Single read at
+    P5 entry, no caching (Firestore client already has a local cache layer)."""
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return {}
+    try:
+        snap = _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id).get()
+        data = snap.to_dict() or {}
+        return data.get("links") or {}
+    except Exception as e:
+        log(f"Firestore links read failed: {e}", "WARN")
+        return {}
 
 
 def _update_firestore_research(updates):
@@ -3667,15 +3702,24 @@ def validate_link(platform: str, url: str) -> bool:
     return False
 
 
-def emit_validated_link(phase: int, agent: str, url: str, label: str):
+def emit_validated_link(phase: int, agent: str, url: str, label: str, link_kind: str = ""):
     """Emit a link_extracted event ONLY if the URL passes validation.
-    Returns True if emitted, False if rejected."""
+    Returns True if emitted, False if rejected. Also writes to the research
+    doc's `links.{kind}` aggregate map — P5 reads from there to compose
+    the Doc body (single source of truth, no event-log replay needed).
+
+    `link_kind` overrides the Firestore aggregate key when it differs from
+    the FE event's `agent` field — e.g. audio-overview emits as
+    agent="notebooklm" (FE groups under the NLM dropdown) but stores as
+    "audio" in the aggregate so P5 picks it up as a separate URL.
+    """
     verified = validate_link(agent, url)
     if not verified:
         log(f"[{label}] Link REJECTED — not a valid public link: {url[:80]}", "WARN")
         return False
     emit_event("link_extracted", phase=phase, agent=agent,
                url=url, label=label, verified=True)
+    update_link_in_firestore(link_kind or agent, url, label=label, phase=phase, verified=True)
     log(f"[{label}] Link VERIFIED: {url}")
     return True
 
@@ -5024,12 +5068,10 @@ def emit_event(event_type, phase=None, agent=None, **data):
         _runtime.last_event_id = f"{event['timestamp']}_{event_type}"
     except Exception:
         pass
-    # Write to disk (local debugging + resume)
-    try:
-        with open(_tracks_dir / "events.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
-    except Exception:
-        pass
+    # 2026-04-29: events.jsonl disk write removed. The FE reads pipeline
+    # events from Firestore (`pipeline_events` subcoll) only — disk mirror
+    # was dead weight (no live readers, only legacy /api/runs HTTP
+    # endpoints which are themselves stale).
     # Record phase durations for analytics-based ETAs
     if event_type == "phase_complete" and phase is not None:
         dur = data.get("durationSec", 0)
@@ -9640,6 +9682,22 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             # _runtime is a process-level singleton — should always exist.
             # If it doesn't, Phase 5's fallback (agent_chat_urls) still works.
             pass
+        # Also propagate to the Firestore aggregate links map so P5's Doc
+        # body composition can read it from the single source of truth.
+        # Key by lowercase platform name to match the rest of the map
+        # (chatgpt / gemini / claude).
+        try:
+            if share_url:
+                update_link_in_firestore(
+                    name.lower(),
+                    share_url,
+                    label=share_label or name,
+                    phase=2,
+                    verified=share_verified,
+                    kind=share_kind,
+                )
+        except Exception as _ufe:
+            log(f"[{name}] Firestore link update failed (non-fatal): {_ufe}", "WARN")
 
     return {
         "status": "done" if n_chars > 0 else "failed",
@@ -14497,8 +14555,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             log(f"Audio overview link extraction failed: {e}", "WARN")
         if audio_overview_url:
             log(f"Audio overview link: {audio_overview_url}")
-            # Emit link immediately — route through validate_link to prevent fake URLs
-            emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview")
+            # Emit link immediately — route through validate_link to prevent fake URLs.
+            # link_kind="audio" stores it in the aggregate as a separate URL so
+            # P5 doc body shows it as the "Link to Audio Overview:" line; FE
+            # event keeps agent="notebooklm" so the NLM dropdown groups it.
+            emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview", link_kind="audio")
         else:
             log("Audio overview link not found — using notebook URL as fallback", "WARN")
 
@@ -15322,15 +15383,39 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
                      brief_url="", audio_url="", email=None, verbose=False):
     """Phase 5: build the research Google Doc + email the user.
 
-    The orchestrator's old extract_with_retry / existing_doc_url loop is
-    gone — this path is now reliable enough to run once and trust the
-    result. Returns {doc_url, email_sent}.
+    Doc body is composed from the Firestore aggregate `links` map (single
+    source of truth populated by every `emit_validated_link` call across
+    Phases 1-4). The `links` / `*_url` args are kept as a fallback for the
+    rare case where Firestore reads fail or a link wasn't propagated.
     """
     log("=" * 60)
     log("PHASE 5: Doc + Email Delivery")
     log("=" * 60)
 
-    body = _compose_p5_doc_body(topic, brief_url, links, notebook_url, audio_url, youtube_url)
+    # Read the Firestore aggregate as the primary source of all phase URLs.
+    # On any miss, fall back to in-memory args (orchestrator state).
+    fs_links = _read_links_map_from_firestore()
+    def _fs_url(kind: str) -> str:
+        entry = fs_links.get(kind) or {}
+        return (entry.get("url") if isinstance(entry, dict) else "") or ""
+
+    eff_brief_url = _fs_url("brief") or brief_url
+    eff_notebook_url = _fs_url("notebooklm") or notebook_url
+    eff_audio_url = _fs_url("audio") or audio_url
+    eff_youtube_url = _fs_url("youtube") or youtube_url
+
+    # Per-agent: prefer Firestore, fall back to the legacy `links` arg.
+    # Build a shadowed dict so _compose_p5_doc_body's existing per-agent
+    # lookup chain (which checks _runtime.agent_share_urls then `links`)
+    # picks up the Firestore values via the `links` fallback path.
+    eff_links = dict(links or {})
+    for cap_name, kind in [("ChatGPT", "chatgpt"), ("Gemini", "gemini"), ("Claude", "claude")]:
+        fs_url = _fs_url(kind)
+        if fs_url:
+            eff_links[cap_name] = fs_url
+
+    body = _compose_p5_doc_body(topic, eff_brief_url, eff_links,
+                                eff_notebook_url, eff_audio_url, eff_youtube_url)
 
     # ── Doc creation ─────────────────────────────────────────────────
     emit_event("agent_progress", phase=5, agent="gdocs",
@@ -16430,6 +16515,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     return
                 brief_text = p1["text"]
                 brief_url = p1.get("url", "")
+                # Propagate the ChatGPT-share / conversation URL to the
+                # Firestore aggregate so P5's Doc body shows the
+                # "ChatGPT Brief: <url>" line. This URL is NOT emitted as
+                # a separate link_extracted (P1 surfaces only the in-app
+                # /documents primary to the FE) — but the Doc spec
+                # requires it, so we land it directly in the aggregate.
+                if brief_url:
+                    try:
+                        update_link_in_firestore("brief", brief_url,
+                                                 label="ChatGPT Brief", phase=1, verified=True)
+                    except Exception:
+                        pass
                 break
                 # Brief-short acknowledgement: run_phase1 already emitted a
                 # pipeline_warning with [continue_anyway] buttons when the
@@ -17122,7 +17219,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _audio_link = audio_overview_url or notebook_url
                 update_delivery(audio_url=_audio_link)
                 if audio_overview_url:
-                    emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview")
+                    emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview", link_kind="audio")
             save_meta(queue_dir, topic, 3)
             # Build Phase 3 links — include both notebook and audio overview
             # Only include links that pass validation (no fake/placeholder URLs)
