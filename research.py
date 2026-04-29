@@ -4857,6 +4857,44 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=1)
         if await _verify_paste_landed(page, brief_text, platform, label, source="clipboard"):
             return True
 
+        # Strategy A.5 (Gemini-only): CHUNKED clipboard paste. Background:
+        # Gemini's Lit/Angular composer truncates a single large paste at
+        # ~5-6K chars (observed: 5608/8951 = 62.7%). Splitting the brief
+        # into ~2000-char chunks and Ctrl+V'ing each one lets the composer
+        # incrementally reflow + commit each chunk to its underlying state
+        # before the next paste lands. Avoids the keyboard-type fallback's
+        # 60s wall-time penalty when chunked clipboard works fine.
+        if platform_key == "gemini" and len(brief_text) > 4000:
+            try:
+                CHUNK = 2000
+                # Reset composer first — Strategy A may have left a
+                # truncated paste in there.
+                await ta.click()
+                await asyncio.sleep(0.2)
+                await page.keyboard.press("Control+a")
+                await asyncio.sleep(0.1)
+                await page.keyboard.press("Delete")
+                await asyncio.sleep(0.1)
+                # Walk the brief and paste each chunk via clipboard. On a
+                # rich-text composer the cursor stays at end-of-content
+                # after each Ctrl+V, so successive pastes naturally append.
+                _n = (len(brief_text) + CHUNK - 1) // CHUNK
+                log(f"[{label}] Chunked paste: {_n} chunks of {CHUNK} chars (total {len(brief_text)})")
+                for i in range(0, len(brief_text), CHUNK):
+                    chunk = brief_text[i:i + CHUNK]
+                    await page.evaluate("text => navigator.clipboard.writeText(text)", chunk)
+                    await asyncio.sleep(0.15)
+                    await page.keyboard.press("Control+v")
+                    # 200ms settle lets Gemini's input handler commit the
+                    # chunk to its model layer before the next paste fires.
+                    await asyncio.sleep(0.2)
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                log(f"[{label}] Strategy A.5 (chunked clipboard) raised: {e}", "WARN")
+
+            if await _verify_paste_landed(page, brief_text, platform, label, source="chunked-clipboard"):
+                return True
+
         # Strategy B: real keyboard typing (slower — ~60s for a 30K-char
         # brief — but actually dispatches genuine keydown/keypress events
         # that any controlled composer must handle). Gated to Gemini only
