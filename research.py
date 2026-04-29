@@ -7,6 +7,35 @@ Topic + PDFs → ChatGPT Brief → 3x Deep Research → NotebookLM → Audio →
 Built on the proven research.py patterns: direct Playwright first, CUA fallback only.
 Every submit → verify → then wait. Never blind wait.
 
+DOM → (Vision →) CUA contract
+─────────────────────────────
+For every UI surface the pipeline drives (paste, share-link extract, MD
+extract, copy buttons, etc.) the contract is:
+
+  1. ONE DOM attempt (a single coherent flow with selector fallbacks for
+     resilience — NOT multi-attempt). Verifies inline. Returns False on
+     failure so the caller can hand off cleanly.
+  2. If DOM fails → ONE CUA mission. CUA is *persistent* within its
+     budget (`agent_loop` runs internal iterations until success OR
+     iteration cap OR wall-clock timeout). One mission, real budget.
+  3. Future: Vision tier slots between DOM and CUA. Vision observes today
+     in shadow mode (`DG_VISION_TIER=shadow`); promotion is per-hotspot
+     after telemetry proves agreement.
+
+Why "DOM once → CUA" and not "DOM N times → CUA":
+  - Each DOM click can have side effects (off-target click → new tab,
+     framework state corruption, modal lingering). N attempts = N risk.
+  - CUA is already persistent inside one call — re-running CUA on a
+     wonky-modal state just compounds misclicks. (Real bug we hit:
+     Gemini's share dialog social icons getting clicked across two CUA
+     passes.)
+  - Popup guard at BrowserManager auto-closes off-allowlist tabs as a
+     safety net. Combined with single-attempt DOM, off-target clicks
+     become harmless.
+
+If you find yourself adding a 2nd DOM retry, ask: should the budget go
+to CUA instead? Almost always: yes.
+
 Usage:
   python research.py "Topic here"                        # Full pipeline
   python research.py "Topic" --brief-file brief.txt      # Skip Phase 1
@@ -2479,12 +2508,31 @@ class PipelineRuntime:
         # Gmail tab for email send, the orchestrator's retry path would
         # grab `mail.google.com/...` and fail validation.
         self.gdoc_page = None
+        # Doc URL of the LAST doc that successfully sent an email. Used by
+        # `_send_p5_email` to short-circuit the orchestrator's post-hoc
+        # email re-fire when the inline send already succeeded — prevents
+        # duplicate emails on the recovery path.
+        self.p5_email_sent_for_doc: str = ""
+        # Per-agent state keyed by lowercase platform name. Mirrored into
+        # checkpoint.json so a Phoenix restart can rebuild "where each
+        # agent was" before silence escalation kicked in. Shape:
+        #   {agent: {status, url, share_url, partial_text_len, last_event_ms}}
+        # Updated by extract_and_record_agent + register_page paths;
+        # snapshotted into checkpoint.json on phase boundaries.
+        self.agent_states: dict = {}
+        # ID of the last event written to events.jsonl + Firestore. Lets a
+        # Phoenix-resumed run skip events the FE already saw, instead of
+        # replaying them and producing dup phase transitions in chat.
+        self.last_event_id: str = ""
 
     def reset(self):
         self.__init__()
         # Clear module-level page-keyed stream observers — entries are keyed by
         # id(page) and would alias new pages once Python recycles ids.
         _agent_streams.clear()
+        # Drop tier escalation history so a fresh run doesn't inherit the
+        # previous run's retry budget burn.
+        reset_tier_escalations()
 
     def register_page(self, platform, page, url=None):
         self.active_pages[platform] = page
@@ -2504,6 +2552,10 @@ class PipelineRuntime:
 
     def snapshot(self):
         """Snapshot current state for checkpoint.json."""
+        try:
+            tier_history = {k: e.to_dict() for k, e in _tier_escalations.items()}
+        except Exception:
+            tier_history = {}
         return {
             "phase": self.phase,
             "sub_state": self.sub_state,
@@ -2511,10 +2563,123 @@ class PipelineRuntime:
             "agent_statuses": dict(self.agent_statuses),
             "partial_text_lens": dict(self.partial_text_lens),
             "original_inputs": dict(self.original_inputs),
+            # Enriched fields (2026-04-28, Commit 1 of error-redesign):
+            "agent_states": dict(self.agent_states),
+            "last_event_id": self.last_event_id,
+            "tier_escalation_history": tier_history,
         }
 
 
 _runtime = PipelineRuntime()  # Singleton — reset per run
+
+
+# ── Tier Framework ──────────────────────────────────────────────────────────
+# Unified retry/escalation tracking across BE operations. Replaces ad-hoc
+# tier_transition emits. Tier ladder:
+#   T0  in-place retry up to 3× (≤30s gap, ≤90s total)
+#   T1  tab-restart (close → reopen → retry, up to 2×)
+#   T2  full-browser restart (browser.stop() → browser.start() → retry once)
+#   T3  BE Phoenix exit via daemon-loop (saves to pending_queue.json, exits 0)
+#
+# Each (op, agent) pair gets a TierEscalation record with a 30-min sliding
+# window. Outside the window, attempt counts reset — a fresh failure 35 min
+# after the last one starts at T0a1, not at whatever tier the prior incident
+# escalated to. The history list persists into checkpoint.json so a Phoenix
+# restart picks up where the prior run left off.
+
+_TIER_WINDOW_SEC = 30 * 60  # 30-min per-errorId budget window
+
+
+class TierEscalation:
+    """Per-op-and-agent tier tracking. Records each retry/escalation with
+    timestamp + reason; auto-resets attempt counters after `_TIER_WINDOW_SEC`.
+
+    Serializable for checkpoint resume — see to_dict / from_dict.
+    """
+    __slots__ = ("op", "agent", "attempts", "window_start", "history")
+
+    def __init__(self, op: str, agent: str = ""):
+        self.op = op
+        self.agent = (agent or "").lower()
+        self.attempts = {"T0": 0, "T1": 0, "T2": 0, "T3": 0}
+        self.window_start = time.time()
+        self.history: list = []  # [{tier, ts_ms, reason, attempt}]
+
+    def _maybe_reset_window(self):
+        if time.time() - self.window_start > _TIER_WINDOW_SEC:
+            self.attempts = {"T0": 0, "T1": 0, "T2": 0, "T3": 0}
+            self.window_start = time.time()
+
+    def record(self, tier: str, reason: str = "") -> int:
+        """Increment counter for `tier` and append history. Returns the new
+        attempt number (1-based) for use in narration / event payloads."""
+        self._maybe_reset_window()
+        n = self.attempts.get(tier, 0) + 1
+        self.attempts[tier] = n
+        self.history.append({
+            "tier": tier, "ts_ms": int(time.time() * 1000),
+            "reason": (reason or "")[:200], "attempt": n,
+        })
+        # Bound history per (op, agent) so a runaway loop can't bloat
+        # checkpoint.json. 50 entries ≈ 2-3 incidents worth of tier moves.
+        if len(self.history) > 50:
+            self.history = self.history[-50:]
+        return n
+
+    def to_dict(self) -> dict:
+        return {"op": self.op, "agent": self.agent,
+                "attempts": dict(self.attempts),
+                "window_start": self.window_start,
+                "history": list(self.history)}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TierEscalation":
+        e = cls(d.get("op", ""), d.get("agent", ""))
+        e.attempts = dict(d.get("attempts", e.attempts))
+        e.window_start = float(d.get("window_start", time.time()))
+        e.history = list(d.get("history", []))
+        return e
+
+
+_tier_escalations: "dict[str, TierEscalation]" = {}
+
+
+def _tier_key(op: str, agent: str = "") -> str:
+    return f"{op}:{(agent or '').lower()}"
+
+
+def get_tier_escalation(op: str, agent: str = "") -> TierEscalation:
+    key = _tier_key(op, agent)
+    if key not in _tier_escalations:
+        _tier_escalations[key] = TierEscalation(op, agent)
+    return _tier_escalations[key]
+
+
+def reset_tier_escalations():
+    """Drop all tracked escalations. Called on `_runtime.reset()` so a fresh
+    pipeline run starts with empty counters."""
+    _tier_escalations.clear()
+
+
+def emit_tier_transition(*, phase: int, agent: str, op: str,
+                         from_tier: str, to_tier: str, reason: str = ""):
+    """Centralized tier_transition emit. Records the move into the per-(op,
+    agent) TierEscalation registry AND fires the Firestore event for FE
+    narration / Track-A telemetry. Failures here are non-fatal — never
+    raises into hot paths.
+    """
+    try:
+        esc = get_tier_escalation(op, agent)
+        attempt_n = esc.record(to_tier, reason=reason)
+    except Exception:
+        attempt_n = 0
+    try:
+        emit_event("tier_transition", phase=phase,
+                   agent=(agent or "").lower() or None,
+                   op=op, from_tier=from_tier, to_tier=to_tier,
+                   reason=reason, attempt=attempt_n)
+    except Exception:
+        pass
 
 
 def save_pause_checkpoint(queue_dir, extra=None):
@@ -3166,21 +3331,10 @@ async def resume_browser_from_checkpoint(browser, queue_dir):
     # Reset dedup cache
     global _last_progress
     _last_progress = {}
-    # Crash-recovery alert (Template C, blue/info): announce we restored
-    # from a checkpoint AFTER a previous run was interrupted. Renders in
-    # the recovered phase's dropdown via the FE pipeline_recovered handler.
-    # [Dismiss] only — no retry/skip; the auto-recover already happened.
-    if cp:
-        emit_event("pipeline_recovered",
-                   phase=cp.get("phase", 0),
-                   reason="auto_recover_after_crash",
-                   message="Recovered from previous run — resuming from checkpoint.",
-                   details=(f"Phase {cp.get('phase', '?')} was interrupted; the orchestrator "
-                            "restored the saved state and is continuing."),
-                   actions=[{"id": "dismiss", "label": "Dismiss", "style": "default",
-                             "command": {"action": "dismiss_alert"}}],
-                   dismissible=True,
-                   alert_id=f"recovered_p{cp.get('phase', 0)}")
+    # C3 (2026-04-28): dropped the `pipeline_recovered` info banner — crash
+    # recovery is autonomous-first now (checkpoint enrichment + tier
+    # framework handle it without user intervention). Only `pipeline_resumed`
+    # is emitted for telemetry / chat narrator.
     emit_event("pipeline_resumed", phase=_runtime.phase,
                restored=list(restored.keys()))
     clear_pause_checkpoint(queue_dir)
@@ -3198,7 +3352,12 @@ _LINK_VALIDATORS = {
     "claude":  lambda u: ("claude.site/artifacts/" in u or "claude.site/" in u),
     "notebooklm": lambda u: "notebooklm.google.com/notebook/" in u,
     "youtube": lambda u: ("youtu.be/" in u or "youtube.com/watch?v=" in u),
-    "gdocs":   lambda u: "docs.google.com/document/" in u,
+    # Require the `/document/d/` doc-id segment — `/document/` alone
+    # matches the home page (`/document/u/0/?usp=docs_home`), the create
+    # tab (`/document/create`), and other non-doc surfaces. Without `/d/`
+    # the validator was letting through pages that look like docs but
+    # have no doc-id, causing P5 to early-return as if creation failed.
+    "gdocs":   lambda u: "docs.google.com/document/d/" in u,
 }
 
 # Known BAD URLs that must NEVER be emitted as links
@@ -3246,15 +3405,22 @@ def emit_validated_link(phase: int, agent: str, url: str, label: str):
 
 
 class LinkResult:
-    """Result of a link extraction attempt."""
-    __slots__ = ("url", "label", "platform", "verified", "error")
+    """Result of a link extraction attempt.
 
-    def __init__(self, url="", label="", platform="", verified=False, error=""):
+    cua_attempted: True if the extractor's internal CUA fallback ran. Lets
+    callers (extract_and_record_agent Step 4b) skip a SECOND CUA pass on
+    the same UI surface when the first already had a turn — avoids
+    wonky-modal misclicks on share dialogs (caused Gemini tab spam).
+    """
+    __slots__ = ("url", "label", "platform", "verified", "error", "cua_attempted")
+
+    def __init__(self, url="", label="", platform="", verified=False, error="", cua_attempted=False):
         self.url = url
         self.label = label
         self.platform = platform
         self.verified = verified
         self.error = error
+        self.cua_attempted = cua_attempted
 
     def to_dict(self):
         return {"url": self.url, "label": self.label, "verified": self.verified}
@@ -3275,6 +3441,7 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
     the chat URL without burning 90s across retries."""
     page = browser.page
     url = await browser.current_url() or ""
+    cua_attempted = False
     try:
         # 2026-04-26: close-first preamble — any open citations panel,
         # plan-item drawer, or modal can intercept the Share button click.
@@ -3371,12 +3538,10 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
         # for autonomous promotion.
         if "chatgpt.com/share" not in url:
             log(f"[{label}] CUA fallback for share link...")
-            try:
-                emit_event("tier_transition", phase=2, agent="chatgpt",
-                           op="p2_share_extract", from_tier="dom",
-                           to_tier="cua", reason="iframe_share_intercept")
-            except Exception:
-                pass
+            cua_attempted = True
+            emit_tier_transition(phase=2, agent="chatgpt",
+                op="p2_share_extract", from_tier="dom", to_tier="cua",
+                reason="iframe_share_intercept")
             async def _chatgpt_share_cua():
                 return await asyncio.wait_for(
                     agent_loop(cua_client, browser,
@@ -3423,14 +3588,23 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
                 except (asyncio.TimeoutError, Exception):
                     pass
         verified = "chatgpt.com/share" in url
-        return LinkResult(url=url, label=label, platform="chatgpt", verified=verified)
+        return LinkResult(url=url, label=label, platform="chatgpt", verified=verified,
+                          cua_attempted=cua_attempted)
     except Exception as e:
         log(f"Link extraction failed (ChatGPT): {e}", "WARN")
-        return LinkResult(url=url, label=label, platform="chatgpt", error=str(e))
+        return LinkResult(url=url, label=label, platform="chatgpt", error=str(e),
+                          cua_attempted=cua_attempted)
 
 
 async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Research", verbose=False):
     """Extract shareable Gemini conversation link with public visibility.
+
+    Architecture: DOM-once → CUA. Each DOM stage (open dialog, click
+    public-link submenu, set visibility, read URL) makes ONE click attempt
+    using a selector fallback chain — not multi-attempt. If the URL
+    isn't verified after the DOM pass, ONE CUA mission (90 s budget) gets
+    a chance. `cua_attempted` flag stops the caller (extract_and_record_agent
+    Step 4b) from running a SECOND redundant CUA pass.
 
     Hardened 2026-04-25:
     - Added "Export & save" label variants (current Gemini Deep Research
@@ -3444,6 +3618,7 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
     page = browser.page
     url = await browser.current_url() or ""
     last_stage = "init"
+    cua_attempted = False
     try:
         # 2026-04-26: close-first preamble — close any open dialog/drawer
         # that could intercept the Share & Export click. Same pattern as
@@ -3624,6 +3799,7 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
             # consumed entirely by a stuck CUA loop and still time out, with
             # the page never getting to even check the clipboard.
             last_stage = "cua_fallback"
+            cua_attempted = True
             try:
                 result = await asyncio.wait_for(
                     agent_loop(cua_client, browser,
@@ -3658,10 +3834,12 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
         # this gate fails.
         _lu = url.lower()
         verified = ("gemini.google.com/share" in _lu) or ("g.co/gemini" in _lu)
-        return LinkResult(url=url, label=label, platform="gemini", verified=verified)
+        return LinkResult(url=url, label=label, platform="gemini", verified=verified,
+                          cua_attempted=cua_attempted)
     except Exception as e:
         return LinkResult(url=url, label=label, platform="gemini",
-                          error=f"{last_stage}: {type(e).__name__}: {e}")
+                          error=f"{last_stage}: {type(e).__name__}: {e}",
+                          cua_attempted=cua_attempted)
 
 
 async def extract_share_link_claude(browser, cua_client, label="Claude Deep Research", verbose=False):
@@ -3683,6 +3861,7 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
     page = browser.page
     url = await browser.current_url() or ""
     last_stage = "init"
+    cua_attempted = False
     try:
         # Step 1: close any currently-open artifact panel and open the
         # LAST artifact in the conversation (the deep-research output).
@@ -3728,6 +3907,7 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
             # Fallback: full CUA flow, capped at 90s so a stuck loop doesn't
             # blow the inline 90s outer budget at the call-site.
             last_stage = "cua_fallback"
+            cua_attempted = True
             try:
                 result = await asyncio.wait_for(
                     agent_loop(cua_client, browser,
@@ -3758,10 +3938,12 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
         # the user's own chat (not a public share) — the Phase 2 outer loop will
         # fall back to it silently with verified=False when this gate fails.
         verified = "claude.site" in url.lower()
-        return LinkResult(url=url, label=label, platform="claude", verified=verified)
+        return LinkResult(url=url, label=label, platform="claude", verified=verified,
+                          cua_attempted=cua_attempted)
     except Exception as e:
         return LinkResult(url=url, label=label, platform="claude",
-                          error=f"{last_stage}: {type(e).__name__}: {e}")
+                          error=f"{last_stage}: {type(e).__name__}: {e}",
+                          cua_attempted=cua_attempted)
 
 
 async def _set_nlm_public_and_get_link(page, label):
@@ -3975,16 +4157,46 @@ async def _ensure_gdoc_public(page) -> bool:
             return false;
         }""")
         await asyncio.sleep(1)
-        # Ensure role = Editor (not Viewer/Commenter)
+        # Ensure role = Editor on the GENERAL-ACCESS row (not on a
+        # member-list row — that would demote a real share recipient).
+        # Scope: find the "General access" label, then look for a
+        # role dropdown that's a SIBLING/DESCENDANT of its container.
         await page.evaluate("""() => {
-            const btns = document.querySelectorAll('button, [role="combobox"]');
+            // Find the "General access" label first
+            const labels = document.querySelectorAll('span, div, p, h2, h3, h4');
+            let generalRow = null;
+            for (const l of labels) {
+                const t = (l.innerText || l.textContent || '').trim().toLowerCase();
+                if (t === 'general access' || t.startsWith('general access')) {
+                    // Walk up to a container that holds the role button
+                    let container = l;
+                    for (let i = 0; i < 6 && container; i++) {
+                        const roleBtn = container.querySelector(
+                            'button, [role="combobox"], [role="button"]'
+                        );
+                        if (roleBtn) {
+                            const rt = (roleBtn.innerText || '').toLowerCase();
+                            if (rt.includes('viewer') || rt.includes('commenter')
+                                || rt.includes('editor')) {
+                                generalRow = container;
+                                break;
+                            }
+                        }
+                        container = container.parentElement;
+                    }
+                    if (generalRow) break;
+                }
+            }
+            if (!generalRow) return false;
+            const btns = generalRow.querySelectorAll('button, [role="combobox"]');
             for (const b of btns) {
                 const txt = (b.innerText || b.textContent || '').toLowerCase();
                 if (txt.includes('viewer') || txt.includes('commenter')) {
                     b.click();
-                    return;
+                    return true;
                 }
             }
+            return false;  // already Editor — no-op
         }""")
         await asyncio.sleep(0.6)
         await page.evaluate("""() => {
@@ -4128,7 +4340,9 @@ async def extract_gdoc_url(browser, page=None, **_):
             url = ""
     else:
         url = (await browser.current_url()) or ""
-    verified = "docs.google.com/document" in url
+    # Require `/document/d/` so we don't verify the home page or the
+    # `/document/create` redirect as a real doc URL.
+    verified = "docs.google.com/document/d/" in url
     return LinkResult(url=url, label="Google Doc", platform="gdoc", verified=verified)
 
 
@@ -4222,217 +4436,263 @@ class BriefArtifact:
         self.extracted_at = extracted_at or int(time.time() * 1000)
 
 
-async def verified_paste_brief(page, brief_text, platform, label, max_retries=3):
-    """Paste brief into the active textarea and verify it was pasted completely.
-    Returns True on success. Uses multiple strategies: CDP clipboard, JS injection,
-    keyboard insert_text, and navigator.clipboard API.
+# ─────────────────────────────────────────────────────────────────────
+# DOM-tier paste helpers. Single attempt + CUA fallback contract.
+# verified_paste_brief returns False on DOM failure → caller runs
+# cua_paste_fallback. No internal retries, no reload/restart loops.
+# ─────────────────────────────────────────────────────────────────────
 
-    For Claude (which auto-converts large pastes to file attachments), also accepts
-    attachment presence as a valid paste signal and clears any duplicates before retry."""
-    selectors = ['#prompt-textarea', 'div[contenteditable="true"]', 'textarea', '.ProseMirror',
-                 'div[contenteditable="true"][data-placeholder]', 'rich-textarea div[contenteditable="true"]',
-                 '[aria-label*="message"]', '[aria-label*="Message"]']
+# JS that finds the longest visible composer-like element and returns its
+# text length. Used for verifying both DOM and CUA-assisted pastes.
+_VERIFY_PASTE_JS = """() => {
+    const candidates = [
+        '#prompt-textarea',
+        'rich-textarea div[contenteditable="true"]',
+        '.ProseMirror',
+        'div[contenteditable="true"][data-placeholder]',
+        'div[contenteditable="true"]',
+        'textarea[placeholder]',
+        'textarea',
+    ];
+    let best = 0;
+    for (const sel of candidates) {
+        for (const el of document.querySelectorAll(sel)) {
+            if (el.offsetParent === null) continue;  // visible only
+            const txt = (el.innerText || el.value || el.textContent || '');
+            if (txt.length > best) best = txt.length;
+        }
+    }
+    return best;
+}"""
+
+# Claude attachment-count probe — large pastes auto-convert into one tile.
+_CLAUDE_ATTACH_COUNT_JS = """() => {
+    const tiles = document.querySelectorAll(
+        '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i]'
+    );
+    let c = 0;
+    for (const t of tiles) if (t.offsetParent !== null) c++;
+    return c;
+}"""
+
+# Per-platform composer selectors. Each list leads with the platform's
+# composer-specific selector; the broad `div[contenteditable="true"]`
+# lives last as a fallback. _GENERIC is the unknown-platform default.
+_PASTE_SELECTORS = {
+    "gemini": ['rich-textarea div[contenteditable="true"]',
+               'div[contenteditable="true"][data-placeholder]',
+               'div[contenteditable="true"]',
+               'textarea', '[aria-label*="prompt"]'],
+    "chatgpt": ['#prompt-textarea', 'textarea',
+                'div[contenteditable="true"]', '.ProseMirror'],
+    "claude": ['.ProseMirror', 'div[contenteditable="true"]', 'textarea'],
+}
+_PASTE_SELECTORS_GENERIC = ['#prompt-textarea',
+                            'rich-textarea div[contenteditable="true"]',
+                            '.ProseMirror',
+                            'div[contenteditable="true"][data-placeholder]',
+                            'div[contenteditable="true"]',
+                            'textarea', '[aria-label*="message"]', '[aria-label*="Message"]']
+
+
+async def _verify_paste_landed(page, brief_text, platform, label, source="dom"):
+    """Read the composer's text length and return True iff ≥ 90% of brief.
+    For Claude, a single attachment tile also counts as success (large
+    pastes auto-convert). `source` is just a tag for the success log line."""
     is_claude = platform.lower() == "claude"
+    try:
+        content_len = await page.evaluate(_VERIFY_PASTE_JS)
+        expected = len(brief_text)
+        ratio = content_len / expected if expected > 0 else 0
+        if is_claude and ratio < 0.90:
+            try:
+                attach_count = await page.evaluate(_CLAUDE_ATTACH_COUNT_JS)
+                if attach_count == 1:
+                    log(f"[{label}] Brief pasted ✓ ({source}, 1 attachment tile, Claude auto-convert)")
+                    return True
+                if attach_count > 1:
+                    log(f"[{label}] Claude shows {attach_count} attachments (duplicate)", "WARN")
+            except Exception:
+                pass
+        if ratio >= 0.90:
+            log(f"[{label}] Brief pasted ✓ ({source}, {content_len}/{expected} chars, {ratio:.0%})")
+            return True
+        log(f"[{label}] Paste verify ({source}): {content_len}/{expected} chars ({ratio:.0%})", "WARN")
+    except Exception as e:
+        log(f"[{label}] Paste verify error ({source}): {e}", "WARN")
+    return False
 
+
+async def _grant_clipboard_permission(page):
+    """Best-effort CDP clipboard permission grant. Silent on failure —
+    Strategy still has the keyboard-typing fallback."""
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        await cdp.send("Browser.grantPermissions",
+                       {"permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]})
+        await cdp.detach()
+    except Exception:
+        pass
+
+
+async def verified_paste_brief(page, brief_text, platform, label, max_retries=1):
+    """Paste the brief into the platform's composer and verify it landed.
+
+    DOM-tier contract (1 attempt by default). Two strategies inside ONE
+    attempt: CDP clipboard + Ctrl+V (fast) → real keyboard typing
+    (reliable, slower). Returns True on verified paste, False to hand
+    off to `cua_paste_fallback` at the call site.
+
+    For Claude, accepts a single attachment tile as success (large pastes
+    auto-convert).
+
+    `max_retries` defaults to 1 — multiple DOM retries here amplified the
+    risk of side-effects (off-target clicks → tab spam, framework state
+    corruption). Callers should escalate to CUA on first DOM failure
+    rather than retry DOM.
+    """
+    is_claude = platform.lower() == "claude"
     platform_key = (platform or "").strip().lower()
+    selectors = _PASTE_SELECTORS.get(platform_key, _PASTE_SELECTORS_GENERIC)
+
     for attempt in range(1, max_retries + 1):
-        pasted = False
-        # Narrate each outer-loop attempt to the frontend. Per-strategy emits
-        # would be too noisy (4 strategies × 3 attempts = 12 events per paste),
-        # so we emit once per outer attempt with a "retrying" badge. First
-        # attempt is silent; retries appear as "X: paste retry N/M…".
         if attempt > 1:
-            # Per-strategy emits would be too noisy. Inline retries are
-            # silent — the round-robin's agent_progress narration shows the
-            # higher-level state and fail_agent surfaces if all retries fail.
             log(f"[{label}] paste retry {attempt}/{max_retries}", "INFO")
-        # Claude: before retry, delete any existing attachments to prevent duplicates
+        # Claude: clear stale attachments before retry
         if is_claude and attempt > 1:
             try:
                 removed = await page.evaluate("""() => {
-                    // Find attachment tiles and click their X/remove buttons
-                    const removeBtns = document.querySelectorAll(
-                        'button[aria-label*="Remove"], button[aria-label*="Delete"], button[data-testid*="remove"]'
+                    const btns = document.querySelectorAll(
+                        'button[aria-label*="Remove"], button[aria-label*="Delete"], '
+                        + 'button[data-testid*="remove"]'
                     );
-                    let count = 0;
-                    for (const b of removeBtns) {
-                        if (b.offsetParent !== null) { b.click(); count++; }
-                    }
-                    return count;
+                    let n = 0;
+                    for (const b of btns) if (b.offsetParent !== null) { b.click(); n++; }
+                    return n;
                 }""")
                 if removed:
                     log(f"[{label}] Cleared {removed} stale attachment(s) before retry")
                     await asyncio.sleep(0.5)
             except Exception:
                 pass
-        # Ensure page has focus (critical for clipboard access in new tabs)
+        # Page focus is needed for clipboard access in new tabs.
         try:
             await page.bring_to_front()
             await asyncio.sleep(0.5)
         except Exception:
             pass
 
+        # Find composer (first matching selector wins).
+        ta = None
         for sel in selectors:
             try:
-                ta = await page.wait_for_selector(sel, timeout=3000)
-                if not ta:
-                    continue
-                await ta.click()
-                await asyncio.sleep(0.3)
-                await page.keyboard.press("Control+a")
-                await asyncio.sleep(0.1)
-
-                # Strategy 1: CDP clipboard (bypasses permissions, most reliable)
-                try:
-                    cdp = await page.context.new_cdp_session(page)
-                    await cdp.send("Browser.grantPermissions", {"permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]})
-                    await cdp.detach()
-                except Exception:
-                    pass
-                try:
-                    await page.evaluate("text => navigator.clipboard.writeText(text)", brief_text)
-                    await asyncio.sleep(0.3)
-                    await page.keyboard.press("Control+v")
-                    await asyncio.sleep(2)
-                    pasted = True
+                ta = await page.wait_for_selector(sel, timeout=1500)
+                if ta:
                     break
-                except Exception:
-                    pass
-
-                # Strategy 2: Direct JS injection into contenteditable/textarea
-                if not pasted:
-                    try:
-                        injected = await page.evaluate("""(text) => {
-                            const ta = document.querySelector('#prompt-textarea, div[contenteditable="true"], textarea, .ProseMirror');
-                            if (!ta) return false;
-                            if (ta.tagName === 'TEXTAREA' || ta.tagName === 'INPUT') {
-                                const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-                                nativeSet.call(ta, text);
-                                ta.dispatchEvent(new Event('input', { bubbles: true }));
-                                return true;
-                            } else {
-                                ta.focus();
-                                ta.innerHTML = '';
-                                // Use insertText to trigger React/framework state updates
-                                document.execCommand('selectAll', false, null);
-                                document.execCommand('insertText', false, text);
-                                return true;
-                            }
-                        }""", brief_text)
-                        if injected:
-                            await asyncio.sleep(1)
-                            pasted = True
-                            break
-                    except Exception:
-                        pass
-
-                # Strategy 3: Playwright keyboard.insert_text (no clipboard needed,
-                # but sends everything as one big inserted blob — some composers
-                # like Gemini's rich-textarea don't always update controller state
-                # on a single insert event).
-                if not pasted:
-                    try:
-                        await ta.click()
-                        await page.keyboard.press("Control+a")
-                        await asyncio.sleep(0.1)
-                        await page.keyboard.insert_text(brief_text)
-                        await asyncio.sleep(1.5)
-                        pasted = True
-                        break
-                    except Exception:
-                        pass
-
-                # Strategy 4: Real keyboard type — dispatches a genuine keydown/
-                # keypress/keyup per character, which any controlled composer
-                # has to handle (that's the contract of a browser). Slower
-                # (~0.5–2s for typical briefs) but virtually always works, and
-                # it's the only thing that reliably gets past Gemini's
-                # rich-textarea when CDP paste / execCommand / insert_text all
-                # leave the composer visually empty.
-                if not pasted:
-                    try:
-                        await ta.click()
-                        await page.keyboard.press("Control+a")
-                        await asyncio.sleep(0.1)
-                        await page.keyboard.press("Delete")
-                        await asyncio.sleep(0.1)
-                        # delay=2ms per char keeps it realistic without adding
-                        # seconds to the run (a 5k-char brief is ~10s of typing).
-                        await page.keyboard.type(brief_text, delay=2)
-                        await asyncio.sleep(1.5)
-                        pasted = True
-                        break
-                    except Exception:
-                        pass
-
             except Exception:
                 continue
-
-        if not pasted:
-            log(f"[{label}] Paste attempt {attempt}/{max_retries}: no textarea found or all strategies failed", "WARN")
-            await asyncio.sleep(1)
+        if not ta:
+            log(f"[{label}] Composer not found (attempt {attempt}/{max_retries})", "WARN")
+            await asyncio.sleep(0.5)
             continue
 
-        # Verify: scrape textarea and check length. Claude: also accept attachment tile as success.
-        # For Gemini, `div[contenteditable="true"]` can match a non-composer
-        # sidebar element; also try the explicit rich-textarea path so we
-        # don't falsely fail a successful paste just because we read the
-        # wrong container.
+        # Strategy A: CDP clipboard + Ctrl+V (fast).
         try:
-            content_len = await page.evaluate("""() => {
-                const candidates = [
-                    '#prompt-textarea',
-                    'rich-textarea div[contenteditable="true"]',
-                    '.ProseMirror',
-                    'div[contenteditable="true"][data-placeholder]',
-                    'div[contenteditable="true"]',
-                    'textarea[placeholder]',
-                    'textarea',
-                ];
-                let best = 0;
-                for (const sel of candidates) {
-                    for (const el of document.querySelectorAll(sel)) {
-                        if (el.offsetParent === null) continue;  // must be visible
-                        const txt = (el.innerText || el.value || el.textContent || '');
-                        if (txt.length > best) best = txt.length;
-                    }
-                }
-                return best;
-            }""")
-            expected = len(brief_text)
-            ratio = content_len / expected if expected > 0 else 0
-            # Claude: if text is small but an attachment exists, that's a successful paste (auto-converted)
-            if is_claude and ratio < 0.90:
-                try:
-                    attach_count = await page.evaluate("""() => {
-                        // Claude pasted-as-attachment tiles have file-like preview elements
-                        const tiles = document.querySelectorAll('[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i]');
-                        let count = 0;
-                        for (const t of tiles) {
-                            if (t.offsetParent !== null) count++;
-                        }
-                        return count;
-                    }""")
-                    if attach_count == 1:
-                        log(f"[{label}] Brief pasted ✓ (1 attachment tile, Claude auto-convert)")
-                        return True
-                    if attach_count > 1:
-                        log(f"[{label}] Claude shows {attach_count} attachments (duplicate) — retry will clear", "WARN")
-                        continue
-                except Exception:
-                    pass
-            if ratio >= 0.90:
-                log(f"[{label}] Brief pasted ✓ ({content_len}/{expected} chars, {ratio:.0%})")
-                return True
-            else:
-                log(f"[{label}] Paste attempt {attempt}: only {content_len}/{expected} chars ({ratio:.0%})", "WARN")
+            await ta.click()
+            await asyncio.sleep(0.3)
+            await page.keyboard.press("Control+a")
+            await asyncio.sleep(0.1)
+            await _grant_clipboard_permission(page)
+            await page.evaluate("text => navigator.clipboard.writeText(text)", brief_text)
+            await asyncio.sleep(0.3)
+            await page.keyboard.press("Control+v")
+            await asyncio.sleep(2)
         except Exception as e:
-            log(f"[{label}] Paste verify failed: {e}", "WARN")
+            log(f"[{label}] Strategy A (clipboard) raised: {e}", "WARN")
 
+        if await _verify_paste_landed(page, brief_text, platform, label, source="clipboard"):
+            return True
+
+        # Strategy B: real keyboard typing (slower — ~60s for a 30K-char
+        # brief — but actually dispatches genuine keydown/keypress events
+        # that any controlled composer must handle). Gated to Gemini only
+        # because that's where clipboard paste leaves the rich-textarea
+        # visually empty due to framework-state issues; ChatGPT/Claude
+        # accept clipboard reliably, so a failed clipboard verify there
+        # is more likely a wrong-element-read problem that escalating to
+        # CUA recovers faster than burning 60s on keyboard typing.
+        if platform_key == "gemini":
+            try:
+                await ta.click()
+                await asyncio.sleep(0.2)
+                await page.keyboard.press("Control+a")
+                await asyncio.sleep(0.1)
+                await page.keyboard.press("Delete")
+                await asyncio.sleep(0.1)
+                await page.keyboard.type(brief_text, delay=2)
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                log(f"[{label}] Strategy B (keyboard) raised: {e}", "WARN")
+                await asyncio.sleep(1)
+                continue
+
+            if await _verify_paste_landed(page, brief_text, platform, label, source="keyboard"):
+                return True
         await asyncio.sleep(1)
 
-    log(f"[{label}] Brief paste failed after {max_retries} retries", "ERROR")
+    log(f"[{label}] DOM paste failed after {max_retries} attempt(s) — caller should run CUA fallback", "WARN")
     return False
+
+
+async def cua_paste_fallback(page, browser, cua_client, brief_text, platform, label, verbose=False):
+    """CUA-assisted paste: CUA focuses the composer (one persistent mission
+    within budget), Python pastes via clipboard. CUA can't reliably type
+    a 30K-char brief, so we delegate ONLY focus to CUA.
+
+    Tier-transition event is emitted so Track-A telemetry sees the DOM→CUA
+    handoff. Returns True on verified paste, False otherwise — caller
+    fails the agent on False.
+    """
+    if not cua_client or not browser:
+        log(f"[{label}] CUA paste fallback skipped (no client/browser)", "WARN")
+        return False
+    log(f"[{label}] DOM paste exhausted — handing off to CUA")
+    emit_tier_transition(phase=2, agent=platform.lower(),
+        op="brief_paste", from_tier="dom", to_tier="cua",
+        reason="dom_paste_unverified")
+
+    # CUA focus mission (45s budget, ~4 iterations).
+    try:
+        await browser.switch_to_page(page)
+        await asyncio.wait_for(
+            agent_loop(cua_client, browser,
+                "You are focusing a chat composer for a paste operation. "
+                "Click the chat input area at the bottom of the page so the "
+                "cursor lands in it. Stop after focusing — do NOT type or "
+                "paste anything. The Python code will handle the actual "
+                "paste from the clipboard.",
+                f"Click on the message input area at the bottom of this "
+                f"{platform} page. The cursor should be in the input. "
+                f"Then STOP — do not type or paste.",
+                model=CUA_MODEL, max_iterations=4, verbose=verbose,
+                target_page=page),
+            timeout=45.0,
+        )
+    except (asyncio.TimeoutError, Exception) as e:
+        log(f"[{label}] CUA composer-focus failed: {e}", "WARN")
+        return False
+
+    # Python pastes via clipboard.
+    try:
+        await _grant_clipboard_permission(page)
+        await page.evaluate("text => navigator.clipboard.writeText(text)", brief_text)
+        await asyncio.sleep(0.3)
+        await page.keyboard.press("Control+v")
+        await asyncio.sleep(2)
+    except Exception as e:
+        log(f"[{label}] CUA-assisted clipboard paste raised: {e}", "WARN")
+
+    return await _verify_paste_landed(page, brief_text, platform, label, source="cua-assisted")
 
 
 # ── Event Emission (dual-write: disk + Firestore) ────────────────────────────
@@ -4475,6 +4735,13 @@ def emit_event(event_type, phase=None, agent=None, **data):
         event["agent"] = agent
     if data:
         event["data"] = data
+    # Track last-emitted event id for Phoenix-resume dedup. Cheap monotonic
+    # id (timestamp-ms + type) is enough — FE just needs a "have we seen
+    # this one?" cursor, not a globally-unique key.
+    try:
+        _runtime.last_event_id = f"{event['timestamp']}_{event_type}"
+    except Exception:
+        pass
     # Write to disk (local debugging + resume)
     try:
         with open(_tracks_dir / "events.jsonl", "a", encoding="utf-8") as f:
@@ -6988,6 +7255,23 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
 class Browser:
     """Playwright persistent Chrome context — proven from original research.py."""
 
+    # Hosts where popups are allowed to live. Anything else opened during a
+    # run (linkedin/x/reddit/facebook from Gemini's share dialog social
+    # icons, ads, third-party redirects we don't drive) gets auto-closed
+    # by _guard_popup. Subdomain match: host == ALLOWED or host endswith
+    # "." + ALLOWED. `google.com` covers the OAuth/sign-in chain.
+    _POPUP_ALLOWED_HOSTS = frozenset({
+        "chatgpt.com", "openai.com", "auth.openai.com",
+        "claude.ai", "claude.site", "anthropic.com",
+        "gemini.google.com", "g.co",
+        "docs.google.com", "drive.google.com",
+        "accounts.google.com", "myaccount.google.com",
+        "mail.google.com",
+        "notebooklm.google.com",
+        "studio.youtube.com", "youtube.com",
+        "google.com",
+    })
+
     def __init__(self, profile_dir, headless=False):
         self.profile_dir = str(profile_dir)
         self.headless = headless
@@ -6995,6 +7279,9 @@ class Browser:
         self.context = None
         self.page = None
         self._upload_queue = []
+        # Tabs opened by us via new_tab() get registered here. Anything
+        # NOT here AND not on _POPUP_ALLOWED_HOSTS is auto-closed.
+        self._known_pages: set = set()
 
     async def start(self):
         # Kill only orphaned Playwright Chrome from OUR profile directory.
@@ -7091,12 +7378,65 @@ class Browser:
             self.page = self.context.pages[0]
         else:
             self.page = await self.context.new_page()
+        self._known_pages.add(self.page)
         self.context.on("page", self._attach_file_handler)
+        self.context.on("page", self._guard_popup)
         self._attach_file_handler(self.page)
         log("Browser started (stealth: patchright + channel=chrome)")
 
     def _attach_file_handler(self, page):
         page.on("filechooser", self._on_file_chooser)
+
+    async def _guard_popup(self, page):
+        """Auto-close popup tabs that aren't on the agent host allow-list.
+
+        Fires for BOTH our own new_tab() calls AND spontaneous popups
+        (social-share window.open, target=_blank). Polls page.url for up to
+        ~4s waiting for the URL to settle past about:blank — then matches
+        the host against the allow-list. Tabs explicitly registered in
+        _known_pages by new_tab() are never closed (belt-and-suspenders for
+        race cases).
+
+        Allow-list covers every host we drive a flow through (chatgpt/
+        claude/gemini/notebooklm/youtube/gmail/gdocs/google-auth). Anything
+        else (linkedin/facebook/x/reddit etc. from Gemini's share dialog
+        social icons, ads, OAuth redirects we don't drive) gets closed.
+        """
+        try:
+            if page in self._known_pages:
+                return
+            url = ""
+            for _ in range(8):  # ~4s window for URL to settle
+                try:
+                    url = page.url or ""
+                except Exception:
+                    return
+                if url and url != "about:blank":
+                    break
+                await asyncio.sleep(0.5)
+            if not url or url == "about:blank":
+                # Stayed at about:blank — likely a still-loading agent tab.
+                # Don't close; the caller's flow will manage it.
+                return
+            try:
+                from urllib.parse import urlparse
+                host = (urlparse(url).hostname or "").lower()
+            except Exception:
+                return
+            host_norm = host[4:] if host.startswith("www.") else host
+            if host_norm and any(host_norm == a or host_norm.endswith("." + a)
+                                  for a in self._POPUP_ALLOWED_HOSTS):
+                # Treat as legitimate — register so a subsequent event won't
+                # re-evaluate it, and exit.
+                self._known_pages.add(page)
+                return
+            log(f"[popup-guard] Closing off-allowlist popup: {host} ({url[:80]})", "INFO")
+            try:
+                await page.close()
+            except Exception as e:
+                log(f"[popup-guard] close failed: {e}", "WARN")
+        except Exception as e:
+            log(f"[popup-guard] error: {e}", "WARN")
 
     async def _on_file_chooser(self, file_chooser):
         if self._upload_queue:
@@ -7190,6 +7530,16 @@ class Browser:
     async def new_tab(self, url=None):
         """Open new tab. Sets self.page to the new tab."""
         self.page = await self.context.new_page()
+        # Register BEFORE goto so the popup guard's race window (between
+        # context "page" event firing and goto completing) sees this as
+        # a known agent tab and skips closing it.
+        self._known_pages.add(self.page)
+        # Discard from set on close so _known_pages doesn't grow unbounded
+        # across hard-retries that close+reopen agent tabs.
+        try:
+            self.page.on("close", lambda p: self._known_pages.discard(p))
+        except Exception:
+            pass
         if url:
             log(f"New tab: {url}")
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -8207,12 +8557,9 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             and cua_client and browser):
                         log(f"[{label}] DOM missed strip 2x — escalating to CUA tier-3 "
                             f"(elapsed={elapsed_sec}s)")
-                        try:
-                            emit_event("tier_transition", phase=phase, agent="chatgpt",
-                                       op="open_activity_panel_p1", from_tier="dom",
-                                       to_tier="cua", reason="dom_2_misses")
-                        except Exception:
-                            pass
+                        emit_tier_transition(phase=phase, agent="chatgpt",
+                            op="open_activity_panel_p1", from_tier="dom",
+                            to_tier="cua", reason="dom_2_misses")
                         _panel_cua_attempts = 1
                         async def _cgpt_p1_cua():
                             return await asyncio.wait_for(
@@ -8852,6 +9199,7 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         share_kind = "conversation"
         share_verified = False
         share_label = f"{name} conversation"
+        inner_cua_attempted = False
         if share_extractor:
             _share_t0 = time.time()
             try:
@@ -8874,6 +9222,13 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                     err = (link_res.error if link_res else "no result")
                     log(f"[{name}] Inline share-link unverified ({err}, {_elapsed_share:.1f}s) "
                         f"— falling back to conversation URL silently", "INFO")
+                # Capture whether the inner extractor's CUA fallback already
+                # ran — Step 4b below skips when True to avoid a wonky-modal
+                # double-CUA pass (was a tab-spam contributor on Gemini's
+                # share dialog, where the dialog renders social-share icons
+                # that CUA misclicks open as new tabs).
+                if link_res and getattr(link_res, "cua_attempted", False):
+                    inner_cua_attempted = True
             except asyncio.TimeoutError:
                 log(f"[{name}] Inline share-link timed out (90s) "
                     f"— falling back to conversation URL silently", "INFO")
@@ -8881,27 +9236,26 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                 log(f"[{name}] Inline share-link errored ({_e}) "
                     f"— falling back to conversation URL silently", "INFO")
         # ── Step 4b — Inline CUA share fallback (Gemini/Claude only) ──
-        # If the DOM-tier extractor didn't return a verified public URL,
-        # try CUA on the same page (no tab switch, no revisit). Wrapped in
+        # If the DOM-tier extractor didn't return a verified public URL AND
+        # its inner CUA fallback hasn't already run, try CUA here on the
+        # same page (no tab switch, no revisit). Wrapped in
         # _shadow_observed_cua so Vision (tier-2 shadow) observes in
         # parallel and Track A telemetry accumulates on the new "p2-share"
         # hotspot. ChatGPT is excluded here — extract_share_link_chatgpt
         # already runs its own CUA pass internally (research.py:3340-3379)
         # and is wrapped in shadow at that site, so a second pass would
-        # double the budget without new information.
-        if (not share_verified) and cua_client and n_chars > 0 and name != "ChatGPT":
+        # double the budget without new information. Same logic now applies
+        # to Gemini/Claude via inner_cua_attempted.
+        if ((not share_verified) and (not inner_cua_attempted) and
+                cua_client and n_chars > 0 and name != "ChatGPT"):
             cua_share_prompt = {
                 "Gemini": PROMPT_SHARE_GEMINI,
                 "Claude": PROMPT_PUBLISH_CLAUDE,
             }.get(name)
             if cua_share_prompt:
-                try:
-                    emit_event("tier_transition", phase=2, agent=agent_key,
-                               op="p2_share_extract", from_tier="dom",
-                               to_tier="cua",
-                               reason="dom_share_extractor_unverified")
-                except Exception:
-                    pass
+                emit_tier_transition(phase=2, agent=agent_key,
+                    op="p2_share_extract", from_tier="dom", to_tier="cua",
+                    reason="dom_share_extractor_unverified")
                 _cua_t0 = time.time()
                 async def _p2_share_cua():
                     return await asyncio.wait_for(
@@ -9633,12 +9987,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         and cua_client):
                     log(f"[Claude] DOM missed artifact 2x — escalating to CUA tier-3 "
                         f"(cycle={p.get('poll_cycles')})")
-                    try:
-                        emit_event("tier_transition", phase=2, agent="claude",
-                                   op="open_artifact_1", from_tier="dom",
-                                   to_tier="cua", reason="dom_2_misses")
-                    except Exception:
-                        pass
+                    emit_tier_transition(phase=2, agent="claude",
+                        op="open_artifact_1", from_tier="dom", to_tier="cua",
+                        reason="dom_2_misses")
                     p["claude_artifact_cua_attempts"] = 1
                     async def _claude_p2_cua():
                         return await asyncio.wait_for(
@@ -9747,12 +10098,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         and cua_client):
                     log(f"[ChatGPT] DOM missed strip 2x — escalating to CUA tier-3 "
                         f"(cycle={p.get('poll_cycles')})")
-                    try:
-                        emit_event("tier_transition", phase=2, agent="chatgpt",
-                                   op="open_activity_panel", from_tier="dom",
-                                   to_tier="cua", reason="dom_2_misses")
-                    except Exception:
-                        pass
+                    emit_tier_transition(phase=2, agent="chatgpt",
+                        op="open_activity_panel", from_tier="dom", to_tier="cua",
+                        reason="dom_2_misses")
                     p["chatgpt_panel_cua_attempts"] = 1
                     async def _cgpt_p2_cua():
                         return await asyncio.wait_for(
@@ -12772,11 +13120,15 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     model=CUA_MODEL, max_iterations=6, verbose=verbose)
         else:
             log(f"[{label}] Brief attachment failed — falling back to inline paste", "WARN")
-            paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
+            # DOM-once → CUA contract.
+            paste_ok = await verified_paste_brief(page, brief, platform, label)
             if not paste_ok:
-                log(f"[{label}] CRITICAL: Both attach and paste failed — skipping this agent", "ERROR")
+                paste_ok = await cua_paste_fallback(page, browser, cua_client,
+                                                     brief, platform, label, verbose)
+            if not paste_ok:
+                log(f"[{label}] CRITICAL: Both attach and paste (DOM+CUA) failed — skipping this agent", "ERROR")
                 fail_agent(platform_l, "Brief delivery failed",
-                           "Both file-attach and inline paste failed. Retry to relaunch the agent.")
+                           "Both file-attach and DOM+CUA paste failed. Retry to relaunch the agent.")
                 return page, False
     else:
         # Gemini always uses paste; legacy path also uses paste
@@ -12784,23 +13136,19 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             log(f"[{label}] Pasting brief directly (Gemini Deep Research requires text input, not file)")
         else:
             log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
-        paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=3)
+        # DOM-once → CUA contract: single DOM attempt, then a CUA-assisted
+        # fallback (CUA focuses composer, Python pastes via clipboard).
+        # Removed the old page-reload + 2nd-DOM-retry path — it amplified
+        # tab-spam risk (off-target click on a fresh page) without buying
+        # reliability that CUA doesn't provide.
+        paste_ok = await verified_paste_brief(page, brief, platform, label)
         if not paste_ok:
-            log(f"[{label}] All paste strategies failed — retrying with page reload", "WARN")
-            try:
-                await page.reload(wait_until="domcontentloaded", timeout=15000)
-                await asyncio.sleep(3)
-                # Gemini: re-activate Deep Research after reload
-                if is_gemini:
-                    await setup_gemini_dr(page)
-                    await asyncio.sleep(1)
-                paste_ok = await verified_paste_brief(page, brief, platform, label, max_retries=2)
-            except Exception as e:
-                log(f"[{label}] Reload+retry failed: {e}", "WARN")
+            paste_ok = await cua_paste_fallback(page, browser, cua_client,
+                                                 brief, platform, label, verbose)
         if not paste_ok:
-            log(f"[{label}] CRITICAL: Brief paste completely failed — skipping this agent", "ERROR")
+            log(f"[{label}] CRITICAL: Brief paste failed (DOM + CUA) — skipping this agent", "ERROR")
             fail_agent(platform_l, "Brief paste failed",
-                       "All paste strategies + reload failed. Retry to relaunch the agent.")
+                       "DOM and CUA paste both failed. Retry to relaunch the agent.")
             return page, False
 
     # ── Just-before-send: ensure the required mode is STILL active ──
@@ -14457,11 +14805,17 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
     # signature. Each link on its own line keeps Google Docs' URL
     # auto-detection clean and makes the doc readable when emailed as plain
     # text. Sections only render when they have content.
-    DIVIDER = "─" * 48
+    #
+    # Note: ALL-CAPS section labels (RESEARCH BRIEF / AGENT REPORTS /
+    # NOTEBOOKLM / VIDEO) are formatted as Heading 2 in Google Docs by the
+    # CUA agent (PROMPT_CREATE_DOC step 2b). The previous `─×48` dividers
+    # were dropped — CUA mistyped the unicode line, the divider competed
+    # with paragraph-style application, and the empty-line spacing alone
+    # is sufficient visual separation once headings are styled.
     doc_lines = [short_topic, "", ""]
 
     if brief_url:
-        doc_lines += ["RESEARCH BRIEF", DIVIDER, brief_url, "", ""]
+        doc_lines += ["RESEARCH BRIEF", "", brief_url, "", ""]
 
     agent_section: list = []
     for name in ["ChatGPT", "Gemini", "Claude"]:
@@ -14487,7 +14841,7 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         agent_section.append(url)
         agent_section.append("")
     if agent_section:
-        doc_lines += ["AGENT REPORTS", DIVIDER] + agent_section + [""]
+        doc_lines += ["AGENT REPORTS", ""] + agent_section + [""]
 
     nlm_section: list = []
     if notebook_url:
@@ -14500,12 +14854,12 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         nlm_section.append(_audio_for_doc)
         nlm_section.append("")
     if nlm_section:
-        doc_lines += ["NOTEBOOKLM", DIVIDER] + nlm_section + [""]
+        doc_lines += ["NOTEBOOKLM", ""] + nlm_section + [""]
 
     if youtube_url:
-        doc_lines += ["VIDEO", DIVIDER, "YouTube:", youtube_url, "", ""]
+        doc_lines += ["VIDEO", "", "YouTube:", youtube_url, "", ""]
 
-    doc_lines += [DIVIDER, "Generated by Super Research"]
+    doc_lines += ["Generated by Super Research"]
     doc_content = "\n".join(doc_lines)
 
     # Create Google Doc: create → fill → make public → emit link
@@ -14559,7 +14913,7 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         try:
             await agent_loop(cua_client, browser, PROMPT_CREATE_DOC,
                 f"Type this content into the doc, then share with 'Anyone with link' as Editor:\n\n{doc_content}",
-                model=CUA_MODEL, max_iterations=20, verbose=verbose)
+                model=CUA_MODEL, max_iterations=30, verbose=verbose)
         finally:
             await stop_narration_ticker(_stop, _task)
         await asyncio.sleep(2)
@@ -14598,79 +14952,121 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         log("[Phase5] Doc URL not validated — skipping email (orchestrator will retry/fail)", "WARN")
         return {"doc_url": doc_url, "email_sent": False}
 
-    # Send email
-    email_sent = False
-    if email:
-        log(f"Sending email to {email}...")
-        emit_event("agent_progress", phase=5, agent="gmail",
-                   status="composing",
-                   progress=f"Opening Gmail and composing notification email to {email}…")
-        try:
-            page = await browser.new_tab("https://mail.google.com")
-            await asyncio.sleep(4)
-
-            # HV gate — same risk as Google Docs. Catch sign-in walls
-            # before CUA burns iterations clicking on them.
-            cleared = await check_hv_gate(browser, cua_client, "gmail", "Gmail",
-                                           phase=5, max_iterations=2)
-            if not cleared:
-                log("[Phase5] Gmail HV not cleared — skipping email send", "WARN")
-                return {"doc_url": doc_url}
-
-            # Subject uses the smart title so it matches NotebookLM + YouTube.
-            subject = f"Research Complete: {smart_title(topic)}"
-            body_parts = [f"Research complete: {topic[:200]}\n"]
-            if doc_url:
-                body_parts.append(f"Google Doc: {doc_url}")
-            for pname in ["ChatGPT", "Gemini", "Claude"]:
-                purl = links.get(pname, "")
-                if purl:
-                    body_parts.append(f"{pname}: {purl}")
-            if notebook_url:
-                body_parts.append(f"NotebookLM: {notebook_url}")
-            if youtube_url:
-                body_parts.append(f"YouTube: {youtube_url}")
-            body = "\n".join(body_parts) + "\n"
-
-            _stop, _task = start_narration_ticker(
-                5, "gmail",
-                f"Composing & sending notification email to {email}",
-                interval=20)
-            try:
-                await agent_loop(cua_client, browser, PROMPT_SEND_EMAIL,
-                    f"Send email to: {email}\nSubject: {subject}\nBody:\n{body}",
-                    model=CUA_MODEL, max_iterations=12, verbose=verbose)
-            finally:
-                await stop_narration_ticker(_stop, _task)
-
-            email_sent = True
-            log("Email sent ✓")
-            save_track("Phase5", {"status": "email_sent", "email": email})
-            # Emit Gmail link immediately so it shows in the dropdown
-            emit_event("link_extracted", phase=5, agent="gmail",
-                       url="https://mail.google.com", label="Open Gmail", verified=True)
-        except Exception as e:
-            log(f"Email error: {e}", "ERROR")
-            # Email failure isn't fatal — pipeline is essentially done by
-            # this point (doc is shipped). Warn so the user knows they
-            # need to open Gmail manually, and distinguish bad-address
-            # from SMTP/auth issues so the message is actionable.
-            _err_msg = str(e)
-            _low = _err_msg.lower()
-            if "invalid" in _low and ("address" in _low or "email" in _low or "recipient" in _low):
-                _msg = f"Email not sent — recipient address '{email}' looks invalid"
-                _det = "Gmail rejected the recipient. Update the email in Settings and re-send manually, or resume with a corrected address."
-            elif "auth" in _low or "login" in _low or "signin" in _low:
-                _msg = "Email not sent — Gmail login expired"
-                _det = "Re-authenticate Gmail in the browser and resume to retry, or send the notification manually."
-            else:
-                _msg = "Email not sent — SMTP/Gmail error"
-                _det = f"{_err_msg[:200]}"
-            fail_phase(5, _msg, _det, agent="gmail")
-    else:
-        log("No email configured — skipping")
-
+    # Send email (delegated so the orchestrator can re-fire after a
+    # post-hoc doc-URL recovery — see _send_p5_email docstring).
+    email_sent = await _send_p5_email(
+        browser, cua_client, topic, doc_url, links,
+        notebook_url, youtube_url, email, verbose,
+    )
     return {"doc_url": doc_url, "email_sent": email_sent}
+
+
+async def _send_p5_email(browser, cua_client, topic, doc_url, links,
+                         notebook_url, youtube_url, email, verbose=False):
+    """Send the Phase 5 notification email. Standalone so it can be called
+    from BOTH `run_phase5` (inline at end) AND the orchestrator's post-hoc
+    URL-recovery path (when run_phase5 returned with email_sent=False
+    because doc_url didn't validate, but the orchestrator's
+    `extract_gdoc_url` retry then succeeded — without this re-fire, email
+    never gets sent on that path even though we now have a valid URL).
+
+    Returns True iff email_sent. False on missing email param, HV gate,
+    Gmail auth issues, or CUA failure.
+
+    Idempotency: if `_runtime.p5_email_sent_for_doc == doc_url` (set on
+    success), return True without re-sending. Prevents the orchestrator's
+    post-recovery re-fire from sending a duplicate when the inline send
+    already completed (CUA can raise after Gmail's send button has fired,
+    leaving us with a "False return + email actually sent" state).
+    """
+    if not email:
+        log("No email configured — skipping")
+        return False
+    try:
+        if doc_url and getattr(_runtime, "p5_email_sent_for_doc", "") == doc_url:
+            log(f"Email already sent for this doc — skipping re-fire to avoid dup")
+            return True
+    except Exception:
+        pass
+    log(f"Sending email to {email}...")
+    emit_event("agent_progress", phase=5, agent="gmail",
+               status="composing",
+               progress=f"Opening Gmail and composing notification email to {email}…")
+    try:
+        page = await browser.new_tab("https://mail.google.com")
+        await asyncio.sleep(4)
+
+        # HV gate — same risk as Google Docs. Catch sign-in walls
+        # before CUA burns iterations clicking on them.
+        cleared = await check_hv_gate(browser, cua_client, "gmail", "Gmail",
+                                       phase=5, max_iterations=2)
+        if not cleared:
+            log("[Phase5] Gmail HV not cleared — skipping email send", "WARN")
+            return False
+
+        # Subject uses the smart title so it matches NotebookLM + YouTube.
+        subject = f"Research Complete: {smart_title(topic)}"
+        body_parts = [f"Research complete: {topic[:200]}\n"]
+        if doc_url:
+            body_parts.append(f"Google Doc: {doc_url}")
+        # Per-agent URLs: prefer _runtime.agent_share_urls (public share if
+        # available, otherwise conversation captured at extraction time)
+        # over the legacy `links` arg. This matches the doc builder's
+        # fallback chain — without parity, the email would show the chat
+        # URL while the doc shows the public share, confusing the
+        # recipient.
+        for pname in ["ChatGPT", "Gemini", "Claude"]:
+            share = _runtime.agent_share_urls.get(pname) or {}
+            purl = share.get("url") or links.get(pname, "")
+            if purl:
+                body_parts.append(f"{pname}: {purl}")
+        if notebook_url:
+            body_parts.append(f"NotebookLM: {notebook_url}")
+        if youtube_url:
+            body_parts.append(f"YouTube: {youtube_url}")
+        body = "\n".join(body_parts) + "\n"
+
+        _stop, _task = start_narration_ticker(
+            5, "gmail",
+            f"Composing & sending notification email to {email}",
+            interval=20)
+        try:
+            await agent_loop(cua_client, browser, PROMPT_SEND_EMAIL,
+                f"Send email to: {email}\nSubject: {subject}\nBody:\n{body}",
+                model=CUA_MODEL, max_iterations=12, verbose=verbose)
+        finally:
+            await stop_narration_ticker(_stop, _task)
+
+        log("Email sent ✓")
+        # Stamp the doc_url so a post-recovery re-fire doesn't dup-send.
+        try:
+            _runtime.p5_email_sent_for_doc = doc_url or ""
+        except Exception:
+            pass
+        save_track("Phase5", {"status": "email_sent", "email": email})
+        # Emit Gmail link immediately so it shows in the dropdown
+        emit_event("link_extracted", phase=5, agent="gmail",
+                   url="https://mail.google.com", label="Open Gmail", verified=True)
+        return True
+    except Exception as e:
+        log(f"Email error: {e}", "ERROR")
+        # Email failure isn't fatal — pipeline is essentially done by
+        # this point (doc is shipped). Warn so the user knows they
+        # need to open Gmail manually, and distinguish bad-address
+        # from SMTP/auth issues so the message is actionable.
+        _err_msg = str(e)
+        _low = _err_msg.lower()
+        if "invalid" in _low and ("address" in _low or "email" in _low or "recipient" in _low):
+            _msg = f"Email not sent — recipient address '{email}' looks invalid"
+            _det = "Gmail rejected the recipient. Update the email in Settings and re-send manually, or resume with a corrected address."
+        elif "auth" in _low or "login" in _low or "signin" in _low:
+            _msg = "Email not sent — Gmail login expired"
+            _det = "Re-authenticate Gmail in the browser and resume to retry, or send the notification manually."
+        else:
+            _msg = "Email not sent — SMTP/Gmail error"
+            _det = f"{_err_msg[:200]}"
+        fail_phase(5, _msg, _det, agent="gmail")
+        return False
 
 
 # ── Checkpoint & Resume ───────────────────────────────────────────────────────
@@ -14679,6 +15075,17 @@ def save_checkpoint(queue_dir, phase, **kwargs):
     """Save pipeline checkpoint after completing a phase."""
     cp = {"last_completed_phase": phase, "timestamp": datetime.now().isoformat()}
     cp.update(kwargs)
+    # Enrichment (2026-04-28, Commit 1 of error-redesign): persist tier
+    # escalation history, per-agent state, and last_event_id so a Phoenix
+    # restart can resume retry budgets fairly + dedupe replayed events.
+    # Caller-supplied kwargs win — we only fill if not already passed.
+    try:
+        snap = _runtime.snapshot()
+        for key in ("tier_escalation_history", "agent_states", "last_event_id"):
+            if key not in cp and key in snap:
+                cp[key] = snap[key]
+    except Exception:
+        pass
     (Path(queue_dir) / "checkpoint.json").write_text(json.dumps(cp, indent=2), encoding="utf-8")
 
 
@@ -14945,6 +15352,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Load pipeline config on resume
         config_path = queue_dir / "config.json"
         pipeline_config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        # Restore tier escalation history so retry budgets carry over from
+        # the prior run (a Phoenix restart at T1 attempt 2 doesn't reset to
+        # attempt 1 — the framework's 30-min window judges that fairly).
+        try:
+            for key, esc_dict in (cp.get("tier_escalation_history") or {}).items():
+                if isinstance(esc_dict, dict):
+                    _tier_escalations[key] = TierEscalation.from_dict(esc_dict)
+            # Restore agent_states + last_event_id so a Phoenix-resumed run
+            # rebuilds "where each agent was" before silence escalation.
+            _runtime.agent_states = dict(cp.get("agent_states") or {})
+            _runtime.last_event_id = cp.get("last_event_id", "") or ""
+        except Exception as _re:
+            log(f"[resume] tier/agent state restore failed: {_re}", "WARN")
     else:
         run_name = run_id or f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         queue_dir = Path(__file__).parent / "queues" / run_name
@@ -16533,6 +16953,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     return
             else:
                 emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
+            # Re-fire the email send if `run_phase5` returned with
+            # email_sent=False (typically because its inline doc-URL check
+            # failed) AND the orchestrator's `extract_gdoc_url` retry
+            # above then recovered a valid URL. Without this, the email
+            # never gets sent on the recovery path even though we now
+            # have a verified Doc URL — was the P5-stuck-at-0.3min bug.
+            if (doc_url and email and not p6.get("email_sent")
+                    and not _p5_user_skipped):
+                log("Phase 5: doc URL recovered post-hoc — firing email send now")
+                _email_sent = await _send_p5_email(
+                    browser, cua_client, topic, doc_url, links,
+                    notebook_url, youtube_url, email, verbose,
+                )
+                p6["email_sent"] = _email_sent
             update_delivery(doc_url=doc_url, email_sent=p6.get("email_sent", False),
                             status="completed")
             save_checkpoint(queue_dir, 5, topic=topic, brief_url=brief_url, notebook_url=notebook_url,
@@ -17105,6 +17539,34 @@ async def run_server(port=8000):
     # the cancel-queued action can also trigger a position refresh.
     _QUEUE_STATE["recompute_fn"] = _recompute_queue_positions
 
+    # ── pending_queue.json (Phoenix T3 resume) ─────────────────────────────
+    # The in-memory _job_queue (asyncio.Queue) is lost when the BE process
+    # exits — daemon-loop relaunch otherwise restarts with an empty queue,
+    # losing any work that hadn't reached `status=queued` in Firestore yet.
+    # Snapshot to disk on every worker boundary so a Phoenix restart can
+    # restore. Firestore-driven rehydration (line ~17850) takes precedence;
+    # this is a belt-and-suspenders fallback for racing/network-blocked cases.
+    _pending_queue_path = queues_root / "_pending_queue.json"
+
+    def _persist_pending_queue(current_job=None):
+        """Snapshot _job_queue contents (+ optional current_job) to disk.
+        Best-effort — never raises into the worker hot path."""
+        try:
+            queues_root.mkdir(parents=True, exist_ok=True)
+            try:
+                pending = list(_job_queue._queue)
+            except Exception:
+                pending = []
+            payload = {
+                "ts_ms": int(time.time() * 1000),
+                "current": current_job,
+                "pending": pending,
+            }
+            _pending_queue_path.write_text(
+                json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as e:
+            log(f"[pending_queue] persist failed: {e}", "WARN")
+
     async def _job_worker():
         """Process pipeline jobs one at a time from the queue."""
         nonlocal _queue_running
@@ -17114,6 +17576,11 @@ async def run_server(port=8000):
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
             log(f"Starting queued job: {job['topic'][:60]}")
+            # Snapshot AFTER popping so an exit during run_pipeline can
+            # restore both the running job AND remaining queue. Without the
+            # current_job param a Phoenix restart would lose this in-flight
+            # research.
+            _persist_pending_queue(current_job=job)
             # Flip this run's research doc from queued → ongoing. No-op for
             # the very first start in an idle backend (already ongoing).
             _flip_queued_to_ongoing(job.get("uid"), job.get("research_id"))
@@ -17132,6 +17599,9 @@ async def run_server(port=8000):
                 _job_queue.task_done()
                 # Shift remaining queued jobs up one position.
                 _recompute_queue_positions()
+                # Re-snapshot post-completion (current cleared, pending may
+                # have been cancelled/reordered).
+                _persist_pending_queue(current_job=None)
 
     # Worker + Firestore start listener are launched below in the direct
     # startup path (before `await server.serve()`). We used to ALSO register
@@ -17345,6 +17815,13 @@ async def run_server(port=8000):
                         save_device_config(paired_uid=paired_uid)
             except Exception as e:
                 log(f"Could not resolve paired uid from token doc: {e}", "WARN")
+        # Track every Firestore research_id touched by rehydration — used by
+        # the disk-restore block below so an ongoing run that got marked
+        # paused_backend_restart isn't falsely re-enqueued from
+        # pending_queue.json (would run twice). Hoisted out of the try so
+        # the disk-restore block downstream can reference it even if
+        # rehydration raised partway through.
+        _rehydrated_rids: "set[str]" = set()
         if paired_uid:
             write_device_doc(paired_uid, token)
             # Queue rehydration: recover runs that were queued or mid-run when
@@ -17366,6 +17843,7 @@ async def run_server(port=8000):
                     for snap in snaps:
                         data = snap.to_dict() or {}
                         research_id = snap.id
+                        _rehydrated_rids.add(research_id)
                         if status_val == "ongoing":
                             # Mark as paused_backend_restart so the frontend can
                             # render a dedicated "Resume from checkpoint" CTA.
@@ -17403,6 +17881,51 @@ async def run_server(port=8000):
                     log(f"Queue rehydration: re-enqueued {rehydrated} queued, marked {orphaned} orphaned runs stopped")
             except Exception as e:
                 log(f"Queue rehydration failed: {e}", "WARN")
+
+        # ── pending_queue.json restoration (Phoenix T3 fallback) ──────────
+        # Firestore-driven rehydration above is the source of truth, but a
+        # research that hadn't yet reached `status=queued` (e.g. crashed in
+        # the put_nowait → Firestore-write window) won't appear there. The
+        # disk snapshot covers that gap. Dedupe by research_id so we don't
+        # double-enqueue something Firestore already restored — including
+        # ongoing runs that got marked paused_backend_restart and shouldn't
+        # silently re-launch from a stale disk snapshot.
+        try:
+            if _pending_queue_path.exists():
+                snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
+                # Seed dedupe with anything Firestore-rehydration touched
+                # (queued + ongoing), then add what's currently in the
+                # in-memory queue (the rehydrated queued set).
+                already = set(_rehydrated_rids)
+                try:
+                    for q in list(_job_queue._queue):
+                        rid = (q or {}).get("research_id") or ""
+                        if rid:
+                            already.add(rid)
+                except Exception:
+                    pass
+                # Restore current_job FIRST if it was mid-flight (so it
+                # resumes ahead of pending). Then the rest of pending in
+                # original order.
+                cur = snap.get("current") or None
+                disk_jobs = []
+                if cur and (cur.get("research_id") or "") not in already:
+                    disk_jobs.append(cur)
+                for j in (snap.get("pending") or []):
+                    rid = (j or {}).get("research_id") or ""
+                    if rid and rid in already:
+                        continue
+                    disk_jobs.append(j)
+                for j in disk_jobs:
+                    try:
+                        _job_queue.put_nowait(j)
+                    except Exception:
+                        pass
+                if disk_jobs:
+                    log(f"[pending_queue] Restored {len(disk_jobs)} job(s) from disk snapshot")
+        except Exception as e:
+            log(f"[pending_queue] restore failed: {e}", "WARN")
+
         # Sub-second relink: watch the token doc so a paste-token flow
         # (which only writes linkedUid, never touches the device doc) gets
         # reflected in the Account page tile almost immediately, instead of

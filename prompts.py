@@ -489,17 +489,19 @@ To scroll inside the dialog: click the content area, then Page Down or mouse whe
 
 PROMPT_CREATE_DOC = SYSTEM_BASE + """
 
-Your task: Fill a blank Google Doc with the provided content AND make it public.
-Both steps are required. Do NOT stop early.
+Your task: Fill a blank Google Doc with the provided content, apply heading styles to the section labels, AND make it public. All three are required. Do NOT stop early.
 
 Steps:
-1. You should see a new blank Google Doc. Click into the body and type/paste the provided content (title + links). Use the EXACT content given.
-2. After the content is entered, click the blue "Share" button at the top-right.
-3. In the Share dialog, find "General access" near the bottom. If it says "Restricted", click the dropdown and change it to "Anyone with the link".
-4. Confirm the role next to it is "Editor" (if not already).
-5. If there is a "Copy link" button, click it.
-6. Click "Done" to close the dialog.
-7. Say "created" when the doc is filled AND public.
+1. You should see a new blank Google Doc. Click into the body. Type the EXACT content given line-by-line. Type fast — do NOT re-read the doc between iterations. (If a paste shortcut works, use Ctrl+V; otherwise type.)
+2. Apply heading styles for readability:
+   a. Select the FIRST line (the title — the topic name). Apply Heading 1 (Format menu → Paragraph styles → Heading 1, or shortcut Ctrl+Alt+1).
+   b. For each ALL-CAPS section label in the body (e.g. "RESEARCH BRIEF", "AGENT REPORTS", "NOTEBOOKLM", "VIDEO"), select that line and apply Heading 2 (Ctrl+Alt+2).
+3. After content + headings are done, click the blue "Share" button at the top-right.
+4. In the Share dialog, find "General access" near the bottom. If it says "Restricted", click the dropdown and change it to "Anyone with the link".
+5. Confirm the role next to it is "Editor" (if not already).
+6. If there is a "Copy link" button, click it.
+7. Click "Done" to close the dialog. If a "Link copied" toast appears, that's success — do NOT click Share again.
+8. Say "created" when the doc is filled, headings are styled, AND public.
 
 ENTERPRISE-POLICY FALLBACK:
 - If the "Anyone with the link" option is GRAYED OUT / DISABLED with text like "This option is restricted by your organization" or similar admin-policy banner, do NOT keep clicking it. Instead:
@@ -513,11 +515,11 @@ Your task: Compose and send an email via Gmail.
 
 Steps:
 1. Click "Compose".
-2. Enter the recipient email in "To".
-3. Enter the subject.
-4. Type the email body with the provided links.
+2. Click into the "To" field BEFORE typing — Gmail's compose sometimes opens with focus on the body, and typing the address there ruins the email. Then enter the recipient email.
+3. Click into the Subject field, then enter the subject.
+4. Click into the body, then type the email body with the provided links.
 5. Click "Send".
-6. After clicking Send, verify: the Compose dialog should disappear and a "Message sent" toast should appear at the bottom. Say "sent: <recipient>" when you see the confirmation.
+6. After clicking Send, the Compose dialog should disappear and a "Message sent" toast should appear at the bottom. Wait ~3 seconds. If the Compose window is still open after that, Send was rejected — see ERROR HANDLING below. If the dialog closed, say "sent: <recipient>".
 
 ERROR HANDLING:
 - If a "Discard draft?" dialog appears, do NOT discard — click Cancel/Keep editing and re-click Send.
