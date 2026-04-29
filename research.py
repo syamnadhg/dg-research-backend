@@ -1628,13 +1628,17 @@ def start_firestore_start_listener(job_queue, loop):
                 doc.reference.delete()
             except Exception:
                 pass
-            # Queue the job (default-arg capture avoids lambda-in-loop closure bug)
+            # Queue the job via _safe_enqueue (Q7) — does a final
+            # existence + status check on the asyncio loop right before
+            # put_nowait, catching any delete/cancel that landed between
+            # this listener's pre-checks above and the actual enqueue.
+            # Default-arg capture avoids the lambda-in-loop closure bug.
             loop.call_soon_threadsafe(
                 lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text:
-                    job_queue.put_nowait(
+                    _safe_enqueue(job_queue,
                         {"topic": t, "email": e, "config": c, "run_id": r,
-                         "uid": u, "research_id": ri, "brief_text": bt}
-                    )
+                         "uid": u, "research_id": ri, "brief_text": bt},
+                        source="start-listener")
             )
 
     _start_listener = col_ref.on_snapshot(on_snapshot)
@@ -1679,6 +1683,47 @@ def teardown_firestore_run():
 
 
 _exit_scheduled = False
+
+
+def _safe_enqueue(job_queue, job, source: str) -> bool:
+    """Existence-validate + status-whitelist check before put_nowait.
+
+    Returns True if the job entered the queue, False if it was skipped.
+    Q7: single funnel for all 3 enqueue paths (Firestore start listener,
+    Phoenix rehydrate, disk-restore) so a research deleted between any
+    of those decision points and the actual put_nowait can't slip
+    through. The disk-restore Q1 inline check was the first patch; this
+    helper consolidates the same logic for all paths and adds a
+    status-whitelist (queued / ongoing / paused_backend_restart) so a
+    cancelled or completed research can't get re-enqueued either.
+    """
+    rid = (job or {}).get("research_id") or ""
+    uid_v = (job or {}).get("uid") or ""
+    if not (rid and uid_v):
+        log(f"[safe_enqueue:{source}] skipped — missing research_id/uid", "WARN")
+        return False
+    if _firebase_db is None:
+        log(f"[safe_enqueue:{source}] skipped — Firestore unavailable", "WARN")
+        return False
+    try:
+        snap = _firebase_db.collection("users").document(uid_v) \
+            .collection("researches").document(rid).get()
+        if not snap.exists:
+            log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… no longer exists in Firestore", "INFO")
+            return False
+        status = (snap.to_dict() or {}).get("status")
+        if status not in ("queued", "ongoing", "paused_backend_restart"):
+            log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not enqueueable)", "INFO")
+            return False
+    except Exception as e:
+        log(f"[safe_enqueue:{source}] skipped — Firestore check failed for {rid[:24]}…: {e}", "WARN")
+        return False
+    try:
+        job_queue.put_nowait(job)
+        return True
+    except Exception as e:
+        log(f"[safe_enqueue:{source}] put_nowait failed: {e}", "WARN")
+        return False
 
 
 def _schedule_server_exit(source: str, delay_sec: float = 3.0):
@@ -17576,7 +17621,11 @@ async def run_server(port=8000):
 
     # ── Job queue: one pipeline at a time, multiple can be queued ──
     _job_queue = asyncio.Queue()
-    _queue_running = False
+    # `_QUEUE_STATE["running"]` is the single source of truth for worker
+    # busy-state. The closure-local _queue_running was dropped in Q7 — it
+    # was a vestigial duplicate that could diverge from _QUEUE_STATE if a
+    # write raised between the two assignments. /api/queue, /api/health,
+    # _aegis_pulse_loop, and the listener all now read _QUEUE_STATE.
     _QUEUE_STATE["queue_ref"] = _job_queue
     _QUEUE_STATE["recompute_fn"] = None  # set below after defining helper
 
@@ -17709,12 +17758,21 @@ async def run_server(port=8000):
         except Exception as e:
             log(f"[pending_queue] persist failed: {e}", "WARN")
 
+    # Outer wall-clock ceiling for a single pipeline run. Phase budgets
+    # inside run_pipeline are cooperative — long Playwright/CUA awaits
+    # without timeouts can deadlock the worker indefinitely, leaving
+    # /api/queue stuck at running:true and any pending jobs starved.
+    # Q7 watchdog: if a single run exceeds this, we declare it stuck,
+    # request_stop, mark the doc stopped_by_watchdog, and schedule a
+    # process exit so the daemon-loop respawns a fresh worker that can
+    # drain the rest of the queue. Generous 4h ceiling — a healthy run
+    # is under 90min; this only fires for genuine deadlocks.
+    WORKER_OUTER_TIMEOUT_SEC = 4 * 60 * 60
+
     async def _job_worker():
         """Process pipeline jobs one at a time from the queue."""
-        nonlocal _queue_running
         while True:
             job = await _job_queue.get()
-            _queue_running = True
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
             log(f"Starting queued job: {job['topic'][:60]}")
@@ -17727,15 +17785,39 @@ async def run_server(port=8000):
             # the very first start in an idle backend (already ongoing).
             _flip_queued_to_ongoing(job.get("uid"), job.get("research_id"))
             try:
-                await run_pipeline(topic=job["topic"], email=job.get("email", ""),
-                                   verbose=True, resume_dir=job.get("resume_dir"),
-                                   config=job.get("config"), run_id=job.get("run_id"),
-                                   uid=job.get("uid"), research_id=job.get("research_id"),
-                                   brief_text=job.get("brief_text", ""))
+                await asyncio.wait_for(
+                    run_pipeline(topic=job["topic"], email=job.get("email", ""),
+                                 verbose=True, resume_dir=job.get("resume_dir"),
+                                 config=job.get("config"), run_id=job.get("run_id"),
+                                 uid=job.get("uid"), research_id=job.get("research_id"),
+                                 brief_text=job.get("brief_text", "")),
+                    timeout=WORKER_OUTER_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                # Q7 outer-ceiling deadlock guard. Mark the doc, request
+                # cooperative stop, schedule hard exit. Daemon-loop
+                # respawns a fresh worker; pending jobs drain on the
+                # next process.
+                hours = WORKER_OUTER_TIMEOUT_SEC // 3600
+                log(f"[worker-watchdog] Pipeline exceeded {hours}h ceiling — declaring stuck and scheduling restart", "ERROR")
+                try:
+                    _controls.request_stop()
+                except Exception:
+                    pass
+                if _firebase_db and job.get("uid") and job.get("research_id"):
+                    try:
+                        _firebase_db.collection("users").document(job["uid"]) \
+                            .collection("researches").document(job["research_id"]) \
+                            .update({
+                                "status": "stopped_by_watchdog",
+                                "summary": f"Stopped — pipeline exceeded {hours}h ceiling",
+                            })
+                    except Exception as e:
+                        log(f"[worker-watchdog] doc update failed: {e}", "WARN")
+                _schedule_server_exit("worker-watchdog")
             except Exception as e:
                 log(f"Pipeline job error: {e}", "ERROR")
             finally:
-                _queue_running = False
                 _QUEUE_STATE["running"] = False
                 _QUEUE_STATE["current_job"] = None
                 _job_queue.task_done()
@@ -17757,12 +17839,12 @@ async def run_server(port=8000):
     @app.get("/api/queue")
     async def get_queue_status():
         """Get queue status: current job + pending count."""
-        return {"running": _queue_running, "pending": _job_queue.qsize()}
+        return {"running": bool(_QUEUE_STATE.get("running")), "pending": _job_queue.qsize()}
 
     @app.get("/api/health")
     async def health_check():
         """Server health check."""
-        return {"status": "ok", "running": _queue_running, "pending": _job_queue.qsize()}
+        return {"status": "ok", "running": bool(_QUEUE_STATE.get("running")), "pending": _job_queue.qsize()}
 
     @app.patch("/api/runs/{run_id}/config")
     async def update_config(run_id: str, request_data: dict):
@@ -17855,7 +17937,7 @@ async def run_server(port=8000):
         await _job_queue.put({"topic": topic, "email": email, "config": config,
                               "run_id": run_id, "uid": uid, "brief_text": brief_text})
         position = _job_queue.qsize()
-        is_running = _queue_running
+        is_running = bool(_QUEUE_STATE.get("running"))
         status = "running" if position <= 1 and not is_running else f"queued (position {position})"
         return {"status": status, "topic": topic, "queue_position": position, "id": run_id}
 
@@ -17934,7 +18016,7 @@ async def run_server(port=8000):
             try:
                 while True:
                     await asyncio.sleep(60)
-                    if not _queue_running:
+                    if not _QUEUE_STATE.get("running"):
                         log(f"[aegis] {glyphs[i % 2]} standing watch")
                         i += 1
             except asyncio.CancelledError:
@@ -18010,15 +18092,21 @@ async def run_server(port=8000):
                             cfg = dict(data.get("pipelineConfig") or {})
                             if "skippedPhases" in cfg and "skipPhases" not in cfg:
                                 cfg["skipPhases"] = cfg.pop("skippedPhases")
-                            _job_queue.put_nowait({
+                            # Funnel through _safe_enqueue (Q7) — even
+                            # though the where(status=="queued") query
+                            # filtered above, Firestore is eventually
+                            # consistent on edge cases (deletion racing
+                            # the query) and the helper's final check
+                            # closes that gap.
+                            if _safe_enqueue(_job_queue, {
                                 "topic": topic,
                                 "email": "",  # not persisted on research doc; Phase 5 email will skip
                                 "config": cfg,
                                 "run_id": data.get("backendRunId") or "",
                                 "uid": paired_uid,
                                 "research_id": research_id,
-                            })
-                            rehydrated += 1
+                            }, source="rehydrate"):
+                                rehydrated += 1
                 if rehydrated or orphaned:
                     log(f"Queue rehydration: re-enqueued {rehydrated} queued, marked {orphaned} orphaned runs stopped")
             except Exception as e:
@@ -18058,67 +18146,22 @@ async def run_server(port=8000):
                     if rid and rid in already:
                         continue
                     disk_jobs.append(j)
-                # Existence-validate every disk-restored job against
-                # Firestore before it can re-enter the queue. The user
-                # can delete a research between a BE crash and restart;
-                # without this check the disk snapshot silently re-fires
-                # a research that no longer exists, eats a Patchright
-                # session, and runs a pipeline that writes events into a
-                # non-existent doc (events get swallowed; orphan browser
-                # persists). The Firestore-rehydration query above only
-                # sees status=queued/ongoing — a deleted doc is in
-                # neither, so its research_id never makes it into
-                # `_rehydrated_rids` and the dedupe alone can't catch
-                # this case. Hence: positive existence check here.
-                #
-                # Fail-closed posture — if we can't verify, skip rather
-                # than re-fire. This DIVERGES intentionally from the
-                # Firestore-listener's fail-open at ~line 1516: a fresh
-                # user write is a strong intent signal so the listener
-                # allows transient errors through, while disk-restore is
-                # replaying potentially stale state where a re-fire of a
-                # deleted research costs a real Patchright session +
-                # orphan browser. Asymmetric cost → asymmetric posture.
+                # Funnel each disk-restored job through _safe_enqueue
+                # (Q7) — it does the same Firestore existence check the
+                # Q1 inline loop did, plus a status-whitelist (queued /
+                # ongoing / paused_backend_restart). Fail-closed posture
+                # is preserved (helper skips on missing/error/no-firebase
+                # rather than re-fire). The skipped-count is rolled up;
+                # per-job reasons are in the helper's own logs.
                 restored = 0
-                skipped_missing = 0
-                skipped_unverifiable = 0
+                skipped = 0
                 for j in disk_jobs:
-                    rid = (j or {}).get("research_id") or ""
-                    uid_v = (j or {}).get("uid") or ""
-                    if not (rid and uid_v):
-                        skipped_unverifiable += 1
-                        log("[pending_queue] Skipped restore — disk job missing research_id/uid", "WARN")
-                        continue
-                    if _firebase_db is None:
-                        skipped_unverifiable += 1
-                        log(f"[pending_queue] Skipped restore for {rid[:24]}… — Firestore unavailable, cannot verify existence", "WARN")
-                        continue
-                    try:
-                        doc_snap = _firebase_db.collection("users").document(uid_v) \
-                            .collection("researches").document(rid).get()
-                        if not doc_snap.exists:
-                            skipped_missing += 1
-                            log(f"[pending_queue] Skipped restore for {rid[:24]}… — research no longer exists in Firestore (user-deleted)", "INFO")
-                            continue
-                    except Exception as e:
-                        skipped_unverifiable += 1
-                        log(f"[pending_queue] Existence check failed for {rid[:24]}…: {e} — skipping for safety", "WARN")
-                        continue
-                    try:
-                        _job_queue.put_nowait(j)
+                    if _safe_enqueue(_job_queue, j, source="disk-restore"):
                         restored += 1
-                    except Exception:
-                        pass
-                # Always log the outcome inside the file-exists branch
-                # — silent disk-restore is a debugging hazard. (No-file
-                # case stays silent; that's the normal idle BE state.)
-                if restored or skipped_missing or skipped_unverifiable:
-                    parts = [f"restored={restored}"]
-                    if skipped_missing:
-                        parts.append(f"deleted={skipped_missing}")
-                    if skipped_unverifiable:
-                        parts.append(f"unverifiable={skipped_unverifiable}")
-                    log(f"[pending_queue] Disk snapshot processed: {', '.join(parts)}")
+                    else:
+                        skipped += 1
+                if restored or skipped:
+                    log(f"[pending_queue] Disk snapshot processed: restored={restored}, skipped={skipped}")
                 else:
                     log("[pending_queue] Disk snapshot empty — nothing to restore")
         except Exception as e:
