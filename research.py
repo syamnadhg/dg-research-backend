@@ -1672,6 +1672,14 @@ def start_firestore_start_listener(job_queue, loop):
             email = data.get("email", "")
             config = data.get("config", {})
             brief_text = (data.get("briefText") or "").strip()
+            # Flow B (P1+P2 skipped, user attached source files) — list of
+            # {name, storagePath, mime, size}. BE downloads each from Storage
+            # into queue_dir/documents/ before P3 runs.
+            user_sources = data.get("userSources") or []
+            # Flow C (P1+P2+P3 skipped, user pasted URLs) — list of
+            # {kind, label, url}. BE hydrates notebook_url / youtube_url /
+            # links from these in the P3-skip block of run_pipeline.
+            user_links = data.get("userLinks") or []
             if not topic or not uid or not research_id:
                 log(f"Firestore start request missing fields: uid={uid}, rid={research_id}, topic={topic[:30]}", "WARN")
                 try:
@@ -1789,10 +1797,11 @@ def start_firestore_start_listener(job_queue, loop):
             # this listener's pre-checks above and the actual enqueue.
             # Default-arg capture avoids the lambda-in-loop closure bug.
             loop.call_soon_threadsafe(
-                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text:
+                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text, us=user_sources, ul=user_links:
                     _safe_enqueue(job_queue,
                         {"topic": t, "email": e, "config": c, "run_id": r,
-                         "uid": u, "research_id": ri, "brief_text": bt},
+                         "uid": u, "research_id": ri, "brief_text": bt,
+                         "user_sources": us, "user_links": ul},
                         source="start-listener")
             )
 
@@ -15589,7 +15598,8 @@ def detect_resume_phase(queue_dir):
 
 async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        api_key=None, email=None, resume_dir=None, config=None,
-                       run_id=None, uid=None, research_id=None, brief_text=""):
+                       run_id=None, uid=None, research_id=None, brief_text="",
+                       user_sources=None, user_links=None):
     """Run the full pipeline. Supports resume from a previous queue directory.
 
     brief_text (2026-04): inline brief content passed from the frontend when
@@ -15597,7 +15607,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     queues/<run>/documents/brief.md before Phase 1 decides its path; this
     makes `brief_file` point at the fresh file and flows through the
     `_brief_from_file` branch, skipping ChatGPT brief generation + share-link
-    extraction."""
+    extraction.
+
+    user_sources (2026-04-29): Flow B. List of {name, storagePath, mime}
+    when P1 + all P2 agents are skipped — the user attached source files to
+    NotebookLM directly. BE downloads each from Firebase Storage into
+    queue_dir/documents/<name>.md before P3 fires; the existing
+    _build_phase2_to_phase3_handoff scan then naturally feeds them into NLM.
+
+    user_links (2026-04-29): Flow C. List of {kind, label, url} when P1 + P2
+    + P3 are all skipped — the user pasted source URLs and just wants the
+    final Doc + email. BE hydrates notebook_url / youtube_url / audio_url /
+    links from these in the P3-skip block so P5 has something to compose."""
+    user_sources = user_sources or []
+    user_links = user_links or []
     pdf_paths = pdf_paths or []
     api_key = resolve_api_key(api_key)
     if not api_key:
@@ -16854,6 +16877,45 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _reason = "user_skip" if _user_skip_p3 else "Disabled in pipeline config"
             log(f"Phase 3: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=3, reason=_reason)
+            # Flow C: when P3 is skipped AND the user pasted source URLs at
+            # start time, hydrate the P5-bound locals from those URLs so the
+            # final Doc + email body have something to render. Each url is
+            # classified by domain on the FE (parseLinksFromText). Falsy
+            # entries are silently skipped — P5's compose helpers already
+            # tolerate empty notebook_url / youtube_url / audio_url.
+            if user_links:
+                _flow_c_count = 0
+                for _link in user_links:
+                    _kind = (_link.get("kind") or "").lower()
+                    _url = (_link.get("url") or "").strip()
+                    _label = (_link.get("label") or "Source").strip() or "Source"
+                    if not _url:
+                        continue
+                    if _kind == "notebook" and not notebook_url:
+                        notebook_url = _url
+                    elif _kind == "youtube" and not youtube_url:
+                        youtube_url = _url
+                    elif _kind == "audio" and not audio_overview_url:
+                        audio_overview_url = _url
+                    elif _kind in ("doc", "agent", "other"):
+                        # Stash under links{} keyed by label — P5 renders this
+                        # dict as the "Sources" section of the final Doc/email.
+                        # Append-with-suffix on collision so two ChatGPT links
+                        # don't clobber each other.
+                        _key = _label
+                        _i = 2
+                        while _key in links:
+                            _key = f"{_label} ({_i})"
+                            _i += 1
+                        links[_key] = _url
+                    _flow_c_count += 1
+                log(f"Flow C hydration: {_flow_c_count} link(s) → notebook={'set' if notebook_url else '∅'} "
+                    f"youtube={'set' if youtube_url else '∅'} audio={'set' if audio_overview_url else '∅'} "
+                    f"sources={len(links)}")
+                # Mirror to delivery.json so P5 reads them on resume + the FE
+                # tile shows them as the run progresses.
+                update_delivery(notebook_url=notebook_url, youtube_url=youtube_url,
+                                audio_url=audio_overview_url, research_links=dict(links))
         elif start_phase <= 3:
             emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
             _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
@@ -17945,7 +18007,9 @@ async def run_server(port=8000):
                                  verbose=True, resume_dir=job.get("resume_dir"),
                                  config=job.get("config"), run_id=job.get("run_id"),
                                  uid=job.get("uid"), research_id=job.get("research_id"),
-                                 brief_text=job.get("brief_text", "")),
+                                 brief_text=job.get("brief_text", ""),
+                                 user_sources=job.get("user_sources") or [],
+                                 user_links=job.get("user_links") or []),
                     timeout=WORKER_OUTER_TIMEOUT_SEC,
                 )
             except asyncio.TimeoutError:
