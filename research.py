@@ -17954,13 +17954,69 @@ async def run_server(port=8000):
                     if rid and rid in already:
                         continue
                     disk_jobs.append(j)
+                # Existence-validate every disk-restored job against
+                # Firestore before it can re-enter the queue. The user
+                # can delete a research between a BE crash and restart;
+                # without this check the disk snapshot silently re-fires
+                # a research that no longer exists, eats a Patchright
+                # session, and runs a pipeline that writes events into a
+                # non-existent doc (events get swallowed; orphan browser
+                # persists). The Firestore-rehydration query above only
+                # sees status=queued/ongoing — a deleted doc is in
+                # neither, so its research_id never makes it into
+                # `_rehydrated_rids` and the dedupe alone can't catch
+                # this case. Hence: positive existence check here.
+                #
+                # Fail-closed posture — if we can't verify, skip rather
+                # than re-fire. This DIVERGES intentionally from the
+                # Firestore-listener's fail-open at ~line 1516: a fresh
+                # user write is a strong intent signal so the listener
+                # allows transient errors through, while disk-restore is
+                # replaying potentially stale state where a re-fire of a
+                # deleted research costs a real Patchright session +
+                # orphan browser. Asymmetric cost → asymmetric posture.
+                restored = 0
+                skipped_missing = 0
+                skipped_unverifiable = 0
                 for j in disk_jobs:
+                    rid = (j or {}).get("research_id") or ""
+                    uid_v = (j or {}).get("uid") or ""
+                    if not (rid and uid_v):
+                        skipped_unverifiable += 1
+                        log("[pending_queue] Skipped restore — disk job missing research_id/uid", "WARN")
+                        continue
+                    if _firebase_db is None:
+                        skipped_unverifiable += 1
+                        log(f"[pending_queue] Skipped restore for {rid[:24]}… — Firestore unavailable, cannot verify existence", "WARN")
+                        continue
+                    try:
+                        doc_snap = _firebase_db.collection("users").document(uid_v) \
+                            .collection("researches").document(rid).get()
+                        if not doc_snap.exists:
+                            skipped_missing += 1
+                            log(f"[pending_queue] Skipped restore for {rid[:24]}… — research no longer exists in Firestore (user-deleted)", "INFO")
+                            continue
+                    except Exception as e:
+                        skipped_unverifiable += 1
+                        log(f"[pending_queue] Existence check failed for {rid[:24]}…: {e} — skipping for safety", "WARN")
+                        continue
                     try:
                         _job_queue.put_nowait(j)
+                        restored += 1
                     except Exception:
                         pass
-                if disk_jobs:
-                    log(f"[pending_queue] Restored {len(disk_jobs)} job(s) from disk snapshot")
+                # Always log the outcome inside the file-exists branch
+                # — silent disk-restore is a debugging hazard. (No-file
+                # case stays silent; that's the normal idle BE state.)
+                if restored or skipped_missing or skipped_unverifiable:
+                    parts = [f"restored={restored}"]
+                    if skipped_missing:
+                        parts.append(f"deleted={skipped_missing}")
+                    if skipped_unverifiable:
+                        parts.append(f"unverifiable={skipped_unverifiable}")
+                    log(f"[pending_queue] Disk snapshot processed: {', '.join(parts)}")
+                else:
+                    log("[pending_queue] Disk snapshot empty — nothing to restore")
         except Exception as e:
             log(f"[pending_queue] restore failed: {e}", "WARN")
 
