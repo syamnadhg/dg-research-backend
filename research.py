@@ -1083,7 +1083,9 @@ async def _heartbeat_loop():
     `Date.now() - lastHeartbeat` directly, so a Timestamp object would
     become NaN and the tile would look perpetually offline. """
     from google.cloud.firestore import SERVER_TIMESTAMP
-    global _last_heartbeat_at_ms, _heartbeat_failures
+    # All globals must be declared at the top of the function — Python
+    # rejects `global X` if X has already been read in this scope.
+    global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db
     while True:
         try:
             if _firebase_db and _research_token:
@@ -1136,7 +1138,6 @@ async def _heartbeat_loop():
             # truthy, so reset that to None too. Counter resets ONLY on
             # successful reinit so a flaky reinit doesn't ping-pong.
             if _heartbeat_failures >= HEARTBEAT_REINIT_THRESHOLD:
-                global _firebase_db
                 log(f"[heartbeat] {_heartbeat_failures} consecutive failures — attempting Firebase Admin SDK reinit", "WARN")
                 try:
                     import firebase_admin as _fa
