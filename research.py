@@ -1390,25 +1390,37 @@ def start_firestore_start_listener(job_queue, loop):
                     except Exception:
                         pass
                     continue
-                # Don't interfere with the actively-running job — per-run
-                # command listener handles it via its own stop path.
+                # If the target is the actively-running job, route to the
+                # same stop path the per-run command listener uses:
+                # request_stop + schedule_server_exit. _controls.is_stop()
+                # checks aren't inside long Playwright awaits, so a stop
+                # signal alone can take minutes to land — the 3s exit
+                # timer bounds tear-down. daemon-loop respawns --serve
+                # fresh and any orphan Patchright/Chromium dies with the
+                # parent process. Mark the research status="stopped" too
+                # so the FE chat + tile reflect cancelled immediately;
+                # `_flip_queued_to_ongoing` is now transactional and
+                # honors this even if the worker dequeues concurrently.
+                # (Replaces the old cancelTooLate band-aid: the cancel
+                # actually cancels now, so no "couldn't cancel" message
+                # path is needed.)
                 current = _QUEUE_STATE.get("current_job") or {}
                 if current.get("research_id") == target_rid:
-                    log(f"Cancel: target {target_rid} is actively running — skipping queue surgery", "INFO")
-                    # Tell the FE the cancel raced with worker pickup. The FE
-                    # has already optimistically written status="stopped" to
-                    # Firestore — without this signal, the BE's subsequent
-                    # status="ongoing" + phase events clobber the FE state and
-                    # the user sees the run continue silently. Writing
-                    # cancelTooLate to the research doc lets the FE detect
-                    # the race and roll back its optimistic teardown.
+                    log(f"Cancel: target {target_rid[:8]}… is the running job — requesting stop + scheduling exit", "INFO")
+                    loop.call_soon_threadsafe(_controls.request_stop)
+                    run_id = current.get("run_id") or ""
+                    if run_id:
+                        try:
+                            (Path(__file__).parent / "queues" / run_id / ".stop").touch()
+                        except Exception:
+                            pass
                     if _firebase_db:
                         try:
                             _firebase_db.collection("users").document(target_uid) \
                                 .collection("researches").document(target_rid) \
                                 .update({
-                                    "cancelTooLate": True,
-                                    "cancelTooLateAt": int(time.time() * 1000),
+                                    "status": "stopped",
+                                    "summary": "Cancelled",
                                 })
                         except Exception:
                             pass
@@ -1416,9 +1428,44 @@ def start_firestore_start_listener(job_queue, loop):
                         doc.reference.delete()
                     except Exception:
                         pass
+                    _schedule_server_exit("token-cancel-current")
                     continue
                 def _do_cancel(rid=target_rid, u=target_uid, dref=doc.reference):
                     try:
+                        # Race-safe re-check: between the listener's initial
+                        # current_job read (above) and this callback running on
+                        # the asyncio loop, the worker may have completed its
+                        # `await _job_queue.get()` AND set _QUEUE_STATE
+                        # ["current_job"]. If we just scanned the deque, the
+                        # job would be missing (already popped) → no-op → the
+                        # pipeline would start despite the cancel. Re-checking
+                        # current_job here closes that window.
+                        current_now = _QUEUE_STATE.get("current_job") or {}
+                        if current_now.get("research_id") == rid:
+                            log(f"Cancel: target {rid[:8]}… popped to current_job between listener checks — routing to stop+exit", "INFO")
+                            _controls.request_stop()
+                            run_id_now = current_now.get("run_id") or ""
+                            if run_id_now:
+                                try:
+                                    (Path(__file__).parent / "queues" / run_id_now / ".stop").touch()
+                                except Exception:
+                                    pass
+                            if _firebase_db:
+                                try:
+                                    _firebase_db.collection("users").document(u) \
+                                        .collection("researches").document(rid) \
+                                        .update({
+                                            "status": "stopped",
+                                            "summary": "Cancelled",
+                                        })
+                                except Exception:
+                                    pass
+                            try:
+                                dref.delete()
+                            except Exception:
+                                pass
+                            _schedule_server_exit("token-cancel-current-late")
+                            return
                         dq = job_queue._queue  # deque
                         kept = [j for j in dq if j.get("research_id") != rid]
                         removed = any(j.get("research_id") == rid for j in dq)
@@ -17100,6 +17147,14 @@ async def run_server(port=8000):
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
 
+    # Reset module-level exit-scheduled flag. Daemon-respawn already gives
+    # us a fresh process (so the flag resets naturally), but if the same
+    # process is somehow re-entering run_server (test harness, future
+    # in-process restarts), we want a clean slate so a new stop can
+    # actually schedule its exit.
+    global _exit_scheduled
+    _exit_scheduled = False
+
     app = FastAPI(title="Research Pipeline API")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -17516,20 +17571,41 @@ async def run_server(port=8000):
 
     def _flip_queued_to_ongoing(uid_val, research_id_val):
         """Worker pickup: flip status from queued → ongoing and clear queue
-        fields. No-op if Firestore is unavailable or uid/rid missing (HTTP
-        /api/runs path doesn't carry them)."""
+        fields. Transactional — only flips if current status is "queued",
+        so a concurrent cancel that wrote status="stopped" between dequeue
+        and this call wins the race. Without this, a cancel landing in the
+        ms between worker dequeue and worker.flip() would be silently
+        overwritten back to "ongoing" and the user would see "Cancelled" in
+        chat while the tile said running. No-op if Firestore is unavailable
+        or uid/rid missing (HTTP /api/runs path doesn't carry them)."""
         if not (_firebase_db and uid_val and research_id_val):
             return
         try:
-            from google.cloud.firestore import DELETE_FIELD
-            _firebase_db.collection("users").document(uid_val) \
-                .collection("researches").document(research_id_val) \
-                .update({
+            from google.cloud import firestore as _firestore
+            doc_ref = _firebase_db.collection("users").document(uid_val) \
+                .collection("researches").document(research_id_val)
+
+            @_firestore.transactional
+            def _flip_txn(tx):
+                snap = doc_ref.get(transaction=tx)
+                if not snap.exists:
+                    return "missing"
+                cur = (snap.to_dict() or {}).get("status")
+                if cur != "queued":
+                    return f"skipped({cur})"
+                tx.update(doc_ref, {
                     "status": "ongoing",
-                    "queuePosition": DELETE_FIELD,
-                    "queuedBehindRunId": DELETE_FIELD,
-                    "queuedBehindTitle": DELETE_FIELD,
+                    "queuePosition": _firestore.DELETE_FIELD,
+                    "queuedBehindRunId": _firestore.DELETE_FIELD,
+                    "queuedBehindTitle": _firestore.DELETE_FIELD,
                 })
+                return "flipped"
+
+            outcome = _flip_txn(_firebase_db.transaction())
+            if outcome.startswith("skipped"):
+                log(f"[flip] {research_id_val[:8]}… {outcome} — leaving status as-is (cancel race won)", "INFO")
+            elif outcome == "missing":
+                log(f"[flip] {research_id_val[:8]}… research doc missing — Q3 cascade-cancel should catch this", "WARN")
         except Exception as e:
             log(f"Failed to flip queued→ongoing for {research_id_val}: {e}", "WARN")
 
