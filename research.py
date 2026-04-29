@@ -1421,6 +1421,10 @@ def start_firestore_start_listener(job_queue, loop):
                                 .update({
                                     "status": "stopped",
                                     "summary": "Cancelled",
+                                    # Q6: distinguishes user-cancel from
+                                    # worker-stop. FE consumes for the red
+                                    # dialog and the auto-delete-on-close.
+                                    "cancelled": True,
                                 })
                         except Exception:
                             pass
@@ -1457,6 +1461,7 @@ def start_firestore_start_listener(job_queue, loop):
                                         .update({
                                             "status": "stopped",
                                             "summary": "Cancelled",
+                                            "cancelled": True,
                                         })
                                 except Exception:
                                     pass
@@ -1480,15 +1485,21 @@ def start_firestore_start_listener(job_queue, loop):
                                         "status": "stopped",
                                         "phase": 0,
                                         "summary": "Cancelled before starting",
+                                        "cancelled": True,
                                     })
                             except Exception as ex:
                                 log(f"Cancel: failed to mark stopped: {ex}", "WARN")
                             fn = _QUEUE_STATE.get("recompute_fn")
                             if fn:
                                 fn()
-                        # Log the outcome (was: persisted on doc as `cancelled`
-                        # field). Doc absence = success signal for any FE
-                        # listener; the bool was never read elsewhere.
+                        # Log the outcome. The `cancelled: True` field on
+                        # the research doc (Q6) is the FE signal that
+                        # drives the red Cancelled dialog AND the
+                        # auto-delete-on-chat-close cascade. The
+                        # token-queue cancel doc itself is deleted
+                        # immediately above (dref.delete()) — the FE
+                        # tracks completion via the research doc, not the
+                        # cancel doc's existence.
                         log(f"Cancel: rid={rid[:8]}... removed_from_queue={removed}", "INFO")
                         try:
                             dref.delete()
