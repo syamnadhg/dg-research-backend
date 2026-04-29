@@ -751,6 +751,14 @@ def init_firebase():
 
 _start_listener = None  # Global start-command listener
 _heartbeat_task = None  # Async task: writes lastHeartbeat every 5s
+# Q8 observability: track when our heartbeat last successfully landed, +
+# how many consecutive writes have failed. /api/health surfaces the
+# timestamp so the FE can sanity-check "device offline despite localhost
+# responsive" cases (FE reads Firestore lastHeartbeat; BE may be writing
+# to a stale Firestore client). Reinit threshold below.
+_last_heartbeat_at_ms = 0
+_heartbeat_failures = 0
+HEARTBEAT_REINIT_THRESHOLD = 3  # consecutive fails before reinit_firebase()
 # Heartbeat cadence. Paired with the frontend's 15s offline threshold at
 # `DEVICE_OFFLINE_THRESHOLD_MS` in web/src/lib/firestore.ts so missing
 # two consecutive ticks + a ~5s slack flips the UI to offline. Cadence
@@ -1075,6 +1083,7 @@ async def _heartbeat_loop():
     `Date.now() - lastHeartbeat` directly, so a Timestamp object would
     become NaN and the tile would look perpetually offline. """
     from google.cloud.firestore import SERVER_TIMESTAMP
+    global _last_heartbeat_at_ms, _heartbeat_failures
     while True:
         try:
             if _firebase_db and _research_token:
@@ -1106,8 +1115,47 @@ async def _heartbeat_loop():
                         # call clear_paired_uid() shortly and subsequent
                         # ticks skip the mirror block entirely.
                         pass
+                # Q8 observability — record success.
+                _last_heartbeat_at_ms = int(time.time() * 1000)
+                if _heartbeat_failures > 0:
+                    log(f"[heartbeat] recovered after {_heartbeat_failures} consecutive failures", "INFO")
+                    _heartbeat_failures = 0
         except Exception as e:
-            log(f"Heartbeat write failed: {e}", "WARN")
+            _heartbeat_failures += 1
+            log(f"[heartbeat] write failed (consecutive={_heartbeat_failures}): {e}", "WARN")
+            # Q8 self-heal — after the threshold, attempt to reinitialize
+            # the Firestore client. Covers the case where _firebase_db's
+            # underlying gRPC channel has died but the SDK doesn't surface
+            # it through retries (the FE reads lastHeartbeat from
+            # Firestore; without recovery it perpetually shows "offline"
+            # despite localhost being responsive).
+            #
+            # firebase_admin.initialize_app() raises if the default app
+            # already exists — must delete_app() first to clear it. And
+            # init_firebase() has a fast-path return if _firebase_db is
+            # truthy, so reset that to None too. Counter resets ONLY on
+            # successful reinit so a flaky reinit doesn't ping-pong.
+            if _heartbeat_failures >= HEARTBEAT_REINIT_THRESHOLD:
+                global _firebase_db
+                log(f"[heartbeat] {_heartbeat_failures} consecutive failures — attempting Firebase Admin SDK reinit", "WARN")
+                try:
+                    import firebase_admin as _fa
+                    try:
+                        _fa.delete_app(_fa.get_app())
+                    except (ValueError, Exception):
+                        # No default app to delete — first reinit attempt
+                        # after a fresh process, or the app was somehow
+                        # already cleaned up. Either way, proceed to
+                        # initialize_app via init_firebase().
+                        pass
+                    _firebase_db = None  # Force init_firebase()'s fast-path to fall through
+                    if init_firebase():
+                        _heartbeat_failures = 0
+                        log("[heartbeat] reinit succeeded — next tick will retry", "INFO")
+                    else:
+                        log("[heartbeat] reinit returned False (service-account.json missing?)", "ERROR")
+                except Exception as reinit_err:
+                    log(f"[heartbeat] reinit raised: {reinit_err}", "ERROR")
         await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
 
 
@@ -17843,8 +17891,19 @@ async def run_server(port=8000):
 
     @app.get("/api/health")
     async def health_check():
-        """Server health check."""
-        return {"status": "ok", "running": bool(_QUEUE_STATE.get("running")), "pending": _job_queue.qsize()}
+        """Server health check. Q8: includes lastHeartbeatAt (millis since
+        epoch) + consecutive heartbeat failure count so the FE can sanity-
+        check 'device offline despite localhost responsive' cases. The
+        Account-tile online indicator reads Firestore lastHeartbeat — if
+        Firestore writes are failing but local HTTP is fine, this endpoint
+        shows the disparity directly."""
+        return {
+            "status": "ok",
+            "running": bool(_QUEUE_STATE.get("running")),
+            "pending": _job_queue.qsize(),
+            "lastHeartbeatAt": _last_heartbeat_at_ms,
+            "heartbeatFailures": _heartbeat_failures,
+        }
 
     @app.patch("/api/runs/{run_id}/config")
     async def update_config(run_id: str, request_data: dict):
