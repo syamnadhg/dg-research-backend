@@ -15827,6 +15827,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         ee = pipeline_config.get("emailEnabled", True)
         if 3 in sp:
             sp.add(4)
+        # Brief-on requires ≥1 P2 agent — otherwise the brief feeds nothing
+        # and Phase 3 has no documents. The FE has 3 separate guards (chat
+        # panel, settings page, tile diagram) but a stale config.json or a
+        # mid-pipeline command-config update can still land an invalid
+        # combo here. Auto-enable ChatGPT silently rather than fail —
+        # preserves the brief's investment, matches the FE auto-enable on
+        # the skip-brief Settings toggle, and makes downstream phases work.
+        if 1 not in sp and not any(ac.values()):
+            log("Config: brief on with 0 agents — auto-enabling ChatGPT", "WARN")
+            ac["chatgpt"] = True
         return sp, ac, ve, ee
 
     skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
