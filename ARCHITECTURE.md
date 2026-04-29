@@ -64,7 +64,7 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 | `login_required` | 0-5 | `{platforms: string[], platformLabels: string[], envErrors?: string[], attempt, message}` | **Phase 0 (Apr 19): sequential — fired with `platforms: [key]` scoped to the ONE platform currently being verified, one at a time until all pass. Phases 1-5: cookie-only probe at phase entry fires this with the missing platforms for that phase regardless of `skipInitVerify`.** |
 | `phase_narration` | 1-5 | `{text: string, timestamp: int}` | **Gemini 2.0 Flash narrator (Apr 19).** Emits one human-readable sentence describing what's happening in the active phase, every ~45s. Fed by a bounded ring buffer (~40 recent events). Warms on `phase_start`, quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Frontend stores in `phaseNarrations[researchId][phase]` and renders inside the phase dropdown. *(The U2 cleanup removed the older `/api/narrate` speculative-fallback hook; speculative entries no longer appear.)* |
 | `agent_narration` | 2 | `{agent: string, text: string, timestamp: int}` | **Per-agent Gemini 2.0 Flash narrator (Apr 19 late-late).** Emits one human-readable sentence per active Phase 2 agent every ~6s. Separate Flash API call per agent because per-agent context changes fast during P1/P2. Frontend stores in `agentNarrations[researchId][agentKey]`, rendered by `AgentAccordionRow` in preference over the legacy `richNarrative` string. Cleared on phase-2 complete. |
-| `tier_transition` | 0-5 | `{op, agent?, hotspot_id?, from_tier, to_tier, reason}` | **Vision shadow-eval telemetry (Apr 26).** Records every escalation between tiers (e.g. DOM→CUA, Vision→CUA). Used by `scripts/vision_shadow_report.py` to compute per-hotspot agreement metrics. Persisted to events.jsonl AND to `logs/vision_shadow.jsonl` when `DG_VISION_TIER=shadow`. |
+| `tier_transition` | 0-5 | `{op, agent?, hotspot_id?, from_tier, to_tier, reason, attempt}` | **Vision shadow-eval telemetry (Apr 26) + TierEscalation tracking (Apr 28).** Records every escalation between interaction tiers (e.g. DOM→CUA, Vision→CUA). The `attempt` field is the per-(op, agent) counter inside a 30-min sliding window — fed by `TierEscalation.record()` (research.py:2580+), centralized via `emit_tier_transition()`. Used by `scripts/vision_shadow_report.py` to compute per-hotspot agreement metrics. Persisted to events.jsonl AND to `logs/vision_shadow.jsonl` when `DG_VISION_TIER=shadow`. |
 | `wrong_artifact_rejected` | 2 | `{agent, op, tier, attempt}` | **Finalize-extraction guard (Apr 26).** Fired when `_is_sources_not_document` rejects a finalize-copy result (extracted content is the source-list panel, not the report). Tier ∈ {cua, dom_html_md, dom_js, dom_panel}. Drives the retry-cap-2 loop on hotspots #2c and #2d. |
 | `extract_failed` | 2 | `{agent, op, attempts, last_tier}` | **Final-failure terminal (Apr 26).** Fired when all retry attempts on hotspots #2c / #2d are exhausted. Pairs with a `pipeline_error` for FE phase-alert routing. |
 
@@ -177,12 +177,12 @@ Phase 2 agents are declared "done" only when BOTH conditions are met:
 | `pipeline_error` | `pipeline_error` branch | warn/error panel with backend-supplied `actions: [Retry, Skip, …]` |
 | `pipeline_warning` | `pipeline_warning` branch | info/warn panel with the `actions` payload (e.g. `[Retry, Continue anyway]`) |
 | `login_required` | `login_required` branch | warn panel: "Log into X on Y", actions `[Retry, Skip verification]` |
-| `phase_restart` | `phase_restart` branch | quiet info panel: "Phase N restarted with your additional context" |
+| `phase_restart` | (no FE handler — C3 cleanup) | telemetry only; phase tile updates in place, no banner |
 | `pipeline_stopped` | `pipeline_stopped` branch (legacy paired event) | error panel with humanized error text |
 | `human_verification_required` | `human_verification_required` branch | per-AGENT (not phase) alert via `setAgentAlert` — listed here because it's part of the same alert system |
 | `agent_link_failed` | `agent_link_failed` branch | per-AGENT alert with `[Retry, Skip]` actions |
-| watchdog 30-min auto-pause | `startFirestoreListener` watchdog interval | warn panel: "Backend silent for 30 min — pipeline auto-paused" with `[Retry (ping), Skip phase]` |
-| watchdog reviving (supervised) | same | quiet info panel: "Reviving backend…" |
+| watchdog T2 silence (per-phase tier 2) | `startFirestoreListener` watchdog interval | warn-level dropdown alert with Dismiss only + OS notification. Pipeline keeps running — autonomous tier framework handles recovery. (C2 dropped the prior auto-pause + Retry/Skip behavior.) |
+| watchdog T3 silence (per-phase tier 3) | same | informational dropdown alert + OS notification, no actions. ChatContainer separately surfaces the checkpoint-resume CTA when status flips to `stopped_by_watchdog`. |
 | `ChatContainer.tsx` paused_backend_restart recovery | onMount Firestore read | warn panel: "Backend restarted mid-run — resume from the last checkpoint?" |
 | pre-Phase-0 start failure | `startPipelineViaFirestore` ack timeout in `startPipeline` | warn panel with `[Retry, Skip]` (`retry_start` / `skip_start`) |
 
@@ -264,6 +264,46 @@ Frontend renders the new status as a phaseAlert at the last-known phase:
 - `[Discard + start new]` → clears the alert locally; queue directory stays on disk as a backup.
 
 Checkpoints that survive the crash: `documents/*.md`, `tracks/*.json`, `delivery.json`, `links.json`, `podcasts/*.m4a`, `checkpoint.json`. Missing state (browser + CUA session) is re-created by the resume run.
+
+---
+
+## Tier Escalation Tracking + Phoenix Resume (C1, Apr 28)
+
+Unified per-(op, agent) attempt tracking for retry/escalation across BE operations. Replaces ad-hoc tier_transition emits with the centralized `emit_tier_transition()` helper.
+
+**TierEscalation class** (`research.py:2580+`) — one record per (`op`, `agent`) pair, with a 30-min sliding window:
+- `attempts: {T0, T1, T2, T3}` — counters bucketed by tier label
+- `window_start: float` — counters auto-reset after `_TIER_WINDOW_SEC = 1800`
+- `history: list[{tier, ts_ms, reason, attempt}]` — bounded at 50 entries
+- `to_dict()` / `from_dict()` for checkpoint serialization
+
+**Tier ladder semantics (crash-recovery):**
+| Tier | Action | Budget |
+|------|--------|--------|
+| T0 | In-place retry | up to 3× (≤30s gap, ≤90s total) |
+| T1 | Tab restart (close → reopen → retry) | up to 2× |
+| T2 | Full-browser restart (`browser.stop()` → `browser.start()`) | once |
+| T3 | BE Phoenix exit via daemon-loop (saves to `_pending_queue.json`, exits 0) | once per window |
+
+> **Naming note:** these T0/T1/T2/T3 labels are the **crash-recovery escalation ladder** and are unrelated to the **interaction tier ladder** in `scratch/vision_v3_plan.md` (Playwright = tier-1, Vision = tier-2, CUA = tier-3). The two systems coexist; the `from_tier`/`to_tier` fields on `tier_transition` events use the *interaction* labels (`dom`, `cua`, `vision`).
+
+**Centralized emit:** `emit_tier_transition(*, phase, agent, op, from_tier, to_tier, reason)` calls `TierEscalation.record(to_tier, reason)` then fires the `tier_transition` event with the new attempt counter. The 6 wired hotspots are:
+
+| research.py site | `op` | `agent` | direction |
+|------------------|------|---------|-----------|
+| `extract_share_link_chatgpt` | `p2_share_extract` | chatgpt | dom→cua |
+| `verified_paste_brief` → `cua_paste_fallback` | `brief_paste` | platform | dom→cua |
+| ChatGPT P1 activity panel | `open_activity_panel_p1` | chatgpt | dom→cua |
+| Round-robin gemini share | `p2_share_extract` | gemini | dom→cua |
+| Claude artifact panel | `open_artifact_1` | claude | dom→cua |
+| ChatGPT P2 activity panel | `open_activity_panel` | chatgpt | dom→cua |
+
+**Checkpoint enrichment:**
+- `tier_escalation_history: dict[str, dict]` — full registry of TierEscalation records, keyed by `f"{op}:{agent.lower()}"`
+- `agent_states: dict` — per-agent runtime state mirror so a Phoenix restart rebuilds "where each agent was"
+- `last_event_id: str` — `f"{ts_ms}_{event_type}"` cursor so the FE can dedup events on resume
+
+**Phoenix T3 resume — `_pending_queue.json`:** the in-memory `_job_queue` (asyncio.Queue) is lost on BE exit. The worker writes a snapshot `{ts_ms, current, pending}` to `queues/_pending_queue.json` after every `_job_queue.get()` and again in the `finally` block. On startup, after Firestore-driven rehydration runs, the disk snapshot is read and any research_id NOT already in the rehydrated set is re-enqueued. Covers the gap where a job got `put_nowait`'d locally but the Firestore `status:"queued"` write hadn't landed yet.
 
 ---
 
