@@ -1912,12 +1912,25 @@ def _schedule_server_exit(source: str, delay_sec: float = 3.0):
 
 
 def _emit_to_firestore(event):
-    """Write event to Firestore pipeline_events subcollection."""
+    """Write event to Firestore pipeline_events subcollection.
+
+    expireAt: a 30-day-future Timestamp paired with the Firestore TTL policy
+    on `pipeline_events.expireAt` (configured manually in the console). At
+    a typical cadence of 2-3k events per 90-min run, the unbounded subcoll
+    would otherwise hit ~1.5 MB / run × N users → linear-storage growth.
+    Completed-run replay reads from the parent message doc + agents map,
+    not the event log, so 30-day pruning is invisible to UX.
+    """
     global _fb_seq
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return
     _fb_seq += 1
-    doc_data = {**event, "seq": _fb_seq}
+    from datetime import timedelta, timezone
+    doc_data = {
+        **event,
+        "seq": _fb_seq,
+        "expireAt": datetime.now(timezone.utc) + timedelta(days=30),
+    }
     try:
         _firebase_db.collection("users").document(_fb_uid) \
             .collection("researches").document(_fb_research_id) \
@@ -13911,9 +13924,28 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
             p3_links[_name] = _url
         if _has_md:
             p3_md_files.append(_md_path)
+    # Flow B: P1 + all P2 skipped means `results` is empty, so the loop
+    # above adds no md files. Scan documents/ for any user-supplied source
+    # files (md/txt/pdf/docx — anything except brief.md) so P3 still has
+    # something to upload to NotebookLM.
+    _docs_dir = Path(queue_dir) / "documents"
+    if _docs_dir.exists():
+        _already = {p.name for p in p3_md_files}
+        for _f in sorted(_docs_dir.iterdir()):
+            if not _f.is_file():
+                continue
+            if _f.stem == "brief":
+                continue
+            if _f.suffix.lower() not in (".md", ".txt", ".pdf", ".docx"):
+                continue
+            if _f.name in _already:
+                continue
+            if _f.stat().st_size < 32:
+                continue   # Empty / placeholder file — skip
+            p3_md_files.append(_f)
     _runtime.p2_links_for_p3 = p3_links
     _runtime.p2_md_files_for_p3 = p3_md_files
-    log(f"[Phase 2→3 handoff] {len(p3_links)} links, {len(p3_md_files)} MDs ready for NotebookLM")
+    log(f"[Phase 2→3 handoff] {len(p3_links)} links, {len(p3_md_files)} files ready for NotebookLM")
 
 
 # ── Phase 3: NotebookLM Upload ───────────────────────────────────────────────
@@ -15705,6 +15737,50 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             brief_file = str(_inline_brief_path)
             log(f"Inline brief persisted ({len(brief_text)} chars) → {_inline_brief_path.name}")
 
+        # Flow B: P1 + all P2 skipped → user attached source files (uploaded
+        # to Storage by the FE). Download each into queue_dir/documents/
+        # preserving the original extension so NotebookLM ingests them
+        # natively (NLM accepts md/txt/pdf/docx). The existing P3 file scan
+        # at gate-decision time + run_phase3_upload pick them up like any
+        # other agent-generated artifact. Failures are logged but the
+        # pipeline continues with whatever sources DID download.
+        if user_sources:
+            try:
+                from firebase_admin import storage as _fb_storage
+                _bucket = _fb_storage.bucket()
+                _ok, _fail = 0, 0
+                for _src in user_sources:
+                    _name = (_src.get("name") or "source").strip() or "source"
+                    _path = (_src.get("storagePath") or "").strip()
+                    if not _path:
+                        _fail += 1
+                        continue
+                    # Sanitize: keep alnum + . _ - and cap length so a
+                    # malicious name can't escape queue_dir.
+                    _safe = re.sub(r"[^A-Za-z0-9._-]", "-", _name)[:80] or "source"
+                    # Avoid clobbering brief.md or another source with the
+                    # same sanitized name — append a numeric suffix.
+                    _dest = queue_dir / "documents" / _safe
+                    if _dest.stem == "brief":
+                        _dest = queue_dir / "documents" / f"src-{_safe}"
+                    _i = 2
+                    while _dest.exists():
+                        _stem = _dest.stem
+                        _ext = _dest.suffix
+                        _dest = queue_dir / "documents" / f"{_stem}-{_i}{_ext}"
+                        _i += 1
+                    try:
+                        _blob = _bucket.blob(_path)
+                        _blob.download_to_filename(str(_dest))
+                        log(f"Flow B source: gs://{_bucket.name}/{_path} → {_dest.name} ({_dest.stat().st_size} bytes)")
+                        _ok += 1
+                    except Exception as _e:
+                        log(f"Flow B source download FAILED ({_path}): {_e}", "WARN")
+                        _fail += 1
+                log(f"Flow B sources: {_ok} downloaded, {_fail} failed")
+            except Exception as _outer:
+                log(f"Flow B handler failed (non-fatal): {_outer}", "WARN")
+
     log(f"Queue: {queue_dir}")
     tracks_dir = init_tracks(queue_dir.name)  # Same name as queue — one research = one tracks folder
 
@@ -16805,7 +16881,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # ends the run. Previously we capped at 1 retry and then
         # silently marked the run failed — that broke the contract.
         doc_dir = queue_dir / "documents"
-        md_files = [f for f in doc_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
+        # Source scan: include user-attached PDFs/DOCX/TXT alongside agent
+        # MDs so Flow B (P1+P2 skipped, sources-only) doesn't trip the
+        # "no documents" gate. brief.md is still excluded — it's input,
+        # not a NotebookLM source.
+        md_files = [f for f in doc_dir.iterdir()
+                    if doc_dir.exists() and f.is_file()
+                    and f.suffix.lower() in (".md", ".txt", ".pdf", ".docx")
+                    and f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
         has_results = md_files or any(r.get("text") for r in results.values())
         _p3gate_skipped = False
         _p3gate_attempt = 0
@@ -16842,8 +16925,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _regen_md = f"# {name} Deep Research (retry)\n\n{r['text']}"
                         (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
                         save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
-                # Re-check gate
-                md_files = [f for f in doc_dir.glob("*.md") if f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
+                # Re-check gate (same source scan as the initial pre-gate
+                # check above — keeps Flow B sources counted on retry).
+                md_files = [f for f in doc_dir.iterdir()
+                            if doc_dir.exists() and f.is_file()
+                            and f.suffix.lower() in (".md", ".txt", ".pdf", ".docx")
+                            and f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
                 has_results = md_files or any(r.get("text") for r in results.values())
                 continue
             if gate_decision == "skip":
