@@ -68,12 +68,19 @@ try:
     import vision as _vision  # type: ignore
 except Exception as _ve:
     _vision = None  # noqa: N816 — fallthrough; shadow path no-ops below.
-    print(f"[vision] import failed (shadow disabled): {_ve}", flush=True)
+    # Guard print: under pythonw.exe (Scheduled Task supervisor path),
+    # sys.stdout is None and any unguarded write raises AttributeError at
+    # import time, killing the daemon-loop before main() runs.
+    if sys.stdout is not None:
+        print(f"[vision] import failed (shadow disabled): {_ve}", flush=True)
 
-# Windows UTF-8 fix
+# Windows UTF-8 fix — guarded for pythonw.exe (sys.stdout/stderr are None
+# under the no-console interpreter, so .reconfigure would crash at import).
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    if sys.stdout is not None:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    if sys.stderr is not None:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -18590,18 +18597,48 @@ async def run_pair(profile_dir, wait_minutes=10):
 _SUPERVISOR_TASK_NAME = "SuperResearchBackend"
 
 
+def _supervisor_python_exe() -> str:
+    """Return pythonw.exe (no-console interpreter) sibling of the current
+    interpreter, falling back to sys.executable. Used for the Scheduled
+    Task action and detached daemon-loop spawns so the supervisor doesn't
+    pop a visible console window at logon."""
+    cur = Path(sys.executable)
+    if cur.name.lower() == "python.exe":
+        sib = cur.parent / "pythonw.exe"
+        if sib.exists():
+            return str(sib)
+    return str(cur)
+
+
+def _console_python_exe() -> str:
+    """Return python.exe (console interpreter) sibling of the current
+    interpreter, falling back to sys.executable. Used by daemon-loop when
+    spawning --serve so uvicorn keeps predictable stdio semantics even when
+    daemon-loop itself is running under pythonw.exe."""
+    cur = Path(sys.executable)
+    if cur.name.lower() == "pythonw.exe":
+        sib = cur.parent / "python.exe"
+        if sib.exists():
+            return str(sib)
+    return str(cur)
+
+
 def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
-    """Return [(pid, cmdline, role), ...] for every python.exe whose
-    command line references this script. role ∈ {'daemon-loop', 'serve',
-    'other'}. Single source of truth for --resurrect (what's running
-    before I spawn?) and --retire (what do I need to kill?).
+    """Return [(pid, cmdline, role), ...] for every python.exe / pythonw.exe
+    whose command line references this script. role ∈ {'daemon-loop',
+    'serve', 'other'}. Single source of truth for --resurrect (what's
+    running before I spawn?) and --retire (what do I need to kill?).
 
     Matches on "research.py" substring so subprocess invocations launched
     from different cwd styles (absolute, relative, with/without quotes)
-    all get caught. Safe on non-Windows — returns [] when wmic is absent."""
+    all get caught. Safe on non-Windows — returns [] when wmic is absent.
+
+    Includes pythonw.exe because the Scheduled Task action runs the
+    supervisor under the no-console interpreter."""
     try:
         ps = subprocess.run(
-            ["wmic", "process", "where", "name='python.exe'",
+            ["wmic", "process", "where",
+             "(name='python.exe' or name='pythonw.exe')",
              "get", "processid,commandline", "/format:list"],
             capture_output=True, text=True, timeout=15,
         )
@@ -18701,7 +18738,29 @@ def run_daemon_loop(port: int = 8000):
     import time as _time
 
     script_path = str(Path(__file__).resolve())
-    python_exe = _sys.executable
+    _log_dir = Path(script_path).parent
+    _serve_log = _log_dir / "backend.log"
+    _serve_err = _log_dir / "backend.err.log"
+
+    # When the Scheduled Task action runs the supervisor under pythonw.exe
+    # (no-console interpreter — keeps the daemon-loop window from appearing
+    # at logon), sys.stdout / sys.stderr are None and any print() inside
+    # log() crashes. Tee both to the backend log files BEFORE the first
+    # log() call so the supervisor stays observable and never raises on a
+    # write. No-op when running under console-attached python.exe.
+    if Path(_sys.executable).name.lower() == "pythonw.exe":
+        try:
+            _sys.stdout = open(_serve_log, "a", encoding="utf-8", buffering=1)
+            _sys.stderr = open(_serve_err, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            pass
+
+    # --serve always runs under console python.exe for predictable stdio
+    # semantics even when the supervisor itself is pythonw.exe; uvicorn
+    # output still flows into the redirected log files below, and
+    # CREATE_NO_WINDOW keeps the child invisible regardless of parent.
+    python_exe = _console_python_exe()
+
     # When --resurrect spawns daemon-loop detached (DETACHED_PROCESS), this
     # wrapper runs with no console. A naked `subprocess.run` on python.exe
     # (a console app) then forces Windows to ALLOCATE A NEW CONSOLE for
@@ -18710,9 +18769,6 @@ def run_daemon_loop(port: int = 8000):
     # stdio to the log files keeps uvicorn's output tailable without a
     # window ever appearing.
     _NO_WINDOW = getattr(_subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    _log_dir = Path(script_path).parent
-    _serve_log = _log_dir / "backend.log"
-    _serve_err = _log_dir / "backend.err.log"
 
     # Pre-flight orphan sweep — runs once at wrapper startup. Catches:
     #   (a) other daemon-loop PIDs (only one wrapper at a time; PT5M task
@@ -18866,7 +18922,10 @@ def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
     if _platform.system() != "Windows":
         return False, None, "non-Windows", 0
 
-    python_exe = _sys.executable
+    # pythonw.exe (no-console subsystem) keeps the supervisor invisible at
+    # logon — under the `/IT` interactive token, console-mode python.exe
+    # would otherwise pop a visible daemon-loop terminal.
+    python_exe = _supervisor_python_exe()
     script_path = str(Path(__file__).resolve())
     task_run = f'"{python_exe}" "{script_path}" --daemon-loop'
 
@@ -18988,7 +19047,11 @@ def run_resurrect():
         print(f"  {_c(_DIM, 'as task #355 (launchd + systemd-user). See PERSISTENCE-RECIPE.md.')}")
         return
 
-    python_exe = _sys.executable
+    # pythonw.exe (no-console subsystem) keeps the supervisor invisible at
+    # logon — under the `/IT` interactive token, console-mode python.exe
+    # would otherwise pop a visible daemon-loop terminal. Falls back to
+    # sys.executable if pythonw.exe isn't installed alongside.
+    python_exe = _supervisor_python_exe()
     script_path = str(Path(__file__).resolve())
     # Use the full path to python.exe so the task runs even if PATH isn't set
     # up for the scheduler's session. Quote both to tolerate spaces.
