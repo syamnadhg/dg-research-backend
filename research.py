@@ -1558,6 +1558,112 @@ def start_firestore_start_listener(job_queue, loop):
                         log(f"Cancel queued failed: {ex}", "WARN")
                 loop.call_soon_threadsafe(_do_cancel)
                 continue
+            # Resume-from-checkpoint: the FE banner Resume / chat-tool resume
+            # for a paused_backend_restart / stopped_by_watchdog run lands here.
+            # The per-research command listener is dead in those states (this
+            # is a fresh daemon process), so the token-queue is the only path
+            # that re-enqueues the job from disk artifacts.
+            if action == "resume":
+                target_uid = data.get("uid", "")
+                target_rid = data.get("researchId", "")
+                if not target_uid or not target_rid:
+                    log("Resume: missing uid/researchId", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
+                try:
+                    rs = _firebase_db.collection("users").document(target_uid) \
+                        .collection("researches").document(target_rid).get()
+                except Exception as ex:
+                    log(f"Resume: failed to read research doc: {ex}", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
+                if not rs.exists:
+                    log(f"Resume: research {target_rid[:8]}... not found", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
+                rd = rs.to_dict() or {}
+                backend_run_id = rd.get("backendRunId") or ""
+                if not backend_run_id:
+                    log(f"Resume: research {target_rid[:8]}... has no backendRunId", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
+                queue_dir = Path(__file__).parent / "queues" / backend_run_id
+                if not queue_dir.exists():
+                    log(f"Resume: queue_dir missing for {backend_run_id} — disk artifacts gone", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
+                # Block resume of terminal-stopped runs (mirrors HTTP endpoint).
+                if (queue_dir / ".stop").exists():
+                    log(f"Resume: run {backend_run_id} marked .stop (terminal) — skipping", "WARN")
+                    try: doc.reference.delete()
+                    except Exception: pass
+                    continue
+                # Clear .pause signal so the dispatcher / phase loops drain.
+                p = queue_dir / ".pause"
+                if p.exists():
+                    try: p.unlink()
+                    except Exception: pass
+                # Merge config into config.json if provided.
+                payload_config = data.get("config") or {}
+                if payload_config:
+                    config_path = queue_dir / "config.json"
+                    try:
+                        existing = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+                        existing.update(payload_config)
+                        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+                    except Exception as ex:
+                        log(f"Resume: config merge failed: {ex}", "WARN")
+                # Reset delivery + meta status from "paused" back to "ongoing"
+                # so disk artifacts agree with the new run state.
+                for fname in ("delivery.json", "meta.json"):
+                    fpath = queue_dir / fname
+                    if fpath.exists():
+                        try:
+                            d = json.loads(fpath.read_text(encoding="utf-8"))
+                            if d.get("status") == "paused":
+                                d["status"] = "ongoing"
+                                fpath.write_text(json.dumps(d, indent=2), encoding="utf-8")
+                        except Exception:
+                            pass
+                # Read topic from checkpoint (most authoritative); fall back to
+                # the research doc's topic.
+                cp = load_checkpoint(queue_dir)
+                topic = (cp or {}).get("topic", "") or rd.get("topic", "")
+                email = data.get("email") or ""
+                # Flip Firestore status to "ongoing" so the FE drops the alert
+                # banner immediately (the listener race below is harmless —
+                # _safe_enqueue's whitelist accepts ongoing).
+                try:
+                    _firebase_db.collection("users").document(target_uid) \
+                        .collection("researches").document(target_rid) \
+                        .update({"status": "ongoing"})
+                except Exception:
+                    pass
+                # Delete the queue doc — Firestore's onSnapshot replays it
+                # otherwise, double-enqueueing on every BE restart.
+                try: doc.reference.delete()
+                except Exception: pass
+                # Enqueue with resume_dir. We've already validated existence,
+                # so put_nowait directly bypasses _safe_enqueue's status check
+                # (which can race with our just-written "ongoing" flip).
+                def _do_resume_enqueue(t=topic, e=email, c=payload_config,
+                                       r=backend_run_id, u=target_uid, ri=target_rid,
+                                       rd_path=str(queue_dir)):
+                    try:
+                        job_queue.put_nowait({
+                            "topic": t, "email": e, "config": c, "run_id": r,
+                            "uid": u, "research_id": ri, "resume_dir": rd_path,
+                        })
+                    except Exception as ex:
+                        log(f"Resume: put_nowait failed: {ex}", "WARN")
+                loop.call_soon_threadsafe(_do_resume_enqueue)
+                log(f"Resume: re-enqueued {backend_run_id} for rid={target_rid[:8]}...")
+                continue
             if action != "start":
                 continue
             uid = data.get("uid", "")
