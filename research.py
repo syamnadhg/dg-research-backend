@@ -4854,6 +4854,37 @@ async def stop_narration_ticker(stop, task):
         pass
 
 
+# Maps Vision hotspot ids → the `op` string used by emit_tier_transition.
+# Lets _shadow_observed_cua read the live attempt counter out of the
+# TierEscalation registry (added Apr 28) so flow_context.attempts reflects
+# the real escalation count instead of a hardcoded 1. Vision._pick_model
+# upgrades Sonnet → Opus when attempts >= 2; without the live read that
+# upgrade branch never fires for genuine retries.
+_HOTSPOT_TO_OP = {
+    "p2-share": "p2_share_extract",
+    "7c":      "open_activity_panel",
+    "7c-p1":   "open_activity_panel_p1",
+    "7d":      "open_artifact_1",
+    # 2c / 2d (finalize hotspots) have no emit_tier_transition wired —
+    # they fall through to the default-1 path below.
+}
+
+
+def _attempts_for_hotspot(hotspot_id: str, platform: str) -> int:
+    """Return the per-(op, agent) escalation count for a Vision hotspot,
+    falling back to 1 when the hotspot isn't tier-tracked. Reads the
+    `cua` bucket of TierEscalation since every wired emit lands as
+    dom→cua. Keeps the contract floor at 1 so Vision's first call still
+    sees a sane minimum."""
+    op = _HOTSPOT_TO_OP.get(hotspot_id)
+    if not op:
+        return 1
+    esc = _tier_escalations.get(_tier_key(op, platform))
+    if not esc:
+        return 1
+    return max(1, esc.attempts.get("cua", 0))
+
+
 async def _shadow_observed_cua(
     page, *, hotspot_id, phase, platform, current_step,
     context_hint, cua_coro_factory, expected_outcome="",
@@ -4887,7 +4918,7 @@ async def _shadow_observed_cua(
         "current_step": current_step,
         "expected_outcome": expected_outcome,
         "context_hint": context_hint,
-        "attempts": 1,
+        "attempts": _attempts_for_hotspot(hotspot_id, platform),
     }
     try:
         return await _vision.shadow_observe_then_cua(
