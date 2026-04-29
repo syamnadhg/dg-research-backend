@@ -485,47 +485,10 @@ Non-negotiable: "No, it's not made for kids" + "Unlisted" + SAVE clicked. Never 
 
 To scroll inside the dialog: click the content area, then Page Down or mouse wheel."""
 
-# ── Phase 6: Google Doc + Email ───────────────────────────────────────────────
-
-PROMPT_CREATE_DOC = SYSTEM_BASE + """
-
-Your task: Fill a blank Google Doc with the provided content, apply heading styles to the section labels, AND make it public. All three are required. Do NOT stop early.
-
-Steps:
-1. You should see a new blank Google Doc. Click into the body. Type the EXACT content given line-by-line. Type fast — do NOT re-read the doc between iterations. (If a paste shortcut works, use Ctrl+V; otherwise type.)
-2. Apply heading styles for readability:
-   a. Select the FIRST line (the title — the topic name). Apply Heading 1 (Format menu → Paragraph styles → Heading 1, or shortcut Ctrl+Alt+1).
-   b. For each ALL-CAPS section label in the body (e.g. "RESEARCH BRIEF", "AGENT REPORTS", "NOTEBOOKLM", "VIDEO"), select that line and apply Heading 2 (Ctrl+Alt+2).
-3. After content + headings are done, click the blue "Share" button at the top-right.
-4. In the Share dialog, find "General access" near the bottom. If it says "Restricted", click the dropdown and change it to "Anyone with the link".
-5. Confirm the role next to it is "Editor" (if not already).
-6. If there is a "Copy link" button, click it.
-7. Click "Done" to close the dialog. If a "Link copied" toast appears, that's success — do NOT click Share again.
-8. Say "created" when the doc is filled, headings are styled, AND public.
-
-ENTERPRISE-POLICY FALLBACK:
-- If the "Anyone with the link" option is GRAYED OUT / DISABLED with text like "This option is restricted by your organization" or similar admin-policy banner, do NOT keep clicking it. Instead:
-  (a) Try selecting "Distributed Global" or your workspace-domain option from the General access dropdown — that lets anyone in the workspace open the doc.
-  (b) If even that is unavailable, click "Add people and groups" and explicitly type the recipient email from the provided content, set their role to Editor, then send.
-  (c) Say "created (restricted_share: <reason>)" so the orchestrator knows the link isn't fully public — e.g. "created (restricted_share: workspace_only)" or "created (restricted_share: explicit_recipient_only)"."""
-
-PROMPT_SEND_EMAIL = SYSTEM_BASE + """
-
-Your task: Compose and send an email via Gmail.
-
-Steps:
-1. Click "Compose".
-2. Click into the "To" field BEFORE typing — Gmail's compose sometimes opens with focus on the body, and typing the address there ruins the email. Then enter the recipient email.
-3. Click into the Subject field, then enter the subject.
-4. Click into the body, then type the email body with the provided links.
-5. Click "Send".
-6. After clicking Send, the Compose dialog should disappear and a "Message sent" toast should appear at the bottom. Wait ~3 seconds. If the Compose window is still open after that, Send was rejected — see ERROR HANDLING below. If the dialog closed, say "sent: <recipient>".
-
-ERROR HANDLING:
-- If a "Discard draft?" dialog appears, do NOT discard — click Cancel/Keep editing and re-click Send.
-- If Gmail rejects the recipient ("invalid email address" / "address not found"), say "send failed: invalid recipient" and STOP.
-- If Gmail rejects the send for any other reason (quota, attachment too large, "try again"), say "send failed: <reason>" and STOP — do not retry blindly.
-- If you cannot find the Send button, say "send failed: send button not visible" and STOP."""
+# ── Phase 5: Google Doc + Email ───────────────────────────────────────────────
+# 2026-04-29: PROMPT_CREATE_DOC and PROMPT_SEND_EMAIL deleted. Phase 5 now uses
+# direct Playwright (no CUA) for Doc creation + Resend HTTP API for email —
+# see _create_p5_doc_via_playwright and _send_p5_email_resend in research.py.
 
 # ── Inline CUA Prompts (used as one-off fallbacks) ────────────────────────────
 

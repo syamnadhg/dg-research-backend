@@ -2789,17 +2789,6 @@ class PipelineRuntime:
         # keeping all share-URL/MD work scoped to P2.
         self.p2_links_for_p3: dict = {}
         self.p2_md_files_for_p3: list = []
-        # P5 docs Page object — stashed by run_phase5 so the orchestrator's
-        # extract-with-retry path can read `page.url` directly instead of
-        # `browser.current_url()`. Without this, after run_phase5 opens the
-        # Gmail tab for email send, the orchestrator's retry path would
-        # grab `mail.google.com/...` and fail validation.
-        self.gdoc_page = None
-        # Doc URL of the LAST doc that successfully sent an email. Used by
-        # `_send_p5_email` to short-circuit the orchestrator's post-hoc
-        # email re-fire when the inline send already succeeded — prevents
-        # duplicate emails on the recovery path.
-        self.p5_email_sent_for_doc: str = ""
         # Per-agent state keyed by lowercase platform name. Mirrored into
         # checkpoint.json so a Phoenix restart can rebuild "where each
         # agent was" before silence escalation kicked in. Shape:
@@ -4599,38 +4588,6 @@ async def extract_youtube_url(browser, cua_client, verbose=False, **_):
         return LinkResult(url=url, label="YouTube Video", platform="youtube", verified=verified)
     except Exception as e:
         return LinkResult(url=url, label="YouTube Video", platform="youtube", error=str(e))
-
-
-async def extract_gdoc_url(browser, page=None, **_):
-    """Extract Google Doc URL.
-
-    Tab-context guard: prefer the explicit `page` kwarg (the docs Page
-    object held by run_phase5) over `browser.current_url()`. When email
-    send opens the Gmail tab, `browser.current_url()` returns Gmail —
-    grabbing it here would feed the validator a `mail.google.com` URL
-    and burn 3× retries on a guaranteed-fail. The orchestrator's retry
-    path passes `_runtime.gdoc_page` via this kwarg to avoid that race.
-
-    When `page` is supplied we ONLY trust it. If `page.url` raises or
-    returns something that doesn't look like a Docs URL, return empty
-    rather than falling through to `browser.current_url()` — the whole
-    point of the kwarg is to avoid the racing-tab read, so falling
-    back to it on a partial failure would reopen the same wound.
-    """
-    if page is not None:
-        url = ""
-        try:
-            url = page.url or ""
-        except Exception:
-            url = ""
-        if url and "docs.google.com" not in url:
-            url = ""
-    else:
-        url = (await browser.current_url()) or ""
-    # Require `/document/d/` so we don't verify the home page or the
-    # `/document/create` redirect as a real doc URL.
-    verified = "docs.google.com/document/d/" in url
-    return LinkResult(url=url, label="Google Doc", platform="gdoc", verified=verified)
 
 
 # ── B1: Link-first phase_complete — retry helpers ────────────────────────────
@@ -15113,297 +15070,271 @@ Do NOT report studio.youtube.com URLs — those are NOT video links.""",
 
 # ── Phase 6: Google Doc + Gmail Delivery ─────────────────────────────────────
 
-async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
-                     brief_url="", audio_url="", email=None, verbose=False,
-                     existing_doc_url=""):
-    """Phase 5: Create + fill + publicly share Google Doc, then send email with Open Gmail link.
+def _compose_p5_doc_body(topic, brief_url, links, notebook_url, audio_url, youtube_url):
+    """Build the Phase 5 Google Doc body in the user's exact spec:
 
-    If `existing_doc_url` is supplied AND validates as a real Google Doc, the
-    function reuses it instead of creating a fresh `/document/create` tab —
-    prevents duplicate docs on outer-orchestrator retry paths.
+        {title}
+
+        Links to Researches:
+        ChatGPT Brief: {brief_url}
+        ChatGPT: {chatgpt_url}
+        Gemini: {gemini_url}
+        Claude: {claude_url}
+
+        Link to NotebookLM: {notebook_url}
+        Link to Audio Overview:
+        {audio_url}
+        Link to Youtube:
+        {youtube_url}
+
+    Each line is conditional — entries with empty URLs are silently omitted.
+    Per-agent URLs prefer `_runtime.agent_share_urls` (public share captured
+    in P2 by extract_and_record_agent) and fall back to the legacy `links`
+    arg (conversation URL).
+    """
+    short_topic = topic[:200] if len(topic) > 200 else topic
+    out = [short_topic, ""]
+
+    research_lines = []
+    if brief_url:
+        research_lines.append(f"ChatGPT Brief: {brief_url}")
+    for name in ["ChatGPT", "Gemini", "Claude"]:
+        share = _runtime.agent_share_urls.get(name) or {}
+        url = share.get("url") or links.get(name, "")
+        if url:
+            research_lines.append(f"{name}: {url}")
+    if research_lines:
+        out.append("Links to Researches:")
+        out.extend(research_lines)
+        out.append("")
+
+    if notebook_url:
+        out.append(f"Link to NotebookLM: {notebook_url}")
+    # `audio_url` is always non-empty here when NotebookLM ran — the
+    # orchestrator pre-fills it with `notebook_url` when no separate audio
+    # overview URL was extracted. Helper trusts what callers pass; no
+    # internal fallback so isolated unit tests behave predictably.
+    if audio_url:
+        out.append("Link to Audio Overview:")
+        out.append(audio_url)
+    if youtube_url:
+        out.append("Link to Youtube:")
+        out.append(youtube_url)
+
+    return "\n".join(out)
+
+
+async def _create_p5_doc_via_playwright(browser, body):
+    """Create a fresh Google Doc, type the body, make it public — pure
+    Playwright (no CUA, no OAuth). Returns the validated public URL or "".
+
+    Why direct Playwright over the prior CUA-driven path: CUA's `agent_loop`
+    was burning 30 iterations clicking around the share dialog and silently
+    falling out without ever advancing past `/document/create`, leaving
+    `page.url` stuck on the redirect. With direct keyboard.type + the
+    existing `_ensure_gdoc_public` DOM helper for the share step, we get
+    deterministic timing and a real URL back. The user's Google session is
+    already authenticated (Gmail + agents work), so no OAuth setup is
+    needed.
+    """
+    try:
+        page = await browser.new_tab("https://docs.google.com/document/create")
+    except Exception as e:
+        log(f"[Phase5] Failed to open Docs tab: {e}", "ERROR")
+        return ""
+
+    # Wait for the editor scaffold. /document/create redirects to a real
+    # /document/d/{id}/edit URL; we need that to land before we type.
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=20000)
+        # The kix canvas + the hidden text-event iframe are both reliable
+        # signals that the editor is ready for keystrokes.
+        await page.wait_for_selector(".kix-canvas-tile-content, .docs-texteventtarget-iframe",
+                                       timeout=20000, state="attached")
+    except Exception as e:
+        log(f"[Phase5] Editor never became interactive: {e}", "ERROR")
+        return ""
+
+    # Settle — Google Docs runs additional async layout passes after the
+    # selector lands. 2-3s on first load is the typical safe window.
+    await asyncio.sleep(3)
+
+    # Click into the canvas to focus the hidden text-event iframe. Kix
+    # routes keystrokes through `.docs-texteventtarget-iframe` once any
+    # part of the canvas is clicked.
+    try:
+        await page.locator(".kix-canvas-tile-content").first.click(timeout=5000)
+    except Exception:
+        # Fallback: click middle of viewport.
+        try:
+            box = await page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+            await page.mouse.click(box["w"] // 2, box["h"] // 2)
+        except Exception:
+            pass
+    await asyncio.sleep(0.7)
+
+    # Type body. delay=1ms is fast but lets Kix's input handlers keep up
+    # with newlines (each \n triggers a layout pass).
+    try:
+        await page.keyboard.type(body, delay=1)
+    except Exception as e:
+        log(f"[Phase5] Type failed: {e}", "ERROR")
+        return ""
+    await asyncio.sleep(2)
+
+    # Make public via the existing DOM safety-net helper. Idempotent — if
+    # the share dialog is already configured, the helper's role-button
+    # walks just no-op. Wrapped in try because the share button can move
+    # in some Google A/B variants.
+    try:
+        ok = await _ensure_gdoc_public(page)
+        if ok:
+            log("[Phase5] Public-share confirmed via DOM")
+        else:
+            log("[Phase5] DOM share flow returned False — doc may not be public", "WARN")
+        # Close any lingering share modal so the URL bar stabilizes.
+        await page.keyboard.press("Escape")
+    except Exception as e:
+        log(f"[Phase5] Share-flow error: {e}", "WARN")
+    await asyncio.sleep(1)
+
+    doc_url = page.url or ""
+    if validate_link("gdocs", doc_url):
+        return doc_url
+    log(f"[Phase5] Final URL didn't validate as a Doc: {doc_url}", "ERROR")
+    return ""
+
+
+async def _send_p5_email_resend(email, topic, doc_url, youtube_url):
+    """Send the Phase 5 notification email via Resend HTTP API. Returns
+    True on success. Only the Doc link + (optional) YouTube link are
+    surfaced — the doc itself contains the full set of agent / NLM /
+    audio links, so the email stays focused.
+
+    Why Resend over CUA-driven Gmail: CUA's `agent_loop` over the Gmail
+    compose dialog was the second major P5 failure mode (the first being
+    the Doc creation flake). Resend is a transactional API, succeeds in
+    one HTTP round-trip, and gives us a structured success/failure
+    signal we can act on. RESEND_API_KEY must be set in the BE env;
+    NOTIFY_FROM_EMAIL controls the From header (defaults to a Resend
+    onboarding address that works without DNS verification).
+    """
+    if not email:
+        log("[Phase5] No recipient email — email send skipped")
+        return False
+    ok, reason = validate_email(email)
+    if not ok:
+        log(f"[Phase5] Recipient email invalid ({reason}) — skipping send", "WARN")
+        return False
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        log("[Phase5] RESEND_API_KEY not set — email send skipped", "ERROR")
+        return False
+
+    from_email = os.environ.get("NOTIFY_FROM_EMAIL", "Super Research <onboarding@resend.dev>").strip()
+    smart = smart_title(topic) if topic else "your research"
+    subject = f"Research complete: {smart}"
+
+    # Build a minimal HTML body with the two links the user spec'd. The
+    # doc itself carries the full agent / NLM / audio bundle, so the
+    # email body intentionally stays focused.
+    parts = [
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:14px;line-height:1.5;color:#222;">',
+        '<p>Your research is complete.</p>',
+        f'<p style="margin:12px 0;"><a href="{doc_url}" style="color:#3b82f6;font-weight:600;text-decoration:none;">Open the Research Hub Doc →</a></p>',
+    ]
+    if youtube_url:
+        parts.append(
+            f'<p style="margin:12px 0;"><a href="{youtube_url}" style="color:#3b82f6;font-weight:600;text-decoration:none;">Watch on YouTube →</a></p>'
+        )
+    parts.append('<p style="color:#888;font-size:12px;margin-top:24px;">Sent by Super Research.</p>')
+    parts.append('</div>')
+    html = "".join(parts)
+
+    plain_lines = ["Your research is complete.", "", f"Doc: {doc_url}"]
+    if youtube_url:
+        plain_lines.append(f"YouTube: {youtube_url}")
+    plain_lines += ["", "— Super Research"]
+    plain = "\n".join(plain_lines)
+
+    try:
+        import requests as _r
+        resp = _r.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"from": from_email, "to": [email], "subject": subject, "html": html, "text": plain},
+            timeout=30,
+        )
+    except Exception as e:
+        log(f"[Phase5] Resend request failed: {e}", "ERROR")
+        return False
+
+    if resp.status_code in (200, 202):
+        try:
+            _id = (resp.json() or {}).get("id", "")
+        except Exception:
+            _id = ""
+        log(f"[Phase5] Email sent to {email} via Resend (id={_id})")
+        return True
+    log(f"[Phase5] Resend rejected {resp.status_code}: {resp.text[:300]}", "ERROR")
+    return False
+
+
+async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
+                     brief_url="", audio_url="", email=None, verbose=False):
+    """Phase 5: build the research Google Doc + email the user.
+
+    The orchestrator's old extract_with_retry / existing_doc_url loop is
+    gone — this path is now reliable enough to run once and trust the
+    result. Returns {doc_url, email_sent}.
     """
     log("=" * 60)
     log("PHASE 5: Doc + Email Delivery")
     log("=" * 60)
 
-    # Build doc content — structured format matching PRD.
-    #
-    # 2026-04-25 (Commit 14): prefer _runtime.agent_share_urls[name] over the
-    # `links` arg. The inline share-link extractor in extract_and_record_agent
-    # (Commit 11) populates agent_share_urls with public-share URLs when the
-    # public toggle succeeded, or the conversation URL as a silent fallback.
-    # Either way, the URL stashed there is the one we want in the Doc — it's
-    # newer/canonical and carries verification state. The legacy `links` arg
-    # is the conversation URL captured at extraction time and is only used as
-    # a final fallback (e.g. for resumed runs where _runtime was reset
-    # between phases).
-    short_topic = topic[:200] if len(topic) > 200 else topic
-    # Sectioned layout — title, then dividers between artefact groups, then
-    # signature. Each link on its own line keeps Google Docs' URL
-    # auto-detection clean and makes the doc readable when emailed as plain
-    # text. Sections only render when they have content.
-    #
-    # Note: ALL-CAPS section labels (RESEARCH BRIEF / AGENT REPORTS /
-    # NOTEBOOKLM / VIDEO) are formatted as Heading 2 in Google Docs by the
-    # CUA agent (PROMPT_CREATE_DOC step 2b). The previous `─×48` dividers
-    # were dropped — CUA mistyped the unicode line, the divider competed
-    # with paragraph-style application, and the empty-line spacing alone
-    # is sufficient visual separation once headings are styled.
-    doc_lines = [short_topic, "", ""]
+    body = _compose_p5_doc_body(topic, brief_url, links, notebook_url, audio_url, youtube_url)
 
-    if brief_url:
-        doc_lines += ["RESEARCH BRIEF", "", brief_url, "", ""]
-
-    agent_section: list = []
-    for name in ["ChatGPT", "Gemini", "Claude"]:
-        share = _runtime.agent_share_urls.get(name) or {}
-        share_url = share.get("url") or ""
-        share_kind = share.get("kind") or ""
-        # Fallback chain: _runtime public share → _runtime conversation →
-        # legacy `links` arg (conversation captured at extraction time).
-        url = share_url or links.get(name, "")
-        if not url:
-            continue
-        # Tag the line so the recipient knows whether the link is a real
-        # public share or just the agent's chat URL. Public links are
-        # readable by anyone; conversation URLs only by the original
-        # signed-in user — important context for an email recipient.
-        if share_kind == "public" and share.get("verified"):
-            kind_tag = "public share"
-        elif share_url:
-            kind_tag = "conversation"
-        else:
-            kind_tag = "conversation"
-        agent_section.append(f"{name} ({kind_tag}):")
-        agent_section.append(url)
-        agent_section.append("")
-    if agent_section:
-        doc_lines += ["AGENT REPORTS", ""] + agent_section + [""]
-
-    nlm_section: list = []
-    if notebook_url:
-        nlm_section.append("Notebook:")
-        nlm_section.append(notebook_url)
-        nlm_section.append("")
-    _audio_for_doc = audio_url or (notebook_url if notebook_url else "")
-    if _audio_for_doc:
-        nlm_section.append("Audio Overview:")
-        nlm_section.append(_audio_for_doc)
-        nlm_section.append("")
-    if nlm_section:
-        doc_lines += ["NOTEBOOKLM", ""] + nlm_section + [""]
-
-    if youtube_url:
-        doc_lines += ["VIDEO", "", "YouTube:", youtube_url, "", ""]
-
-    doc_lines += ["Generated by Super Research"]
-    doc_content = "\n".join(doc_lines)
-
-    # Create Google Doc: create → fill → make public → emit link
-    log("Creating Google Doc...")
+    # ── Doc creation ─────────────────────────────────────────────────
     emit_event("agent_progress", phase=5, agent="gdocs",
                status="creating",
                progress="Opening a new Google Doc…")
-    doc_url = ""
-    # Idempotency: if a prior run already created a doc and we have a
-    # validated URL on hand, reuse it instead of creating a fresh
-    # `/document/create` tab. Prevents duplicate docs on outer
-    # _phase_timeout_decision retries.
-    if existing_doc_url:
-        try:
-            if validate_link("gdocs", existing_doc_url):
-                log(f"[Phase5] Re-using existing Google Doc: {existing_doc_url}")
-                emit_event("agent_progress", phase=5, agent="gdocs",
-                           status="reused",
-                           progress=f"Re-using prior Google Doc (no duplicate created)")
-                # Reuse path skips email by design — gmail send is NOT
-                # idempotent (would dup) per the orchestrator timeout-retry
-                # caveat. Return same shape as the success path so callers
-                # don't get None for email_sent.
-                return {"doc_url": existing_doc_url, "email_sent": False}
-        except Exception:
-            pass
+    _stop, _task = start_narration_ticker(
+        5, "gdocs",
+        f"Writing & sharing Google Doc hub ({body.count(chr(10)) + 1} lines)",
+        interval=20, expected_minutes=2)
     try:
-        page = await browser.new_tab("https://docs.google.com/document/create")
-        # Stash on _runtime so the orchestrator's extract-with-retry path
-        # can read `page.url` directly even after Gmail's new_tab clobbers
-        # `browser.page` for the email step.
-        _runtime.gdoc_page = page
-        await asyncio.sleep(5)
+        doc_url = await _create_p5_doc_via_playwright(browser, body)
+    finally:
+        await stop_narration_ticker(_stop, _task)
 
-        # HV gate — Google account-challenge interstitials can land here
-        # after fingerprint drift. Without this, CUA burns 20 iterations
-        # clicking on a sign-in wall. Pattern matches P3/P4 entry checks.
-        cleared = await check_hv_gate(browser, cua_client, "gdocs", "Google Docs",
-                                       phase=5, max_iterations=2)
-        if not cleared:
-            log("[Phase5] Google Docs HV not cleared — orchestrator will retry", "WARN")
-            return {"doc_url": ""}
+    if not doc_url:
+        log("[Phase5] Doc creation failed — surfacing alert", "ERROR")
+        fail_phase(
+            phase=5,
+            error="Couldn't create the Google Doc",
+            reason="The Doc page didn't reach a typable state. Check your Google session, then Retry. Skip drops the Doc + email and finishes the pipeline.",
+            agent="gdocs",
+            actions=[
+                {"id": "retry", "label": "Retry", "style": "primary",
+                 "command": {"action": "retry_phase", "phase": 5}},
+                {"id": "skip", "label": "Skip Phase 5", "style": "default",
+                 "command": {"action": "skip_phase", "phase": 5}},
+            ],
+        )
+        return {"doc_url": "", "email_sent": False}
 
-        emit_event("agent_progress", phase=5, agent="gdocs",
-                   status="writing",
-                   progress=f"Writing research hub ({len(doc_content)} chars, {len(doc_lines)} lines)…")
-        _stop, _task = start_narration_ticker(
-            5, "gdocs",
-            f"Writing & sharing Google Doc hub ({len(doc_lines)} lines)",
-            interval=20, expected_minutes=4)
-        try:
-            await agent_loop(cua_client, browser, PROMPT_CREATE_DOC,
-                f"Type this content into the doc, then share with 'Anyone with link' as Editor:\n\n{doc_content}",
-                model=CUA_MODEL, max_iterations=30, verbose=verbose)
-        finally:
-            await stop_narration_ticker(_stop, _task)
-        await asyncio.sleep(2)
+    emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
+    save_track("Phase5", {"status": "doc_created", "doc_url": doc_url})
 
-        # C5: DOM safety net — ensure the doc is public even if CUA missed the share step
-        emit_event("agent_progress", phase=5, agent="gdocs",
-                   status="sharing",
-                   progress="Setting doc to 'Anyone with the link can edit'…")
-        try:
-            if await _ensure_gdoc_public(page):
-                log("Google Doc public share confirmed via DOM")
-            await asyncio.sleep(1)
-            # Close any lingering share dialog
-            await page.keyboard.press("Escape")
-        except Exception as e:
-            log(f"[gdoc] DOM safety net error: {e}", "WARN")
-
-        # Read URL directly from the docs Page object. `browser.current_url()`
-        # returns whatever `self.page` is, which Gmail's `new_tab()` later
-        # clobbers — so use the stable Page reference instead.
-        doc_url = page.url or ""
-        # C5: emit link IMMEDIATELY so the frontend doc-icon dropdown renders
-        # the working URL before we move on to Gmail.
-        if doc_url and validate_link("gdocs", doc_url):
-            emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
-        log(f"Google Doc: {doc_url}")
-        save_track("Phase5", {"status": "doc_created", "doc_url": doc_url})
-    except Exception as e:
-        log(f"[Phase5] Google Doc creation error (orchestrator will retry): {str(e)[:200]}", "WARN")
-
-    # If doc creation didn't yield a valid URL, skip email — sending a
-    # notification that points at a missing/broken doc is worse than no
-    # email at all. The orchestrator's extract-with-retry path runs next
-    # and uses _runtime.gdoc_page to attempt a fresh extraction.
-    if not (doc_url and validate_link("gdocs", doc_url)):
-        log("[Phase5] Doc URL not validated — skipping email (orchestrator will retry/fail)", "WARN")
-        return {"doc_url": doc_url, "email_sent": False}
-
-    # Send email (delegated so the orchestrator can re-fire after a
-    # post-hoc doc-URL recovery — see _send_p5_email docstring).
-    email_sent = await _send_p5_email(
-        browser, cua_client, topic, doc_url, links,
-        notebook_url, youtube_url, email, verbose,
-    )
-    return {"doc_url": doc_url, "email_sent": email_sent}
-
-
-async def _send_p5_email(browser, cua_client, topic, doc_url, links,
-                         notebook_url, youtube_url, email, verbose=False):
-    """Send the Phase 5 notification email. Standalone so it can be called
-    from BOTH `run_phase5` (inline at end) AND the orchestrator's post-hoc
-    URL-recovery path (when run_phase5 returned with email_sent=False
-    because doc_url didn't validate, but the orchestrator's
-    `extract_gdoc_url` retry then succeeded — without this re-fire, email
-    never gets sent on that path even though we now have a valid URL).
-
-    Returns True iff email_sent. False on missing email param, HV gate,
-    Gmail auth issues, or CUA failure.
-
-    Idempotency: if `_runtime.p5_email_sent_for_doc == doc_url` (set on
-    success), return True without re-sending. Prevents the orchestrator's
-    post-recovery re-fire from sending a duplicate when the inline send
-    already completed (CUA can raise after Gmail's send button has fired,
-    leaving us with a "False return + email actually sent" state).
-    """
-    if not email:
-        log("No email configured — skipping")
-        return False
-    try:
-        if doc_url and getattr(_runtime, "p5_email_sent_for_doc", "") == doc_url:
-            log(f"Email already sent for this doc — skipping re-fire to avoid dup")
-            return True
-    except Exception:
-        pass
-    log(f"Sending email to {email}...")
+    # ── Email send ───────────────────────────────────────────────────
     emit_event("agent_progress", phase=5, agent="gmail",
-               status="composing",
-               progress=f"Opening Gmail and composing notification email to {email}…")
-    try:
-        page = await browser.new_tab("https://mail.google.com")
-        await asyncio.sleep(4)
-
-        # HV gate — same risk as Google Docs. Catch sign-in walls
-        # before CUA burns iterations clicking on them.
-        cleared = await check_hv_gate(browser, cua_client, "gmail", "Gmail",
-                                       phase=5, max_iterations=2)
-        if not cleared:
-            log("[Phase5] Gmail HV not cleared — skipping email send", "WARN")
-            return False
-
-        # Subject uses the smart title so it matches NotebookLM + YouTube.
-        subject = f"Research Complete: {smart_title(topic)}"
-        body_parts = [f"Research complete: {topic[:200]}\n"]
-        if doc_url:
-            body_parts.append(f"Google Doc: {doc_url}")
-        # Per-agent URLs: prefer _runtime.agent_share_urls (public share if
-        # available, otherwise conversation captured at extraction time)
-        # over the legacy `links` arg. This matches the doc builder's
-        # fallback chain — without parity, the email would show the chat
-        # URL while the doc shows the public share, confusing the
-        # recipient.
-        for pname in ["ChatGPT", "Gemini", "Claude"]:
-            share = _runtime.agent_share_urls.get(pname) or {}
-            purl = share.get("url") or links.get(pname, "")
-            if purl:
-                body_parts.append(f"{pname}: {purl}")
-        if notebook_url:
-            body_parts.append(f"NotebookLM: {notebook_url}")
-        if youtube_url:
-            body_parts.append(f"YouTube: {youtube_url}")
-        body = "\n".join(body_parts) + "\n"
-
-        _stop, _task = start_narration_ticker(
-            5, "gmail",
-            f"Composing & sending notification email to {email}",
-            interval=20)
-        try:
-            await agent_loop(cua_client, browser, PROMPT_SEND_EMAIL,
-                f"Send email to: {email}\nSubject: {subject}\nBody:\n{body}",
-                model=CUA_MODEL, max_iterations=12, verbose=verbose)
-        finally:
-            await stop_narration_ticker(_stop, _task)
-
-        log("Email sent ✓")
-        # Stamp the doc_url so a post-recovery re-fire doesn't dup-send.
-        try:
-            _runtime.p5_email_sent_for_doc = doc_url or ""
-        except Exception:
-            pass
+               status="sending",
+               progress=f"Emailing {email or 'the configured address'}…")
+    email_sent = await _send_p5_email_resend(email, topic, doc_url, youtube_url)
+    if email_sent:
         save_track("Phase5", {"status": "email_sent", "email": email})
-        # Emit Gmail link immediately so it shows in the dropdown
-        emit_event("link_extracted", phase=5, agent="gmail",
-                   url="https://mail.google.com", label="Open Gmail", verified=True)
-        return True
-    except Exception as e:
-        log(f"Email error: {e}", "ERROR")
-        # Email failure isn't fatal — pipeline is essentially done by
-        # this point (doc is shipped). Warn so the user knows they
-        # need to open Gmail manually, and distinguish bad-address
-        # from SMTP/auth issues so the message is actionable.
-        _err_msg = str(e)
-        _low = _err_msg.lower()
-        if "invalid" in _low and ("address" in _low or "email" in _low or "recipient" in _low):
-            _msg = f"Email not sent — recipient address '{email}' looks invalid"
-            _det = "Gmail rejected the recipient. Update the email in Settings and re-send manually, or resume with a corrected address."
-        elif "auth" in _low or "login" in _low or "signin" in _low:
-            _msg = "Email not sent — Gmail login expired"
-            _det = "Re-authenticate Gmail in the browser and resume to retry, or send the notification manually."
-        else:
-            _msg = "Email not sent — SMTP/Gmail error"
-            _det = f"{_err_msg[:200]}"
-        fail_phase(5, _msg, _det, agent="gmail")
-        return False
+
+    return {"doc_url": doc_url, "email_sent": email_sent}
 
 
 # ── Checkpoint & Resume ───────────────────────────────────────────────────────
@@ -17342,114 +17273,46 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=5, description="Creating Google Doc hub + sending email notification", agents=["gdocs", "gmail"])
             _update_firestore_research({"phase": 5, "currentPhase": 5, "status": "ongoing"})
             _p5_start = time.time()
-            # Active-time ceiling — paused seconds don't count.
-            # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
-            # Use audio overview URL if extracted, else notebook URL as fallback
             _effective_audio_url = audio_overview_url if audio_overview_url else notebook_url
-            _p5_user_skipped = False
             while True:  # timeout-retry loop
                 try:
                     p6 = await _await_phase_with_active_deadline(
                         5, PHASE_5_MAX_MIN,
                         lambda: run_phase5(browser, cua_client, topic, links, notebook_url, youtube_url,
                                            brief_url=brief_url, audio_url=_effective_audio_url,
-                                           email=email, verbose=verbose,
-                                           existing_doc_url=cp.get("doc_url", "")),
+                                           email=email, verbose=verbose),
                     )
                     break
                 except asyncio.TimeoutError:
-                    # Phase 5 retry caveat: GDoc creation is idempotent (creates
-                    # a fresh doc), but Gmail send is NOT — retry may send a
-                    # duplicate email if prior attempt got that far.
                     _decision = await _phase_timeout_decision(5, PHASE_5_MAX_MIN)
                     if _decision == "retry":
                         emit_event("phase_restart", phase=5, reason="user_retry_after_timeout")
                         continue
                     if _decision == "skip":
                         emit_event("phase_skipped", phase=5, reason="user_skip_after_timeout")
-                        _p5_user_skipped = True
-                        p6 = {"doc_url": ""}
+                        p6 = {"doc_url": "", "email_sent": False}
                         break
                     emit_event("pipeline_stopped", phase=5, reason=f"user_{_decision}_after_timeout")
                     return
             doc_url = p6.get("doc_url", "")
-            # B1: Link-first — retry Google Doc URL extraction on validation failure.
-            # ARCHITECTURE 2026-04-18 (never-die): wrap retries in a
-            # decision loop so the user sees Retry / Skip instead of a
-            # silent termination.
-            if not (doc_url and validate_link("gdocs", doc_url)):
-                if doc_url:
-                    log(f"[Google Doc] URL doesn't look right: {doc_url} — retrying extractor (3×)", "WARN")
-                else:
-                    log("[Google Doc] No URL returned — retrying extractor (3×)", "WARN")
-                while True:
-                    # Pass the stashed docs Page so extract_gdoc_url reads
-                    # page.url instead of browser.current_url() — see the
-                    # _runtime.gdoc_page comment for the tab-context race.
-                    gd_res = await extract_with_retry(
-                        phase=5, agent="gdocs", browser=browser, cua_client=cua_client,
-                        extractor_fn=extract_gdoc_url,
-                        label="Google Doc Hub", verbose=verbose,
-                        page=_runtime.gdoc_page,
-                    )
-                    if gd_res.verified:
-                        doc_url = gd_res.url
-                        break
-                    log(f"Phase 5: no verified Google Doc URL after retries — awaiting user decision ({gd_res.error})", "ERROR")
-                    # Clarify the most common failure mode: extraction picked
-                    # up a non-Docs URL (typically Gmail or accounts.google.com)
-                    # because the docs tab failed/redirected. The original
-                    # message blamed the sign-in wall, which masked the real
-                    # tab-context race.
-                    _err = (gd_res.error or "")
-                    if "mail.google.com" in _err or "accounts.google.com" in _err:
-                        _reason = "Phase 5 picked up a Gmail/auth URL where the Doc URL should be — the Docs tab likely failed to load or got redirected. Retry re-runs the doc creation; Skip moves past Phase 5."
-                    else:
-                        _reason = "Google Doc extraction couldn't confirm a valid URL. Retry tries again; Skip moves past Phase 5 without a report link (email/notification step may be skipped too)."
-                    fail_phase(
-                        phase=5,
-                        error=f"Could not extract verified Google Doc URL: {gd_res.error}",
-                        reason=_reason,
-                        agent="gdocs",
-                    )
-                    decision = await _controls.await_phase_decision(5)
-                    if decision == "retry":
-                        log("Phase 5 link extraction: user requested retry", "INFO")
-                        emit_event("phase_restart", phase=5, reason="user_retry_link_extract", attempt=0)
-                        continue
-                    if decision == "skip":
-                        log("Phase 5 link extraction: user skipped — proceeding without Google Doc URL", "INFO")
-                        doc_url = ""
-                        break
-                    log(f"Phase 5 link extraction: user {decision} — terminating pipeline", "INFO")
-                    emit_event("pipeline_stopped", phase=5, reason=f"user_{decision}_link_extract")
-                    return
-            else:
-                emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
-            # Re-fire the email send if `run_phase5` returned with
-            # email_sent=False (typically because its inline doc-URL check
-            # failed) AND the orchestrator's `extract_gdoc_url` retry
-            # above then recovered a valid URL. Without this, the email
-            # never gets sent on the recovery path even though we now
-            # have a verified Doc URL — was the P5-stuck-at-0.3min bug.
-            if (doc_url and email and not p6.get("email_sent")
-                    and not _p5_user_skipped):
-                log("Phase 5: doc URL recovered post-hoc — firing email send now")
-                _email_sent = await _send_p5_email(
-                    browser, cua_client, topic, doc_url, links,
-                    notebook_url, youtube_url, email, verbose,
-                )
-                p6["email_sent"] = _email_sent
-            update_delivery(doc_url=doc_url, email_sent=p6.get("email_sent", False),
-                            status="completed")
+            email_sent = p6.get("email_sent", False)
+            # No more orchestrator-level link-retry loop or post-hoc email
+            # re-fire — run_phase5's direct-Playwright path is reliable
+            # enough that we trust its single result. If doc_url is empty
+            # the caller already surfaced fail_phase() inside run_phase5.
+            update_delivery(doc_url=doc_url, email_sent=email_sent, status="completed")
             save_checkpoint(queue_dir, 5, topic=topic, brief_url=brief_url, notebook_url=notebook_url,
-                            youtube_url=youtube_url, doc_url=doc_url)
+                            youtube_url=youtube_url)
             save_meta(queue_dir, topic, 5, status="completed")
-            _p5_links = [{"label": "Google Doc Hub", "url": doc_url, "verified": True}]
-            if p6.get("email_sent"):
-                _p5_links.append({"label": "Open Gmail", "url": "https://mail.google.com", "verified": True})
-            emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start), links=_p5_links,
-                summary=f"Google Doc created{', email sent' if p6.get('email_sent') else ''}")
+            _p5_links = []
+            if doc_url:
+                _p5_links.append({"label": "Google Doc Hub", "url": doc_url, "verified": True})
+            _summary_bits = []
+            if doc_url: _summary_bits.append("Google Doc created")
+            if email_sent: _summary_bits.append("email sent")
+            emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start),
+                       links=_p5_links,
+                       summary=", ".join(_summary_bits) or "Phase 5 finished (no doc, no email)")
 
         emit_event("pipeline_complete", summary=f"Pipeline finished for: {topic[:100]}")
         log(f"\n{'='*60}")
