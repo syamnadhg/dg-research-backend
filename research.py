@@ -15778,6 +15778,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         log(f"Flow B source download FAILED ({_path}): {_e}", "WARN")
                         _fail += 1
                 log(f"Flow B sources: {_ok} downloaded, {_fail} failed")
+                # If every download failed, the run is doomed — P3 will trip
+                # the gate and surface a generic "no documents" alert. Better
+                # to fail fast with the actual reason so the user can retry
+                # the upload or fix Storage permissions.
+                if _ok == 0 and _fail > 0:
+                    log(f"Flow B: ALL {_fail} source downloads failed — aborting", "ERROR")
+                    fail_phase(
+                        phase=3,
+                        error=f"Couldn't download {_fail} attached source(s) from Storage",
+                        reason="The pipeline can't continue without the sources you attached. Re-attach and Retry, or Skip Phase 3 to run with no NotebookLM/podcast.",
+                        actions=[
+                            {"id": "retry", "label": "Retry", "style": "primary",
+                             "command": {"action": "retry_phase", "phase": 3}},
+                            {"id": "skip", "label": "Skip Phase 3", "style": "default",
+                             "command": {"action": "skip_phase", "phase": 3}},
+                        ],
+                    )
+                    return
             except Exception as _outer:
                 log(f"Flow B handler failed (non-fatal): {_outer}", "WARN")
 
