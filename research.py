@@ -2822,6 +2822,14 @@ class PipelineRuntime:
         # Phoenix-resumed run skip events the FE already saw, instead of
         # replaying them and producing dup phase transitions in chat.
         self.last_event_id: str = ""
+        # True when run_pipeline is invoked with resume_dir set (auto-retry
+        # from checkpoint OR user-resume from paused). Browser-crash sites
+        # check this: on the first attempt (False), emit a passive
+        # "Reconnecting…" banner since run_pipeline.finally will auto-retry
+        # 5s later. On a retry attempt (True), the auto-retry won't fire
+        # again (`if not resume_dir` guard) so the real fail_phase/fail_agent
+        # alert with [Retry, Skip] is the only escape and must surface.
+        self.is_retry_attempt: bool = False
 
     def reset(self):
         self.__init__()
@@ -5369,8 +5377,10 @@ def fail_phase(phase: int, title: str = "", details: str = "",
                             "command": {"action": "retry_phase", "phase": phase}})
         actions.append({"id": "skip", "label": "Skip", "style": "default",
                         "command": {"action": "skip_phase", "phase": phase}})
-        actions.append({"id": "dismiss", "label": "Dismiss", "style": "default",
-                        "command": {"action": "dismiss_alert"}})
+        # Dismiss button removed 2026-04-30 — corner ✕ already records
+        # alertId in dismissedAlertIds and clears the visible alert
+        # (PhaseDropdown.tsx). Matches fail_agent which dropped Dismiss
+        # 2026-04-28. Reduces redundant affordances.
     payload = {"error": title or "phase error",
                "details": details,
                "actions": actions,
@@ -5380,6 +5390,36 @@ def fail_phase(phase: int, title: str = "", details: str = "",
         payload["agent"] = agent
     payload.update(extra)
     emit_event("pipeline_error", phase=phase, **payload)
+
+
+def emit_browser_recovery_status(phase: int, agent: str | None = None):
+    """Passive 'Reconnecting…' banner for a browser crash that will
+    auto-recover via run_pipeline.finally. NO action buttons — the banner
+    is informational only and clears on the next pipeline_resumed event
+    when the auto-retry kicks in.
+
+    Use this on the FIRST attempt (initial run, not a resume_dir retry).
+    On a retry attempt the auto-retry guard won't fire again, so callers
+    must use fail_phase/fail_agent instead — see the `_runtime.is_retry_attempt`
+    branch at each browser-crash site."""
+    base = {
+        "actions": [],
+        "alertType": "warn",
+        "dismissible": True,
+        "alert_id": f"phase{phase}_browser_recovery"
+                   + (f"_{agent}" if agent else ""),
+        "auto_clear_on_resume": True,
+    }
+    if agent:
+        emit_event("pipeline_warning", phase=phase, agent=agent,
+                   message=f"{agent.title()} tab crashed — auto-retrying from checkpoint…",
+                   details="The pipeline will rebuild the browser session and resume.",
+                   **base)
+    else:
+        emit_event("pipeline_warning", phase=phase,
+                   message="Browser tab crashed — auto-retrying from checkpoint…",
+                   details="The pipeline will rebuild the browser session and resume.",
+                   **base)
 
 
 def fail_agent(agent_key: str, title: str, details: str = "",
@@ -9090,7 +9130,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             if page.is_closed():
                 log(f"[{label}] Browser tab closed unexpectedly", "WARN")
                 _ag_norm_crash = normalize_agent_key(label)
-                if phase == 2 and _ag_norm_crash:
+                if not _runtime.is_retry_attempt:
+                    # First attempt — run_pipeline.finally will auto-retry.
+                    # Show passive banner only.
+                    emit_browser_recovery_status(
+                        phase, agent=_ag_norm_crash if (phase == 2 and _ag_norm_crash) else None)
+                elif phase == 2 and _ag_norm_crash:
                     fail_agent(_ag_norm_crash,
                                "Browser tab crashed",
                                "The agent's browser tab closed unexpectedly. Retry to relaunch.")
@@ -9104,7 +9149,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             # garbage; treat that as a crash too.
             log(f"[{label}] Page handle invalid — treating as crash", "WARN")
             _ag_norm_crash = normalize_agent_key(label)
-            if phase == 2 and _ag_norm_crash:
+            if not _runtime.is_retry_attempt:
+                emit_browser_recovery_status(
+                    phase, agent=_ag_norm_crash if (phase == 2 and _ag_norm_crash) else None)
+            elif phase == 2 and _ag_norm_crash:
                 fail_agent(_ag_norm_crash, "Browser tab crashed",
                            "The agent's browser tab closed unexpectedly. Retry to relaunch.")
             else:
@@ -10129,9 +10177,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if _crashed:
                 _crash_key = normalize_agent_key(_crash_name)
                 log(f"[{_crash_name}] Browser tab crashed — failing agent", "WARN")
-                fail_agent(_crash_key,
-                           "Browser tab crashed",
-                           "The agent's browser tab closed unexpectedly. Retry to relaunch.")
+                if not _runtime.is_retry_attempt:
+                    # Initial run — auto-retry will rebuild the browser session.
+                    # Passive banner so the user sees what's happening without
+                    # being asked to click [Retry] mid-recovery.
+                    emit_browser_recovery_status(2, agent=_crash_key)
+                else:
+                    fail_agent(_crash_key,
+                               "Browser tab crashed",
+                               "The agent's browser tab closed unexpectedly. Retry to relaunch.")
                 results[_crash_name] = {"status": "browser_crashed", "text": "",
                                         "url": _crash_p.get("url", ""),
                                         "page": None,
@@ -16182,6 +16236,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Resume dir not found: {queue_dir}", "ERROR")
             return
         (queue_dir / "documents").mkdir(exist_ok=True)
+        # Mark as retry/resume so browser-crash sites surface the real alert
+        # (auto-retry won't fire from finally for this attempt — the guard
+        # at the bottom of run_pipeline gates on `not resume_dir`).
+        _runtime.is_retry_attempt = True
         start_phase, reason = detect_resume_phase(queue_dir)
         log(f"RESUME: {reason}")
         # Emit resume marker so frontend knows to ignore events before this point
@@ -16933,9 +16991,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # use the pasted text as the brief and continue.
                         emit_event("manual_brief_required", phase=1,
                                    message="Type your research brief into chat, then press Resume.",
-                                   actions=[{"id": "dismiss", "label": "Dismiss",
-                                             "style": "default",
-                                             "command": {"action": "dismiss_alert"}}],
+                                   actions=[],
                                    dismissible=True,
                                    alert_id="phase1_manual_brief_required")
                         while not _controls.peek_extra_context() and not _controls.is_stop():
@@ -18003,9 +18059,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if 1 < phase <= 5:
                 log(f"Pipeline failed at phase {phase} — auto-retrying from checkpoint...", "WARN")
                 await asyncio.sleep(5)
+                # Forward uid/research_id/run_id so the retry rebinds its
+                # Firestore command listener (cancel/config/retry from FE).
+                # Without these, setup_firestore_run is skipped (line ~16169
+                # `if uid:`) and the FE's Stop button writes to a Firestore
+                # commands subcollection no one is listening to — the BE
+                # keeps running orphaned while the FE shows "stopped".
                 await run_pipeline(topic=topic, email=email, verbose=verbose,
                                    api_key=api_key, resume_dir=str(queue_dir),
-                                   config=config)
+                                   config=config,
+                                   run_id=run_id, uid=uid, research_id=research_id)
 
 
 # ── Server Mode (Web App API) ────────────────────────────────────────────────
