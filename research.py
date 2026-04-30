@@ -5038,7 +5038,7 @@ async def cua_paste_fallback(page, browser, cua_client, brief_text, platform, la
     return await _verify_paste_landed(page, brief_text, platform, label, source="cua-assisted")
 
 
-# ── Event Emission (dual-write: disk + Firestore) ────────────────────────────
+# ── Event Emission (Firestore-only — disk mirror removed 2026-04-29) ───────
 
 # T2 narrator ring buffer. Populated by emit_event, read by _narrator_loop.
 # Bounded at 50 — wide enough to cover ~2-5 min at typical event density,
@@ -6622,10 +6622,12 @@ async def scrape_progress_gemini(page):
                     // for the structural walker; treating those rows as
                     // a "side panel open" would mis-trigger panel-aware
                     // vision crops). The Show-thinking branch lower in
-                    // the function DOES set panel_open=true intentionally
-                    // since that expander is the closest Gemini analog
-                    // to Claude's artifact panel — see the explicit
-                    // "Hide thinking" detection below.
+                    // the function sets r.thinking_visible (NOT panel_open)
+                    // for the same reason — Gemini's thinking expander is
+                    // inline below the response, full-width, not a side
+                    // panel. The vision crop targets the right viewport
+                    // edge; firing it on inline thinking would scrape the
+                    // wrong region.
                     const panelSteps = rows.map(x => x.t).slice(-15);
                     r.steps = r.steps.concat(panelSteps).slice(-15);
                     if (live) r.progress = live;
