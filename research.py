@@ -2198,9 +2198,16 @@ def _start_command_listener(uid, research_id, loop):
                     _ph = None
                 if _ph is not None:
                     loop.call_soon_threadsafe(_controls.request_skip_phase, _ph)
+                    # Cascade: skip P3 → also skip P4 (no YouTube without
+                    # podcast — P4 depends on the audio file P3 generates).
+                    # User design rule clarified 2026-04-30.
+                    if _ph == 3:
+                        loop.call_soon_threadsafe(_controls.request_skip_phase, 4)
+                        log(f"Command received: SKIP_PHASE phase={_ph} → cascading skip to P4 (no YouTube without podcast)")
+                    else:
+                        log(f"Command received: SKIP_PHASE phase={_ph}")
                     # Also release any pause so the phase coroutine can exit cleanly
                     loop.call_soon_threadsafe(_controls.request_resume)
-                    log(f"Command received: SKIP_PHASE phase={_ph}")
                 else:
                     log("Command received: SKIP_PHASE rejected — no phase number", "WARN")
             elif action == "continue_anyway":
@@ -8111,14 +8118,32 @@ class Browser:
     async def start(self):
         # Kill only orphaned Playwright Chrome from OUR profile directory.
         # NEVER kill all chrome.exe — that nukes the user's personal browser.
+        # Q8 (2026-04-30): match by profile path AND only kill chromes whose
+        # create_time predates this --serve process. A chrome younger than us
+        # was spawned by this same --serve (sibling pipeline restart, parallel
+        # phase relaunch, etc.) and killing it surfaces as "Page.bring_to_front:
+        # Target page, context or browser has been closed" on the sibling run.
+        # Pre-fix the killer was indiscriminate — every Browser.start() in the
+        # process lifetime would chew live sibling chromes.
         try:
             import psutil
             our_profile = str(Path(self.profile_dir).resolve()).lower().replace("\\", "/")
+            try:
+                serve_start_ts = psutil.Process(os.getpid()).create_time()
+            except Exception:
+                serve_start_ts = 0.0
             for proc in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
                     if proc.info["name"] and "chrome" in proc.info["name"].lower():
                         cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
                         if our_profile in cmdline:
+                            try:
+                                chrome_start_ts = proc.create_time()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                chrome_start_ts = 0.0
+                            if serve_start_ts > 0 and chrome_start_ts >= serve_start_ts:
+                                log(f"Sparing sibling Chrome PID {proc.info['pid']} (younger than --serve, our profile)")
+                                continue
                             log(f"Killing orphaned Chrome PID {proc.info['pid']} (our profile)")
                             proc.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -18734,8 +18759,10 @@ async def run_server(port=8000):
                 log(f"[flip] {research_id_val[:8]}… {outcome} — leaving status as-is (cancel race won)", "INFO")
             elif outcome == "missing":
                 log(f"[flip] {research_id_val[:8]}… research doc missing — Q3 cascade-cancel should catch this", "WARN")
+            return outcome
         except Exception as e:
             log(f"Failed to flip queued→ongoing for {research_id_val}: {e}", "WARN")
+            return None
 
     def _recompute_queue_positions():
         """After a job finishes, shift remaining queued jobs' positions up by
@@ -18880,18 +18907,33 @@ async def run_server(port=8000):
             _persist_pending_queue(current_job=job)
             # Flip this run's research doc from queued → ongoing. No-op for
             # the very first start in an idle backend (already ongoing).
-            _flip_queued_to_ongoing(job.get("uid"), job.get("research_id"))
+            flip_outcome = _flip_queued_to_ongoing(job.get("uid"), job.get("research_id"))
+            # Q8 (2026-04-30): when the flip is skipped — i.e. status was
+            # paused_backend_restart / stopped / cancelled when we dequeued —
+            # bail BEFORE run_pipeline so we don't launch a browser, run the
+            # orphan-Chrome killer, and chew live sibling browsers belonging
+            # to runs the user is actively watching. The cascade was: stale
+            # paused_backend_restart on a chat → flip skipped → run_pipeline
+            # called anyway → Browser.start() killed every Chrome with our
+            # profile (incl. live siblings) → P1 surfaced "Page.bring_to_front:
+            # Target page, context or browser has been closed" on the wrong
+            # chat. None outcome (no firebase / missing args / exception) is
+            # treated as legacy success — proceed with run_pipeline.
+            should_run = not (flip_outcome and flip_outcome.startswith("skipped("))
+            if not should_run:
+                log(f"[worker] Bailing on job — flip outcome={flip_outcome}, skipping run_pipeline to spare sibling browsers", "INFO")
             try:
-                await asyncio.wait_for(
-                    run_pipeline(topic=job["topic"], email=job.get("email", ""),
-                                 verbose=True, resume_dir=job.get("resume_dir"),
-                                 config=job.get("config"), run_id=job.get("run_id"),
-                                 uid=job.get("uid"), research_id=job.get("research_id"),
-                                 brief_text=job.get("brief_text", ""),
-                                 user_sources=job.get("user_sources") or [],
-                                 user_links=job.get("user_links") or []),
-                    timeout=WORKER_OUTER_TIMEOUT_SEC,
-                )
+                if should_run:
+                    await asyncio.wait_for(
+                        run_pipeline(topic=job["topic"], email=job.get("email", ""),
+                                     verbose=True, resume_dir=job.get("resume_dir"),
+                                     config=job.get("config"), run_id=job.get("run_id"),
+                                     uid=job.get("uid"), research_id=job.get("research_id"),
+                                     brief_text=job.get("brief_text", ""),
+                                     user_sources=job.get("user_sources") or [],
+                                     user_links=job.get("user_links") or []),
+                        timeout=WORKER_OUTER_TIMEOUT_SEC,
+                    )
             except asyncio.TimeoutError:
                 # Q7 outer-ceiling deadlock guard. Mark the doc, request
                 # cooperative stop, schedule hard exit. Daemon-loop
@@ -19689,16 +19731,12 @@ async def run_pair(profile_dir, wait_minutes=10):
             pass
 
     for idx, (name, url, key) in enumerate(services):
-        # Cookie fast-path — trusted signal, no tab open, no CUA call.
-        try:
-            cookie_ok = await cookie_login_hit(browser, key)
-        except Exception:
-            cookie_ok = False
-        if cookie_ok:
-            results[key] = True
-            _emit_row(name, True, "already logged in (session cookie found)")
-            _push_firestore_progress()
-            continue
+        # 2026-04-30: cookie fast-path REMOVED. Was raising false positives —
+        # cookies persist past server-side session invalidation, so
+        # cookie_login_hit returned "logged in" when the session was actually
+        # dead. Mirrors the same removal init/Phase 0 made on 2026-04-24
+        # (research.py:16894-16902). Always open tab → settle → URL check →
+        # CUA. Slower but it looks at what's actually on screen.
 
         # Stagger tab opens just like the probe paths — a user clicking
         # through bookmarks takes a beat between each one.
@@ -19735,24 +19773,28 @@ async def run_pair(profile_dir, wait_minutes=10):
                     pass
                 break
 
-            # Re-check cookies first (cheap). Login flow landed? Cookie's there.
-            try:
-                cookie_ok = await cookie_login_hit(browser, key)
-            except Exception:
-                cookie_ok = False
-            if cookie_ok:
-                platform_ok = True
-                break
+            # 2026-04-30: cookie + Playwright DOM shortcuts REMOVED. Both
+            # raised false positives — cookies survive server-side session
+            # invalidation, and strict DOM selectors match cached sidebar
+            # fragments on logged-out landings. Mirror init's gate
+            # (research.py:16934-16947): URL host negative signal first,
+            # then CUA as the single source of truth.
 
-            # Fall through to the two-layer verify: Playwright DOM + CUA.
+            # Cheap negative signal first: URL on a known login host →
+            # definitely not logged in. Skip the CUA call to save budget.
             try:
-                playwright_ok = await verify_login(tab, key, strict=True)
+                current_url = (tab.url or "").lower()
             except Exception:
-                playwright_ok = False
-            if not playwright_ok:
+                current_url = ""
+            if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
                 print(f"  {_c(_WARN, 'Not logged in yet — finish the flow and press Enter again.')}")
                 continue
 
+            # Vision verification is the gate. URL already cleared the
+            # cheap "obvious login wall" case; everything else is a CUA
+            # decision. If no CUA client (Anthropic key missing/disabled),
+            # accept on URL pass — that mirrors init's behavior in the
+            # CuaUnavailableError fallback path.
             if not _setup_cua_client:
                 platform_ok = True
                 break
@@ -19764,7 +19806,7 @@ async def run_pair(profile_dir, wait_minutes=10):
             if cua_ok:
                 platform_ok = True
                 break
-            print(f"  {_c(_WARN, 'DOM passed but CUA disagreed — try the login again and press Enter.')}")
+            print(f"  {_c(_WARN, 'CUA could not confirm login — try again and press Enter.')}")
 
         if cancelled:
             break
