@@ -587,43 +587,23 @@ def safe_name(topic, max_len=50):
     return re.sub(r'[^\w\s-]', '', topic)[:max_len].strip().replace(' ', '_')
 
 
-# ── Progress Tracking ─────────────────────────────────────────────────────────
+# ── Run-name reference ───────────────────────────────────────────────────────
+# `_tracks_dir` is a legacy name kept for the many call sites that read
+# `_tracks_dir.name` (the run identifier). We no longer create the
+# tracks/{run_name}/ folder tree on disk — Firestore is the single source
+# of truth for events + per-agent state. The Path object is set so .name
+# resolves; the actual directory is never written to.
 
 _tracks_dir = None  # Set per-run in run_pipeline
 
 
 def init_tracks(run_name):
-    """Create/reuse tracks directory for this run. Uses same name as queue dir."""
+    """Set the per-run name reference for `_tracks_dir.name` lookups.
+    Does NOT create any directories — the tracks/ folder tree was removed
+    in 2026-04-29's Firestore-only migration."""
     global _tracks_dir
     _tracks_dir = Path(__file__).parent / "tracks" / run_name
-    # Create full phase structure (idempotent — safe for resumes)
-    # Phases 0-5 only. Directory names match _TRACK_ROUTES below.
-    for phase_dir in [
-        "phase0/init",
-        "phase1/brief",
-        "phase2/chatgpt", "phase2/gemini", "phase2/claude",
-        "phase3/notebooklm",
-        "phase4/youtube",
-        "phase5/delivery",
-    ]:
-        (_tracks_dir / phase_dir).mkdir(parents=True, exist_ok=True)
-    log(f"Tracks: {_tracks_dir}")
     return _tracks_dir
-
-
-# Track routing: platform name → phase/subfolder (phases 0-5)
-_TRACK_ROUTES = {
-    "phase0": "phase0/init",
-    "phase1": "phase1/brief",
-    "chatgpt": "phase2/chatgpt",
-    "gemini": "phase2/gemini",
-    "claude": "phase2/claude",
-    "phase3": "phase3/notebooklm",
-    "notebooklm": "phase3/notebooklm",
-    "phase4": "phase4/youtube",
-    "youtube": "phase4/youtube",
-    "phase5": "phase5/delivery",
-}
 
 
 def get_clipboard():
@@ -666,15 +646,9 @@ def normalize_agent_key(name):
     return _AGENT_KEY_ALIASES.get(k, k)
 
 
-def save_track(platform, data):
-    """No-op since 2026-04-29 — write-only telemetry with no live readers.
-
-    Was previously writing one JSON per scrape under tracks/{run_id}/{platform}/
-    for raw scrape preservation, but nothing in the BE or FE ever read these
-    files back. The retained call sites are kept so the function signature
-    stays stable; if we ever want raw-scrape archiving again, this is the
-    single point to wire it back."""
-    return
+# save_track removed 2026-04-29 — was write-only telemetry under tracks/{rid}/
+# with zero readers. Firestore + pipeline_events events are the single source
+# of truth for run progress.
 
 
 # ── Firebase Bridge (Firestore real-time transport) ──────────────────────────
@@ -4431,10 +4405,17 @@ async def _set_nlm_public_and_get_link(page, label):
 
 async def _ensure_gdoc_public(page) -> bool:
     """Open the Google Doc share dialog and set General access to
-    'Anyone with the link' (Editor). DOM-first; returns True on success.
-    Designed to be idempotent — safe to call even if already public."""
+    'Anyone with the link' (Editor). DOM-first; returns True only when
+    EVERY step actually landed (vs. silently no-op'ing on a missing
+    selector and returning True like the prior version, which left some
+    docs private under "Restricted" while the caller logged "confirmed").
+
+    Idempotent — safe to call even if already public (each step's
+    matcher returns True if its target either fired or was already in
+    the desired state)."""
     try:
-        # Click Share button (top-right)
+        # Click Share button (top-right) — load-bearing; if this fails,
+        # nothing else matters.
         share_clicked = await page.evaluate("""() => {
             const selectors = [
                 'div[aria-label*="Share"][role="button"]',
@@ -4449,33 +4430,51 @@ async def _ensure_gdoc_public(page) -> bool:
             return false;
         }""")
         if not share_clicked:
+            log("[gdoc] Share button not found", "WARN")
             return False
         await asyncio.sleep(2)
-        # Change "General access" → "Anyone with the link"
-        await page.evaluate("""() => {
+        # Change "General access" → "Anyone with the link". The dropdown
+        # may already say "Anyone with the link" (idempotent re-runs),
+        # in which case opening it isn't needed — return True from this
+        # eval to acknowledge "already in desired state".
+        access_step = await page.evaluate("""() => {
+            // First check: is the General access section already showing
+            // "Anyone with the link"? If yes, we're idempotent-done for
+            // this step.
+            const anyAlreadyOpen = Array.from(document.querySelectorAll('button, [role="combobox"], [role="button"]'))
+                .some(b => /anyone with the link/i.test(b.innerText || b.textContent || ''));
+            if (anyAlreadyOpen) return 'already';
+            // Else find the "Restricted" / "Only people..." dropdown trigger.
             const buttons = document.querySelectorAll('button, [role="combobox"], [role="button"]');
             for (const b of buttons) {
                 const txt = (b.innerText || b.textContent || '').toLowerCase();
                 if (txt.includes('restricted') ||
                     (txt.includes('only') && txt.includes('access'))) {
                     b.click();
-                    return true;
+                    return 'opened';
                 }
             }
-            return false;
+            return 'missing';
         }""")
+        if access_step == "missing":
+            log("[gdoc] General-access dropdown not found", "WARN")
+            return False
         await asyncio.sleep(1)
-        await page.evaluate("""() => {
-            const options = document.querySelectorAll('[role="menuitem"], [role="option"], li, span, div');
-            for (const opt of options) {
-                const txt = (opt.innerText || opt.textContent || '').trim().toLowerCase();
-                if (txt === 'anyone with the link' || txt.startsWith('anyone with the link')) {
-                    opt.click();
-                    return true;
+        if access_step == "opened":
+            picked = await page.evaluate("""() => {
+                const options = document.querySelectorAll('[role="menuitem"], [role="option"], li, span, div');
+                for (const opt of options) {
+                    const txt = (opt.innerText || opt.textContent || '').trim().toLowerCase();
+                    if (txt === 'anyone with the link' || txt.startsWith('anyone with the link')) {
+                        opt.click();
+                        return true;
+                    }
                 }
-            }
-            return false;
-        }""")
+                return false;
+            }""")
+            if not picked:
+                log("[gdoc] 'Anyone with the link' option not found in dropdown", "WARN")
+                return False
         await asyncio.sleep(1)
         # Ensure role = Editor on the GENERAL-ACCESS row (not on a
         # member-list row — that would demote a real share recipient).
@@ -4527,7 +4526,9 @@ async def _ensure_gdoc_public(page) -> bool:
             }
         }""")
         await asyncio.sleep(0.6)
-        # Click Done/Copy link
+        # Click Done/Copy link — close the dialog. Best-effort; if the
+        # dialog is gone, no harm. We don't gate the return on this since
+        # the doc is already public from the prior steps.
         await page.evaluate("""() => {
             const btns = document.querySelectorAll('button, [role="button"]');
             for (const b of btns) {
@@ -4539,7 +4540,23 @@ async def _ensure_gdoc_public(page) -> bool:
             }
         }""")
         await asyncio.sleep(1)
-        return True
+        # Final verification: read the current "General access" state from
+        # the dialog DOM. Truthy only if "Anyone with the link" is the
+        # active selection. Without this final check, the function used
+        # to return True even when an early eval silently no-op'd.
+        verified = await page.evaluate("""() => {
+            const all = document.querySelectorAll('button, [role="combobox"], [role="button"], span, div');
+            for (const el of all) {
+                const t = (el.innerText || el.textContent || '').toLowerCase();
+                // Match the General-access summary line; tolerate trailing role
+                // text like "Anyone with the link · Editor".
+                if (t.includes('anyone with the link')) return true;
+            }
+            return false;
+        }""")
+        if not verified:
+            log("[gdoc] post-share verification failed — doc may still be Restricted", "WARN")
+        return verified
     except Exception as e:
         log(f"[gdoc] public-share DOM flow error: {e}", "WARN")
         return False
@@ -8857,7 +8874,6 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
         if scrape_fn:
             try:
                 progress = await scrape_fn(page)
-                save_track(label, progress)
                 # Hoisted from dedupe block — needed by panel-open gate below.
                 elapsed_sec = int(time.time() - wait_start)
 
@@ -10264,7 +10280,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 try:
                     progress = await scrape_fn(p["page"]) or {}
                     scrape_ok = True
-                    save_track(name, progress)
                 except Exception as _scrape_err:
                     # Don't mask scrape failures — tell frontend the scrape degraded
                     log(f"[{name}] DOM scrape failed: {_scrape_err}", "WARN")
@@ -10332,7 +10347,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             if artifact_data.get("partial_text_len", 0) > progress.get("partial_text_len", 0):
                                 progress["partial_text_len"] = artifact_data["partial_text_len"]
                             progress["artifact_count"] = artifact_data.get("artifact_count", 0)
-                            save_track("Claude", {**artifact_data, "source": "artifact_scrape"})
                             scrape_ok = True
                             log(f"[Claude] Artifact tracking: {len(artifact_data.get('source_urls', []))} URLs, "
                                 f"{len(artifact_data.get('steps', []))} steps, "
@@ -14038,7 +14052,6 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
     # Save links
     links_file = queue_dir / "links.json"
     links_file.write_text(json.dumps(links, indent=2), encoding="utf-8")
-    save_track("Phase3", {"status": "links_saved", "links": links})
     log(f"Links saved: {links}")
 
     # Upload MDs to NotebookLM (wrapped in retry loop — user can re-attempt
@@ -14121,8 +14134,6 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # Emit notebook link immediately — frontend shows it without waiting for phase end
             if notebook_url and "notebooklm.google.com/notebook" in notebook_url:
                 emit_validated_link(3, "notebooklm", notebook_url, "NotebookLM Notebook")
-            save_track("NotebookLM", {"status": "uploaded", "notebook_url": notebook_url,
-                                       "sources_count": len(md_files)})
             break  # Successful upload — exit retry loop
         except Exception as e:
             log(f"NotebookLM upload error: {e}", "ERROR")
@@ -14337,7 +14348,6 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
             log(f"[Phase4] Audio still generating... ({elapsed_min}m total)")
-            save_track("Phase4", {"status": "generating", "elapsed_min": elapsed_min})
             # Live narration tick — without this the FE dropdown sits on the
             # last pre-poll string ("Setting notebook to…") for the full 45-min
             # audio window. Match the P2 round-robin cadence.
@@ -14873,7 +14883,6 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                            agent="youtube")
             return {"youtube_url": ""}
         log(f"Video: {video_path} ({video_path.stat().st_size / 1024 / 1024:.1f}MB)")
-        save_track("Phase5", {"status": "video_created", "size_mb": round(video_path.stat().st_size / 1024 / 1024, 1)})
     except Exception as e:
         log(f"ffmpeg failed: {e}", "ERROR")
         _err_msg = str(e)
@@ -15158,8 +15167,6 @@ Do NOT report studio.youtube.com URLs — those are NOT video links.""",
         log("[YouTube] Could not extract video URL — no link will be emitted", "WARN")
         # No alert: extract_with_retry's 3× pass either succeeds or fires
         # a fail_phase upstream. Emitting here would only add noise.
-    save_track("Phase5", {"status": "youtube_uploaded" if youtube_url else "youtube_url_failed",
-                          "youtube_url": youtube_url})
 
     # Keep all generated files (audio, video, thumbnail) — used by web app
     log(f"Files preserved in queue: {queue_dir}")
@@ -15447,15 +15454,12 @@ async def run_phase5(browser, cua_client, topic, links, notebook_url, youtube_ur
         return {"doc_url": "", "email_sent": False}
 
     emit_validated_link(5, "gdocs", doc_url, "Google Doc Hub")
-    save_track("Phase5", {"status": "doc_created", "doc_url": doc_url})
 
     # ── Email send ───────────────────────────────────────────────────
     emit_event("agent_progress", phase=5, agent="gmail",
                status="sending",
                progress=f"Emailing {email or 'the configured address'}…")
     email_sent = await _send_p5_email_resend(email, topic, doc_url, youtube_url)
-    if email_sent:
-        save_track("Phase5", {"status": "email_sent", "email": email})
 
     return {"doc_url": doc_url, "email_sent": email_sent}
 
@@ -16782,35 +16786,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     if key not in agents:
                         agents[key] = {}
                     agents[key]["completionTimeSec"] = r.get("elapsed_sec", 0)
-                # Compile source URLs from track events (DOM scraping)
-                events_file = _tracks_dir / "events.jsonl" if _tracks_dir else None
-                if events_file and events_file.exists():
-                    try:
-                        for line in events_file.read_text(encoding="utf-8").strip().split("\n"):
-                            if not line.strip():
-                                continue
-                            evt = json.loads(line)
-                            # Agent key is at top level on events, payload is under "data"
-                            plat = normalize_agent_key(evt.get("agent") or evt.get("data", {}).get("platform", ""))
-                            data = evt.get("data", {}) if isinstance(evt.get("data"), dict) else {}
-                            if plat in agents:
-                                # Merge source URLs from scraping events (accept both sourceUrls and source_urls)
-                                urls = data.get("sourceUrls") or data.get("source_urls") or []
-                                if urls:
-                                    existing = set(agents[plat].get("sourceUrls", []))
-                                    existing.update(urls)
-                                    agents[plat]["sourceUrls"] = list(existing)[:50]
-                                    agents[plat]["sources"] = len(agents[plat]["sourceUrls"])
-                                # Merge source count if higher
-                                src_count = data.get("sources", 0)
-                                if src_count > agents[plat].get("sources", 0):
-                                    agents[plat]["sources"] = src_count
-                                # Merge sections
-                                secs = data.get("sections", [])
-                                if secs and len(secs) > len(agents[plat].get("sections", [])):
-                                    agents[plat]["sections"] = secs
-                    except Exception:
-                        pass
+                # 2026-04-29: events.jsonl scrape merge removed — events.jsonl
+                # is no longer written to disk (Firestore pipeline_events is
+                # the single transport). The agents map is already kept in
+                # sync via per-event `_update_firestore_research` calls
+                # during P2; the disk-merge here was a redundant backstop.
                 meta["agents"] = agents
                 meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             # ── 2026-04-25: Markdown-as-primary phase_complete (P1 mirror) ──
@@ -17074,10 +17054,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         continue
                     if _kind == "notebook" and not notebook_url:
                         notebook_url = _url
+                        # Surface to FE PhaseDropdown + populate the Firestore
+                        # links aggregate so P5's body composition reads it
+                        # back from the single source of truth. Without these
+                        # the FE P3 dropdown stays empty + P5 falls back to
+                        # the in-memory args (works, but the aggregate is
+                        # incomplete for resume / debugging).
+                        emit_validated_link(3, "notebooklm", _url, _label or "NotebookLM Notebook")
                     elif _kind == "youtube" and not youtube_url:
                         youtube_url = _url
+                        emit_validated_link(4, "youtube", _url, _label or "YouTube Video")
                     elif _kind == "audio" and not audio_overview_url:
                         audio_overview_url = _url
+                        emit_validated_link(3, "notebooklm", _url, _label or "Audio Overview", link_kind="audio")
                     elif _kind in ("doc", "agent", "other"):
                         # Stash under links{} keyed by label — P5 renders this
                         # dict as the "Sources" section of the final Doc/email.
@@ -17089,6 +17078,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             _key = f"{_label} ({_i})"
                             _i += 1
                         links[_key] = _url
+                        # Map "agent" kind to the matching platform key so the
+                        # Firestore aggregate keeps per-agent slots populated
+                        # for P5's Doc body. "doc" / "other" go under their
+                        # raw kind so they don't clobber agent slots.
+                        _label_lower = _label.lower()
+                        if _kind == "agent":
+                            if "chatgpt" in _label_lower: _agg_kind = "chatgpt"
+                            elif "gemini" in _label_lower: _agg_kind = "gemini"
+                            elif "claude" in _label_lower: _agg_kind = "claude"
+                            else: _agg_kind = "agent"
+                        else:
+                            _agg_kind = _kind
+                        try:
+                            update_link_in_firestore(_agg_kind, _url, label=_label, phase=3, verified=True)
+                        except Exception:
+                            pass
                     _flow_c_count += 1
                 log(f"Flow C hydration: {_flow_c_count} link(s) → notebook={'set' if notebook_url else '∅'} "
                     f"youtube={'set' if youtube_url else '∅'} audio={'set' if audio_overview_url else '∅'} "
@@ -17749,60 +17754,10 @@ async def run_server(port=8000):
             pipeline_state = "completed"
         return {"meta": meta, "checkpoint": cp, "delivery": delivery, "pipeline_state": pipeline_state}
 
-    @app.get("/api/runs/{run_id}/events")
-    async def get_events(run_id: str, offset: int = 0):
-        """Get progress events. Use ?offset=N to get only new events (long-poll friendly)."""
-        events_file = _find_events_file(run_id)
-        if not events_file:
-            return {"events": [], "offset": 0, "total": 0}
-        lines = [l for l in events_file.read_text(encoding="utf-8").strip().split("\n") if l.strip()]
-        events = []
-        for line in lines[offset:]:
-            try:
-                events.append(json.loads(line))
-            except Exception:
-                log(f"Events API: Failed to parse line at offset {offset}: {line[:80]}", "WARN")
-        return {"events": events, "offset": len(lines), "total": len(lines)}
-
-    @app.websocket("/ws/{run_id}")
-    async def ws_stream(websocket: WebSocket, run_id: str):
-        """WebSocket: push new progress events in real-time (tracks by line count, not byte offset)."""
-        await websocket.accept()
-        events_file = _find_events_file(run_id)
-        last_line = 0
-        try:
-            while True:
-                if not events_file or not events_file.exists():
-                    events_file = _find_events_file(run_id)
-                if events_file and events_file.exists():
-                    lines = [l for l in events_file.read_text(encoding="utf-8").strip().split("\n") if l.strip()]
-                    if len(lines) > last_line:
-                        for line in lines[last_line:]:
-                            try:
-                                await websocket.send_json(json.loads(line))
-                            except Exception:
-                                log(f"WS: Failed to parse event line: {line[:80]}", "WARN")
-                        last_line = len(lines)
-                await asyncio.sleep(2)
-        except WebSocketDisconnect:
-            pass
-
-    def _find_events_file(run_id):
-        """Find events.jsonl for a run — exact match (tracks and queues share the same dir name)."""
-        if not tracks_root.exists():
-            return None
-        # Exact match first
-        ef = tracks_root / run_id / "events.jsonl"
-        if ef.exists():
-            return ef
-        # Fallback: prefix match for legacy tracks
-        prefix = run_id.rsplit("_", 2)[0] if "_" in run_id else run_id
-        for d in tracks_root.iterdir():
-            if d.is_dir() and prefix in d.name:
-                ef = d / "events.jsonl"
-                if ef.exists():
-                    return ef
-        return None
+    # 2026-04-29: GET /api/runs/{id}/events + WS /ws/{run_id} +
+    # _find_events_file removed. Both read events.jsonl from disk, but
+    # writes were dropped (Firestore pipeline_events is the FE transport).
+    # No live FE consumers — verified zero callsites in the FE source.
 
     @app.post("/api/runs/{run_id}/stop")
     async def stop_run(run_id: str):
