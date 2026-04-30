@@ -15858,6 +15858,27 @@ def _compose_p5_doc_body(topic, brief_url, links, notebook_url, audio_url, youtu
         out.append("Link to Youtube:")
         out.append(youtube_url)
 
+    # Flow C — user-pasted source URLs (Google Docs, generic links, etc.)
+    # are stored in `links` keyed by label. The per-agent loop above only
+    # consumes ChatGPT / Gemini / Claude entries; without this branch any
+    # other URL the user pasted (e.g. an existing Google Doc, an arbitrary
+    # web source) was silently dropped from the final Doc body, leaving
+    # Flow C runs with an almost-empty deliverable. Render the remainder
+    # as a Sources section so the user's pasted references actually
+    # appear in the Doc + email.
+    _agent_keys = {"ChatGPT", "Gemini", "Claude"}
+    _source_lines = []
+    for _label, _url in (links or {}).items():
+        if _label in _agent_keys:
+            continue
+        if not _url:
+            continue
+        _source_lines.append(f"{_label}: {_url}")
+    if _source_lines:
+        out.append("")
+        out.append("Sources:")
+        out.extend(_source_lines)
+
     return "\n".join(out)
 
 
@@ -16410,6 +16431,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         except Exception as _re:
             log(f"[resume] tier/agent state restore failed: {_re}", "WARN")
     else:
+        # Flow C cosmetic — when the user pasted only URLs (no prose), the
+        # FE-supplied topic is the raw URL string. That makes for an ugly
+        # Doc title, sidebar tile, queue dir name, and email subject.
+        # Replace it with a label-based summary derived from the parsed
+        # link kinds (e.g. "Research from NotebookLM, YouTube, Google Doc")
+        # so every downstream consumer renders something readable. Pure
+        # cosmetic — pipeline routing is unaffected.
+        if user_links and topic.strip().lower().startswith(("http://", "https://")):
+            _labels = []
+            _seen_labels = set()
+            for _l in user_links:
+                _lbl = (_l.get("label") or "").strip()
+                if _lbl and _lbl not in _seen_labels:
+                    _seen_labels.add(_lbl)
+                    _labels.append(_lbl)
+            if _labels:
+                topic = "Research from " + ", ".join(_labels[:5])
         run_name = run_id or f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         queue_dir = Path(__file__).parent / "queues" / run_name
         queue_dir.mkdir(parents=True, exist_ok=True)
