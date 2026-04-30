@@ -14480,23 +14480,33 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
             p3_md_files.append(_md_path)
     # Flow B: P1 + all P2 skipped means `results` is empty, so the loop
     # above adds no md files. Scan documents/ for any user-supplied source
-    # files (md/txt/pdf/docx — anything except brief.md) so P3 still has
-    # something to upload to NotebookLM.
-    _docs_dir = Path(queue_dir) / "documents"
-    if _docs_dir.exists():
-        _already = {p.name for p in p3_md_files}
-        for _f in sorted(_docs_dir.iterdir()):
-            if not _f.is_file():
-                continue
-            if _f.stem == "brief":
-                continue
-            if _f.suffix.lower() not in (".md", ".txt", ".pdf", ".docx"):
-                continue
-            if _f.name in _already:
-                continue
-            if _f.stat().st_size < 32:
-                continue   # Empty / placeholder file — skip
-            p3_md_files.append(_f)
+    # files (md/txt/pdf/docx — anything except brief.md / derived MDs) so
+    # P3 still has something to upload to NotebookLM.
+    #
+    # GATE (2026-04-30): only scan when the per-agent loop above added
+    # NOTHING. With agents present, p3_md_files already has every MD that
+    # belongs in NotebookLM; running the scan anyway picks up derived
+    # artifacts (consolidated.md is the offender — it's a P2 byproduct of
+    # claude+gemini concatenation, used for the Documents page only) and
+    # uploads them as duplicate sources. The Flow B scenario the scan was
+    # written for has p3_md_files empty by definition (no agents ran).
+    _DERIVED_STEMS = {"brief", "consolidated"}
+    if not p3_md_files:
+        _docs_dir = Path(queue_dir) / "documents"
+        if _docs_dir.exists():
+            _already = {p.name for p in p3_md_files}
+            for _f in sorted(_docs_dir.iterdir()):
+                if not _f.is_file():
+                    continue
+                if _f.stem in _DERIVED_STEMS:
+                    continue
+                if _f.suffix.lower() not in (".md", ".txt", ".pdf", ".docx"):
+                    continue
+                if _f.name in _already:
+                    continue
+                if _f.stat().st_size < 32:
+                    continue   # Empty / placeholder file — skip
+                p3_md_files.append(_f)
     _runtime.p2_links_for_p3 = p3_links
     _runtime.p2_md_files_for_p3 = p3_md_files
     log(f"[Phase 2→3 handoff] {len(p3_links)} links, {len(p3_md_files)} files ready for NotebookLM")
