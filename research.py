@@ -5446,7 +5446,9 @@ def _compact_event_for_narration(e: dict) -> str:
     if ag:
         parts.append(f"agent={ag}")
     for k in ("status", "progress", "error", "message", "reason",
-              "sources", "sections", "partialTextLen", "elapsedSec"):
+              "sources", "sections", "partialTextLen", "elapsedSec",
+              "searches", "sectionsDone", "sectionsTotal", "currentFocus",
+              "websitesCount", "panelOpen", "artifactCount"):
         v = d.get(k)
         if v in (None, "", [], {}):
             continue
@@ -5477,14 +5479,14 @@ async def _narrator_loop(phase: int):
         import requests as _requests
     except Exception:
         return
-    # gemini-2.0-flash was deprecated for new users (returns 404). Default to
-    # 2.5-flash; respect GEMINI_NARRATE_MODEL override so future bumps don't
-    # require a code change. On 5xx (saw 12+ overload responses on
-    # 2026-04-28) fall back to 2.5-pro for one retry — different model
-    # family hedges against flash-specific outages instead of retrying
-    # the same overloaded endpoint.
-    _model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash")
-    _model_fallback = "gemini-2.5-pro"
+    # 2026-04-29: bumped per-agent narrator from 2.5-flash to 2.5-pro for
+    # richer, more-fluid sentences that weave structured fields (searches,
+    # sections_done/total, current_focus, partial_text_len) into natural
+    # narration. Pro is ~5× cost / ~3× latency but the narrator only fires
+    # every 30-90s per agent — budget headroom is fine. On 5xx fall back
+    # to 2.5-flash to hedge against pro-specific outages.
+    _model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-pro")
+    _model_fallback = "gemini-2.5-flash"
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{_model}:generateContent?key={GEMINI_API_KEY}"
@@ -5691,13 +5693,21 @@ async def _narrator_loop(phase: int):
                     )
                     a_system = (
                         f"You narrate ONE human sentence about what the {akey.upper()} "
-                        f"agent is doing RIGHT NOW in Super Research Phase {phase}. "
-                        "CITE the real numbers (sources, chars, sections) when they "
-                        "appear in the events. Output exactly ONE sentence, "
-                        "<= 100 chars. No markdown. No prefix. No em-dashes. "
-                        f"STRICT SCOPE: Discuss ONLY {akey.upper()}'s own progress. "
-                        "Do not mention, infer, or compare against the other agents. "
-                        "Start the sentence with the agent name."
+                        f"agent is doing RIGHT NOW in Super Research Phase {phase}.\n"
+                        "STYLE: Weave structured data into a NATURAL sentence. Examples:\n"
+                        "  - 'ChatGPT is reading 224 sources, currently focused on "
+                        "false-positive detection in voice mode docs.'\n"
+                        "  - 'Gemini is visiting 178 websites, drafted 4/8 sections, "
+                        "currently researching technical discrepancies.'\n"
+                        "  - 'Claude has collected 380 sources across 7 minutes, "
+                        "building artifact-1 with 65KB of content.'\n"
+                        "RULES: Output ONE sentence, <= 140 chars. No markdown. "
+                        "No prefix. No em-dashes (use commas/periods). Start with "
+                        "the agent name. If the events include searches=N, "
+                        "sectionsDone=M, sectionsTotal=N, currentFocus, or "
+                        "partialTextLen — work them in as natural facts. If data "
+                        "is sparse, fall back to phase-stage description.\n"
+                        f"SCOPE: ONLY {akey.upper()}'s progress. Don't compare agents."
                     )
                     a_user = (
                         f"Recent events for {akey.upper()} (newest last):\n"
@@ -6083,12 +6093,13 @@ async def scrape_progress_chatgpt(page):
                                         seen_s.add(k); merged_steps.append(s)
                                 result["steps"] = merged_steps[-15:]
                                 if dr.get("progress"):
-                                    # Keep richer existing progress; only swap
-                                    # to iframe progress if it's substantially
-                                    # longer (avoids "Researching" clobbering
-                                    # a rich host-panel sentence).
+                                    # 2026-04-29: keep host-panel progress when
+                                    # present — the host strip's "Focusing on X"
+                                    # / "224 searches" line is canonical for FE
+                                    # narration. Only fall through to iframe
+                                    # progress when host produced nothing.
                                     cur = result.get("progress") or ""
-                                    if not cur or len(dr["progress"]) > len(cur) * 0.5:
+                                    if not cur:
                                         result["progress"] = dr["progress"]
                             # Sections: union (exact-string dedup since headings)
                             if dr.get("sections"):
@@ -6684,6 +6695,47 @@ async def scrape_progress_gemini(page):
                 '[class*="response"] h1, [class*="response"] h2'
             );
             r.sections = Array.from(headings).map(h => h.innerText.substring(0, 80)).filter(s => s.length > 1);
+            // Per-section status — Gemini renders ✓ / spinner / pending icons
+            // next to section headings in the Show-thinking panel. Capture
+            // counts so FE narration can say "drafted 4/8 sections".
+            try {
+                let doneCount = 0;
+                Array.from(headings).forEach(h => {
+                    const parent = h.parentElement;
+                    if (!parent) return;
+                    const checkLike = parent.querySelector(
+                        'svg[class*="check"], [aria-label*="complete" i], ' +
+                        '[aria-label*="done" i], [class*="completed"]'
+                    );
+                    if (checkLike) doneCount++;
+                });
+                r.sections_done = doneCount;
+                r.sections_total = r.sections.length;
+            } catch(e) { r.sections_done = 0; r.sections_total = r.sections.length; }
+            // Show-thinking expander detection — set panel_open so the
+            // gemini_narrate vision gate fires + FE knows panel-aware
+            // narration applies. Gemini's Show-thinking is inline below the
+            // response (not a side panel like Claude's artifact-1) so the
+            // panel-walker above misses it.
+            try {
+                const showThinkingBtn = Array.from(document.querySelectorAll('button'))
+                    .find(b => /show thinking|hide thinking/i.test(b.textContent || ''));
+                if (showThinkingBtn && /hide thinking/i.test(showThinkingBtn.textContent || '')) {
+                    r.panel_open = true;
+                }
+            } catch(e) {}
+            // Composite progress line — cite section progress + website
+            // count when both are present. Mirrors Claude's artifact tracker
+            // narration ("Tracking N sources from artifact") with Gemini's
+            // data shape. Boosts narration quality on iter-#3+ when the
+            // raw `r.progress` (live row) is short or missing.
+            if (r.searches > 0 && r.sections.length > 0) {
+                const liveSection = r.sections[r.sections.length - 1];
+                const composite = `Researching ${r.searches} websites — currently on "${liveSection}"`;
+                if (composite.length > (r.progress || '').length) r.progress = composite;
+            } else if (r.searches > 0 && !r.progress) {
+                r.progress = `Researching ${r.searches} websites`;
+            }
             // Partial text
             const responses = document.querySelectorAll('message-content, .model-response-text');
             if (responses.length > 0) r.partial_text_len = responses[responses.length-1].innerText.length;
@@ -10437,7 +10489,24 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #    (`_verify_chatgpt_panel_open`) confirms side panel actually
             #    rendered before flipping the flag.
             #  - After 2 DOM misses → CUA tier-3 fallback (capped at 1/phase).
-            _cgpt_gate_ok = (p.get("poll_cycles", 0) >= 3 or elapsed >= 180)
+            # 2026-04-29: lowered gate from iter-#3/180s to iter-#2/90s. The
+            # activity strip exists from t≈10s on a DR job; waiting 3 polls
+            # left the FE narration card stuck on "0 sources, 0 chars" stub
+            # copy for up to 3 minutes. Earlier gate = sub-2-min rich data.
+            _cgpt_gate_ok = (p.get("poll_cycles", 0) >= 2 or elapsed >= 90)
+            # Re-verify each cycle — ChatGPT auto-collapses the panel when
+            # the user navigates sub-views or after long idle. The verifier
+            # is a cheap JS call; if the panel stays open across cycles
+            # this is a no-op early exit. If it collapsed, we re-open.
+            if name == "ChatGPT" and _cgpt_gate_ok and p.get("chatgpt_activity_panel_open"):
+                try:
+                    if not await _verify_chatgpt_panel_open(p["page"]):
+                        p["chatgpt_activity_panel_open"] = False
+                        log(f"[ChatGPT] activity panel collapsed (cycle="
+                            f"{p.get('poll_cycles')}) — will re-open this cycle",
+                            "DEBUG")
+                except Exception:
+                    pass
             if (name == "ChatGPT" and _cgpt_gate_ok and
                     not p.get("chatgpt_activity_panel_open")):
                 try:
@@ -10762,6 +10831,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     panelOpen=bool(progress.get("panel_open", False)),
                     observedSources=int(progress.get("observed_sources", 0) or 0),
                     searches=int(progress.get("searches", 0) or 0),
+                    # New rich-narration fields (2026-04-29). Consumed by the
+                    # BE per-agent narrator + FE PhaseDropdown so the cards
+                    # show "drafted 4/8 sections" / "currently focused on X"
+                    # instead of "0 sources, 0 chars" stub copy.
+                    sectionsDone=int(progress.get("sections_done", 0) or 0),
+                    sectionsTotal=int(progress.get("sections_total", 0) or 0),
+                    currentFocus=str(progress.get("progress", "") or "")[:200],
+                    websitesCount=int(progress.get("searches", 0) or 0),
+                    artifactCount=int(progress.get("artifact_count", 0) or 0),
                     elapsedSec=elapsed_sec,
                     expectedMinutes=get_expected_minutes(2),
                     scrapeOk=scrape_ok)
