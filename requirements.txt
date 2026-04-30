@@ -2,6 +2,11 @@
 # Core
 anthropic>=0.40
 playwright>=1.40
+# patchright is a stealth drop-in for playwright's async API — used in
+# start_browser_session at research.py:8186 since the 2026-04-19 stealth
+# migration. Without this, every fresh `--pair` install crashes after
+# stage 2 with ModuleNotFoundError.
+patchright>=1.59
 
 # Extraction
 markdownify>=0.14
