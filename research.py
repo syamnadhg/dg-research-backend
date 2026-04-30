@@ -7750,6 +7750,161 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
     }
 
 
+async def scrape_chatgpt_activity_panel_tracking(page):
+    """Walk ChatGPT Deep Research's *open* activity side panel for live
+    progress data — steps checklist, section headings, source URLs,
+    aggregate search count.
+
+    Mirrors `scrape_claude_artifact_tracking` (Claude's gold-standard
+    rich-narration path). The panel must already be open — caller is
+    responsible for invoking `_open_chatgpt_activity_panel` first and
+    keeping it open across polls (`chatgpt_activity_panel_open` flag).
+
+    DOM-only: no CUA fallback. Reading from an already-mounted panel is a
+    cheap structural walk; if DOM yields nothing the caller can fall
+    through to vision narration (which already runs alongside this in the
+    round-robin loop). Returns None when the panel isn't mounted /
+    mounted-but-empty so the caller can skip merging.
+
+    Returns dict with keys:
+        steps, sections, source_urls, searches, partial_text_len, progress
+    """
+    JS = """() => {
+        const out = {
+            steps: [], sections: [], source_urls: [],
+            searches: 0, partial_text_len: 0, progress: ""
+        };
+        // Panel root — ChatGPT renders the side panel as <aside> /
+        // [role="complementary"] / [aria-label~=source] in the DR
+        // sandbox iframe OR host page (post-2025 redesign). Match either.
+        // Width gate prevents matching narrow chrome (sidebar nav, etc.).
+        const PANEL_SELS = [
+            'aside', '[role="complementary"]', '[role="region"]',
+            '[aria-label*="source" i]', '[aria-label*="activity" i]',
+            '[aria-label*="research" i]',
+            '[class*="panel" i][class*="side" i]'
+        ].join(', ');
+        const panels = Array.from(document.querySelectorAll(PANEL_SELS))
+            .filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width >= 280 && r.height >= 200 &&
+                       r.right > window.innerWidth * 0.45;
+            });
+        if (panels.length === 0) return out;
+        // Prefer the rightmost-and-tallest — ChatGPT mounts a single
+        // dominant side panel; smaller candidates are usually unrelated
+        // chrome that happens to match the selector.
+        panels.sort((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            return (rb.height * (rb.right > window.innerWidth * 0.5 ? 1.5 : 1))
+                 - (ra.height * (ra.right > window.innerWidth * 0.5 ? 1.5 : 1));
+        });
+        const panel = panels[0];
+        const panelText = (panel.innerText || '').trim();
+        out.partial_text_len = panelText.length;
+
+        // Step rows — walk listitems and styled <div>s. Same shape as
+        // Claude's walker. Skip rows with nested children (we want leaf
+        // text only, not the parent that contains many siblings).
+        const STEP_SELS = [
+            'li', '[role="listitem"]',
+            '[class*="step" i]', '[class*="checklist" i] > div',
+            '[class*="task" i] > div', '[class*="activity" i]',
+            '[class*="row" i]'
+        ].join(', ');
+        const seenStep = new Set();
+        panel.querySelectorAll(STEP_SELS).forEach(e => {
+            const t = (e.innerText || '').trim();
+            if (!t || t.length < 4 || t.length > 240) return;
+            if (e.querySelector('li, [role="listitem"]')) return;
+            const k = t.slice(0, 80);
+            if (seenStep.has(k)) return;
+            seenStep.add(k);
+            out.steps.push(t.slice(0, 220));
+        });
+        out.steps = out.steps.slice(-15);
+        if (out.steps.length > 0) out.progress = out.steps[out.steps.length - 1];
+
+        // Section headings — ChatGPT uses h1/h2/h3 inside the panel for
+        // top-level outline (Deep Research's running report skeleton).
+        panel.querySelectorAll('h1, h2, h3').forEach(h => {
+            const t = (h.innerText || '').trim();
+            if (t && t.length > 1 && t.length < 120) out.sections.push(t);
+        });
+        out.sections = out.sections.slice(0, 20);
+
+        // URL list — every external <a>. Exclude ChatGPT/OpenAI internal
+        // anchors (sign-in, settings, share endpoint) since those aren't
+        // research sources. Cap at 50 to bound payload size.
+        const seenUrl = new Set();
+        panel.querySelectorAll('a[href^="http"]').forEach(a => {
+            const h = a.href || '';
+            if (!h || h.length > 500) return;
+            if (h.includes('chatgpt.com') || h.includes('openai.com')) return;
+            if (seenUrl.has(h)) return;
+            seenUrl.add(h);
+            out.source_urls.push(h);
+        });
+        out.source_urls = out.source_urls.slice(0, 50);
+
+        // Aggregate search count — ChatGPT renders strings like
+        // "193 searches" / "33 sources" in the panel header or near the
+        // step list. Pick the largest match so a transient lower count
+        // doesn't shrink the chip mid-run. Same heuristic as Gemini's
+        // panel walker.
+        try {
+            const re = /(\\d+)\\s+(?:websites?|sources?|searches?|sites?|results?)\\b/gi;
+            let mm; let best = 0;
+            while ((mm = re.exec(panelText)) !== null) {
+                const n = parseInt(mm[1], 10) || 0;
+                if (n > best) best = n;
+            }
+            out.searches = best;
+        } catch (e) {}
+
+        return out;
+    }"""
+    try:
+        res = await page.evaluate(JS)
+    except Exception as _e:
+        log(f"[ChatGPT] activity panel walker failed: {_e}", "DEBUG")
+        return None
+    # Also try the Deep Research sandbox iframe — the panel often mounts
+    # there when the conversation runs in DR mode (cross-origin iframe
+    # at oaiusercontent / web-sandbox.oaiusercontent).
+    if not res or (not res.get("steps") and not res.get("source_urls")):
+        try:
+            for frame in page.frames:
+                try:
+                    src = (frame.url or "").lower()
+                except Exception:
+                    continue
+                if not src:
+                    continue
+                if ("deep_research" in src or "oaiusercontent" in src):
+                    try:
+                        f_res = await frame.evaluate(JS)
+                        if f_res and (f_res.get("steps") or f_res.get("source_urls")):
+                            res = f_res
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    if not res:
+        return None
+    has_data = (
+        bool(res.get("steps"))
+        or bool(res.get("source_urls"))
+        or bool(res.get("sections"))
+        or int(res.get("searches", 0) or 0) > 0
+    )
+    if not has_data:
+        return None
+    return res
+
+
 # ── Browser ────────────────────────────────────────────────────────────────────
 
 class Browser:
@@ -10662,6 +10817,59 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         log("[ChatGPT] CUA tier-3 timed out after 120s", "WARN")
                     except Exception as _ce:
                         log(f"[ChatGPT] CUA tier-3 failed: {_ce}", "WARN")
+
+            # ── Block 1c: ChatGPT activity-panel scrape (mirror of Claude
+            # artifact tracking). Runs every cycle once the panel is open,
+            # walking the side panel for live steps/sections/source_urls/
+            # searches count. Without this, _open_chatgpt_activity_panel
+            # opens the panel for URL extraction at end-of-phase but
+            # leaves the FE staring at "Deep Research in progress" the
+            # whole run — Claude reads its artifact panel continuously
+            # for the gold-standard narration; ChatGPT now does the same.
+            # DOM-only: no CUA fallback. Reading from an already-open
+            # panel is a cheap structural walk; if the walker yields
+            # nothing the vision narration block below picks up the slack.
+            if (name == "ChatGPT"
+                    and p.get("chatgpt_activity_panel_open")
+                    and (time.time() - p.get("last_chatgpt_panel_scrape", 0))
+                            > ARTIFACT_SCRAPE_INTERVAL):
+                try:
+                    panel_data = await scrape_chatgpt_activity_panel_tracking(p["page"])
+                    if panel_data:
+                        # Merge into outer progress dict using dedupe-keep-
+                        # first semantics (mirrors Claude artifact merge).
+                        for key in ("source_urls", "steps", "sections"):
+                            if panel_data.get(key):
+                                existing = progress.get(key, []) or []
+                                merged = list(dict.fromkeys(existing + panel_data[key]))
+                                progress[key] = merged
+                        # Invariant: progress["sources"] == len(progress["source_urls"]).
+                        progress["sources"] = len(progress.get("source_urls", []) or [])
+                        # Searches count — take max so transient lower
+                        # reads don't shrink the chip.
+                        _ps = int(panel_data.get("searches", 0) or 0)
+                        if _ps > int(progress.get("searches", 0) or 0):
+                            progress["searches"] = _ps
+                        # Mark panel_open=True so the FE chip + the vision
+                        # narration block both see the panel as live.
+                        progress["panel_open"] = True
+                        # Refresh progress text from latest step if our
+                        # pre-scrape progress was empty (don't override a
+                        # rich pre-existing string).
+                        if (panel_data.get("progress")
+                                and not (progress.get("progress") or "").strip()):
+                            progress["progress"] = panel_data["progress"]
+                        if int(panel_data.get("partial_text_len", 0) or 0) > int(progress.get("partial_text_len", 0) or 0):
+                            progress["partial_text_len"] = panel_data["partial_text_len"]
+                        scrape_ok = True
+                        log(f"[ChatGPT] panel tracking: "
+                            f"{len(panel_data.get('source_urls', []))} URLs, "
+                            f"{len(panel_data.get('steps', []))} steps, "
+                            f"{len(panel_data.get('sections', []))} sections, "
+                            f"searches={panel_data.get('searches', 0)}")
+                except Exception as _e:
+                    log(f"[ChatGPT] activity panel scrape failed: {_e}", "DEBUG")
+                p["last_chatgpt_panel_scrape"] = time.time()
 
             # ── Block 2: per-agent vision narration (P2 mirror of P1) ──
             # Same cooldown (90s) + budget (30/phase) enforced inside
