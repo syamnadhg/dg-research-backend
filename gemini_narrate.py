@@ -35,8 +35,16 @@ GEMINI_MODEL_PRIMARY = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash"
 # with a different model family rather than retrying the same one.
 GEMINI_MODEL_FALLBACK = "gemini-2.5-pro"
 GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_NARRATE_TIMEOUT", "8.0"))
-PHASE_BUDGET = int(os.environ.get("GEMINI_NARRATE_BUDGET", "30"))
-MIN_GAP_S = float(os.environ.get("GEMINI_NARRATE_MIN_GAP_S", "90"))
+# Aggressive defaults (2026-04-29) — Sammy wants "always-on" narration
+# during P1 + P2. With a working GEMINI_API_KEY there's no reason to
+# throttle the narrator. Cooldown dropped from 90s → 30s and budget
+# raised from 30 → 80 calls/phase so the FE sees a fresh sentence
+# ~every poll cycle for the duration of the phase. P1 ET runs 10-20
+# min so 80 calls @ 30s gives full coverage; P2 polling is bounded by
+# round-robin cadence so the budget is comfortably above what's
+# actually needed.
+PHASE_BUDGET = int(os.environ.get("GEMINI_NARRATE_BUDGET", "80"))
+MIN_GAP_S = float(os.environ.get("GEMINI_NARRATE_MIN_GAP_S", "30"))
 PANEL_CROP_RIGHT_FRACTION = float(os.environ.get("GEMINI_NARRATE_CROP", "0.45"))
 
 

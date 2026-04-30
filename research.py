@@ -9283,20 +9283,24 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 _vn_progress_str = (progress.get("progress") or "").strip()
                 _vn_sources = int(progress.get("sources", 0) or 0)
                 _vn_panel_open = bool(progress.get("panel_open", False))
-                # Trigger vision when:
-                #   (a) DOM is empty (no steps + no sources) past 60s warmup, OR
-                #   (b) the right-side panel is detected as OPEN past 90s —
-                #       vision's panel-aware screenshot extraction pulls
-                #       narration quality (one-sentence panel summary +
-                #       sectioned headings) the DOM walker often can't.
+                # 2026-04-29: aggressive vision narration cadence. With a
+                # working GEMINI_API_KEY the narrator should fire often
+                # enough that the FE always has a fresh sentence. Lowered
+                # the DOM-empty warmup from 60s → 20s and the panel-open
+                # gate from 90s → 30s. The narrator's own MIN_GAP_S
+                # (30s default) bounds the actual call frequency, so
+                # these warmups just decide WHEN the first call happens.
                 _vn_should_call = (
-                    elapsed_sec > 60
+                    elapsed_sec > 20
                     and _vn_steps_n < 2
                     and _vn_sources == 0
                 ) or (
-                    elapsed_sec > 90 and _vn_panel_open
+                    elapsed_sec > 30 and _vn_panel_open
                 )
-                _vn_force_every_n = int(os.environ.get("GEMINI_NARRATE_FORCE_EVERY_N", "4"))
+                # Force every Nth poll so the narrator fires even when
+                # DOM is producing data (keeps FE narration fresh during
+                # rich-DOM windows). Default 2 (every other poll).
+                _vn_force_every_n = int(os.environ.get("GEMINI_NARRATE_FORCE_EVERY_N", "2"))
                 if _vn_force_every_n > 0 and elapsed_sec > 0:
                     try:
                         _poll_interval = max(int(POLL_PRO if phase == 1 else POLL_DEEP_RESEARCH), 1)
@@ -9324,7 +9328,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     except Exception as _vne:
                         log(f"[{label}] gemini_narrate failed: {_vne}", "DEBUG")
                         _vision_data = None
-                if _vision_data and float(_vision_data.get("confidence", 0)) >= 0.4:
+                # Confidence floor lowered 0.4 → 0.3 (2026-04-29). The
+                # narrator self-tags low-confidence reads as < 0.4 when
+                # the panel is closed/empty, so 0.3 still filters the
+                # totally-blank cases while accepting "partial-but-real"
+                # narration the user benefits from seeing.
+                if _vision_data and float(_vision_data.get("confidence", 0)) >= 0.3:
                     _scrape_source = "vision"
                     _vision_narration = _vision_data.get("narration", "")
                     _vision_phase_signal = _vision_data.get("phase_signal", "") or ""
@@ -9408,12 +9417,24 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         progress["status"] = "extended_thinking"
                         # Prefer vision's rich narration over the generic
                         # "<X> active" fallback when vision gave us a
-                        # confident reading. Otherwise keep the fallback so
-                        # the dropdown isn't blank.
+                        # confident reading. Otherwise build a dynamic
+                        # fallback from whatever DOM data we have so the
+                        # dropdown isn't a static "Extended Thinking
+                        # active" string for the entire 10-20 min ET
+                        # window. Includes elapsed minutes + drafted
+                        # chars when those grow — gives the user
+                        # something to watch even when vision is between
+                        # cooldown ticks.
                         if _vision_narration:
                             progress["progress"] = _vision_narration
                         else:
-                            progress["progress"] = f"{_think_label} active"
+                            _et_parts = [f"{_think_label} active"]
+                            _et_min = elapsed_sec // 60
+                            if _et_min >= 1:
+                                _et_parts.append(f"{_et_min} min elapsed")
+                            if _merged_partial_len >= 200:
+                                _et_parts.append(f"{_merged_partial_len:,} chars drafted")
+                            progress["progress"] = " · ".join(_et_parts)
                     agent_key = normalize_agent_key(label)
                     emit_event("agent_progress", phase=phase, agent=agent_key,
                         status=progress.get("status", ""),
@@ -10882,19 +10903,20 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             _vn_progress_str = (progress.get("progress") or "").strip()
             _vn_sources = int(progress.get("sources", 0) or 0)
             _vn_panel_open = bool(progress.get("panel_open", False))
-            # Trigger vision when:
-            #   (a) DOM is empty (no steps + no sources) past 60s warmup, OR
-            #   (b) the right-side panel is detected as OPEN past 90s —
-            #       vision's panel-aware screenshot extraction pulls
-            #       narration quality DOM walker often can't.
+            # 2026-04-29: aggressive vision cadence (mirrors the P1 block
+            # above). DOM-empty warmup 60s → 20s, panel-open gate 90s →
+            # 30s. Narrator's MIN_GAP_S (30s) bounds actual call
+            # frequency. With a working GEMINI_API_KEY the FE should see
+            # a fresh narration sentence ~every poll once the agent is
+            # past the 20s warmup.
             _vn_should_call = (
-                _elapsed_sec_now > 60
+                _elapsed_sec_now > 20
                 and _vn_steps_n < 2
                 and _vn_sources == 0
             ) or (
-                _elapsed_sec_now > 90 and _vn_panel_open
+                _elapsed_sec_now > 30 and _vn_panel_open
             )
-            _vn_force_every_n = int(os.environ.get("GEMINI_NARRATE_FORCE_EVERY_N", "4"))
+            _vn_force_every_n = int(os.environ.get("GEMINI_NARRATE_FORCE_EVERY_N", "2"))
             if _vn_force_every_n > 0 and _elapsed_sec_now > 0:
                 try:
                     _poll_interval = max(int(POLL_DEEP_RESEARCH), 1)
@@ -10921,7 +10943,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as _vne:
                     log(f"[{name}] gemini_narrate failed: {_vne}", "DEBUG")
                     _vision_data_p2 = None
-                if _vision_data_p2 and float(_vision_data_p2.get("confidence", 0)) >= 0.4:
+                # Confidence floor lowered 0.4 → 0.3 (matches P1 block).
+                if _vision_data_p2 and float(_vision_data_p2.get("confidence", 0)) >= 0.3:
                     _vision_narration_p2 = _vision_data_p2.get("narration", "")
                     _vision_phase_signal_p2 = _vision_data_p2.get("phase_signal", "") or ""
                     _v_progress = _vision_data_p2.get("progress", "")
