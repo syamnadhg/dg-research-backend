@@ -5065,7 +5065,9 @@ def _recent_events_window(seconds: float) -> list:
 
 
 def emit_event(event_type, phase=None, agent=None, **data):
-    """Emit a typed event to events.jsonl AND Firestore pipeline_events."""
+    """Emit a typed event to Firestore pipeline_events. (events.jsonl
+    disk mirror was removed 2026-04-29 — Firestore is the single
+    transport.)"""
     if not _tracks_dir:
         return
     event = {
@@ -6615,12 +6617,15 @@ async def scrape_progress_gemini(page):
                     }
                 }
                 if (rows.length > 0) {
-                    // NOTE: Gemini's research progress is shown INLINE in the
-                    // chat, not in a side panel — so we do NOT set panel_open
-                    // here (would be semantically wrong + would mis-trigger
-                    // panel-aware vision logic downstream). The walker still
-                    // runs as a structural fallback if Gemini renames the
-                    // .research-step/.activity-item classes.
+                    // NOTE: this generic panel-walker tier does NOT set
+                    // panel_open (Gemini's research is INLINE in the chat
+                    // for the structural walker; treating those rows as
+                    // a "side panel open" would mis-trigger panel-aware
+                    // vision crops). The Show-thinking branch lower in
+                    // the function DOES set panel_open=true intentionally
+                    // since that expander is the closest Gemini analog
+                    // to Claude's artifact panel — see the explicit
+                    // "Hide thinking" detection below.
                     const panelSteps = rows.map(x => x.t).slice(-15);
                     r.steps = r.steps.concat(panelSteps).slice(-15);
                     if (live) r.progress = live;
@@ -6712,16 +6717,18 @@ async def scrape_progress_gemini(page):
                 r.sections_done = doneCount;
                 r.sections_total = r.sections.length;
             } catch(e) { r.sections_done = 0; r.sections_total = r.sections.length; }
-            // Show-thinking expander detection — set panel_open so the
-            // gemini_narrate vision gate fires + FE knows panel-aware
-            // narration applies. Gemini's Show-thinking is inline below the
-            // response (not a side panel like Claude's artifact-1) so the
-            // panel-walker above misses it.
+            // Show-thinking expander detection — capture state in
+            // r.thinking_visible (not panel_open) since Gemini's thinking
+            // is INLINE below the response, not a right-side panel. The
+            // gemini_narrate vision crop targets the right edge of the
+            // viewport, which would be the wrong region here. Setting
+            // panel_open=true would mis-trigger that crop. Use this flag
+            // for FE narration context without invoking vision.
             try {
                 const showThinkingBtn = Array.from(document.querySelectorAll('button'))
                     .find(b => /show thinking|hide thinking/i.test(b.textContent || ''));
                 if (showThinkingBtn && /hide thinking/i.test(showThinkingBtn.textContent || '')) {
-                    r.panel_open = true;
+                    r.thinking_visible = true;
                 }
             } catch(e) {}
             // Composite progress line — cite section progress + website
@@ -17564,7 +17571,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         fail_phase(
             phase=last_phase,
             error=str(e)[:200] or "unexpected failure",
-            reason="The pipeline hit an unexpected error. Details saved to backend.log and tracks/events.jsonl.",
+            reason="The pipeline hit an unexpected error. Details saved to backend.log.",
             agent=None,
         )
     finally:
@@ -18237,7 +18244,7 @@ async def run_server(port=8000):
         config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
         # Forward to in-memory controls (for mid-phase config awareness)
         _controls.update_config(existing)
-        # Emit via dual-write (events.jsonl + Firestore) so frontend gets it
+        # Emit to Firestore pipeline_events so frontend gets it
         emit_event("config_updated", config=existing)
         return {"status": "config_updated", "id": run_id, "config": existing}
 
