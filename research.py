@@ -17372,30 +17372,77 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # MDs so Flow B (P1+P2 skipped, sources-only) doesn't trip the
         # "no documents" gate. brief.md is still excluded — it's input,
         # not a NotebookLM source.
-        md_files = [f for f in doc_dir.iterdir()
-                    if doc_dir.exists() and f.is_file()
+        def _scan_p3_docs():
+            if not doc_dir.exists():
+                return []
+            return [f for f in doc_dir.iterdir()
+                    if f.is_file()
                     and f.suffix.lower() in (".md", ".txt", ".pdf", ".docx")
-                    and f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
+                    and f.stat().st_size > 100 and f.stem != "brief"]
+        md_files = _scan_p3_docs()
         has_results = md_files or any(r.get("text") for r in results.values())
+        # Flow B context detection: P2 was *deliberately* skipped (config or
+        # all-agents-off via the FE), so the user's intent was P3-as-entry
+        # with attached source files. The legacy gate ("Phase 2 produced no
+        # documents — Retry Phase 2") is wrong for this path: P2 wasn't
+        # supposed to produce anything, and Retry would just re-run P2 with
+        # the same all-agents-off config and loop forever. Surface a Flow-B-
+        # specific error and don't offer Retry P2 in that case.
+        _p2_was_skipped = (2 in skip_phases) or (not any(agents_cfg.values()))
+        _flow_b_intent = _p2_was_skipped and (1 in skip_phases)
+        # Flow C bypass: P3 already in skip_phases means the user's intent
+        # was P5-as-entry (or P4-as-entry) with user-pasted URLs hydrating
+        # delivery.json. The P3 entry block below detects 3 in skip_phases
+        # and runs the user_links hydration flow — no documents required.
+        # Skipping the gate here lets Flow C runs proceed without the user
+        # having to click "Skip P3" on a misleading "Phase 2 produced no
+        # documents" alert.
+        _p3_already_skipped = (3 in skip_phases)
         _p3gate_skipped = False
         _p3gate_attempt = 0
-        while not has_results:
+        while not has_results and not _p3_already_skipped:
             _p3gate_attempt += 1
-            log(f"No research output (attempt {_p3gate_attempt}) — awaiting user decision", "WARN")
-            fail_phase(
-                phase=3,
-                error="Phase 2 produced no documents — can't continue to NotebookLM.",
-                reason="All three agents timed out, errored, or returned empty. Retry re-runs Phase 2 with the same brief; Skip moves past Phase 3 (no notebook, no audio).",
-                actions=[
-                    {"id": "retry", "label": "Retry Phase 2", "style": "primary",
-                     "command": {"action": "retry_phase", "phase": 3}},
-                    {"id": "skip", "label": "Skip Phase 3", "style": "default",
-                     "command": {"action": "skip_phase", "phase": 3}},
-                ],
-            )
+            log(f"No research output (attempt {_p3gate_attempt}) — awaiting user decision "
+                f"(flow_b_intent={_flow_b_intent}, p2_was_skipped={_p2_was_skipped})", "WARN")
+            if _flow_b_intent:
+                # Flow B: P1+P2 skipped, user expected to bring source docs.
+                # Either none were attached, or all downloads failed (the
+                # download block at run_pipeline entry already would have
+                # fail_phase'd that case explicitly). Reaching here means
+                # zero usable sources landed on disk. No Retry P2 action —
+                # there's nothing to retry. Offer Skip P3 (run P5 with
+                # whatever the pipeline can salvage) or stop.
+                fail_phase(
+                    phase=3,
+                    error="No source documents found for NotebookLM",
+                    reason=("Phase 1 + Phase 2 are skipped, so the pipeline "
+                            "expects you to attach source files (.md/.txt/"
+                            ".pdf/.docx) for NotebookLM to ingest. None of "
+                            "your attachments landed on disk — they may "
+                            "have failed to upload, or the run was started "
+                            "without any. Skip Phase 3 to continue with "
+                            "whatever artifacts the later phases can "
+                            "produce, or stop and re-attach."),
+                    actions=[
+                        {"id": "skip", "label": "Skip Phase 3", "style": "primary",
+                         "command": {"action": "skip_phase", "phase": 3}},
+                    ],
+                )
+            else:
+                fail_phase(
+                    phase=3,
+                    error="Phase 2 produced no documents — can't continue to NotebookLM.",
+                    reason="All three agents timed out, errored, or returned empty. Retry re-runs Phase 2 with the same brief; Skip moves past Phase 3 (no notebook, no audio).",
+                    actions=[
+                        {"id": "retry", "label": "Retry Phase 2", "style": "primary",
+                         "command": {"action": "retry_phase", "phase": 3}},
+                        {"id": "skip", "label": "Skip Phase 3", "style": "default",
+                         "command": {"action": "skip_phase", "phase": 3}},
+                    ],
+                )
             gate_decision = await _controls.await_phase_decision(3)
             log(f"Phase 3 gate decision: {gate_decision}")
-            if gate_decision == "retry":
+            if gate_decision == "retry" and not _flow_b_intent:
                 try:
                     emit_event("phase_restart", phase=2, reason="user_retry_p3_gate", attempt=_p3gate_attempt + 1)
                 except Exception:
@@ -17412,12 +17459,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _regen_md = f"# {name} Deep Research (retry)\n\n{r['text']}"
                         (queue_dir / "documents" / fname).write_text(_regen_md, encoding="utf-8")
                         save_document_to_firestore(name.lower().replace(" ", ""), _regen_md, f"{name} Deep Research")
-                # Re-check gate (same source scan as the initial pre-gate
-                # check above — keeps Flow B sources counted on retry).
-                md_files = [f for f in doc_dir.iterdir()
-                            if doc_dir.exists() and f.is_file()
-                            and f.suffix.lower() in (".md", ".txt", ".pdf", ".docx")
-                            and f.stat().st_size > 100 and f.stem != "brief"] if doc_dir.exists() else []
+                # Re-check gate using the same source scan helper.
+                md_files = _scan_p3_docs()
                 has_results = md_files or any(r.get("text") for r in results.values())
                 continue
             if gate_decision == "skip":
