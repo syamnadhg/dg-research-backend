@@ -8289,15 +8289,45 @@ class Browser:
             log(f"[popup-guard] error: {e}", "WARN")
 
     async def _on_file_chooser(self, file_chooser):
-        if self._upload_queue:
-            path = self._upload_queue.pop(0)
-            if Path(path).exists():
-                log(f"File dialog intercepted — uploading: {Path(path).name}")
-                await file_chooser.set_files(path)
-            else:
-                log(f"File dialog — queued file not found: {path}", "WARN")
-        else:
+        if not self._upload_queue:
             log("File dialog opened but upload queue is empty", "WARN")
+            return
+        # 2026-04-30: type-aware routing. Pre-fix the queue was strict FIFO,
+        # so YouTube uploads broke whenever the thumbnail file dialog opened
+        # before the video dialog (or CUA misclicked into thumbnail first):
+        # the PNG fed into the video picker → "Invalid file format" banner.
+        # Now we read the input element's `accept` attribute and pop the
+        # queued file whose extension matches. Falls back to FIFO when the
+        # accept attribute is unset / ambiguous.
+        accept = ""
+        try:
+            handle = await file_chooser.element_handle()
+            if handle is not None:
+                accept = (await handle.get_attribute("accept")) or ""
+        except Exception:
+            accept = ""
+        accept_lower = accept.lower()
+        VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
+        IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        wants_image = ("image" in accept_lower) or any(ext in accept_lower for ext in IMAGE_EXTS)
+        wants_video = ("video" in accept_lower) or any(ext in accept_lower for ext in VIDEO_EXTS)
+        chosen_idx = 0  # default FIFO
+        if wants_image and not wants_video:
+            for i, p in enumerate(self._upload_queue):
+                if Path(p).suffix.lower() in IMAGE_EXTS:
+                    chosen_idx = i
+                    break
+        elif wants_video and not wants_image:
+            for i, p in enumerate(self._upload_queue):
+                if Path(p).suffix.lower() in VIDEO_EXTS:
+                    chosen_idx = i
+                    break
+        path = self._upload_queue.pop(chosen_idx)
+        if Path(path).exists():
+            log(f"File dialog intercepted — uploading: {Path(path).name} (accept={accept[:60] or 'unset'})")
+            await file_chooser.set_files(path)
+        else:
+            log(f"File dialog — queued file not found: {path}", "WARN")
 
     def set_upload_file(self, path):
         """Set the file for the next file dialog (replaces any queued files)."""
@@ -15964,6 +15994,25 @@ async def _create_p5_doc_via_playwright(browser, body):
         log(f"[Phase5] Type failed: {e}", "ERROR")
         return ""
     await asyncio.sleep(2)
+    # 2026-04-30: verify body actually landed in Kix. If the canvas click
+    # failed silently (no exception, no focus into the iframe), keyboard.type
+    # writes to nowhere and the URL still validates → empty Doc, "complete"
+    # emitted upstream. Read back the rendered text and require ≥50% char
+    # parity with the source body. Whitespace + line breaks render
+    # differently in Kix than what we typed, so we compare on a
+    # whitespace-collapsed length.
+    try:
+        rendered = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('.kix-page')).map(p => p.innerText).join('\\n')"
+        )
+        rendered_len = len((rendered or "").replace("\n", " ").replace("\r", " "))
+        expected_len = len((body or "").replace("\n", " ").replace("\r", " "))
+        if expected_len > 100 and rendered_len < expected_len * 0.5:
+            log(f"[Phase5] Body readback short — typed {expected_len} chars, rendered {rendered_len}. Doc likely empty (canvas focus failed)", "ERROR")
+            return ""
+        log(f"[Phase5] Body readback OK — rendered {rendered_len}/{expected_len} chars")
+    except Exception as e:
+        log(f"[Phase5] Body readback failed (non-fatal — proceeding): {e}", "WARN")
 
     # Make public via the existing DOM safety-net helper. Idempotent — if
     # the share dialog is already configured, the helper's role-button
@@ -16403,6 +16452,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # Clear dedup cache — stale keys from a prior run in the same process
     # would otherwise suppress early events in this run.
     _last_progress.clear()
+    # 2026-04-30: clear the OS clipboard at run start. extract_youtube_url
+    # falls back to reading the clipboard via get_clipboard() when neither
+    # the Share dialog nor the page-readback yields a youtu.be URL. The
+    # Windows clipboard is process-global and persists across runs — a
+    # YouTube link from a previous run sitting in the clipboard would be
+    # accepted by _is_yt_video and emitted to Firestore as THIS run's
+    # video, so P5 would deliver a wrong link to the user. This nukes
+    # the cross-run bleed channel.
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", "Set-Clipboard -Value ''"],
+                timeout=5, capture_output=True, check=False,
+            )
+    except Exception:
+        pass
     brief_artifact = None  # Set after Phase 1 completes
     # Validate email early (email is the user's Google account email from frontend)
     if email:
@@ -18205,10 +18270,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
         # ══════════════════════ PHASE 5: Report & Notification ══════════════════════
         _user_skip_p5 = _controls.consume_phase_skip(5)
+        # 2026-04-30: track whether P5 either delivered a Doc or was
+        # legitimately skipped, so we can gate pipeline_complete below.
+        # A failed P5 (no doc_url) used to still fire pipeline_complete →
+        # FE marked the research "complete" with nothing delivered.
+        _p5_delivered = False
         if 5 in skip_phases or not email_enabled or _user_skip_p5:
             _reason = "user_skip" if _user_skip_p5 else ("Disabled in pipeline config" if 5 in skip_phases else "Email disabled")
             log(f"Phase 5: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=5, reason=_reason)
+            _p5_delivered = True  # skip is a legit terminal state
         else:
             emit_event("phase_start", phase=5, description="Creating Google Doc hub + sending email notification", agents=["gdocs", "gmail"])
             _update_firestore_research({"phase": 5, "currentPhase": 5, "status": "ongoing"})
@@ -18240,27 +18311,47 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # re-fire — run_phase5's direct-Playwright path is reliable
             # enough that we trust its single result. If doc_url is empty
             # the caller already surfaced fail_phase() inside run_phase5.
-            update_delivery(doc_url=doc_url, email_sent=email_sent, status="completed")
+            # 2026-04-30: only mark delivery completed when doc_url was
+            # actually produced. Pre-fix we wrote status="completed" even
+            # when run_phase5 returned doc_url="" after fail_phase fired.
+            _delivery_status = "completed" if doc_url else "failed"
+            update_delivery(doc_url=doc_url, email_sent=email_sent, status=_delivery_status)
             save_checkpoint(queue_dir, 5, topic=topic, brief_url=brief_url, notebook_url=notebook_url,
                             youtube_url=youtube_url)
-            save_meta(queue_dir, topic, 5, status="completed")
+            save_meta(queue_dir, topic, 5, status=_delivery_status)
             _p5_links = []
             if doc_url:
                 _p5_links.append({"label": "Google Doc Hub", "url": doc_url, "verified": True})
             _summary_bits = []
             if doc_url: _summary_bits.append("Google Doc created")
             if email_sent: _summary_bits.append("email sent")
-            emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start),
-                       links=_p5_links,
-                       summary=", ".join(_summary_bits) or "Phase 5 finished (no doc, no email)")
+            # 2026-04-30: gate phase_complete on doc_url. When P5 failed,
+            # run_phase5 already fired fail_phase upstream — emitting
+            # phase_complete on top of that lied to the FE (the phase tile
+            # flipped green and pipeline_complete fired below).
+            if doc_url:
+                emit_event("phase_complete", phase=5, durationSec=int(time.time() - _p5_start),
+                           links=_p5_links,
+                           summary=", ".join(_summary_bits) or "Phase 5 finished")
+                _p5_delivered = True
+            else:
+                log("[Phase 5] No Google Doc produced — phase_complete suppressed (fail_phase fired upstream)", "WARN")
 
-        emit_event("pipeline_complete", summary=f"Pipeline finished for: {topic[:100]}")
-        log(f"\n{'='*60}")
-        log("PIPELINE COMPLETE")
-        log(f"  YouTube: {youtube_url or 'N/A'}")
-        log(f"  NotebookLM: {notebook_url or 'N/A'}")
-        log(f"  Queue: {queue_dir}")
-        log(f"{'='*60}")
+        if _p5_delivered:
+            emit_event("pipeline_complete", summary=f"Pipeline finished for: {topic[:100]}")
+            log(f"\n{'='*60}")
+            log("PIPELINE COMPLETE")
+            log(f"  YouTube: {youtube_url or 'N/A'}")
+            log(f"  NotebookLM: {notebook_url or 'N/A'}")
+            log(f"  Queue: {queue_dir}")
+            log(f"{'='*60}")
+        else:
+            log(f"\n{'='*60}")
+            log("PIPELINE INCOMPLETE — Phase 5 did not produce a Google Doc")
+            log(f"  YouTube:    {youtube_url or 'N/A'}")
+            log(f"  NotebookLM: {notebook_url or 'N/A'}")
+            log(f"  Queue:      {queue_dir}")
+            log(f"{'='*60}")
 
     except KeyboardInterrupt:
         log("Interrupted — progress saved to checkpoint", "WARN")
