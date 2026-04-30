@@ -1,6 +1,6 @@
 # Super Research — Backend Pipeline
 
-Automates multi-agent deep research across 6 platforms using Claude Computer Use API.
+Automates multi-agent deep research across 6 platforms. Tiered automation: Playwright (primary) → Vision (Anthropic Sonnet via `vision.py`, tier-2) → Claude Computer Use (tier-3 fallback).
 
 > **Jira:** [DGOPS-6933](https://distributedglobal.atlassian.net/browse/DGOPS-6933)
 > **Repo (this one):** github.com/dg-eng/super-research-backend
@@ -286,7 +286,7 @@ Multiple people can also share one backend. Share your ResearchToken — they pa
 | 2. Research | ChatGPT + Gemini + Claude (parallel) | ~49 min |
 | 3. Podcast | NotebookLM (upload + audio generation) | ~25 min |
 | 4. YouTube | YouTube Studio (video render + upload) | ~9 min |
-| 5. Report | Google Docs + Gmail (delivery) | ~3 min |
+| 5. Report | Google Docs (Playwright DOM) + Resend (HTTP API) (delivery) | ~3 min |
 
 Times based on real run analytics. Total: ~1h 50m for a full pipeline.
 
@@ -294,8 +294,8 @@ Times based on real run analytics. Total: ~1h 50m for a full pipeline.
 
 Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. Apr 19 + Apr 26 ship a two-layer narration system so there's always a visible human-language pulse:
 
-- **Phase narrator (Gemini 2.0 Flash inside `research.py`)** — every active phase has a narrator worker that reads a bounded ring buffer of recent events (~40) and emits a `phase_narration` event about every 45s. Narrator warms on `phase_start`, stays quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Cost envelope: ~200 input / 30 output tokens per narration → <$0.02 per full pipeline run.
-- **Per-agent narrator (Gemini 2.0 Flash inside `gemini_narrate.py`)** — separate module, separate cadence. Each Phase 1/2 agent has a narrator that reads the right-side activity panel directly via Gemini 2.0 Flash vision (screenshot-and-OCR). DOM-walker output is the primary; vision narrator fires when the walker yields nothing AND the panel is non-empty (typical case: ChatGPT Pro "Extended Thinking active" gap), or every 4th poll for a richer rolling sentence. New `agent_progress` fields: `scrapeSource: "dom" | "vision"` records which tier produced the data; `visionNarration` carries the human-readable sentence rendered verbatim in the agent dropdown. Hard caps: 30 calls per phase, 90s minimum gap per agent.
+- **Phase narrator (Gemini 2.5 Pro inside `research.py`)** — every active phase has a narrator worker that reads a bounded ring buffer of recent events (~40) and emits a `phase_narration` event about every 45s. Narrator warms on `phase_start`, stays quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Cost envelope: ~200 input / 30 output tokens per narration → <$0.02 per full pipeline run.
+- **Per-agent narrator (Gemini 2.5 Pro inside `gemini_narrate.py`)** — separate module, separate cadence. Each Phase 1/2 agent has a narrator that reads the right-side activity panel directly via Gemini 2.5 Pro vision (screenshot-and-OCR). DOM-walker output is the primary; vision narrator fires when the walker yields nothing AND the panel is non-empty (typical case: ChatGPT Pro "Extended Thinking active" gap), or every 4th poll for a richer rolling sentence. New `agent_progress` fields: `scrapeSource: "dom" | "vision"` records which tier produced the data; `visionNarration` carries the human-readable sentence rendered verbatim in the agent dropdown. Hard caps: 30 calls per phase, 90s minimum gap per agent.
 - **Backend-down detection** — the LivenessEye title swap in the phase header signals quiet-but-alive vs. potentially-dead. Past the per-phase T2 silence threshold the watchdog surfaces a Dismiss-only warn dropdown alert + OS notification; the pipeline keeps running while the autonomous tier framework (BE TierEscalation, Apr 28) recovers. T3 silence raises an informational dropdown alert without auto-stopping the run.
 
 ## Phase 0 verification (sequential, Apr 19)
@@ -333,10 +333,10 @@ Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, s
 - **Phase 2** — 90-min timeout with live source count, send-button CUA fallback, paste outer-retry narration, full HV (human-verification) stage narration: detected → auto-clear 1/2 → 3 min cooldown → retry 2/2 → success/fail with Resume/Skip. HV cooldown is 180s (was 45s — providers need the time to release holds)
 - **Phase 3** — per-agent share-link extraction failure, NotebookLM login-expired vs generic upload failure, "no MD files" gate, inter-phase gate (P2 produced no documents)
 - **Phase 4** — audio skip via command, poll-budget timeout, download-event timeout + fallback + final fail, Firebase Storage upload as best-effort (warning, not fatal)
-- **Phase 5** — ffmpeg disk-full / not-found / generic, YouTube URL extract fail, Google Doc creation fail, email bad-address / auth / SMTP, email skip via command
+- **Phase 5** — ffmpeg disk-full / not-found / generic, YouTube URL extract fail, Google Doc creation fail, email bad-address / Resend HTTP error, email skip via command
 - **Cross-cutting** — Anthropic 429/529 narrate as retrying; other API errors surface as `pipeline_warning` on the current phase
 
-Default action on every alert is `[Retry] [Skip]`. Skip writes the unified `skip_phase phase=N` command, replacing the old `skip_audio` / `skip_email` verbs (removed in U2). Phase-specific alerts may add `HV Resume` or `continue_anyway`. **Stop is NOT a per-phase action** — pause/stop/resume stay global in the app's chat input bar.
+Default action on every alert is `[Retry] [Skip]`. Skip writes the unified `skip_phase phase=N` command, replacing the old `skip_phase` / `skip_phase` verbs (removed in U2). Phase-specific alerts may add `HV Resume` or `continue_anyway`. **Stop is NOT a per-phase action** — pause/stop/resume stay global in the app's chat input bar.
 
 ### Error matrix (normalized, Apr 19 late-late)
 
@@ -348,7 +348,7 @@ The per-alert action set was consolidated to reduce noise and remove affordances
 - **Removed the "Poke" button and "Proceed without CUA" options entirely.** Poke morphed into the normalized Retry (which in turn does the hard tab close+reopen from the Apr 19 early `retry_agent` work). "Proceed without CUA" let users walk into broken-state pipelines with no recovery path.
 - **Stuck-agent buttons relabeled** to match the normalized vocabulary: Poke → **Retry**, "Wait longer" → **Wait**, "Skip agent" → **Skip**.
 
-The backend's per-agent narrator runs alongside the phase narrator during P1/P2 — separate Gemini 2.0 Flash calls emit `agent_narration` events (one per active agent, ~6s cadence) that the frontend shows inside each agent row of the Phase 2 accordion. Cost bounded: ~200 in / 30 out per call × 3 agents × a few hundred seconds per run.
+The backend's per-agent narrator runs alongside the phase narrator during P1/P2 — separate Gemini 2.5 Pro calls emit `agent_narration` events (one per active agent, ~6s cadence) that the frontend shows inside each agent row of the Phase 2 accordion. Cost bounded: ~200 in / 30 out per call × 3 agents × a few hundred seconds per run.
 
 ## CLI Mode
 
@@ -396,8 +396,10 @@ research-automate/
 ├── tests/fixtures/vision/      # V1 Vision fixtures (PNG + JSON pairs); auto/ subdir is gitignored
 ├── queues/                     # Active/completed pipeline runs (per-topic dirs)
 │   └── {topic}_{timestamp}/    # meta.json, config.json, delivery.json, documents/, podcasts/
-└── tracks/                     # Real-time progress data (events.jsonl + per-agent scrapes)
-    └── {topic}_{timestamp}/    # events.jsonl, phase0/, phase1/, phase2/, ...
+# tracks/ — DEPRECATED 2026-04-29. Per-run event log + per-agent scrape
+# files (events.jsonl, phase0/.../phase5/) no longer written. Firestore
+# `users/{uid}/researches/{rid}/pipeline_events/` is the sole event store.
+# Stale on-disk tracks/ artifacts from older runs are safe to delete.
 ```
 
 ## Troubleshooting
@@ -416,7 +418,7 @@ research-automate/
 
 **Phase 4 audio failed but Phase 5 still matters** — Hit `[Skip]` on the Phase 4 alert (writes `skip_phase phase=4`); Phase 5 YouTube + Email proceed normally.
 
-**Phase 5 email not sending** — Alert surfaces with the specific cause (bad address / auth / SMTP). Hit `[Skip]` (writes `skip_phase phase=5`) to skip email but still get the Google Doc link.
+**Phase 5 email not sending** — Alert surfaces with the specific cause (bad recipient / Resend HTTP error / `RESEND_API_KEY` unset / unverified `NOTIFY_FROM_EMAIL` domain). Hit `[Skip]` (writes `skip_phase phase=5`) to skip email but still get the Google Doc link. Verify your domain on resend.com → set `RESEND_API_KEY` + `NOTIFY_FROM_EMAIL` in BE env → restart `--serve`.
 
 ---
 

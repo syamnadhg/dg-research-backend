@@ -19,9 +19,14 @@ queues/<topic>_<timestamp>/
   thumbnail.png          — Phase 4: Generated thumbnail
   links.json             — Share/publish URLs collected during pipeline
   checkpoint.json        — Resume data (last completed phase, state)
-  events.jsonl           — All events (web app polls this)
-  .stop                  — Stop signal (API creates, pipeline checks between phases)
+  .stop / .pause         — Sentinel files (legacy fallback; primary stop/pause
+                           goes via Firestore commands)
 ```
+
+> **Note**: `events.jsonl` (per-run event log) was removed 2026-04-29. Events
+> now live exclusively in Firestore at `users/{uid}/researches/{rid}/pipeline_events/`.
+> The FE reads pipeline events from Firestore via `onSnapshot`, not by polling
+> any local HTTP/file endpoint.
 
 ## Pipeline Phases (0-5)
 
@@ -32,7 +37,7 @@ queues/<topic>_<timestamp>/
 | 2. Research | documents/chatgpt.md, gemini.md, claude.md (parallel) |
 | 3. NLM + Audio | podcasts/*.m4a |
 | 4. YouTube | video/research_overview.mp4, thumbnail.png |
-| 5. Report | delivery.json updated with gdoc + email links |
+| 5. Report | Google Doc (Playwright DOM) created + emailed via Resend; delivery.json updated with gdoc URL |
 
 Phase 2 runs 3 parallel research agents. Each saves output as separate MD.
 delivery.json updates incrementally — frontend reads it for live link availability.
