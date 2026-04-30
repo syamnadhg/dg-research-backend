@@ -3915,6 +3915,16 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
     url = await browser.current_url() or ""
     last_stage = "init"
     cua_attempted = False
+    # 2026-04-29 dup-tabs hardening: snapshot the page set so we can close
+    # any *new* gemini.google.com tab that opens during this function. The
+    # popup-guard allowlist permits gemini.google.com/share/... so the
+    # global guard (BrowserManager._guard_popup) won't catch a duplicate
+    # share-page tab on its own. Function-scoped guard runs in the
+    # `finally` below.
+    try:
+        _pages_snapshot = set(getattr(browser.context, "pages", []))
+    except Exception:
+        _pages_snapshot = set()
     try:
         # 2026-04-26: close-first preamble — close any open dialog/drawer
         # that could intercept the Share & Export click. Same pattern as
@@ -4067,17 +4077,40 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
             if link_el:
                 url = await link_el.get_attribute("value") or url
             else:
-                # Try clicking "Copy link" button
+                # 2026-04-29 dup-tabs hardening: scope the copy-link click
+                # to inside the share dialog ONLY, and require an exact
+                # "Copy link" match. Previously selected ALL document
+                # buttons + matched on a loose "copy" substring — that
+                # could click a code-block "Copy code" button or a social-
+                # share icon, both of which can spawn new tabs that
+                # `gemini.google.com` allowlist permits.
                 try:
                     await page.evaluate("""() => {
-                        const btns = document.querySelectorAll('button');
-                        for (const b of btns) {
-                            const txt = (b.innerText || '').toLowerCase();
-                            if (txt.includes('copy link') || txt.includes('copy')) {
-                                b.click();
-                                return 'copied';
-                            }
-                        }
+                        const dlg = document.querySelector(
+                            '[role="dialog"], mat-dialog-container, [role="menu"], ' +
+                            '[class*="cdk-overlay-pane"]'
+                        );
+                        if (!dlg) return '';
+                        const isSocial = (b) => {
+                            const cls = (b.className || '').toLowerCase();
+                            const lbl = (b.getAttribute('aria-label') || '').toLowerCase();
+                            return cls.includes('social') ||
+                                   /twitter|facebook|email|reddit|linkedin|whatsapp/i.test(lbl);
+                        };
+                        // Prefer aria-label exact match.
+                        const exact = dlg.querySelector(
+                            'button[aria-label="Copy link"], button[aria-label*="Copy link" i]'
+                        );
+                        if (exact && !isSocial(exact)) { exact.click(); return 'aria'; }
+                        // Text-content fallback within the dialog only;
+                        // require exact "copy link" (no substring "copy").
+                        const buttons = [...dlg.querySelectorAll('button')];
+                        const target = buttons.find(b => {
+                            if (isSocial(b)) return false;
+                            const t = (b.textContent || '').trim().toLowerCase();
+                            return t === 'copy link';
+                        });
+                        if (target) { target.click(); return 'text'; }
                         return '';
                     }""")
                     await asyncio.sleep(0.5)
@@ -4136,6 +4169,27 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
         return LinkResult(url=url, label=label, platform="gemini",
                           error=f"{last_stage}: {type(e).__name__}: {e}",
                           cua_attempted=cua_attempted)
+    finally:
+        # 2026-04-29 dup-tabs hardening: close any pages that opened during
+        # this function. Gemini's share dialog occasionally spawns a
+        # `gemini.google.com/share/...` preview tab when the public-link
+        # toggle flips, and the popup-guard allowlist permits it (correctly
+        # — we don't want to close legitimate agent tabs globally). The
+        # function-scoped diff catches duplicate share-page tabs without
+        # weakening the global allowlist.
+        try:
+            _pages_after = set(getattr(browser.context, "pages", []))
+            extras = (_pages_after - _pages_snapshot) - {page}
+            for _p in extras:
+                try:
+                    await _p.close()
+                except Exception:
+                    pass
+            if extras:
+                log(f"[{label}] Closed {len(extras)} extra tab(s) opened during share extract "
+                    f"(scoped guard caught what popup-guard's allowlist permits)", "INFO")
+        except Exception as _ge:
+            log(f"[{label}] Function-scoped tab guard failed (non-fatal): {_ge}", "DEBUG")
 
 
 async def extract_share_link_claude(browser, cua_client, label="Claude Deep Research", verbose=False):
@@ -11564,23 +11618,68 @@ async def _extract_html_to_md(page, selectors, label):
 
 
 async def _try_copy_button(page, browser, cua_client, label, verbose=False):
-    """Try to use the platform's copy button, fall back to CUA."""
-    # Try JS first — look for copy buttons
+    """Click the assistant message's copy button to put response text on
+    the clipboard. DOM (1 attempt with scoped selectors) → CUA fallback.
+
+    Selector scoping (2026-04-29 dup-tabs hardening): the prior
+    `document.querySelectorAll('button')` + loose "copy" text match was
+    matching buttons OUTSIDE the assistant response — code-block "Copy
+    code" buttons, share-dialog "Copy link" buttons, social-share icons.
+    The wrong click could spawn a popup the popup-guard allowlist
+    permits (gemini.google.com/share/...) → user-visible duplicate
+    tab. We now require either an exact aria-label match or an exact
+    "Copy" textContent match, scoped to the main response container,
+    AND explicitly exclude buttons inside any dialog / code block /
+    sidebar wrapper. CUA fallback unchanged.
+    """
+    matched_selector = ""
     try:
-        clicked = await page.evaluate("""() => {
-            const btns = document.querySelectorAll('button');
-            for (const b of btns) {
-                const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                const txt = b.textContent.trim().toLowerCase();
-                if (label.includes('copy') || txt === 'copy' || txt.includes('copy to clipboard')) {
-                    b.click();
-                    return true;
+        result = await page.evaluate("""() => {
+            // Containers known to wrap the assistant's response across
+            // ChatGPT / Gemini / Claude. Anything outside these is off-limits.
+            const ROOT_SELECTORS = [
+                'message-content', 'message-actions', 'message-actions-list',
+                '.model-response-text', '.response-container',
+                '[data-message-author-role="assistant"]',
+                '[data-testid*="message"]',
+            ];
+            const inside = (el, sel) => !!el.closest(sel);
+            const isExcluded = (b) => (
+                // Dialogs / modals that may contain "Copy link" buttons.
+                inside(b, '[role="dialog"]') ||
+                inside(b, 'mat-dialog-container') ||
+                // Code-block copy buttons (we want response text, not code).
+                /copy[\\s_-]*code/i.test(b.getAttribute('aria-label') || '') ||
+                /copy[\\s_-]*code/i.test(b.textContent || '') ||
+                // Sidebars / nav chrome that occasionally render a "Copy" item.
+                inside(b, 'aside, nav, [role="navigation"]')
+            );
+            const ariaExact = (b) => {
+                const a = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+                return a === 'copy' || a === 'copy response' || a === 'copy message';
+            };
+            const textExact = (b) => {
+                const t = (b.textContent || '').trim().toLowerCase();
+                return t === 'copy';
+            };
+            for (const root of ROOT_SELECTORS) {
+                const containers = document.querySelectorAll(root);
+                for (const c of containers) {
+                    const buttons = c.querySelectorAll('button');
+                    for (const b of buttons) {
+                        if (isExcluded(b)) continue;
+                        if (ariaExact(b) || textExact(b)) {
+                            b.click();
+                            return root + ' (' + (b.getAttribute('aria-label') || b.textContent.trim()) + ')';
+                        }
+                    }
                 }
             }
-            return false;
+            return '';
         }""")
-        if clicked:
-            log(f"[{label}] Copy button clicked via JS")
+        matched_selector = result or ""
+        if matched_selector:
+            log(f"[{label}] Copy button clicked via JS: {matched_selector}")
             await asyncio.sleep(1)
             return get_clipboard()
     except Exception:
@@ -11588,7 +11687,7 @@ async def _try_copy_button(page, browser, cua_client, label, verbose=False):
 
     # CUA fallback
     if browser and cua_client:
-        log(f"[{label}] Using CUA to click copy button...")
+        log(f"[{label}] Scoped DOM copy-button miss — falling back to CUA…")
         await browser.switch_to_page(page)
         await agent_loop(cua_client, browser, PROMPT_COPY_RESPONSE,
             "Copy the AI response text to clipboard using the Copy button.",
