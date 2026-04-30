@@ -5547,10 +5547,55 @@ def _narrator_cadence_for_phase(phase: int) -> float:
     return 6.0 if phase in (1, 2) else 20.0
 
 
+# Chat-thread chrome that leaks via DOM scrape into events. Strip from
+# narrator inputs ONLY (scrape outputs untouched — chip/step count still
+# read those raw). Patterns mirror the FE filter at
+# PhaseDropdown.tsx:2034-2041 plus 'brief.md' and the partial form
+# without trailing colon. Compiled once at module load.
+_NARR_NOISE_PREFIX_RE = re.compile(
+    # Optional leading verb-prefix (e.g. "Building: ", "Searching: ") allows
+    # the JS-prepended composites at research.py:7102 to be cleaned —
+    # "Building: Claude responded: I'll start by..." → "I'll start by..."
+    r"^\s*(?:\w+:\s*)?(?:you|chatgpt|gemini|claude|notebooklm|gpt)\s+(?:said|responded)\b\s*[:.]?\s*",
+    re.IGNORECASE,
+)
+_NARR_NOISE_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:you|chatgpt|gemini|claude|notebooklm|gpt)\s+(?:said|responded)\b"
+    r"|brief\.md"
+    r"|skip to content"
+    r"|new chat"
+    r")\s*[:.]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _scrub_for_narrator(s: str) -> str:
+    """Strip chat-thread chrome from a single narrator-input string.
+    Returns "" when the input is entirely chrome (caller should drop the
+    field). Used only for narrator inputs — does NOT touch scrape outputs
+    that drive chip/step counts."""
+    if not isinstance(s, str) or not s:
+        return ""
+    s = s.strip()
+    if not s:
+        return ""
+    if _NARR_NOISE_LINE_RE.match(s):
+        return ""
+    # Strip leading "X said:" / "X responded:" prefix (handles both
+    # bare-prefix lines and verbose "Building: Claude responded: ..."
+    # composites — sub() runs once at start; the JS prepends "Building: "
+    # so the noise prefix still appears at start in the worst case).
+    s = _NARR_NOISE_PREFIX_RE.sub("", s, count=1).strip()
+    return s
+
+
 def _compact_event_for_narration(e: dict) -> str:
     """Flatten an event into one line for the narrator prompt. Skips
     high-cardinality fields and caps each value at 120 chars so a 20-event
-    window stays well under the Gemini Flash input budget."""
+    window stays well under the narrator input budget. Also strips
+    chat-thread chrome ("You said:", "Claude responded:", "brief.md") so
+    the narrator doesn't paraphrase noise back as narration."""
     t = e.get("type", "")
     ph = e.get("phase", "")
     ag = e.get("agent", "")
@@ -5566,9 +5611,19 @@ def _compact_event_for_narration(e: dict) -> str:
         if v in (None, "", [], {}):
             continue
         if isinstance(v, (list, dict)):
+            # Scrub each list element of chat-thread chrome before serializing.
+            if k in ("sections", "steps") and isinstance(v, list):
+                v = [c for c in (_scrub_for_narrator(x) for x in v
+                                  if isinstance(x, str)) if c]
+                if not v:
+                    continue
             s = json.dumps(v)[:120]
         else:
             s = str(v)[:120]
+            if k in ("progress", "currentFocus", "message", "reason"):
+                s = _scrub_for_narrator(s)
+                if not s:
+                    continue
         parts.append(f"{k}={s}")
     return " | ".join(parts)
 
@@ -5592,32 +5647,85 @@ async def _narrator_loop(phase: int):
         import requests as _requests
     except Exception:
         return
-    # 2026-04-29: bumped per-agent narrator from 2.5-flash to 2.5-pro for
-    # richer, more-fluid sentences that weave structured fields (searches,
-    # sections_done/total, current_focus, partial_text_len) into natural
-    # narration. Pro is ~5× cost / ~3× latency but the narrator only fires
-    # every 30-90s per agent — budget headroom is fine. On 5xx fall back
-    # to 2.5-flash to hedge against pro-specific outages.
-    _model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-pro")
+    # 2026-04-30: per-agent narrator brain switched from Gemini Pro 2.5 to
+    # Anthropic Haiku 4.5. Pro echoed specific input spans verbatim at
+    # temp 0.2 ("research voice mode false positives" → "researching voice
+    # mode false positives"), which spoiled Gemini's narration after the
+    # 04-29 Flash→Pro upgrade. Haiku 4.5 follows "do not parrot input"
+    # tighter and is cheaper at this volume (~$1/run vs ~$2.50/run).
+    # Anthropic SDK is already a BE dep (vision.py uses Sonnet for ACT).
+    # Gemini 2.5 Flash stays as the safety net — it was the stable
+    # narrator before the 04-29 Pro bump.
+    _USE_HAIKU = os.environ.get("DG_NARRATOR_USE_HAIKU", "1").lower() not in ("0", "false", "no")
+    _haiku_model = os.environ.get("DG_NARRATOR_HAIKU_MODEL", "claude-haiku-4-5")
     _model_fallback = "gemini-2.5-flash"
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{_model}:generateContent?key={GEMINI_API_KEY}"
-    )
     url_fallback = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{_model_fallback}:generateContent?key={GEMINI_API_KEY}"
     )
-    _err_logged = False  # one-shot — avoid log spam if Gemini stays broken
+    _err_logged = False  # one-shot — avoid log spam if narrator stays broken
+    _haiku_err_logged = False  # one-shot — log Haiku→Flash downgrade once
 
-    def _call_gemini(system: str, user_msg: str, max_tokens: int = 200):
-        # Gemini 2.5 Flash/Pro have thinking ON by default and the
-        # `maxOutputTokens` cap covers thinking + visible output COMBINED.
-        # With a small budget (e.g. 60), thinking eats ~50 tokens and the
-        # actual sentence gets truncated to 2-3 words ("GEMINI is" stub
-        # observed 2026-04-28). Disabling thinking dedicates the full budget
-        # to visible output — narration doesn't need reasoning, just a
-        # one-line summary of recent events.
+    def _call_narrator(system: str, user_msg: str, max_tokens: int = 200):
+        """Call the narrator brain. Haiku 4.5 first; Gemini Flash fallback
+        on ANY Haiku failure (4xx, 5xx, timeout, SDK error, empty output).
+        Sync — wrapped in asyncio.to_thread by callers. Returns (text,
+        status_code). 429 is surfaced (not fallback) so the outer loop
+        can back off — Flash fallback would just hit Anthropic's own
+        rate-limit semantics again on the same key.
+
+        Note: 4xx errors fall through to Flash (not surfaced) so workspace-
+        usage-limit windows don't blank the narrator for 24+ hours. The
+        downgrade is logged once via _haiku_err_logged so operator sees
+        when narration is running on Flash instead of Haiku."""
+        nonlocal _haiku_err_logged
+        if _USE_HAIKU:
+            try:
+                import anthropic as _anth
+                _key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CUA_API_KEY")
+                if _key:
+                    _cli = _anth.Anthropic(api_key=_key, timeout=5.0)
+                    try:
+                        resp = _cli.messages.create(
+                            model=_haiku_model,
+                            max_tokens=max_tokens,
+                            system=system,
+                            messages=[{"role": "user", "content": user_msg}],
+                        )
+                        txt = "".join(
+                            getattr(b, "text", "") for b in resp.content
+                            if getattr(b, "type", "") == "text"
+                        )
+                        txt = (txt or "").strip()
+                        if txt:
+                            return txt, 200
+                        # empty text — fall through to Gemini Flash
+                    except _anth.RateLimitError:
+                        return "", 429  # let outer loop back off
+                    except _anth.APIStatusError as e:
+                        sc = getattr(e, "status_code", 500)
+                        if not _haiku_err_logged:
+                            log(f"[narrator] Haiku failed sc={sc} ({str(e)[:160]}) "
+                                f"— falling back to Gemini Flash", "WARN")
+                            _haiku_err_logged = True
+                        # fall through to Gemini Flash
+                    except _anth.APITimeoutError:
+                        if not _haiku_err_logged:
+                            log("[narrator] Haiku timeout — falling back to Gemini Flash", "WARN")
+                            _haiku_err_logged = True
+                        # fall through to Gemini Flash
+                    except Exception as _haiku_e:
+                        if not _haiku_err_logged:
+                            log(f"[narrator] Haiku error ({type(_haiku_e).__name__}: "
+                                f"{str(_haiku_e)[:120]}) — falling back to Gemini Flash", "WARN")
+                            _haiku_err_logged = True
+                        # fall through to Gemini Flash
+            except Exception:
+                pass  # SDK import / key resolution failed — Gemini Flash
+
+        # Gemini Flash fallback. Thinking disabled — narration doesn't
+        # need reasoning, just a one-line summary, and thinking eats the
+        # token budget leaving 2-3-word stubs.
         payload = {
             "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
             "systemInstruction": {"parts": [{"text": system}]},
@@ -5627,31 +5735,19 @@ async def _narrator_loop(phase: int):
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
-
-        def _post(_url):
-            try:
-                resp = _requests.post(_url, json=payload, timeout=5)
-            except Exception:
-                return None, 0
-            try:
-                j = resp.json()
-                text = (j.get("candidates", [{}])[0]
-                         .get("content", {})
-                         .get("parts", [{}])[0]
-                         .get("text", ""))
-            except Exception:
-                return None, resp.status_code
-            return (text or "").strip(), resp.status_code
-
-        text, status_code = _post(url)
-        # On 5xx (overloaded / transient outage), retry once on the
-        # fallback model. Don't retry 4xx — those are auth/quota/bad-input
-        # and won't change between primary and fallback.
-        if status_code >= 500:
-            text_fb, status_fb = _post(url_fallback)
-            if text_fb and status_fb < 400:
-                return text_fb, status_fb
-        return text, status_code
+        try:
+            resp = _requests.post(url_fallback, json=payload, timeout=5)
+        except Exception:
+            return None, 0
+        try:
+            j = resp.json()
+            text = (j.get("candidates", [{}])[0]
+                     .get("content", {})
+                     .get("parts", [{}])[0]
+                     .get("text", ""))
+        except Exception:
+            return None, resp.status_code
+        return (text or "").strip(), resp.status_code
 
     async def _realistic_fallback(akey: str, ph: int, elapsed_sec: float,
                                    last_status: str = "") -> str:
@@ -5680,7 +5776,7 @@ async def _narrator_loop(phase: int):
             "than generic. Start the sentence with the agent name."
         )
         fb_text, fb_status = await asyncio.to_thread(
-            _call_gemini, fb_system, "", 200
+            _call_narrator, fb_system, "", 200
         )
         if fb_status >= 400 or not fb_text:
             return ""
@@ -5728,7 +5824,7 @@ async def _narrator_loop(phase: int):
             )
             user_msg = f"Recent events (newest last):\n{event_lines or '[none]'}"
 
-            text, status_code = await asyncio.to_thread(_call_gemini, system, user_msg)
+            text, status_code = await asyncio.to_thread(_call_narrator, system, user_msg)
             if status_code == 429:
                 backoff_ticks_left = 3
                 continue
@@ -5739,9 +5835,10 @@ async def _narrator_loop(phase: int):
                 # `continue`d). Log the first failure per phase so the operator
                 # can act; subsequent failures stay quiet to avoid log spam.
                 if not _err_logged:
-                    log(f"[narrator] Gemini call failed (status={status_code}, "
-                        f"model={_model}) — phase narration silent until "
-                        f"resolved. Set GEMINI_NARRATE_MODEL or check key.", "WARN")
+                    log(f"[narrator] narrator call failed status={status_code} "
+                        f"(haiku={_USE_HAIKU}, fallback_model={_model_fallback}) "
+                        f"— phase narration silent until resolved. Check "
+                        f"ANTHROPIC_API_KEY or GEMINI_API_KEY.", "WARN")
                     _err_logged = True
                 continue
             # Reset the err flag once we recover so a later regression re-logs.
@@ -5807,26 +5904,38 @@ async def _narrator_loop(phase: int):
                     a_system = (
                         f"You narrate ONE human sentence about what the {akey.upper()} "
                         f"agent is doing RIGHT NOW in Super Research Phase {phase}.\n"
-                        "STYLE: Weave structured data into a NATURAL sentence. Examples:\n"
-                        "  - 'ChatGPT is reading 224 sources, currently focused on "
-                        "false-positive detection in voice mode docs.'\n"
-                        "  - 'Gemini is visiting 178 websites, drafted 4/8 sections, "
-                        "currently researching technical discrepancies.'\n"
-                        "  - 'Claude has collected 380 sources across 7 minutes, "
-                        "building artifact-1 with 65KB of content.'\n"
+                        "ANTI-PATTERNS — do NOT do these:\n"
+                        "  - DO NOT echo any phrase from the input verbatim. If "
+                        "the input contains 'research voice mode false positives', "
+                        "do NOT write 'researching voice mode false positives'. "
+                        "Paraphrase or skip.\n"
+                        "  - DO NOT start with 'currently' or 'Status:' or any "
+                        "prefix. Start with the agent name.\n"
+                        "  - DO NOT include UI chrome like 'You said:', 'Claude "
+                        "responded:', 'Gemini said', 'brief.md', or any line "
+                        "containing '<name> said' / '<name> responded' — treat "
+                        "those as noise from the chat thread and skip them.\n"
+                        "GOOD examples (paraphrase the underlying activity, "
+                        "don't quote the input):\n"
+                        "  - 'Gemini is mapping discrepancy patterns across the "
+                        "latest test runs while pulling fresh sources.'\n"
+                        "  - 'Claude has woven 380 sources into a 7-section "
+                        "outline so far.'\n"
+                        "  - 'ChatGPT is narrowing in on the false-positive root "
+                        "cause via the docs cluster.'\n"
                         "RULES: Output ONE sentence, <= 140 chars. No markdown. "
-                        "No prefix. No em-dashes (use commas/periods). Start with "
-                        "the agent name. If the events include searches=N, "
-                        "sectionsDone=M, sectionsTotal=N, currentFocus, or "
-                        "partialTextLen — work them in as natural facts. If data "
-                        "is sparse, fall back to phase-stage description.\n"
+                        "No em-dashes (use commas/periods). Weave structured "
+                        "fields (searches, sectionsDone/Total, currentFocus, "
+                        "partialTextLen) as paraphrased facts, not quoted "
+                        "strings. If data is sparse, describe the phase stage "
+                        "instead of inventing specifics.\n"
                         f"SCOPE: ONLY {akey.upper()}'s progress. Don't compare agents."
                     )
                     a_user = (
                         f"Recent events for {akey.upper()} (newest last):\n"
                         f"{a_lines or '[none]'}"
                     )
-                    a_text, a_status = await asyncio.to_thread(_call_gemini, a_system, a_user, 200)
+                    a_text, a_status = await asyncio.to_thread(_call_narrator, a_system, a_user, 200)
                     if a_status == 429:
                         backoff_ticks_left = 3
                         break
@@ -6994,15 +7103,25 @@ async def scrape_progress_claude(page):
             // chip still reads from r.searches for visual consistency.
             r.searches = liveSrcCount;
 
-            // ---- Sections — headings across conversation, artifact, and research card
+            // ---- Sections — headings restricted to artifact / aside /
+            // research-panel scope. The .font-claude-message + .contents
+            // selectors used to be here (2026-04-30 removed) but they
+            // grabbed conversation-thread chrome ("# You said:", "# Claude
+            // responded:") which got prepended with "Building: " at line
+            // 7102 and contaminated r.steps[] / r.progress, then leaked
+            // into narrator inputs as parroted "Claude responded: I'll
+            // start by..." narration. Belt-and-suspenders chrome filter
+            // on the .filter() line defends against any future selector
+            // that re-introduces chat-thread headings.
             const headings = document.querySelectorAll(
-                '.font-claude-message h1, .font-claude-message h2, .font-claude-message h3, ' +
-                '.contents h1, .contents h2, .contents h3, ' +
                 'aside h1, aside h2, aside h3, ' +
                 '[class*="artifact"] h1, [class*="artifact"] h2, ' +
                 '[class*="research"] h1, [class*="research"] h2, [class*="research"] h3'
             );
-            r.sections = Array.from(headings).map(h => (h.innerText || '').substring(0, 80)).filter(s => s.length > 1);
+            r.sections = Array.from(headings)
+                .map(h => (h.innerText || '').substring(0, 80))
+                .filter(s => s.length > 1 &&
+                             !/^(?:you|claude|chatgpt|gemini|notebooklm|gpt)\\s+(?:said|responded)\\b/i.test(s));
 
             // ---- Partial text — conversation + artifact + research card
             let textLen = 0;
@@ -7851,17 +7970,24 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         // Step rows — walk listitems and styled <div>s. Same shape as
         // Claude's walker. Skip rows with nested children (we want leaf
         // text only, not the parent that contains many siblings).
+        // 2026-04-30: dropped [class*="row" i] — too loose; matched
+        // sidebar nav / model-switcher rows and bled UI chrome into
+        // out.steps[]. Min length raised 4→12 to drop "OK"/"Done"
+        // single-word noise. Activity-verb gate mirrors Claude's panel
+        // walker at research.py:7052 — without it the walker grabs any
+        // 4-240-char text inside a panel-shaped div.
         const STEP_SELS = [
             'li', '[role="listitem"]',
             '[class*="step" i]', '[class*="checklist" i] > div',
-            '[class*="task" i] > div', '[class*="activity" i]',
-            '[class*="row" i]'
+            '[class*="task" i] > div', '[class*="activity" i]'
         ].join(', ');
+        const VERB_GATE = /^(?:checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing)\b/i;
         const seenStep = new Set();
         panel.querySelectorAll(STEP_SELS).forEach(e => {
             const t = (e.innerText || '').trim();
-            if (!t || t.length < 4 || t.length > 240) return;
+            if (!t || t.length < 12 || t.length > 240) return;
             if (e.querySelector('li, [role="listitem"]')) return;
+            if (!VERB_GATE.test(t)) return;
             const k = t.slice(0, 80);
             if (seenStep.has(k)) return;
             seenStep.add(k);
