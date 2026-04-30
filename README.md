@@ -8,6 +8,26 @@ Automates multi-agent deep research across 6 platforms. Tiered automation: Playw
 > The Firebase Admin SDK key (`firebase-service-account.json`) is **gitignored**
 > and emailed separately by the dev — see ["Firebase Admin Key" below](#firebase-admin-key-required--firebase-service-accountjson).
 
+## Platform support
+
+| Platform | Server | `--pair` | `--resurrect` / `--retire` | `--unpair` |
+|----------|--------|----------|----------------------------|------------|
+| Windows 10 / 11 | Full | Full | Full (Scheduled Task) | Full |
+| macOS | Full (manual `nohup`/`tmux`/`launchd` user agent) | Full | Planned (Track C — see `PersistenceRecipe.md`) | Step-1/3 only (no supervisor) |
+| Linux desktop (X11/Wayland) | Full (manual `nohup`/`tmux`/`systemd --user`) | Full | Planned (Track C — see `PersistenceRecipe.md`) | Step-1/3 only (no supervisor) |
+| Linux headless / WSL / Docker | **Unsupported** — Chrome needs a real display + user session for CAPTCHA / 2FA / login refresh |
+
+The supervisor (`--resurrect` / `--retire`) currently uses Windows Task Scheduler. macOS launchd + Linux systemd-user are specced in `PersistenceRecipe.md` as Track C. See [Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending) below for stop-gap options.
+
+## Before you start (prerequisites checklist)
+
+- **Python 3.11+** (`python --version`).
+- **Real Google Chrome** installed (not just Chromium — patchright launches with `channel="chrome"`).
+- **Anthropic API key** with browser-automation access (`CUA_API_KEY` or `ANTHROPIC_API_KEY` — either works; see Step 2).
+- **Firebase Admin SDK key** (`firebase-service-account.json`) — emailed to you by the dev. See [Firebase Admin Key](#firebase-admin-key-required--firebase-service-accountjson).
+- **Super Research web app account** — sign in at the deployment URL the dev shares with you (Google sign-in). You'll link the backend's ResearchToken from this account during `--pair` Stage 2.
+- *(Optional)* Gemini API key for Phase 4 nano-banana thumbnails. Resend account + your own verified domain for Phase 5 email — without it, Phase 5 still produces the Google Doc; only the email-send step skips with an alert. Self-hosters should never reuse a shared deployment's Resend key.
+
 ## Quick Start
 
 ```bash
@@ -15,6 +35,7 @@ Automates multi-agent deep research across 6 platforms. Tiered automation: Playw
 git clone https://github.com/dg-eng/super-research-backend.git
 cd super-research-backend
 pip install -r requirements.txt
+python -m patchright install chrome    # downloads patchright's stealth Chrome wrapper
 
 # 2. Drop in the Firebase Admin key (emailed to you by the dev).
 #    The email attachment will have an auto-generated name like
@@ -23,13 +44,13 @@ pip install -r requirements.txt
 #       firebase-service-account.json
 #    Step-by-step + verify command in "Firebase Admin Key" below.
 
-# 3. Setup (one-time: mints ResearchToken, renders QR, waits for logins)
+# 3. Pair (one-time: mints ResearchToken, renders QR, waits for logins)
 python research.py --pair
 
 # 4. Start the server (keep it running)
 python research.py --serve
 
-# 4a. (Optional, recommended) Survive reboots + crashes.
+# 4a. (Optional, recommended) Survive reboots + crashes (Windows only today).
 python research.py --resurrect
 
 # 4b. (Undo 4a) Disable On Startup — kills supervisor + serve, removes
@@ -42,6 +63,13 @@ python research.py --unpair
 ```
 
 That's it. Four commands to a hands-off always-on backend — plus `--retire` to disable On Startup or `--unpair` to fully disconnect this PC.
+
+> **Just want to smoke-test from the terminal first?** Skip pairing entirely and run `python research.py "your topic"` — see [§ CLI Mode](#cli-mode). No QR, no Firebase round-trip, output lands in `queues/`.
+
+> **Order of ops — what you can do in parallel:**
+> - Steps 1 (install) and 2 (env vars) can run alongside waiting for the Firebase Admin email.
+> - You're **blocked** on the Firebase email before you can run Step 3 (`--pair`).
+> - You're **blocked** on the web app account before Stage 2 of `--pair` (link the token).
 
 ## Firebase Admin Key (required) — `firebase-service-account.json`
 
@@ -118,7 +146,7 @@ Both `--pair` and `--serve` fail loudly on startup with the path they tried to l
         Email the dev for the file. See README → "Firebase Admin Key".
 ```
 
-> **Coming in the next update:** a proper pairing-time token exchange so new users self-onboard without the admin key at all. Until then, email flow stays.
+> **Coming in the next update:** a proper pairing-time token exchange so new users self-onboard without the admin key at all (see `PairingRecipe.md` for the spec). Until then, email flow stays.
 
 ## Setup Details
 
@@ -126,16 +154,20 @@ Both `--pair` and `--serve` fail loudly on startup with the path they tried to l
 
 ```bash
 pip install -r requirements.txt
+python -m patchright install chrome
 ```
 
-Requires **Python 3.11+** and a working Chrome/Chromium installation.
+Requires **Python 3.11+** and a working **real Google Chrome** install. `research.py` launches via `patchright` (a stealth Playwright fork) with `channel="chrome"` — it uses your installed Chrome binary, NOT bundled Chromium, so anti-bot heuristics see a real browser fingerprint.
 
-Playwright auto-downloads its bundled Chromium on first run — no separate `playwright install` step needed on Windows, but you may run it if installation lands in an unexpected profile dir:
-```bash
-python -m playwright install chromium
-```
+If Chrome itself isn't installed, install it first:
+- **Windows:** [google.com/chrome](https://www.google.com/chrome/) → run the installer.
+- **macOS:** `brew install --cask google-chrome` (or download from google.com/chrome).
+- **Linux (Debian/Ubuntu):** `sudo apt-get install google-chrome-stable` (after adding Google's apt repo) or download the `.deb` from google.com/chrome.
+- **Linux (Fedora/RHEL):** `sudo dnf install google-chrome-stable` (after adding the repo) or `.rpm` from google.com/chrome.
 
-`qrcode>=7.4` is already listed — the setup flow renders a scannable QR in your terminal.
+`python -m patchright install chrome` then downloads the stealth wrapper that drives that Chrome. Do this once on every machine.
+
+`qrcode>=7.4` is already listed — the pair flow renders a scannable QR in your terminal.
 
 ### Step 2: Environment
 
@@ -149,27 +181,59 @@ Set your Anthropic API key (required for browser automation):
 export CUA_API_KEY="sk-ant-..."
 ```
 
-Optional: `GEMINI_API_KEY` for nano-banana thumbnail generation in Phase 4.
+**`ANTHROPIC_API_KEY` is accepted as a fallback** — `resolve_api_key()` (research.py:181) checks `CUA_API_KEY` first, then `ANTHROPIC_API_KEY`, on both env and Windows User scope. Most Anthropic devs already have `ANTHROPIC_API_KEY` set globally, so it just works without setting a duplicate.
 
-### Step 3: Run Setup
+`GEMINI_API_KEY` is **optional** — required only for Phase 4 nano-banana thumbnail generation. If unset, Phase 4 still uploads the audio video; the thumbnail step skips with a warning. (Same canonical wording in the env-var table below.)
+
+**Phase 5 email (Resend) — OPTIONAL.** Phase 5 always generates the Google Doc; Resend only handles the optional email-delivery step. Without `RESEND_API_KEY`, Phase 5 surfaces a skippable email-send alert (`[Skip]` writes `skip_phase phase=5`) and the pipeline finishes successfully — you just don't get the email; the Doc URL is in the FE phase dropdown.
+
+If you DO want email delivery from your own backend instance, sign up at [resend.com](https://resend.com), add and verify **your own domain** (5-30 min for DNS propagation), then set:
+
+```bash
+# Windows (PowerShell)
+[System.Environment]::SetEnvironmentVariable("RESEND_API_KEY", "re_...", "User")
+[System.Environment]::SetEnvironmentVariable("NOTIFY_FROM_EMAIL", "Super Research <noreply@your-domain.com>", "User")
+
+# macOS/Linux
+export RESEND_API_KEY="re_..."
+export NOTIFY_FROM_EMAIL="Super Research <noreply@your-domain.com>"
+```
+
+> **Self-hosters: do NOT reuse a shared deployment's Resend key.** The hosted Super Research deployment runs its own Resend domain for that deployment's email sends. If you're running your own backend, get your own Resend account and verify your own domain. Free tier (3K emails/month, 1 verified domain) covers typical single-user use.
+
+`BUG_REPORT_EMAIL` is also optional — see the env-var table.
+
+### Step 3: Run pair flow
 
 ```bash
 python research.py --pair
 ```
 
-The flow has three gated stages — each waits for the previous to confirm before advancing:
+The flow has **four** gated stages — each waits for the previous to confirm before advancing:
 
-**`[1/3] Research token`**
-Mints a new ResearchToken (UUID) or reuses the one in `research_config.json`. The token registers in Firestore (`research_tokens/{token}`) with `status: active`, `machineName`, `createdAt`, `lastHeartbeat`. The token is printed and an ASCII QR renders immediately below it. Delete `research_config.json` if you want to mint a fresh one.
+**`[1/4] Research token`**
+Mints a new ResearchToken (UUID) or reuses the one in `research_config.json`. The token registers in Firestore (`research_tokens/{token}`) with `status: active`, `machineName`, `createdAt`, `lastHeartbeat`. The token is printed and an ASCII QR renders immediately below it. Delete `research_config.json` if you want to mint a fresh one. **Stage 2 is gated on the token being linked from the web app.**
 
-**`[2/3] Link token to your app account` — this gate blocks step 3**
-Setup waits (polling Firestore every 3s) until your app actually links the token to an authenticated user. Two equally-good ways:
+**`[2/4] Link token to your app account` — this gate blocks the rest**
+The flow waits (polling Firestore every 3s) until your app actually links the token to an authenticated user. Two equally-good ways:
 - **Scan** — in the Super Research app: chat → *Connect* bubble → *Scan QR* button, OR Account → Pipeline Connection → small QR icon beside the paste field. Point the phone camera at the terminal QR.
 - **Paste** — copy the token line printed above the QR and paste it into Account → Pipeline Connection → *Paste your ResearchToken* → *Link*.
 
-Once the app writes the token to your `users/{uid}/settings.researchToken` field, setup resolves your email via Firebase Auth and prints `[ok] Linked — you@example.com`. Only then does step 3 begin. Default timeout is 10 minutes.
+> **Don't have a web app account yet?** The Super Research app lives at the deployment URL the dev shares with you (Google sign-in only). If you weren't invited yet, ping the dev. The app is required for stages 2 and 3 — `--pair` will sit on its polling loop until you link.
 
-**`[3/3] Platform logins`**
+Once the app writes the token to your `users/{uid}/settings.researchToken` field, the flow resolves your email via Firebase Auth and prints `[ok] Linked — you@example.com`. Default link timeout is 10 minutes.
+
+**`[3/4] On Startup` — supervised auto-restart prompt (Windows-only today)**
+After the link lands, `--pair` prompts:
+
+```
+Enable On Startup? [Y/n]:
+```
+
+- **`Y` (default)** — calls `--resurrect` inline, registers the Windows Scheduled Task, and the backend self-restarts on every reboot / crash. Equivalent to running `python research.py --resurrect` after `--pair` finishes. Windows-only; on macOS/Linux this prompt skips with a "supported on Windows today" notice.
+- **`n`** — skip; you'll run `python research.py --serve` manually after `--pair` finishes (and, on Linux/Mac, set up your own backgrounding via `nohup` / `tmux` / `screen` / your own systemd unit — see [§ Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending)).
+
+**`[4/4] Platform logins`**
 Opens 7 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds:
 - ChatGPT (chatgpt.com)
 - Gemini (gemini.google.com)
@@ -183,23 +247,23 @@ The checklist re-renders only when a platform flips — `[ok]` for logged in, `[
 
 > **Markers only tick after real auth.** `verify_login()` checks only auth-specific DOM (profile menus, account chips, chat-history lists). Generic chat-input elements are excluded because they show up on logged-out landing pages too.
 
-### Step 4: After setup succeeds
+### Step 4: After pair succeeds
 
-When all 7 are `[ok]`, setup:
+When all 7 are `[ok]`, the flow:
 
 1. Closes the browser
 2. Writes `research_config.json` locally (if not already present)
 3. Keeps the token registered in Firestore
-4. **Exits the Python process — setup does not stay running.**
+4. **Exits the Python process — pair does not stay running.**
 
 You'll see a final banner explaining this:
 ```
-SETUP COMPLETE — all 7 platforms verified.
+PAIR COMPLETE — all 7 platforms verified.
 
 What happens now:
   · Browser has been closed.
   · ResearchToken is saved locally AND registered with Firebase.
-  · This process will exit; setup does not stay running.
+  · This process will exit; pair does not stay running.
 
 Next step — start the server:
     python research.py --serve
@@ -220,7 +284,7 @@ The server runs on port 8000 with:
 
 Keep `--serve` running while you use the app. If the server stops, the web app's 60s watchdog detects it, marks running tiles as stopped, and prevents a reload from resurrecting the pipeline.
 
-**Queue persistence across restarts** — on `--serve` startup, the backend re-enqueues any `status:"queued"` researches from Firestore, so the queue survives a `--daemon-loop` respawn. Anything that was `status:"ongoing"` when the previous process died is flipped to `stopped` with a "Backend restarted mid-run" message, instead of appearing live-but-frozen.
+**Queue persistence across restarts** — on `--serve` startup, the backend re-enqueues any `status:"queued"` researches from Firestore, so the queue survives a `--daemon-loop` respawn. Anything that was `status:"ongoing"` when the previous process died is flipped to `paused_backend_restart` (with a "Resume from checkpoint?" warn alert in the FE), instead of appearing live-but-frozen. If the persist itself fails (Firestore unavailable on respawn), affected researches surface a `paused_backend_restart_failed` red error with the actual error string.
 
 ### Step 5a (optional, recommended): Enable On Startup (supervised auto-restart)
 
@@ -231,6 +295,48 @@ python research.py --resurrect
 Registers a Windows Scheduled Task that runs a **daemon-loop wrapper** — a tiny supervisor process that (re-)starts `--serve` whenever it exits for any reason: crash, stop button, logout, reboot, etc. The task is set to ONLOGON + AT STARTUP with unlimited duration, so the backend is effectively always-on while the PC is powered.
 
 The Account page's **Indestructible** toggle reflects the real scheduled task state (`schtasks /Query`), so the toggle survives unlink+relink. Turn it off from the same page if you ever want to stop auto-restart.
+
+> **Cross-platform supervisors** — macOS launchd + Linux systemd-user equivalents are specced in `PersistenceRecipe.md` (Track C, blocked on Track A + Track B). Until shipped, `--resurrect` is a no-op outside Windows; use the manual stop-gaps below.
+
+### Linux/Mac backgrounding (while Track C is still pending)
+
+`--serve` is a normal foreground Python process. To keep it alive past your shell session:
+
+**Linux/macOS — `nohup` (lowest friction):**
+```bash
+nohup python research.py --serve > serve.log 2>&1 &
+disown
+```
+Use `pkill -f "research.py --serve"` to stop. Log accumulates at `serve.log`.
+
+**Linux/macOS — `tmux` / `screen`:**
+```bash
+tmux new -s superresearch
+python research.py --serve
+# Ctrl-b d to detach. Reattach with: tmux attach -t superresearch
+```
+
+**Linux — `systemd --user` (DIY for now; Track C will replace this):**
+```ini
+# ~/.config/systemd/user/superresearch.service
+[Unit]
+Description=Super Research backend
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/super-research-backend
+ExecStart=/usr/bin/python3 %h/super-research-backend/research.py --serve
+Restart=always
+RestartSec=10
+Environment=CUA_API_KEY=sk-ant-...
+
+[Install]
+WantedBy=default.target
+```
+Then: `loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now superresearch.service`. (Yes, this is what Track C will install for you automatically.)
+
+**macOS — launchd user agent (DIY):** see `PersistenceRecipe.md` § Part 2 for a working plist template.
 
 ### Step 5b (disable On Startup): `--retire`
 
@@ -290,28 +396,31 @@ Multiple people can also share one backend. Share your ResearchToken — they pa
 
 Times based on real run analytics. Total: ~1h 50m for a full pipeline.
 
-## Phase + per-agent narration (backend Gemini Flash, two layers)
+## Phase + per-agent narration (consolidated 2026-04-30)
 
-Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. Apr 19 + Apr 26 ship a two-layer narration system so there's always a visible human-language pulse:
+Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. The narration system was consolidated 2026-04-30 from four overlapping writers down to a single per-agent narrator with a backend-fallback tail. Result: cheaper, less duplication, less parroting.
 
-- **Phase narrator (Gemini 2.5 Pro inside `research.py`)** — every active phase has a narrator worker that reads a bounded ring buffer of recent events (~40) and emits a `phase_narration` event about every 45s. Narrator warms on `phase_start`, stays quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Cost envelope: ~200 input / 30 output tokens per narration → <$0.02 per full pipeline run.
-- **Per-agent narrator (Gemini 2.5 Pro inside `gemini_narrate.py`)** — separate module, separate cadence. Each Phase 1/2 agent has a narrator that reads the right-side activity panel directly via Gemini 2.5 Pro vision (screenshot-and-OCR). DOM-walker output is the primary; vision narrator fires when the walker yields nothing AND the panel is non-empty (typical case: ChatGPT Pro "Extended Thinking active" gap), or every 4th poll for a richer rolling sentence. New `agent_progress` fields: `scrapeSource: "dom" | "vision"` records which tier produced the data; `visionNarration` carries the human-readable sentence rendered verbatim in the agent dropdown. Hard caps: 30 calls per phase, 90s minimum gap per agent.
-- **Backend-down detection** — the LivenessEye title swap in the phase header signals quiet-but-alive vs. potentially-dead. Past the per-phase T2 silence threshold the watchdog surfaces a Dismiss-only warn dropdown alert + OS notification; the pipeline keeps running while the autonomous tier framework (BE TierEscalation, Apr 28) recovers. T3 silence raises an informational dropdown alert without auto-stopping the run.
+- **Per-agent narrator (the only writer now)** — every Phase 1/2 agent has a narrator worker that reads a bounded ring buffer of recent events (~50) and emits a `phase_narration` / `agent_narration` event about every 6s per active agent. Brain: **Anthropic Haiku 4.5** primary (`claude-haiku-4-5`); **Gemini 2.5 Flash** fallback on any 4xx/5xx/timeout/empty response so workspace-usage-limit windows don't blank the narrator for 24+ hours. Pre-04-30 used Gemini Pro 2.5; Pro echoed input verbatim at temp 0.2 — Haiku follows the no-parrot prompt rules more tightly. Cost envelope: ~200 input / 30 output tokens per call → <$0.02 per full pipeline run on Haiku.
+- **Anti-parroting prompt + chrome scrub.** The narrator system prompt (research.py:5904-5933) has explicit anti-pattern rules: don't echo input verbatim, don't start with "currently" or "Status:", skip chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md`). Above the narrator, `_compact_event_for_narration` (research.py:5550-5625) scrubs those same chrome strings out of the input window BEFORE the narrator sees them — scrape outputs (chip / step counts) are untouched.
+- **DOM scrape rules per platform:** Claude scrape (research.py:7116-7124) is panel-scoped to `aside` / `[class*="artifact"]` / `[class*="research"]` — dropped `.font-claude-message` and `.contents` heading selectors that grabbed conversation-chrome. ChatGPT P2 panel walker (research.py:7979-7984) dropped the loose `[class*="row" i]` selector and added a 23-verb `VERB_GATE` regex with min-length raised 4→12 to drop "OK" / "Done" single-word noise.
+- **Vision narrator (`gemini_narrate.py`) RETIRED.** `PHASE_BUDGET=0` by default — the per-agent narrator covers the same slot via DOM events without burning a separate Gemini call. Set `DG_VISION_NARRATE=1` to re-enable it as a coverage escape hatch.
+- **BE phase-fallback tail.** When the narrator is silent (Haiku + Flash both failing, or 6s startup gap), research.py:9601-9604 emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. The FE renders this as a final tail under the agent narration (PhaseDropdown.tsx:1880-1885). No more dead silence on a working agent.
 
-## Phase 0 verification (sequential, Apr 19)
+> **Narration brain envs:** `DG_NARRATOR_USE_HAIKU` (default `1`; set `0` to skip Haiku and go straight to Flash), `DG_NARRATOR_HAIKU_MODEL` (default `claude-haiku-4-5`), `DG_VISION_NARRATE` (default `0`; set `1` to re-enable the retired vision narrator). All optional.
 
-Preflight now walks platforms one at a time instead of opening 7 tabs at once. For each enabled platform:
+## Phase 0 verification (sequential, Apr 19; 2026-04-24 simplified)
 
-1. `cookie_login_hit()` reads the persistent profile's cookie store for that platform's primary session token. Hit → emit `agent_progress status=ok` and move on. No tab, no network, no CUA.
-2. Cookie miss → open that one tab, wait 4s for SPA hydration, check URL for known login hosts.
-3. Still ambiguous → CUA vision verification.
-4. Still not logged in → emit `login_required` **scoped to that single platform** and pause for user retry. The next platform does NOT open until the current one is resolved (Cloudflare stealth + less user overwhelm).
+Preflight walks platforms one at a time instead of opening 7 tabs at once. For each enabled platform:
 
-Matches the `--pair` script's one-at-a-time walk that's been working well for months. Global "Skip verification" still bypasses the whole sequence. Per-phase login checks at every subsequent phase are cookie-only (no tabs, no CUA) — they catch mid-run session drift without re-opening anything.
+1. **Tab open** — opens that one tab, waits 4s for SPA hydration, checks URL for known login hosts.
+2. **CUA vision verification** if URL check is ambiguous.
+3. **`login_required`** scoped to that ONE platform if still not logged in. Pause for user retry. The next platform does NOT open until the current one is resolved (Cloudflare stealth + less user overwhelm).
+
+Cookie-only fast-path was removed 2026-04-24 — cookies lie when sessions are server-side invalidated. Phase 0 is now the only login gate; per-phase cookie probes were also removed. Mid-run session drift is caught by the active-platform CUA loop's session-expiry detector (2× consecutive confirms 2 min apart).
 
 ## Phase 2 — per-agent extraction rules (Apr 19 late-late)
 
-Phase 2 now enforces different link-extraction rules per platform. The right rule for each platform comes from how each service exposes authenticated conversations:
+Phase 2 enforces different link-extraction rules per platform. The right rule for each platform comes from how each service exposes authenticated conversations:
 
 - **ChatGPT** — unchanged from Phase 1 brief behavior: public-share link extraction first, falls back to the conversation URL if the share flow fails. A conversation URL is acceptable because it's publicly readable to anyone with the link (shareable without explicit action).
 - **Gemini + Claude** — **PUBLIC share links ONLY**, hard-fail on miss. No conversation-URL fallback — those URLs are private to the authenticated session and would fail silent-ticks downstream. If the share flow fails after 3× retries, the agent surfaces a Retry / Skip gate (matching the B1 link-first completion gate).
@@ -320,20 +429,20 @@ Every extraction method logs explicitly: `[gemini_extractor] method=X result=Y` 
 
 **Claude 2-artifact wait hard-fail.** If Claude has reached ≥80% of its allotted wait time AND has <2 artifacts in the side panel, the pipeline hard-fails that agent with Retry / Skip — no silent half-answer. First artifact is almost always a research plan, not the final report; accepting a single-artifact Claude as done produces a broken downstream.
 
-**Tab round-robin — `target_page` anchoring.** `agent_loop` now accepts a `target_page=None` parameter. Before every polling tick it calls `bring_to_front()` on that agent's tab so CUA always sees a live browser viewport, not a stale background capture from whichever tab happened to be front when three agents were racing. `_anchored_screenshot()` helper handles the pattern; re-anchors after every `execute_action` too. Prevents cross-agent tab interference — e.g. Gemini's vision call returning Claude's screenshot because Claude's tab happened to be front-of-stack when the capture fired.
+**Tab round-robin — `target_page` anchoring.** `agent_loop` accepts a `target_page=None` parameter. Before every polling tick it calls `bring_to_front()` on that agent's tab so CUA always sees a live browser viewport, not a stale background capture from whichever tab happened to be front when three agents were racing. `_anchored_screenshot()` helper handles the pattern; re-anchors after every `execute_action` too. Prevents cross-agent tab interference — e.g. Gemini's vision call returning Claude's screenshot because Claude's tab happened to be front-of-stack when the capture fired.
 
 **Claude setup via Playwright (not CUA).** `setup_claude_dr` was rewritten as 3 Playwright steps — select Opus 4.7 from the model dropdown, toggle Adaptive Thinking, enable the Research tool — all DOM selectors + `.click()` calls. Eliminates ~30-90s of CUA vision overhead per setup and removes a class of "CUA clicked the wrong thing" setup failures. CUA is still used mid-run for anything that isn't deterministic DOM.
 
 ## Per-phase alert narration
 
-Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, share-link misses, login-expired, ffmpeg failures, email auth problems, and more — emits into the correct phase's `PhaseAlertPanel` inside the app's phase dropdown. No chat-bubble spam. Per-phase coverage:
+Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, share-link misses, login-expired, ffmpeg failures, email auth problems, browser crashes, and more — emits into the correct phase's `PhaseAlertPanel` inside the app's phase dropdown. No chat-bubble spam. Per-phase coverage:
 
 - **Phase 0** — browser launch/crash, Playwright profile lock, missing Chromium binary
-- **Phase 1** — brief timeout, brief paste retry per attempt, brief-short (offers `continue_anyway`), brief model error
-- **Phase 2** — 90-min timeout with live source count, send-button CUA fallback, paste outer-retry narration, full HV (human-verification) stage narration: detected → auto-clear 1/2 → 3 min cooldown → retry 2/2 → success/fail with Resume/Skip. HV cooldown is 180s (was 45s — providers need the time to release holds)
-- **Phase 3** — per-agent share-link extraction failure, NotebookLM login-expired vs generic upload failure, "no MD files" gate, inter-phase gate (P2 produced no documents)
+- **Phase 1** — brief timeout, brief paste retry per attempt, brief-short (offers `continue_anyway`), brief model error, manual-brief 3h backstop (auto-fail with `pipeline_stopped` reason `manual_brief_wait_backstop_3h`)
+- **Phase 2** — agent timeout (auto-skip with partial save if ≥200 chars; no human prompt needed since 2026-04-30 `be8f7b3`), send-button CUA fallback, paste outer-retry narration, full HV (human-verification) stage narration: detected → auto-clear 1/2 → 3 min cooldown → retry 2/2 → success/fail with Resume/Skip. HV cooldown is 180s (was 45s — providers need the time to release holds). Browser crashes auto-retry with a passive recovery banner; no Retry/Skip prompt.
+- **Phase 3** — per-agent share-link extraction failure, NotebookLM login-expired vs generic upload failure, "no MD files" gate, inter-phase gate (P2 produced no documents). Derived stems (`brief.md`, `consolidated.md`) are excluded from NotebookLM uploads via `_DERIVED_STEMS` filter (research.py:14627) — never uploads consolidated.md.
 - **Phase 4** — audio skip via command, poll-budget timeout, download-event timeout + fallback + final fail, Firebase Storage upload as best-effort (warning, not fatal)
-- **Phase 5** — ffmpeg disk-full / not-found / generic, YouTube URL extract fail, Google Doc creation fail, email bad-address / Resend HTTP error, email skip via command
+- **Phase 5** — ffmpeg disk-full / not-found / generic, YouTube URL extract fail, Google Doc creation fail, email bad-address / Resend HTTP error / `RESEND_API_KEY` unset / unverified `NOTIFY_FROM_EMAIL` domain, email skip via command
 - **Cross-cutting** — Anthropic 429/529 narrate as retrying; other API errors surface as `pipeline_warning` on the current phase
 
 Default action on every alert is `[Retry] [Skip]`. Skip writes the unified `skip_phase phase=N` command, replacing the old `skip_phase` / `skip_phase` verbs (removed in U2). Phase-specific alerts may add `HV Resume` or `continue_anyway`. **Stop is NOT a per-phase action** — pause/stop/resume stay global in the app's chat input bar.
@@ -344,11 +453,20 @@ The per-alert action set was consolidated to reduce noise and remove affordances
 
 - **Default everywhere: Retry · Skip.** Every failure surface offers this pair unless it's specifically overridden below.
 - **Workspace cap hit in Phase 2 → `End research` only** (`action=stop`). No point retrying when the user is out of workspace slots; other phases keep Retry · Skip.
-- **Poll timeout in Phase 2 → Retry · Skip · Wait** (Wait extends the agent's budget by 15 min). Only phase that gets a third option because "wait a little longer" is a frequently-correct user choice for Phase 2.
-- **Removed the "Poke" button and "Proceed without CUA" options entirely.** Poke morphed into the normalized Retry (which in turn does the hard tab close+reopen from the Apr 19 early `retry_agent` work). "Proceed without CUA" let users walk into broken-state pipelines with no recovery path.
+- **Poll timeout in Phase 2 → auto-skip** (since 2026-04-30 `be8f7b3`). Removed the `Retry · Skip · Wait` alert; the BE saves whatever ≥200 chars it has and continues. Eliminates an indefinite human-decision wait.
+- **Removed the "Proceed without CUA" option** (let users walk into broken-state pipelines with no recovery path). Poke morphed into the normalized Retry (which in turn does the hard tab close+reopen from the Apr 19 early `retry_agent` work).
 - **Stuck-agent buttons relabeled** to match the normalized vocabulary: Poke → **Retry**, "Wait longer" → **Wait**, "Skip agent" → **Skip**.
 
-The backend's per-agent narrator runs alongside the phase narrator during P1/P2 — separate Gemini 2.5 Pro calls emit `agent_narration` events (one per active agent, ~6s cadence) that the frontend shows inside each agent row of the Phase 2 accordion. Cost bounded: ~200 in / 30 out per call × 3 agents × a few hundred seconds per run.
+## Stuck-state risk fixes (2026-04-30 `6545335` + `be8f7b3` + `549f079`)
+
+Three classes of "pipeline silently wedged forever" caught and capped:
+
+- **Manual brief 3h backstop** — `_BRIEF_WAIT_BACKSTOP_S = 3 * 3600`. If the user enabled "Provide my own brief" but never sends one within 3h of the chat-input prompt, `fail_phase` fires + emits `pipeline_stopped` with reason `manual_brief_wait_backstop_3h`. No more pipelines wedged on a vacant chat input.
+- **Pending queue persist-failure surface** — `_persist_pending_queue` returns bool; if a Firestore write fails during BE shutdown handover, affected researches get `status=paused_backend_restart_failed` + `lastError` field with the actual exception string. FE renders this as a red error banner, not the green "queued" pill.
+- **Dead-tab guard before soft retry** — research.py:10380. After 2 hard failures, the loop checks if the agent's tab is dead (closed / crashed); if dead, `fail_agent` fires + remove from pending. Prevents soft-retrying a corpse forever.
+- **Browser crash auto-retry** — when 3 sites crash in the same window, `emit_browser_recovery_status` sends a passive banner to FE and bypasses the run_pipeline.finally retry guard. FE auto-clears the banner on resume (`auto_clear_on_resume=true` flag on AgentAlert).
+- **P2 timeout auto-skip** — drops the `await_agent_decision` block; if the agent has ≥200 chars of partial output, it's saved and the agent flips to skipped without human prompt.
+- **Auto-retry kwarg forwarding** — `uid/research_id/run_id` are forwarded on retry recursion (research.py:18006) so the Firestore listener stays attached on auto-retry.
 
 ## CLI Mode
 
@@ -365,15 +483,23 @@ python research.py --resume queue_name                 # Resume stopped run
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CUA_API_KEY` | (required) | Anthropic API key for browser automation |
-| `RESEARCH_TOKEN` | (from setup) | Override ResearchToken (for Docker/CI) |
+| `CUA_API_KEY` | (required) | Anthropic API key for browser automation. `ANTHROPIC_API_KEY` is also accepted as a fallback (research.py:181). |
+| `ANTHROPIC_API_KEY` | (fallback for `CUA_API_KEY`) | Standard Anthropic env var; auto-detected if `CUA_API_KEY` isn't set. Also drives the narrator's Haiku 4.5 primary brain. |
+| `RESEARCH_TOKEN` | (from pair) | Override ResearchToken (for Docker/CI) |
 | `CUA_MODEL` | `claude-opus-4-7` | Claude model for CUA |
 | `CUA_SCREEN_WIDTH` | `1280` | Browser viewport width |
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |
-| `GEMINI_API_KEY` | (required for Phase 4) | Gemini API for nano-banana thumbnail generation |
+| `GEMINI_API_KEY` | (optional; required only for Phase 4 nano-banana thumbnail generation) | Gemini API key. Phase 4 still uploads audio video without it; only the thumbnail step skips. Also used as the narrator's Flash fallback when Haiku is unavailable. |
 | `MAX_WAIT_DEEP` | `90` | Max minutes to wait per Phase 2 agent |
 | `POLL_DEEP_RESEARCH` | `30` | Seconds between polling cycles |
 | `MIN_AGENT_WAIT_MIN` | `20` | Min minutes before CUA completion checks |
+| `RESEND_API_KEY` | (optional; only needed if you want Phase 5 email delivery) | Your **own** Resend API key. Without it, Phase 5 still creates the Google Doc; the email-send step shows a skippable alert. Self-hosters: sign up at resend.com and verify your own domain — don't reuse a shared deployment's key. |
+| `NOTIFY_FROM_EMAIL` | `Super Research <onboarding@resend.dev>` | From: header for Phase 5 emails. Override with your **own** verified Resend domain (e.g. `Super Research <noreply@your-domain.com>`). |
+| `BUG_REPORT_EMAIL` | (optional) | Where bug-report submissions land if FE bug-report uses the BE relay. FE has its own `BUG_REPORT_EMAIL` env on `/api/bug` — see FE README. |
+| `DG_NARRATOR_USE_HAIKU` | `1` | Enable Anthropic Haiku 4.5 as the narrator primary (Gemini Flash as fallback). Set `0` to use Flash directly. |
+| `DG_NARRATOR_HAIKU_MODEL` | `claude-haiku-4-5` | Haiku model id for the narrator. |
+| `DG_VISION_NARRATE` | `0` | Re-enable the retired vision narrator (`gemini_narrate.py`, `PHASE_BUDGET=80/phase`). Set `1` if a coverage gap appears in DOM-derived narration. |
+| `DG_ORPHAN_MAX_AGE_HOURS` | `4` | Cutoff age for `--retire`'s "manual one-off `--serve` runs" preservation. |
 
 ## File Structure
 
@@ -382,9 +508,9 @@ research-automate/
 ├── research.py                 # Pipeline + FastAPI server
 ├── prompts.py                  # CUA prompts for each phase
 ├── vision.py                   # Anthropic Sonnet vision client (tier-2 acting): take_screenshot, vision_action, with_vision_fallback, shadow_observe_then_cua
-├── gemini_narrate.py           # Gemini Flash agent-side-panel narrator (tier-2 observing): narrate_panel reads the AI activity panel directly via screenshot
+├── gemini_narrate.py           # Vision-tier panel narrator (PHASE_BUDGET=0 by default; retired 2026-04-30 — re-enable via DG_VISION_NARRATE=1)
 ├── vision_test.py              # Fixture replay tool: --capture saves PNG+JSON, --fixtures replays + asserts action-class agreement + bbox containment
-├── requirements.txt            # Python dependencies
+├── requirements.txt            # Python dependencies (now includes patchright>=1.59)
 ├── firebase-service-account.json  # Firebase connection (not committed)
 ├── research_config.json        # Your ResearchToken (generated by --pair)
 ├── run_analytics.json          # Historical phase durations (auto-updated)
@@ -406,6 +532,10 @@ research-automate/
 
 **"No PipeToken found"** — Run `python research.py --pair` first.
 
+**`ModuleNotFoundError: No module named 'patchright'`** — Run `pip install -r requirements.txt` again (patchright was added 2026-04-30 as `patchright>=1.59`). Then `python -m patchright install chrome`.
+
+**`patchright` launches but Chrome doesn't open** — Patchright launches with `channel="chrome"` (real Chrome, not bundled Chromium). If real Chrome isn't installed on this machine, install it from google.com/chrome (Windows), `brew install --cask google-chrome` (macOS), or your distro's Chrome package (Linux).
+
 **Backend shows "Offline" in the web app** — Make sure `python research.py --serve` is running. The heartbeat updates every 30 seconds.
 
 **"Backend did not respond within 15s"** — The backend may be busy with another research. Check the queue: `GET http://localhost:8000/api/queue`.
@@ -416,9 +546,15 @@ research-automate/
 
 **Anthropic 429 / 529 (rate-limit or overload)** — Retries automatically with narration in the current phase dropdown; usually self-resolves within one or two attempts.
 
+**Anthropic API key invalid (401) — narrator goes silent** — The narrator falls through to Gemini 2.5 Flash on any Haiku error including 401. You'll see narration keep flowing (Flash-driven) but the BE log shows `[narrator] Haiku failed sc=401 — falling back to Gemini Flash` once. CUA itself ALSO needs a working Anthropic key — if the key is fully revoked, CUA tier-3 stops working and the pipeline relies on Playwright tier-1 / Vision tier-2 only. Check your Anthropic billing/keys page.
+
+**Anthropic workspace usage limit hit (CUA 400)** — Same fallback semantics as 401: narrator routes to Flash; CUA tier-3 is unavailable until the limit window resets (typically 24h). Pipeline keeps running on Playwright + Vision; specific platform actions that require CUA (e.g. some HV captcha clicks) may need manual help via the FE alerts.
+
 **Phase 4 audio failed but Phase 5 still matters** — Hit `[Skip]` on the Phase 4 alert (writes `skip_phase phase=4`); Phase 5 YouTube + Email proceed normally.
 
 **Phase 5 email not sending** — Alert surfaces with the specific cause (bad recipient / Resend HTTP error / `RESEND_API_KEY` unset / unverified `NOTIFY_FROM_EMAIL` domain). Hit `[Skip]` (writes `skip_phase phase=5`) to skip email but still get the Google Doc link. Verify your domain on resend.com → set `RESEND_API_KEY` + `NOTIFY_FROM_EMAIL` in BE env → restart `--serve`.
+
+**FE shows `paused_backend_restart_failed` red banner** — Backend tried to persist the in-flight queue on shutdown but the Firestore write failed. The `lastError` field on the research doc has the actual exception. Restart `--serve`; affected runs are kept on disk in `queues/` and can be resumed via the FE checkpoint banner once BE is back online.
 
 ---
 

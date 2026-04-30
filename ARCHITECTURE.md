@@ -42,7 +42,7 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 |-----------|-------|--------|------|
 | `phase_start` | 0-5 | `{agents?: string[], description: string}` | Phase begins |
 | `phase_restart` | 1-2 | `{phase, reason, chars, attempt?}` | Phase rerun after pause+input+resume (mid-phase or boundary) |
-| `agent_progress` | 1-2 | `{status, progress, sources, sourceUrls, sections, partialTextLen, model, thinking, steps, plan, toolUses, elapsedSec, expectedMinutes, scrapeOk, scrapeSource, visionNarration}` | During Phase 1/2 polling (~30s interval). New 2026-04-26: `scrapeSource: "dom" \| "vision"` records which tier produced the data; `visionNarration` carries the Gemini 2.5 Pro agent-narrator sentence rendered verbatim in the agent dropdown. |
+| `agent_progress` | 1-2 | `{status, progress, sources, sourceUrls, sections, partialTextLen, model, thinking, steps, plan, toolUses, elapsedSec, expectedMinutes, scrapeOk, scrapeSource, visionNarration}` | During Phase 1/2 polling (~30s interval). `scrapeSource: "dom" \| "vision"` records which tier produced the data; `visionNarration` is legacy and kept on the wire for FE compatibility but no longer populated by default (vision narrator retired 2026-04-30 — see Narration Architecture below). The narration line on the agent card is now driven by `agent_narration` events + a BE phase-fallback `progress` tail. |
 | `agent_skipped` | 2 | `{agent: string}` | Disabled agent in Phase 2 config |
 | `agent_verified` | 2 | `{agent: string, verified: bool}` | Agent confirmed running |
 | `link_extracting` | 1-5 | `{agent: string}` | Link extraction starting |
@@ -62,13 +62,139 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 | ~~`phase_alert_clear`~~ | — | — | **Frontend-only.** FE clears panels via `clearPhaseAlert(researchId, phase)` on `phase_complete` / `phase_skipped` / pong recovery / user action acknowledgement. Not a wire event. |
 | `heartbeat` | N | `{phase, ts}` | Emitted ~60s during long waits so frontend liveness watchdog stays green |
 | `login_required` | 0-5 | `{platforms: string[], platformLabels: string[], envErrors?: string[], attempt, message}` | **Phase 0 (Apr 19): sequential — fired with `platforms: [key]` scoped to the ONE platform currently being verified, one at a time until all pass. Phases 1-5: cookie-only probe at phase entry fires this with the missing platforms for that phase regardless of `skipInitVerify`.** |
-| `phase_narration` | 1-5 | `{text: string, timestamp: int}` | **Gemini 2.5 Pro narrator (Apr 19).** Emits one human-readable sentence describing what's happening in the active phase, every ~45s. Fed by a bounded ring buffer (~40 recent events). Warms on `phase_start`, quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Frontend stores in `phaseNarrations[researchId][phase]` and renders inside the phase dropdown. *(The U2 cleanup removed the older `/api/narrate` speculative-fallback hook; speculative entries no longer appear.)* |
-| `agent_narration` | 2 | `{agent: string, text: string, timestamp: int}` | **Per-agent Gemini 2.5 Pro narrator (Apr 19 late-late).** Emits one human-readable sentence per active Phase 2 agent every ~6s. Separate Flash API call per agent because per-agent context changes fast during P1/P2. Frontend stores in `agentNarrations[researchId][agentKey]`, rendered by `AgentAccordionRow` in preference over the legacy `richNarrative` string. Cleared on phase-2 complete. |
+| `phase_narration` | 1-5 | `{text: string, timestamp: int}` | **Per-phase narrator** — emits one human-readable sentence describing what's happening in the active phase, every ~45s. Fed by a bounded ring buffer (~50 recent events). Warms on `phase_start`, quiet during `pipeline_paused`, tears down on `phase_complete` / `pipeline_stopped`. Frontend stores in `phaseNarrations[researchId][phase]` and renders inside the phase dropdown. **Brain (2026-04-30):** Anthropic Haiku 4.5 primary → Gemini 2.5 Flash fallback. *(The U2 cleanup removed the older `/api/narrate` speculative-fallback hook; speculative entries no longer appear.)* |
+| `agent_narration` | 2 | `{agent: string, text: string, timestamp: int}` | **Per-agent narrator** — emits one human-readable sentence per active Phase 2 agent every ~6s. Separate API call per agent because per-agent context changes fast during P1/P2. Frontend stores in `agentNarrations[researchId][agentKey]`, rendered by `AgentAccordionRow` as the canonical narration source. Cleared on phase-2 complete. **Brain (2026-04-30):** Anthropic Haiku 4.5 primary → Gemini 2.5 Flash fallback. Narrator input is scrubbed of chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites) at `_compact_event_for_narration` (research.py:5550-5625) BEFORE the narrator sees it; scrape outputs (chip / step counts) untouched. |
 | `tier_transition` | 0-5 | `{op, agent?, hotspot_id?, from_tier, to_tier, reason, attempt}` | **Vision shadow-eval telemetry (Apr 26) + TierEscalation tracking (Apr 28).** Records every escalation between interaction tiers (e.g. DOM→CUA, Vision→CUA). The `attempt` field is the per-(op, agent) counter inside a 30-min sliding window — fed by `TierEscalation.record()` (research.py:2580+), centralized via `emit_tier_transition()`. Used by `scripts/vision_shadow_report.py` to compute per-hotspot agreement metrics. Persisted to events.jsonl AND to `logs/vision_shadow.jsonl` when `DG_VISION_TIER=shadow`. |
 | `wrong_artifact_rejected` | 2 | `{agent, op, tier, attempt}` | **Finalize-extraction guard (Apr 26).** Fired when `_is_sources_not_document` rejects a finalize-copy result (extracted content is the source-list panel, not the report). Tier ∈ {cua, dom_html_md, dom_js, dom_panel}. Drives the retry-cap-2 loop on hotspots #2c and #2d. |
 | `extract_failed` | 2 | `{agent, op, attempts, last_tier}` | **Final-failure terminal (Apr 26).** Fired when all retry attempts on hotspots #2c / #2d are exhausted. Pairs with a `pipeline_error` for FE phase-alert routing. |
 
 ---
+
+## Narration Architecture (consolidated 2026-04-30)
+
+**Pre-04-30 — four overlapping writers:**
+1. DOM scraper (Claude headings + ChatGPT row walker) — wrote into `progress["sections"]` / `progress["steps"]`, surfaced by FE as section chips + step strip
+2. Vision narrator (`gemini_narrate.py`, Gemini Flash, screenshot-of-panel) — emitted `visionNarration` field on `agent_progress`; FE rendered verbatim
+3. Per-agent narrator (Gemini Pro 2.5, event-stream-based) — emitted `agent_narration` events
+4. Phase fallback (research.py heuristics) — populated `progress["progress"]` with "Extended Thinking active · N min elapsed"
+
+Conflict: last-write-wins on FE; vision narrator + per-agent narrator overlapped; section chips piled up post-completion; Pro 2.5 echoed input verbatim at temp 0.2.
+
+**Post-04-30 — single writer + tail:**
+1. **Per-agent narrator (canonical)** — Anthropic Haiku 4.5 primary, Gemini 2.5 Flash fallback. Emits `agent_narration` events. Tighter anti-parrot prompt (research.py:5904-5933) + chrome scrub on input window (research.py:5550-5625).
+2. **BE phase-fallback tail** — when narrator silent, research.py:9601-9604 emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. FE renders as last-resort tail (PhaseDropdown.tsx:1880-1885).
+3. **DOM scrape feeds the input window** — `_compact_event_for_narration` flattens events to `key=value` strings, scrubbed of chat-thread chrome before narrator sees them. Sections and step counts still feed FE chips/strips, but the narrator no longer parrots them back.
+4. **Vision narrator retired** — `gemini_narrate.py` `PHASE_BUDGET=0` by default; set `DG_VISION_NARRATE=1` to re-enable.
+
+**Display chain on the agent card (FE, PhaseDropdown.tsx:1861-1891):**
+```
+agentNarrationText                     ← per-agent narrator (Haiku/Flash)
+  || detail.lastNarration              ← persisted last narration on F5/reopen
+  || _progressTail                     ← BE fallback (research.py:9601-9604)
+  || narrations[stage]                 ← P1 parent card phase narrations
+  || generatingFallback                ← "ChatGPT working — fetching live activity..."
+  || ""
+```
+
+**Display chain on the P1 parent card (FE, PhaseDropdown.tsx:889-890):**
+```
+agentNarrationText || fallbackNarratives[stage]
+```
+
+**DOM scrape rules (panel-scoping fixes, 2026-04-30 commit `94b7bde`):**
+
+| Platform | Selector before | Selector after | Why |
+|----------|------------------|----------------|-----|
+| Claude headings | `aside h*, [class*="artifact"] h*, [class*="research"] h*, .font-claude-message, .contents .prose` | dropped `.font-claude-message` + `.contents .prose` selectors; kept aside / artifact / research only | `.font-claude-message` grabbed conversation chrome, contaminating sections/steps |
+| Claude headings | (no chrome filter) | belt-suspender filter `!/^(?:you\|claude\|chatgpt\|gemini\|notebooklm\|gpt)\s+(?:said\|responded)\b/i` | defends future selectors |
+| ChatGPT P2 walker | `STEP_SELS` included `[class*="row" i]` | dropped `[class*="row" i]`; min-len 4→12; new `VERB_GATE` regex with 23 activity verbs | row was too loose; min-len drops "OK"/"Done"; VERB_GATE drops non-activity prose |
+
+## Brief 3h backstop + Manual brief auto-fail (2026-04-30 `6545335`)
+
+Manual-brief mode (Flow A in FE) waits indefinitely for the user to send their own brief into the chat. Pre-04-30, a never-finished brief left the pipeline wedged forever.
+
+- `_BRIEF_WAIT_BACKSTOP_S = 3 * 3600` (research.py:17174). After 3h with no manual brief, `fail_phase` fires + emits `pipeline_stopped` with `reason="manual_brief_wait_backstop_3h"`.
+- FE renders the stopped-by-watchdog status with the same humanized "Manual brief never arrived" message.
+
+## Browser Crash Auto-Retry (2026-04-30 `be8f7b3`)
+
+When 3 sites crash inside the same recovery window:
+
+```
+Browser crash detected (1st site) → log warn, keep going
+Browser crash detected (2nd site) → log warn, keep going
+Browser crash detected (3rd site) → triggers recovery:
+  1. emit_browser_recovery_status(phase, agent) → passive banner on FE
+  2. browser.stop() → browser.start() (T2 restart)
+  3. Bypass run_pipeline.finally retry guard (no Retry/Skip prompt)
+  4. FE shows AgentAlert with auto_clear_on_resume=true flag
+  5. On resume, FE auto-clears the banner
+```
+
+No human prompt; the previous behavior of pausing for Retry/Skip blocked recovery.
+
+## Phase 2 Agent Timeout — Auto-Skip (2026-04-30 `be8f7b3`)
+
+Pre-04-30: Phase 2 agent 90-min poll timeout surfaced an alert + `await_agent_decision` block waiting for Retry/Skip/Wait. If the user wasn't watching, the run wedged for 5 min then auto-defaulted to Skip — but the wait itself was wasted.
+
+Post-04-30: drop the alert + `await_agent_decision`. Auto-flow:
+
+```
+if elapsedSec >= MAX_WAIT_DEEP * 60:
+    if partial_extracted_chars >= 200:
+        save_partial(agent)        # records as done_partial
+        agent_state = "skipped"
+    else:
+        agent_state = "skipped"    # no partial salvaged
+    fail_agent(agent, reason="poll_timeout_auto_skip")
+    continue                       # other agents keep polling
+```
+
+No human-decision wait. FE narration line surfaces the auto-skip via the existing `pipeline_warning` infra.
+
+## Dead-Tab Guard (2026-04-30 `6545335`)
+
+Before soft-retrying a Phase 2 agent (research.py:10380):
+
+```
+if hard_failure_count >= 2:
+    if tab_is_dead(agent.page):    # check page.is_closed() + crash signals
+        fail_agent(agent, reason="dead_tab")
+        remove_from_pending(agent)
+    else:
+        soft_retry(agent)
+```
+
+Prevents soft-retrying a corpse forever — soft-retry on a dead page just re-fails immediately.
+
+## NotebookLM Upload Filter (2026-04-30 `70e2ab2`)
+
+`_DERIVED_STEMS = {"brief", "consolidated"}` (research.py:14627). Phase 3 NotebookLM upload now skips files whose stem matches `_DERIVED_STEMS` — never uploads `consolidated.md` (a P2 byproduct of claude+gemini concatenation, used for the Documents page only) or `brief.md` (Phase 1 input, already implicit in the agent reports). Pre-fix, the scan-fallback loop picked these up as duplicate sources.
+
+## Auto-Retry Kwarg Forwarding (2026-04-30 `549f079`)
+
+When the pipeline auto-retries (e.g. Phase 1 brief-short retry):
+
+```python
+return await run_pipeline(
+    topic=topic, ...,
+    uid=uid,                  # NEW — forward
+    research_id=research_id,  # NEW — forward
+    run_id=run_id,            # NEW — forward
+    _retry_count=_retry_count + 1,
+)
+```
+
+(research.py:18006). Pre-fix, the recursive call dropped `uid/research_id/run_id`, severing the Firestore listener mid-retry. FE saw the run flatline despite BE still running.
+
+## Resend Integration (Phase 5 email)
+
+Phase 5 sends the final delivery email via Resend's HTTP API:
+
+- `RESEND_API_KEY` (env, required) — Resend API key.
+- `NOTIFY_FROM_EMAIL` (env, default `Super Research <onboarding@resend.dev>`) — From: header. Override with verified domain.
+- Without `RESEND_API_KEY` set, research.py:15966-15968 logs `[Phase5] RESEND_API_KEY not set — email send skipped` and surfaces a `fail_phase` alert; the Google Doc still gets created so the user has the link via the FE.
+- Without a verified domain, Resend returns 403; surfaced as `fail_phase` with the Resend error string.
 
 ## Config
 
@@ -258,6 +384,7 @@ When the `--daemon-loop` supervisor respawns `--serve` after a crash, queue rehy
 |-----------------|--------|
 | `queued` | Re-enqueued into `_job_queue` with original topic + pipelineConfig |
 | `ongoing` | Marked `status:"paused_backend_restart"` with summary "Backend restarted mid-run — hit Resume to pick up from the last checkpoint." |
+| Persist failure (Firestore write fails on shutdown handover) | Marked `status:"paused_backend_restart_failed"` + `lastError` field with the actual exception. FE renders red error banner instead of green checkpoint banner. (2026-04-30 `6545335`.) |
 
 Frontend renders the new status as a phaseAlert at the last-known phase:
 - `[Resume from checkpoint]` → calls `POST /api/pipeline?action=resume&id={backendRunId}` → backend enqueues job with `resume_dir=queue`; `run_pipeline` uses `detect_resume_phase()` to skip to the right phase.
@@ -327,3 +454,5 @@ Emits a chat notification: *"Backend disconnected during Phase N (no heartbeat f
 *Updated: 2026-04-19 — **Sequential Phase 0 verification** (one platform at a time — cookie → tab-open → CUA → `login_required` scoped to that platform; matches `--setup` script's walk). **Cookie-only per-phase login probe** (runs on every phase regardless of `skipInitVerify`; `cookie_login_hit` read only, no tabs/CUA; catches mid-run session drift). **`phase_narration` event** (Gemini 2.5 Pro narrator emits one human-readable sentence every ~45s during active phases; frontend `/api/narrate` fallback fills >15s gaps with speculative "Likely: …" entries). Frontend stack: `phaseNarrations` store slice + `<PhaseNarrationLine>` + `useNarrationFallback` hook, budget-capped at 20 fallback calls per run.*
 
 *Updated: 2026-04-19 (late-late) — **Phase 2 per-agent extraction rules**: ChatGPT keeps public-share-then-conversation-URL fallback; Gemini + Claude PUBLIC share ONLY, hard-fail on miss. Explicit `[gemini_extractor] method=X result=Y` logs; `link_extracted` per agent the moment a verified link lands. **Claude 2-artifact hard-fail** at ≥80% wait time. **Tab round-robin**: `agent_loop(target_page=None)` + `_anchored_screenshot()`; `bring_to_front()` before every polling tick + after every `execute_action`. **Playwright Claude setup**: `setup_claude_dr` rewritten as 3 Playwright steps (Opus 4.7 dropdown, Adaptive Thinking, Research tool) — no more CUA vision for setup. **Normalized error matrix**: default Retry · Skip everywhere; Phase 2 workspace cap → End research only; Phase 2 poll timeout → Retry · Skip · Wait; removed Poke + "Proceed without CUA"; stuck-agent relabeled Retry/Wait/Skip. **New `agent_narration` event**: per-agent Gemini 2.5 Pro call, ~6s cadence during P1/P2. Backend commit `547bf17`.*
+
+*Updated: 2026-04-30 — **Narration consolidation** (commit `94b7bde`): retired vision narrator (`gemini_narrate.py` PHASE_BUDGET=0 default; `DG_VISION_NARRATE=1` re-enables). Per-agent narrator brain swap: Gemini Pro 2.5 → Anthropic Haiku 4.5 primary with Gemini 2.5 Flash fallback (`DG_NARRATOR_USE_HAIKU` / `DG_NARRATOR_HAIKU_MODEL` envs). Tighter anti-parrot prompt (research.py:5904-5933) + chrome scrub on narrator inputs (research.py:5550-5625) — strips `You said:` / `Claude responded:` / `Gemini said` / `brief.md` / `Building:`-prefix composites BEFORE narrator sees them; scrape outputs untouched. Claude DOM scrape: dropped `.font-claude-message` + `.contents` heading selectors (research.py:7116-7124). ChatGPT P2 walker: dropped `[class*="row" i]`; added 23-verb VERB_GATE + min-len 4→12 (research.py:7979-7984). **P1 ET fallback** (`86d0ab4`): dropped duplicate elapsed-time bit at research.py:9601-9604 — parent card already shows elapsed. **Stuck-state risk fixes** (`6545335`): manual brief 3h backstop (`_BRIEF_WAIT_BACKSTOP_S`); pending queue persist-failure surfaces `paused_backend_restart_failed` status; dead-tab guard before soft retry at research.py:10380. **Browser crash + P2 timeout** (`be8f7b3`): always-auto, no human prompt — browser crash emits passive `emit_browser_recovery_status` banner + bypasses run_pipeline.finally retry guard; P2 agent timeout drops alert + `await_agent_decision`, saves partial if ≥200 chars and auto-skips. **NotebookLM derived-stems filter** (`70e2ab2`): `_DERIVED_STEMS = {"brief", "consolidated"}` excluded — never uploads consolidated.md. **Auto-retry kwarg forwarding** (`549f079`): forward `uid/research_id/run_id` on retry recursion (research.py:18006) so Firestore listener stays attached. **Doc upload wiring** (`8a05227`): P1/P2 attach + Flow B unblock; `attach_brief_file` extended with `extra_files` for multi-file `set_input_files`. **P2 ChatGPT** (`bf66c9d`): continuous activity-panel scrape mirroring Claude artifact pattern. **patchright** added to `requirements.txt` (`221394d`).*
