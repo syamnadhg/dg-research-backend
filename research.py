@@ -589,20 +589,22 @@ def safe_name(topic, max_len=50):
 
 # ── Run-name reference ───────────────────────────────────────────────────────
 # `_tracks_dir` is a legacy name kept for the many call sites that read
-# `_tracks_dir.name` (the run identifier). We no longer create the
-# tracks/{run_name}/ folder tree on disk — Firestore is the single source
-# of truth for events + per-agent state. The Path object is set so .name
-# resolves; the actual directory is never written to.
+# `_tracks_dir.name` (the run identifier). The tracks/ folder tree was
+# fully removed in 2026-04-29 (events.jsonl writes + per-platform JSON
+# scrape snapshots both gone), so the Path is no longer constructed
+# under a tracks/ root — it just holds the run name so existing
+# `_tracks_dir.name` reads continue to resolve. Firestore + queues/ are
+# the only on-disk + transport surfaces now.
 
 _tracks_dir = None  # Set per-run in run_pipeline
 
 
 def init_tracks(run_name):
     """Set the per-run name reference for `_tracks_dir.name` lookups.
-    Does NOT create any directories — the tracks/ folder tree was removed
-    in 2026-04-29's Firestore-only migration."""
+    Does NOT create any directories. Previously rooted under tracks/;
+    that folder tree is gone, so the Path here is just a name holder."""
     global _tracks_dir
-    _tracks_dir = Path(__file__).parent / "tracks" / run_name
+    _tracks_dir = Path(run_name)
     return _tracks_dir
 
 
@@ -9934,7 +9936,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                      "elapsed_sec": int(time.time() - p["start_time"])}
                 _runtime.phase = 2
                 _runtime.sub_state = "2_parallel_polling"
-                stopped = await pause_and_close_browser(browser, _tracks_dir if _tracks_dir else None, phase=2)
+                # Pause/resume helpers expect the actual queue dir (where
+                # `checkpoint_pause.json` lives). Passing `_tracks_dir`
+                # here was a silent bug — the variable now just holds the
+                # run name, so the write would land at `<run_name>/`
+                # relative to cwd and almost always fail. Resolve to the
+                # real queue dir before calling.
+                _qd = (Path(__file__).parent / "queues" / _tracks_dir.name) if _tracks_dir else None
+                stopped = await pause_and_close_browser(browser, _qd, phase=2)
                 if stopped:
                     return results
                 # If user added input during the pause, bail out of the
@@ -9946,7 +9955,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     return results
                 # Relaunch browser + reopen agent tabs
                 await browser.start()
-                restored = await resume_browser_from_checkpoint(browser, _tracks_dir if _tracks_dir else None)
+                restored = await resume_browser_from_checkpoint(browser, _qd)
                 # Reconstruct pending from restored pages
                 for name in list(results.keys()):
                     if results[name]["status"] != "paused":
@@ -10220,16 +10229,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] Extraction after timeout failed: {e}", "WARN")
                     partial_text = ""
                 partial_len = len(partial_text or "")
-                # Live source count for concrete banner ("42 sources so far")
-                partial_sources = 0
-                try:
-                    tr_path = _tracks_dir / f"{agent_key_to}.json" if _tracks_dir else None
-                    if tr_path and tr_path.exists():
-                        tr = json.loads(tr_path.read_text(encoding="utf-8"))
-                        partial_sources = tr.get("sources", 0) or 0
-                except Exception:
-                    pass
-                _sources_note = f"{partial_sources} sources, " if partial_sources else ""
+                # Source count was previously read from
+                # `tracks/{run}/{agent}.json`, but `save_track` was removed
+                # in 2026-04-29 so that file never exists anymore. Drop
+                # the lookup and the "{N} sources, " banner prefix — the
+                # char count below is enough signal.
+                _sources_note = ""
                 fail_agent(agent_key_to,
                            f"{name} timed out after {max_wait_min} min — {_sources_note}{partial_len} chars extracted",
                            ("The agent exceeded its research budget. "
@@ -15945,7 +15950,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 log(f"Flow B handler failed (non-fatal): {_outer}", "WARN")
 
     log(f"Queue: {queue_dir}")
-    tracks_dir = init_tracks(queue_dir.name)  # Same name as queue — one research = one tracks folder
+    # init_tracks just sets the global `_tracks_dir` to a Path holding
+    # the run name (same name as the queue dir). The local var is unused;
+    # the side effect is what matters.
+    init_tracks(queue_dir.name)
 
     # ── Pipeline config: reload from config.json before each phase (supports mid-pipeline changes) ──
     def reload_config():
@@ -17637,14 +17645,14 @@ async def run_server(port=8000):
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
     queues_root = Path(__file__).parent / "queues"
-    tracks_root = Path(__file__).parent / "tracks"
 
     # ── Startup sweep: purge stale failed runs older than 7 days ──
-    # Without this, queues/ and tracks/ pile up forever with partial MDs,
-    # partial audio, and orphaned Firestore docs. We only sweep entries whose
-    # delivery.json status is NOT in a clean-parked set, and only if the dir
-    # hasn't been touched in > 7 days so active debugging sessions aren't
-    # wiped out.
+    # Without this, queues/ piles up forever with partial MDs, partial
+    # audio, and orphaned Firestore docs. We only sweep entries whose
+    # delivery.json status is NOT in a clean-parked set, and only if the
+    # dir hasn't been touched in > 7 days so active debugging sessions
+    # aren't wiped out. (tracks/ removed 2026-04-29 — was the only other
+    # local artifact; nothing to sweep there anymore.)
     try:
         now_ts = time.time()
         STALE_SECONDS = 7 * 86400
@@ -17688,13 +17696,9 @@ async def run_server(port=8000):
                             try: ref.delete()
                             except Exception: pass
                     except Exception: pass
-                # Nuke local dirs
+                # Nuke local queue dir.
                 import shutil as _shutil
                 try: _shutil.rmtree(d)
-                except Exception: pass
-                try:
-                    tdir = tracks_root / d.name
-                    if tdir.exists(): _shutil.rmtree(tdir)
                 except Exception: pass
                 swept += 1
         if swept:
@@ -17773,12 +17777,6 @@ async def run_server(port=8000):
                     except Exception as _e:
                         log(f"[orphan-sweep] rmtree {d.name} failed: {_e}", "WARN")
                         continue
-                    try:
-                        tdir = tracks_root / d.name
-                        if tdir.exists():
-                            _shutil.rmtree(tdir)
-                    except Exception as _e:
-                        log(f"[orphan-sweep] tracks rmtree {d.name} failed: {_e}", "WARN")
                     swept_n += 1
                 if swept_n:
                     log(f"[orphan-sweep] purged {swept_n} orphan(s) (Firestore research doc missing)", "INFO")
@@ -18252,14 +18250,13 @@ async def run_server(port=8000):
 
     @app.delete("/api/runs/{run_id}")
     async def delete_run(run_id: str):
-        """Delete a completed/stopped run's queue, tracks, and cascade-delete
-        the matching Firestore documents/audios/messages/pipeline_events/
-        commands subcollections. Without the cascade, partial docs from failed
-        runs would linger in Firestore forever."""
+        """Delete a completed/stopped run's queue dir + cascade-delete the
+        matching Firestore documents/audios/messages/pipeline_events/
+        commands subcollections. Without the cascade, partial docs from
+        failed runs would linger in Firestore forever."""
         import shutil
         queue = queues_root / run_id
-        tracks = tracks_root / run_id
-        if not queue.exists() and not tracks.exists():
+        if not queue.exists():
             return JSONResponse({"error": "not found"}, 404)
 
         # ── Cascade Firestore cleanup before nuking the owner file ──
@@ -18292,8 +18289,7 @@ async def run_server(port=8000):
                 log(f"[delete_run] owner.json parse failed: {_oe}", "WARN")
 
         try:
-            if queue.exists(): shutil.rmtree(queue)
-            if tracks.exists(): shutil.rmtree(tracks)
+            shutil.rmtree(queue)
         except Exception as e:
             return JSONResponse({"error": str(e)}, 500)
         return {"status": "deleted", "id": run_id}
@@ -18408,7 +18404,7 @@ async def run_server(port=8000):
                 return
         asyncio.create_task(_aegis_pulse_loop())
         # Periodic orphan sweep: existence-based cleanup of local queues/
-        # tracks/ dirs whose Firestore research doc has been deleted.
+        # dirs whose Firestore research doc has been deleted.
         asyncio.create_task(_orphan_sweep_loop())
         log(f"[orphan-sweep] started ({ORPHAN_SWEEP_INTERVAL_SEC}s interval)")
         # Refresh the paired device doc so the Account page sees this PC
@@ -18457,7 +18453,8 @@ async def run_server(port=8000):
                             # Mark as paused_backend_restart so the frontend can
                             # render a dedicated "Resume from checkpoint" CTA.
                             # Browser + CUA state is gone, but checkpoints on
-                            # disk (documents/, tracks/, delivery.json) let the
+                            # disk (documents/*.md + checkpoint.json +
+                            # delivery.json under queues/{run}/) let the
                             # orchestrator skip already-completed phases via
                             # detect_resume_phase() and pick up from there.
                             try:
@@ -19996,7 +19993,7 @@ def run_unpair():
 
     Preserved on disk (delete manually for a truly clean machine):
       • Chrome profile at ~/.super-research/browser-profile/ (your logins)
-      • Pipeline history in queues/ + tracks/
+      • Pipeline history in queues/
       • firebase-service-account.json (needed to re-pair)
 
     This is the destructive counterpart to the app's "unlink" action, which
@@ -20167,7 +20164,7 @@ def run_unpair():
     print()
     print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
     print(f"       {_c(_DIM, '• Chrome profile at ~/.super-research/browser-profile/  (your logins)')}")
-    print(f"       {_c(_DIM, '• Research history in queues/ and tracks/')}")
+    print(f"       {_c(_DIM, '• Research history in queues/')}")
     print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
     _render_next_actions([
         ("python research.py --pair", "reconnect this machine (mints a fresh token)"),

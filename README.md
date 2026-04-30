@@ -396,10 +396,10 @@ research-automate/
 ├── tests/fixtures/vision/      # V1 Vision fixtures (PNG + JSON pairs); auto/ subdir is gitignored
 ├── queues/                     # Active/completed pipeline runs (per-topic dirs)
 │   └── {topic}_{timestamp}/    # meta.json, config.json, delivery.json, documents/, podcasts/
-# tracks/ — DEPRECATED 2026-04-29. Per-run event log + per-agent scrape
-# files (events.jsonl, phase0/.../phase5/) no longer written. Firestore
+# tracks/ — REMOVED 2026-04-29. The directory tree is gone (its only
+# artifacts, events.jsonl + per-platform scrape JSONs, were already
+# unwritten when Firestore became the sole transport). Firestore
 # `users/{uid}/researches/{rid}/pipeline_events/` is the sole event store.
-# Stale on-disk tracks/ artifacts from older runs are safe to delete.
 ```
 
 ## Troubleshooting

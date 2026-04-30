@@ -263,7 +263,7 @@ Frontend renders the new status as a phaseAlert at the last-known phase:
 - `[Resume from checkpoint]` → calls `POST /api/pipeline?action=resume&id={backendRunId}` → backend enqueues job with `resume_dir=queue`; `run_pipeline` uses `detect_resume_phase()` to skip to the right phase.
 - `[Discard + start new]` → clears the alert locally; queue directory stays on disk as a backup.
 
-Checkpoints that survive the crash: `documents/*.md`, `tracks/*.json`, `delivery.json`, `links.json`, `podcasts/*.m4a`, `checkpoint.json`. Missing state (browser + CUA session) is re-created by the resume run.
+Checkpoints that survive the crash, all under `queues/{run}/`: `documents/*.md`, `delivery.json`, `links.json`, `podcasts/*.m4a`, `checkpoint.json`, `phase2_complete.marker`. Missing state (browser + CUA session) is re-created by the resume run. (The legacy `tracks/*.json` per-agent scrape snapshots were removed alongside the tracks/ directory tree on 2026-04-29 — `documents/*.md` is the single source for Phase 2 output now.)
 
 ---
 

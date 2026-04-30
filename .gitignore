@@ -25,12 +25,11 @@ daemon.err.log
 .playwright-profile/
 playwright-profile/
 
-# Pipeline output — not source. Keep the README in each dir so the
-# schemas for queues/*/ and tracks/*/ stay discoverable in the repo.
+# Pipeline output — not source. Keep the README so the queues/{run}/
+# schema stays discoverable in the repo. (tracks/ removed 2026-04-29 —
+# the directory tree is gone and so are the `tracks/*` ignore lines.)
 queues/*
 !queues/README.md
-tracks/*
-!tracks/README.md
 
 # Runtime debug logs from `python research.py --serve 2>&1 | tee logs/...`
 # and one-off resume_phase2_*.log dumps. Local-only.
