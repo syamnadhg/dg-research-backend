@@ -9468,10 +9468,11 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         if _vision_narration:
                             progress["progress"] = _vision_narration
                         else:
+                            # Elapsed time deliberately omitted — the parent
+                            # phase card already shows "N.N min elapsed" at the
+                            # top of the progress bar; duplicating it on the
+                            # agent narration line is just visual noise.
                             _et_parts = [f"{_think_label} active"]
-                            _et_min = elapsed_sec // 60
-                            if _et_min >= 1:
-                                _et_parts.append(f"{_et_min} min elapsed")
                             if _merged_partial_len >= 200:
                                 _et_parts.append(f"{_merged_partial_len:,} chars drafted")
                             progress["progress"] = " · ".join(_et_parts)
