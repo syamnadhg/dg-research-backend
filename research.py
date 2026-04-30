@@ -2152,7 +2152,18 @@ def _start_command_listener(uid, research_id, loop):
                 if cfg:
                     loop.call_soon_threadsafe(_controls.update_config, cfg)
                     _write_config_to_disk(cfg)
-                    log(f"Command received: CONFIG update (written to disk)")
+                    # Emit config_updated so the FE has explicit ack that
+                    # the BE applied this writeCommand. Without this, the
+                    # FE relies entirely on Firestore doc snapshots, and
+                    # a delayed onSnapshot delivery can leave the chat
+                    # icon row out of sync with the tile that just sent
+                    # this command. Mirrors the HTTP /api/runs/{id}/config
+                    # PATCH path (line ~18347) which already emits.
+                    try:
+                        emit_event("config_updated", config=cfg)
+                    except Exception:
+                        pass
+                    log(f"Command received: CONFIG update (written to disk + ack emitted)")
             elif action == "skip_init_verify":
                 # User bailed on Phase 0 login verification from the dropdown.
                 loop.call_soon_threadsafe(_controls.request_skip_init_verify)
