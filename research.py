@@ -18908,20 +18908,38 @@ async def run_server(port=8000):
             # Flip this run's research doc from queued → ongoing. No-op for
             # the very first start in an idle backend (already ongoing).
             flip_outcome = _flip_queued_to_ongoing(job.get("uid"), job.get("research_id"))
-            # Q8 (2026-04-30): when the flip is skipped — i.e. status was
-            # paused_backend_restart / stopped / cancelled when we dequeued —
-            # bail BEFORE run_pipeline so we don't launch a browser, run the
-            # orphan-Chrome killer, and chew live sibling browsers belonging
-            # to runs the user is actively watching. The cascade was: stale
-            # paused_backend_restart on a chat → flip skipped → run_pipeline
-            # called anyway → Browser.start() killed every Chrome with our
-            # profile (incl. live siblings) → P1 surfaced "Page.bring_to_front:
-            # Target page, context or browser has been closed" on the wrong
-            # chat. None outcome (no firebase / missing args / exception) is
-            # treated as legacy success — proceed with run_pipeline.
-            should_run = not (flip_outcome and flip_outcome.startswith("skipped("))
-            if not should_run:
-                log(f"[worker] Bailing on job — flip outcome={flip_outcome}, skipping run_pipeline to spare sibling browsers", "INFO")
+            # Q8 (2026-04-30): bail ONLY when the flip is skipped AND the
+            # actual current status is a terminal/recovery state (cancelled
+            # mid-run, paused after BE restart, watchdog-stopped, user-
+            # discarded, fully completed). For ANY active state — ongoing
+            # (FE optimistically pre-flipped before BE picked up the job —
+            # this is the normal happy path), paused (user paused mid-run,
+            # wants to resume), queued (flip already handled it) — proceed
+            # with run_pipeline. The original bug was that a stale
+            # paused_backend_restart from a crashing supervisor child
+            # caused run_pipeline to launch a browser and the orphan-
+            # Chrome killer chewed live siblings. Bailing too eagerly
+            # blocks every legitimate run because FE writes ongoing
+            # client-side before the BE worker dequeues. None outcome
+            # (no firebase / missing args / exception) is treated as
+            # legacy success — proceed.
+            BAIL_STATUSES = {
+                "paused_backend_restart",
+                "paused_backend_restart_failed",
+                "stopped_by_watchdog",
+                "terminated_by_user_discard",
+                "stopped",
+                "cancelled",
+                "completed",
+            }
+            should_run = True
+            if flip_outcome and flip_outcome.startswith("skipped(") and flip_outcome.endswith(")"):
+                actual_status = flip_outcome[len("skipped("):-1]
+                if actual_status in BAIL_STATUSES:
+                    should_run = False
+                    log(f"[worker] Bailing on job — actual_status={actual_status} (terminal/recovery), skipping run_pipeline to spare sibling browsers", "INFO")
+                else:
+                    log(f"[worker] Proceeding despite skipped flip — actual_status={actual_status} is active (FE pre-flipped or normal mid-run resume)", "INFO")
             try:
                 if should_run:
                     await asyncio.wait_for(
