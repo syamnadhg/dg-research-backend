@@ -13326,9 +13326,19 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
 # receive long input and dodges all the paste-verification issues.
 # ═════════════════════════════════════════════════════════════════════
 
-async def attach_brief_file(browser, page, brief_path, platform, label):
-    """Attach brief.md to the composer via the hidden file input.
-    Returns True if exactly one attachment was confirmed visible."""
+async def attach_brief_file(browser, page, brief_path, platform, label, extra_files=None):
+    """Attach brief.md (and optional extra user-supplied files) to the
+    composer via the hidden file input. Returns True if at least the
+    brief landed.
+
+    extra_files: list[str] of additional paths to attach alongside the
+    brief (user_sources downloaded into queue_dir/documents/). Empty/None
+    keeps the legacy single-attachment behavior. Playwright's
+    set_input_files takes a list and uploads all in one call — most
+    composers handle that natively, but we soft-fail per-platform if
+    multi-attach doesn't take."""
+    extra_files = extra_files or []
+    all_paths = [str(brief_path)] + [str(p) for p in extra_files]
     try:
         # Clear any residual attachments from a previous attempt
         try:
@@ -13345,12 +13355,29 @@ async def attach_brief_file(browser, page, brief_path, platform, label):
         # PRIMARY — hidden file input (most reliable across all platforms)
         file_input = await page.query_selector('input[type="file"]')
         if file_input:
-            await file_input.set_input_files(str(brief_path))
-            await asyncio.sleep(3)  # Wait for UI to acknowledge
-            log(f"[{label}] Brief attached via hidden file input")
-            return True
+            try:
+                await file_input.set_input_files(all_paths)
+                await asyncio.sleep(3)  # Wait for UI to acknowledge
+                if extra_files:
+                    log(f"[{label}] Brief + {len(extra_files)} user file(s) attached via hidden file input")
+                else:
+                    log(f"[{label}] Brief attached via hidden file input")
+                return True
+            except Exception as _multi_err:
+                if extra_files:
+                    # Multi-file may fail on platforms that allow only one
+                    # input file at a time. Retry with brief alone so the
+                    # phase still proceeds — extras are still on disk for
+                    # P3 NLM upload.
+                    log(f"[{label}] Multi-file attach failed ({_multi_err}); retrying with brief only", "WARN")
+                    await file_input.set_input_files(str(brief_path))
+                    await asyncio.sleep(3)
+                    log(f"[{label}] Brief attached (extras dropped — will reach NLM via P3)")
+                    return True
+                raise
 
         # FALLBACK — queue file for OS-level chooser then click attach
+        # (single-file path; extras can't be plumbed through this branch).
         browser.set_upload_file(str(brief_path))
         for sel in ['button[aria-label*="Attach"]', 'button[aria-label*="Upload"]',
                     'button[data-testid*="upload"]', 'button[data-testid*="file"]']:
@@ -16338,6 +16365,33 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             except Exception as _outer:
                 log(f"Flow B handler failed (non-fatal): {_outer}", "WARN")
 
+        # Bridge user_sources → P1/P2 attachments. After the Flow B block
+        # downloaded everything into documents/, walk that dir and:
+        #   - append any *.pdf / *.docx / *.md to pdf_paths so run_phase1
+        #     attaches them to the ChatGPT brief request as context;
+        #   - the same files remain on disk so the P2 round-robin pass can
+        #     pick them up via _runtime.original_inputs (consumed by
+        #     start_agent_no_gemini_wait's brief_path + auxiliary attach).
+        # Only run when the user actually attached sources; otherwise leave
+        # pdf_paths as the CLI-supplied default.
+        if user_sources:
+            _docs_dir = queue_dir / "documents"
+            if _docs_dir.exists():
+                _aux_paths = list(pdf_paths or [])
+                for _f in sorted(_docs_dir.iterdir()):
+                    if not _f.is_file():
+                        continue
+                    if _f.stem in ("brief", "consolidated"):
+                        continue
+                    if _f.suffix.lower() not in (".pdf", ".md", ".docx", ".txt"):
+                        continue
+                    _full = str(_f)
+                    if _full not in _aux_paths:
+                        _aux_paths.append(_full)
+                if _aux_paths != list(pdf_paths or []):
+                    log(f"User sources -> P1 attach list: {[Path(p).name for p in _aux_paths]}")
+                pdf_paths = _aux_paths
+
     log(f"Queue: {queue_dir}")
     # init_tracks just sets the global `_tracks_dir` to a Path holding
     # the run name (same name as the queue dir). The local var is unused;
@@ -17169,8 +17223,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # ══════════════════════ PHASE 2: Deep Research ══════════════════════
         results = {}
         _user_skip_p2 = _controls.consume_phase_skip(2)
-        if 2 in skip_phases or _user_skip_p2:
-            _reason = "user_skip" if _user_skip_p2 else "Disabled in pipeline config"
+        # Flow B/C entry: when every P2 agent is disabled in agents_cfg,
+        # the FE intent is "skip P2 entirely" (the user toggled all 3
+        # agents off) — even though the FE doesn't write `2` into
+        # skip_phases. Without this branch the elif below would fail_phase
+        # with "No brief text available" because Flow B has no brief by
+        # design (the user attached source docs that go straight to NLM).
+        _all_agents_off = not any(agents_cfg.values())
+        if 2 in skip_phases or _user_skip_p2 or _all_agents_off:
+            if _user_skip_p2:
+                _reason = "user_skip"
+            elif _all_agents_off:
+                _reason = "All Phase 2 agents disabled"
+            else:
+                _reason = "Disabled in pipeline config"
             log(f"Phase 2: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=2, reason=_reason)
         elif start_phase <= 2:
