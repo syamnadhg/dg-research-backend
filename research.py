@@ -2823,13 +2823,17 @@ class PipelineRuntime:
         # replaying them and producing dup phase transitions in chat.
         self.last_event_id: str = ""
         # True when run_pipeline is invoked with resume_dir set (auto-retry
-        # from checkpoint OR user-resume from paused). Browser-crash sites
-        # check this: on the first attempt (False), emit a passive
-        # "Reconnecting…" banner since run_pipeline.finally will auto-retry
-        # 5s later. On a retry attempt (True), the auto-retry won't fire
-        # again (`if not resume_dir` guard) so the real fail_phase/fail_agent
-        # alert with [Retry, Skip] is the only escape and must surface.
+        # from checkpoint OR user-resume from paused). Currently used only
+        # for non-browser-crash recovery decisions; browser crashes are
+        # always-auto regardless of this flag (see last_failure_kind).
         self.is_retry_attempt: bool = False
+        # Tag for the most recent failure that bubbled out of a phase.
+        # Set at fail-detection sites (browser-crash, agent timeout, etc.)
+        # and read by run_pipeline.finally to decide whether the auto-retry
+        # path should bypass its `not resume_dir` gate. Browser crashes
+        # always auto-retry — no human in the loop, no per-attempt cap;
+        # the worker 4h outer ceiling is the safety net.
+        self.last_failure_kind: str = ""
 
     def reset(self):
         self.__init__()
@@ -9130,34 +9134,22 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             if page.is_closed():
                 log(f"[{label}] Browser tab closed unexpectedly", "WARN")
                 _ag_norm_crash = normalize_agent_key(label)
-                if not _runtime.is_retry_attempt:
-                    # First attempt — run_pipeline.finally will auto-retry.
-                    # Show passive banner only.
-                    emit_browser_recovery_status(
-                        phase, agent=_ag_norm_crash if (phase == 2 and _ag_norm_crash) else None)
-                elif phase == 2 and _ag_norm_crash:
-                    fail_agent(_ag_norm_crash,
-                               "Browser tab crashed",
-                               "The agent's browser tab closed unexpectedly. Retry to relaunch.")
-                else:
-                    fail_phase(phase,
-                               "Browser crashed",
-                               "The browser tab closed unexpectedly during this phase.")
+                # Browser crashes are always-auto: human can't do anything
+                # useful here, so emit passive banner and let the outer
+                # auto-retry rebuild the session. last_failure_kind tells
+                # run_pipeline.finally to bypass the not-resume_dir gate.
+                _runtime.last_failure_kind = "browser_crash"
+                emit_browser_recovery_status(
+                    phase, agent=_ag_norm_crash if (phase == 2 and _ag_norm_crash) else None)
                 return False
         except Exception:
             # is_closed() itself can throw if the page handle is already
             # garbage; treat that as a crash too.
             log(f"[{label}] Page handle invalid — treating as crash", "WARN")
             _ag_norm_crash = normalize_agent_key(label)
-            if not _runtime.is_retry_attempt:
-                emit_browser_recovery_status(
-                    phase, agent=_ag_norm_crash if (phase == 2 and _ag_norm_crash) else None)
-            elif phase == 2 and _ag_norm_crash:
-                fail_agent(_ag_norm_crash, "Browser tab crashed",
-                           "The agent's browser tab closed unexpectedly. Retry to relaunch.")
-            else:
-                fail_phase(phase, "Browser crashed",
-                           "The browser tab closed unexpectedly during this phase.")
+            _runtime.last_failure_kind = "browser_crash"
+            emit_browser_recovery_status(
+                phase, agent=_ag_norm_crash if (phase == 2 and _ag_norm_crash) else None)
             return False
         # ── Stop/Pause check ──
         if _controls.is_stop():
@@ -10177,15 +10169,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if _crashed:
                 _crash_key = normalize_agent_key(_crash_name)
                 log(f"[{_crash_name}] Browser tab crashed — failing agent", "WARN")
-                if not _runtime.is_retry_attempt:
-                    # Initial run — auto-retry will rebuild the browser session.
-                    # Passive banner so the user sees what's happening without
-                    # being asked to click [Retry] mid-recovery.
-                    emit_browser_recovery_status(2, agent=_crash_key)
-                else:
-                    fail_agent(_crash_key,
-                               "Browser tab crashed",
-                               "The agent's browser tab closed unexpectedly. Retry to relaunch.")
+                # Always-auto: passive banner, outer run_pipeline.finally
+                # rebuilds the browser session and resumes from checkpoint.
+                _runtime.last_failure_kind = "browser_crash"
+                emit_browser_recovery_status(2, agent=_crash_key)
                 results[_crash_name] = {"status": "browser_crashed", "text": "",
                                         "url": _crash_p.get("url", ""),
                                         "page": None,
@@ -10510,12 +10497,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             except Exception as _sw_err:
                 log(f"[{name}] switch_to_page at cursor start failed: {_sw_err}", "WARN")
 
-            # Timeout
+            # Timeout — auto-skip (2026-04-30): per-agent P2 wall-clock
+            # timeout used to stop and ask [Retry, Wait, Skip]. New rule
+            # is auto: if an agent burned its budget without finishing,
+            # take whatever partial output was extracted, drop it from
+            # the rotation, and let the other agents keep going. The
+            # consolidated downstream pipeline simply gets one fewer
+            # source for NotebookLM — the user's directive: "skipped/
+            # missing agent → NLM skips that file." No human prompt.
             if elapsed > max_wait_min * 60:
-                log(f"[{name}] Timeout ({max_wait_min}min)", "WARN")
+                log(f"[{name}] Timeout ({max_wait_min}min) — auto-skipping agent", "WARN")
                 agent_key_to = normalize_agent_key(name)
-                # Extract partial text now so the user can decide whether it's
-                # enough to proceed with.
                 try:
                     await browser.switch_to_page(p["page"])
                     partial_text = await extract_fns[name](p["page"], browser=browser,
@@ -10524,60 +10516,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] Extraction after timeout failed: {e}", "WARN")
                     partial_text = ""
                 partial_len = len(partial_text or "")
-                # Source count was previously read from
-                # `tracks/{run}/{agent}.json`, but `save_track` was removed
-                # in 2026-04-29 so that file never exists anymore. Drop
-                # the lookup and the "{N} sources, " banner prefix — the
-                # char count below is enough signal.
-                _sources_note = ""
-                fail_agent(agent_key_to,
-                           f"{name} timed out after {max_wait_min} min — {_sources_note}{partial_len} chars extracted",
-                           ("The agent exceeded its research budget. "
-                            "Retry re-runs the agent from scratch. Wait grants another 15 min of budget. "
-                            "Skip drops this agent; others proceed."),
-                           include_wait=True)
-                # Wait up to 5 min for decision. Default (timeout) = wait_longer
-                # — keep polling rather than silently accepting partial output.
-                decision = await _controls.await_agent_decision(agent_key_to, timeout=300.0)
-                log(f"[{name}] Timeout user decision: {decision}")
-                if decision == "stop":
-                    # Let outer stop handler clean up on next iteration
-                    break
-                if decision == "skip":
-                    # skipped_agents handler at the top of the loop will pick
-                    # this up on the next iteration and finalize with
-                    # status=skipped_by_user. Don't touch pending here.
-                    continue
-                if decision == "retry":
-                    log(f"[{name}] Retry — sending follow-up to continue research", "INFO")
-                    followup = (
-                        "Your previous response hit our time budget. Please continue the research "
-                        "and output the complete, thorough final report now — include every source, "
-                        "section, and finding you have. No preamble."
-                    )
-                    try:
-                        await browser.switch_to_page(p["page"])
-                        await paste_followup(p["page"], followup, name.lower(), label=f"{name}-retry")
-                    except Exception as e:
-                        log(f"[{name}] Retry follow-up failed: {e}", "WARN")
-                    # Extend budget by 15 min by rewinding start_time; reset done state
-                    p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
-                    p["done_count"] = 0
-                    p["cua_confirmed"] = False
-                    p["last_cua_check"] = time.time()
-                    p.pop("_cached_text", None)
-                    p["empty_retries"] = 0
-                    continue
-                if decision in ("wait_longer", "timeout"):
-                    # User picked "Wait" (or auto-default timeout) — grant
-                    # another 15 min without pinging the agent. Keep polling.
-                    log(f"[{name}] Extending budget by 15 min — still waiting for completion", "INFO")
-                    p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
-                    continue
-                # Legacy 'continue_partial' only — no button surfaces this
-                # anymore, but keep handling for in-flight commands.
-                results[name] = {"status": "timeout_partial", "text": partial_text or "",
-                                 "url": p.get("url", ""), "page": p["page"]}
+                # Surface the auto-skip as a passive warning so the user
+                # sees what happened (no buttons — corner-✕ to dismiss).
+                emit_event("pipeline_warning", phase=2, agent=agent_key_to,
+                           message=f"{name} timed out at {max_wait_min} min — auto-skipped",
+                           details=(f"Extracted {partial_len} chars of partial output, "
+                                    "kept for downstream phases. Other agents continue."),
+                           actions=[],
+                           alertType="warn",
+                           dismissible=True,
+                           alert_id=f"agent_{agent_key_to}_timeout_autoskip")
+                # If we got useful partial text, keep it for downstream;
+                # otherwise mark as fully skipped so consolidated/P3 don't
+                # carry an empty placeholder.
+                if partial_len >= 200:
+                    results[name] = {"status": "timeout_partial", "text": partial_text,
+                                     "url": p.get("url", ""), "page": p["page"]}
+                else:
+                    results[name] = {"status": "skipped_timeout", "text": "",
+                                     "url": p.get("url", ""), "page": p["page"]}
                 del pending[name]
                 continue
 
@@ -18056,7 +18013,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
     # Auto-retry from checkpoint if pipeline failed mid-way
     # Skip if: completed, stopped (terminal), or paused (intentional freeze)
-    if not resume_dir and queue_dir:
+    #
+    # Two retry policies:
+    #   - One-shot retry on the initial run (resume_dir is None at entry).
+    #     The recursion sets resume_dir, so a second failure of any kind
+    #     normally surfaces a [Retry, Skip] alert.
+    #   - Browser-crash retry is always-auto: bypass the resume_dir gate
+    #     so a recursive crash also auto-retries. Outer worker 4h ceiling
+    #     is the safety net against infinite chrome-death loops.
+    _kind = getattr(_runtime, "last_failure_kind", "") or ""
+    _is_browser_crash = (_kind == "browser_crash")
+    if queue_dir and (not resume_dir or _is_browser_crash):
         try:
             d_path = queue_dir / "delivery.json"
             d_status = json.loads(d_path.read_text(encoding="utf-8")).get("status") if d_path.exists() else ""
@@ -18067,7 +18034,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 and not (queue_dir / ".pause").exists():
             phase, _ = detect_resume_phase(queue_dir)
             if 1 < phase <= 5:
-                log(f"Pipeline failed at phase {phase} — auto-retrying from checkpoint...", "WARN")
+                _why = "browser-crash" if _is_browser_crash else f"failed at phase {phase}"
+                log(f"Pipeline {_why} — auto-retrying from checkpoint...", "WARN")
                 await asyncio.sleep(5)
                 # Forward uid/research_id/run_id so the retry rebinds its
                 # Firestore command listener (cancel/config/retry from FE).
