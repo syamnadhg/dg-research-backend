@@ -10374,11 +10374,34 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 }
             p = pending[_agent_name]
             _hard_count = int(p.get("hard_retry_count", 0)) + 1
-            # Cap: 2 hard retries per agent per phase. Above the cap,
-            # fall through to soft retry (follow-up in same tab) instead
-            # of looping forever through expensive tab restarts.
+            # Cap: 2 hard retries per agent per phase. Above the cap we
+            # used to fall through to soft retry (follow-up in same tab),
+            # but: (a) if the tab is dead, soft retry is a silent no-op
+            # because there's no live page to paste into, and (b) the
+            # retry_agents set has no consumer in the P2 main loop, so
+            # even with a live tab the soft-retry path was effectively
+            # dead. Dead-tab guard surfaces fail_agent so the agent
+            # doesn't sit in pending forever.
             if _hard_count > 2:
-                log(f"[{_agent_name}] Hard retry cap hit — queuing soft retry", "WARN")
+                _tab_dead = False
+                try:
+                    _old_p = p.get("page")
+                    _tab_dead = (_old_p is None or _old_p.is_closed())
+                except Exception:
+                    _tab_dead = True
+                if _tab_dead:
+                    log(f"[{_agent_name}] Hard retry cap + dead tab — failing agent", "WARN")
+                    fail_agent(_agent_key,
+                               f"{_agent_name} hard retries exhausted, tab gone",
+                               "All hard-retry attempts have been used and the "
+                               "agent's browser tab is no longer alive. Skip drops "
+                               "this agent; the others continue.")
+                    del pending[_agent_name]
+                    results[_agent_name] = {
+                        "status": "hard_retry_exhausted_dead_tab",
+                        "text": "", "url": "", "page": None, "elapsed_sec": 0}
+                    continue
+                log(f"[{_agent_name}] Hard retry cap hit (tab still alive) — queuing soft retry", "WARN")
                 _controls.retry_agents.add(_agent_key)
                 continue
             log(f"[{_agent_name}] Hard retry #{_hard_count} — closing tab, re-running setup", "WARN")
@@ -16961,7 +16984,26 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                    actions=[],
                                    dismissible=True,
                                    alert_id="phase1_manual_brief_required")
+                        # 3h backstop (2026-04-30): if the user walks away
+                        # and never pastes a brief or stops, the wait used
+                        # to hang forever, leaving the run in `ongoing`
+                        # status indefinitely. After 3h we auto-fail the
+                        # phase with [Retry, Skip] so the run reaches a
+                        # terminal-or-actionable state.
+                        _BRIEF_WAIT_BACKSTOP_S = 3 * 3600
+                        _brief_wait_start = time.time()
                         while not _controls.peek_extra_context() and not _controls.is_stop():
+                            if (time.time() - _brief_wait_start) > _BRIEF_WAIT_BACKSTOP_S:
+                                log("Phase 1: manual brief wait exceeded 3h — auto-failing", "WARN")
+                                fail_phase(1,
+                                           "Manual brief not received in 3h",
+                                           "Phase 1 was waiting for you to type a research "
+                                           "brief into chat, but no brief arrived in 3 hours. "
+                                           "Retry to re-prompt and start over, or Skip to "
+                                           "abandon Phase 1.")
+                                emit_event("pipeline_stopped", phase=1,
+                                           reason="manual_brief_wait_backstop_3h")
+                                return
                             await asyncio.sleep(0.5)
                         if _controls.is_stop():
                             log("Phase 1: stop pressed during manual brief wait", "INFO")
@@ -18536,7 +18578,14 @@ async def run_server(port=8000):
 
     def _persist_pending_queue(current_job=None):
         """Snapshot _job_queue contents (+ optional current_job) to disk.
-        Best-effort — never raises into the worker hot path."""
+        Returns True on success, False on persist failure. Never raises.
+
+        On failure with a current_job, immediately writes
+        status=paused_backend_restart_failed + lastError to the affected
+        research's Firestore doc so the FE recovery banner surfaces. The
+        Phoenix auto-restore path on respawn relies on this snapshot — if
+        it didn't write, there's nothing to restore from, and the run
+        would otherwise be silently lost on BE restart."""
         try:
             queues_root.mkdir(parents=True, exist_ok=True)
             try:
@@ -18550,8 +18599,30 @@ async def run_server(port=8000):
             }
             _pending_queue_path.write_text(
                 json.dumps(payload, indent=2), encoding="utf-8")
+            return True
         except Exception as e:
             log(f"[pending_queue] persist failed: {e}", "WARN")
+            if current_job and _firebase_db is not None:
+                uid = current_job.get("uid")
+                rid = current_job.get("research_id")
+                if uid and rid:
+                    try:
+                        _firebase_db.collection("users").document(uid)\
+                            .collection("researches").document(rid)\
+                            .update({
+                                "status": "paused_backend_restart_failed",
+                                "lastError": (
+                                    "Pipeline state could not be saved before "
+                                    f"backend restart ({str(e)[:120]}). Tap "
+                                    "Resume to attempt manual recovery from "
+                                    "the last checkpoint, or Discard to abandon."
+                                ),
+                            })
+                        log(f"[pending_queue] Surfaced persist failure for "
+                            f"{rid[:24]} — FE will show recovery banner", "WARN")
+                    except Exception as _fe:
+                        log(f"[pending_queue] Firestore alert emit failed: {_fe}", "WARN")
+            return False
 
     # Outer wall-clock ceiling for a single pipeline run. Phase budgets
     # inside run_pipeline are cooperative — long Playwright/CUA awaits
