@@ -1939,12 +1939,23 @@ def _emit_to_firestore(event):
 
 
 def update_link_in_firestore(kind: str, url: str, **fields):
-    """Atomically merge a single link into `users/{uid}/researches/{rid}.links.{kind}`.
+    """Write a single canonical-slot link into `users/{uid}/researches/{rid}.links.{kind}`.
 
-    Single source of truth for the FE's Phase 5 Doc body composition —
-    every successful `emit_validated_link` call feeds this so the aggregate
-    stays in sync with the per-event log. The FE reads the map (alongside
-    the streamed pipeline_events) when composing the Doc.
+    This is HALF of the Firestore link-storage contract; the other half is
+    the `userSources` array (see `append_user_source_in_firestore`).
+
+    `links.{kind}` — first-of-kind canonical CACHE. One URL per kind. Used
+    where the FE needs a single canonical URL: phase dropdown buttons
+    ("Open NotebookLM", "Watch on YouTube"), the brief Doc URL embedded
+    in completion emails, etc. Pipeline-generated runs naturally produce
+    one link per kind, so the keyed map is a clean fit. Flow C / B paste
+    flows write only the FIRST pasted link of each kind here so those
+    canonical-slot consumers keep working.
+
+    `userSources` — append-log of every pasted link, full labels preserved.
+    The single source of truth for "all links" when assembling the Doc;
+    the FE-P5 composer reads it alongside the keyed `links` map and
+    dedupes by URL before rendering uniform sections.
 
     `kind` is the platform key (matches `emit_validated_link`'s `agent` arg):
       - "brief" / "chatgpt" / "gemini" / "claude"  — research links
@@ -1964,6 +1975,40 @@ def update_link_in_firestore(kind: str, url: str, **fields):
             .set({"links": {kind: payload}}, merge=True)
     except Exception as e:
         log(f"Firestore link update failed ({kind}): {e}", "WARN")
+
+
+def append_user_source_in_firestore(kind: str, url: str, label: str = "", phase: int = 3) -> None:
+    """Append a user-pasted source link to `users/{uid}/researches/{rid}.userSources`
+    (a Firestore array). Used for Flow C / Flow B inputs where the user
+    explicitly hands the BE a list of reference links — bypasses the strict
+    `validate_link` allow-list, preserves the user's label verbatim, and
+    avoids the key-collision overwrite that the per-kind `links` map has
+    when multiple pasted links share the same kind (two Google Docs, three
+    pasted ChatGPT chats, etc.).
+
+    Each element: `{kind, url, label, phase, ts}`. The FE-P5 Doc composer
+    reads this array and renders one row per element, preserving order +
+    user-supplied labels — every pasted link is guaranteed to land in the
+    Doc, with consistent formatting.
+    """
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    if not url:
+        return
+    try:
+        from google.cloud import firestore as _gcfs
+        entry = {
+            "kind": (kind or "other").lower(),
+            "url": url,
+            "label": (label or "").strip() or "Source",
+            "phase": phase,
+            "ts": int(time.time() * 1000),
+        }
+        _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id) \
+            .set({"userSources": _gcfs.ArrayUnion([entry])}, merge=True)
+    except Exception as e:
+        log(f"Firestore userSources append failed ({kind}): {e}", "WARN")
 
 
 def _update_firestore_research(updates):
@@ -17469,10 +17514,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_skipped", phase=3, reason=_reason)
             # Flow C: when P3 is skipped AND the user pasted source URLs at
             # start time, hydrate the P5-bound locals from those URLs so the
-            # final Doc + email body have something to render. Each url is
-            # classified by domain on the FE (parseLinksFromText). Falsy
-            # entries are silently skipped — P5's compose helpers already
-            # tolerate empty notebook_url / youtube_url / audio_url.
+            # final Doc + email body have something to render. Every pasted
+            # link is appended to a Firestore `userSources` array
+            # (collision-safe, validation-skipping, label-preserving) so the
+            # FE-P5 Doc composer sees the full list — no link is ever
+            # dropped due to key overwrite or strict validate_link rejection.
+            #
+            # First-of-kind also writes to the keyed `links` aggregate via
+            # emit_validated_link (notebook / youtube / audio) so existing
+            # FE consumers that key on those slots (P3/P4 dropdowns) keep
+            # working uniformly with non-Flow-C runs.
             if user_links:
                 _flow_c_count = 0
                 for _link in user_links:
@@ -17481,14 +17532,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _label = (_link.get("label") or "Source").strip() or "Source"
                     if not _url:
                         continue
+                    # Always append to userSources — guarantees the Doc
+                    # renders every pasted link with the user's label.
+                    append_user_source_in_firestore(_kind, _url, _label, phase=3)
+                    # Populate keyed-aggregate slots for first-of-kind so
+                    # phase dropdowns + downstream pipeline consumers find
+                    # them at the canonical paths.
                     if _kind == "notebook" and not notebook_url:
                         notebook_url = _url
-                        # Surface to FE PhaseDropdown + populate the Firestore
-                        # links aggregate so P5's body composition reads it
-                        # back from the single source of truth. Without these
-                        # the FE P3 dropdown stays empty + P5 falls back to
-                        # the in-memory args (works, but the aggregate is
-                        # incomplete for resume / debugging).
                         emit_validated_link(3, "notebooklm", _url, _label or "NotebookLM Notebook")
                     elif _kind == "youtube" and not youtube_url:
                         youtube_url = _url
@@ -17497,32 +17548,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         audio_overview_url = _url
                         emit_validated_link(3, "notebooklm", _url, _label or "Audio Overview", link_kind="audio")
                     elif _kind in ("doc", "agent", "other"):
-                        # Stash under links{} keyed by label — P5 renders this
-                        # dict as the "Sources" section of the final Doc/email.
-                        # Append-with-suffix on collision so two ChatGPT links
-                        # don't clobber each other.
+                        # In-memory map keeps existing label-suffix collision
+                        # avoidance for delivery.json mirror + downstream uses.
+                        # Firestore truth lives in userSources (above).
                         _key = _label
                         _i = 2
                         while _key in links:
                             _key = f"{_label} ({_i})"
                             _i += 1
                         links[_key] = _url
-                        # Map "agent" kind to the matching platform key so the
-                        # Firestore aggregate keeps per-agent slots populated
-                        # for P5's Doc body. "doc" / "other" go under their
-                        # raw kind so they don't clobber agent slots.
-                        _label_lower = _label.lower()
-                        if _kind == "agent":
-                            if "chatgpt" in _label_lower: _agg_kind = "chatgpt"
-                            elif "gemini" in _label_lower: _agg_kind = "gemini"
-                            elif "claude" in _label_lower: _agg_kind = "claude"
-                            else: _agg_kind = "agent"
-                        else:
-                            _agg_kind = _kind
-                        try:
-                            update_link_in_firestore(_agg_kind, _url, label=_label, phase=3, verified=True)
-                        except Exception:
-                            pass
                     _flow_c_count += 1
                 log(f"Flow C hydration: {_flow_c_count} link(s) → notebook={'set' if notebook_url else '∅'} "
                     f"youtube={'set' if youtube_url else '∅'} audio={'set' if audio_overview_url else '∅'} "
