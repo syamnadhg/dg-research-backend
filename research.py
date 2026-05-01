@@ -18941,7 +18941,16 @@ async def run_server(port=8000):
     # ever arrive until the app claims a token. Surface --pair. If paired
     # but On Startup isn't enabled, surface --resurrect so users discover
     # the "run in background" capability.
-    _currently_supervised = _detect_supervised()
+    # _detect_supervised runs schtasks subprocess — Windows can occasionally
+    # hang the call past its own timeout, parking startup before uvicorn binds.
+    # Treat it as best-effort (default to False), banner just shows --resurrect
+    # action whether supervised or not — UX is harmless either way.
+    try:
+        _currently_supervised = await asyncio.wait_for(
+            asyncio.to_thread(_detect_supervised), timeout=8.0,
+        )
+    except (asyncio.TimeoutError, Exception):
+        _currently_supervised = False
     if not (_research_token and _paired_uid_now):
         print()
         print(f"  {_c(_WARN, '⚠')}  Not paired yet — jobs will be ignored until this machine is paired.")
