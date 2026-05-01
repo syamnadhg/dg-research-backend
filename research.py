@@ -15179,8 +15179,15 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 pass
             audio_url = upload_audio_to_storage(audio_path)
             # Use the filename stem as doc id so re-runs upsert in place
-            # instead of stacking duplicates.
-            save_audio_to_firestore(audio_path.stem, audio_path.name, dur_sec, audio_url)
+            # instead of stacking duplicates. Display name = research
+            # title from Firestore (set by FE's /api/title early in P1)
+            # so the Podcasts page shows one human-readable title instead
+            # of the auto-generated underscore .m4a filename. If the
+            # Firestore title isn't set (rare P3-before-P1-write race),
+            # smart_title falls back to a stem-derived topic with
+            # underscores swapped for spaces — still readable.
+            display_name = smart_title(audio_path.stem.replace("_", " "))
+            save_audio_to_firestore(audio_path.stem, display_name, dur_sec, audio_url)
             # Storage upload is best-effort — local playback still works via
             # the backend, and Phase 5 can still upload to YouTube from the
             # local file. Warn (not error) if it failed.
