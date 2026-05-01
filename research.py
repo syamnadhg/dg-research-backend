@@ -584,7 +584,11 @@ def log_action(action, details=""):
 
 
 def safe_name(topic, max_len=50):
-    return re.sub(r'[^\w\s-]', '', topic)[:max_len].strip().replace(' ', '_')
+    # Collapse any run of non-(word|dash) characters into a single underscore.
+    # Old impl replaced literal spaces only — newlines and other whitespace
+    # leaked into queue dir names (e.g. multi-line Flow C topics like
+    # "Research\n\nLinks to..."), which Windows rejects with WinError 123.
+    return re.sub(r'[^\w-]+', '_', topic).strip('_')[:max_len]
 
 
 # ── Run-name reference ───────────────────────────────────────────────────────
@@ -15948,6 +15952,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     user_sources = user_sources or []
     user_links = user_links or []
     pdf_paths = pdf_paths or []
+    # Collapse internal whitespace runs in the topic to single spaces. Multi-
+    # line topics (Flow C: user pastes URLs+labels, FE concatenates as topic
+    # with newlines) would otherwise leak \n into the queue dir name, the Doc
+    # title, the email subject, and FE storage. safe_name() handles the dir
+    # part, but we want the topic STRING itself clean for downstream
+    # consumers too.
+    if isinstance(topic, str):
+        topic = re.sub(r'\s+', ' ', topic).strip()
     api_key = resolve_api_key(api_key)
     if not api_key:
         log("No API key (set CUA_API_KEY)", "ERROR")
