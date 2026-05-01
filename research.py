@@ -18809,21 +18809,85 @@ async def run_server(port=8000):
                         research_id = snap.id
                         _rehydrated_rids.add(research_id)
                         if status_val == "ongoing":
-                            # Mark as paused_backend_restart so the frontend can
-                            # render a dedicated "Resume from checkpoint" CTA.
-                            # Browser + CUA state is gone, but checkpoints on
-                            # disk (documents/*.md + checkpoint.json +
-                            # delivery.json under queues/{run}/) let the
-                            # orchestrator skip already-completed phases via
-                            # detect_resume_phase() and pick up from there.
-                            try:
-                                researches_col.document(research_id).update({
-                                    "status": "paused_backend_restart",
-                                    "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
-                                })
-                                orphaned += 1
-                            except Exception as e:
-                                log(f"Rehydrate: mark paused_backend_restart failed for {research_id}: {e}", "WARN")
+                            # Mid-run runs need either auto-resume (supervised
+                            # device — supervisor just respawned us, take the
+                            # natural next step and resume the runs too) or a
+                            # paused_backend_restart marker so the FE shows a
+                            # Resume CTA. Browser + CUA state is gone either
+                            # way, but checkpoints on disk
+                            # (documents/*.md + checkpoint.json + delivery.json
+                            # under queues/{run}/) let detect_resume_phase()
+                            # skip already-completed phases.
+                            #
+                            # Resolve the run's device's supervised flag — if
+                            # supervised, attempt auto-resume so the FE's
+                            # passive banner clears via pipeline_resumed
+                            # without any user click.
+                            device_id = data.get("deviceId") or ""
+                            is_supervised = False
+                            if device_id:
+                                try:
+                                    dev_snap = _firebase_db.collection("users") \
+                                        .document(paired_uid) \
+                                        .collection("devices") \
+                                        .document(device_id).get()
+                                    if dev_snap.exists:
+                                        is_supervised = bool(
+                                            (dev_snap.to_dict() or {})
+                                            .get("supervised", False))
+                                except Exception as _de:
+                                    log(f"Rehydrate: device read failed for {research_id[:24]}…: {_de}", "WARN")
+
+                            auto_resumed = False
+                            if is_supervised:
+                                run_id = data.get("backendRunId") or ""
+                                if run_id:
+                                    queue_dir = Path(__file__).parent / "queues" / run_id
+                                    # Only auto-resume if the on-disk artifacts
+                                    # are intact and the run wasn't terminally
+                                    # stopped (.stop sentinel set by Stop /
+                                    # watchdog T3).
+                                    if queue_dir.exists() and not (queue_dir / ".stop").exists():
+                                        cp = load_checkpoint(queue_dir)
+                                        topic = (cp or {}).get("topic", "") or data.get("topic", "")
+                                        cfg = dict(data.get("pipelineConfig") or {})
+                                        if "skippedPhases" in cfg and "skipPhases" not in cfg:
+                                            cfg["skipPhases"] = cfg.pop("skippedPhases")
+                                        if topic:
+                                            # Clear any stale .pause signal so
+                                            # the resumed run drains immediately.
+                                            p_signal = queue_dir / ".pause"
+                                            if p_signal.exists():
+                                                try: p_signal.unlink()
+                                                except Exception: pass
+                                            if _safe_enqueue(_job_queue, {
+                                                "topic": topic,
+                                                "email": "",  # delivery prefs are on disk in delivery.json
+                                                "config": cfg,
+                                                "run_id": run_id,
+                                                "resume_dir": str(queue_dir),
+                                                "uid": paired_uid,
+                                                "research_id": research_id,
+                                            }, source="rehydrate-supervised-auto-resume"):
+                                                rehydrated += 1
+                                                auto_resumed = True
+                                                log(f"Rehydrate: auto-resumed {research_id[:24]}… on supervised device")
+
+                            if not auto_resumed:
+                                # Either unsupervised, or supervised-but-couldn't-
+                                # auto-resume (queue_dir missing, run_id absent,
+                                # .stop sentinel set, etc.). Mark
+                                # paused_backend_restart so the FE recovery
+                                # banner fires — actionable for unsupervised,
+                                # passive-with-2min-escalation for supervised.
+                                try:
+                                    researches_col.document(research_id).update({
+                                        "status": "paused_backend_restart",
+                                        "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
+                                    })
+                                    orphaned += 1
+                                except Exception as e:
+                                    log(f"Rehydrate: mark paused_backend_restart failed for {research_id}: {e}", "WARN")
                         else:  # queued
                             topic = data.get("topic", "")
                             if not topic:
