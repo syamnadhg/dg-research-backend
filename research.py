@@ -1045,7 +1045,10 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
 
 async def _heartbeat_loop():
     """Write lastHeartbeat to research_tokens/{token} AND the paired device
-    doc every 30s so the frontend can show Online/Offline status per device.
+    doc every 5s (HEARTBEAT_INTERVAL_SEC) so the frontend can show
+    Online/Offline status per device. Pairs with the FE 15s offline
+    threshold (DEVICE_OFFLINE_THRESHOLD_MS) — missing two consecutive
+    ticks plus a small slack flips the UI to offline.
 
     Token doc uses SERVER_TIMESTAMP (frontend reads `.seconds` off the
     Timestamp). Device doc uses millis-as-int — the frontend compares
@@ -19876,6 +19879,32 @@ def _kill_pids(pids: list[int]) -> int:
     return killed
 
 
+def _wait_for_port_free(port: int, max_wait_s: float = 10.0) -> bool:
+    """Poll bindability of 0.0.0.0:<port> until it becomes free or the
+    timeout fires. Returns True if the port is bindable, False if we
+    gave up. Used by the daemon-loop's restart cycle so a fresh --serve
+    isn't immediately wedged by Windows holding the previous socket in
+    TIME_WAIT (typically <1s on a clean exit, but can stretch to ~30s
+    if uvicorn was force-killed mid-handshake).
+
+    Uses SO_REUSEADDR=0 (default) for the probe — we want to know if
+    the port is *truly* free, not whether we could squeeze in. The
+    real --serve subprocess will bind without REUSEADDR moments later,
+    so a probe success guarantees uvicorn won't hit EADDRINUSE."""
+    import socket as _socket
+    deadline = _time.time() + max_wait_s
+    while _time.time() < deadline:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
+            sock.bind(("0.0.0.0", port))
+            sock.close()
+            return True
+        except OSError:
+            sock.close()
+            _time.sleep(0.5)
+    return False
+
+
 def run_daemon_loop(port: int = 8000):
     """Wrapper that keeps `--serve` alive. The scheduled task installed by
     --resurrect invokes this instead of --serve directly so that the
@@ -19982,6 +20011,28 @@ def run_daemon_loop(port: int = 8000):
         except KeyboardInterrupt:
             log("[daemon-loop] Interrupted during sleep — exiting wrapper")
             return
+
+        # Per-iteration sweep + port-free probe. The wrapper-startup
+        # sweep (above) only runs once; without this mid-cycle check
+        # a serve that died mid-bind, or a hard-reset that didn't
+        # quite release the socket, would leave port 8000 blocked
+        # and the next subprocess.run would crash on EADDRINUSE in
+        # uvicorn's startup — looping forever at 5s/cycle. Sweep
+        # any orphan --serve PIDs first, then poll the port for up
+        # to 10s. If still blocked, log and proceed anyway —
+        # subprocess.run's failure logs will reveal the real cause.
+        try:
+            stale_serve: list[int] = []
+            for pid, _cmd, role in _enumerate_research_py_procs():
+                if pid != self_pid and role == "serve":
+                    stale_serve.append(pid)
+            if stale_serve:
+                killed = _kill_pids(stale_serve)
+                log(f"[daemon-loop] Pre-restart sweep: killed {killed}/{len(stale_serve)} stale --serve procs ({stale_serve})")
+        except Exception as _se:
+            log(f"[daemon-loop] Pre-restart sweep failed: {_se}", "WARN")
+        if not _wait_for_port_free(port, max_wait_s=10.0):
+            log(f"[daemon-loop] Port {port} still in use after 10s — spawning anyway; uvicorn will surface the cause", "WARN")
 
 
 def _write_supervised_flag(enabled: bool):
