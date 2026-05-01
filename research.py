@@ -17720,6 +17720,55 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _p4_start = time.time()
             # Active-time ceiling — paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
+            # Resolve missing audio_path via a user-decision loop instead of
+            # silently skipping P4. Prior behavior emitted phase_skipped with
+            # reason="No audio produced in Phase 3" — but that broke the
+            # design rule that P4 only skips when the user toggled video
+            # off. When P3 finishes without an audio file (NotebookLM
+            # didn't generate one, extraction failed, etc.) the user
+            # should be told and given a choice: Retry the audio step,
+            # Skip P4 explicitly, or terminate.
+            while not audio_path:
+                log("Phase 4: no audio from Phase 3 — awaiting user decision", "WARN")
+                fail_phase(
+                    phase=4,
+                    error="No audio overview from Phase 3",
+                    reason="Phase 3 finished without producing an audio file (NotebookLM may have failed to generate one). Retry re-runs the audio step; Skip moves past Phase 4 without a YouTube video.",
+                    agent="youtube",
+                )
+                decision = await _controls.await_phase_decision(4)
+                if decision == "retry":
+                    if not notebook_url:
+                        log("Phase 4: retry requested but no notebook URL — re-prompting", "WARN")
+                        continue
+                    log("Phase 4: user requested audio retry", "INFO")
+                    emit_event("phase_restart", phase=4, reason="user_retry_audio")
+                    try:
+                        _p3_audio = await _await_phase_with_active_deadline(
+                            3, PHASE_3_MAX_MIN,
+                            lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                        )
+                        audio_path = _p3_audio.get("audio_path")
+                        _ao_url = _p3_audio.get("audio_overview_url", "")
+                        if _ao_url:
+                            audio_overview_url = _ao_url
+                            emit_validated_link(3, "notebooklm", _ao_url, "Audio Overview", link_kind="audio")
+                        if audio_path:
+                            save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
+                                            notebook_url=notebook_url,
+                                            audio_path=str(audio_path),
+                                            audio_overview_url=audio_overview_url)
+                    except Exception as _ar:
+                        log(f"Phase 4 audio retry failed: {_ar}", "WARN")
+                        audio_path = None
+                    continue
+                if decision == "skip":
+                    log("Phase 4: user skipped after no audio", "INFO")
+                    emit_event("phase_skipped", phase=4, reason="user_skip_after_no_audio")
+                    break
+                log(f"Phase 4: user {decision} after no audio — terminating", "INFO")
+                emit_event("pipeline_stopped", phase=4, reason=f"user_{decision}_after_no_audio")
+                return
             if audio_path:
                 _p4_user_skipped = False
                 while True:  # timeout-retry loop
@@ -17795,9 +17844,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _p4_links = [{"label": "YouTube Video", "url": youtube_url, "verified": True}]
                 emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links,
                     summary=f"Video uploaded: {youtube_url}")
-            else:
-                log("Skipping Phase 4 — no audio from Phase 3", "WARN")
-                emit_event("phase_skipped", phase=4, reason="No audio produced in Phase 3")
+            # No `else` — the no-audio case is handled by the user-decision
+            # loop above. If the user chose Skip, phase_skipped already
+            # fired with reason="user_skip_after_no_audio"; if they chose
+            # to terminate, we returned. Falling through here means audio
+            # was acquired and the success branch ran.
 
         if _controls.is_stop_or_pause():
             if _controls.is_stop():
@@ -17834,6 +17885,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # P5 (Doc + email) is owned by the FE — it picks up here from the
         # streamed pipeline_events. BE marks delivery completed so the
         # auto-retry guard doesn't re-fire a clean P4 success.
+        # Advance currentPhase so the homepage research-tile diagram
+        # stops rendering YouTube as the active node (with the brand-red
+        # glow). Without this, currentPhase stayed at 4 forever — the
+        # diagram's `node.phase === currentPhase` rule painted the
+        # YouTube node active even after phase_skipped/phase_complete.
+        # Status stays "ongoing" — FE-P5's markFeP5Completed flips it
+        # to "completed" once the Doc + email finishes.
+        _update_firestore_research({"phase": 5, "currentPhase": 5})
         update_delivery(status="completed")
         log(f"\n{'='*60}")
         log("PIPELINE COMPLETE — through Phase 4 (FE owns Phase 5 delivery)")
