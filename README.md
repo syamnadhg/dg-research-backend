@@ -13,11 +13,11 @@ Automates multi-agent deep research across 6 platforms. Tiered automation: Playw
 | Platform | Server | `--pair` | `--resurrect` / `--retire` | `--unpair` |
 |----------|--------|----------|----------------------------|------------|
 | Windows 10 / 11 | Full | Full | Full (Scheduled Task) | Full |
-| macOS | Full (manual `nohup`/`tmux`/`launchd` user agent) | Full | Planned (Track C — see `PersistenceRecipe.md`) | Step-1/3 only (no supervisor) |
-| Linux desktop (X11/Wayland) | Full (manual `nohup`/`tmux`/`systemd --user`) | Full | Planned (Track C — see `PersistenceRecipe.md`) | Step-1/3 only (no supervisor) |
+| macOS | Full (manual `nohup`/`tmux`/`launchd` user agent) | Full | Planned (Track C) | Step-1/3 only (no supervisor) |
+| Linux desktop (X11/Wayland) | Full (manual `nohup`/`tmux`/`systemd --user`) | Full | Planned (Track C) | Step-1/3 only (no supervisor) |
 | Linux headless / WSL / Docker | **Unsupported** — Chrome needs a real display + user session for CAPTCHA / 2FA / login refresh |
 
-The supervisor (`--resurrect` / `--retire`) currently uses Windows Task Scheduler. macOS launchd + Linux systemd-user are specced in `PersistenceRecipe.md` as Track C. See [Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending) below for stop-gap options.
+The supervisor (`--resurrect` / `--retire`) currently uses Windows Task Scheduler. macOS launchd + Linux systemd-user supervisors are planned (Track C). See [Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending) below for stop-gap options.
 
 ## Before you start (prerequisites checklist)
 
@@ -26,7 +26,7 @@ The supervisor (`--resurrect` / `--retire`) currently uses Windows Task Schedule
 - **Anthropic API key** with browser-automation access (`CUA_API_KEY` or `ANTHROPIC_API_KEY` — either works; see Step 2).
 - **Firebase Admin SDK key** (`firebase-service-account.json`) — emailed to you by the dev. See [Firebase Admin Key](#firebase-admin-key-required--firebase-service-accountjson).
 - **Super Research web app account** — sign in at the deployment URL the dev shares with you (Google sign-in). You'll link the backend's ResearchToken from this account during `--pair` Stage 2.
-- *(Optional)* Gemini API key for Phase 4 nano-banana thumbnails. Resend account + your own verified domain for Phase 5 email — without it, Phase 5 still produces the Google Doc; only the email-send step skips with an alert. Self-hosters should never reuse a shared deployment's Resend key.
+- *(Optional)* Gemini API key for Phase 4 nano-banana thumbnails. (Phase 5 — Google Doc creation + email — runs entirely in the frontend; no BE-side Resend setup needed.)
 
 ## Quick Start
 
@@ -185,23 +185,9 @@ export CUA_API_KEY="sk-ant-..."
 
 `GEMINI_API_KEY` is **optional** — required only for Phase 4 nano-banana thumbnail generation. If unset, Phase 4 still uploads the audio video; the thumbnail step skips with a warning. (Same canonical wording in the env-var table below.)
 
-**Phase 5 email (Resend) — OPTIONAL.** Phase 5 always generates the Google Doc; Resend only handles the optional email-delivery step. Without `RESEND_API_KEY`, Phase 5 surfaces a skippable email-send alert (`[Skip]` writes `skip_phase phase=5`) and the pipeline finishes successfully — you just don't get the email; the Doc URL is in the FE phase dropdown.
+**Phase 5 (Google Doc + email) is FE-owned.** No BE setup needed. The frontend creates the Google Doc via the Docs API and sends the email via Resend, both using the deployment's own service account + Resend key — see the FE README for that side's env vars (`RESEND_API_KEY`, `NOTIFY_FROM_EMAIL`).
 
-If you DO want email delivery from your own backend instance, sign up at [resend.com](https://resend.com), add and verify **your own domain** (5-30 min for DNS propagation), then set:
-
-```bash
-# Windows (PowerShell)
-[System.Environment]::SetEnvironmentVariable("RESEND_API_KEY", "re_...", "User")
-[System.Environment]::SetEnvironmentVariable("NOTIFY_FROM_EMAIL", "Super Research <noreply@your-domain.com>", "User")
-
-# macOS/Linux
-export RESEND_API_KEY="re_..."
-export NOTIFY_FROM_EMAIL="Super Research <noreply@your-domain.com>"
-```
-
-> **Self-hosters: do NOT reuse a shared deployment's Resend key.** The hosted Super Research deployment runs its own Resend domain for that deployment's email sends. If you're running your own backend, get your own Resend account and verify your own domain. Free tier (3K emails/month, 1 verified domain) covers typical single-user use.
-
-`BUG_REPORT_EMAIL` is also optional — see the env-var table.
+`BUG_REPORT_EMAIL` is optional — see the env-var table.
 
 ### Step 3: Run pair flow
 
@@ -296,7 +282,7 @@ Registers a Windows Scheduled Task that runs a **daemon-loop wrapper** — a tin
 
 The Account page's **Indestructible** toggle reflects the real scheduled task state (`schtasks /Query`), so the toggle survives unlink+relink. Turn it off from the same page if you ever want to stop auto-restart.
 
-> **Cross-platform supervisors** — macOS launchd + Linux systemd-user equivalents are specced in `PersistenceRecipe.md` (Track C, blocked on Track A + Track B). Until shipped, `--resurrect` is a no-op outside Windows; use the manual stop-gaps below.
+> **Cross-platform supervisors** — macOS launchd + Linux systemd-user equivalents are planned (Track C, blocked on Track A + Track B). Until shipped, `--resurrect` is a no-op outside Windows; use the manual stop-gaps below.
 
 ### Linux/Mac backgrounding (while Track C is still pending)
 
@@ -335,8 +321,6 @@ Environment=CUA_API_KEY=sk-ant-...
 WantedBy=default.target
 ```
 Then: `loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now superresearch.service`. (Yes, this is what Track C will install for you automatically.)
-
-**macOS — launchd user agent (DIY):** see `PersistenceRecipe.md` § Part 2 for a working plist template.
 
 ### Step 5b (disable On Startup): `--retire`
 
@@ -392,7 +376,7 @@ Multiple people can also share one backend. Share your ResearchToken — they pa
 | 2. Research | ChatGPT + Gemini + Claude (parallel) | ~49 min |
 | 3. Podcast | NotebookLM (upload + audio generation) | ~25 min |
 | 4. YouTube | YouTube Studio (video render + upload) | ~9 min |
-| 5. Report | Google Docs (Playwright DOM) + Resend (HTTP API) (delivery) | ~3 min |
+| 5. Report | Google Doc + email delivery (FE-owned: Docs API + Resend) | ~3 min |
 
 Times based on real run analytics. Total: ~1h 50m for a full pipeline.
 
@@ -442,7 +426,7 @@ Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, s
 - **Phase 2** — agent timeout (auto-skip with partial save if ≥200 chars; no human prompt needed since 2026-04-30 `be8f7b3`), send-button CUA fallback, paste outer-retry narration, full HV (human-verification) stage narration: detected → auto-clear 1/2 → 3 min cooldown → retry 2/2 → success/fail with Resume/Skip. HV cooldown is 180s (was 45s — providers need the time to release holds). Browser crashes auto-retry with a passive recovery banner; no Retry/Skip prompt.
 - **Phase 3** — per-agent share-link extraction failure, NotebookLM login-expired vs generic upload failure, "no MD files" gate, inter-phase gate (P2 produced no documents). Derived stems (`brief.md`, `consolidated.md`) are excluded from NotebookLM uploads via `_DERIVED_STEMS` filter (research.py:14627) — never uploads consolidated.md.
 - **Phase 4** — audio skip via command, poll-budget timeout, download-event timeout + fallback + final fail, Firebase Storage upload as best-effort (warning, not fatal)
-- **Phase 5** — ffmpeg disk-full / not-found / generic, YouTube URL extract fail, Google Doc creation fail, email bad-address / Resend HTTP error / `RESEND_API_KEY` unset / unverified `NOTIFY_FROM_EMAIL` domain, email skip via command
+- **Phase 5** — owned by FE (Doc creation + email). BE no longer surfaces P5 errors; see FE for the alert matrix.
 - **Cross-cutting** — Anthropic 429/529 narrate as retrying; other API errors surface as `pipeline_warning` on the current phase
 
 Default action on every alert is `[Retry] [Skip]`. Skip writes the unified `skip_phase phase=N` command, replacing the old `skip_phase` / `skip_phase` verbs (removed in U2). Phase-specific alerts may add `HV Resume` or `continue_anyway`. **Stop is NOT a per-phase action** — pause/stop/resume stay global in the app's chat input bar.
@@ -493,8 +477,6 @@ python research.py --resume queue_name                 # Resume stopped run
 | `MAX_WAIT_DEEP` | `90` | Max minutes to wait per Phase 2 agent |
 | `POLL_DEEP_RESEARCH` | `30` | Seconds between polling cycles |
 | `MIN_AGENT_WAIT_MIN` | `20` | Min minutes before CUA completion checks |
-| `RESEND_API_KEY` | (optional; only needed if you want Phase 5 email delivery) | Your **own** Resend API key. Without it, Phase 5 still creates the Google Doc; the email-send step shows a skippable alert. Self-hosters: sign up at resend.com and verify your own domain — don't reuse a shared deployment's key. |
-| `NOTIFY_FROM_EMAIL` | `Super Research <onboarding@resend.dev>` | From: header for Phase 5 emails. Override with your **own** verified Resend domain (e.g. `Super Research <noreply@your-domain.com>`). |
 | `BUG_REPORT_EMAIL` | (optional) | Where bug-report submissions land if FE bug-report uses the BE relay. FE has its own `BUG_REPORT_EMAIL` env on `/api/bug` — see FE README. |
 | `DG_NARRATOR_USE_HAIKU` | `1` | Enable Anthropic Haiku 4.5 as the narrator primary (Gemini Flash as fallback). Set `0` to use Flash directly. |
 | `DG_NARRATOR_HAIKU_MODEL` | `claude-haiku-4-5` | Haiku model id for the narrator. |
@@ -551,8 +533,6 @@ research-automate/
 **Anthropic workspace usage limit hit (CUA 400)** — Same fallback semantics as 401: narrator routes to Flash; CUA tier-3 is unavailable until the limit window resets (typically 24h). Pipeline keeps running on Playwright + Vision; specific platform actions that require CUA (e.g. some HV captcha clicks) may need manual help via the FE alerts.
 
 **Phase 4 audio failed but Phase 5 still matters** — Hit `[Skip]` on the Phase 4 alert (writes `skip_phase phase=4`); Phase 5 YouTube + Email proceed normally.
-
-**Phase 5 email not sending** — Alert surfaces with the specific cause (bad recipient / Resend HTTP error / `RESEND_API_KEY` unset / unverified `NOTIFY_FROM_EMAIL` domain). Hit `[Skip]` (writes `skip_phase phase=5`) to skip email but still get the Google Doc link. Verify your domain on resend.com → set `RESEND_API_KEY` + `NOTIFY_FROM_EMAIL` in BE env → restart `--serve`.
 
 **FE shows `paused_backend_restart_failed` red banner** — Backend tried to persist the in-flight queue on shutdown but the Firestore write failed. The `lastError` field on the research doc has the actual exception. Restart `--serve`; affected runs are kept on disk in `queues/` and can be resumed via the FE checkpoint banner once BE is back online.
 

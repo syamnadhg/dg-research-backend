@@ -37,7 +37,7 @@ queues/<topic>_<timestamp>/
 | 2. Research | documents/chatgpt.md, gemini.md, claude.md (parallel) |
 | 3. NLM + Audio | podcasts/*.m4a |
 | 4. YouTube | video/research_overview.mp4, thumbnail.png |
-| 5. Report | Google Doc (Playwright DOM) created + emailed via Resend; delivery.json updated with gdoc URL |
+| 5. Report | Google Doc + email delivery (FE-owned); delivery.json updated with gdoc URL |
 
 Phase 2 runs 3 parallel research agents. Each saves output as separate MD.
 delivery.json updates incrementally — frontend reads it for live link availability.

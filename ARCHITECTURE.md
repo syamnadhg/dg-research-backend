@@ -187,14 +187,9 @@ return await run_pipeline(
 
 (research.py:18006). Pre-fix, the recursive call dropped `uid/research_id/run_id`, severing the Firestore listener mid-retry. FE saw the run flatline despite BE still running.
 
-## Resend Integration (Phase 5 email)
+## Phase 5 — FE-owned
 
-Phase 5 sends the final delivery email via Resend's HTTP API:
-
-- `RESEND_API_KEY` (env, required) — Resend API key.
-- `NOTIFY_FROM_EMAIL` (env, default `Super Research <onboarding@resend.dev>`) — From: header. Override with verified domain.
-- Without `RESEND_API_KEY` set, research.py:15966-15968 logs `[Phase5] RESEND_API_KEY not set — email send skipped` and surfaces a `fail_phase` alert; the Google Doc still gets created so the user has the link via the FE.
-- Without a verified domain, Resend returns 403; surfaced as `fail_phase` with the Resend error string.
+Phase 5 (Google Doc creation + email delivery) is owned by the frontend. After P4 success, the FE picks up all accumulated links from the `pipeline_events` Firestore subcollection, creates the Doc via the Docs API, sends the email via Resend, and emits its own `phase_complete phase=5` event so the P5 dropdown populates uniformly with every other phase. BE has no Doc/email code path. See FE README + ARCHITECTURE for details on that side.
 
 ## Config
 

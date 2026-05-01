@@ -485,11 +485,6 @@ Non-negotiable: "No, it's not made for kids" + "Unlisted" + SAVE clicked. Never 
 
 To scroll inside the dialog: click the content area, then Page Down or mouse wheel."""
 
-# ── Phase 5: Google Doc + Email ───────────────────────────────────────────────
-# 2026-04-29: PROMPT_CREATE_DOC and PROMPT_SEND_EMAIL deleted. Phase 5 now uses
-# direct Playwright (no CUA) for Doc creation + Resend HTTP API for email —
-# see _create_p5_doc_via_playwright and _send_p5_email_resend in research.py.
-
 # ── Inline CUA Prompts (used as one-off fallbacks) ────────────────────────────
 
 # PROMPT_CLICK_SEND is defined earlier at top of this file (hardened with no-type guardrail)
