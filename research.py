@@ -17538,7 +17538,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # Populate keyed-aggregate slots for first-of-kind so
                     # phase dropdowns + downstream pipeline consumers find
                     # them at the canonical paths.
-                    if _kind == "notebook" and not notebook_url:
+                    if _kind == "brief" and not brief_url:
+                        # User-pasted brief link (e.g. "ChatGPT Brief:" label
+                        # in front of a chatgpt.com/share URL). Routes to
+                        # the canonical Research Brief slot so FE-P5 emits
+                        # body.brief_url and the Doc renders it under the
+                        # standard "Research Brief" HEADING_2 section,
+                        # parallel to Flow A/B's pipeline-generated brief.
+                        brief_url = _url
+                        emit_validated_link(2, "brief", _url, _label or "Research Brief")
+                    elif _kind == "notebook" and not notebook_url:
                         notebook_url = _url
                         emit_validated_link(3, "notebooklm", _url, _label or "NotebookLM Notebook")
                     elif _kind == "youtube" and not youtube_url:
