@@ -1266,11 +1266,14 @@ def _start_device_command_listener(uid: str, device_id: str):
                     continue
 
             action = (data.get("action") or "").strip()
-            log(f"[device-cmds] received action={action!r} doc={doc.id} (handlers wired in C2)")
+            log(f"[device-cmds] received action={action!r} doc={doc.id}")
 
-            # Tail-delete: device commands are one-shot. Removing the doc
-            # immediately stops any future serve from re-processing it
-            # AND keeps the subcollection from growing unbounded.
+            # Tail-delete BEFORE acting on the command. If we instead
+            # delete after, the brief window between handler-start and
+            # delete is one where a quick reattach (e.g. SDK reconnect)
+            # could observe and re-fire the same command. For
+            # hard_reset specifically, deleting first also means the
+            # *new* serve that respawns won't re-see it.
             try:
                 doc.reference.delete()
             except Exception as _de:
@@ -1282,6 +1285,61 @@ def _start_device_command_listener(uid: str, device_id: str):
                 except Exception:
                     pass
                 log(f"[device-cmds] doc cleanup failed for {doc.id}: {_de}", "WARN")
+
+            # ── Action dispatch ──
+            if action == "hard_reset":
+                # FE asked to fully reset the backend. Sequence:
+                #   1. Touch the active run's .stop sentinel so the new
+                #      --serve doesn't auto-resume it after respawn
+                #      (matches how the research-scoped stop action
+                #      writes the sentinel at line ~2278). Best-effort:
+                #      if no run is active, skip silently.
+                #   2. Wait up to 5s for any in-flight Storage upload
+                #      to drain — see _wait_for_uploads_to_settle.
+                #      Without this, an os._exit during a P3 audio
+                #      blob.upload_from_filename leaves a half-written
+                #      blob whose Firestore audios/{id} doc already
+                #      points at it.
+                #   3. Schedule os._exit via _schedule_server_exit with
+                #      a 1.5s grace (shorter than the 3s default for
+                #      research stop because we have less to ack —
+                #      no pipeline_stopped emit owed). The daemon-
+                #      loop's blocking subprocess.run sees the exit,
+                #      sleeps 5s + the new C0a port-free probe, then
+                #      respawns --serve. Total cycle ~7-12s.
+                #
+                # We deliberately do NOT use loop.call_soon_threadsafe
+                # to set _controls.request_stop here — the process exit
+                # is the authoritative stop, and the device-cmd
+                # listener doesn't have an asyncio loop reference.
+                # File-sentinel + os._exit is the contract.
+                try:
+                    if _tracks_dir is not None:
+                        _stop_path = Path(__file__).parent / "queues" / _tracks_dir.name / ".stop"
+                        try:
+                            _stop_path.touch()
+                            log(f"[device-cmds] HARD_RESET: marked .stop on active run {_tracks_dir.name}")
+                        except Exception as _se:
+                            log(f"[device-cmds] HARD_RESET: .stop touch failed: {_se}", "WARN")
+                except NameError:
+                    # _tracks_dir might not be defined yet on this serve
+                    # (boot-time hard_reset before any run has started).
+                    pass
+                try:
+                    residual = _wait_for_uploads_to_settle(max_wait_s=5.0)
+                    if residual > 0:
+                        log(f"[device-cmds] HARD_RESET: {residual} upload(s) still in flight after 5s — exiting anyway", "WARN")
+                    else:
+                        log("[device-cmds] HARD_RESET: uploads drained")
+                except Exception as _ue:
+                    log(f"[device-cmds] HARD_RESET: upload-settle check failed: {_ue}", "WARN")
+                log("[device-cmds] HARD_RESET: scheduling exit in 1.5s — daemon-loop will respawn")
+                _schedule_server_exit("device-hard-reset", delay_sec=1.5)
+                continue
+
+            # Unknown action — already logged above and the doc is
+            # already deleted. No-op past this point so future actions
+            # can be slotted in as elif branches.
 
     try:
         _device_cmd_watch = col_ref.on_snapshot(_on_snap)
@@ -19330,13 +19388,19 @@ async def run_server(port=8000):
         worker_task.cancel()
         if heartbeat_task:
             heartbeat_task.cancel()
-        global _token_relink_watch
+        global _token_relink_watch, _device_cmd_watch
         if _token_relink_watch is not None:
             try:
                 _token_relink_watch.unsubscribe()
             except Exception:
                 pass
             _token_relink_watch = None
+        if _device_cmd_watch is not None:
+            try:
+                _device_cmd_watch.unsubscribe()
+            except Exception:
+                pass
+            _device_cmd_watch = None
         # Mark the token offline on shutdown as a hint — the authoritative
         # online/offline signal is heartbeat age on the device doc, which
         # ages past the 60s threshold naturally when the serve stops. We do
