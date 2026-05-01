@@ -220,14 +220,14 @@ Enable On Startup? [Y/n]:
 - **`n`** — skip; you'll run `python research.py --serve` manually after `--pair` finishes (and, on Linux/Mac, set up your own backgrounding via `nohup` / `tmux` / `screen` / your own systemd unit — see [§ Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending)).
 
 **`[4/4] Platform logins`**
-Opens 7 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds:
+Opens 5 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds:
 - ChatGPT (chatgpt.com)
 - Gemini (gemini.google.com)
 - Claude (claude.ai)
 - NotebookLM (notebooklm.google.com)
 - YouTube Studio (studio.youtube.com)
-- Gmail (mail.google.com)
-- Google Docs (docs.google.com)
+
+> Phase 5 (Doc + email) runs in the frontend now, so Gmail and Google Docs are no longer in the BE login checklist.
 
 The checklist re-renders only when a platform flips — `[ok]` for logged in, `[  ]` for not yet. It also mirrors the live state to Firestore (`research_tokens/{token}.logins`, `setupState`) so the app can show your progress. Default timeout is 10 minutes; Ctrl+C cancels.
 
@@ -235,7 +235,7 @@ The checklist re-renders only when a platform flips — `[ok]` for logged in, `[
 
 ### Step 4: After pair succeeds
 
-When all 7 are `[ok]`, the flow:
+When all 5 are `[ok]`, the flow:
 
 1. Closes the browser
 2. Writes `research_config.json` locally (if not already present)
@@ -244,7 +244,7 @@ When all 7 are `[ok]`, the flow:
 
 You'll see a final banner explaining this:
 ```
-PAIR COMPLETE — all 7 platforms verified.
+PAIR COMPLETE — all 5 platforms verified.
 
 What happens now:
   · Browser has been closed.
@@ -394,7 +394,7 @@ Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min
 
 ## Phase 0 verification (sequential, Apr 19; 2026-04-24 simplified)
 
-Preflight walks platforms one at a time instead of opening 7 tabs at once. For each enabled platform:
+Preflight walks platforms one at a time instead of opening all tabs at once. For each enabled platform:
 
 1. **Tab open** — opens that one tab, waits 4s for SPA hydration, checks URL for known login hosts.
 2. **CUA vision verification** if URL check is ambiguous.

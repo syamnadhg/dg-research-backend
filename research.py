@@ -16419,8 +16419,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         _need_claude = _agents_cfg.get("claude", True)
         _need_notebooklm = 3 not in skip_phases
         _need_youtube = 4 not in skip_phases and config.get("videoEnabled", True) if isinstance(config, dict) else 4 not in skip_phases
-        _need_gmail = 5 not in skip_phases and config.get("emailEnabled", True) if isinstance(config, dict) else 5 not in skip_phases
-        _need_gdocs = 5 not in skip_phases
+        # P5 (Doc + email) is FE-owned post-2026-04-30 — BE no longer
+        # opens Google Docs or Gmail, so neither needs login verification
+        # in the BE preflight. Removed from the platform list.
 
         preflight_platforms = []
         if _need_chatgpt:    preflight_platforms.append(("ChatGPT", "chatgpt"))
@@ -16428,8 +16429,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         if _need_claude:     preflight_platforms.append(("Claude", "claude"))
         if _need_notebooklm: preflight_platforms.append(("NotebookLM", "notebooklm"))
         if _need_youtube:    preflight_platforms.append(("YouTube Studio", "youtube"))
-        if _need_gmail:      preflight_platforms.append(("Gmail", "gmail"))
-        if _need_gdocs:      preflight_platforms.append(("Google Docs", "gdocs"))
 
         # Honor the user's preference (global Settings → Pipeline → Skip
         # login verification, plus any per-run override in pipeline_config).
@@ -19241,8 +19240,8 @@ async def run_pair(profile_dir, wait_minutes=10):
         ("Claude",         "https://claude.ai",             "claude"),
         ("NotebookLM",     "https://notebooklm.google.com", "notebooklm"),
         ("YouTube Studio", "https://studio.youtube.com",    "youtube"),
-        ("Gmail",          "https://mail.google.com",       "gmail"),
-        ("Google Docs",    "https://docs.google.com",       "gdocs"),
+        # Gmail + Google Docs dropped 2026-04-30 — P5 is FE-owned,
+        # BE no longer drives either platform.
     ]
     # ── Sequential per-platform login (cookie fast-path + press-Enter) ─────
     # SETUP-2026-04-19: replaces the earlier bulk-open-then-batch-verify
