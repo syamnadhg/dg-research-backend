@@ -19892,8 +19892,10 @@ def _wait_for_port_free(port: int, max_wait_s: float = 10.0) -> bool:
     real --serve subprocess will bind without REUSEADDR moments later,
     so a probe success guarantees uvicorn won't hit EADDRINUSE."""
     import socket as _socket
-    deadline = _time.time() + max_wait_s
-    while _time.time() < deadline:
+    import time as _t  # `_time` is only imported inside run_daemon_loop;
+                       # this helper runs module-level so it imports its own.
+    deadline = _t.time() + max_wait_s
+    while _t.time() < deadline:
         sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
         try:
             sock.bind(("0.0.0.0", port))
@@ -19901,7 +19903,7 @@ def _wait_for_port_free(port: int, max_wait_s: float = 10.0) -> bool:
             return True
         except OSError:
             sock.close()
-            _time.sleep(0.5)
+            _t.sleep(0.5)
     return False
 
 
@@ -20021,6 +20023,10 @@ def run_daemon_loop(port: int = 8000):
         # any orphan --serve PIDs first, then poll the port for up
         # to 10s. If still blocked, log and proceed anyway —
         # subprocess.run's failure logs will reveal the real cause.
+        # Wrapped in the same KeyboardInterrupt handler shape as the
+        # surrounding subprocess.run / sleep blocks so a Ctrl-C lands
+        # in `_wait_for_port_free`'s inner sleep doesn't escape and
+        # crash the wrapper.
         try:
             stale_serve: list[int] = []
             for pid, _cmd, role in _enumerate_research_py_procs():
@@ -20029,10 +20035,13 @@ def run_daemon_loop(port: int = 8000):
             if stale_serve:
                 killed = _kill_pids(stale_serve)
                 log(f"[daemon-loop] Pre-restart sweep: killed {killed}/{len(stale_serve)} stale --serve procs ({stale_serve})")
+            if not _wait_for_port_free(port, max_wait_s=10.0):
+                log(f"[daemon-loop] Port {port} still in use after 10s — spawning anyway; uvicorn will surface the cause", "WARN")
+        except KeyboardInterrupt:
+            log("[daemon-loop] Interrupted during pre-restart sweep — exiting wrapper")
+            return
         except Exception as _se:
-            log(f"[daemon-loop] Pre-restart sweep failed: {_se}", "WARN")
-        if not _wait_for_port_free(port, max_wait_s=10.0):
-            log(f"[daemon-loop] Port {port} still in use after 10s — spawning anyway; uvicorn will surface the cause", "WARN")
+            log(f"[daemon-loop] Pre-restart sweep/probe failed: {_se}", "WARN")
 
 
 def _write_supervised_flag(enabled: bool):
