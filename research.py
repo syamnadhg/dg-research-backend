@@ -4803,10 +4803,33 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
     return LinkResult(url=url, label="NotebookLM Notebook", platform="notebooklm", verified=verified)
 
 
-async def extract_youtube_url(browser, cua_client, verbose=False, **_):
-    """Extract YouTube video URL after upload."""
-    page = browser.page
+async def extract_youtube_url(browser, cua_client, verbose=False, target_page=None, **_):
+    """Extract YouTube video URL after upload.
+
+    B1 (2026-05-01): accepts an explicit `target_page` (the YouTube Studio
+    tab captured by run_phase4). Without this arg, the function fell back to
+    `browser.page` — a stale "last-active tab" pointer. When the Studio tab
+    crashed/closed, browser.page resolved to the NotebookLM tab and the CUA
+    fallback below typed its directive ("Find the YouTube video URL.") into
+    NLM's chat box (which CUA paraphrased to a longer "Find any YouTube URL
+    mentioned in the sources" prompt the user saw in the screenshots).
+    """
+    page = target_page or browser.page
     url = ""
+    if not page:
+        return LinkResult(url="", label="YouTube Video", platform="youtube",
+                          verified=False, error="no_studio_page_reference")
+    # Tab-identity guard — never run YT extraction on a non-YT tab.
+    try:
+        cur_url = page.url or ""
+    except Exception:
+        cur_url = ""
+    if not any(s in cur_url for s in ("studio.youtube.com", "youtube.com/watch", "youtu.be")):
+        log(f"[YouTube] extract_youtube_url called on wrong tab: {cur_url[:120]} — aborting", "ERROR")
+        emit_event("wrong_tab_extract_aborted", phase=4, agent="youtube",
+                   url=cur_url[:200])
+        return LinkResult(url="", label="YouTube Video", platform="youtube",
+                          verified=False, error=f"wrong_tab:{cur_url[:80]}")
     try:
         # Look for video URL in Studio
         for sel in ['a[href*="youtu.be"]', 'a[href*="youtube.com/watch"]',
@@ -4821,6 +4844,13 @@ async def extract_youtube_url(browser, cua_client, verbose=False, **_):
             if "youtu" in clip:
                 url = clip
         if not url:
+            # Bring the Studio tab to front so CUA's screenshot path targets
+            # the correct tab — without this, agent_loop's screenshots could
+            # capture whichever tab Playwright last activated.
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
             result = await agent_loop(cua_client, browser,
                 "Find the YouTube video URL.",
                 "The video was just uploaded. Find and tell me the full YouTube video URL (youtu.be or youtube.com/watch link).",
@@ -7858,22 +7888,47 @@ def _is_sources_not_document(text, *, platform="generic"):
 
     Heuristics (a doc passes if prose check holds; a source artifact must
     trip checklist OR url-list signals AND lack prose):
+      STRONG-DOC    : >=4000 chars AND >=2 headings AND any paragraph
+                      >=200 chars  → False (always accept long prose docs)
       DOC POSITIVE  : >=3 markdown headings AND >=5 paragraphs >100 chars
+      MODERN MARKER : "Research complete · N sources" in text AND >=2
+                      headings → False (Claude's 1-artifact layout)
       CHECKLIST NEG : >=4 [x]/[ ] OR >=4 "Reading source N" lines AND
-                      heading count <2 AND length < 5000
+                      heading count <2 AND length < 5000 AND
+                      checkbox/total-lines ratio > 15% → True
       URL-LIST NEG  : >=8 numbered-URL/bare-hostname lines AND headings <2
                       AND length 800-3000
+
+    A1 (2026-05-01): added STRONG-DOC override + MODERN MARKER sentinel +
+    checklist-ratio gate. Final research reports may include a methodology
+    section with a few checkboxes; the old length-only rejection rule
+    (len<5000 + checkbox>=4 + headings<2) could mis-fire on dense reports
+    that happened to land below 5000 chars during a partial render. The
+    new ratio gate blocks rejection unless checkboxes dominate the body.
     """
     if not text or len(text) < 200:
         return False
     headings = len(re.findall(r'(?m)^#{1,3}\s+\S', text))
     paragraphs = [p for p in text.split('\n\n') if len(p) > 100]
+    # STRONG-DOC: clearly long-form prose with at least minimal structure.
+    if len(text) >= 4000 and headings >= 2 and any(len(p) >= 200 for p in paragraphs):
+        return False
     if headings >= 3 and len(paragraphs) >= 5:
+        return False
+    # MODERN MARKER: Claude's 1-artifact "Research complete · N sources"
+    # layout — if the marker is present alongside any meaningful structure,
+    # the artifact is definitely the final report (the tracking checklist
+    # never carries this exact marker phrase).
+    if re.search(r'research\s+complete(?:d)?\s*[·•—\-\s]+\d[\d,]*\s+sources?', text, re.I) \
+            and headings >= 2:
         return False
     checkbox_lines = len(re.findall(r'(?m)^\s*[-*]?\s*\[[ xX]\]\s+\S', text))
     reading_lines = len(re.findall(
         r'(?im)^\s*(?:reading|checking|analyzing|searching)\s+(?:source\s+)?\d+', text))
-    if (checkbox_lines >= 4 or reading_lines >= 4) and headings < 2 and len(text) < 5000:
+    total_nonempty = max(1, len([l for l in text.splitlines() if l.strip()]))
+    checklist_ratio = checkbox_lines / total_nonempty
+    if (checkbox_lines >= 4 or reading_lines >= 4) and headings < 2 and len(text) < 5000 \
+            and (checkbox_lines < 4 or checklist_ratio > 0.15 or reading_lines >= 4):
         return True
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     url_only = sum(
@@ -11823,6 +11878,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         _claude_completion_marker = False
                     if _claude_completion_marker:
                         log(f"[Claude] Modern completion marker detected — accepting 1-artifact layout (art_count={_art_count})", "INFO")
+                        # A1: telemetry so we can see how often this layout fires
+                        # in the wild vs the legacy 2-artifact path.
+                        try:
+                            emit_event("agent_completion_detected", phase=2, agent="claude",
+                                       layout="1-artifact-modern", art_count=_art_count)
+                        except Exception:
+                            pass
                         # Fall through to extraction (skip both gates below).
                     elif _art_count < 2 and elapsed < (max_wait_min * 60 * 0.8):
                         log(f"[Claude] CUA says done but only {_art_count} artifact(s) at "
@@ -12633,7 +12695,22 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         log(f"[{label}] Post-completion: opening artifact[{target_idx}] (final report)")
         clicked = await _click_claude_artifact(page, index=target_idx)
         if clicked:
-            await asyncio.sleep(2)  # Wait for panel render
+            # A1 (2026-05-01): replaced fixed 2s sleep with a content-driven
+            # wait — yields fast on a normal mount, gives slow renders up
+            # to 8s before falling through to CUA. The brittle sleep was a
+            # likely contributor to repeated 0-char extractions when the
+            # panel was visually open but content hadn't streamed in yet.
+            try:
+                await page.wait_for_selector(
+                    'aside [class*="markdown"], aside .prose, '
+                    '[class*="artifact-panel"] [class*="markdown"], '
+                    '[class*="artifact-panel"] .prose',
+                    timeout=8000)
+            except Exception:
+                # Selector never appeared — fall back to a short fixed
+                # delay so we still try to read SOMETHING below before
+                # abandoning the DOM tier.
+                await asyncio.sleep(1.5)
             panel_text = await _read_claude_artifact_panel(page)
             if panel_text and len(panel_text) > 500:
                 if _is_sources_not_document(panel_text, platform="claude"):
@@ -12820,6 +12897,22 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
     """Publish the currently-open Claude artifact and return its public URL.
     Call this AFTER extract_claude_response while the artifact panel is still open."""
     try:
+        # A1 (2026-05-01): wait up to 12s for the publish/share button to
+        # mount before falling through to JS evaluate. Without this, the
+        # JS query at first call returned empty when the panel was still
+        # animating, immediately escalating to CUA — slow and brittle.
+        try:
+            await page.wait_for_selector(
+                'aside button[aria-label*="Publish"], '
+                'aside button[aria-label*="Share"], '
+                '[class*="artifact"] button[aria-label*="Publish"], '
+                '[class*="artifact"] button[aria-label*="Share"], '
+                'button[data-testid="publish-artifact"]',
+                timeout=12000)
+        except Exception:
+            log("[Claude] Publish/Share button never mounted within 12s — "
+                "falling through to JS query (may still find icon-only variant)",
+                "WARN")
         # Try DOM-first: click publish button on the artifact panel
         clicked = await page.evaluate("""() => {
             // Multiple selector strategies for the publish/share button
@@ -15365,14 +15458,21 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         try:
             dur_sec = 0
             try:
-                _probe = subprocess.run(
+                # B2 (2026-05-01): wrap sync subprocess in asyncio.to_thread so
+                # the asyncio event loop (and _heartbeat_loop on the same loop)
+                # keeps ticking. Without this, ffprobe blocked the loop for up
+                # to 5s — 1/3 of the 15s offline threshold.
+                _probe = await asyncio.to_thread(
+                    subprocess.run,
                     ["ffprobe", "-v", "quiet", "-show_entries",
                      "format=duration", "-of", "csv=p=0", str(audio_path)],
                     capture_output=True, text=True, timeout=5)
                 dur_sec = int(float(_probe.stdout.strip()))
             except Exception:
                 pass
-            audio_url = upload_audio_to_storage(audio_path)
+            # B2: Firebase Storage upload (50-100MB on slow uplinks) was the
+            # biggest single blocker — easily blew past the 15s offline window.
+            audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
             # Use the filename stem as doc id so re-runs upsert in place
             # instead of stacking duplicates. Display name = research
             # title from Firestore (set by FE's /api/title early in P1)
@@ -15382,7 +15482,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # smart_title falls back to a stem-derived topic with
             # underscores swapped for spaces — still readable.
             display_name = smart_title(audio_path.stem.replace("_", " "))
-            save_audio_to_firestore(audio_path.stem, display_name, dur_sec, audio_url)
+            # B2: sync Firestore .set() — small payload but on slow links
+            # still worth offloading.
+            await asyncio.to_thread(save_audio_to_firestore,
+                                    audio_path.stem, display_name, dur_sec, audio_url)
             # Storage upload is best-effort — local playback still works via
             # the backend, and Phase 5 can still upload to YouTube from the
             # local file. Warn (not error) if it failed.
@@ -15644,49 +15747,85 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                status="rendering_thumbnail",
                progress="Generating video thumbnail (Gemini Imagen)…")
     title_card = queue_dir / "thumbnail.png"
-    generate_thumbnail(topic, title_card)
+    # B2 (2026-05-01): generate_thumbnail uses sync requests.post(timeout=60).
+    # That blocked the asyncio loop for up to 60s before ffmpeg even started,
+    # double-counting toward the 15s offline threshold along with the ffmpeg
+    # encode that follows.
+    await asyncio.to_thread(generate_thumbnail, topic, title_card)
 
     # ffmpeg: audio + title card → MP4
+    # C2 (2026-05-01): wrapped in user-decision retry loop so Retry button
+    # actually retries the encode. Mirrors the post-upload extract retry
+    # pattern at run_pipeline P4 link-extract loop (~line 18055). Without
+    # await_phase_decision, fail_phase set retry_phase_requested[4]=True
+    # but no coroutine consumed it → Retry click was silently dropped.
     video_path = video_dir / "research_overview.mp4"
     emit_event("agent_progress", phase=4, agent="youtube",
                status="wrapping_video",
                progress="Wrapping audio + thumbnail into MP4 (ffmpeg)…")
     log("Converting audio to video (ffmpeg)...")
-    try:
-        cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", "2", "-i", str(title_card),
-               "-i", str(audio_path), "-c:v", "libx264", "-tune", "stillimage",
-               "-c:a", "aac", "-b:a", "192k", "-r", "2", "-pix_fmt", "yuv420p",
-               "-shortest", str(video_path)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if r.returncode != 0:
-            log(f"ffmpeg error: {r.stderr[:300]}", "ERROR")
-            # Disk-full is a common cause — call it out if the stderr
-            # mentions it so the user knows to clear space.
-            _err_tail = (r.stderr or "")[-300:]
-            if "no space" in _err_tail.lower() or "disk full" in _err_tail.lower() or "enospc" in _err_tail.lower():
-                fail_phase(4, "Disk full while writing video",
-                           f"Free up space and Retry. Details: {_err_tail[:200]}",
+    ffmpeg_attempt = 0
+    while True:
+        ffmpeg_attempt += 1
+        try:
+            cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", "2", "-i", str(title_card),
+                   "-i", str(audio_path), "-c:v", "libx264", "-tune", "stillimage",
+                   "-c:a", "aac", "-b:a", "192k", "-r", "2", "-pix_fmt", "yuv420p",
+                   "-shortest", str(video_path)]
+            # B2 (2026-05-01): offload the long-running ffmpeg encode (can be
+            # 60-180s on a 50min audio) into a worker thread so the asyncio
+            # event loop keeps ticking — heartbeat, command listener, and
+            # narration ticker all stay alive during the encode.
+            r = await asyncio.to_thread(
+                subprocess.run, cmd,
+                capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                log(f"ffmpeg error (attempt {ffmpeg_attempt}): {r.stderr[:300]}", "ERROR")
+                # Disk-full is a common cause — call it out if the stderr
+                # mentions it so the user knows to clear space.
+                _err_tail = (r.stderr or "")[-300:]
+                if "no space" in _err_tail.lower() or "disk full" in _err_tail.lower() or "enospc" in _err_tail.lower():
+                    fail_phase(4, "Disk full while writing video",
+                               f"Free up space and Retry. Details: {_err_tail[:200]}",
+                               agent="youtube")
+                else:
+                    fail_phase(4, "ffmpeg failed to build the video",
+                               f"Phase 4 video wrap step crashed (attempt {ffmpeg_attempt}). Details: {_err_tail[:200]}",
+                               agent="youtube")
+            else:
+                log(f"Video: {video_path} ({video_path.stat().st_size / 1024 / 1024:.1f}MB)")
+                break  # success — exit retry loop
+        except Exception as e:
+            log(f"ffmpeg failed (attempt {ffmpeg_attempt}): {e}", "ERROR")
+            _err_msg = str(e)
+            _low = _err_msg.lower()
+            if "no space" in _low or "enospc" in _low:
+                fail_phase(4, "Disk full",
+                           f"Free up space and Retry. Details: {_err_msg[:200]}",
+                           agent="youtube")
+            elif "executable" in _low or "not found" in _low or "winerror 2" in _low:
+                fail_phase(4, "ffmpeg not on PATH",
+                           f"Install ffmpeg and Retry. Details: {_err_msg[:200]}",
                            agent="youtube")
             else:
-                fail_phase(4, "ffmpeg failed to build the video",
-                           f"Phase 4 video wrap step crashed. Details: {_err_tail[:200]}",
-                           agent="youtube")
+                fail_phase(4, "ffmpeg crashed", _err_msg[:200], agent="youtube")
+
+        # fail_phase fired — block on user's decision so Retry actually retries.
+        decision = await _controls.await_phase_decision(4)
+        if decision == "retry":
+            log(f"[Phase4] ffmpeg: user requested retry (attempt {ffmpeg_attempt + 1})", "INFO")
+            emit_event("phase_restart", phase=4, reason="user_retry_after_ffmpeg_fail",
+                       attempt=ffmpeg_attempt)
+            emit_event("agent_progress", phase=4, agent="youtube",
+                       status="wrapping_video",
+                       progress=f"Wrapping audio + thumbnail (retry {ffmpeg_attempt + 1})…")
+            continue
+        if decision == "skip":
+            log("[Phase4] ffmpeg: user skipped — proceeding without video", "INFO")
+            emit_event("phase_skipped", phase=4, reason="user_skip_after_ffmpeg_fail")
             return {"youtube_url": ""}
-        log(f"Video: {video_path} ({video_path.stat().st_size / 1024 / 1024:.1f}MB)")
-    except Exception as e:
-        log(f"ffmpeg failed: {e}", "ERROR")
-        _err_msg = str(e)
-        _low = _err_msg.lower()
-        if "no space" in _low or "enospc" in _low:
-            fail_phase(4, "Disk full",
-                       f"Free up space and Retry. Details: {_err_msg[:200]}",
-                       agent="youtube")
-        elif "executable" in _low or "not found" in _low or "winerror 2" in _low:
-            fail_phase(4, "ffmpeg not on PATH",
-                       f"Install ffmpeg and Retry. Details: {_err_msg[:200]}",
-                       agent="youtube")
-        else:
-            fail_phase(4, "ffmpeg crashed", _err_msg[:200], agent="youtube")
+        log(f"[Phase4] ffmpeg: user {decision} — terminating pipeline", "INFO")
+        emit_event("pipeline_stopped", phase=4, reason=f"user_{decision}_after_ffmpeg_fail")
         return {"youtube_url": ""}
 
     # Upload to YouTube
@@ -15695,6 +15834,9 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                status="opening_studio",
                progress="Opening YouTube Studio…")
     page = await browser.new_tab("https://studio.youtube.com")
+    studio_page = page  # B1: keep an explicit reference so extract_youtube_url
+                        # operates on Studio even if browser.page later flips
+                        # back to NotebookLM or some other tab.
     await asyncio.sleep(4)
 
     # Early HV check — YouTube Studio can throw Google's account-challenge
@@ -15961,7 +16103,10 @@ Do NOT report studio.youtube.com URLs — those are NOT video links.""",
     # Keep all generated files (audio, video, thumbnail) — used by web app
     log(f"Files preserved in queue: {queue_dir}")
 
-    return {"youtube_url": youtube_url}
+    # B1: studio_page is included so the outer caller can pass it to
+    # extract_youtube_url as target_page. Prevents CUA fallback from typing
+    # into whichever tab Playwright last activated (e.g. NotebookLM).
+    return {"youtube_url": youtube_url, "studio_page": studio_page}
 
 
 # ── Checkpoint & Resume ───────────────────────────────────────────────────────
@@ -17899,7 +18044,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 update_delivery(audio_url=_audio_link)
                 if audio_overview_url:
                     emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview", link_kind="audio")
-            save_meta(queue_dir, topic, 3)
+            # B2: save_meta runs ffprobe per podcast file inline (5s/file).
+            # Wrap so the per-file probes don't starve the heartbeat.
+            await asyncio.to_thread(save_meta, queue_dir, topic, 3)
             # Build Phase 3 links — include both notebook and audio overview
             # Only include links that pass validation (no fake/placeholder URLs)
             _p3_links = []
@@ -18057,6 +18204,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             phase=4, agent="youtube", browser=browser, cua_client=cua_client,
                             extractor_fn=extract_youtube_url,
                             label="YouTube Video", verbose=verbose,
+                            # B1: pass the Studio tab through so extract_youtube_url
+                            # operates on it explicitly (and aborts cleanly if
+                            # browser.page has flipped to NotebookLM or elsewhere).
+                            target_page=p5.get("studio_page"),
                         )
                         if yt_res.verified:
                             youtube_url = yt_res.url
@@ -18085,7 +18236,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 save_checkpoint(queue_dir, 4, topic=topic, brief_url=brief_url,
                                 notebook_url=notebook_url, youtube_url=youtube_url)
                 update_delivery(youtube_url=youtube_url)
-                save_meta(queue_dir, topic, 4)
+                # B2: see same wrap in P3 success path.
+                await asyncio.to_thread(save_meta, queue_dir, topic, 4)
                 _p4_links = [{"label": "YouTube Video", "url": youtube_url, "verified": True}]
                 emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links,
                     summary=f"Video uploaded: {youtube_url}")
