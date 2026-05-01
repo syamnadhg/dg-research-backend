@@ -1272,6 +1272,49 @@ def get_expected_minutes(phase: int) -> int:
     return _DEFAULT_PHASE_MINUTES.get(phase, 10)
 
 
+# Counter of in-flight Storage uploads, protected by a lock for thread-
+# safe inc/dec. The hard-reset handler waits briefly for this to drop to
+# zero before triggering os._exit so that an in-progress audio/.m4a
+# upload doesn't end up half-written in the bucket while its Firestore
+# audios/{id} doc points at the partial blob. Anything that uploads to
+# Storage on the user's behalf should bracket the call with this
+# counter — only audio uploads do today (album-art is FE-side).
+import threading as _threading
+_inflight_uploads_lock = _threading.Lock()
+_inflight_uploads = 0
+
+
+def _begin_storage_upload() -> None:
+    global _inflight_uploads
+    with _inflight_uploads_lock:
+        _inflight_uploads += 1
+
+
+def _end_storage_upload() -> None:
+    global _inflight_uploads
+    with _inflight_uploads_lock:
+        if _inflight_uploads > 0:
+            _inflight_uploads -= 1
+
+
+def _wait_for_uploads_to_settle(max_wait_s: float = 5.0, poll_s: float = 0.1) -> int:
+    """Block until _inflight_uploads == 0 or the deadline fires. Returns
+    the count remaining at the end (0 if drained, >0 if we timed out).
+    Used by the hard-reset path so a kill that lands mid-upload waits a
+    few seconds for the upload to finish rather than truncating it.
+    Caller decides what to do if the count is still nonzero — typically
+    log + proceed (the BE shutdown is the user's primary intent)."""
+    import time as _t
+    deadline = _t.time() + max_wait_s
+    while _t.time() < deadline:
+        with _inflight_uploads_lock:
+            if _inflight_uploads <= 0:
+                return 0
+        _t.sleep(poll_s)
+    with _inflight_uploads_lock:
+        return _inflight_uploads
+
+
 def upload_audio_to_storage(local_path: "Path") -> str | None:
     """Upload the NotebookLM audio file to Firebase Storage and return a
     public download URL. Path is scoped under the user's uid + researchId so
@@ -1282,6 +1325,7 @@ def upload_audio_to_storage(local_path: "Path") -> str | None:
         return None
     if not local_path or not local_path.exists():
         return None
+    _begin_storage_upload()
     try:
         from firebase_admin import storage as _fb_storage
         # Object path mirrors the Firestore layout for easy reasoning.
@@ -1304,6 +1348,8 @@ def upload_audio_to_storage(local_path: "Path") -> str | None:
     except Exception as e:
         log(f"Audio upload to Firebase Storage failed: {e}", "WARN")
         return None
+    finally:
+        _end_storage_upload()
 
 
 def save_audio_to_firestore(audio_id: str, name: str, duration_sec: int, audio_url: str | None):
