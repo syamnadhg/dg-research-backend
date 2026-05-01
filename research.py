@@ -18752,7 +18752,24 @@ async def run_server(port=8000):
         # rehydration raised partway through.
         _rehydrated_rids: "set[str]" = set()
         if paired_uid:
-            write_device_doc(paired_uid, token)
+            # Hard 15s ceiling on the device-doc write so a stalled
+            # Firestore gRPC channel (auth-token refresh / Watch back-
+            # pressure on a busy account) can't park startup forever
+            # before `await server.serve()` binds port 8000. Pre-fix
+            # symptom: BE log reaches "[orphan-sweep] started" then
+            # never emits "Device doc updated", uvicorn never binds,
+            # FE renders BE as offline indefinitely. Heartbeat retries
+            # the device write every 5s anyway, so a timeout here is
+            # purely a recovery latency cost (next tick fixes it).
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(write_device_doc, paired_uid, token),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                log("[startup] write_device_doc timed out — heartbeat will retry on next tick", "WARN")
+            except Exception as _wd_e:
+                log(f"[startup] write_device_doc failed: {_wd_e} — heartbeat will retry", "WARN")
             # Queue rehydration: recover runs that were queued or mid-run when
             # the previous daemon process died. Queued jobs re-enter the in-
             # memory queue; mid-run jobs can't safely resume (browser/CUA state
