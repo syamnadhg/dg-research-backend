@@ -114,7 +114,6 @@ PHASE_2_MAX_MIN = int(os.environ.get("PHASE_2_MAX_MIN", "90"))   # 3 agents in p
 # (was two sub-step ceilings of 15m + 20m). One ceiling, one alert.
 PHASE_3_MAX_MIN = int(os.environ.get("PHASE_3_MAX_MIN", "40"))
 PHASE_4_MAX_MIN = int(os.environ.get("PHASE_4_MAX_MIN", "15"))   # ffmpeg + YouTube
-PHASE_5_MAX_MIN = int(os.environ.get("PHASE_5_MAX_MIN", "10"))   # GDoc + email
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -662,7 +661,7 @@ def normalize_agent_key(name):
 _firebase_db = None     # Firestore client (module-level, init once)
 _fb_uid = None          # Per-run: user ID for Firestore path
 _fb_research_id = None  # Per-run: research ID for Firestore path
-_fb_seq = 0             # Per-run: monotonic event sequence number
+_fb_seq = 0             # Per-run: last-emitted seq (monotonic guard; ms-based)
 _fb_listener = None     # Per-run: command listener unsubscribe handle
 _research_token = None  # ResearchToken: this backend instance's unique ID
 
@@ -1908,11 +1907,23 @@ def _emit_to_firestore(event):
     would otherwise hit ~1.5 MB / run × N users → linear-storage growth.
     Completed-run replay reads from the parent message doc + agents map,
     not the event log, so 30-day pruning is invisible to UX.
+
+    `seq` uses millisecond timestamps (Date.now()-equivalent) so the FE's
+    `where("seq", ">", lastSeq)` filter correctly orders BE-emitted events
+    relative to FE-side emits (FE-P5 uses Date.now() + offset). The prior
+    per-run 0-based counter caused FE to silently drop post-resume BE
+    events because lastSeq in localStorage had advanced past them via
+    FE-P5's Date.now()-based emits in an earlier session. `_fb_seq` is
+    kept as the monotonic guard so multiple emits in the same millisecond
+    still get strictly-increasing seq values.
     """
     global _fb_seq
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return
-    _fb_seq += 1
+    new_seq = int(time.time() * 1000)
+    if new_seq <= _fb_seq:
+        new_seq = _fb_seq + 1
+    _fb_seq = new_seq
     from datetime import timedelta, timezone
     doc_data = {
         **event,
@@ -1953,22 +1964,6 @@ def update_link_in_firestore(kind: str, url: str, **fields):
             .set({"links": {kind: payload}}, merge=True)
     except Exception as e:
         log(f"Firestore link update failed ({kind}): {e}", "WARN")
-
-
-def _read_links_map_from_firestore() -> dict:
-    """Read the aggregate links map from the research doc. Returns {} on
-    miss or error — caller falls back to in-memory state. Single read at
-    P5 entry, no caching (Firestore client already has a local cache layer)."""
-    if not _firebase_db or not _fb_uid or not _fb_research_id:
-        return {}
-    try:
-        snap = _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id).get()
-        data = snap.to_dict() or {}
-        return data.get("links") or {}
-    except Exception as e:
-        log(f"Firestore links read failed: {e}", "WARN")
-        return {}
 
 
 def _update_firestore_research(updates):
@@ -15460,10 +15455,10 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     # can't fight past that automatically, so pause early for the user.
     if cua_client:
         cleared = await check_hv_gate(browser, cua_client, "youtube", "YouTube Studio",
-                                       phase=5, verbose=verbose)
+                                       phase=4, verbose=verbose)
         if not cleared:
-            log("Phase 5: HV gate on YouTube Studio could not be cleared — aborting upload", "ERROR")
-            fail_phase(5, "YouTube Studio human-verification unresolved",
+            log("Phase 4: HV gate on YouTube Studio could not be cleared — aborting upload", "ERROR")
+            fail_phase(4, "YouTube Studio human-verification unresolved",
                        "Resolve the challenge in the browser and Retry.",
                        agent="youtube")
             return {"youtube_url": ""}
@@ -15888,7 +15883,12 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
 
 def detect_resume_phase(queue_dir):
     """Detect which phase to resume from based on existing output files.
-    Returns (phase_number, description). Uses 6-phase model (0-5)."""
+    Returns (phase_number, description). 5-phase BE model (0-4) plus
+    FE-owned Phase 5 (Doc + email). Return value of 5 means "BE work is
+    done, FE-P5 still needs to fire" — run_pipeline handles this by
+    re-emitting phase_complete phase=4 to retrigger triggerFeP5 on the
+    frontend (its CAS guard makes a re-trigger idempotent). 6 means
+    "delivery.json marks the run completed — nothing to resume"."""
     queue_dir = Path(queue_dir)
     if (queue_dir / "delivery.json").exists():
         try:
@@ -15898,9 +15898,10 @@ def detect_resume_phase(queue_dir):
         except Exception:
             pass
     cp = load_checkpoint(queue_dir)
-    # Phase 4 done → resume from Phase 5: check if YouTube done but no delivery
+    # Phase 4 done — BE work complete, FE-P5 retriggered via re-emit of
+    # phase_complete phase=4 inside run_pipeline.
     if cp and cp.get("youtube_url"):
-        return 5, "YouTube done — Phase 4 done, resuming from Phase 5 (Report)"
+        return 5, "YouTube done — Phase 4 complete, FE will pick up Phase 5"
     # Phase 3 done → resume from Phase 4: check if audio exists
     if cp and cp.get("audio_path") and Path(cp["audio_path"]).exists():
         return 4, "Audio exists — Phase 3 done, resuming from Phase 4 (YouTube)"
@@ -16039,8 +16040,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         log(f"RESUME: {reason}")
         # Emit resume marker so frontend knows to ignore events before this point
         emit_event("pipeline_resumed", phase=start_phase, resumeReason=reason)
-        if start_phase > 5:
+        if start_phase >= 6:
             log("Pipeline already complete — nothing to resume")
+            return
+        if start_phase == 5:
+            # P4 was done before crash but FE-P5 may not have completed
+            # (Doc + email is FE-owned post-2026-04-30). Re-emit
+            # phase_complete phase=4 with the checkpoint links so the FE
+            # listener fires triggerFeP5 again. Its CAS guard
+            # (casFeP5 + feP5State) handles "already completed" /
+            # "in flight" idempotently.
+            cp = load_checkpoint(queue_dir) or {}
+            yt_url = cp.get("youtube_url", "")
+            nb_url = cp.get("notebook_url", "")
+            bf_url = cp.get("brief_url", "")
+            _resume_links = []
+            if yt_url:
+                _resume_links.append({"label": "YouTube Video", "url": yt_url, "verified": True})
+            if nb_url:
+                _resume_links.append({"label": "NotebookLM", "url": nb_url, "verified": True})
+            if bf_url:
+                _resume_links.append({"label": "Research Brief", "url": bf_url, "verified": True})
+            emit_event("phase_complete", phase=4, durationSec=0, links=_resume_links,
+                       summary="Resumed from checkpoint — frontend handles Phase 5")
+            log("Resume: P4 already done, re-emitted phase_complete phase=4 to retrigger FE-P5")
+            update_delivery(status="completed")
+            _update_firestore_research({"status": "ongoing", "phase": 4})
             return
         cp = load_checkpoint(queue_dir) or {}
         topic = topic or cp.get("topic", queue_dir.name.rsplit("_", 2)[0].replace("_", " "))
@@ -17886,7 +17911,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 and not (queue_dir / ".stop").exists() \
                 and not (queue_dir / ".pause").exists():
             phase, _ = detect_resume_phase(queue_dir)
-            if 1 < phase <= 5:
+            # Phase 5 means BE finished P4 — FE owns Phase 5, no BE auto-retry
+            # needed. The supervised-rehydrate auto-resume + manual Resume
+            # paths both call run_pipeline which re-emits phase_complete
+            # phase=4 to retrigger FE-P5. Cap at 4 so the auto-retry only
+            # fires for actual BE-recoverable work (mid-phase crashes).
+            if 1 < phase <= 4:
                 _why = "browser-crash" if _is_browser_crash else f"failed at phase {phase}"
                 log(f"Pipeline {_why} — auto-retrying from checkpoint...", "WARN")
                 await asyncio.sleep(5)
