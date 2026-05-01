@@ -1059,10 +1059,23 @@ async def _heartbeat_loop():
     while True:
         try:
             if _firebase_db and _research_token:
-                _firebase_db.collection("research_tokens").document(_research_token).update({
-                    "lastHeartbeat": SERVER_TIMESTAMP,
-                    "status": "active",
-                })
+                # Wrap Firestore .update() in to_thread + 10s ceiling. Sync
+                # firebase_admin calls run on the event-loop thread by default;
+                # if the gRPC channel stalls (auth-token refresh under load,
+                # busy account), the loop wedges and uvicorn.serve() never
+                # binds. Treat each tick as best-effort — a missed heartbeat
+                # ages the device tile to "offline" gracefully; the next
+                # successful tick recovers. Without this, one stalled tick
+                # parks --serve forever.
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        lambda: _firebase_db.collection("research_tokens")
+                            .document(_research_token).update({
+                                "lastHeartbeat": SERVER_TIMESTAMP,
+                                "status": "active",
+                            })),
+                    timeout=10.0,
+                )
                 # Mirror to device doc for the per-device status indicator.
                 # Skip silently when no paired uid is pinned — either setup
                 # hasn't run yet, or the user just unlinked and the relink
@@ -1075,10 +1088,15 @@ async def _heartbeat_loop():
                 device_id = load_device_id()
                 if paired_uid and device_id:
                     try:
-                        _firebase_db.collection("users").document(paired_uid) \
-                            .collection("devices").document(device_id).update({
-                                "lastHeartbeat": int(time.time() * 1000),
-                            })
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                lambda: _firebase_db.collection("users")
+                                    .document(paired_uid)
+                                    .collection("devices").document(device_id).update({
+                                        "lastHeartbeat": int(time.time() * 1000),
+                                    })),
+                            timeout=10.0,
+                        )
                     except Exception:
                         # Doc missing but pairedUid still set — either a
                         # transient Firestore blip or the relink watcher
