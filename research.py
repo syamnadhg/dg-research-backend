@@ -1202,6 +1202,94 @@ def _start_token_relink_watcher(token: str):
         log(f"Could not start relink watcher (falling back to 30s heartbeat): {e}", "WARN")
 
 
+_device_cmd_watch = None  # Firestore Watch handle; kept for lifetime cleanup
+
+
+def _start_device_command_listener(uid: str, device_id: str):
+    """Subscribe to users/{uid}/devices/{deviceId}/commands so the FE can
+    issue device-level commands that aren't scoped to a particular
+    research run. The first such command will be `hard_reset` (C2 wires
+    that handler in) — this commit just establishes the plumbing.
+
+    Mirrors _start_command_listener's pattern: a startup sweep that
+    deletes any `processed:true` docs left over from a prior session
+    that crashed before its tail-delete flushed, plus a 30s stale-age
+    gate so commands written before the previous serve died don't
+    replay on the new attach.
+
+    Unlike the research-scoped listener, this one runs for the full
+    lifetime of `--serve` (until os._exit/SIGINT) because it's
+    device-scoped, not run-scoped. The Firestore Admin SDK fires the
+    snapshot callback in a background thread — we do sync work only
+    (log + delete). Idempotent against repeated snapshots: handled
+    docs are deleted in the same callback iteration."""
+    global _device_cmd_watch
+    if not _firebase_db or not uid or not device_id:
+        log("[device-cmds] not starting — missing uid/device_id/firebase", "DEBUG")
+        return
+    col_ref = _firebase_db.collection("users").document(uid) \
+        .collection("devices").document(device_id) \
+        .collection("commands")
+
+    # Startup sweep — same rationale as _start_command_listener (line ~2127).
+    try:
+        for d in col_ref.where("processed", "==", True).stream():
+            try:
+                d.reference.delete()
+            except Exception:
+                pass
+    except Exception as _sweep_err:
+        log(f"[device-cmds] startup sweep failed: {_sweep_err}", "DEBUG")
+
+    def _on_snap(col_snapshot, changes, read_time):
+        for change in changes:
+            if change.type.name != "ADDED":
+                continue
+            doc = change.document
+            data = doc.to_dict() or {}
+            if data.get("processed"):
+                continue
+
+            # 30s stale-command gate — commands older than this are from a
+            # previous serve session and should NOT replay (e.g. a stop
+            # written 5 minutes ago when serve was already down). Same
+            # threshold as the research-scoped listener at line ~2154.
+            STALE_COMMAND_AGE_MS = 30_000
+            _ts = data.get("timestamp")
+            if isinstance(_ts, (int, float)) and _ts > 0:
+                _age_ms = int(time.time() * 1000) - int(_ts)
+                if _age_ms > STALE_COMMAND_AGE_MS:
+                    try:
+                        doc.reference.update({"processed": True, "staleSkipped": True})
+                    except Exception:
+                        pass
+                    continue
+
+            action = (data.get("action") or "").strip()
+            log(f"[device-cmds] received action={action!r} doc={doc.id} (handlers wired in C2)")
+
+            # Tail-delete: device commands are one-shot. Removing the doc
+            # immediately stops any future serve from re-processing it
+            # AND keeps the subcollection from growing unbounded.
+            try:
+                doc.reference.delete()
+            except Exception as _de:
+                # Fall back to mark-processed if delete fails (e.g.
+                # transient permission glitch) — at least the doc won't
+                # replay. The startup sweep cleans it up later.
+                try:
+                    doc.reference.update({"processed": True})
+                except Exception:
+                    pass
+                log(f"[device-cmds] doc cleanup failed for {doc.id}: {_de}", "WARN")
+
+    try:
+        _device_cmd_watch = col_ref.on_snapshot(_on_snap)
+        log(f"Device command listener started for device {device_id[:24]}…")
+    except Exception as e:
+        log(f"Could not start device command listener: {e}", "WARN")
+
+
 # ── Run Analytics (phase duration tracking for realistic ETAs) ────────────
 
 ANALYTICS_PATH = Path(__file__).parent / "run_analytics.json"
@@ -19165,6 +19253,20 @@ async def run_server(port=8000):
         # reflected in the Account page tile almost immediately, instead of
         # waiting up to 30s for the heartbeat-based self-heal.
         _start_token_relink_watcher(token)
+
+        # Device-scoped command channel — receives hard_reset and any
+        # future device-level controls (vs research-scoped commands which
+        # ride users/{uid}/researches/{rid}/commands). Listener lives for
+        # the lifetime of --serve. Best-effort: if the device isn't
+        # paired yet, this no-ops; the next --serve restart after pairing
+        # will pick it up.
+        try:
+            _paired_uid_for_cmds = load_paired_uid() or ""
+            _device_id_for_cmds = load_device_id() or ""
+            if _paired_uid_for_cmds and _device_id_for_cmds:
+                _start_device_command_listener(_paired_uid_for_cmds, _device_id_for_cmds)
+        except Exception as _dce:
+            log(f"[device-cmds] listener attach failed: {_dce}", "WARN")
 
     # ── Branded --serve banner — 'aegis, standing watch' ──
     # Shows which account this backend is paired to, where it's listening,
