@@ -2218,6 +2218,126 @@ def _update_firestore_research(updates):
         log(f"Firestore research update failed: {e}", "WARN")
 
 
+def _do_agent_terminal_status_write(agent_key: str, status: str):
+    """Inner sync write — kept separate so the public _write_*
+    helpers can fire-and-forget on a daemon thread, avoiding the
+    event-loop blocking that B2 (research.py:1046) called out for
+    sync Firestore I/O on the main asyncio loop."""
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    try:
+        ak = (agent_key or "").lower()
+        _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id) \
+            .set({"agents": {ak: {"status": status}}}, merge=True)
+    except Exception as e:
+        log(f"Firestore agent-status write failed ({agent_key}={status}): {e}", "WARN")
+
+
+def _write_agent_terminal_status(agent_key: str, status: str):
+    """Persist a per-agent terminal status to the root research doc so the
+    listing-page tile + chat phase icons + in-chat config icons all stay
+    consistent across browser reloads. Volatile signals (FE alerts,
+    chat-message details) survive only the same-tab session; this is
+    the single source of truth post-reload.
+
+    Tile/Icon Consistency (2026-05-01): without this write, an agent that
+    was skipped or errored mid-run has no persisted record on the root
+    doc — `Research.agents[k]` only had timing + sources. Tile reverted
+    to all-green checks for completed runs after reload.
+
+    Fire-and-forget on a daemon thread so the sync Firestore round-trip
+    doesn't block the asyncio event loop (heartbeat, command listener,
+    narration ticker). Same lesson as B2 (research.py:1046) — any
+    multi-second sync I/O on the main loop starves heartbeat and trips
+    the FE 15s offline threshold.
+
+    Caller writes one of:
+      - "complete"  → on phase_complete phase=2 for agents whose details
+                      show status complete/done/done_partial.
+      - "skipped"   → on agent_skipped (runtime, NOT config-skip — config
+                      skip stays derived from pipelineConfig). Note: a
+                      runtime skip persists for the run; the BE has no
+                      "un-skip" path, so an agent disabled-during-pause
+                      then re-enabled would still read as skipped on the
+                      tile. In the current pipeline shape this is bounded
+                      because re-enable applies to future phases (P3+),
+                      and only P2 has per-agent records — no real surface.
+      - "errored"   → on fail_agent terminal (no successful retry by run end).
+
+    Uses set+merge with dotted path so we don't clobber the rest of the
+    agents map (other agents' sources/sourceUrls/etc.).
+    """
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    if not agent_key or status not in ("complete", "skipped", "errored"):
+        return
+    try:
+        _threading.Thread(
+            target=_do_agent_terminal_status_write,
+            args=(agent_key, status),
+            name=f"agent-status-{(agent_key or '').lower()}-{status}",
+            daemon=True,
+        ).start()
+    except Exception as e:
+        log(f"Failed to dispatch agent-status thread ({agent_key}={status}): {e}", "WARN")
+
+
+def _do_phase_terminal_status_write(phase_num: int, status: str):
+    """Inner sync write — see _do_agent_terminal_status_write rationale."""
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    try:
+        ref = _firebase_db.collection("users").document(_fb_uid) \
+            .collection("researches").document(_fb_research_id)
+        snap = ref.get()
+        data = (snap.to_dict() or {}) if snap.exists else {}
+        phases = list(data.get("phases") or [])
+        # Upsert by phase number
+        found = False
+        for entry in phases:
+            if isinstance(entry, dict) and entry.get("phase") == phase_num:
+                entry["status"] = status
+                found = True
+                break
+        if not found:
+            phases.append({"phase": phase_num, "label": f"Phase {phase_num}",
+                           "startedAt": int(time.time() * 1000), "status": status})
+        ref.update({"phases": phases})
+    except Exception as e:
+        log(f"Firestore phase-status write failed (phase={phase_num}, status={status}): {e}", "WARN")
+
+
+def _write_phase_terminal_status(phase_num: int, status: str):
+    """Persist a per-phase terminal status to the root research doc.
+    Mirror of _write_agent_terminal_status for phases. Used by tile +
+    chat phase icons to color the phase node correctly after reload.
+    Config skips (user toggled the phase off in pipelineConfig) are NOT
+    written — they stay derived from pipelineConfig.skippedPhases so a
+    re-enable mid-run isn't masked by stale "skipped" status.
+
+    Tile/Icon Consistency (2026-05-01). Fire-and-forget on a daemon
+    thread (same B2 rationale as _write_agent_terminal_status). The
+    read-modify-write on the `phases` array isn't a Firestore
+    transaction — concurrent writes on the same phase could race, but
+    same-phase concurrency is rare in practice (events serialize
+    through emit_event).
+    """
+    if not _firebase_db or not _fb_uid or not _fb_research_id:
+        return
+    if status not in ("complete", "skipped", "errored"):
+        return
+    try:
+        _threading.Thread(
+            target=_do_phase_terminal_status_write,
+            args=(phase_num, status),
+            name=f"phase-status-{phase_num}-{status}",
+            daemon=True,
+        ).start()
+    except Exception as e:
+        log(f"Failed to dispatch phase-status thread (phase={phase_num}, status={status}): {e}", "WARN")
+
+
 def _read_firestore_research_title(fallback=""):
     """Read the current `title` field from the research doc in Firestore.
     Frontend's /api/title fills this with a smart 4–8 word title right after
@@ -5309,6 +5429,31 @@ def emit_event(event_type, phase=None, agent=None, **data):
         dur = data.get("durationSec", 0)
         if dur > 0:
             record_phase_duration(phase, dur, agent=agent or "")
+    # Tile/Icon Consistency (2026-05-01): persist per-phase + per-agent
+    # terminal status to root doc so listing tile + chat icons stay
+    # correct post-reload. Single point so every phase_complete /
+    # phase_skipped / agent_skipped emit auto-persists; no need to touch
+    # each call site individually. phase_complete OVERWRITES a prior
+    # "errored" — important when user picks Retry on a fail_phase alert
+    # and the retry succeeds. agent_skipped without a `reason` is
+    # treated as a config-skip and NOT persisted (config-skip stays
+    # derived from pipelineConfig — single source of truth).
+    try:
+        if event_type == "phase_complete" and isinstance(phase, int) and phase >= 0:
+            _write_phase_terminal_status(phase, "complete")
+        elif event_type == "phase_skipped" and isinstance(phase, int) and phase >= 0:
+            _write_phase_terminal_status(phase, "skipped")
+        elif event_type == "agent_skipped" and agent:
+            # `reason` is in `data`. Only runtime skips (have a reason)
+            # get persisted; config-skips emitted from
+            # `for da in disabled_agents` (no reason) stay derived
+            # from pipelineConfig.
+            if data.get("reason"):
+                _write_agent_terminal_status(agent, "skipped")
+    except Exception:
+        # Status persistence is best-effort — never let it break event
+        # emission (which is the critical path for FE state updates).
+        pass
     # Write to Firestore (frontend real-time transport)
     _emit_to_firestore(event)
     # Drop into the narrator ring buffer (after Firestore so ordering
@@ -5528,6 +5673,10 @@ def fail_phase(phase: int, title: str = "", details: str = "",
         payload["agent"] = agent
     payload.update(extra)
     emit_event("pipeline_error", phase=phase, **payload)
+    # Tile/Icon Consistency (2026-05-01): persist errored status to root
+    # doc so the listing-page tile + chat phase icons stay red post-
+    # reload. If a later Retry succeeds, phase_complete overwrites this.
+    _write_phase_terminal_status(phase, "errored")
 
 
 def emit_browser_recovery_status(phase: int, agent: str | None = None):
@@ -5590,6 +5739,11 @@ def fail_agent(agent_key: str, title: str, details: str = "",
     emit_event("pipeline_error", phase=2, agent=agent_key,
                error=title, details=details, actions=actions,
                dismissible=True, alert_id=f"agent_{agent_key}_error")
+    # Tile/Icon Consistency: persist errored status. If user picks Retry
+    # and the agent eventually completes, the phase_complete handler
+    # overwrites this with "complete". If they pick Skip, the
+    # agent_skipped emit overwrites with "skipped".
+    _write_agent_terminal_status(agent_key, "errored")
 
 
 # ── T2: Phase narration (Gemini Flash — one human sentence per tick) ─────────
@@ -10629,6 +10783,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                                  "url": results[name]["url"], "page": results[name]["page"],
                                                  "elapsed_sec": results[name]["elapsed_sec"]}
                             emit_event("agent_skipped", phase=2, agent=agent_key)
+                            _write_agent_terminal_status(agent_key, "skipped")
                 emit_event("pipeline_resumed", phase=2)
                 continue
             return results
@@ -10663,6 +10818,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 emit_event("agent_skipped", phase=2, agent=_ag_key,
                            reason="user_skip",
                            partial_chars=len(_partial or ""))
+                # status="skipped" auto-persisted by emit_event hook (runtime reason set).
             # Whether or not the agent was actually in pending, clear it from
             # the skip set so we don't keep firing agent_skipped every tick.
             _controls.skipped_agents.discard(_ag_key)
@@ -11664,6 +11820,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             del pending[name]
                             emit_event("agent_skipped", phase=2, agent=agent_key,
                                        reason="extraction_failure_skip")
+                            # status="skipped" auto-persisted by emit_event hook.
                             continue
                         if decision == "stop":
                             break
@@ -14211,6 +14368,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             log(f"[{label}] User chose Skip agent during human verification — dropping {platform_key}", "INFO")
             emit_event("agent_skipped", phase=phase, agent=platform_key,
                        reason="human_verification_skipped")
+            # status="skipped" auto-persisted by emit_event hook.
             emit_event("pipeline_resumed", phase=phase, reason="skip_agent_during_verification", agent=platform_key)
             _controls.request_resume()
             return False
@@ -17630,6 +17788,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — "
                         f"{len(_p2_links)} in-app primary links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
+            # Tile/Icon Consistency (2026-05-01): write the phase-complete
+            # status to root doc so the listing-page tile + chat phase
+            # icons + in-chat config icons stay green post-reload.
+            _write_phase_terminal_status(2, "complete")
+            # Also write per-agent terminal status. Each agent in `results`
+            # is one of: "done" (clean) → "complete"; "failed" / "stopped"
+            # / "paused" → leave alone (not terminal); "skipped" /
+            # "skipped_runtime" already had _write_agent_terminal_status
+            # called at the agent_skipped emit site, so don't overwrite.
+            # Match `name` (display) to lowercase agent key.
+            for _ag_name, _ag_r in results.items():
+                _ag_status = (_ag_r.get("status") or "").lower()
+                _ag_key_lc = _ag_name.lower().replace(" ", "")
+                if _ag_status in ("done", "complete", "completed", "done_partial"):
+                    _write_agent_terminal_status(_ag_key_lc, "complete")
+                # "skipped"/"failed"/"paused"/etc. left to their own emit
+                # sites (which already write the right status).
             # Phase-2 completion marker for resume safety. The marker tells
             # detect_resume_phase that Phase 2 actually finished — without
             # it, the previous "any non-brief MD >100 bytes → Phase 3" rule
