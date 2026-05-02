@@ -15887,7 +15887,7 @@ async def _cleanup_nlm_default_audio(page) -> dict:
         return result
 
 
-# ── Phase 5: Video Conversion + YouTube Upload ──────────────────────────────
+# ── Phase 4: Video Conversion + YouTube Upload ──────────────────────────────
 
 GEMINI_API_KEY = get_env("GEMINI_API_KEY")  # For thumbnail generation (nano-banana)
 THUMBNAIL_MODEL = os.environ.get("THUMBNAIL_MODEL", "gemini-2.5-flash-image")  # nano-banana
@@ -15961,7 +15961,7 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                      existing_youtube_url=""):
     """Phase 4: Convert audio to video + upload to YouTube (unlisted, not-for-kids)."""
     log("=" * 60)
-    log("PHASE 5: Video + YouTube Upload")
+    log("PHASE 4: Video + YouTube Upload")
     log("=" * 60)
 
     if not audio_path or not Path(audio_path).exists():
@@ -16795,7 +16795,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        summary="Resumed from checkpoint — frontend handles Phase 5")
             log("Resume: P4 already done, re-emitted phase_complete phase=4 to retrigger FE-P5")
             update_delivery(status="completed")
-            _update_firestore_research({"status": "ongoing", "phase": 4})
+            # Mirror the success-path handoff (~line 18663): advance both
+            # phase AND currentPhase to 5 so the homepage tile diagram
+            # stops glowing the YouTube node and FE-P5 picks up cleanly.
+            # Pre-fix this only wrote phase=4, leaving currentPhase stale
+            # at 4 and the diagram painting YouTube as the active node
+            # forever post-resume.
+            _update_firestore_research({"status": "ongoing", "phase": 5, "currentPhase": 5})
             return
         cp = load_checkpoint(queue_dir) or {}
         topic = topic or cp.get("topic", queue_dir.name.rsplit("_", 2)[0].replace("_", " "))
@@ -18372,7 +18378,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if notebook_url:
                 while True:  # timeout-retry loop
                     try:
-                        p4 = await _await_phase_with_active_deadline(
+                        _p3_audio = await _await_phase_with_active_deadline(
                             3, PHASE_3_MAX_MIN,
                             lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
                         )
@@ -18384,12 +18390,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             continue
                         if _decision == "skip":
                             emit_event("phase_skipped", phase=3, reason="user_skip_audio_timeout")
-                            p4 = {"audio_path": None, "audio_overview_url": ""}
+                            _p3_audio = {"audio_path": None, "audio_overview_url": ""}
                             break
                         emit_event("pipeline_stopped", phase=3, reason=f"user_{_decision}_audio_timeout")
                         return
-                audio_path = p4.get("audio_path")
-                audio_overview_url = p4.get("audio_overview_url", "")
+                audio_path = _p3_audio.get("audio_path")
+                audio_overview_url = _p3_audio.get("audio_overview_url", "")
                 save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
                                 notebook_url=notebook_url,
                                 audio_path=str(audio_path) if audio_path else "",
@@ -18520,7 +18526,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _p4_user_skipped = False
                 while True:  # timeout-retry loop
                     try:
-                        p5 = await _await_phase_with_active_deadline(
+                        p4_result = await _await_phase_with_active_deadline(
                             4, PHASE_4_MAX_MIN,
                             lambda: run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                                                links=links, notebook_url=notebook_url, verbose=verbose,
@@ -18539,15 +18545,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         if _decision == "skip":
                             emit_event("phase_skipped", phase=4, reason="user_skip_after_timeout")
                             _p4_user_skipped = True
-                            p5 = {"youtube_url": ""}
+                            p4_result = {"youtube_url": ""}
                             break
                         emit_event("pipeline_stopped", phase=4, reason=f"user_{_decision}_after_timeout")
                         return
-                youtube_url = p5.get("youtube_url", "")
+                youtube_url = p4_result.get("youtube_url", "")
                 # Pick up user-skip signal from run_phase4 (ffmpeg-skip path)
                 # in addition to the timeout-skip flag set above. Both paths
                 # need to bypass extract-retry + the success-path phase_complete.
-                _p4_user_skipped = _p4_user_skipped or bool(p5.get("user_skipped", False))
+                _p4_user_skipped = _p4_user_skipped or bool(p4_result.get("user_skipped", False))
                 # B1: Link-first — retry YouTube URL extraction on validation failure.
                 # ARCHITECTURE 2026-04-18 (never-die): wrap the retry in a
                 # decision loop so repeated extract failures surface as a
@@ -18566,7 +18572,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             # B1: pass the Studio tab through so extract_youtube_url
                             # operates on it explicitly (and aborts cleanly if
                             # browser.page has flipped to NotebookLM or elsewhere).
-                            target_page=p5.get("studio_page"),
+                            target_page=p4_result.get("studio_page"),
                         )
                         if yt_res.verified:
                             youtube_url = yt_res.url
