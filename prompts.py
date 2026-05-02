@@ -434,14 +434,40 @@ Steps:
 
 PROMPT_AUDIO_GENERATE = SYSTEM_BASE + """
 
-Your task: Generate ONE Deep Dive Long audio overview in NotebookLM.
+Your task: Generate EXACTLY ONE audio overview with FORMAT="Deep Dive" and LENGTH="Long". Anything else is a failure.
 
-Steps:
+CRITICAL — NEVER CLICK THESE (any one of these creates an unwanted default audio):
+- The "Audio Overview" card body itself
+- The card's headline / title text
+- The card's thumbnail / play-icon area
+- Any "Generate" / "Create" button on the card BEFORE you've opened the customize panel
+- An existing audio entry that's already in the Studio panel (its play button, its row)
+
+You may ONLY click:
+- The gear / settings icon, "Customize" link, or three-dot menu on the Audio Overview card.
+- Inside the customize panel: the Format dropdown, the Length dropdown, and the final Generate button.
+
+Steps (do them in order, do not skip):
+
 1. Confirm all sources are checked in the Sources panel ("Select all" if present).
-2. In the Studio panel, open Audio Overview customize/settings (gear icon,
-   "Customize" link, or three-dot menu — NOT the bare tile body). Set
-   FORMAT="Deep Dive" and LENGTH="Long".
-3. Click Generate once. Say "generating" when the progress indicator appears."""
+
+2. SCAN the Studio panel and COUNT how many audio entries are visible right now.
+   - If the count is 0 → continue.
+   - If the count is ≥ 1 → say exactly: "abort: audio already present" and STOP. Do not click anything else.
+
+3. Find the Audio Overview card's gear / Customize / three-dot affordance and click ONLY that.
+   - If you cannot find a clear gear/Customize/three-dot control, say exactly: "abort: no customize affordance" and STOP. Do not click the card body as a fallback.
+
+4. WAIT for the customize panel to open. Confirm you can see BOTH a Format selector AND a Length selector before any next click.
+   - If the panel doesn't open or the dropdowns aren't visible, say exactly: "abort: customize did not open" and STOP.
+
+5. Set FORMAT = "Deep Dive" and LENGTH = "Long". Both must be set explicitly — do not leave defaults.
+
+6. Click the Generate button inside the customize panel EXACTLY ONCE. Do not click it a second time, do not retry, do not click any other Generate-like button on the page.
+
+7. Say exactly: "generating" once a progress indicator appears for the new audio.
+
+If at any point you realize you've clicked the wrong thing and a default/unwanted audio has started generating, say exactly: "abort: misclick — default audio fired" and STOP. Do not try to click "stop" or "delete" — leave the page as-is and report."""
 
 PROMPT_AUDIO_CHECK = SYSTEM_BASE + """
 

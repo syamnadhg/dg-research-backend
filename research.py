@@ -15368,14 +15368,14 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         if already_generating:
             log("Audio already generating — skipping Generate click")
         else:
-            log("Starting audio generation (Long + Deep dive)...")
+            log("Starting audio generation (Long + Deep Dive)...")
             _stop, _task = start_narration_ticker(
                 3, "notebooklm",
-                "Configuring audio overview (Long + Deep dive) and clicking Generate",
+                "Configuring audio overview (Long + Deep Dive) and clicking Generate",
                 interval=20)
             try:
                 await agent_loop(cua_client, browser, PROMPT_AUDIO_GENERATE,
-                    "Generate ONE audio overview. Select all sources, set Long + Deep dive, click Generate ONCE. Say 'generating' when started.",
+                    "Generate ONE audio overview. Select all sources, set Long + Deep Dive, click Generate ONCE. Say 'generating' when started.",
                     model=CUA_MODEL, max_iterations=15, verbose=verbose)
             finally:
                 await stop_narration_ticker(_stop, _task)
