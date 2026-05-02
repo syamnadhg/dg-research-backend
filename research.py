@@ -10559,6 +10559,78 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
     }
 
 
+async def _spotlight_latest_response(page, agent_name: str):
+    """A4 (2026-05-01): briefly select the latest response paragraph via
+    DOM Range API so the user can SEE which agent the round-robin is
+    currently polling. Symmetric across ChatGPT/Gemini/Claude — no CUA
+    cost, no screenshot, no click. Auto-clears after 900ms so the user's
+    own selection isn't held hostage. Failures are silent (visual cue
+    is non-essential — polling/scraping is what actually matters).
+    """
+    if not page:
+        return
+    # Per-platform selectors for the response container. Walk last→first
+    # and pick the first on-screen match. Fallback: any visible <article>
+    # or <p> chunk so the spotlight still flashes if selectors drift.
+    sel_map = {
+        "ChatGPT": (
+            '[data-message-author-role="assistant"] .markdown, '
+            '[data-message-author-role="assistant"], '
+            '[data-testid^="conversation-turn"] .markdown, '
+            'main article'
+        ),
+        "Gemini": (
+            'message-content, '
+            '.response-content, '
+            '.markdown-main-panel, '
+            'model-response, '
+            'main .markdown'
+        ),
+        "Claude": (
+            '[data-test-render-count] .font-claude-message, '
+            '.font-claude-message, '
+            '[data-testid="user-message"] ~ * .prose, '
+            '.prose, '
+            'main article'
+        ),
+    }
+    css = sel_map.get(agent_name, "main article, main .markdown, p")
+    try:
+        await page.evaluate(
+            """(css) => {
+                try {
+                    const els = Array.from(document.querySelectorAll(css));
+                    if (!els.length) return false;
+                    // pick the LAST visible-on-screen element so we spotlight
+                    // the freshest paragraph, not the user's prompt at top.
+                    let target = null;
+                    for (let i = els.length - 1; i >= 0; i--) {
+                        const r = els[i].getBoundingClientRect();
+                        if (r.height > 18 && r.bottom > 0
+                                && r.top < (window.innerHeight + 200)) {
+                            target = els[i]; break;
+                        }
+                    }
+                    target = target || els[els.length - 1];
+                    const range = document.createRange();
+                    range.selectNodeContents(target);
+                    const s = window.getSelection();
+                    if (!s) return false;
+                    s.removeAllRanges();
+                    s.addRange(range);
+                    setTimeout(() => {
+                        try { window.getSelection()?.removeAllRanges(); }
+                        catch (_) {}
+                    }, 900);
+                    return true;
+                } catch (_) { return false; }
+            }""",
+            css,
+        )
+    except Exception:
+        pass
+
+
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -11009,6 +11081,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 await browser.switch_to_page(p["page"])
             except Exception as _sw_err:
                 log(f"[{name}] switch_to_page at cursor start failed: {_sw_err}", "WARN")
+
+            # A4 (2026-05-01): visible spotlight — DOM Range select on the
+            # latest response paragraph so the user can SEE the round-robin
+            # land on this agent. Symmetric across all 3 (Claude already
+            # had a CUA-side-effect "highlight" via artifact panel open;
+            # this gives ChatGPT/Gemini matching visibility without the
+            # ~$0.05/round CUA cost). Throttled to once per 30s/agent so
+            # it doesn't fight rapidly with the user's manual selection.
+            _last_spotlight = p.get("last_spotlight_at", 0)
+            if (time.time() - _last_spotlight) > 30:
+                p["last_spotlight_at"] = time.time()
+                try:
+                    await _spotlight_latest_response(p["page"], name)
+                except Exception:
+                    pass
 
             # Timeout — auto-skip (2026-04-30): per-agent P2 wall-clock
             # timeout used to stop and ask [Retry, Wait, Skip]. New rule
@@ -15938,17 +16025,40 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
                 subprocess.run, cmd,
                 capture_output=True, text=True, timeout=600)
             if r.returncode != 0:
-                log(f"ffmpeg error (attempt {ffmpeg_attempt}): {r.stderr[:300]}", "ERROR")
+                # C1 (2026-05-01): write full stderr to a per-attempt log file
+                # so post-mortem isn't bottlenecked on the truncated 300-char
+                # tail. Also log first 400 + last 400 chars (head and tail) —
+                # ffmpeg often surfaces the actionable cause in the first few
+                # lines (missing input, codec mismatch) and the failure mode in
+                # the last lines (segfault, ENOSPC, broken pipe).
+                _full_stderr = r.stderr or ""
+                _full_stdout = r.stdout or ""
+                try:
+                    _log_path = queue_dir / f"ffmpeg-attempt-{ffmpeg_attempt}.log"
+                    _log_path.write_text(
+                        f"# ffmpeg attempt {ffmpeg_attempt} — returncode={r.returncode}\n"
+                        f"# cmd: {' '.join(cmd)}\n\n"
+                        f"=== STDERR ===\n{_full_stderr}\n\n"
+                        f"=== STDOUT ===\n{_full_stdout}\n",
+                        encoding="utf-8", errors="replace")
+                    log(f"ffmpeg attempt {ffmpeg_attempt} full log → {_log_path}", "ERROR")
+                except Exception as _log_e:
+                    log(f"ffmpeg log write failed: {_log_e}", "WARN")
+                _err_head = _full_stderr[:400]
+                _err_tail = _full_stderr[-400:] if len(_full_stderr) > 400 else ""
+                log(f"ffmpeg error (attempt {ffmpeg_attempt}) HEAD: {_err_head}", "ERROR")
+                if _err_tail:
+                    log(f"ffmpeg error (attempt {ffmpeg_attempt}) TAIL: {_err_tail}", "ERROR")
                 # Disk-full is a common cause — call it out if the stderr
                 # mentions it so the user knows to clear space.
-                _err_tail = (r.stderr or "")[-300:]
-                if "no space" in _err_tail.lower() or "disk full" in _err_tail.lower() or "enospc" in _err_tail.lower():
+                _err_low = _full_stderr.lower()
+                if "no space" in _err_low or "disk full" in _err_low or "enospc" in _err_low:
                     fail_phase(4, "Disk full while writing video",
-                               f"Free up space and Retry. Details: {_err_tail[:200]}",
+                               f"Free up space and Retry. Details: {_err_tail[:200] or _err_head[:200]}",
                                agent="youtube")
                 else:
                     fail_phase(4, "ffmpeg failed to build the video",
-                               f"Phase 4 video wrap step crashed (attempt {ffmpeg_attempt}). Details: {_err_tail[:200]}",
+                               f"Phase 4 video wrap step crashed (attempt {ffmpeg_attempt}). Details: {_err_tail[:200] or _err_head[:200]}",
                                agent="youtube")
             else:
                 log(f"Video: {video_path} ({video_path.stat().st_size / 1024 / 1024:.1f}MB)")
@@ -15957,6 +16067,23 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
             log(f"ffmpeg failed (attempt {ffmpeg_attempt}): {e}", "ERROR")
             _err_msg = str(e)
             _low = _err_msg.lower()
+            # C1 (2026-05-01): symmetric per-attempt log for subprocess-level
+            # crashes (TimeoutExpired, OSError, ffmpeg-not-on-PATH). Captures
+            # the exception type + traceback so post-mortem on these is as
+            # easy as the returncode-failure case.
+            try:
+                import traceback
+                _log_path = queue_dir / f"ffmpeg-attempt-{ffmpeg_attempt}.log"
+                _tb = traceback.format_exc()
+                _log_path.write_text(
+                    f"# ffmpeg attempt {ffmpeg_attempt} — subprocess-level crash\n"
+                    f"# cmd: {' '.join(cmd)}\n"
+                    f"# exception: {type(e).__name__}: {e}\n\n"
+                    f"=== TRACEBACK ===\n{_tb}\n",
+                    encoding="utf-8", errors="replace")
+                log(f"ffmpeg attempt {ffmpeg_attempt} crash log → {_log_path}", "ERROR")
+            except Exception as _log_e:
+                log(f"ffmpeg crash log write failed: {_log_e}", "WARN")
             if "no space" in _low or "enospc" in _low:
                 fail_phase(4, "Disk full",
                            f"Free up space and Retry. Details: {_err_msg[:200]}",
