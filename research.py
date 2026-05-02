@@ -2809,6 +2809,38 @@ def _start_command_listener(uid, research_id, loop):
     _fb_listener = col_ref.on_snapshot(on_snapshot)
 
 
+def _start_cli_command_reader(loop):
+    """CLI-mode stdin parser. Daemon thread reads stdin lines and dispatches
+    to the same _controls.* handlers --serve's Firestore listener uses, so
+    CLI users have a working escape from login_required (and other) pauses
+    without needing --serve. No-op if stdin isn't a TTY (e.g. piped input,
+    Task Scheduler) — the pause menu still prints but no input is consumed."""
+    if not sys.stdin.isatty():
+        return
+    def _reader():
+        for line in sys.stdin:
+            cmd = line.strip().lower()
+            if not cmd:
+                continue
+            if cmd in ("r", "resume"):
+                log("[CMD] resume")
+                loop.call_soon_threadsafe(_controls.request_resume)
+            elif cmd in ("s", "skip"):
+                ph = getattr(_runtime, "phase", 0)
+                log(f"[CMD] skip phase {ph}")
+                loop.call_soon_threadsafe(_controls.request_skip_phase, ph)
+                # request_skip_phase doesn't release the pause; mirror the
+                # Firestore handler at line ~2682 and resume.
+                loop.call_soon_threadsafe(_controls.request_resume)
+            elif cmd in ("q", "stop", "quit"):
+                log("[CMD] stop")
+                loop.call_soon_threadsafe(_controls.request_stop)
+                loop.call_soon_threadsafe(_controls.request_resume)
+            else:
+                log("[CMD] unknown — type r/s/q (resume/skip/stop)")
+    threading.Thread(target=_reader, daemon=True, name="cli-cmd-reader").start()
+
+
 # ── Pipeline Controls (asyncio.Event based stop/pause/resume) ────────────────
 
 class PipelineControls:
@@ -2874,14 +2906,21 @@ class PipelineControls:
         # Resets the no-growth timer so the stuck detector grants another
         # 10-min window before re-prompting.
         self.wait_longer_agents: set[str] = set()
+        # Reason string set by request_pause(reason=...). The CLI-mode pause
+        # menu reads this to print a context-aware header (e.g. "login_required —
+        # log in via the browser, then…"). Cleared on resume.
+        self.pause_reason: str = ""
 
     def request_stop(self):
         self.stop_event.set()
 
-    def request_pause(self):
+    def request_pause(self, reason: str = ""):
+        if reason:
+            self.pause_reason = reason
         self.pause_event.set()
 
     def request_resume(self):
+        self.pause_reason = ""
         self.pause_event.clear()
         self.resume_event.set()
 
@@ -2937,7 +2976,26 @@ class PipelineControls:
         """Block pipeline coroutine until resume or stop is received."""
         if not self.pause_event.is_set():
             return
-        log("Pipeline paused — waiting for resume or stop...")
+        if _cli_mode:
+            # Discoverable, context-aware menu so CLI users have a working
+            # recovery path without --serve. login_required gets a tailored
+            # header instructing the user to log in via the open Chrome
+            # window before resuming.
+            reason = self.pause_reason or ""
+            if reason == "login_required":
+                header = "[PAUSE] login_required — log in via the open browser, then:"
+            elif reason:
+                header = f"[PAUSE] {reason} — waiting."
+            else:
+                header = "[PAUSE] pipeline paused — waiting."
+            print(
+                f"\n{header}\n"
+                "  r) resume   s) skip phase   q) stop pipeline\n"
+                "> ",
+                flush=True,
+            )
+        else:
+            log("Pipeline paused — waiting for resume or stop...")
         self.resume_event.clear()
         # Wait for either resume or stop
         done, _ = await asyncio.wait(
@@ -2963,6 +3021,7 @@ class PipelineControls:
         self.stop_event.clear()
         self.pause_event.clear()
         self.resume_event.clear()
+        self.pause_reason = ""
         self.extra_context.clear()
         self._config_updates.clear()
         self.pending_agent_decision = None
@@ -3246,6 +3305,10 @@ class PipelineControls:
 
 
 _controls = PipelineControls()  # Singleton — reset per run
+# True when invoked as `python research.py "topic"` or --resume (no --serve).
+# Toggled in main() before the asyncio.run call. Drives the CLI pause menu
+# and the stdin command reader; --serve keeps Firestore as its sole input.
+_cli_mode = False
 
 
 # ── Pipeline Runtime State (shared across coroutines, reset per run) ────────
@@ -17141,6 +17204,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     if uid:
         # Use frontend research_id for Firestore paths (not run_id which is the backend dir name)
         setup_firestore_run(uid, research_id or run_id, asyncio.get_running_loop(), run_id=run_id)
+    if _cli_mode:
+        # CLI mode has no Firestore command listener — wire stdin instead so
+        # the user can resume/skip/stop from the same terminal.
+        _start_cli_command_reader(asyncio.get_running_loop())
     # Start mid-run input dispatcher (watches _controls.extra_context, pastes to active pages)
     try:
         _runtime.dispatcher_task = asyncio.create_task(run_input_dispatcher())
@@ -17759,7 +17826,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            machineName=socket.gethostname(),
                            attempt=attempt,
                            message=f"Log into {label} in the browser on your setup PC.")
-                _controls.request_pause()
+                _controls.request_pause("login_required")
                 emit_event("pipeline_paused", phase=0, reason="login_required")
                 await _controls.wait_if_paused()
                 if _controls.is_stop():
@@ -22019,6 +22086,8 @@ def main():
         if not resume_path.is_absolute():
             resume_path = Path(__file__).parent / "queues" / args.resume
         log(f"Resuming from: {resume_path}")
+        global _cli_mode
+        _cli_mode = True
         asyncio.run(run_pipeline(
             topic=args.topic or "", resume_dir=str(resume_path),
             verbose=args.verbose, api_key=args.api_key, email=args.email,
@@ -22034,6 +22103,7 @@ def main():
     if args.pdf:
         log(f"PDFs: {[Path(p).name for p in args.pdf]}")
 
+    _cli_mode = True
     asyncio.run(run_pipeline(
         topic=args.topic, pdf_paths=args.pdf,
         brief_file=args.brief_file, verbose=args.verbose,

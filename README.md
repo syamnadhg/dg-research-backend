@@ -463,6 +463,16 @@ python research.py "Topic" --pdf paper.pdf             # Attach PDFs
 python research.py --resume queue_name                 # Resume stopped run
 ```
 
+**If the pipeline pauses** (most commonly Phase 0 `login_required`), the terminal prints a recovery menu:
+
+```
+[PAUSE] login_required — log in via the open browser, then:
+  r) resume   s) skip phase   q) stop pipeline
+>
+```
+
+After completing the login in the Chrome window the backend opened, type `r` + Enter to resume — Phase 0 re-verifies and the pipeline continues. `s` skips the current phase; `q` stops the run cleanly. Commands are accepted while stdin is a TTY; piped or headless runs see the menu but ignore typed input.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -535,6 +545,15 @@ research-automate/
 **Phase 4 audio failed but Phase 5 still matters** — Hit `[Skip]` on the Phase 4 alert (writes `skip_phase phase=4`); Phase 5 YouTube + Email proceed normally.
 
 **FE shows `paused_backend_restart_failed` red banner** — Backend tried to persist the in-flight queue on shutdown but the Firestore write failed. The `lastError` field on the research doc has the actual exception. Restart `--serve`; affected runs are kept on disk in `queues/` and can be resumed via the FE checkpoint banner once BE is back online.
+
+**CLI mode pause hangs (no web app)** — `python research.py "topic"` running standalone (without `--serve`) cannot use the app's Skip/Retry buttons. When Phase 0 emits `login_required` (or any other pause), the terminal prints a recovery menu:
+
+```
+[PAUSE] login_required — log in via the open browser, then:
+  r) resume   s) skip phase   q) stop pipeline
+```
+
+Complete the login in the open Chrome window, then type `r` + Enter to resume. `s` skips the current phase; `q` stops cleanly. Useful for headless rigs and onboarding before the web app is available. The menu only accepts input when stdin is a TTY — piped/Task-Scheduler runs print the menu but ignore typed input.
 
 ---
 
