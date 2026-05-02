@@ -15363,8 +15363,37 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             except Exception:
                 pass
 
-        # Check if audio is ALREADY generating (prevent double click)
+        # Pre-flight invariant check (2026-05-02). Per the user's
+        # no-delete constraint, we cannot recover from a duplicate-audio
+        # state — we have to prevent it. Two failure modes guarded:
+        #   (a) >1 audio card visible → orphaned + duplicate state we
+        #       can't safely resolve without deleting one. fail_phase.
+        #   (b) exactly 1 card AND not generating → completed orphan
+        #       from a prior run. fail_phase asks user to clean it up.
+        # The 5s sleep absorbs panel-render lag after the navigate/reload
+        # that preceded this loop iteration — without it the count can
+        # come back as 0 prematurely.
+        await asyncio.sleep(5)
+        existing_cards = await _count_nlm_audio_cards(browser.page)
         already_generating = await _check_audio_generating(browser.page)
+        log(f"[Phase3] Pre-flight inventory: {existing_cards} audio card(s), generating={already_generating}")
+
+        if existing_cards >= 2:
+            fail_phase(3,
+                       f"NotebookLM Studio shows {existing_cards} audio entries (expected 0)",
+                       "Open the notebook, delete the extra audio entries manually, then retry. We never auto-delete to avoid removing the wrong one.",
+                       agent="notebooklm",
+                       can_retry=True)
+            return {"audio_path": None}
+
+        if existing_cards == 1 and not already_generating:
+            fail_phase(3,
+                       "NotebookLM Studio has 1 completed audio from a prior run",
+                       "Open the notebook, delete that audio entry manually, then retry. We never auto-delete to avoid touching the wrong one.",
+                       agent="notebooklm",
+                       can_retry=True)
+            return {"audio_path": None}
+
         if already_generating:
             log("Audio already generating — skipping Generate click")
         else:
@@ -15388,6 +15417,25 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
         if not verified:
             log("Could not verify audio generation started", "WARN")
+
+        # Post-generate invariant check (2026-05-02). If CUA misclicked
+        # the Audio Overview tile body during the customize flow, the
+        # NLM Studio panel auto-fires a default short audio in addition
+        # to the one we explicitly requested — leaving the user with two
+        # in-flight entries. We can't delete (user constraint), so we
+        # fail_phase loud and ask the user to manually clean up the
+        # non-Deep-Dive entry. The 5s sleep gives the new card time to
+        # render in the panel before the count.
+        await asyncio.sleep(5)
+        post_gen_cards = await _count_nlm_audio_cards(browser.page)
+        log(f"[Phase3] Post-generate inventory: {post_gen_cards} audio card(s)")
+        if post_gen_cards > 1:
+            fail_phase(3,
+                       f"Duplicate audio overview detected — NotebookLM Studio shows {post_gen_cards} entries",
+                       "Likely a CUA misclick fired a default audio alongside the Deep Dive Long one. Open the notebook, delete the non-Deep-Dive entry manually, then retry.",
+                       agent="notebooklm",
+                       can_retry=True)
+            return {"audio_path": None}
 
         # Minimum 2 minute wait — audio generation typically starts within 1-2 min;
         # waiting 5 min was burning slack for no reason. First poll at 2 min is
@@ -15462,15 +15510,24 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             if "audio complete" in diag_text:
                 log("Audio generation complete ✓")
                 audio_done = True
-                # NLM new-Studio sometimes auto-fires a default audio when
-                # the Audio Overview tile is opened to expose the customize
-                # controls. Cleanup runs BEFORE share-link extraction so the
-                # share dialog opens against a single clean Deep Dive entry.
+                # Post-completion invariant LOG (no fail_phase). At this
+                # point the user already has a working audio (audio_done
+                # is True, download is moments away), so nuking the run
+                # for an invariant-only delta would lose them the artifact.
+                # The pre-flight + post-generate guards above are the real
+                # prevention; this log is just a final sanity report so a
+                # regression in those guards surfaces in the chat dropdown
+                # instead of silently shipping a non-Deep-Dive audio. We
+                # used to call _cleanup_nlm_default_audio here — disabled
+                # 2026-05-02 per user no-delete constraint.
                 try:
-                    cleanup = await _cleanup_nlm_default_audio(browser.page)
-                    log(f"[Phase3] NLM cleanup: {cleanup}")
-                except Exception as _ce:
-                    log(f"[Phase3] NLM cleanup failed: {_ce}", "WARN")
+                    dd_count = await _count_nlm_deep_dive_cards(browser.page)
+                    total_count = await _count_nlm_audio_cards(browser.page)
+                    log(f"[Phase3] Post-completion inventory: {dd_count} Deep Dive / {total_count} total audio card(s)")
+                    if dd_count != 1 or total_count != 1:
+                        log(f"[Phase3] Audio invariant delta: expected 1 Deep Dive + 1 total, got {dd_count} DD + {total_count} total — proceeding to download but flagging for review", "WARN")
+                except Exception as _ie:
+                    log(f"[Phase3] Post-completion invariant check failed: {_ie}", "WARN")
                 break
 
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
@@ -15759,11 +15816,108 @@ async def _check_audio_generating(page):
         return False
 
 
+# ── Audio-card invariant helpers (2026-05-02) ──────────────────────────────
+# Pure read helpers used to enforce the "exactly one Long + Deep Dive
+# audio overview" invariant without ever clicking or deleting. Pair with
+# the pre-flight check before agent_loop and the post-generate check
+# after wait_until_verified — both fail_phase loud if the count is wrong,
+# letting the user clean up manually (per the no-delete constraint).
+#
+# DOM selectors mirror _cleanup_nlm_default_audio so all three functions
+# count the same cards. If NotebookLM ships a Studio redesign that breaks
+# the selectors, all three break together and the failure is consistent.
+
+async def _count_nlm_audio_cards(page) -> int:
+    """Count visible audio-overview cards in the NLM Studio panel.
+
+    Returns the total number of audio entries (in-flight + completed).
+    Read-only — never clicks anything. Returns 0 on any DOM exception.
+    """
+    try:
+        return await page.evaluate("""() => {
+            const panel = document.querySelector(
+                '[aria-label*="Studio" i], [data-testid*="studio" i], aside'
+            ) || document.body;
+            const candidates = panel.querySelectorAll(
+                '[role="article"], [role="listitem"], '
+                + '[class*="audio-card"], [class*="AudioCard"], '
+                + '[data-testid*="audio"], [data-testid*="overview-item"]'
+            );
+            let count = 0;
+            candidates.forEach((el) => {
+                if (el.offsetParent === null) return;
+                const t = (el.innerText || '').toLowerCase();
+                const isAudio = t.includes('audio overview')
+                    || t.includes('conversation') || t.includes('discussion')
+                    || t.includes('podcast');
+                // Exclude the configuration TILE — the offering UI that
+                // contains the "Customize" link/button. Its innerText
+                // also matches "audio overview" but it's not a generated
+                // entry. Real generated cards (in-flight or done) do not
+                // render the word "customize" in their visible text.
+                const isConfigTile = t.includes('customize');
+                if (isAudio && !isConfigTile) count++;
+            });
+            return count;
+        }""") or 0
+    except Exception:
+        return 0
+
+
+async def _count_nlm_deep_dive_cards(page) -> int:
+    """Count visible Deep Dive audio cards specifically.
+
+    Distinct from _count_nlm_audio_cards — this only counts entries whose
+    innerText contains 'deep dive', matching what the user explicitly
+    asked for (Format=Deep Dive, Length=Long). Used by the post-completion
+    invariant log to confirm we ended up with the right kind of audio.
+    """
+    try:
+        return await page.evaluate("""() => {
+            const panel = document.querySelector(
+                '[aria-label*="Studio" i], [data-testid*="studio" i], aside'
+            ) || document.body;
+            const candidates = panel.querySelectorAll(
+                '[role="article"], [role="listitem"], '
+                + '[class*="audio-card"], [class*="AudioCard"], '
+                + '[data-testid*="audio"], [data-testid*="overview-item"]'
+            );
+            let count = 0;
+            candidates.forEach((el) => {
+                if (el.offsetParent === null) return;
+                const t = (el.innerText || '').toLowerCase();
+                const isAudio = t.includes('audio overview')
+                    || t.includes('conversation') || t.includes('discussion')
+                    || t.includes('podcast');
+                // Same configuration-tile filter as _count_nlm_audio_cards
+                // — keep both helpers in lockstep so they count the same
+                // population of cards.
+                const isConfigTile = t.includes('customize');
+                if (isAudio && !isConfigTile && t.includes('deep dive')) count++;
+            });
+            return count;
+        }""") or 0
+    except Exception:
+        return 0
+
+
 async def _cleanup_nlm_default_audio(page) -> dict:
-    """Delete any non-Deep-Dive audio entries from NLM Studio after our
-    Deep Dive Long generation completes. NotebookLM's redesigned Studio
-    occasionally auto-fires a default audio when the Audio Overview tile
-    is opened to expose customize controls — leaving us with two entries.
+    """DEPRECATED 2026-05-02 — no longer called. Body retained as
+    reference for future selector work.
+
+    Original purpose: delete any non-Deep-Dive audio entries from NLM
+    Studio after our Deep Dive Long generation completes. NotebookLM's
+    redesigned Studio occasionally auto-fires a default audio when the
+    Audio Overview tile is opened to expose customize controls — leaving
+    us with two entries.
+
+    Why deprecated: user locked deletion off (2026-05-02) — the risk of
+    nuking the real audio if our identifier ever drifts from the actual
+    DOM signal was unacceptable. Replaced by prevention-only guards
+    (tightened CUA prompt + pre-flight + post-generate audio-card count
+    invariants — see _count_nlm_audio_cards). When duplicates are
+    detected the pipeline now fail_phases and asks the user to clean up
+    manually.
 
     Idempotent + safe: refuses to delete anything if no Deep Dive entry is
     visible (mis-classification safeguard — better one extra row than nuking
