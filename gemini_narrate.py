@@ -144,11 +144,22 @@ async def narrate_panel(
       1. cooldown -- never within MIN_GAP_S of the last call.
       2. budget   -- never more than PHASE_BUDGET per phase.
     """
-    api_key = (
-        os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-        or _read_user_scope_env_safe("GEMINI_API_KEY")
-    )
+    # Prefer the user's Account-page key (Firestore apiKeys.gemini) over
+    # any env. Late import to dodge the research↔gemini_narrate cycle —
+    # gemini_narrate is imported by research.py, so by the time
+    # narrate_panel runs, research.resolve_gemini_api_key is fully defined.
+    api_key = ""
+    try:
+        from research import resolve_gemini_api_key as _resolve
+        api_key = _resolve() or ""
+    except Exception:
+        api_key = ""
+    if not api_key:
+        api_key = (
+            os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+            or _read_user_scope_env_safe("GEMINI_API_KEY")
+        )
     if not api_key:
         return None
 

@@ -220,6 +220,35 @@ def resolve_api_key(cli_key=None):
     return None
 
 
+def resolve_gemini_api_key():
+    """Resolve the Gemini / Google AI API key. Same priority shape as
+    resolve_api_key() — the user's Account-page key wins over any env.
+
+    Priority (highest first):
+        1. Firestore apiKeys.gemini (from the web app's Account page)
+        2. Windows User-scope GEMINI_API_KEY
+        3. Windows User-scope GOOGLE_API_KEY
+        4. os.environ GEMINI_API_KEY
+        5. os.environ GOOGLE_API_KEY
+
+    Used by: narrator loop, vision URL extractor, nano-banana thumbnail
+    generation (Phase 4), and gemini_narrate.narrate_panel. Each consumer
+    calls this at use-time (not at module-load) because Firestore isn't
+    initialized when research.py is first imported."""
+    fs_keys = _read_firestore_api_keys()
+    if fs_keys.get("gemini"):
+        return fs_keys["gemini"]
+    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        key = _read_user_scope_env(var)
+        if key:
+            return key
+    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        key = os.environ.get(var, "").strip()
+        if key:
+            return key
+    return ""
+
+
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}")
@@ -5965,7 +5994,12 @@ async def _narrator_loop(phase: int):
     sentence (phase-wide) plus, for Phase 2, one sentence per active agent.
     Emits `phase_narration` always and `agent_narration` for Phase 2.
     Back off on 429 / network blip."""
-    if not GEMINI_API_KEY:
+    # Resolve at loop entry, not module-load — so the user's Account-page
+    # apiKeys.gemini wins. Module-load resolution would always lose: the
+    # backend may pair / re-fetch keys before any pipeline starts, and the
+    # narrator only spins up inside run_pipeline anyway.
+    gemini_key = resolve_gemini_api_key()
+    if not gemini_key:
         return
     if phase is None or phase < 0:
         return
@@ -5993,7 +6027,7 @@ async def _narrator_loop(phase: int):
     _model_fallback = "gemini-2.5-flash"
     url_fallback = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{_model_fallback}:generateContent?key={GEMINI_API_KEY}"
+        f"{_model_fallback}:generateContent?key={gemini_key}"
     )
     _err_logged = False  # one-shot — avoid log spam if narrator stays broken
     _haiku_err_logged = False  # one-shot — log Haiku→Flash downgrade once
@@ -9515,10 +9549,7 @@ async def extract_source_urls_via_vision(page, agent_key: str,
 
     Disabled by setting DG_VISION_URL_EXTRACT=0.
     """
-    api_key = (
-        os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-    )
+    api_key = resolve_gemini_api_key()
     if not api_key:
         return []
 
@@ -16169,41 +16200,99 @@ async def _cleanup_nlm_keep_long_deep_dive(page) -> dict:
 
 # ── Phase 4: Video Conversion + YouTube Upload ──────────────────────────────
 
-GEMINI_API_KEY = get_env("GEMINI_API_KEY")  # For thumbnail generation (nano-banana)
-THUMBNAIL_MODEL = os.environ.get("THUMBNAIL_MODEL", "gemini-2.5-flash-image")  # nano-banana
+# Try Nano Banana 2 (3.1-flash-image-preview) first — it ships 4K output and
+# better instruction-following than the GA 2.5-flash-image. Fall through to
+# the GA model if the preview ID is unavailable on the caller's key/region
+# (404 PERMISSION_DENIED) or transiently throttled. Override either via env
+# THUMBNAIL_MODEL=<id>.
+_THUMBNAIL_MODEL_PRIMARY = os.environ.get("THUMBNAIL_MODEL", "gemini-3.1-flash-image-preview")
+_THUMBNAIL_MODEL_FALLBACK = "gemini-2.5-flash-image"
+
+
+def _build_thumbnail_prompt(topic: str) -> str:
+    """Build a tight, topic-specific thumbnail prompt. Anchored on concrete
+    visual cues so the image model produces something idiosyncratic rather
+    than another generic dark-tech-grid. Mirrors the FE album-art "concrete
+    motifs over abstractions" rule, just adapted for 16:9 video covers."""
+    t = topic.strip()[:240]
+    return (
+        f"Design a striking, magazine-quality YouTube cover image for a "
+        f"deep-research video on: \"{t}\".\n\n"
+        "Composition rules:\n"
+        "- 16:9 horizontal aspect ratio. Cinematic framing — shot like a "
+        "prestige film still or an editorial magazine spread.\n"
+        "- ONE commanding focal subject. The subject must be a literal, "
+        "physical visualization of the topic, NOT a generic 'tech' cliché. "
+        "Choose specific objects, environments, materials, or symbolic "
+        "imagery that an illustrator could render — molten metal, woven "
+        "cables, layered glass, microbial blooms, satellite arrays, etc. — "
+        "whichever fits the topic.\n"
+        "- Color: editorial palette of 2–3 tones plus one unexpected accent. "
+        "Avoid neon-blue cyber clichés unless the topic genuinely calls for "
+        "them. Match palette to the topic's mood (warm earth tones for "
+        "biology / urbanism; cool blues + chrome for orbital / quantum; "
+        "deep crimson + ash for geopolitics; etc.).\n"
+        "- Lighting: dramatic, single-source where possible — chiaroscuro, "
+        "rim-light, or atmospheric haze with controlled grain.\n"
+        "- Negative space: leave the upper-right or upper-left ~20% relatively "
+        "clean so YouTube's overlay UI doesn't fight the composition.\n\n"
+        "Hard prohibitions:\n"
+        "- NO text, NO letters, NO numbers, NO logos, NO watermarks anywhere.\n"
+        "- NO play buttons, no thumbnail icons, no UI chrome.\n"
+        "- NO microphones, headphones, waveforms, or generic podcast/tech imagery.\n"
+        "- NO cartoon characters, no emoji, no clipart.\n\n"
+        "Deliver: a single high-resolution 16:9 image. Polished, gallery-worthy, "
+        "evocative of the SPECIFIC topic — not interchangeable with a hundred "
+        "other 'AI research' thumbnails."
+    )
 
 
 def generate_thumbnail(topic, output_path):
-    """Generate a topic-relevant thumbnail via Gemini 2.5 Flash Image (nano-banana).
-    Falls back to Pillow text card if the API call fails."""
+    """Generate a topic-relevant thumbnail via Gemini image gen (Nano Banana 2
+    preview → 2.5-flash-image GA fallback). Falls back to Pillow text card if
+    both image models fail."""
+    last_err = None
+    last_status = None
     try:
         import requests
-        prompt = (
-            f"Create a professional, modern YouTube thumbnail for a research video about: "
-            f"{topic[:200]}. Dark futuristic theme, clean design, abstract tech visuals. "
-            f"No text on the image — just visual design. 16:9 aspect ratio."
-        )
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{THUMBNAIL_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
-        }
-        resp = requests.post(url, json=payload, timeout=60)
-        if resp.status_code == 200:
-            data = resp.json()
-            for candidate in data.get("candidates", []):
-                for part in candidate.get("content", {}).get("parts", []):
-                    if "inlineData" in part:
-                        img_data = base64.b64decode(part["inlineData"]["data"])
-                        Path(output_path).write_bytes(img_data)
-                        log(f"Thumbnail generated via {THUMBNAIL_MODEL} ✓ ({len(img_data)} bytes)")
-                        return
-        log(f"{THUMBNAIL_MODEL} returned {resp.status_code} — falling back to Pillow", "WARN")
+        # Resolve at use-time so the user's Account-page key wins. Module-load
+        # capture would freeze whatever was in env when --serve booted.
+        gemini_key = resolve_gemini_api_key()
+        if not gemini_key:
+            log("[thumbnail] No Gemini key — falling back to Pillow text card", "WARN")
+            raise RuntimeError("no-gemini-key")
+        prompt = _build_thumbnail_prompt(topic)
+        for model_id in (_THUMBNAIL_MODEL_PRIMARY, _THUMBNAIL_MODEL_FALLBACK):
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_id}:generateContent?key={gemini_key}"
+            )
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+            }
+            try:
+                resp = requests.post(url, json=payload, timeout=90)
+            except Exception as _re:
+                last_err = _re
+                log(f"[thumbnail] {model_id} request failed: {_re} — trying next", "WARN")
+                continue
+            if resp.status_code == 200:
+                data = resp.json()
+                for candidate in data.get("candidates", []):
+                    for part in candidate.get("content", {}).get("parts", []):
+                        if "inlineData" in part:
+                            img_data = base64.b64decode(part["inlineData"]["data"])
+                            Path(output_path).write_bytes(img_data)
+                            log(f"Thumbnail generated via {model_id} ({len(img_data)} bytes)")
+                            return
+                log(f"[thumbnail] {model_id} returned 200 but no inlineData — trying next", "WARN")
+                continue
+            last_status = resp.status_code
+            log(f"[thumbnail] {model_id} returned {resp.status_code} — trying next", "WARN")
+        log(f"[thumbnail] both models failed (last status={last_status}, last err={last_err}) — falling back to Pillow", "WARN")
     except Exception as e:
-        log(f"{THUMBNAIL_MODEL} image gen failed: {e} — falling back to Pillow", "WARN")
+        log(f"[thumbnail] image gen failed: {e} — falling back to Pillow", "WARN")
 
     # Fallback: Pillow text card
     try:
@@ -17687,15 +17776,26 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            progress="Verification skipped by user")
                 break  # break outer for
 
-        # Env checks: Gemini key for nano-banana thumbnail + ffmpeg for video.
+        # Env checks: required keys for the pipeline + ffmpeg for video.
         # Run these regardless of whether login verification was skipped —
-        # missing env breaks phase 4 whether or not logins are verified.
+        # missing env breaks the pipeline whether or not logins are verified.
+        # All three checks resolve via the SAME functions the actual call
+        # sites use, so a key set in the Account page (Firestore) wins over
+        # any local env. Without this, the gate would falsely refuse a run
+        # the BE could otherwise complete.
         _env_ok = True
         _env_errors: list[str] = []
+        # Anthropic / CUA — needed across phases for vision tier-2 + tier-3
+        # (CUA fallback). Hard requirement for any non-trivial run; surface
+        # the error before phase 1 so the user gets a clear "add it via
+        # Account → API Keys" instead of a mid-phase vision crash.
+        if not resolve_api_key():
+            _env_ok = False
+            _env_errors.append("Anthropic API key missing — add it in Account → API Keys (preferred), or set ANTHROPIC_API_KEY on the BE machine. Vision/CUA tiers can't run without it.")
         if _need_youtube:
-            if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+            if not resolve_gemini_api_key():
                 _env_ok = False
-                _env_errors.append("GOOGLE_API_KEY / GEMINI_API_KEY missing (needed for thumbnail)")
+                _env_errors.append("Gemini API key missing — add it in Account → API Keys, or set GOOGLE_API_KEY / GEMINI_API_KEY on the BE machine. Needed for the YouTube thumbnail.")
             if not shutil.which("ffmpeg"):
                 _env_ok = False
                 _env_errors.append("ffmpeg not on PATH (needed for video encoding)")
