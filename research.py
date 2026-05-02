@@ -19298,8 +19298,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 log("Phase 4: no audio from Phase 3 — awaiting user decision", "WARN")
                 fail_phase(
                     phase=4,
-                    error="No audio overview from Phase 3",
-                    reason="Phase 3 finished without producing an audio file (NotebookLM may have failed to generate one). Retry re-runs the audio step; Skip moves past Phase 4 without a YouTube video.",
+                    error="YouTube upload skipped — no source audio available",
+                    reason="No downloadable audio file is available for the YouTube video. Retry attempts the audio step again; Skip proceeds past Phase 4 without a YouTube video.",
                     agent="youtube",
                 )
                 decision = await _controls.await_phase_decision(4)
