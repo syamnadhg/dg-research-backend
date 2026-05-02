@@ -378,7 +378,7 @@ Multiple people can also share one backend. Share your ResearchToken — they pa
 | 4. YouTube | YouTube Studio (video render + upload) | ~9 min |
 | 5. Report | Google Doc + email delivery (FE-owned: Docs API + Resend) | ~3 min |
 
-Times based on real run analytics. Total: ~1h 50m for a full pipeline.
+Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT Pro, Claude Pro, and Gemini Pro are the assumed baseline — the Pipeline still runs end-to-end on free tiers, but Deep Research depth, image quality, and turn limits are far lower than what the per-agent timings, prompts, and waits were tuned against, so per-agent output is much shallower without Pro.
 
 ## Phase + per-agent narration (consolidated 2026-04-30)
 

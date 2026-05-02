@@ -32,6 +32,8 @@ Phase 0 (Init)
 
 **Dependency cascade:** Phase 3 off → Phase 4 auto-off (no audio to upload)
 
+> **Phase 4 fix plan (open).** Phase 4 (YouTube upload) currently has an open fix plan tracked in BE memory (`project_p4_fix_plan`) — a multi-commit sequence aimed at unblocking the YouTube path and the FE-P5 handoff. The dependency contract above ("REQUIRES Phase 3, videoEnabled") is unchanged by that work; the fix plan is about reliability of the upload itself.
+
 ---
 
 ## Event Types
@@ -170,6 +172,16 @@ Prevents soft-retrying a corpse forever — soft-retry on a dead page just re-fa
 ## NotebookLM Upload Filter (2026-04-30 `70e2ab2`)
 
 `_DERIVED_STEMS = {"brief", "consolidated"}` (research.py:14627). Phase 3 NotebookLM upload now skips files whose stem matches `_DERIVED_STEMS` — never uploads `consolidated.md` (a P2 byproduct of claude+gemini concatenation, used for the Documents page only) or `brief.md` (Phase 1 input, already implicit in the agent reports). Pre-fix, the scan-fallback loop picked these up as duplicate sources.
+
+## NotebookLM Strict-Keep Cleanup (`a52bd7b`, `2a93af0`)
+
+Phase 3 used to lean on a "cleanup-by-delete" pass after audio generation — sweep the studio panel and delete any audio cards we didn't want. That model is deprecated; the current flow is a **strict-keep** cleanup with invariant guards on either side of generation:
+
+- **Pre-flight invariant** — before triggering audio generation, the narrator counts the existing NLM audio cards in the studio panel. The expected baseline is 0 (a fresh notebook); if the count is non-zero the agent reconciles state before clicking generate, so we never start with a dirty studio.
+- **Post-generate invariant** — after generate fires, the agent verifies `count == 1` (the new Long + Deep-Dive card is the only one present). A mismatch here surfaces a Phase 3 alert instead of silently letting the wrong card flow downstream to YouTube.
+- **Post-completion strict-keep** — once the audio is fully rendered, the cleanup pass deletes any cards that are NOT the Long + Deep-Dive entry, while ALWAYS preserving the Long + Deep-Dive one. The keep-list is the contract; deletions are derived from "everything else", not from a denylist of known-bad shapes. This makes the cleanup robust to NLM UI changes that introduce new card variants.
+
+Within the same flow, the audio-generate prompt itself was tightened (`98bd631`) to keep CUA's click target on the generate button rather than wandering onto the surrounding tile body — a class of misclicks that, pre-fix, occasionally created a second card the strict-keep pass then had to clean up.
 
 ## Auto-Retry Kwarg Forwarding (2026-04-30 `549f079`)
 
