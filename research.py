@@ -15831,41 +15831,6 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             if "audio complete" in diag_text:
                 log("Audio generation complete ✓")
                 audio_done = True
-                # Strict-keep cleanup (2026-05-02). Identifies the Long +
-                # Deep Dive card unambiguously and deletes only the other
-                # entries around it. If the keep target is missing or
-                # ambiguous, deletes nothing — the post-cleanup invariant
-                # below then fail_phases. Replaces the older
-                # _cleanup_nlm_default_audio whose "deep dive only" filter
-                # could have nuked the real audio if NLM ever shipped a
-                # "Deep Dive Short" default.
-                try:
-                    cleanup = await _cleanup_nlm_keep_long_deep_dive(browser.page)
-                    log(f"[Phase3] NLM strict-keep cleanup: {cleanup}")
-                except Exception as _ce:
-                    log(f"[Phase3] NLM cleanup failed: {_ce}", "WARN")
-
-                # Post-cleanup invariant. We re-verify the panel state is
-                # exactly 1 Deep Dive card + 1 total card. If anything
-                # else, fail_phase: cleanup couldn't safely reduce to a
-                # clean Long+Deep Dive entry, and the share-link extract
-                # that runs next would pick whatever it could grab —
-                # potentially the wrong audio. Better to fail loud than
-                # ship a possibly-wrong artifact.
-                try:
-                    await asyncio.sleep(2)  # let DOM settle after deletes
-                    dd_count = await _count_nlm_deep_dive_cards(browser.page)
-                    total_count = await _count_nlm_audio_cards(browser.page)
-                    log(f"[Phase3] Post-cleanup inventory: {dd_count} Deep Dive / {total_count} total audio card(s)")
-                    if dd_count != 1 or total_count != 1:
-                        fail_phase(3,
-                                   f"Post-cleanup audio invariant failed: {dd_count} Deep Dive + {total_count} total (expected 1 + 1)",
-                                   "Cleanup couldn't safely reduce NLM Studio to a single Long + Deep Dive entry. Open the notebook, leave only that one entry, then retry.",
-                                   agent="notebooklm",
-                                   can_retry=True)
-                        return {"audio_path": None}
-                except Exception as _ie:
-                    log(f"[Phase3] Post-cleanup invariant check failed: {_ie}", "WARN")
                 break
 
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
@@ -15995,6 +15960,31 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             fail_phase(3, "Audio file not located on disk",
                        "NotebookLM finished but neither the Playwright download event nor the Downloads scan found the file.",
                        agent="notebooklm")
+
+    # Strict-keep cleanup (moved 2026-05-02). Was inside the poll loop at
+    # the audio-complete detection point — but cleanup-before-download is
+    # structurally fragile: if the post-cleanup invariant fail_phased OR
+    # cleanup's DOM manipulation re-rendered the panel before the
+    # download click landed, the download below never ran. Cleanup
+    # post-download means we already have the file on disk; cleanup then
+    # prepares the panel for the share-link extract that follows. The
+    # invariant degrades from fail_phase to log-warn — share-link extract
+    # uses a notebook-level API that doesn't depend on card count.
+    if audio_done and audio_path:
+        try:
+            cleanup = await _cleanup_nlm_keep_long_deep_dive(browser.page)
+            log(f"[Phase3] NLM strict-keep cleanup: {cleanup}")
+        except Exception as _ce:
+            log(f"[Phase3] NLM cleanup failed: {_ce}", "WARN")
+        try:
+            await asyncio.sleep(2)  # let DOM settle after deletes
+            dd_count = await _count_nlm_deep_dive_cards(browser.page)
+            total_count = await _count_nlm_audio_cards(browser.page)
+            log(f"[Phase3] Post-cleanup inventory: {dd_count} Deep Dive / {total_count} total audio card(s)")
+            if dd_count != 1 or total_count != 1:
+                log(f"[Phase3] Post-cleanup invariant warning: {dd_count} Deep Dive + {total_count} total (expected 1 + 1) — proceeding with share-link extract anyway since audio is already on disk", "WARN")
+        except Exception as _ie:
+            log(f"[Phase3] Post-cleanup invariant check failed: {_ie}", "WARN")
 
     # ── Extract NotebookLM Audio Overview shareable link ──
     # Audio overview share: three-dots/menu → Share → Notebook access → public → get link → Save
