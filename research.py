@@ -4847,34 +4847,26 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
         # LAST artifact in the conversation (the deep-research output).
         last_stage = "select_last_artifact"
         try:
+            # Close any open artifact panel first so the click-last targets
+            # a fresh card, not whatever was previously open.
             await page.evaluate("""() => {
-                // Close any open artifact panel first.
                 const closeBtn = document.querySelector(
                     'aside button[aria-label*="Close"], aside button[aria-label*="close"]'
                 );
                 if (closeBtn) closeBtn.click();
             }""")
             await asyncio.sleep(0.5)
-            opened = await page.evaluate("""() => {
-                // Find all artifact-preview tiles in the conversation, click the LAST one.
-                // Selectors target the inline cards that open the right-side artifact panel.
-                const candidates = document.querySelectorAll(
-                    '[data-testid*="artifact"], button[aria-label*="Open artifact"], ' +
-                    'button[aria-label*="open artifact"], a[href*="/artifacts/"], ' +
-                    '[class*="artifact-preview"], [class*="ArtifactPreview"]'
-                );
-                if (candidates.length === 0) return 'no_artifacts';
-                const last = candidates[candidates.length - 1];
-                // Some preview cards aren't directly clickable — fall through to
-                // a clickable ancestor (button or [role="button"]).
-                const target = last.closest('button, [role="button"]') || last;
-                target.click();
-                return 'opened_last';
-            }""")
-            if opened == 'opened_last':
+            # Use the unified helper instead of duplicating a divergent
+            # selector list — this guarantees we click whatever
+            # _count_claude_artifacts called the LAST card.
+            opened_ok = await _click_claude_artifact(page, index=-1)
+            if opened_ok:
                 # Let the artifact panel render before publish_open_claude_artifact
                 # tries to find its publish/share button.
                 await asyncio.sleep(1.5)
+            else:
+                log(f"[{label}] No clickable artifact cards found via unified helper",
+                    "DEBUG")
         except Exception as _ce:
             log(f"[{label}] artifact-select prelude skipped: {_ce}", "DEBUG")
 
@@ -8246,7 +8238,11 @@ async def _click_claude_artifact(page, index=0):
                 if (c.closest('[role="dialog"], [aria-modal="true"]')) return false;
                 return true;
             }});
-            if (cards.length > idx) {{ cards[idx].click(); return true; }}
+            const targetIdx = idx < 0 ? cards.length + idx : idx;
+            if (cards.length > 0 && targetIdx >= 0 && targetIdx < cards.length) {{
+                cards[targetIdx].click();
+                return true;
+            }}
             return false;
         }}""", index)
     except Exception as e:
@@ -8349,6 +8345,19 @@ def _is_sources_not_document(text, *, platform="generic"):
     """
     if not text or len(text) < 200:
         return False
+    # CHAT-TRANSCRIPT NEG (2026-05-02): chat-transcript meta-summary
+    # artifacts (e.g. "Claude Deep Research" tile with body containing
+    # "You said: …" / "Claude responded: …") would otherwise pass the
+    # STRONG-DOC override below — they have prose + headings but are
+    # fundamentally a recorded conversation, not the report. Reject when
+    # ≥2 chat-chrome lines are present anywhere.
+    chat_chrome_lines = sum(
+        1 for _l in text.splitlines()
+        if re.match(r'^\s*(?:you|chatgpt|gemini|claude|notebooklm|gpt)\s+(?:said|responded)\b',
+                    _l, re.I)
+    )
+    if chat_chrome_lines >= 2:
+        return True
     headings = len(re.findall(r'(?m)^#{1,3}\s+\S', text))
     paragraphs = [p for p in text.split('\n\n') if len(p) > 100]
     # STRONG-DOC: clearly long-form prose with at least minimal structure.
@@ -13380,9 +13389,20 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         log(f"[{label}] Extracted via CUA artifact copy: {len(clipboard)} chars")
         return clipboard
 
-    # Method 3: HTML→MD
+    # Method 3: HTML→MD (artifact-panel scoped — the prior list included
+    # `.font-claude-message` and `.contents .prose` which read the LEFT
+    # conversation column, admitting chat-transcript content. Now scoped
+    # to the right-side artifact panel only; chat-transcript guard in
+    # _is_sources_not_document catches anything that slips through.)
     md = await _extract_html_to_md(page, [
-        '[data-is-streaming="false"] .markdown', '.font-claude-message', '.contents .prose',
+        '[data-testid="artifact-content"]',
+        '.artifact-content',
+        '.artifact-panel .contents',
+        'aside .markdown',
+        'aside .prose',
+        '[class*="artifact-panel"] [class*="content"]',
+        '[class*="artifact"] .ProseMirror',
+        '[class*="artifact"] [class*="rendered"]',
     ], label)
     if md and len(md) > 100:
         if _is_sources_not_document(md, platform="claude"):
@@ -13395,10 +13415,16 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         else:
             return md
 
-    # Method 4: JS fallback
+    # Method 4: JS fallback (artifact-panel scoped — same narrowing as
+    # Method 3 above; chat-transcript guard catches stragglers).
     try:
         text = await page.evaluate("""() => {
-            const r = document.querySelectorAll('[data-is-streaming="false"] .markdown, .font-claude-message');
+            const r = document.querySelectorAll(
+                '[data-testid="artifact-content"], .artifact-content, ' +
+                '.artifact-panel .contents, aside .markdown, aside .prose, ' +
+                '[class*="artifact-panel"] [class*="content"], ' +
+                '[class*="artifact"] .ProseMirror, [class*="artifact"] [class*="rendered"]'
+            );
             if (r.length > 0) return r[r.length - 1].innerText;
             return '';
         }""")
