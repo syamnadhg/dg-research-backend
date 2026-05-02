@@ -10518,7 +10518,8 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
 #   Caller then does completed_set.add(agent) and clears extraction_in_progress.
 
 async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
-                                    elapsed_sec=0, verbose=False):
+                                    elapsed_sec=0, verbose=False,
+                                    expected_text_len=0):
     """Per-agent extract + save + emit ladder. Returns a result dict
     the caller drops into results[]. Never raises — on any internal failure
     returns status='failed' so the poll loop can decide whether to retry.
@@ -10583,6 +10584,24 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                 _runtime.claude_artifact_panel_open = False
             except Exception:
                 pass
+            # Length-sanity (2026-05-02): if streamed partial text accumulated
+            # during round-robin was substantial AND the extracted text is
+            # <30% of it, the extractor likely grabbed the wrong artifact
+            # (e.g. an early summary tile). Reject and let the failed-status
+            # branch fire so the caller's retry budget kicks in.
+            if (text and expected_text_len >= 1000
+                    and len(text) < int(0.3 * expected_text_len)):
+                log(f"[{name}] Length-sanity rejection: {len(text)} chars < 30% of "
+                    f"streamed {expected_text_len} chars — likely wrong artifact", "WARN")
+                try:
+                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                               op="finalize_length_sanity",
+                               length=len(text),
+                               expected=expected_text_len,
+                               tier="length_sanity")
+                except Exception:
+                    pass
+                text = ""
     n_chars = len(text)
 
     # Step 2b — Save MD to disk (Phase 3 input) + Firestore mirror (FE doc).
@@ -12159,6 +12178,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         queue_dir=_queue_dir,
                         elapsed_sec=int(elapsed),
                         verbose=verbose,
+                        expected_text_len=int(_partial_text_len or 0),
                     )
                     # 2026-04-25: markdown-as-primary. "done" means text>0 +
                     # in-app primary emitted. res["url"] is the conversation
@@ -12535,6 +12555,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     name, p["page"], browser, cua_client,
                     queue_dir=_queue_dir, elapsed_sec=int(elapsed),
                     verbose=verbose,
+                    expected_text_len=int(_partial_text_len or 0),
                 )
                 if res["status"] == "done":
                     _runtime.unregister_page(name.lower().replace(" ", ""),
