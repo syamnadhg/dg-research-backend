@@ -354,19 +354,6 @@ Steps:
 
 # ── Phase 3: Shareable Links + NotebookLM ─────────────────────────────────────
 
-PROMPT_SHARE_CHATGPT = SYSTEM_BASE + """
-
-Your task: Make this ChatGPT conversation shareable via link.
-
-Steps:
-1. Look for a "Share" button (usually top-right of the conversation).
-2. Click it.
-3. If the share dialog has a visibility selector (e.g. "Only people in this conversation" / "Anyone with the link" / "Unlisted"), pick the most public option (typically "Anyone with the link") BEFORE generating.
-4. If there's a separate "Make accessible to anyone with the link" toggle, enable it.
-5. Click "Create link" or "Copy link".
-6. The link should now be in your clipboard or visible on screen.
-7. Say "shared" with the URL if you can see it (must contain chatgpt.com/share/)."""
-
 PROMPT_SHARE_GEMINI = SYSTEM_BASE + """
 
 Your task: Make this Gemini conversation shareable via a PUBLIC link.
