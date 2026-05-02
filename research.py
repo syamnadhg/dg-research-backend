@@ -15306,16 +15306,16 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
     return {"links": links, "notebook_url": notebook_url, "md_files": [str(p) for p in md_files]}
 
 
-# ── Phase 4: Audio Overview Generation ───────────────────────────────────────
+# ── Phase 3 (audio): Audio Overview Generation ───────────────────────────────
 
 async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False):
     """Phase 3 (step b): Generate long-form audio overview in NotebookLM + share public."""
     log("=" * 60)
-    log("PHASE 4: Audio Overview Generation")
+    log("PHASE 3 (audio): Audio Overview Generation")
     log("=" * 60)
 
     if not notebook_url:
-        log("No NotebookLM notebook — skipping Phase 4", "WARN")
+        log("No NotebookLM notebook — skipping Phase 3 (audio)", "WARN")
         return {"audio_path": None}
 
     # Navigate to notebook if not already there
@@ -15330,24 +15330,24 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # workspace quota without moving forward.
     if cua_client:
         cleared = await check_hv_gate(browser, cua_client, "notebooklm", "NotebookLM",
-                                       phase=4, verbose=verbose)
+                                       phase=3, verbose=verbose)
         if not cleared:
-            log("Phase 4: HV gate on NotebookLM could not be cleared — aborting audio step", "ERROR")
+            log("Phase 3: HV gate on NotebookLM could not be cleared — aborting audio step", "ERROR")
             return {"audio_path": None}
 
     # Wrap generation + polling in a retry loop so the user can re-trigger
     # audio generation from scratch if the first attempt times out.
     audio_done = False
-    p4_max_retries = 1
-    p4_attempt = 0
+    p3_audio_max_retries = 1
+    p3_audio_attempt = 0
 
-    while p4_attempt <= p4_max_retries and not audio_done and not _controls.is_stop():
-        if p4_attempt > 0:
-            log(f"Phase 4: Retrying audio generation (attempt {p4_attempt + 1}/{p4_max_retries + 1})")
+    while p3_audio_attempt <= p3_audio_max_retries and not audio_done and not _controls.is_stop():
+        if p3_audio_attempt > 0:
+            log(f"Phase 3: Retrying audio generation (attempt {p3_audio_attempt + 1}/{p3_audio_max_retries + 1})")
             try:
-                emit_event("phase_restart", phase=4,
+                emit_event("phase_restart", phase=3,
                            reason="user_retry_audio",
-                           attempt=p4_attempt + 1)
+                           attempt=p3_audio_attempt + 1)
             except Exception:
                 pass
             # Reload notebook for a clean retry
@@ -15364,7 +15364,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         else:
             log("Starting audio generation (Long + Deep dive)...")
             _stop, _task = start_narration_ticker(
-                4, "notebooklm",
+                3, "notebooklm",
                 "Configuring audio overview (Long + Deep dive) and clicking Generate",
                 interval=20)
             try:
@@ -15377,7 +15377,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # Verify it started
         verified = await wait_until_verified(
             lambda page: _check_audio_generating(page),
-            browser.page, "Phase4", browser=browser, cua_client=cua_client,
+            browser.page, "Phase3-audio", browser=browser, cua_client=cua_client,
             max_retries=10, interval=5, verbose=verbose)
 
         if not verified:
@@ -15389,10 +15389,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         log("Waiting 2 minutes before first audio check (generation takes ~10-20 min)...")
         interrupt = await _controls.interruptible_sleep(2 * 60, check_interval=10)
         if interrupt == "stop":
-            log("[Phase4] STOP during initial wait — aborting", "WARN")
+            log("[Phase3] STOP during initial wait — aborting", "WARN")
             return {"audio_path": None}
         if interrupt == "pause":
-            emit_event("pipeline_paused", phase=4)
+            emit_event("pipeline_paused", phase=3)
             await _controls.wait_if_paused()
             if _controls.is_stop():
                 return {"audio_path": None}
@@ -15405,10 +15405,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         while (time.time() - poll_start) < max_poll:
             # ── Stop/Pause check per cycle ──
             if _controls.is_stop():
-                log("[Phase4] STOP requested — aborting audio poll")
+                log("[Phase3] STOP requested — aborting audio poll")
                 break
             if _controls.is_pause():
-                emit_event("pipeline_paused", phase=4)
+                emit_event("pipeline_paused", phase=3)
                 await _controls.wait_if_paused()
                 if _controls.is_stop():
                     break
@@ -15462,18 +15462,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 # share dialog opens against a single clean Deep Dive entry.
                 try:
                     cleanup = await _cleanup_nlm_default_audio(browser.page)
-                    log(f"[Phase4] NLM cleanup: {cleanup}")
+                    log(f"[Phase3] NLM cleanup: {cleanup}")
                 except Exception as _ce:
-                    log(f"[Phase4] NLM cleanup failed: {_ce}", "WARN")
+                    log(f"[Phase3] NLM cleanup failed: {_ce}", "WARN")
                 break
 
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
-            log(f"[Phase4] Audio still generating... ({elapsed_min}m total)")
+            log(f"[Phase3] Audio still generating... ({elapsed_min}m total)")
             # Live narration tick — without this the FE dropdown sits on the
             # last pre-poll string ("Setting notebook to…") for the full 45-min
             # audio window. Match the P2 round-robin cadence.
             try:
-                emit_event("agent_progress", phase=4, agent="notebooklm",
+                emit_event("agent_progress", phase=3, agent="notebooklm",
                            status="generating",
                            progress=f"NotebookLM still generating audio overview… "
                                     f"({elapsed_min}m total / ~15m typical)",
@@ -15483,10 +15483,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 pass
             interrupt = await _controls.interruptible_sleep(90, check_interval=10)
             if interrupt == "stop":
-                log("[Phase4] STOP during poll wait — aborting")
+                log("[Phase3] STOP during poll wait — aborting")
                 break
             if interrupt == "pause":
-                emit_event("pipeline_paused", phase=4)
+                emit_event("pipeline_paused", phase=3)
                 await _controls.wait_if_paused()
                 if _controls.is_stop():
                     break
@@ -15499,25 +15499,25 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # Timeout: offer user [Retry audio] / [Skip audio]. Skip routes
         # through the standard skip_phase command; retry restarts generation
         # from scratch.
-        retries_left = max(0, p4_max_retries - p4_attempt)
-        fail_phase(4,
-                   f"NotebookLM audio generation timed out (45 min cap, attempt {p4_attempt + 1}/{p4_max_retries + 1})",
+        retries_left = max(0, p3_audio_max_retries - p3_audio_attempt)
+        fail_phase(3,
+                   f"NotebookLM audio generation timed out (45 min cap, attempt {p3_audio_attempt + 1}/{p3_audio_max_retries + 1})",
                    "Retry regenerates from scratch. Skip proceeds with the written report + links only.",
                    agent="notebooklm",
                    can_retry=retries_left > 0)
         if retries_left > 0:
             # Wait up to 10 min for user choice. Default = skip (don't hang).
-            p4_decision = await _controls.await_phase_decision(4)
-            log(f"Phase 4 timeout decision: {p4_decision}")
-            if p4_decision == "retry":
-                p4_attempt += 1
+            p3_audio_decision = await _controls.await_phase_decision(3)
+            log(f"Phase 3 audio timeout decision: {p3_audio_decision}")
+            if p3_audio_decision == "retry":
+                p3_audio_attempt += 1
                 continue
-            if p4_decision == "stop":
+            if p3_audio_decision == "stop":
                 break
             # continue_anyway / skip / timeout → exit retry loop
             break
         else:
-            log("Phase 4: No audio retries left — proceeding without audio", "WARN")
+            log("Phase 3: No audio retries left — proceeding without audio", "WARN")
             break
 
     # Download audio
@@ -15544,11 +15544,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
         browser.page.on("download", _on_download)
 
-        emit_event("agent_progress", phase=4, agent="notebooklm",
+        emit_event("agent_progress", phase=3, agent="notebooklm",
                    status="downloading",
                    progress="Downloading audio file from NotebookLM…")
         _stop_d, _task_d = start_narration_ticker(
-            4, "notebooklm",
+            3, "notebooklm",
             "Downloading audio overview .m4a from NotebookLM",
             interval=20)
         try:
@@ -15591,7 +15591,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # That's a real error — surface it so the user knows Phase 5 will
         # skip and can decide whether to re-run or accept report-only.
         if not audio_path:
-            fail_phase(4, "Audio file not located on disk",
+            fail_phase(3, "Audio file not located on disk",
                        "NotebookLM finished but neither the Playwright download event nor the Downloads scan found the file.",
                        agent="notebooklm")
 
@@ -15735,7 +15735,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # the backend, and Phase 5 can still upload to YouTube from the
             # local file. Warn (not error) if it failed.
             if not audio_url:
-                log("[Phase4] Firebase Storage upload failed — audio still saved locally", "WARN")
+                log("[Phase3] Firebase Storage upload failed — audio still saved locally", "WARN")
         except Exception as e:
             log(f"Audio Firestore/Storage sync failed: {e}", "WARN")
 
@@ -15796,7 +15796,7 @@ async def _cleanup_nlm_default_audio(page) -> dict:
         if result["kept"] == 0 and non_dd:
             result["skipped_reason"] = "no_deep_dive_visible"
             try:
-                emit_event("nlm_cleanup_skipped", phase=4,
+                emit_event("nlm_cleanup_skipped", phase=3,
                            reason="no_deep_dive_visible",
                            scanned=result["scanned"])
             except Exception:
@@ -15856,7 +15856,7 @@ async def _cleanup_nlm_default_audio(page) -> dict:
             await asyncio.sleep(0.8)
             result["deleted"] += 1
             try:
-                emit_event("nlm_cleanup_deleted", phase=4,
+                emit_event("nlm_cleanup_deleted", phase=3,
                            card_snippet=card["snippet"])
             except Exception:
                 pass
@@ -15871,7 +15871,7 @@ async def _cleanup_nlm_default_audio(page) -> dict:
             pass
 
         try:
-            emit_event("nlm_cleanup_done", phase=4,
+            emit_event("nlm_cleanup_done", phase=3,
                        scanned=result["scanned"],
                        deleted=result["deleted"],
                        kept=result["kept"])
@@ -15881,7 +15881,7 @@ async def _cleanup_nlm_default_audio(page) -> dict:
     except Exception as e:
         result["skipped_reason"] = f"{type(e).__name__}: {e}"
         try:
-            emit_event("nlm_cleanup_error", phase=4, error=str(e)[:200])
+            emit_event("nlm_cleanup_error", phase=3, error=str(e)[:200])
         except Exception:
             pass
         return result
