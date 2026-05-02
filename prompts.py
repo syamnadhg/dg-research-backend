@@ -18,6 +18,76 @@ SYSTEM_BASE = (
     "handles human escalation."
 )
 
+# ── Phase 0: Account Tier Detection (read-only, single screenshot) ────────────
+# Used by Phase 0 preflight after login-verify succeeds. The pipeline was tuned
+# against Pro tiers on ChatGPT/Claude/Gemini; non-Pro silently produces a far
+# shallower brief / report. These prompts answer ONE word: PRO/FREE/UNSURE.
+# UNSURE → caller fails open (assumes Pro) — see _cua_pro_tier_call.
+
+PROMPT_DETECT_CHATGPT_PRO = SYSTEM_BASE + """
+
+Screenshot of ChatGPT (chatgpt.com), user is logged in.
+
+Look ONLY for these PRO subscription signals:
+- Current model label visible at top contains "Pro" — e.g. "GPT-5 Pro", "Pro mode", "o1 pro", "ChatGPT Pro"
+- Account/profile menu shows "Pro" plan label
+- Model selector (if open) lists "Pro" / "GPT-5 Pro" / "Pro mode" as a selectable option
+- "Pro" badge near the avatar / sidebar account area
+
+Look ONLY for these FREE subscription signals:
+- Current model label is "ChatGPT" with no Pro/Plus suffix, "GPT-5", "GPT-4o", "GPT-4o mini", "Auto"
+- Prominent "Upgrade to Pro" / "Get Pro" / "Try Pro" call-to-action button (not buried in a settings page)
+- Visible label "Free" / "Free plan" near the avatar
+- Model selector (if open) lists ONLY Free / Plus / Auto / Mini — no Pro option
+
+Reply with EXACTLY one word, no punctuation:
+PRO    — any PRO signal is clearly visible
+FREE   — a FREE signal is clearly visible AND no PRO signals
+UNSURE — mixed/hidden signals, or you cannot tell from this screenshot"""
+
+
+PROMPT_DETECT_CLAUDE_PRO = SYSTEM_BASE + """
+
+Screenshot of Claude (claude.ai), user is logged in.
+
+Look ONLY for these PRO subscription signals:
+- Model selector / message header shows "Opus" — e.g. "Opus 4.7", "Opus 4.7 Adaptive", "Claude Opus"
+- Account/profile menu shows "Pro" / "Max" / "Team" / "Enterprise" plan label
+- "Research" tool toggle is selectable in the composer (paid feature)
+
+Look ONLY for these FREE subscription signals:
+- Model selector shows ONLY "Sonnet" or "Haiku", no Opus option visible
+- Prominent "Upgrade to Pro" / "Try Pro" call-to-action button (not buried)
+- Visible label "Free" / "Free plan" near the avatar
+- "Pro" upsell banner across the top of the page
+
+Reply with EXACTLY one word, no punctuation:
+PRO    — any PRO signal is clearly visible
+FREE   — a FREE signal is clearly visible AND no PRO signals
+UNSURE — mixed/hidden signals, or you cannot tell from this screenshot"""
+
+
+PROMPT_DETECT_GEMINI_PRO = SYSTEM_BASE + """
+
+Screenshot of Gemini (gemini.google.com), user is logged in.
+
+Look ONLY for these PRO subscription signals:
+- Top-left product label reads "Gemini Advanced", "Gemini Pro", "Gemini 2.5 Pro", or "Gemini 2.5 Deep Think"
+- Model selector (if open) lists "2.5 Pro" / "Deep Think" / "Advanced" as available
+- Account chip shows "Advanced" / "Pro" subscription label
+
+Look ONLY for these FREE subscription signals:
+- Top-left product label reads only "Gemini" with no Advanced/Pro suffix
+- Prominent "Get Gemini Advanced" / "Try Advanced" / "Upgrade" call-to-action (not buried)
+- Model selector lists only "2.5 Flash" / standard models, no Pro/Deep Think options
+- Free-plan upsell banner across top
+
+Reply with EXACTLY one word, no punctuation:
+PRO    — any PRO signal is clearly visible
+FREE   — a FREE signal is clearly visible AND no PRO signals
+UNSURE — mixed/hidden signals, or you cannot tell from this screenshot"""
+
+
 # ── Phase 1: ChatGPT Brief Generation ─────────────────────────────────────────
 
 PROMPT_SELECT_PRO = SYSTEM_BASE + """

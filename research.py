@@ -2887,6 +2887,11 @@ class PipelineControls:
         # menu reads this to print a context-aware header (e.g. "login_required —
         # log in via the browser, then…"). Cleared on resume.
         self.pause_reason: str = ""
+        # User clicked "Continue with Free" on a Phase 0 pro_required alert.
+        # Suppresses subsequent platforms' Pro alerts in the same run, plus the
+        # Phase 1 backstop at the ChatGPT Pro selector site. Per-run only — NOT
+        # persisted to Firestore. A later Pro→Free downgrade should re-prompt.
+        self.pro_warning_acknowledged: bool = False
 
     def request_stop(self):
         self.stop_event.set()
@@ -3007,6 +3012,7 @@ class PipelineControls:
         self.skipped_agents.clear()
         self.skipped_phases.clear()
         self.continue_anyway = False
+        self.pro_warning_acknowledged = False
         self.retry_phase_requested.clear()
         self.retry_agents.clear()
         self.retry_agents_hard.clear()
@@ -3884,6 +3890,88 @@ async def _cua_login_call(page, platform: str, cua_client) -> tuple[bool, str]:
             or "overloaded" in low or "529" in err):
             raise CuaUnavailableError(err) from e
         return (False, f"API error: {e}")
+
+
+_PRO_TIER_PROMPT_BY_KEY = {
+    "chatgpt": "PROMPT_DETECT_CHATGPT_PRO",
+    "claude":  "PROMPT_DETECT_CLAUDE_PRO",
+    "gemini":  "PROMPT_DETECT_GEMINI_PRO",
+}
+
+
+async def _cua_pro_tier_call(page, platform: str, cua_client) -> str:
+    """Single-screenshot Pro/Free verdict for ChatGPT/Claude/Gemini.
+
+    Returns 'pro' | 'free' | 'unsure'. UNSURE is a fail-open signal — caller
+    treats it as "assume Pro, log INFO" so a transient UI state doesn't
+    false-flag.
+
+    Raises CuaUnavailableError on structural Anthropic failures (billing cap,
+    invalid key, 529) so the caller can surface the canonical "CUA can't run"
+    alert rather than silently degrading.
+    """
+    pname = platform.lower()
+    prompt_attr = _PRO_TIER_PROMPT_BY_KEY.get(pname)
+    if not prompt_attr:
+        return "unsure"  # No prompt for this platform — caller should not have called us
+    try:
+        from prompts import (
+            PROMPT_DETECT_CHATGPT_PRO,
+            PROMPT_DETECT_CLAUDE_PRO,
+            PROMPT_DETECT_GEMINI_PRO,
+        )
+    except Exception as e:
+        log(f"[pro_tier:{pname}] prompt import failed: {e}", "WARN")
+        return "unsure"
+    prompt_map = {
+        "chatgpt": PROMPT_DETECT_CHATGPT_PRO,
+        "claude":  PROMPT_DETECT_CLAUDE_PRO,
+        "gemini":  PROMPT_DETECT_GEMINI_PRO,
+    }
+    prompt = prompt_map[pname]
+    try:
+        buf = await page.screenshot(type="png", timeout=10000, full_page=False)
+        b64 = base64.b64encode(buf).decode("ascii")
+    except Exception as e:
+        log(f"[pro_tier:{pname}] screenshot failed: {e}", "WARN")
+        return "unsure"
+    try:
+        resp = await asyncio.to_thread(
+            cua_client.messages.create,
+            model=CUA_MODEL,
+            max_tokens=8,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        raw = ""
+        try:
+            for blk in resp.content:
+                if getattr(blk, "type", None) == "text":
+                    raw = (blk.text or "").strip()
+                    break
+        except Exception:
+            raw = ""
+        verdict = raw.strip().lower()
+        if verdict.startswith("pro"):
+            return "pro"
+        if verdict.startswith("free"):
+            return "free"
+        return "unsure"
+    except Exception as e:
+        err = str(e)
+        low = err.lower()
+        if ("workspace api usage limits" in low
+            or ("400" in err and "usage limit" in low)
+            or ("401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low))
+            or "overloaded" in low or "529" in err):
+            raise CuaUnavailableError(err) from e
+        log(f"[pro_tier:{pname}] API error: {e}", "WARN")
+        return "unsure"
 
 
 async def verify_login_cua(page, platform: str, cua_client) -> bool:
@@ -5813,6 +5901,53 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     # doc so the listing-page tile + chat phase icons stay red post-
     # reload. If a later Retry succeeds, phase_complete overwrites this.
     _write_phase_terminal_status(phase, "errored")
+
+
+_PRO_TIER_DETAILS_BY_KEY = {
+    "chatgpt": ("ChatGPT Pro required for Phase 1",
+                "This account isn't on ChatGPT Pro ($200/mo). Phase 1 was tuned "
+                "for Pro + Extended Thinking — Free produces a much shallower "
+                "brief, and Phase 2 agents are tuned against that brief. "
+                "Continue with Free, or Stop and upgrade?"),
+    "claude":  ("Claude Pro required for Phase 2",
+                "This account isn't on Claude Pro ($20/mo). Phase 2's Claude "
+                "agent uses Opus 4.7 + Research mode — Free tiers don't expose "
+                "Opus or Research and the report will be far shallower. "
+                "Continue with Free, or Stop and upgrade?"),
+    "gemini":  ("Gemini Advanced required for Phase 2",
+                "This account isn't on Gemini Advanced ($20/mo). Phase 2's "
+                "Gemini agent expects 2.5 Pro / Deep Think + Deep Research — "
+                "Free tiers cap turn limits and depth. "
+                "Continue with Free, or Stop and upgrade?"),
+}
+
+
+def _emit_pro_required_alert(phase: int, agent: str):
+    """Pro-tier alert with [Continue with Free, Stop] action set. Emits a
+    pipeline_error directly (not via fail_phase) so we don't write a terminal
+    'errored' status — the user hasn't failed the phase, just been asked to
+    confirm Free-tier degradation. The FE renders pipeline_error via the
+    unified PhaseAlertPanel, so no new event handler is needed.
+
+    `agent` is the platform key ('chatgpt' / 'claude' / 'gemini'). The alert_id
+    embeds it so concurrent multi-platform Pro alerts don't collide."""
+    title, details = _PRO_TIER_DETAILS_BY_KEY.get(
+        agent.lower(),
+        (f"{agent.title()} Pro required",
+         f"{agent.title()} isn't on a Pro tier — quality degrades. Continue with Free, or Stop?"),
+    )
+    emit_event(
+        "pipeline_error", phase=phase, agent=agent,
+        error=title, details=details,
+        actions=[
+            {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
+             "command": {"action": "continue_anyway"}},
+            {"id": "stop", "label": "Stop", "style": "danger",
+             "command": {"action": "stop"}},
+        ],
+        dismissible=True,
+        alert_id=f"phase{phase}_pro_required_{agent.lower()}",
+    )
 
 
 def emit_browser_recovery_status(phase: int, agent: str | None = None):
@@ -13468,7 +13603,32 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             result = {"text": "no pro available (cua_timeout)"}
         last = (result.get("text") or "").lower()
         if "no pro" in last or "not available" in last:
-            log("Pro mode not available", "WARN")
+            # DGOPS-7363 backstop. Phase 0 normally catches Pro-Free
+            # downgrade and pauses for [Continue with Free] [Stop]. This
+            # branch fires only when:
+            #  • skipInitVerify=true (Phase 0 was bypassed entirely), OR
+            #  • Pro was revoked between Phase 0 verify and Phase 1 active
+            #    (rare — usually means the subscription expired mid-day).
+            # If the user already opted into Free at Phase 0, log + fall
+            # through silently. Otherwise emit the same pro_required alert
+            # at Phase 1 and block on the user's choice.
+            if _controls.pro_warning_acknowledged:
+                log("Phase 1: Pro unavailable — user opted into Free at Phase 0 (continuing)", "INFO")
+            else:
+                log("Phase 1: Pro mode not available — Phase 0 was skipped or Pro was revoked; surfacing alert", "WARN")
+                _emit_pro_required_alert(phase=1, agent="chatgpt")
+                _controls.request_pause("pro_required")
+                emit_event("pipeline_paused", phase=1, reason="pro_required")
+                await _controls.wait_if_paused()
+                if _controls.is_stop():
+                    emit_event("pipeline_stopped", phase=1, reason="user_stop_pro_required")
+                    return None
+                # continue_anyway / resume → mark acknowledged so the rest
+                # of the run doesn't re-prompt, then fall through to the
+                # Free-tier brief flow.
+                _controls.consume_continue_anyway()
+                _controls.pro_warning_acknowledged = True
+                log("Phase 1: user opted into Free — proceeding with Free-tier brief", "INFO")
 
     # Attach PDFs
     _pdf_total = len(pdf_paths) if pdf_paths else 0
@@ -17790,6 +17950,52 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if ok:
                     emit_event("agent_progress", phase=0, agent=key,
                                status="ok", progress=f"{label}: logged in ✓")
+                    # Pro-tier verification (DGOPS-7363). Runs only for
+                    # platforms that have a Pro/Free split affecting Deep
+                    # Research output (ChatGPT/Claude/Gemini). Skipped if
+                    # the user already opted into Free on a prior platform
+                    # in this run, or if no CUA client is available.
+                    if (key in _PRO_TIER_PROMPT_BY_KEY
+                            and cua_client is not None
+                            and not _controls.pro_warning_acknowledged):
+                        emit_event("agent_progress", phase=0, agent=key,
+                                   status="checking_tier",
+                                   progress=f"{label}: checking subscription tier…")
+                        try:
+                            tier = await _cua_pro_tier_call(tab, key, cua_client)
+                        except CuaUnavailableError as cua_err:
+                            log(f"Phase 0: CUA unavailable during {label} tier check — assuming Pro: {cua_err}", "WARN")
+                            tier = "unsure"
+                        if tier == "free":
+                            log(f"Phase 0: {label} on Free tier — emitting pro_required alert", "INFO")
+                            emit_event("agent_progress", phase=0, agent=key,
+                                       status="not_pro",
+                                       progress=f"{label}: Pro NOT detected — Phase output will be degraded")
+                            _emit_pro_required_alert(phase=0, agent=key)
+                            _controls.request_pause("pro_required")
+                            emit_event("pipeline_paused", phase=0, reason="pro_required")
+                            await _controls.wait_if_paused()
+                            if _controls.is_stop():
+                                emit_event("pipeline_stopped", phase=0, reason="user_stop_pro_required")
+                                return
+                            if _controls.consume_continue_anyway():
+                                _controls.pro_warning_acknowledged = True
+                                log(f"Phase 0: user opted into Free — suppressing further Pro alerts this run", "INFO")
+                                emit_event("agent_progress", phase=0, agent=key,
+                                           status="free_acknowledged",
+                                           progress=f"{label}: continuing on Free (user-acknowledged)")
+                            else:
+                                # Resume without continue_anyway — treat as
+                                # acknowledgement too (user dismissed the alert
+                                # without picking either button, then resumed).
+                                _controls.pro_warning_acknowledged = True
+                                log(f"Phase 0: pro_required pause resumed without explicit choice — treating as Free-acknowledged", "INFO")
+                        elif tier == "pro":
+                            log(f"Phase 0: {label} Pro detected ✓", "INFO")
+                            emit_event("agent_progress", phase=0, agent=key,
+                                       status="pro_ok", progress=f"{label}: Pro tier ✓")
+                        else:  # unsure → fail open
+                            log(f"Phase 0: {label} tier UNSURE — assuming Pro (fail-open)", "INFO")
                     break  # move to next platform
 
                 # Not logged in — emit login_required scoped to JUST this
@@ -18026,6 +18232,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     emit_event("phase_restart", phase=1,
                                reason="mid_phase_input_on_resume",
                                chars=len(extra_ctx_retry), attempt=_p1_attempt+1)
+                if _controls.is_stop():
+                    # User pressed Stop during Phase 1 (e.g. on the Pro-required
+                    # backstop alert). Don't fire the "no brief generated"
+                    # alert — Stop already emitted pipeline_stopped. Outer
+                    # finally cleans up the browser. Pre-existing latent bug
+                    # surfaced by DGOPS-7363's Phase 1 backstop.
+                    log("Phase 1: stop_event set — exiting cleanly (no fail_phase cascade)", "INFO")
+                    return
                 if not p1 or not p1["text"]:
                     log("Phase 1 failed — no brief generated; awaiting user decision", "ERROR")
                     fail_phase(
