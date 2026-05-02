@@ -9022,21 +9022,20 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 await asyncio.sleep(60); continue
             elif "workspace api usage limits" in low or ("400" in err and "usage limit" in low):
                 log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
+                _cap_detail = err[:200] or "Workspace cap hit on the current Anthropic key."
+                _cap_hint = "Paste a different key in Account → API Keys (preferred), raise the cap in the Anthropic Console, or wait for reset."
                 if _phase == 2 and _agent:
-                    fail_agent(_agent, "Claude API workspace cap hit",
-                               err[:200] or "Raise the cap in the Anthropic Console or wait for reset.")
+                    fail_agent(_agent, "Claude API workspace cap hit", f"{_cap_detail} {_cap_hint}")
                 else:
-                    fail_phase(_phase, "Claude API workspace cap hit",
-                               err[:200] or "Raise the cap in the Anthropic Console or wait for reset.")
+                    fail_phase(_phase, "Claude API workspace cap hit", f"{_cap_detail} {_cap_hint}")
                 return {"status": "error", "text": str(e)}
             elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
                 log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
+                _bad_key_hint = "Paste a fresh key in Account → API Keys (preferred, no restart), or update CUA_API_KEY on the BE machine and restart."
                 if _phase == 2 and _agent:
-                    fail_agent(_agent, "Claude API key rejected",
-                               "Update CUA_API_KEY and restart the backend.")
+                    fail_agent(_agent, "Claude API key rejected", _bad_key_hint)
                 else:
-                    fail_phase(_phase, "Claude API key rejected",
-                               "Update CUA_API_KEY and restart the backend.")
+                    fail_phase(_phase, "Claude API key rejected", _bad_key_hint)
                 return {"status": "error", "text": str(e)}
             else:
                 log(f"API error: {e}", "ERROR")
@@ -17766,8 +17765,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # skip this platform (proceed with remaining) or stop.
                     log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
                     fail_phase(0, "CUA vision check can't run",
-                               (f"{str(cua_err)[:180]} — raise the Anthropic workspace cap, "
-                                "swap CUA_API_KEY, or skip remaining verification."),
+                               (f"{str(cua_err)[:180]} — paste a fresh key in Account → API Keys (preferred), "
+                                "raise the Anthropic workspace cap, swap CUA_API_KEY on the BE machine, "
+                                "or skip remaining verification."),
                                agent=key)
                     _controls.request_pause()
                     emit_event("pipeline_paused", phase=0, reason="cua_unavailable")
