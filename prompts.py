@@ -530,19 +530,37 @@ PROMPT_AUDIO_CHECK = SYSTEM_BASE + """
 
 Check if the NotebookLM audio overview has FINISHED generating.
 
-Look carefully:
-1. Is there a progress bar, "Generating..." text, or spinning/loading indicator? → say "still generating"
-2. Is there a completed audio player with play and download controls, AND NO progress indicator? → say "audio complete"
+Look ONLY at the audio overview CARD inside the Studio panel — the card
+that shows the Long + Deep Dive audio you generated. IGNORE other panel
+chrome, sidebars, banners, source-list spinners, or page-level loading
+indicators (NotebookLM regularly shows ambient progress on unrelated UI
+elements while the audio itself is fully done — these false-positives are
+the most common cause of 45-min poll timeouts).
 
-CRITICAL: If you see ANY loading/progress/generating indicator, say "still generating" even if play controls also exist.
-Only say "audio complete" if generation is 100% finished with no progress indicator visible."""
+On the audio overview card only:
+1. Is there a progress bar, "Generating..." text, or spinning indicator on the card itself? → say "still generating"
+2. Is there a completed audio player with play + download controls on the card, AND no progress indicator on the card? → say "audio complete"
+
+CRITICAL: Say "audio complete" as soon as the audio CARD itself is finished. A spinner on a different card, panel, or banner does NOT count — only the audio card's own state matters."""
 
 PROMPT_AUDIO_DOWNLOAD = SYSTEM_BASE + """
 
-Download the generated audio overview.
-1. Find the download button or three-dot menu near the audio player.
-2. Click to download.
-3. Say "downloaded" when the download begins."""
+Download the Long + Deep Dive audio overview that was just generated.
+
+If the Studio panel shows multiple audio entries (for example an auto-fired
+short default alongside the Long + Deep Dive one), target ONLY the Long +
+Deep Dive entry — the one whose label, duration, or thumbnail matches a
+long-form deep dive (typically 15+ minutes). Do NOT click any other audio
+entry's play button, download button, or three-dot menu.
+
+Steps:
+1. Locate the Long + Deep Dive audio entry in the Studio panel.
+2. On THAT entry, open its three-dot menu (or find its download affordance).
+3. Click Download. Say "downloaded" when the download begins.
+
+If only one audio entry exists, download that one. If multiple entries exist
+and the labels are genuinely ambiguous, download the most recently completed
+entry (usually the topmost or latest-timestamped)."""
 
 # ── Phase 5: YouTube Upload ───────────────────────────────────────────────────
 
