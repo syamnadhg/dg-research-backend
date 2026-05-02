@@ -15821,7 +15821,17 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             except Exception:
                 pass
 
-            # CUA check — strict: only "audio complete" counts
+            # DOM-first: read the audio card directly. Avoids CUA's
+            # page-wide-chrome confusion where unrelated NLM panel
+            # spinners triggered "still generating" answers even after
+            # the audio itself was done. CUA still runs as fallback.
+            dom_complete = await _check_audio_complete_dom(browser.page)
+            if dom_complete:
+                log("Audio generation complete ✓ (DOM-detected)")
+                audio_done = True
+                break
+
+            # CUA fallback — strict: only "audio complete" counts
             diag = await agent_loop(cua_client, browser, PROMPT_AUDIO_CHECK,
                 "Check: Has audio generation FINISHED? Is there a completed audio player "
                 "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
@@ -15829,7 +15839,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             diag_text = (diag.get("text") or "").lower()
 
             if "audio complete" in diag_text:
-                log("Audio generation complete ✓")
+                log("Audio generation complete ✓ (CUA-detected)")
                 audio_done = True
                 break
 
@@ -16140,6 +16150,49 @@ async def _check_audio_generating(page):
             const text = document.body.innerText.toLowerCase();
             return text.includes('generating') || text.includes('creating audio') || text.includes('in progress');
         }""")
+    except Exception:
+        return False
+
+
+async def _check_audio_complete_dom(page) -> bool:
+    """Detect a completed NLM audio overview by reading the card's own DOM.
+    Returns True only when an audio card has a present <audio> element AND
+    no progress indicators AND no generating-related text. Used as a
+    DOM-first check before CUA — avoids the page-wide-chrome false
+    negatives where CUA reports "still generating" because some unrelated
+    NLM panel still shows a spinner while the audio itself is done.
+    """
+    try:
+        return await page.evaluate("""() => {
+            const panel = document.querySelector(
+                '[aria-label*="Studio" i], [data-testid*="studio" i], aside'
+            ) || document.body;
+            const candidates = panel.querySelectorAll(
+                '[role="article"], [role="listitem"], '
+                + '[class*="audio-card"], [class*="AudioCard"], '
+                + '[data-testid*="audio"], [data-testid*="overview-item"]'
+            );
+            for (const el of candidates) {
+                if (el.offsetParent === null) continue;
+                const t = (el.innerText || '').toLowerCase();
+                const isAudio = t.includes('audio overview')
+                    || t.includes('conversation') || t.includes('discussion')
+                    || t.includes('podcast');
+                const isConfigTile = t.includes('customize');
+                if (!isAudio || isConfigTile) continue;
+                const hasAudioEl = !!el.querySelector('audio');
+                if (!hasAudioEl) continue;
+                const isBusy = el.getAttribute('aria-busy') === 'true'
+                    || !!el.querySelector('[role="progressbar"]')
+                    || !!el.querySelector('[aria-busy="true"]');
+                const hasGeneratingText = t.includes('generating')
+                    || t.includes('creating audio') || t.includes('preparing audio')
+                    || t.includes('loading') || t.includes('in progress');
+                if (isBusy || hasGeneratingText) continue;
+                return true;
+            }
+            return false;
+        }""") or False
     except Exception:
         return False
 
