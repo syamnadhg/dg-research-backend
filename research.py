@@ -13647,9 +13647,11 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 emit_event("pipeline_resumed", phase=1, reason="pro_retry")
                 continue
             # continue_anyway / generic resume → ack and proceed on Free.
-            _controls.consume_continue_anyway()
+            chose_free = _controls.consume_continue_anyway()
             _controls.pro_warning_acknowledged = True
             log("Phase 1: user opted into Free — proceeding with Free-tier brief", "INFO")
+            emit_event("pipeline_resumed", phase=1,
+                       reason="continue_with_free" if chose_free else "resume")
             break
 
     # Attach PDFs
@@ -18020,6 +18022,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             if _controls.consume_continue_anyway():
                                 _controls.pro_warning_acknowledged = True
                                 log(f"Phase 0: user opted into Free — suppressing further Pro alerts this run", "INFO")
+                                emit_event("pipeline_resumed", phase=0, reason="continue_with_free")
                                 emit_event("agent_progress", phase=0, agent=key,
                                            status="free_acknowledged",
                                            progress=f"{label}: continuing on Free (user-acknowledged)")
@@ -18029,6 +18032,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 # then resumed via chat-box).
                                 _controls.pro_warning_acknowledged = True
                                 log(f"Phase 0: pro_required pause resumed without explicit choice — treating as Free-acknowledged", "INFO")
+                                emit_event("pipeline_resumed", phase=0, reason="resume")
                         elif tier == "pro":
                             log(f"Phase 0: {label} Pro detected ✓", "INFO")
                             emit_event("agent_progress", phase=0, agent=key,
