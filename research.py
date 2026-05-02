@@ -5907,34 +5907,45 @@ _PRO_TIER_DETAILS_BY_KEY = {
     "chatgpt": ("ChatGPT Pro required for Phase 1",
                 "This account isn't on ChatGPT Pro ($200/mo). Phase 1 was tuned "
                 "for Pro + Extended Thinking — Free produces a much shallower "
-                "brief, and Phase 2 agents are tuned against that brief. "
-                "Continue with Free, or Stop and upgrade?"),
+                "brief, and Phase 2 agents are tuned against that brief.\n\n"
+                "To upgrade: sign out of ChatGPT in the open browser, sign back in "
+                "with a Pro-tier account, then click Retry to re-verify. "
+                "Or click Continue with Free to accept the degraded brief."),
     "claude":  ("Claude Pro required for Phase 2",
                 "This account isn't on Claude Pro ($20/mo). Phase 2's Claude "
                 "agent uses Opus 4.7 + Research mode — Free tiers don't expose "
-                "Opus or Research and the report will be far shallower. "
-                "Continue with Free, or Stop and upgrade?"),
+                "Opus or Research and the report will be far shallower.\n\n"
+                "To upgrade: sign out of Claude in the open browser, sign back in "
+                "with a Pro-tier account, then click Retry to re-verify. "
+                "Or click Continue with Free to accept the degraded report."),
     "gemini":  ("Gemini Advanced required for Phase 2",
                 "This account isn't on Gemini Advanced ($20/mo). Phase 2's "
                 "Gemini agent expects 2.5 Pro / Deep Think + Deep Research — "
-                "Free tiers cap turn limits and depth. "
-                "Continue with Free, or Stop and upgrade?"),
+                "Free tiers cap turn limits and depth.\n\n"
+                "To upgrade: sign out of Gemini in the open browser, sign back in "
+                "with an Advanced-tier account, then click Retry to re-verify. "
+                "Or click Continue with Free to accept the degraded report."),
 }
 
 
 def _emit_pro_required_alert(phase: int, agent: str):
-    """Pro-tier alert with [Continue with Free, Stop] action set. Emits a
+    """Pro-tier alert with [Continue with Free, Retry] action set. Emits a
     pipeline_error directly (not via fail_phase) so we don't write a terminal
     'errored' status — the user hasn't failed the phase, just been asked to
     confirm Free-tier degradation. The FE renders pipeline_error via the
     unified PhaseAlertPanel, so no new event handler is needed.
+
+    Stop is omitted by design: the chat-box Stop button is always reachable
+    while paused, so adding a Stop action here would be a redundant affordance.
+    Retry re-verifies login + tier on the same platform after the user signs
+    in with a Pro account.
 
     `agent` is the platform key ('chatgpt' / 'claude' / 'gemini'). The alert_id
     embeds it so concurrent multi-platform Pro alerts don't collide."""
     title, details = _PRO_TIER_DETAILS_BY_KEY.get(
         agent.lower(),
         (f"{agent.title()} Pro required",
-         f"{agent.title()} isn't on a Pro tier — quality degrades. Continue with Free, or Stop?"),
+         f"{agent.title()} isn't on a Pro tier — quality degrades. Sign in with a Pro account and Retry, or Continue with Free."),
     )
     emit_event(
         "pipeline_error", phase=phase, agent=agent,
@@ -5942,8 +5953,8 @@ def _emit_pro_required_alert(phase: int, agent: str):
         actions=[
             {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
              "command": {"action": "continue_anyway"}},
-            {"id": "stop", "label": "Stop", "style": "danger",
-             "command": {"action": "stop"}},
+            {"id": "retry", "label": "Retry", "style": "primary",
+             "command": {"action": "retry_phase", "phase": phase}},
         ],
         dismissible=True,
         alert_id=f"phase{phase}_pro_required_{agent.lower()}",
@@ -13587,48 +13598,59 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     # so the rest of Phase 1 falls through gracefully (the pipeline still
     # gets an Extended Thinking attempt without the Pro model upgrade).
     if cua_client:
-        log("Selecting Pro + Extended Thinking...")
-        emit_event("agent_progress", phase=1, agent="chatgpt",
-                   status="selecting_model",
-                   progress="Selecting ChatGPT Pro with Extended Thinking…")
-        try:
-            result = await asyncio.wait_for(
-                agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
-                    "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
-                    model=CUA_MODEL, max_iterations=15, verbose=verbose),
-                timeout=180.0,
-            )
-        except asyncio.TimeoutError:
-            log("Phase 1: Pro+Extended Thinking selection timed out (180s) — proceeding without explicit Pro upgrade", "WARN")
-            result = {"text": "no pro available (cua_timeout)"}
-        last = (result.get("text") or "").lower()
-        if "no pro" in last or "not available" in last:
-            # DGOPS-7363 backstop. Phase 0 normally catches Pro-Free
-            # downgrade and pauses for [Continue with Free] [Stop]. This
-            # branch fires only when:
+        # DGOPS-7363 retry-aware Pro selection. Wrapped in a while-True so the
+        # backstop alert's Retry button can re-run PROMPT_SELECT_PRO inline
+        # after the user signs in with a Pro account. Exits the loop on:
+        #  • Pro selected (no "no pro" in output) → break to PDFs
+        #  • Stop pressed during the alert → return None
+        #  • Continue with Free / generic resume → ack flag set, break
+        #  • pro_warning_acknowledged already set on entry → break
+        while True:
+            log("Selecting Pro + Extended Thinking...")
+            emit_event("agent_progress", phase=1, agent="chatgpt",
+                       status="selecting_model",
+                       progress="Selecting ChatGPT Pro with Extended Thinking…")
+            try:
+                result = await asyncio.wait_for(
+                    agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
+                        "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
+                        model=CUA_MODEL, max_iterations=15, verbose=verbose),
+                    timeout=180.0,
+                )
+            except asyncio.TimeoutError:
+                log("Phase 1: Pro+Extended Thinking selection timed out (180s) — proceeding without explicit Pro upgrade", "WARN")
+                result = {"text": "no pro available (cua_timeout)"}
+            last = (result.get("text") or "").lower()
+            if not ("no pro" in last or "not available" in last):
+                break  # Pro selected — exit the retry loop
+            # Backstop: Phase 0 normally catches Pro-Free downgrade and pauses
+            # for the alert. This branch fires only when:
             #  • skipInitVerify=true (Phase 0 was bypassed entirely), OR
             #  • Pro was revoked between Phase 0 verify and Phase 1 active
             #    (rare — usually means the subscription expired mid-day).
-            # If the user already opted into Free at Phase 0, log + fall
-            # through silently. Otherwise emit the same pro_required alert
-            # at Phase 1 and block on the user's choice.
             if _controls.pro_warning_acknowledged:
                 log("Phase 1: Pro unavailable — user opted into Free at Phase 0 (continuing)", "INFO")
-            else:
-                log("Phase 1: Pro mode not available — Phase 0 was skipped or Pro was revoked; surfacing alert", "WARN")
-                _emit_pro_required_alert(phase=1, agent="chatgpt")
-                _controls.request_pause("pro_required")
-                emit_event("pipeline_paused", phase=1, reason="pro_required")
-                await _controls.wait_if_paused()
-                if _controls.is_stop():
-                    emit_event("pipeline_stopped", phase=1, reason="user_stop_pro_required")
-                    return None
-                # continue_anyway / resume → mark acknowledged so the rest
-                # of the run doesn't re-prompt, then fall through to the
-                # Free-tier brief flow.
-                _controls.consume_continue_anyway()
-                _controls.pro_warning_acknowledged = True
-                log("Phase 1: user opted into Free — proceeding with Free-tier brief", "INFO")
+                break
+            log("Phase 1: Pro mode not available — Phase 0 was skipped or Pro was revoked; surfacing alert", "WARN")
+            _emit_pro_required_alert(phase=1, agent="chatgpt")
+            _controls.request_pause("pro_required")
+            emit_event("pipeline_paused", phase=1, reason="pro_required")
+            await _controls.wait_if_paused()
+            if _controls.is_stop():
+                emit_event("pipeline_stopped", phase=1, reason="user_stop_pro_required")
+                return None
+            if _controls.consume_retry_phase(1):
+                # User clicked Retry — re-run PROMPT_SELECT_PRO. Likely the
+                # user signed into a Pro account in the open browser; the
+                # next iteration will detect Pro and break.
+                log("Phase 1: user clicked Retry on pro_required — re-running Pro selector", "INFO")
+                emit_event("pipeline_resumed", phase=1, reason="pro_retry")
+                continue
+            # continue_anyway / generic resume → ack and proceed on Free.
+            _controls.consume_continue_anyway()
+            _controls.pro_warning_acknowledged = True
+            log("Phase 1: user opted into Free — proceeding with Free-tier brief", "INFO")
+            break
 
     # Attach PDFs
     _pdf_total = len(pdf_paths) if pdf_paths else 0
@@ -17978,6 +18000,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             if _controls.is_stop():
                                 emit_event("pipeline_stopped", phase=0, reason="user_stop_pro_required")
                                 return
+                            if _controls.consume_retry_phase(0):
+                                # User clicked Retry — they're (presumably)
+                                # signing in with a Pro account. Close the
+                                # current tab so the next iteration re-opens
+                                # fresh and re-runs login + tier checks from
+                                # scratch. The while loop's `continue` re-runs
+                                # the whole verification for THIS platform.
+                                log(f"Phase 0: user clicked Retry on {label} pro_required — re-verifying", "INFO")
+                                emit_event("pipeline_resumed", phase=0, reason="pro_retry")
+                                _t = _preflight_tabs.pop(key, None)
+                                if _t is not None:
+                                    try: await _t.close()
+                                    except Exception: pass
+                                emit_event("phase_start", phase=0,
+                                           description=f"Re-checking {label} after Pro retry (attempt {attempt + 1})")
+                                _update_firestore_research({"phase": 0, "currentPhase": 0, "status": "ongoing"})
+                                continue  # re-run the while loop for this platform
                             if _controls.consume_continue_anyway():
                                 _controls.pro_warning_acknowledged = True
                                 log(f"Phase 0: user opted into Free — suppressing further Pro alerts this run", "INFO")
@@ -17985,9 +18024,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                            status="free_acknowledged",
                                            progress=f"{label}: continuing on Free (user-acknowledged)")
                             else:
-                                # Resume without continue_anyway — treat as
-                                # acknowledgement too (user dismissed the alert
-                                # without picking either button, then resumed).
+                                # Resume without continue_anyway / retry — treat
+                                # as acknowledgement (user dismissed the alert
+                                # then resumed via chat-box).
                                 _controls.pro_warning_acknowledged = True
                                 log(f"Phase 0: pro_required pause resumed without explicit choice — treating as Free-acknowledged", "INFO")
                         elif tier == "pro":

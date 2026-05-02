@@ -30,7 +30,7 @@ The supervisor (`--resurrect` / `--retire`) currently uses Windows Task Schedule
   - **ChatGPT Pro** ($200/mo per seat) — Phase 1 brief uses Pro + Extended Thinking.
   - **Claude Pro** ($20/mo per seat) — Phase 2 Claude agent uses Opus 4.7 + Research mode (Free tiers don't expose Opus or Research).
   - **Gemini Advanced** ($20/mo per seat, via Google One AI Premium) — Phase 2 Gemini agent uses 2.5 Pro / Deep Think + Deep Research.
-  - The pipeline will *run* end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower. **Phase 0 vision-checks each platform's tier after login-verify and hard-flags the first non-Pro account it finds** with a `[Continue with Free] [Stop]` alert — opting into Free for one platform suppresses the prompt for the rest of the run, so verify Pro is active in each platform's account/billing page before pairing to avoid surprises.
+  - The pipeline will *run* end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower. **Phase 0 vision-checks each platform's tier after login-verify and hard-flags the first non-Pro account it finds** with a `[Continue with Free] [Retry]` alert — sign out, sign in with a Pro account in the same browser, then click Retry to re-verify. Opting into Free for one platform suppresses the prompt for the rest of the run, so verify Pro is active in each platform's account/billing page before pairing to avoid surprises. (Stop is always reachable from the chat-box during a paused pipeline — no separate Stop button on the alert.)
 - *(Optional)* Gemini API key for Phase 4 nano-banana thumbnails. (Phase 5 — Google Doc creation + email — runs entirely in the frontend; no BE-side Resend setup needed.)
 
 ## Quick Start
@@ -383,7 +383,7 @@ Multiple people can also share one backend. Share your ResearchToken — they pa
 | 4. YouTube | YouTube Studio (video render + upload) | ~9 min |
 | 5. Report | Google Doc + email delivery (FE-owned: Docs API + Resend) | ~3 min |
 
-Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT Pro, Claude Pro, and Gemini Advanced are the assumed baseline — see [Before you start](#before-you-start-prerequisites-checklist) for per-seat costs. Phase 0 vision-checks each platform's tier after login-verify and hard-flags non-Pro accounts with `[Continue with Free] [Stop]` before Phase 1 starts; if you `Continue with Free` (or have Phase 0 verification disabled in Settings), the pipeline runs end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower than what the per-agent timings, prompts, and waits were tuned against, so per-agent output is much shallower.
+Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT Pro, Claude Pro, and Gemini Advanced are the assumed baseline — see [Before you start](#before-you-start-prerequisites-checklist) for per-seat costs. Phase 0 vision-checks each platform's tier after login-verify and hard-flags non-Pro accounts with `[Continue with Free] [Retry]` before Phase 1 starts; Retry re-verifies after you sign in with a Pro account in the same browser. If you `Continue with Free` (or have Phase 0 verification disabled in Settings), the pipeline runs end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower than what the per-agent timings, prompts, and waits were tuned against, so per-agent output is much shallower.
 
 ## Phase + per-agent narration (consolidated 2026-04-30)
 
