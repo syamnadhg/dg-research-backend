@@ -19092,6 +19092,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             update_delivery(research_links=links, notebook_url=notebook_url)
             # Sub-step 3b: Generate audio overview
             audio_overview_url = ""
+            _p3_audio_user_skipped = False
             if notebook_url:
                 while True:  # timeout-retry loop
                     try:
@@ -19108,6 +19109,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         if _decision == "skip":
                             emit_event("phase_skipped", phase=3, reason="user_skip_audio_timeout")
                             _p3_audio = {"audio_path": None, "audio_overview_url": ""}
+                            _p3_audio_user_skipped = True
+                            _controls.skipped_phases.add(4)
                             break
                         emit_event("pipeline_stopped", phase=3, reason=f"user_{_decision}_audio_timeout")
                         return
@@ -19137,8 +19140,58 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # label+url at FE allLinks lets the second row survive.
             if audio_overview_url and validate_link("notebooklm", audio_overview_url):
                 _p3_links.append({"label": "Audio Overview", "url": audio_overview_url, "verified": True})
-            emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
-                summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}{', audio link extracted' if audio_overview_url else ''}")
+            # Hard rule (user_locked 2026-05-02): P3 marks complete only when
+            # both notebook AND audio are obtained. Surface a [Retry, Skip]
+            # alert when audio is missing rather than emitting phase_complete
+            # with stale-audio risk and tripping P4's no-audio fail_phase.
+            while bool(notebook_url) and not audio_path and not _p3_audio_user_skipped:
+                log("Phase 3: audio file missing after run — awaiting user decision", "WARN")
+                fail_phase(
+                    phase=3,
+                    error="No audio file from NotebookLM",
+                    reason="Phase 3 finished without producing a downloadable audio file. Retry re-runs the audio step (NotebookLM may have stalled or the download was missed); Skip moves past Phase 3 with the notebook link only — Phase 4 (YouTube) will skip too.",
+                    agent="notebooklm",
+                )
+                decision = await _controls.await_phase_decision(3)
+                if decision == "retry":
+                    log("Phase 3: user requested audio retry (no audio file)", "INFO")
+                    emit_event("phase_restart", phase=3, reason="user_retry_audio_missing")
+                    try:
+                        _p3_audio = await _await_phase_with_active_deadline(
+                            3, PHASE_3_MAX_MIN,
+                            lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                        )
+                        audio_path = _p3_audio.get("audio_path")
+                        _ao_url = _p3_audio.get("audio_overview_url", "")
+                        if _ao_url:
+                            audio_overview_url = _ao_url
+                            emit_validated_link(3, "notebooklm", _ao_url, "Audio Overview", link_kind="audio")
+                            if validate_link("notebooklm", _ao_url) and not any(l.get("url") == _ao_url for l in _p3_links):
+                                _p3_links.append({"label": "Audio Overview", "url": _ao_url, "verified": True})
+                        if audio_path:
+                            save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
+                                            notebook_url=notebook_url,
+                                            audio_path=str(audio_path),
+                                            audio_overview_url=audio_overview_url)
+                    except asyncio.TimeoutError:
+                        log("Phase 3 audio retry timed out", "WARN")
+                        audio_path = None
+                    except Exception as _ar:
+                        log(f"Phase 3 audio retry failed: {_ar}", "WARN")
+                        audio_path = None
+                    continue
+                if decision == "skip":
+                    log("Phase 3: user skipped after no audio — cascading P4 skip (P3-OFF ⇒ P4-OFF)", "INFO")
+                    emit_event("phase_skipped", phase=3, reason="user_skip_after_no_audio")
+                    _p3_audio_user_skipped = True
+                    _controls.skipped_phases.add(4)
+                    break
+                log(f"Phase 3: user {decision} after no audio — terminating pipeline", "INFO")
+                emit_event("pipeline_stopped", phase=3, reason=f"user_{decision}_after_no_audio")
+                return
+            if not _p3_audio_user_skipped:
+                emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
+                    summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}{', audio link extracted' if audio_overview_url else ''}")
         else:
             links_file = queue_dir / "links.json"
             if links_file.exists():
