@@ -16108,10 +16108,15 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
         if decision == "skip":
             log("[Phase4] ffmpeg: user skipped — proceeding without video", "INFO")
             emit_event("phase_skipped", phase=4, reason="user_skip_after_ffmpeg_fail")
-            return {"youtube_url": ""}
+            # Signal back to the orchestrator so it skips extract-retry + the
+            # dishonest empty-URL phase_complete emit. Without this, the
+            # orchestrator's _p4_user_skipped flag stays False and Skip
+            # cascades into a SECOND fail_phase ("Could not extract verified
+            # YouTube URL") — i.e. the "Skip stuck" symptom.
+            return {"youtube_url": "", "user_skipped": True}
         log(f"[Phase4] ffmpeg: user {decision} — terminating pipeline", "INFO")
         emit_event("pipeline_stopped", phase=4, reason=f"user_{decision}_after_ffmpeg_fail")
-        return {"youtube_url": ""}
+        return {"youtube_url": "", "user_skipped": True}
 
     # Upload to YouTube
     log("Uploading to YouTube (unlisted)...")
@@ -18491,12 +18496,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         emit_event("pipeline_stopped", phase=4, reason=f"user_{_decision}_after_timeout")
                         return
                 youtube_url = p5.get("youtube_url", "")
+                # Pick up user-skip signal from run_phase4 (ffmpeg-skip path)
+                # in addition to the timeout-skip flag set above. Both paths
+                # need to bypass extract-retry + the success-path phase_complete.
+                _p4_user_skipped = _p4_user_skipped or bool(p5.get("user_skipped", False))
                 # B1: Link-first — retry YouTube URL extraction on validation failure.
                 # ARCHITECTURE 2026-04-18 (never-die): wrap the retry in a
                 # decision loop so repeated extract failures surface as a
                 # phase alert with Retry / Skip instead of silently
                 # terminating.
-                if not (youtube_url and validate_link("youtube", youtube_url)):
+                if not _p4_user_skipped and not (youtube_url and validate_link("youtube", youtube_url)):
                     if youtube_url:
                         log(f"[YouTube] REJECTED invalid URL: {youtube_url} — retrying extractor (3×)", "WARN")
                     else:
@@ -18529,20 +18538,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         if decision == "skip":
                             log("Phase 4 link extraction: user skipped — proceeding without YouTube URL", "INFO")
                             youtube_url = ""
+                            # Same skip-clean-exit invariant as the ffmpeg-skip and
+                            # timeout-skip paths: mark skipped so the success-branch
+                            # phase_complete + dishonest empty-URL link push is gated
+                            # off. Pre-existing bug surfaced during Commit 2 review.
+                            _p4_user_skipped = True
+                            emit_event("phase_skipped", phase=4, reason="user_skip_link_extract")
                             break
                         log(f"Phase 4 link extraction: user {decision} — terminating pipeline", "INFO")
                         emit_event("pipeline_stopped", phase=4, reason=f"user_{decision}_link_extract")
                         return
-                else:
+                elif not _p4_user_skipped:
                     emit_validated_link(4, "youtube", youtube_url, "YouTube Video")
                 save_checkpoint(queue_dir, 4, topic=topic, brief_url=brief_url,
                                 notebook_url=notebook_url, youtube_url=youtube_url)
                 update_delivery(youtube_url=youtube_url)
                 # B2: see same wrap in P3 success path.
                 await asyncio.to_thread(save_meta, queue_dir, topic, 4)
-                _p4_links = [{"label": "YouTube Video", "url": youtube_url, "verified": True}]
-                emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links,
-                    summary=f"Video uploaded: {youtube_url}")
+                # Only emit phase_complete on actual completion. On skip paths
+                # (ffmpeg-fail or timeout) the corresponding phase_skipped:4
+                # event already fired upstream — emitting phase_complete here
+                # too would double-count the phase AND push a dishonest
+                # "Video uploaded:" link with empty URL marked verified=True.
+                if not _p4_user_skipped:
+                    _p4_links = [{"label": "YouTube Video", "url": youtube_url, "verified": True}]
+                    emit_event("phase_complete", phase=4, durationSec=int(time.time() - _p4_start), links=_p4_links,
+                        summary=f"Video uploaded: {youtube_url}")
             # No `else` — the no-audio case is handled by the user-decision
             # loop above. If the user chose Skip, phase_skipped already
             # fired with reason="user_skip_after_no_audio"; if they chose
