@@ -15510,24 +15510,41 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             if "audio complete" in diag_text:
                 log("Audio generation complete ✓")
                 audio_done = True
-                # Post-completion invariant LOG (no fail_phase). At this
-                # point the user already has a working audio (audio_done
-                # is True, download is moments away), so nuking the run
-                # for an invariant-only delta would lose them the artifact.
-                # The pre-flight + post-generate guards above are the real
-                # prevention; this log is just a final sanity report so a
-                # regression in those guards surfaces in the chat dropdown
-                # instead of silently shipping a non-Deep-Dive audio. We
-                # used to call _cleanup_nlm_default_audio here — disabled
-                # 2026-05-02 per user no-delete constraint.
+                # Strict-keep cleanup (2026-05-02). Identifies the Long +
+                # Deep Dive card unambiguously and deletes only the other
+                # entries around it. If the keep target is missing or
+                # ambiguous, deletes nothing — the post-cleanup invariant
+                # below then fail_phases. Replaces the older
+                # _cleanup_nlm_default_audio whose "deep dive only" filter
+                # could have nuked the real audio if NLM ever shipped a
+                # "Deep Dive Short" default.
                 try:
+                    cleanup = await _cleanup_nlm_keep_long_deep_dive(browser.page)
+                    log(f"[Phase3] NLM strict-keep cleanup: {cleanup}")
+                except Exception as _ce:
+                    log(f"[Phase3] NLM cleanup failed: {_ce}", "WARN")
+
+                # Post-cleanup invariant. We re-verify the panel state is
+                # exactly 1 Deep Dive card + 1 total card. If anything
+                # else, fail_phase: cleanup couldn't safely reduce to a
+                # clean Long+Deep Dive entry, and the share-link extract
+                # that runs next would pick whatever it could grab —
+                # potentially the wrong audio. Better to fail loud than
+                # ship a possibly-wrong artifact.
+                try:
+                    await asyncio.sleep(2)  # let DOM settle after deletes
                     dd_count = await _count_nlm_deep_dive_cards(browser.page)
                     total_count = await _count_nlm_audio_cards(browser.page)
-                    log(f"[Phase3] Post-completion inventory: {dd_count} Deep Dive / {total_count} total audio card(s)")
+                    log(f"[Phase3] Post-cleanup inventory: {dd_count} Deep Dive / {total_count} total audio card(s)")
                     if dd_count != 1 or total_count != 1:
-                        log(f"[Phase3] Audio invariant delta: expected 1 Deep Dive + 1 total, got {dd_count} DD + {total_count} total — proceeding to download but flagging for review", "WARN")
+                        fail_phase(3,
+                                   f"Post-cleanup audio invariant failed: {dd_count} Deep Dive + {total_count} total (expected 1 + 1)",
+                                   "Cleanup couldn't safely reduce NLM Studio to a single Long + Deep Dive entry. Open the notebook, leave only that one entry, then retry.",
+                                   agent="notebooklm",
+                                   can_retry=True)
+                        return {"audio_path": None}
                 except Exception as _ie:
-                    log(f"[Phase3] Post-completion invariant check failed: {_ie}", "WARN")
+                    log(f"[Phase3] Post-cleanup invariant check failed: {_ie}", "WARN")
                 break
 
             elapsed_min = 5 + int((time.time() - poll_start) / 60)
@@ -15901,29 +15918,38 @@ async def _count_nlm_deep_dive_cards(page) -> int:
         return 0
 
 
-async def _cleanup_nlm_default_audio(page) -> dict:
-    """DEPRECATED 2026-05-02 — no longer called. Body retained as
-    reference for future selector work.
+async def _cleanup_nlm_keep_long_deep_dive(page) -> dict:
+    """Strict-keep cleanup. Identifies the SINGLE NLM Studio audio card
+    that matches our explicit request (Long + Deep Dive) and deletes
+    every other audio card around it. If the keep target is missing or
+    ambiguous, deletes NOTHING and reports the skip reason — the caller
+    can then fail_phase rather than risk nuking the real audio.
 
-    Original purpose: delete any non-Deep-Dive audio entries from NLM
-    Studio after our Deep Dive Long generation completes. NotebookLM's
-    redesigned Studio occasionally auto-fires a default audio when the
-    Audio Overview tile is opened to expose customize controls — leaving
-    us with two entries.
+    Replaces the older _cleanup_nlm_default_audio (2026-05-02) which
+    keyed only on "deep dive" — a too-loose filter that risked deleting
+    the real audio if NLM ever shipped a "Deep Dive Short" default.
+    Strict here means the keep target must contain BOTH "deep dive"
+    AND "long" in its visible text (or, as a secondary signal, a
+    duration of ≥15 minutes which only Long Deep Dives reach).
 
-    Why deprecated: user locked deletion off (2026-05-02) — the risk of
-    nuking the real audio if our identifier ever drifts from the actual
-    DOM signal was unacceptable. Replaced by prevention-only guards
-    (tightened CUA prompt + pre-flight + post-generate audio-card count
-    invariants — see _count_nlm_audio_cards). When duplicates are
-    detected the pipeline now fail_phases and asks the user to clean up
-    manually.
+    Safety rails:
+      - keep_candidates count must be EXACTLY 1; 0 → skip, >1 → skip.
+      - delete only cards whose data-cleanup-idx differs from the keep.
+      - log every intended deletion via emit_event for audit.
+      - caller is expected to verify post-cleanup card count separately;
+        this function reports `remaining_after` from a fresh count call
+        so the caller doesn't have to re-scan.
 
-    Idempotent + safe: refuses to delete anything if no Deep Dive entry is
-    visible (mis-classification safeguard — better one extra row than nuking
-    the real audio). All actions emit telemetry.
+    Returns a dict with keys:
+      scanned, kept_idx, deleted, remaining_after, skipped_reason.
     """
-    result = {"scanned": 0, "deleted": 0, "kept": 0, "skipped_reason": None}
+    result = {
+        "scanned": 0,
+        "kept_idx": None,
+        "deleted": 0,
+        "remaining_after": None,
+        "skipped_reason": None,
+    }
     try:
         cards = await page.evaluate("""() => {
             const panel = document.querySelector(
@@ -15938,32 +15964,77 @@ async def _cleanup_nlm_default_audio(page) -> dict:
             candidates.forEach((el, i) => {
                 if (el.offsetParent === null) return;
                 const t = (el.innerText || '').toLowerCase();
-                const isDeepDive = t.includes('deep dive');
                 const isAudio = t.includes('audio overview')
                     || t.includes('conversation') || t.includes('discussion')
                     || t.includes('podcast');
-                if (isAudio) {
-                    el.setAttribute('data-cleanup-idx', String(i));
-                    out.push({idx: i, isDeepDive: isDeepDive, snippet: t.slice(0, 80)});
-                }
+                const isConfigTile = t.includes('customize');
+                if (!isAudio || isConfigTile) return;
+                // Strict keep predicate: deep dive AND (long OR duration >= 15min).
+                // The default auto-fired audio is short (~5-7 min) and is never
+                // tagged "long" — so the keep filter excludes it cleanly.
+                const hasDeepDive = t.includes('deep dive');
+                const hasLong = t.includes('long');
+                const durMatch = t.match(/(\\d+):(\\d+)/);
+                const durMinutes = durMatch ? parseInt(durMatch[1], 10) : 0;
+                const isLongDuration = durMinutes >= 15;
+                const isKeep = hasDeepDive && (hasLong || isLongDuration);
+                el.setAttribute('data-cleanup-idx', String(i));
+                out.push({
+                    idx: i,
+                    isKeep: isKeep,
+                    hasDeepDive: hasDeepDive,
+                    hasLong: hasLong,
+                    durationMin: durMinutes,
+                    snippet: t.slice(0, 100),
+                });
             });
             return out;
-        }""")
-        result["scanned"] = len(cards)
-        non_dd = [c for c in cards if not c["isDeepDive"]]
-        result["kept"] = sum(1 for c in cards if c["isDeepDive"])
+        }""") or []
 
-        if result["kept"] == 0 and non_dd:
-            result["skipped_reason"] = "no_deep_dive_visible"
+        result["scanned"] = len(cards)
+        keep_candidates = [c for c in cards if c["isKeep"]]
+
+        # Safety rail: must have EXACTLY one unambiguous keep target.
+        if len(keep_candidates) == 0:
+            result["skipped_reason"] = "no_keep_target_found"
             try:
                 emit_event("nlm_cleanup_skipped", phase=3,
-                           reason="no_deep_dive_visible",
+                           reason="no_keep_target_found",
                            scanned=result["scanned"])
             except Exception:
                 pass
             return result
+        if len(keep_candidates) > 1:
+            result["skipped_reason"] = f"ambiguous_keep_targets ({len(keep_candidates)} matches)"
+            try:
+                emit_event("nlm_cleanup_skipped", phase=3,
+                           reason="ambiguous_keep_targets",
+                           scanned=result["scanned"],
+                           keep_count=len(keep_candidates))
+            except Exception:
+                pass
+            return result
 
-        for card in non_dd:
+        keep = keep_candidates[0]
+        result["kept_idx"] = keep["idx"]
+        delete_targets = [c for c in cards if c["idx"] != keep["idx"]]
+
+        # Nothing to delete — the panel is already in the desired state.
+        if not delete_targets:
+            result["remaining_after"] = await _count_nlm_audio_cards(page)
+            return result
+
+        # Audit log every intended deletion BEFORE clicking, so we have a
+        # paper trail in telemetry even if the click sequence half-fails.
+        try:
+            emit_event("nlm_cleanup_plan", phase=3,
+                       keep_snippet=keep["snippet"],
+                       deletes=[d["snippet"] for d in delete_targets])
+        except Exception:
+            pass
+
+        for card in delete_targets:
+            # Open the card's "..." / More menu.
             opened = await page.evaluate(f"""() => {{
                 const c = document.querySelector('[data-cleanup-idx="{card["idx"]}"]');
                 if (!c) return false;
@@ -15978,6 +16049,7 @@ async def _cleanup_nlm_default_audio(page) -> dict:
                 continue
             await asyncio.sleep(0.6)
 
+            # Click Delete in the menu.
             deleted = await page.evaluate("""() => {
                 const items = document.querySelectorAll(
                     '[role="menuitem"], [role="menuitemradio"]'
@@ -15998,6 +16070,7 @@ async def _cleanup_nlm_default_audio(page) -> dict:
                 continue
             await asyncio.sleep(0.5)
 
+            # Confirm in the secondary dialog if NLM shows one.
             try:
                 await page.evaluate("""() => {
                     const dlg = document.querySelector('[role="dialog"], [role="alertdialog"]');
@@ -16017,24 +16090,27 @@ async def _cleanup_nlm_default_audio(page) -> dict:
             result["deleted"] += 1
             try:
                 emit_event("nlm_cleanup_deleted", phase=3,
-                           card_snippet=card["snippet"])
+                           card_snippet=card["snippet"],
+                           had_deep_dive=card["hasDeepDive"],
+                           duration_min=card["durationMin"])
             except Exception:
                 pass
 
-        # Defensive: close any lingering menu/dialog before share-link
-        # extraction runs. Without this, the share-three-dots probe at
-        # ~13165 may land on a stale menu from cleanup deletes.
+        # Defensive: close any lingering menu/dialog so share-link
+        # extraction runs against a clean DOM.
         try:
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.3)
         except Exception:
             pass
 
+        # Re-count so the caller can verify the invariant in one place.
+        result["remaining_after"] = await _count_nlm_audio_cards(page)
         try:
             emit_event("nlm_cleanup_done", phase=3,
                        scanned=result["scanned"],
                        deleted=result["deleted"],
-                       kept=result["kept"])
+                       remaining_after=result["remaining_after"])
         except Exception:
             pass
         return result
