@@ -220,6 +220,25 @@ def resolve_api_key(cli_key=None):
     return None
 
 
+# 60s TTL cache so the heartbeat (every 5s) can mirror BE-side key state to
+# the device doc without spawning PowerShell every tick. resolve_api_key()
+# itself logs every call — running it on heartbeat would flood backend.log.
+_HAS_ANTHROPIC_KEY_CACHE: tuple[float, bool] | None = None
+
+def _has_anthropic_key() -> bool:
+    global _HAS_ANTHROPIC_KEY_CACHE
+    now = time.time()
+    if _HAS_ANTHROPIC_KEY_CACHE and now - _HAS_ANTHROPIC_KEY_CACHE[0] < 60:
+        return _HAS_ANTHROPIC_KEY_CACHE[1]
+    found = bool(
+        _read_firestore_api_keys().get("anthropic")
+        or any(_read_user_scope_env(v) for v in ("CUA_API_KEY", "ANTHROPIC_API_KEY"))
+        or any(os.environ.get(v, "").strip() for v in ("CUA_API_KEY", "ANTHROPIC_API_KEY"))
+    )
+    _HAS_ANTHROPIC_KEY_CACHE = (now, found)
+    return found
+
+
 def resolve_gemini_api_key():
     """Resolve the Gemini / Google AI API key. Same priority shape as
     resolve_api_key() — the user's Account-page key wins over any env.
@@ -1051,6 +1070,9 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
         # schtasks says "installed", we overwrite whatever was in the doc;
         # the task is the truth.
         "supervised": _detect_supervised(),
+        # Mirrors BE-side anthropic key availability so the FE Account
+        # banner only nags users whose paired devices truly have no key.
+        "hasAnthropicKey": _has_anthropic_key(),
     }
     # Name field rules:
     #  - If --pair passed an explicit device_name, honor it (user typed
@@ -1125,6 +1147,7 @@ async def _heartbeat_loop():
                                     .document(paired_uid)
                                     .collection("devices").document(device_id).update({
                                         "lastHeartbeat": int(time.time() * 1000),
+                                        "hasAnthropicKey": _has_anthropic_key(),
                                     })),
                             timeout=10.0,
                         )
