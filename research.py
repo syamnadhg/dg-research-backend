@@ -1337,6 +1337,50 @@ def _start_device_command_listener(uid: str, device_id: str):
                 _schedule_server_exit("device-hard-reset", delay_sec=1.5)
                 continue
 
+            if action == "clear_local_storage":
+                # User-triggered manual cleanup of the device-side queues/
+                # dir. Documents/audios/chat already live in Firestore +
+                # Storage, so the only thing we lose is intermediate
+                # per-run scratch (sources_*.md, brief.md, source PDFs,
+                # half-rendered podcasts). Safe to wipe.
+                #
+                # Active-run guard: if a pipeline is currently producing
+                # for `_tracks_dir`, that single dir is preserved. Without
+                # this, an in-flight run would crash mid-phase when its
+                # checkpoint.json / source files vanish.
+                queues_root = Path(__file__).parent / "queues"
+                active_name = None
+                try:
+                    if _tracks_dir is not None:
+                        active_name = _tracks_dir.name
+                except NameError:
+                    active_name = None
+
+                wiped = 0
+                preserved = 0
+                try:
+                    if queues_root.exists():
+                        for entry in queues_root.iterdir():
+                            # Keep top-level files (README.md, _pending_queue.json).
+                            if not entry.is_dir():
+                                continue
+                            if active_name and entry.name == active_name:
+                                preserved += 1
+                                continue
+                            try:
+                                shutil.rmtree(entry, ignore_errors=True)
+                                wiped += 1
+                            except Exception as _wipe_err:
+                                log(f"[device-cmds] CLEAR_LOCAL_STORAGE: failed to wipe {entry.name}: {_wipe_err}", "WARN")
+                except Exception as _walk_err:
+                    log(f"[device-cmds] CLEAR_LOCAL_STORAGE: walk failed: {_walk_err}", "WARN")
+
+                if active_name and preserved:
+                    log(f"[device-cmds] CLEAR_LOCAL_STORAGE: wiped {wiped} dir(s); preserved active run {active_name}")
+                else:
+                    log(f"[device-cmds] CLEAR_LOCAL_STORAGE: wiped {wiped} dir(s)")
+                continue
+
             # Unknown action — already logged above and the doc is
             # already deleted. No-op past this point so future actions
             # can be slotted in as elif branches.
@@ -16998,6 +17042,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Resume dir not found: {queue_dir}", "ERROR")
             return
         (queue_dir / "documents").mkdir(exist_ok=True)
+        # Set the active-run global as early as possible so the
+        # `clear_local_storage` device-command handler treats this dir
+        # as protected. Without this, a clear fired during the lengthy
+        # checkpoint-restore / config-load block below could rmtree the
+        # dir we're about to resume from. Also re-set at line ~17235
+        # for symmetry with the new-run branch — idempotent.
+        init_tracks(queue_dir.name)
         # Mark as retry/resume so browser-crash sites surface the real alert
         # (auto-retry won't fire from finally for this attempt — the guard
         # at the bottom of run_pipeline gates on `not resume_dir`).
@@ -17079,6 +17130,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         queue_dir = Path(__file__).parent / "queues" / run_name
         queue_dir.mkdir(parents=True, exist_ok=True)
         (queue_dir / "documents").mkdir(exist_ok=True)
+        # Set the active-run global immediately after mkdir so a
+        # `clear_local_storage` device command fired during Flow B
+        # source downloads / config write doesn't rmtree this dir
+        # mid-construction. The init_tracks call at line ~17235 is
+        # now redundant on this branch but harmless (idempotent).
+        init_tracks(queue_dir.name)
         start_phase = 1
         cp = {}
         # Save pipeline config for new runs
@@ -18957,6 +19014,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Browser final close error: {e}", "WARN")
         _runtime.reset()
         teardown_firestore_run()
+        # Clear the active-run global so subsequent device commands
+        # (e.g. `clear_local_storage`) don't preserve a stale dir from
+        # the just-finished run. Without this reset, the global keeps
+        # pointing at the most recently completed run forever — every
+        # idle clear would skip that one dir, leaking it indefinitely.
+        global _tracks_dir
+        _tracks_dir = None
 
     # Auto-retry from checkpoint if pipeline failed mid-way
     # Skip if: completed, stopped (terminal), or paused (intentional freeze)
