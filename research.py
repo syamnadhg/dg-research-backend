@@ -10536,13 +10536,19 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         # (chatgpt / gemini / claude).
         try:
             if share_url:
+                # link_kind (not kind) — `kind` is already the positional arg
+                # carrying the agent name ("chatgpt" / "gemini" / "claude"),
+                # and Python won't tolerate the same parameter passed twice.
+                # The earlier `kind=share_kind` collision swallowed silently
+                # in the broad except below, so per-agent links never made
+                # it to Firestore and the FE-P5 Doc was missing P2 sections.
                 update_link_in_firestore(
                     name.lower(),
                     share_url,
                     label=share_label or name,
                     phase=2,
                     verified=share_verified,
-                    kind=share_kind,
+                    link_kind=share_kind,
                 )
         except Exception as _ufe:
             log(f"[{name}] Firestore link update failed (non-fatal): {_ufe}", "WARN")
