@@ -15965,7 +15965,17 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     log("=" * 60)
 
     if not audio_path or not Path(audio_path).exists():
-        log("No audio file — skipping Phase 5", "WARN")
+        log("No audio file — skipping Phase 4", "WARN")
+        return {"youtube_url": ""}
+    # Defensive: 0-byte audio means the P3 download flushed an empty file
+    # (Playwright save_as edge case or interrupted download). Treat as
+    # missing — the orchestrator's no-audio retry path handles it.
+    try:
+        _audio_size = Path(audio_path).stat().st_size
+    except Exception:
+        _audio_size = 0
+    if _audio_size == 0:
+        log(f"Audio file is 0 bytes — skipping Phase 4: {audio_path}", "WARN")
         return {"youtube_url": ""}
 
     # Idempotency: if a prior run already uploaded a video and we have a
@@ -16013,17 +16023,55 @@ async def run_phase4(browser, cua_client, audio_path, topic, queue_dir,
     while True:
         ffmpeg_attempt += 1
         try:
-            cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", "2", "-i", str(title_card),
-                   "-i", str(audio_path), "-c:v", "libx264", "-tune", "stillimage",
-                   "-c:a", "aac", "-b:a", "192k", "-r", "2", "-pix_fmt", "yuv420p",
-                   "-shortest", str(video_path)]
-            # B2 (2026-05-01): offload the long-running ffmpeg encode (can be
-            # 60-180s on a 50min audio) into a worker thread so the asyncio
-            # event loop keeps ticking — heartbeat, command listener, and
-            # narration ticker all stay alive during the encode.
+            # Defensive (2026-05-01): confirm inputs exist + non-empty
+            # before invoking ffmpeg. Catches a 0-byte thumbnail (if the
+            # Pillow fallback in generate_thumbnail somehow wrote an empty
+            # file) or audio file truncated mid-download. Without this
+            # guard the next ffmpeg call wastes the whole timeout window
+            # before reporting a generic error.
+            if not title_card.exists() or title_card.stat().st_size == 0:
+                raise RuntimeError(f"Thumbnail missing or empty: {title_card}")
+            if not Path(audio_path).exists() or Path(audio_path).stat().st_size == 0:
+                raise RuntimeError(f"Audio file missing or empty: {audio_path}")
+
+            # Encode strategy fix (2026-05-01): the prior command,
+            # `-loop 1 -framerate 2 -c:v libx264 -tune stillimage`, used
+            # libx264's default `medium` preset to re-encode every
+            # still-image frame over the audio's full duration. On a
+            # 60-min audio that's ~7,200 frames at the medium preset,
+            # which routinely timed out at the 600s subprocess cap.
+            # That's the actual root cause of every "ffmpeg crashed"
+            # alert seen since the BE→FE-P5 migration.
+            #
+            # Fix: keep the same one-pass shape but switch to
+            # `-preset ultrafast` (5-10x faster encode) plus `-g 99999`
+            # (one keyframe ever — every subsequent frame is a tiny
+            # "no-change" P-frame, since the image never moves). Audio
+            # is m4a/AAC-LC, which remuxes cleanly into MP4 container
+            # via `-c:a copy` (no audio re-encode either). Local repro
+            # on the captured 61-min fixture: 7.7s encode, 131MB output
+            # (vs 600s+ timeout previously). `-shortest` stops at audio
+            # EOF. `-movflags +faststart` writes the moov atom up front
+            # so YouTube can begin processing on receipt.
+            cmd = ["ffmpeg", "-y", "-loglevel", "info", "-stats",
+                   "-loop", "1", "-framerate", "1", "-i", str(title_card),
+                   "-i", str(audio_path),
+                   "-c:v", "libx264", "-preset", "ultrafast",
+                   "-tune", "stillimage", "-g", "99999",
+                   "-pix_fmt", "yuv420p",
+                   "-c:a", "copy",
+                   "-shortest", "-movflags", "+faststart",
+                   str(video_path)]
+            # B2 (2026-05-01): offload the ffmpeg subprocess into a
+            # worker thread so the asyncio event loop keeps ticking —
+            # heartbeat, command listener, and narration ticker all
+            # stay alive during the encode. Timeout dropped from 600s
+            # to 300s now that the encode is ultrafast; if 300s ever
+            # proves tight on truly long audio, the right fix is
+            # encoder strategy, not a higher cap.
             r = await asyncio.to_thread(
                 subprocess.run, cmd,
-                capture_output=True, text=True, timeout=600)
+                capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 # C1 (2026-05-01): write full stderr to a per-attempt log file
                 # so post-mortem isn't bottlenecked on the truncated 300-char
