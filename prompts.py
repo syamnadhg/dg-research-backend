@@ -768,6 +768,11 @@ Shape A — glowing inline label (P1 / Pro + Extended Thinking, most common):
     * "Looking into <topic>" / "Looking up <thing>"
     * "Investigating <topic>" / "Researching <topic>"
     * "Analyzing" / "Exploring" / "Checking <source>"
+    * "Confirming <thing>" / "Confirming <topic>"
+    * "Summarizing <thing>" / "Summarising <thing>"
+    * "Synthesizing <results>" / "Synthesising <results>"
+    * "Drafting <thing>"
+    * "Finalizing <thing>" / "Finalising <thing>"
 - IMPORTANT: in this mode "Thinking" / "Pro thinking" IS the correct
   click target. Do NOT skip it as a "show reasoning" toggle.
 
