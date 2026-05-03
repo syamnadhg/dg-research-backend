@@ -6634,7 +6634,7 @@ async def scrape_progress_chatgpt(page):
             // Verb regex constrained to start-of-string + count badge so
             // stale chat text (user prompts, prior responses) won't match.
             try {
-                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring)\\b/i;
+                const VERB = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching|confirming|summari[zs]ing|synthesi[zs]ing|drafting|finali[zs]ing)\\b/i;
                 const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?)\\b/i;
                 let stripText = '';
                 let stripTop = -1;
