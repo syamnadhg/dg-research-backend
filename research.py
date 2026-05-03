@@ -7149,7 +7149,7 @@ async def _open_chatgpt_activity_panel(page):
         // Verb-only fallback for Pro+ET strips that haven't materialized a count yet.
         // Includes "thinking"/"reasoning" because Pro+ET shows those before swapping
         // to site-fetch verbs ("Reading <site>", "Visiting <url>") mid-stream.
-        const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching)\\b/i;
+        const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching|confirming|summari[zs]ing|synthesi[zs]ing|drafting|finali[zs]ing)\\b/i;
 
         function findHitsIn(root) {
             // Local accumulator — kept narrow so caller can priority-rank
