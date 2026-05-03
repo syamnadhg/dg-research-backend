@@ -7151,6 +7151,15 @@ async def _open_chatgpt_activity_panel(page):
         // to site-fetch verbs ("Reading <site>", "Visiting <url>") mid-stream.
         const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching|confirming|summari[zs]ing|synthesi[zs]ing|drafting|finali[zs]ing)\\b/i;
 
+        // Specificity score for hit ranking. Parent strip (verb+count) must
+        // outrank the inner count-only badge — the badge is a presentational
+        // span with no React handler, so dispatching click on it silently
+        // no-ops while the strip's actual handler never fires. Without this
+        // score, the prior len-ascending tiebreaker picked the shorter badge
+        // child over the parent strip. Score: 3 (verb+count) > 2 (verb-only)
+        // > 1 (count-only) > 0 (neither — unreachable; findHitsIn filters).
+        const hitScore = (h) => (h.hasCount && h.hasVerb ? 3 : h.hasVerb ? 2 : h.hasCount ? 1 : 0);
+
         function findHitsIn(root) {
             // Local accumulator — kept narrow so caller can priority-rank
             // dialog hits ahead of host-page hits.
@@ -7167,7 +7176,7 @@ async def _open_chatgpt_activity_panel(page):
                 if (!matchesCount && !matchesVerb) continue;
                 const r = el.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
-                out.push({ el, top: r.top, len: t.length, hasCount: matchesCount });
+                out.push({ el, top: r.top, len: t.length, hasCount: matchesCount, hasVerb: matchesVerb });
             }
             return out;
         }
@@ -7232,7 +7241,7 @@ async def _open_chatgpt_activity_panel(page):
             for (const h of found) dialogHits.push(h);
         }
         if (dialogHits.length > 0) {
-            dialogHits.sort((a, b) => (b.hasCount - a.hasCount) || (b.top - a.top) || (a.len - b.len));
+            dialogHits.sort((a, b) => (hitScore(b) - hitScore(a)) || (b.top - a.top) || (a.len - b.len));
             return clickAndReturn(dialogHits[0].el, dialogHits.length, 'dialog');
         }
 
@@ -7253,8 +7262,9 @@ async def _open_chatgpt_activity_panel(page):
         }
         walk(document);
         if (!hits.length) return { found: false, candidates: 0 };
-        // count-badge wins (more specific), then lowest-on-page, then shortest text
-        hits.sort((a, b) => (b.hasCount - a.hasCount) || (b.top - a.top) || (a.len - b.len));
+        // Parent strip (verb+count) wins over badge child (count-only) via
+        // hitScore; ties broken by lowest-on-page, then shortest text.
+        hits.sort((a, b) => (hitScore(b) - hitScore(a)) || (b.top - a.top) || (a.len - b.len));
         return clickAndReturn(hits[0].el, hits.length, 'global');
     }"""
     try:
