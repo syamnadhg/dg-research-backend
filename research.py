@@ -6985,7 +6985,7 @@ async def scrape_progress_chatgpt(page):
                         try:
                             walk = await frame.evaluate("""() => {
                                 const out = { steps: [], live_label: '', clicked: false, already_expanded: false };
-                                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring)\\b/i;
+                                const VERB = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching|confirming|summari[zs]ing|synthesi[zs]ing|drafting|finali[zs]ing)\\b/i;
                                 const all = Array.from(document.querySelectorAll('div, li, [role="listitem"], button, [role="button"]'));
                                 const rows = [];
                                 for (const el of all) {
