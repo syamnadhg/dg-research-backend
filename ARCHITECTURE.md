@@ -419,7 +419,7 @@ Unified per-(op, agent) attempt tracking for retry/escalation across BE operatio
 | T2 | Full-browser restart (`browser.stop()` → `browser.start()`) | once |
 | T3 | BE Phoenix exit via daemon-loop (saves to `_pending_queue.json`, exits 0) | once per window |
 
-> **Naming note:** these T0/T1/T2/T3 labels are the **crash-recovery escalation ladder** and are unrelated to the **interaction tier ladder** in `scratch/vision_v3_plan.md` (Playwright = tier-1, Vision = tier-2, CUA = tier-3). The two systems coexist; the `from_tier`/`to_tier` fields on `tier_transition` events use the *interaction* labels (`dom`, `cua`, `vision`).
+> **Naming note:** these T0/T1/T2/T3 labels are the **crash-recovery escalation ladder** and are unrelated to the **interaction tier ladder** in `DG Research/VisionRecipe.md` (DOM = tier-1, Vision = tier-2, CUA = tier-3). The two systems coexist; the `from_tier`/`to_tier` fields on `tier_transition` events use the *interaction* labels (`dom`, `cua`, `vision`).
 
 **Centralized emit:** `emit_tier_transition(*, phase, agent, op, from_tier, to_tier, reason)` calls `TierEscalation.record(to_tier, reason)` then fires the `tier_transition` event with the new attempt counter. The 6 wired hotspots are:
 

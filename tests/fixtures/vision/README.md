@@ -35,7 +35,8 @@ coords land inside `expected_target_bbox`, and confidence ≥ `min_confidence`.
 ## V1 ship target
 
 5 of 8 hotspot fixtures green + #1, #3, #6 verified live. See
-`scratch/vision_hotspots.md` for the hotspot list (numbered 1–8).
+`../../../../VisionRecipe.md` (root `DG Research/`) for the full hotspot
+inventory + Pattern A/B classification + promotion roadmap.
 
 Priority order for fixture collection:
 1. `gemini_share_submenu` — hotspot #1, highest Playwright failure rate

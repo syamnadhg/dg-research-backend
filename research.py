@@ -21878,7 +21878,7 @@ def run_resurrect():
         print()
         print(f"  {_c(_WARN, 'Only supported on Windows today.')}")
         print(f"  {_c(_DIM, 'macOS / Linux desktop: cross-platform background runners are tracked')}")
-        print(f"  {_c(_DIM, 'as task #355 (launchd + systemd-user). See PERSISTENCE-RECIPE.md.')}")
+        print(f"  {_c(_DIM, 'as task #355 (launchd + systemd-user). See PersistenceRecipe.md.')}")
         return
 
     # pythonw.exe (no-console subsystem) keeps the supervisor invisible at
