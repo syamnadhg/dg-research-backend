@@ -6732,7 +6732,7 @@ async def scrape_progress_chatgpt(page):
                 // Deep Research source-title rows because they often have
                 // no spin/check icon AND no verb prefix. New gate accepts
                 // any leaf-row (no nested listitems) with substantial text.
-                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing)\\b/i;
+                const VERB = /^(checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing|confirming|synthesi[zs]ing)\\b/i;
                 const rowEls = Array.from(root.querySelectorAll('li, [role="listitem"], div, p, button, [role="button"]'));
                 const seenKey = new Set();
                 const rows = [];
@@ -8600,7 +8600,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
             '[class*="step" i]', '[class*="checklist" i] > div',
             '[class*="task" i] > div', '[class*="activity" i]'
         ].join(', ');
-        const VERB_GATE = /^(?:checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing)\b/i;
+        const VERB_GATE = /^(?:checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing|confirming|synthesi[zs]ing)\b/i;
         const seenStep = new Set();
         panel.querySelectorAll(STEP_SELS).forEach(e => {
             const t = (e.innerText || '').trim();
