@@ -21826,20 +21826,20 @@ def run_daemon_loop(port: int = 8000):
     # second chance after the user fixes deps.
     try:
         import importlib
+        # Use full dotted module paths — importlib.import_module handles
+        # submodules (PIL.Image, google.auth, google.cloud.firestore) but
+        # `import PIL; getattr(PIL, "Image")` raises AttributeError because
+        # PIL.Image is a submodule, not an attribute of the PIL package.
         _critical = [
-            ("fastapi", None), ("uvicorn", None), ("websockets", None),
-            ("pydantic", None), ("typing_extensions", None),
-            ("anthropic", None), ("playwright", None), ("patchright", None),
-            ("firebase_admin", None), ("google.auth", None),
-            ("google.cloud.firestore", None), ("PIL", "Image"),
-            ("markdownify", None), ("requests", None), ("qrcode", None),
+            "fastapi", "uvicorn", "websockets", "pydantic",
+            "typing_extensions", "anthropic", "playwright", "patchright",
+            "firebase_admin", "google.auth", "google.cloud.firestore",
+            "PIL.Image", "markdownify", "requests", "qrcode",
         ]
         _missing: list[str] = []
-        for _mod, _attr in _critical:
+        for _mod in _critical:
             try:
-                _m = importlib.import_module(_mod)
-                if _attr:
-                    getattr(_m, _attr)
+                importlib.import_module(_mod)
             except Exception as _ie:
                 _missing.append(f"{_mod} ({_ie.__class__.__name__}: {_ie})")
         if _missing:
