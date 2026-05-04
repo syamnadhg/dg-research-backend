@@ -7146,10 +7146,17 @@ async def _open_chatgpt_activity_panel(page):
     JS = """() => {
         // searches | sources | results — covers all observed badge wordings
         const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?)\\b/i;
-        // Verb-only fallback for Pro+ET strips that haven't materialized a count yet.
-        // Includes "thinking"/"reasoning" because Pro+ET shows those before swapping
-        // to site-fetch verbs ("Reading <site>", "Visiting <url>") mid-stream.
-        const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching|confirming|summari[zs]ing|synthesi[zs]ing|drafting|finali[zs]ing)\\b/i;
+        // Verb-only fallback for P1 Pro+ET strips that haven't materialized a
+        // count yet. Includes "thinking"/"reasoning" because Pro+ET shows
+        // those before swapping to site-fetch verbs ("Reading <site>",
+        // "Visiting <url>") mid-stream. Reverted 2026-05-03 to the pre-c06a60e
+        // P1-only list — the P2 synthesis-stage verbs (confirming, summarizing,
+        // synthesizing, drafting, finalizing) added across commits c06a60e..
+        // 9f4117c chased a moving target and never opened the P2 source panel
+        // reliably anyway. The new ELLIPSIS structural anchor handles all P2
+        // wording (live narration always ends in "..."); P1 verb wording is
+        // stable so this list stays.
+        const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching)\\b/i;
         // 2026-05-03 STRUCTURAL ANCHOR: the live in-tile glow line ALWAYS
         // ends with ellipsis ("..." or U+2026 normalized) while the run is
         // streaming. Verb wording mutates per stream (5 prior commits keep

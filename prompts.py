@@ -768,13 +768,13 @@ Shape A — glowing inline label (P1 / Pro + Extended Thinking, most common):
     * "Looking into <topic>" / "Looking up <thing>"
     * "Investigating <topic>" / "Researching <topic>"
     * "Analyzing" / "Exploring" / "Checking <source>"
-    * "Confirming <thing>" / "Confirming <topic>"
-    * "Summarizing <thing>" / "Summarising <thing>"
-    * "Synthesizing <results>" / "Synthesising <results>"
-    * "Drafting <thing>"
-    * "Finalizing <thing>" / "Finalising <thing>"
 - IMPORTANT: in this mode "Thinking" / "Pro thinking" IS the correct
   click target. Do NOT skip it as a "show reasoning" toggle.
+- The P2 Deep Research synthesis-stage verbs ("Confirming",
+  "Summarizing", "Synthesizing", "Drafting", "Finalizing") used to be
+  listed here too. They were removed because the STRUCTURAL HINT below
+  (ellipsis suffix) is the reliable anchor for those — wording mutates
+  too fast to keep an exhaustive list in sync.
 
 Shape B — count-badge strip (P2 / Deep Research):
 - A wider horizontal strip, still attached to the bottom of the latest
