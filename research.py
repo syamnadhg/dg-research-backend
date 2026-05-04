@@ -21813,6 +21813,58 @@ def run_daemon_loop(port: int = 8000):
         killed = _kill_pids(sweep_pids)
         log(f"[daemon-loop] Pre-flight sweep: killed {killed}/{len(sweep_pids)} stale research.py procs ({sweep_pids})")
 
+    # Pre-flight dependency probe — runs once before the respawn loop.
+    # Catches the silent-crash trap: when --serve fails its import chain
+    # (e.g. fastapi missing, or firebase_admin importable but its
+    # google.auth transitive dep absent), the supervisor would otherwise
+    # retry forever at 5s/cycle with no loud signal. 2026-05-03: a Python
+    # 3.13→3.14 interpreter swap orphaned 17 packages and produced a
+    # 295-restart silent crash-loop that looked healthy from the outside
+    # (daemon-loop alive, /api/health 200 once finally working but
+    # Firestore disabled). One loud abort is much better than infinite
+    # quiet retries — the Scheduled Task's PT5M re-fire still gives a
+    # second chance after the user fixes deps.
+    try:
+        import importlib
+        _critical = [
+            ("fastapi", None), ("uvicorn", None), ("websockets", None),
+            ("pydantic", None), ("typing_extensions", None),
+            ("anthropic", None), ("playwright", None), ("patchright", None),
+            ("firebase_admin", None), ("google.auth", None),
+            ("google.cloud.firestore", None), ("PIL", "Image"),
+            ("markdownify", None), ("requests", None), ("qrcode", None),
+        ]
+        _missing: list[str] = []
+        for _mod, _attr in _critical:
+            try:
+                _m = importlib.import_module(_mod)
+                if _attr:
+                    getattr(_m, _attr)
+            except Exception as _ie:
+                _missing.append(f"{_mod} ({_ie.__class__.__name__}: {_ie})")
+        if _missing:
+            _req_path = _log_dir / "requirements.txt"
+            _msg = (
+                f"SUPERVISOR ABORT: {len(_missing)} required import(s) failed under "
+                f"{python_exe}. Run: \"{python_exe}\" -m pip install -r \"{_req_path}\". "
+                f"Missing: " + "; ".join(_missing)
+            )
+            try:
+                log(_msg, "ERROR")
+            except Exception:
+                pass
+            try:
+                with open(_serve_err, "a", encoding="utf-8") as _ef:
+                    _bar = "=" * 80
+                    _ef.write(f"\n{_bar}\n[{_time.strftime('%H:%M:%S')}] {_msg}\n{_bar}\n")
+            except Exception:
+                pass
+            _sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception as _pe:
+        log(f"[daemon-loop] Pre-flight import probe crashed (continuing anyway): {_pe}", "WARN")
+
     restarts = 0
     while True:
         try:
