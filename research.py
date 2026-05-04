@@ -7808,8 +7808,11 @@ async def scrape_progress_claude(page):
             // "Research completed in Xm" → research done
             // 2026-04-26: matches BOTH "research completed in 5m" (legacy)
             // AND "Research complete · 553 sources · 24m 41s" (modern 2026).
+            // 2026-05-04: also Claude's 2026-05+ "Boom! Research report is
+            // ready" callout — long DR runs ship this instead of the prefix.
             const doneM = bodyText.match(/research\\s+complete(?:d)?(?:\\s+in)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?(?:[\\s·•—\\-]+\\d+(?:[hms]|\\s*(?:hour|min|sec)))?/i);
-            const researchDone = !!doneM;
+            const boomM = bodyText.match(/\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/);
+            const researchDone = !!(doneM || boomM);
 
             // ---- Tool uses (Research tool, web_search, browse, etc.)
             const tools = document.querySelectorAll(
@@ -8183,11 +8186,14 @@ async def detect_completion_claude(page):
             )) hasStop = true;
 
             const bodyText = document.body?.innerText || '';
-            // 2026-04-26: regex now matches BOTH "research completed in 5m"
+            // 2026-04-26: regex matches BOTH "research completed in 5m"
             // (legacy) AND "Research complete · 553 sources · 24m 41s" (modern
-            // 2026 layout). The middle separators are unicode bullets/dots/
-            // hyphens. Sources/duration suffixes optional.
-            const researchDone = /research\\s+complete(?:d)?(?:\\s+in)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?(?:[\\s·•—\\-]+\\d+(?:[hms]|\\s*(?:hour|min|sec)))?/i.test(bodyText);
+            // 2026 layout). 2026-05-04: also "Boom! Research report is ready"
+            // — Claude's 2026-05+ ready callout for long DR runs (the artifact
+            // card title alone, "<Title> · N sources · Xh Ym", is matched by
+            // the scoped fallback below to avoid mid-stream false positives).
+            const researchDone = /research\\s+complete(?:d)?(?:\\s+in)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?(?:[\\s·•—\\-]+\\d+(?:[hms]|\\s*(?:hour|min|sec)))?/i.test(bodyText)
+                              || /\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(bodyText);
             const liveActive = /\\d[\\d,]*\\s+sources?\\s+and\\s+counting/i.test(bodyText);
             // Claude's research card flips status when streaming ends.
             // 2026-04-26: also accept TEXT-CONTENT match — Claude's modern
@@ -8200,6 +8206,17 @@ async def detect_completion_claude(page):
                 researchCardDone = !!Array.from(
                     document.querySelectorAll('[class*="card"], [class*="artifact"], button, div[role="button"]')
                 ).find(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || ''));
+            }
+            // 2026-05-04: Claude's 2026-05+ artifact card drops the "complete"
+            // prefix and shows just "<Title> · N sources · Xh Ym". Body-text
+            // matching that pattern is too greedy (mid-stream pages can render
+            // separate elapsed-timer + source-count elements that look the
+            // same when flattened to innerText). Scope to artifact/aside
+            // containers — those only render this title post-completion.
+            if (!researchCardDone) {
+                researchCardDone = !!Array.from(document.querySelectorAll(
+                    '.font-claude-message [class*="artifact"], aside [class*="artifact"], aside [class*="card"]'
+                )).find(el => /[\\s·•—\\-]+\\d[\\d,]*\\s+sources?\\s*[\\s·•—\\-]+\\d+\\s*[hms]/i.test(el.innerText || ''));
             }
 
             let textLen = 0;
@@ -12659,10 +12676,27 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # without nudging or hard-failing.
                     _claude_completion_marker = False
                     try:
+                        # 2026-05-04: parity with detect_completion_claude — three
+                        # markers: anchored "research complete · N sources" (legacy
+                        # + modern 2026-04 layouts, body-text safe), anchored
+                        # "Boom! Research report is ready" (2026-05+ ready
+                        # callout, body-text safe), and the modern card title
+                        # "<Title> · N sources · Xh Ym" (no "complete" prefix —
+                        # body-text would false-positive mid-stream, scope to
+                        # artifact/aside containers).
                         _claude_completion_marker = bool(await p["page"].evaluate(
-                            """() => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]+\\d[\\d,]*\\s+sources?/i.test(
-                                document.body?.innerText || ''
-                            )"""
+                            """() => {
+                                const body = document.body?.innerText || '';
+                                if (/research\\s+complete(?:d)?\\s*[\\s·•—\\-]+\\d[\\d,]*\\s+sources?/i.test(body)) return true;
+                                if (/\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(body)) return true;
+                                const cards = document.querySelectorAll(
+                                    '.font-claude-message [class*="artifact"], aside [class*="artifact"], aside [class*="card"]'
+                                );
+                                for (const el of cards) {
+                                    if (/[\\s·•—\\-]+\\d[\\d,]*\\s+sources?\\s*[\\s·•—\\-]+\\d+\\s*[hms]/i.test(el.innerText || '')) return true;
+                                }
+                                return false;
+                            }"""
                         ))
                     except Exception:
                         _claude_completion_marker = False
