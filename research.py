@@ -640,16 +640,115 @@ def init_tracks(run_name):
     return _tracks_dir
 
 
-def get_clipboard():
-    """Read clipboard text via PowerShell (Windows). Returns empty string on failure."""
+# Once-per-process gate so a Linux box without wl-clipboard/xclip installed
+# logs the missing-tool diagnosis exactly once (not on every clipboard read).
+_clipboard_tool_missing_warned: set = set()
+
+
+def _warn_clipboard_tool_missing_once(platform_label: str, tried: list):
+    if platform_label in _clipboard_tool_missing_warned:
+        return
+    _clipboard_tool_missing_warned.add(platform_label)
     try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
+        log(f"[clipboard] No usable clipboard tool found on {platform_label} "
+            f"(tried: {', '.join(tried)}). Install wl-clipboard (Wayland) or "
+            f"xclip (X11) for clipboard-based extraction to work.", "WARN")
     except Exception:
-        return ""
+        pass
+
+
+def get_clipboard():
+    """Read clipboard text via the platform-native tool.
+
+    Windows : powershell.exe Get-Clipboard
+    macOS   : pbpaste
+    Linux   : wl-paste --no-newline (Wayland) → xclip -selection clipboard -o (X11)
+
+    Returns "" on any failure (tool missing, timeout, non-zero exit). On Linux
+    a missing tool is reported once-per-process so the run log surfaces it
+    without spamming."""
+    if sys.platform == "win32":
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.stdout.strip() if result.returncode == 0 else ""
+        except Exception:
+            return ""
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["pbpaste"], capture_output=True, text=True, timeout=5
+            )
+            return result.stdout.strip() if result.returncode == 0 else ""
+        except FileNotFoundError:
+            _warn_clipboard_tool_missing_once("macOS", ["pbpaste"])
+            return ""
+        except Exception:
+            return ""
+    # Linux / other POSIX: try Wayland first, then X11.
+    tried = []
+    for cmd in (["wl-paste", "--no-newline"],
+                ["xclip", "-selection", "clipboard", "-o"]):
+        tried.append(cmd[0])
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                return result.stdout.strip()
+            # wl-paste exits 1 on an empty clipboard ("Nothing is copied" on
+            # stderr) — that's the intended "" result, not a tool failure.
+            # Without this branch we'd cascade to xclip and, on a Wayland-only
+            # box without xclip, fire a spurious tool-missing WARN on every
+            # extraction (because clear_clipboard() runs immediately before
+            # get_clipboard() at every call site).
+            if cmd[0] == "wl-paste" and result.returncode == 1:
+                return ""
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    _warn_clipboard_tool_missing_once("Linux", tried)
+    return ""
+
+
+def clear_clipboard():
+    """Clear the OS clipboard. Silent no-op on failure.
+
+    Used to prevent stale text from a prior run / prior phase being returned
+    by extractors that race a fresh copy against an old clipboard. Same
+    platform branching as get_clipboard()."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", "Set-Clipboard -Value ''"],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+        return
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(["pbcopy"], input="", text=True,
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+        return
+    # Linux / other POSIX: try Wayland first, then X11.
+    for cmd in (["wl-copy", "--clear"],
+                ["xclip", "-selection", "clipboard", "-i"]):
+        try:
+            # wl-copy --clear takes no stdin; xclip -i needs empty stdin.
+            kwargs = {"capture_output": True, "timeout": 5}
+            if cmd[0] == "xclip":
+                kwargs["input"] = ""
+                kwargs["text"] = True
+            subprocess.run(cmd, **kwargs)
+            return
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return
 
 
 # Canonical agent/platform key the frontend uses in details[<key>]. Matches the
@@ -12996,11 +13095,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     + DOM scrape (fallback) → JS innerText (last resort).
     ChatGPT Deep Research outputs a document/artifact card, not regular chat text."""
     # Clear clipboard first so stale brief text doesn't get returned
-    try:
-        subprocess.run(["powershell.exe", "-NoProfile", "-Command", "Set-Clipboard ''"],
-                       capture_output=True, timeout=5)
-    except Exception:
-        pass
+    clear_clipboard()
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
@@ -13163,8 +13258,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
                     await asyncio.sleep(0.4)
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await asyncio.sleep(0.6)
-                    subprocess.run(["powershell.exe", "-NoProfile", "-Command",
-                                    "Set-Clipboard ''"], capture_output=True, timeout=5)
+                    clear_clipboard()
                 except Exception:
                     pass
             continue
@@ -13297,11 +13391,7 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     this, relying on a panel-swap can race or no-op (artifact_count==1 case)
     and silently extract artifact-1's references instead of the final report."""
     # Clear clipboard first so stale brief text doesn't get returned
-    try:
-        subprocess.run(["powershell.exe", "-NoProfile", "-Command", "Set-Clipboard ''"],
-                       capture_output=True, timeout=5)
-    except Exception:
-        pass
+    clear_clipboard()
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
@@ -13515,8 +13605,7 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await asyncio.sleep(0.6)
                     artifact_count = await _count_claude_artifacts(page)
-                    subprocess.run(["powershell.exe", "-NoProfile", "-Command",
-                                    "Set-Clipboard ''"], capture_output=True, timeout=5)
+                    clear_clipboard()
                 except Exception:
                     pass
             continue
@@ -17543,20 +17632,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     _last_progress.clear()
     # 2026-04-30: clear the OS clipboard at run start. extract_youtube_url
     # falls back to reading the clipboard via get_clipboard() when neither
-    # the Share dialog nor the page-readback yields a youtu.be URL. The
-    # Windows clipboard is process-global and persists across runs — a
-    # YouTube link from a previous run sitting in the clipboard would be
-    # accepted by _is_yt_video and emitted to Firestore as THIS run's
-    # video, so P5 would deliver a wrong link to the user. This nukes
-    # the cross-run bleed channel.
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["powershell.exe", "-NoProfile", "-Command", "Set-Clipboard -Value ''"],
-                timeout=5, capture_output=True, check=False,
-            )
-    except Exception:
-        pass
+    # the Share dialog nor the page-readback yields a youtu.be URL. The OS
+    # clipboard is process-global and persists across runs on every
+    # platform — a YouTube link from a previous run sitting in the
+    # clipboard would be accepted by _is_yt_video and emitted to Firestore
+    # as THIS run's video, so P5 would deliver a wrong link to the user.
+    # This nukes the cross-run bleed channel. (2026-05-03: was Windows-only;
+    # extended to all platforms via clear_clipboard() helper alongside the
+    # E4 Linux/macOS clipboard-extraction fix — same bleed risk, same fix.)
+    clear_clipboard()
     brief_artifact = None  # Set after Phase 1 completes
     # Validate email early (email is the user's Google account email from frontend)
     if email:
