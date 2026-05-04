@@ -118,6 +118,17 @@ PHASE_4_MAX_MIN = int(os.environ.get("PHASE_4_MAX_MIN", "15"))   # ffmpeg + YouT
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+# CREATE_NO_WINDOW (0x08000000) — passed to every subprocess.run that spawns
+# a Windows console app (powershell.exe, schtasks, etc.) so child processes
+# don't pop a visible terminal when the parent (pythonw.exe daemon-loop, or
+# python.exe --serve launched with -WindowStyle Hidden / DETACHED_PROCESS)
+# has no inherited console. Without this flag Windows allocates a fresh
+# console for the child and the user sees a brief terminal flash on every
+# clipboard read / env-var lookup. No-op on POSIX (the kwarg is ignored
+# inside our explicit win32 branches).
+_PS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
+
+
 def _read_user_scope_env(name: str) -> str:
     """Read a Windows User-scope env var via PowerShell. Empty string
     on non-Windows or failure. Persistent across shells — settable via
@@ -129,7 +140,8 @@ def _read_user_scope_env(name: str) -> str:
         r = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command",
              f"[System.Environment]::GetEnvironmentVariable('{name}','User')"],
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True, timeout=5,
+            creationflags=_PS_NO_WINDOW)
         return r.stdout.strip()
     except Exception:
         return ""
@@ -671,7 +683,8 @@ def get_clipboard():
         try:
             result = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5,
+                creationflags=_PS_NO_WINDOW,
             )
             return result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
@@ -723,6 +736,7 @@ def clear_clipboard():
             subprocess.run(
                 ["powershell.exe", "-NoProfile", "-Command", "Set-Clipboard -Value ''"],
                 capture_output=True, timeout=5,
+                creationflags=_PS_NO_WINDOW,
             )
         except Exception:
             pass
