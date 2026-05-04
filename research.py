@@ -3330,6 +3330,19 @@ class PipelineRuntime:
         # final artifact. Initialized here so reset() always lands at False
         # (otherwise an attribute set externally would leak across runs).
         self.claude_artifact_panel_open = False
+        # 2026-05-03: per-agent live progress snapshot keyed by lowercase
+        # platform name. Polling loop writes into this on every emit cycle
+        # (research.py:~12091) so the P2 completion emit at
+        # extract_and_record_agent (research.py:~10705) can pull the latest
+        # rich fields (source_urls / sections / steps / searches /
+        # observed_sources) into the `complete` agent_progress payload.
+        # Without this, the completion emit only shipped partialTextLen +
+        # links, so the FE's persisted `agents[key]` map ended up empty
+        # post-reload (sources / steps absent) and the dropdown rendered
+        # the bare "ChatGPT is now in Super Research Phase 2" stub.
+        # Shape: { agent_key: { source_urls, sections, steps, searches,
+        #                       observed_sources, partial_text_len, ... } }
+        self.agent_progress_snapshots: dict = {}
         # P2 → P3 handoff state. Populated at end of P2 (and as resume-safety
         # fallback at start of P3) by _build_phase2_to_phase3_handoff. P3
         # consumes these instead of doing its own per-agent reconciliation —
@@ -6330,17 +6343,23 @@ async def _narrator_loop(phase: int):
         elapsed_min = elapsed_sec / 60.0
         timeline_text = "\n".join(f"- {t}" for t in timeline)
         fb_system = (
-            f"You are narrating what the {akey.upper()} agent is likely doing "
-            f"right now in Phase {ph} of a Super Research pipeline. "
-            f"It's been {elapsed_min:.1f} minutes since the phase started. "
+            f"You narrate what the {akey.upper()} agent is likely doing right now. "
+            f"Elapsed: {elapsed_min:.1f} minutes. "
             f"Last known status: {last_status or 'unknown'}.\n\n"
-            f"TYPICAL TIMELINE for {akey.upper()} in Phase {ph}:\n"
+            f"TYPICAL TIMELINE for {akey.upper()}:\n"
             f"{timeline_text}\n\n"
             "Output ONE realistic sentence in present tense (<= 110 chars) "
-            "describing what's likely happening right now, based on the "
-            f"timeline position at {elapsed_min:.1f} min. No markdown, no "
-            "prefix, no em-dashes. Be specific to the current stage rather "
-            "than generic. Start the sentence with the agent name."
+            f"describing what's happening at minute {elapsed_min:.1f} of the "
+            "timeline above. Reference the specific stage by what the agent "
+            "is doing (e.g. 'ChatGPT is mapping cluster overlaps across the "
+            "first 80 sources') — NOT by phase number.\n\n"
+            "FORBIDDEN OUTPUT PATTERNS — the response must NOT contain any of "
+            "these phrasings (they leaked into the post-completion dropdown "
+            "card and the user complained):\n"
+            "  - 'Super Research Phase' / 'in Phase N' / 'Phase 2'\n"
+            "  - 'is now in' / 'currently in' / 'Status:'\n"
+            "  - generic 'still working' / 'is still processing'\n"
+            "Start with the agent name. No markdown, no em-dashes, no prefix."
         )
         fb_text, fb_status = await asyncio.to_thread(
             _call_narrator, fb_system, "", 200
@@ -6470,7 +6489,7 @@ async def _narrator_loop(phase: int):
                     )
                     a_system = (
                         f"You narrate ONE human sentence about what the {akey.upper()} "
-                        f"agent is doing RIGHT NOW in Super Research Phase {phase}.\n"
+                        f"agent is doing RIGHT NOW.\n"
                         "ANTI-PATTERNS — do NOT do these:\n"
                         "  - DO NOT echo any phrase from the input verbatim. If "
                         "the input contains 'research voice mode false positives', "
@@ -6482,6 +6501,14 @@ async def _narrator_loop(phase: int):
                         "responded:', 'Gemini said', 'brief.md', or any line "
                         "containing '<name> said' / '<name> responded' — treat "
                         "those as noise from the chat thread and skip them.\n"
+                        "  - DO NOT use the phrasings 'Super Research Phase N', "
+                        "'is now in Phase N', 'in Phase N', 'Phase 2' — those "
+                        "are pipeline-meta noise that leaked into the post-"
+                        "completion dropdown card. Describe what the agent is "
+                        "DOING, not which phase number it's in.\n"
+                        "  - DO NOT default to 'still working' / 'is still "
+                        "processing' when data is sparse — pick the most "
+                        "specific recent status/step you have and paraphrase it.\n"
                         "GOOD examples (paraphrase the underlying activity, "
                         "don't quote the input):\n"
                         "  - 'Gemini is mapping discrepancy patterns across the "
@@ -6494,8 +6521,8 @@ async def _narrator_loop(phase: int):
                         "No em-dashes (use commas/periods). Weave structured "
                         "fields (searches, sectionsDone/Total, currentFocus, "
                         "partialTextLen) as paraphrased facts, not quoted "
-                        "strings. If data is sparse, describe the phase stage "
-                        "instead of inventing specifics.\n"
+                        "strings. If data is sparse, describe the most recent "
+                        "concrete step you have — never generic copy.\n"
                         f"SCOPE: ONLY {akey.upper()}'s progress. Don't compare agents."
                     )
                     a_user = (
@@ -10701,12 +10728,30 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                        verified=True, primary=True)
         except Exception:
             pass
+        # 2026-05-03: pull the latest rich progress snapshot so the
+        # completion emit carries sourceUrls / sections / steps / searches
+        # alongside partialTextLen + links. Without this enrichment, the
+        # FE persistence in usePipeline at phase_complete only had
+        # partialTextLen to write — agents[key].sourceUrls landed empty
+        # and the post-completion dropdown card showed the bare stub.
+        _snap = {}
+        try:
+            _snap = dict(getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}) or {})
+        except Exception:
+            _snap = {}
         try:
             emit_event("agent_progress", phase=2, agent=agent_key,
                        status="complete",
                        progress=f"Content extracted: {n_chars} chars ({elapsed_sec}s)",
                        partialTextLen=n_chars,
                        elapsedSec=int(elapsed_sec or 0),
+                       sourceUrls=_snap.get("source_urls", []),
+                       sections=_snap.get("sections", []),
+                       steps=_snap.get("steps", []),
+                       searches=int(_snap.get("searches", 0) or 0),
+                       observedSources=int(_snap.get("observed_sources", 0) or 0),
+                       sources=max(int(_snap.get("sources", 0) or 0),
+                                   len(_snap.get("source_urls", []) or [])),
                        links=[{"label": _in_app_label, "url": _in_app_url,
                                "verified": True, "primary": True}])
         except Exception:
@@ -11585,7 +11630,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[Claude] refresh failed: {_re}", "WARN")
                 p["claude_refreshed_once"] = True
 
-            _claude_gate_ok = (p.get("poll_cycles", 0) >= 3 or elapsed >= 180)
+            # 2026-05-03: lowered cycle gate 3→2 and elapsed 180s→90s for
+            # parity with ChatGPT's panel-open gate at line ~11689.
+            # Claude's artifact panel is the only path that ships
+            # source_urls into progress["source_urls"]; the prior 180s gate
+            # left the dropdown showing 0 source chips for the first 3
+            # minutes of every Claude P2 run. ChatGPT proved the 90s gate
+            # is safe (artifact strip is rendered by ~30s on a healthy run).
+            _claude_gate_ok = (p.get("poll_cycles", 0) >= 2 or elapsed >= 90)
             if (name == "Claude" and _claude_gate_ok and
                     (time.time() - p.get("last_artifact_scrape", 0)) > ARTIFACT_SCRAPE_INTERVAL):
                 try:
@@ -12119,6 +12171,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     elapsedSec=elapsed_sec,
                     expectedMinutes=get_expected_minutes(2),
                     scrapeOk=scrape_ok)
+                # 2026-05-03: snapshot the rich fields so the P2 completion
+                # emit at extract_and_record_agent can ship the same data to
+                # the FE — without this, the `complete` event was bare and
+                # the persisted Firestore agents map ended up missing
+                # sourceUrls/sections/steps/searches, leaving the dropdown
+                # post-completion card empty.
+                try:
+                    _runtime.agent_progress_snapshots[agent_key] = {
+                        "source_urls": list(progress.get("source_urls", []) or [])[:50],
+                        "sections":    list(progress.get("sections", []) or [])[:20],
+                        "steps":       list(progress.get("steps", []) or [])[:15],
+                        "searches":    int(progress.get("searches", 0) or 0),
+                        "observed_sources": int(progress.get("observed_sources", 0) or 0),
+                        "sources":     int(progress.get("sources", 0) or 0),
+                        "partial_text_len": int(_partial_text_len or 0),
+                        "current_focus": str(progress.get("progress", "") or "")[:200],
+                    }
+                except Exception:
+                    pass
 
             # Heartbeat every 60s per agent
             if time.time() - p.get("last_heartbeat", 0) >= 60:
