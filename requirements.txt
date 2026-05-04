@@ -23,6 +23,11 @@ pydantic>=2.0
 
 # Firebase bridge (backend → Firestore → frontend)
 firebase-admin>=6.5
+# google-cloud-firestore is normally pulled in transitively by firebase-admin,
+# but research.py imports it directly (`from google.cloud import firestore`)
+# in 6+ places — pin it explicitly so the dep doesn't disappear if firebase-admin
+# ever drops it.
+google-cloud-firestore>=2.0
 
 # Setup QR code rendering
 qrcode>=7.4
