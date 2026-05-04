@@ -8352,6 +8352,12 @@ async def _count_claude_artifacts(page):
     role=button rounded card divs, plus a TEXT-content fallback that
     finds buttons whose text contains "Research complete" or starts with
     a research-card-style prefix (e.g. "OpenClaw and OpenShell research").
+    2026-05-04: scope to assistant-message containers + strip user-message
+    and attachment chips. Claude renders user-attached .md files (e.g.
+    brief.md) as artifact-style preview cards inside the user-message
+    bubble — same DOM shape as assistant artifacts — so the broad
+    selectors would inflate the count by 1 and make _click_claude_artifact
+    land on the brief instead of the assistant's report.
     """
     try:
         return await page.evaluate("""() => {
@@ -8366,25 +8372,45 @@ async def _count_claude_artifacts(page):
                 'a[href*="/artifacts/"]',
                 'div[role="button"][class*="rounded"][class*="border"]',
             ];
+            const isUserOrAttachment = (el) => !!el.closest(
+                '[data-testid="user-message"], [data-message-author-role="user"], ' +
+                '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i]'
+            );
+            const isInAssistant = (el) => !!el.closest('.font-claude-message');
             let total = 0;
+            // Pass 1: prefer matches inside assistant message scope.
             for (const sel of selectors) {
-                const found = document.querySelectorAll(sel);
+                const found = Array.from(document.querySelectorAll(sel))
+                    .filter(el => isInAssistant(el) && !isUserOrAttachment(el));
                 if (found.length > 0) { total = Math.max(total, found.length); }
             }
-            // Text-content fallback: any clickable element that contains the
-            // modern "Research complete · N sources · Xm Ys" marker.
-            const textHits = Array.from(document.querySelectorAll(
-                '.font-claude-message button, .font-claude-message [role="button"], ' +
-                'button, [role="button"]'
-            )).filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || ''));
-            total = Math.max(total, textHits.length);
-            // Legacy fallback: document-like inline cards in assistant messages
+            // Pass 2: only run when assistant-scoped lookup returned nothing
+            // (covers Claude UI variants without .font-claude-message
+            // wrappers). Still strips user-message + attachment matches.
             if (total === 0) {
-                const cards = document.querySelectorAll(
+                for (const sel of selectors) {
+                    const found = Array.from(document.querySelectorAll(sel))
+                        .filter(el => !isUserOrAttachment(el));
+                    if (found.length > 0) { total = Math.max(total, found.length); }
+                }
+            }
+            // Text-content fallback: any clickable element matching the
+            // legacy "Research complete · N sources · Xm Ys" marker OR the
+            // 2026-05+ Boom! ready callout. Scope to .font-claude-message
+            // and strip user/attachment matches.
+            const textHits = Array.from(document.querySelectorAll(
+                '.font-claude-message button, .font-claude-message [role="button"]'
+            )).filter(el => !isUserOrAttachment(el))
+              .filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || '')
+                         || /\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(el.textContent || ''));
+            total = Math.max(total, textHits.length);
+            // Legacy fallback: document-like inline cards in assistant messages.
+            if (total === 0) {
+                const cards = Array.from(document.querySelectorAll(
                     '.font-claude-message button[class*="block"], ' +
                     '.font-claude-message [class*="artifact"], ' +
                     '[data-is-streaming] button[class*="w-full"]'
-                );
+                )).filter(el => !isUserOrAttachment(el));
                 total = cards.length;
             }
             return total;
@@ -8396,7 +8422,10 @@ async def _count_claude_artifacts(page):
 
 async def _click_claude_artifact(page, index=0):
     """Click the Nth artifact card (0-indexed). Returns True if clicked.
-    2026-04-26: same modernized selectors as _count_claude_artifacts."""
+    2026-04-26: same modernized selectors as _count_claude_artifacts.
+    2026-05-04: same assistant-scope + user/attachment strip as
+    _count_claude_artifacts so the brief.md attachment chip in the
+    user-message bubble can't be the click target."""
     try:
         return await page.evaluate(f"""(idx) => {{
             const selectors = [
@@ -8410,25 +8439,43 @@ async def _click_claude_artifact(page, index=0):
                 'a[href*="/artifacts/"]',
                 'div[role="button"][class*="rounded"][class*="border"]',
             ];
+            const isUserOrAttachment = (el) => !!el.closest(
+                '[data-testid="user-message"], [data-message-author-role="user"], ' +
+                '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i]'
+            );
+            const isInAssistant = (el) => !!el.closest('.font-claude-message');
             let cards = [];
+            // Pass 1: prefer matches inside assistant message scope.
             for (const sel of selectors) {{
-                const found = document.querySelectorAll(sel);
-                if (found.length > 0) {{ cards = Array.from(found); break; }}
+                const found = Array.from(document.querySelectorAll(sel))
+                    .filter(el => isInAssistant(el) && !isUserOrAttachment(el));
+                if (found.length > 0) {{ cards = found; break; }}
+            }}
+            // Pass 2: fallback to broad scan if assistant scope returned
+            // nothing — still strips user-message + attachment matches.
+            if (!cards.length) {{
+                for (const sel of selectors) {{
+                    const found = Array.from(document.querySelectorAll(sel))
+                        .filter(el => !isUserOrAttachment(el));
+                    if (found.length > 0) {{ cards = found; break; }}
+                }}
             }}
             if (!cards.length) {{
-                // Text-content fallback: clickable element with "Research complete · …"
+                // Text-content fallback: legacy "Research complete · …" or
+                // 2026-05+ Boom! marker. Scoped + user/attachment-stripped.
                 const textHits = Array.from(document.querySelectorAll(
-                    '.font-claude-message button, .font-claude-message [role="button"], ' +
-                    'button, [role="button"]'
-                )).filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || ''));
+                    '.font-claude-message button, .font-claude-message [role="button"]'
+                )).filter(el => !isUserOrAttachment(el))
+                  .filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || '')
+                             || /\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(el.textContent || ''));
                 if (textHits.length > 0) cards = textHits;
             }}
             if (!cards.length) {{
-                const fallback = document.querySelectorAll(
+                const fallback = Array.from(document.querySelectorAll(
                     '.font-claude-message button[class*="block"], ' +
                     '.font-claude-message [class*="artifact"]'
-                );
-                cards = Array.from(fallback);
+                )).filter(el => !isUserOrAttachment(el));
+                cards = fallback;
             }}
             // 2026-04-26: visibility + dialog-modal filter — a publish/share
             // dialog left over from a prior turn can match the same selectors;
