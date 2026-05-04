@@ -785,6 +785,17 @@ Shape B — count-badge strip (P2 / Deep Research):
 
 Either shape is a valid target. They behave the same on click.
 
+STRUCTURAL HINT (use this when verb wording is unfamiliar):
+- The live activity line ALWAYS ends with three dots / ellipsis ("...")
+  while the run is in progress. If you see a glowing/shimmering line
+  attached to the latest response that ends in `...`, that IS the click
+  target — even if the leading words aren't on the trigger-phrase list
+  above. The ellipsis suffix is the most reliable visual anchor; the
+  text in front of it mutates throughout the run, the dots do not.
+- The ellipsis line sits on a row with a small spinner/dot on the left
+  and (in P2 Deep Research) a "<N> searches" count badge plus a stop
+  button to its right. That whole row is the strip.
+
 VERIFY STATE FIRST (do this BEFORE any click):
 - If a wide side panel is ALREADY visible on the RIGHT showing a numbered
   step list with URL bullets — the panel is already open. Output exactly:

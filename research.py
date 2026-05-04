@@ -7150,15 +7150,29 @@ async def _open_chatgpt_activity_panel(page):
         // Includes "thinking"/"reasoning" because Pro+ET shows those before swapping
         // to site-fetch verbs ("Reading <site>", "Visiting <url>") mid-stream.
         const VERB_ONLY = /^(thinking|reasoning|searching|looking|browsing|investigating|analyzing|reading|exploring|checking|visiting|researching|confirming|summari[zs]ing|synthesi[zs]ing|drafting|finali[zs]ing)\\b/i;
+        // 2026-05-03 STRUCTURAL ANCHOR: the live in-tile glow line ALWAYS
+        // ends with ellipsis ("..." or U+2026 normalized) while the run is
+        // streaming. Verb wording mutates per stream (5 prior commits keep
+        // expanding the verb regex with no end in sight); the ellipsis
+        // suffix does not. Match BOTH ASCII three-dot and Unicode \\u2026.
+        const ELLIPSIS = /(?:\\.{3}|\\u2026)\\s*$/;
 
-        // Specificity score for hit ranking. Parent strip (verb+count) must
-        // outrank the inner count-only badge — the badge is a presentational
-        // span with no React handler, so dispatching click on it silently
-        // no-ops while the strip's actual handler never fires. Without this
-        // score, the prior len-ascending tiebreaker picked the shorter badge
-        // child over the parent strip. Score: 3 (verb+count) > 2 (verb-only)
-        // > 1 (count-only) > 0 (neither — unreachable; findHitsIn filters).
-        const hitScore = (h) => (h.hasCount && h.hasVerb ? 3 : h.hasVerb ? 2 : h.hasCount ? 1 : 0);
+        // Specificity score for hit ranking. Layered to keep the 32c2957
+        // "parent strip > badge child" guarantee while putting the live
+        // ellipsis-bearing leaf above everything (it's the actual click
+        // target with the React handler attached, not a presentational
+        // wrapper). Tiers: 5 ellipsis+verb > 4 ellipsis+count > 3.5 bare
+        // ellipsis > 3 verb+count > 2 verb-only > 1 count-only > 0 (none —
+        // unreachable; findHitsIn filters).
+        const hitScore = (h) => {
+            if (h.hasEllipsis && h.hasVerb)  return 5;
+            if (h.hasEllipsis && h.hasCount) return 4;
+            if (h.hasEllipsis)               return 3.5;
+            if (h.hasVerb && h.hasCount)     return 3;
+            if (h.hasVerb)                   return 2;
+            if (h.hasCount)                  return 1;
+            return 0;
+        };
 
         function findHitsIn(root) {
             // Local accumulator — kept narrow so caller can priority-rank
@@ -7171,12 +7185,19 @@ async def _open_chatgpt_activity_panel(page):
             for (const el of nodes) {
                 const t = (el.innerText || el.textContent || '').trim();
                 if (!t || t.length < 4 || t.length > 300) continue;
-                const matchesCount = COUNT.test(t);
-                const matchesVerb  = VERB_ONLY.test(t);
-                if (!matchesCount && !matchesVerb) continue;
+                const matchesCount    = COUNT.test(t);
+                const matchesVerb     = VERB_ONLY.test(t);
+                // Ellipsis match limited to 12–240 char leaves — the live
+                // narration sentences land in this window. Mid-sentence
+                // "..." in streamed prose paragraphs typically run >240
+                // chars (filtered out) or <12 chars (placeholder spans).
+                const matchesEllipsis = ELLIPSIS.test(t) && t.length >= 12 && t.length <= 240;
+                if (!matchesCount && !matchesVerb && !matchesEllipsis) continue;
                 const r = el.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
-                out.push({ el, top: r.top, len: t.length, hasCount: matchesCount, hasVerb: matchesVerb });
+                out.push({ el, top: r.top, len: t.length,
+                           hasCount: matchesCount, hasVerb: matchesVerb,
+                           hasEllipsis: matchesEllipsis });
             }
             return out;
         }
