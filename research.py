@@ -380,6 +380,7 @@ def _battery_state() -> str:
              "$b = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1; "
              "if ($b -eq $null) { 'NONE' } else { \"$($b.BatteryStatus):$($b.EstimatedChargeRemaining)\" }"],
             capture_output=True, text=True, timeout=8,
+            creationflags=_PS_NO_WINDOW,
         )
         out = (ps.stdout or "").strip()
     except Exception:
@@ -431,6 +432,7 @@ def _local_api_health(port: int = 8000, timeout_s: float = 3.0) -> "tuple[bool, 
              "Write-Output $r.StatusCode } "
              "catch { Write-Output \"ERR:$($_.Exception.Message)\" }"],
             capture_output=True, text=True, timeout=timeout_s + 5,
+            creationflags=_PS_NO_WINDOW,
         )
         out = (ps.stdout or "").strip()
         if out.startswith("ERR:"):
@@ -17434,7 +17436,8 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             try:
                 r = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries",
                     "format=duration", "-of", "csv=p=0", str(f)],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5,
+                    creationflags=_PS_NO_WINDOW)
                 dur_sec = int(float(r.stdout.strip()))
             except Exception:
                 pass
@@ -21619,6 +21622,7 @@ def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
              "(name='python.exe' or name='pythonw.exe')",
              "get", "processid,commandline", "/format:list"],
             capture_output=True, text=True, timeout=15,
+            creationflags=_PS_NO_WINDOW,
         )
     except Exception:
         return []
@@ -21668,6 +21672,7 @@ def _proc_age_seconds(pid: int) -> float | None:
             ["wmic", "process", "where", f"ProcessId={pid}",
              "get", "CreationDate", "/format:list"],
             capture_output=True, text=True, timeout=10,
+            creationflags=_PS_NO_WINDOW,
         )
         for line in (r.stdout or "").splitlines():
             if line.startswith("CreationDate="):
@@ -21690,6 +21695,7 @@ def _kill_pids(pids: list[int]) -> int:
             r = subprocess.run(
                 ["taskkill", "/F", "/PID", str(pid)],
                 capture_output=True, text=True, timeout=10,
+                creationflags=_PS_NO_WINDOW,
             )
             if r.returncode == 0:
                 killed += 1
@@ -21919,6 +21925,7 @@ def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
         result = _subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
             capture_output=True, text=True, timeout=30,
+            creationflags=_PS_NO_WINDOW,
         )
         if result.returncode != 0:
             return False, (result.stderr or result.stdout or "PS exit non-zero").strip()
@@ -21974,7 +21981,8 @@ def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
         "/F",
     ]
     try:
-        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                 creationflags=_PS_NO_WINDOW)
     except Exception as e:
         return False, None, f"schtasks error: {e}", 0
     if result.returncode != 0:
@@ -22039,7 +22047,8 @@ def _disarm_supervisor_quiet() -> tuple[str, int]:
     if _platform.system() == "Windows":
         cmd = ["schtasks", "/Delete", "/TN", _SUPERVISOR_TASK_NAME, "/F"]
         try:
-            result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                     creationflags=_PS_NO_WINDOW)
             if result.returncode == 0:
                 task_info = "removed"
             elif "cannot find the file" in (result.stdout + result.stderr).lower():
@@ -22136,7 +22145,8 @@ def run_resurrect():
         "/F",                   # overwrite existing
     ]
     try:
-        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                 creationflags=_PS_NO_WINDOW)
     except Exception as e:
         print(f"  {_c(_WARN, '⚠')}  Failed to run schtasks: {e}")
         return
@@ -22331,7 +22341,8 @@ def run_retire():
         "/F",
     ]
     try:
-        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                 creationflags=_PS_NO_WINDOW)
     except Exception as e:
         print(f"  {_c(_WARN, '⚠')}  Failed to run schtasks: {e}")
         return
@@ -22536,7 +22547,8 @@ def run_unpair():
     if _platform.system() == "Windows":
         cmd = ["schtasks", "/Delete", "/TN", _SUPERVISOR_TASK_NAME, "/F"]
         try:
-            result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                     creationflags=_PS_NO_WINDOW)
             if result.returncode == 0:
                 print(f"  {_c(_OK, '✓')}  Scheduled Task removed ({_SUPERVISOR_TASK_NAME})")
             elif "cannot find the file" in (result.stdout + result.stderr):
