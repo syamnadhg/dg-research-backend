@@ -17528,6 +17528,18 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
             unique_urls = list(dict.fromkeys(urls))[:50]  # Dedupe, cap at 50
             # Build/update agent entry. unique_urls is already capped at 50.
             existing = agents.get(platform, {})
+            # 2026-05-04: pull the runtime per-agent progress snapshot so
+            # searches + observedSources land in the persisted Firestore
+            # agents map alongside the markdown-derived fields above. The
+            # FE post-completion stub (PhaseDropdown.tsx _postCompletionStub)
+            # reads these to recap "Xk chars, N sources, M searches" on
+            # chat reopen — without persistence, the live pipeline_events
+            # window prunes past 50 entries and the values defaulted to 0,
+            # making the stub show only chars+sources after a long break.
+            try:
+                _snap = dict(getattr(_runtime, "agent_progress_snapshots", {}).get(platform, {}) or {})
+            except Exception:
+                _snap = {}
             agents[platform] = {
                 "sources": len(unique_urls),
                 "sourceUrls": unique_urls,
@@ -17535,6 +17547,8 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
                 "outputChars": len(content),
                 "completionTimeSec": existing.get("completionTimeSec", 0),
                 "findings": sections[:3] if sections else [],
+                "searches": int(_snap.get("searches", 0) or existing.get("searches", 0) or 0),
+                "observedSources": int(_snap.get("observed_sources", 0) or existing.get("observedSources", 0) or 0),
             }
 
     # ── Phase timeline (for timeline graph) ──
