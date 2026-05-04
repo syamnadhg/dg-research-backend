@@ -11680,46 +11680,48 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
 
-            # Timeout — auto-skip (2026-04-30): per-agent P2 wall-clock
-            # timeout used to stop and ask [Retry, Wait, Skip]. New rule
-            # is auto: if an agent burned its budget without finishing,
-            # take whatever partial output was extracted, drop it from
-            # the rotation, and let the other agents keep going. The
-            # consolidated downstream pipeline simply gets one fewer
-            # source for NotebookLM — the user's directive: "skipped/
-            # missing agent → NLM skips that file." No human prompt.
-            if elapsed > max_wait_min * 60:
-                log(f"[{name}] Timeout ({max_wait_min}min) — auto-skipping agent", "WARN")
+            # Timeout — soft warn (2026-05-04): per-agent P2 budget rule
+            # rewritten from auto-skip to advisory. User contract: "BE
+            # can't bail on long researches and fail." Deep-research runs
+            # legitimately take 1-2h, and the previous auto-skip-with-
+            # partial-output path was discarding healthy slow-but-running
+            # agents. Now: emit pipeline_warning [Wait, Skip agent] ONCE
+            # per agent, keep polling normally. Wait is implicit (no
+            # command). Skip routes to request_skip_agent → existing
+            # skipped_agents handler drops the agent on the next tick
+            # (lines 11447+). Per-agent flag p["soft_warn_emitted"]
+            # prevents re-warning. Retry intentionally omitted at the
+            # agent level: retry_agents has no consumer in this loop
+            # (see comment at line ~11526), and the heavyweight
+            # retry_agents_hard path closes+re-runs the tab — wrong for
+            # "still working, just slow". Stop button (chat input) +
+            # phase-level Retry remain available regardless.
+            if elapsed > max_wait_min * 60 and not p.get("soft_warn_emitted"):
+                p["soft_warn_emitted"] = True
                 agent_key_to = normalize_agent_key(name)
-                try:
-                    await browser.switch_to_page(p["page"])
-                    partial_text = await extract_fns[name](p["page"], browser=browser,
-                        cua_client=cua_client, label=name, verbose=verbose)
-                except Exception as e:
-                    log(f"[{name}] Extraction after timeout failed: {e}", "WARN")
-                    partial_text = ""
-                partial_len = len(partial_text or "")
-                # Surface the auto-skip as a passive warning so the user
-                # sees what happened (no buttons — corner-✕ to dismiss).
+                log(f"[{name}] Active time {int(elapsed/60)}min past {max_wait_min}min budget — "
+                    f"emitting soft warn (Wait/Skip); polling continues", "WARN")
                 emit_event("pipeline_warning", phase=2, agent=agent_key_to,
-                           message=f"{name} timed out at {max_wait_min} min — auto-skipped",
-                           details=(f"Extracted {partial_len} chars of partial output, "
-                                    "kept for downstream phases. Other agents continue."),
-                           actions=[],
+                           message=f"{name} has been researching for {max_wait_min}+ minutes",
+                           details=("Deep-research runs can legitimately take 1-2 hours. "
+                                    "Wait keeps polling normally (this agent is still being "
+                                    "watched). Skip drops this agent — downstream phases use "
+                                    "partial output if available, or skip the missing source."),
+                           actions=[
+                               {"id": "wait", "label": "Wait — keep watching", "style": "primary",
+                                "command": {"action": "dismiss_alert"}},
+                               {"id": "skip", "label": f"Skip {name}", "style": "default",
+                                "command": {"action": "skip_agent", "agent": agent_key_to}},
+                           ],
                            alertType="warn",
                            dismissible=True,
-                           alert_id=f"agent_{agent_key_to}_timeout_autoskip")
-                # If we got useful partial text, keep it for downstream;
-                # otherwise mark as fully skipped so consolidated/P3 don't
-                # carry an empty placeholder.
-                if partial_len >= 200:
-                    results[name] = {"status": "timeout_partial", "text": partial_text,
-                                     "url": p.get("url", ""), "page": p["page"]}
-                else:
-                    results[name] = {"status": "skipped_timeout", "text": "",
-                                     "url": p.get("url", ""), "page": p["page"]}
-                del pending[name]
-                continue
+                           alert_id=f"agent_{agent_key_to}_soft_timeout")
+                # IMPORTANT: do NOT delete pending[name]. Keep polling.
+                # Wait = implicit (no signal). Skip handled by the
+                # existing skipped_agents path earlier in this loop
+                # (lines 11447+) on subsequent ticks. Falls through to
+                # the normal scrape/detect block below — the agent's
+                # detect_completion can still fire and naturally complete.
 
             # ── Mid-run session expiry check ──
             # Agent tabs sometimes get logged out silently (cookie expiry,
@@ -18057,6 +18059,57 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             except Exception:
                 pass
 
+    class _PhaseSoftDecision(Exception):
+        """Raised by the soft-warn path of _await_phase_with_active_deadline
+        when the user picks Retry or Skip. .decision is "retry" or "skip".
+        Wait + Stop are handled inline (Wait = no signal, polling continues;
+        Stop = CancelledError). 2026-05-04: introduced to support the user's
+        'BE can't bail on long researches' contract — long Claude DR runs
+        (1-2h) emit a soft warn at the phase deadline instead of hard-
+        cancelling, and the user picks the next move."""
+        def __init__(self, decision: str):
+            super().__init__(f"phase soft decision: {decision}")
+            self.decision = decision
+
+    def _emit_phase_soft_warn(phase: int, max_min: int, alert_id: str):
+        """Emit the phase-level soft-timeout pipeline_warning. Used only by
+        _await_phase_with_active_deadline's soft path. Actions:
+          - Wait: pure FE dismiss, no Firestore command needed because BE
+            was never paused. Polling continues uninterrupted.
+          - Retry from checkpoint: writes retry_phase command → helper
+            consumes consume_retry_phase, cancels run_task, raises
+            _PhaseSoftDecision("retry") so the caller can restart.
+          - Skip phase: writes skip_phase command → helper consumes
+            consume_phase_skip, cancels run_task, raises
+            _PhaseSoftDecision("skip") so the caller can advance.
+        """
+        actions = [
+            {"id": "wait", "label": "Wait — keep going", "style": "primary",
+             "command": {"action": "dismiss_alert"}},
+            {"id": "retry", "label": "Retry from checkpoint", "style": "default",
+             "command": {"action": "retry_phase", "phase": phase}},
+            {"id": "skip", "label": "Skip phase", "style": "default",
+             "command": {"action": "skip_phase", "phase": phase}},
+        ]
+        try:
+            emit_event(
+                "pipeline_warning", phase=phase,
+                message=f"Phase {phase} has been running for {max_min} min — agent may still be working",
+                details=(
+                    "The pipeline is still polling normally. Wait keeps watching "
+                    "(deep-research runs can legitimately take 1-2 hours). Retry "
+                    "restarts from the last checkpoint with a fresh budget. Skip "
+                    "moves past this phase. You can also Stop the pipeline from "
+                    "the chat input bar."
+                ),
+                actions=actions,
+                alertType="warn",
+                dismissible=True,
+                alert_id=alert_id,
+            )
+        except Exception as _e:
+            log(f"_emit_phase_soft_warn fallback ({_e})", "WARN")
+
     async def _phase_timeout_decision(phase: int, max_min: int, agent: str | None = None) -> str:
         """Recoverable response to a per-phase active-time ceiling. Per the
         never-die contract, BE-detected stuck phases do NOT terminate the
@@ -18068,7 +18121,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     while the alert was up; await_phase_decision picks that up
                     via _controls.is_stop()
         Returns the user's decision string. Does NOT write delivery.json
-        status="stopped" — that's reserved for terminal stop paths only."""
+        status="stopped" — that's reserved for terminal stop paths only.
+
+        2026-05-04: this is the HARD path — used by P1/P3/P4. P2 now uses
+        the soft-warn path inside _await_phase_with_active_deadline (see
+        _emit_phase_soft_warn) so long DR runs aren't bailed on. Other
+        phases keep this hard-cancel + Retry/Skip pause-for-decision flow
+        because P3/P4 are bounded utility ops where 90 min IS genuinely
+        stuck (NLM upload, ffmpeg, YouTube upload)."""
         log(f"Phase {phase}: active-time ceiling {max_min}min hit — surfacing to user as recoverable error", "WARN")
         actions = [
             {"id": "retry", "label": "Retry from checkpoint", "style": "primary",
@@ -18105,14 +18165,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         emit_event("pipeline_resumed", phase=phase, reason=f"phase_timeout_{decision}")
         return decision
 
-    async def _await_phase_with_active_deadline(phase: int, max_min: int, coro_factory):
+    async def _await_phase_with_active_deadline(phase: int, max_min: int, coro_factory,
+                                                  soft_warn_only: bool = False):
         """Run a phase coroutine factory with an ACTIVE-TIME wall-clock
         deadline. Time spent while `_controls.is_pause()` is True does NOT
         count toward the budget — so a user pausing for an hour doesn't
-        kill a healthy phase. Cancels the coroutine when active-time
-        exhausts and raises asyncio.TimeoutError. The caller catches it,
-        runs `_phase_timeout_decision` to give the user Retry/Skip, and
-        on Retry calls this helper AGAIN (factory creates a fresh coro).
+        kill a healthy phase.
+
+        soft_warn_only=False (default — P1/P3/P4 hard-cap behavior):
+          Cancels the coroutine when active-time exhausts and raises
+          asyncio.TimeoutError. Caller runs `_phase_timeout_decision` to
+          give the user Retry/Skip, and on Retry calls this helper AGAIN
+          (factory creates a fresh coro). Existing behavior — unchanged.
+
+        soft_warn_only=True (P2 only — long-research advisory, 2026-05-04):
+          Emits a pipeline_warning [Wait/Retry/Skip] (amber) at the
+          deadline, DOES NOT cancel the coroutine, and continues polling
+          for the user's decision while the run_task keeps doing work.
+          Wait is implicit — no command needed; the polling never
+          stopped, the alert FE-clears when user dismisses. Retry →
+          cancel + raise _PhaseSoftDecision("retry"). Skip → cancel +
+          raise _PhaseSoftDecision("skip"). User-Stop (chat input) →
+          cancel + raise CancelledError. Run_task completing naturally
+          returns its result. The user's contract: 'BE can't bail on
+          long researches and fail.' One warn per helper invocation —
+          if user clicks Wait and the run continues past another budget
+          window, no re-warn (prevents spam).
 
         coro_factory is `Callable[[], Coroutine]` — must produce a fresh
         coroutine on each call so retry doesn't await an already-awaited
@@ -18121,6 +18199,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         active_sec = 0.0
         deadline_sec = float(max_min * 60)
         tick = 5.0
+        soft_warn_emitted = False
+        soft_alert_id = f"phase{phase}_soft_timeout"
         while not run_task.done():
             try:
                 await asyncio.sleep(tick)
@@ -18138,9 +18218,43 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 try: await run_task
                 except BaseException: pass
                 raise asyncio.CancelledError(f"phase {phase} stopped by user")
+            # Soft-mode user-decision polling — only AFTER the warn is
+            # emitted. Until then there's nothing for the user to decide.
+            # Wait is implicit (no signal); Retry/Skip drive the existing
+            # consume_retry_phase / consume_phase_skip controls.
+            if soft_warn_only and soft_warn_emitted:
+                if _controls.consume_retry_phase(phase):
+                    log(f"Phase {phase}: user chose Retry on soft-warn — cancelling run_task", "INFO")
+                    run_task.cancel()
+                    try: await run_task
+                    except BaseException: pass
+                    raise _PhaseSoftDecision("retry")
+                if _controls.consume_phase_skip(phase):
+                    log(f"Phase {phase}: user chose Skip on soft-warn — cancelling run_task", "INFO")
+                    run_task.cancel()
+                    try: await run_task
+                    except BaseException: pass
+                    raise _PhaseSoftDecision("skip")
             if not _controls.is_pause():
                 active_sec += tick
             if active_sec >= deadline_sec and not run_task.done():
+                if soft_warn_only and not soft_warn_emitted:
+                    # Soft path: emit pipeline_warning ONCE, keep polling.
+                    # Run_task continues uninterrupted; user's Wait/Retry/
+                    # Skip is consumed in subsequent ticks above. Per the
+                    # 'BE can't bail on long researches' contract, Wait
+                    # is implicit — no command, no stop, polling intact.
+                    log(f"Phase {phase}: active-time {active_sec:.0f}s past "
+                        f"{deadline_sec:.0f}s — soft warn emitted, polling continues", "WARN")
+                    _emit_phase_soft_warn(phase, max_min, soft_alert_id)
+                    soft_warn_emitted = True
+                    continue
+                if soft_warn_only and soft_warn_emitted:
+                    # Already warned, user undecided. Keep polling — the
+                    # run_task may finish naturally; if it does, we exit
+                    # the while loop and return its result below.
+                    continue
+                # Hard-cap path (P1/P3/P4 default behavior — unchanged).
                 log(f"Phase {phase}: active-time {active_sec:.0f}s exceeded {deadline_sec:.0f}s — cancelling for user decision", "WARN")
                 run_task.cancel()
                 # CancelledError inherits from BaseException (not Exception)
@@ -18937,9 +19051,35 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             2, PHASE_2_MAX_MIN,
                             lambda: run_phase2(browser, cua_client, research_brief, verbose,
                                                enabled_agents=enabled_agents),
+                            soft_warn_only=True,  # 2026-05-04: long DR runs are legitimate; warn but don't bail
                         )
                         break  # success
+                    except _PhaseSoftDecision as _sd:
+                        # User picked Retry/Skip on the soft-timeout warn.
+                        # Wait is implicit — never reaches this except (the
+                        # helper keeps polling on Wait until run_task either
+                        # finishes naturally OR user picks Retry/Skip).
+                        if _sd.decision == "retry":
+                            emit_event("phase_restart", phase=2, reason="user_retry_after_soft_timeout")
+                            results = {}
+                            continue
+                        if _sd.decision == "skip":
+                            emit_event("phase_skipped", phase=2, reason="user_skip_after_soft_timeout")
+                            _p2_user_skipped = True
+                            results = {}
+                            break
+                        # Defensive — _PhaseSoftDecision only carries
+                        # "retry"/"skip"; anything else means the helper
+                        # contract drifted. Log + re-raise so it surfaces.
+                        log(f"[P2] Unexpected _PhaseSoftDecision.decision={_sd.decision!r}", "ERROR")
+                        raise
                     except asyncio.TimeoutError:
+                        # Legacy hard-path. With soft_warn_only=True the
+                        # helper raises _PhaseSoftDecision instead of
+                        # TimeoutError, so this except block is normally
+                        # unreachable for P2. Kept as a safety net in case
+                        # something inside run_phase2 raises a bare
+                        # TimeoutError that escapes the helper's wrap.
                         _decision = await _phase_timeout_decision(2, PHASE_2_MAX_MIN)
                         if _decision == "retry":
                             emit_event("phase_restart", phase=2, reason="user_retry_after_timeout")
