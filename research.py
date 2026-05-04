@@ -11680,48 +11680,24 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
 
-            # Timeout — soft warn (2026-05-04): per-agent P2 budget rule
-            # rewritten from auto-skip to advisory. User contract: "BE
-            # can't bail on long researches and fail." Deep-research runs
-            # legitimately take 1-2h, and the previous auto-skip-with-
-            # partial-output path was discarding healthy slow-but-running
-            # agents. Now: emit pipeline_warning [Wait, Skip agent] ONCE
-            # per agent, keep polling normally. Wait is implicit (no
-            # command). Skip routes to request_skip_agent → existing
-            # skipped_agents handler drops the agent on the next tick
-            # (lines 11447+). Per-agent flag p["soft_warn_emitted"]
-            # prevents re-warning. Retry intentionally omitted at the
-            # agent level: retry_agents has no consumer in this loop
-            # (see comment at line ~11526), and the heavyweight
-            # retry_agents_hard path closes+re-runs the tab — wrong for
-            # "still working, just slow". Stop button (chat input) +
-            # phase-level Retry remain available regardless.
-            if elapsed > max_wait_min * 60 and not p.get("soft_warn_emitted"):
-                p["soft_warn_emitted"] = True
-                agent_key_to = normalize_agent_key(name)
-                log(f"[{name}] Active time {int(elapsed/60)}min past {max_wait_min}min budget — "
-                    f"emitting soft warn (Wait/Skip); polling continues", "WARN")
-                emit_event("pipeline_warning", phase=2, agent=agent_key_to,
-                           message=f"{name} has been researching for {max_wait_min}+ minutes",
-                           details=("Deep-research runs can legitimately take 1-2 hours. "
-                                    "Wait keeps polling normally (this agent is still being "
-                                    "watched). Skip drops this agent — downstream phases use "
-                                    "partial output if available, or skip the missing source."),
-                           actions=[
-                               {"id": "wait", "label": "Wait — keep watching", "style": "primary",
-                                "command": {"action": "dismiss_alert"}},
-                               {"id": "skip", "label": f"Skip {name}", "style": "default",
-                                "command": {"action": "skip_agent", "agent": agent_key_to}},
-                           ],
-                           alertType="warn",
-                           dismissible=True,
-                           alert_id=f"agent_{agent_key_to}_soft_timeout")
-                # IMPORTANT: do NOT delete pending[name]. Keep polling.
-                # Wait = implicit (no signal). Skip handled by the
-                # existing skipped_agents path earlier in this loop
-                # (lines 11447+) on subsequent ticks. Falls through to
-                # the normal scrape/detect block below — the agent's
-                # detect_completion can still fire and naturally complete.
+            # 2026-05-04: per-agent wall-clock timeout REMOVED entirely.
+            # Phase-level soft warn from _await_phase_with_active_deadline
+            # already covers the slow-agent case (the only practical way
+            # for P2 phase wall-clock to fire is one slow agent in
+            # pending), and the dual phase+agent alert UX required two
+            # Wait clicks to clear. Single phase-level alert is enough.
+            #
+            # Other safety nets remain INSIDE this loop and are unaffected:
+            #   • Browser-crash sweep (line ~11305): page.is_closed → fail_agent
+            #   • Skipped_agents handler (line ~11452): user explicit skip
+            #   • Hard retry (line ~11488): user-driven, capped at 2/agent
+            #   • Session-expiry mid-run (line ~11726): /login redirect detection
+            #   • No-growth stuck watchdog (line ~12279): elapsed>1200 + no_growth>1200
+            #   • Stop button: 5s short-circuit at the helper level
+            # An agent that is genuinely stuck (not just slow) is caught by
+            # the no-growth watchdog within ~20 min — far sooner than 90 min.
+            # An agent that's genuinely working but slow gets the phase-
+            # level soft warn at the user's max_wait_min budget.
 
             # ── Mid-run session expiry check ──
             # Agent tabs sometimes get logged out silently (cookie expiry,
