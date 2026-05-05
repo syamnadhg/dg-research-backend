@@ -18901,6 +18901,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 emit_event("phase_complete", phase=1, durationSec=int(time.time() - _p1_start),
                     summary="Phase 1 skipped after error — no brief generated")
                 _update_firestore_research({"phase": 1, "status": "ongoing"})
+                # Tile/Icon Consistency (mirrors P2 at line ~19244): persist
+                # a terminal P1+ChatGPT status to the root doc so the listing
+                # tile + chat phase icon + agent dropdown stay correct after
+                # reload. Without this, on reopen the FE falls back to the
+                # last volatile per-agent status (e.g. "submitting"), which
+                # never matches the green-tick gate.
+                _write_phase_terminal_status(1, "skipped")
+                _write_agent_terminal_status("chatgpt", "skipped")
             elif _brief_from_file:
                 # Phase 1 bypassed via --brief-file (or frontend briefText).
                 # Persist to disk + Firestore. The user supplied the text;
@@ -18921,6 +18929,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     durationSec=int(time.time() - _p1_start), links=_p1_links,
                     summary=f"Research brief loaded from file ({brief_artifact.chars} chars)")
                 _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
+                # Tile/Icon Consistency — see _p1_skipped_after_error branch above.
+                _write_phase_terminal_status(1, "complete")
+                _write_agent_terminal_status("chatgpt", "complete")
             else:
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
@@ -18951,6 +18962,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     links=_p1_links,
                     summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
                 _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
+                # Tile/Icon Consistency — see _p1_skipped_after_error branch above.
+                _write_phase_terminal_status(1, "complete")
+                _write_agent_terminal_status("chatgpt", "complete")
                 # 2026-04-25: P1 secondary "View on ChatGPT" link removed.
                 # The in-app /documents?open=…:brief primary is the only link
                 # surfaced to the FE. The conversation URL (brief_url, captured
@@ -19009,6 +19023,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         emit_event("phase_complete", phase=1,
                                    summary=f"Brief regenerated with user input ({len(brief_text)} chars)",
                                    links=[{"label": "ChatGPT Brief", "url": brief_url}] if brief_url else [])
+                        # Tile/Icon Consistency — see _p1_skipped_after_error
+                        # branch above. Resume-with-input regen still needs the
+                        # terminal write because the original P1 write (if any)
+                        # was for the pre-pause attempt; the regen produces a
+                        # fresh ChatGPT session whose completion must persist.
+                        _write_phase_terminal_status(1, "complete")
+                        _write_agent_terminal_status("chatgpt", "complete")
             if _controls.is_stop():
                 return
 
