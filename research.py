@@ -1835,6 +1835,7 @@ def start_firestore_start_listener(job_queue, loop):
                             pass
                     if _firebase_db:
                         try:
+                            from google.cloud.firestore import DELETE_FIELD as _DF
                             _firebase_db.collection("users").document(target_uid) \
                                 .collection("researches").document(target_rid) \
                                 .update({
@@ -1844,6 +1845,11 @@ def start_firestore_start_listener(job_queue, loop):
                                     # worker-stop. FE consumes for the red
                                     # dialog and the auto-delete-on-close.
                                     "cancelled": True,
+                                    # Drop stale queue fields — banner reads
+                                    # them as still-queued otherwise.
+                                    "queuePosition": _DF,
+                                    "queuedBehindRunId": _DF,
+                                    "queuedBehindTitle": _DF,
                                 })
                         except Exception:
                             pass
@@ -1875,12 +1881,16 @@ def start_firestore_start_listener(job_queue, loop):
                                     pass
                             if _firebase_db:
                                 try:
+                                    from google.cloud.firestore import DELETE_FIELD as _DF
                                     _firebase_db.collection("users").document(u) \
                                         .collection("researches").document(rid) \
                                         .update({
                                             "status": "stopped",
                                             "summary": "Cancelled",
                                             "cancelled": True,
+                                            "queuePosition": _DF,
+                                            "queuedBehindRunId": _DF,
+                                            "queuedBehindTitle": _DF,
                                         })
                                 except Exception:
                                     pass
@@ -1898,6 +1908,7 @@ def start_firestore_start_listener(job_queue, loop):
                             dq.append(j)
                         if removed and _firebase_db:
                             try:
+                                from google.cloud.firestore import DELETE_FIELD as _DF
                                 _firebase_db.collection("users").document(u) \
                                     .collection("researches").document(rid) \
                                     .update({
@@ -1905,6 +1916,14 @@ def start_firestore_start_listener(job_queue, loop):
                                         "phase": 0,
                                         "summary": "Cancelled before starting",
                                         "cancelled": True,
+                                        # Drop stale queue fields so the
+                                        # banner unmounts; otherwise
+                                        # reopening the cancelled chat
+                                        # shows a wedged "Queued — Cancel"
+                                        # banner backed by no live job.
+                                        "queuePosition": _DF,
+                                        "queuedBehindRunId": _DF,
+                                        "queuedBehindTitle": _DF,
                                     })
                             except Exception as ex:
                                 log(f"Cancel: failed to mark stopped: {ex}", "WARN")
@@ -21097,9 +21116,37 @@ async def run_server(port=8000):
             except Exception as e:
                 log(f"Pipeline job error: {e}", "ERROR")
             finally:
+                # Capture before clearing — `current_job` is the job that
+                # just finished. We need its uid+rid to clear stale queue
+                # fields below; `_recompute_queue_positions` only patches
+                # the *remaining* queued docs, not the one that just left.
+                completed = _QUEUE_STATE.get("current_job") or {}
                 _QUEUE_STATE["running"] = False
                 _QUEUE_STATE["current_job"] = None
                 _job_queue.task_done()
+                # Clear the just-finished job's queue tracking fields from
+                # Firestore. `_flip_queued_to_ongoing` already deletes
+                # these on the queued→ongoing flip (:20869-20874), but if
+                # the worker raced through completion before the listener
+                # delivered the "ongoing" intermediate frame — or the run
+                # errored / was watchdog-stopped without the flip running
+                # — the doc retains stale `queuePosition` /
+                # `queuedBehindRunId` / `queuedBehindTitle`. Reopening the
+                # chat then wedges QueuedBanner because liveStatus reads
+                # them as still-queued. Idempotent on already-cleared docs.
+                _cuid, _crid = completed.get("uid"), completed.get("research_id")
+                if _firebase_db and _cuid and _crid:
+                    try:
+                        from google.cloud.firestore import DELETE_FIELD as _DF
+                        _firebase_db.collection("users").document(_cuid) \
+                            .collection("researches").document(_crid) \
+                            .update({
+                                "queuePosition": _DF,
+                                "queuedBehindRunId": _DF,
+                                "queuedBehindTitle": _DF,
+                            })
+                    except Exception as e:
+                        log(f"[worker-finally] queue field clear failed for {_crid[:8]}…: {e}", "WARN")
                 # Shift remaining queued jobs up one position.
                 _recompute_queue_positions()
                 # Re-snapshot post-completion (current cleared, pending may
