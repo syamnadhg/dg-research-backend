@@ -10988,6 +10988,21 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             (documents_dir / fname).write_text(md_content, encoding="utf-8")
             local_saved = True
             log(f"[{name}] Saved {n_chars} chars to documents/{fname}")
+            # Extract real cited-source findings from the just-written
+            # markdown so the FE GraphAnalysis Findings tab can render
+            # rich {url, snippet, sourceTitle} cards instead of just
+            # section headings. Persisted by save_meta's agents map
+            # writer (research.py:~17686). Source URLs come from the
+            # in-memory progress snapshot (already deduped).
+            try:
+                _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(agent_key, {}).get("source_urls", []) or [])
+                if _src_urls:
+                    _findings = _extract_findings(md_content, _src_urls)
+                    if _findings:
+                        _runtime.agent_findings[agent_key] = _findings
+                        log(f"[{name}] Extracted {len(_findings)} cited-source findings")
+            except Exception as _ef:
+                log(f"[{name}] findings extraction failed: {_ef}", "DEBUG")
         except Exception as e:
             log(f"[{name}] Local MD save failed: {e}", "WARN")
         if local_saved:
@@ -17607,6 +17622,99 @@ def load_checkpoint(queue_dir):
     return None
 
 
+# Sentence-boundary chars used to expand a URL match into its enclosing
+# citation snippet. Treats double-newline (paragraph break) the same as
+# a hard sentence ending so we don't bleed across markdown paragraphs.
+_FIND_SENT_TAIL_RE = re.compile(r'(?:[.!?]\s|\n\n|\n#{1,4}\s)', re.MULTILINE)
+_FIND_SENT_HEAD_RE = re.compile(r'(?:[.!?]\s|\n\n|\n#{1,4}\s)', re.MULTILINE)
+_FIND_HEADING_RE = re.compile(r'^#{2,4}\s+(.{2,80})$', re.MULTILINE)
+_FIND_MD_LINK_RE = re.compile(r'\[([^\]]{1,200})\]\(([^)]+)\)')
+
+
+def _extract_findings(md: str, source_urls: list) -> list:
+    """For each cited source URL, locate the enclosing sentence in the
+    agent's markdown report and return a structured finding entry:
+    `{"url": str, "snippet": str, "sourceTitle": str}`.
+
+    Approach is regex-based — the agents' markdown is LLM-generated and
+    not adversarial; URL substring matching plus sentence-boundary
+    expansion (lookback to last `.`/`?`/`!`/double-newline, lookforward
+    to next) gives a robust 80-280 char snippet without needing a full
+    markdown AST.
+
+    Snippet rules:
+      - Strip markdown link syntax `[label](url)` → `label` so the
+        body reads as prose, not raw markdown.
+      - Cap at 280 chars with `…` suffix when sliced.
+      - Skip when expanded snippet is < 30 chars (almost certainly a
+        bare reference list entry, not a real cited mention).
+
+    SourceTitle = first non-empty heading (`##` / `###`) preceding the
+    URL, or hostname fallback if no heading is found before it.
+
+    Caps result list at 12 per agent. Order = first-mention order in
+    the markdown, deduped by URL.
+    """
+    if not md or not source_urls:
+        return []
+    findings: list = []
+    seen_urls: set = set()
+    # Pre-scan headings so we can find the nearest preceding heading
+    # for any URL match in O(1) per match — without this, a huge md
+    # would re-scan from start for every URL.
+    headings: list = []
+    for hm in _FIND_HEADING_RE.finditer(md):
+        headings.append((hm.start(), hm.group(1).strip()))
+    for url in source_urls:
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        idx = md.find(url)
+        if idx < 0:
+            continue
+        # Find sentence start: last sentence-end token BEFORE idx.
+        head_search = md[:idx]
+        head_match = None
+        for m in _FIND_SENT_HEAD_RE.finditer(head_search):
+            head_match = m
+        sent_start = head_match.end() if head_match else 0
+        # Find sentence end: first sentence-end token AFTER idx + len(url).
+        url_end = idx + len(url)
+        tail_match = _FIND_SENT_TAIL_RE.search(md, url_end)
+        sent_end = tail_match.start() if tail_match else min(url_end + 200, len(md))
+        snippet = md[sent_start:sent_end].strip()
+        if len(snippet) < 30:
+            continue
+        # Replace markdown links with their label text — keeps prose
+        # readable and avoids "click 'http://...'" awkwardness.
+        snippet = _FIND_MD_LINK_RE.sub(lambda m: m.group(1), snippet)
+        # Collapse internal whitespace so "  \n   " runs read as a
+        # single space in the rendered card.
+        snippet = re.sub(r'\s+', ' ', snippet).strip()
+        if len(snippet) > 280:
+            snippet = snippet[:279].rstrip() + "…"
+        # Locate nearest preceding heading.
+        title = ""
+        for h_pos, h_text in headings:
+            if h_pos > idx:
+                break
+            title = h_text
+        if not title:
+            try:
+                from urllib.parse import urlparse as _urlparse
+                _h = (_urlparse(url).hostname or "").lower()
+                if _h.startswith("www."):
+                    _h = _h[4:]
+                title = _h
+            except Exception:
+                title = ""
+        title = title[:80]
+        findings.append({"url": url, "snippet": snippet, "sourceTitle": title})
+        if len(findings) >= 12:
+            break
+    return findings
+
+
 def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     """Save/update meta.json — powers ALL frontend components (graphs, analytics, tracking).
     Contains: Research object + per-agent stats + phase timeline + source references."""
@@ -19345,7 +19453,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # Sync to Firestore documents subcollection — doc_type is the
                     # agent key (chatgpt / gemini / claude), consistent with the
                     # frontend's Documents page expectation.
-                    save_document_to_firestore(name.lower().replace(" ", ""), _agent_md, f"{name} Deep Research")
+                    _agent_lc = name.lower().replace(" ", "")
+                    save_document_to_firestore(_agent_lc, _agent_md, f"{name} Deep Research")
+                    # Backstop findings extraction at the P2 finalize re-save
+                    # site. The primary site is in extract_and_record_agent
+                    # (~research.py:10988), but this resave path can run on
+                    # resume / manual re-finalize when the snapshot ring may
+                    # have been cleared. Skip if findings already exist.
+                    try:
+                        if _agent_lc not in (getattr(_runtime, "agent_findings", {}) or {}):
+                            _src_urls = list(getattr(_runtime, "agent_progress_snapshots", {}).get(_agent_lc, {}).get("source_urls", []) or [])
+                            if _src_urls:
+                                _findings = _extract_findings(_agent_md, _src_urls)
+                                if _findings:
+                                    _runtime.agent_findings[_agent_lc] = _findings
+                    except Exception:
+                        pass
             # Generate consolidated report
             consolidated_parts = [f"# Consolidated Research Report: {topic}\n"]
             for name in ["ChatGPT", "Gemini", "Claude"]:
