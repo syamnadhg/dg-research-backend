@@ -18081,14 +18081,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             {"id": "skip", "label": "Skip phase", "style": "default",
              "command": {"action": "skip_phase", "phase": phase}},
         ]
+        # Phase-aware example so the banner's reassurance fits what's
+        # actually running. P2 = Claude/ChatGPT/Gemini deep research,
+        # P3 = NotebookLM podcast gen. Generic fallback covers any
+        # future phase that opts into soft-warn.
+        if phase == 2:
+            _example = "deep-research runs can legitimately take 1-2 hours"
+        elif phase == 3:
+            _example = "NotebookLM podcast generation can legitimately take 30-60 minutes on long sources"
+        else:
+            _example = "long-running phases can legitimately exceed this estimate"
         try:
             emit_event(
                 "pipeline_warning", phase=phase,
                 message=f"Phase {phase} has been running for {max_min} min — agent may still be working",
                 details=(
-                    "The pipeline is still polling normally. Wait keeps watching "
-                    "(deep-research runs can legitimately take 1-2 hours). Retry "
-                    "restarts from the last checkpoint with a fresh budget. Skip "
+                    f"The pipeline is still polling normally. Wait keeps watching ({_example}). "
+                    "Retry restarts from the last checkpoint with a fresh budget. Skip "
                     "moves past this phase. You can also Stop the pipeline from "
                     "the chat input bar."
                 ),
@@ -18113,12 +18122,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         Returns the user's decision string. Does NOT write delivery.json
         status="stopped" — that's reserved for terminal stop paths only.
 
-        2026-05-04: this is the HARD path — used by P1/P3/P4. P2 now uses
-        the soft-warn path inside _await_phase_with_active_deadline (see
-        _emit_phase_soft_warn) so long DR runs aren't bailed on. Other
-        phases keep this hard-cancel + Retry/Skip pause-for-decision flow
-        because P3/P4 are bounded utility ops where 90 min IS genuinely
-        stuck (NLM upload, ffmpeg, YouTube upload)."""
+        2026-05-04: this is the HARD path. Soft-warn coverage so far:
+          - P2 (deep research, 90m): soft-warn at the deadline so 1-2h
+            DR runs aren't bailed on.
+          - P3 audio sub-step (NotebookLM podcast gen, 40m): soft-warn
+            at the deadline so long-podcast generation isn't killed
+            on healthy runs (incident 2026-05-04: 41.8min healthy run
+            hit the hard cap; bundled into this carve-out).
+        P1, P3 upload, and P4 keep this hard-cancel + Retry/Skip
+        pause-for-decision flow — they're bounded utility ops where
+        the budget IS genuinely stuck (ChatGPT brief gen, NLM upload,
+        ffmpeg + YouTube upload)."""
         log(f"Phase {phase}: active-time ceiling {max_min}min hit — surfacing to user as recoverable error", "WARN")
         actions = [
             {"id": "retry", "label": "Retry from checkpoint", "style": "primary",
@@ -19614,9 +19628,31 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _p3_audio = await _await_phase_with_active_deadline(
                             3, PHASE_3_MAX_MIN,
                             lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                            soft_warn_only=True,  # 2026-05-04: NLM audio gen legitimately runs 30-45m on long podcasts; warn but don't bail
                         )
                         break
+                    except _PhaseSoftDecision as _sd:
+                        # User picked Retry/Skip on the soft-timeout warn.
+                        # Wait is implicit — never reaches this except (the
+                        # helper keeps polling on Wait until run_task either
+                        # finishes naturally OR user picks Retry/Skip).
+                        if _sd.decision == "retry":
+                            emit_event("phase_restart", phase=3, reason="user_retry_after_audio_soft_timeout")
+                            continue
+                        if _sd.decision == "skip":
+                            emit_event("phase_skipped", phase=3, reason="user_skip_after_audio_soft_timeout")
+                            _p3_audio = {"audio_path": None, "audio_overview_url": ""}
+                            _p3_audio_user_skipped = True
+                            _controls.skipped_phases.add(4)
+                            break
+                        log(f"[P3-audio] Unexpected _PhaseSoftDecision.decision={_sd.decision!r}", "ERROR")
+                        raise
                     except asyncio.TimeoutError:
+                        # Legacy hard-path safety net — with soft_warn_only=True
+                        # the helper raises _PhaseSoftDecision instead of
+                        # TimeoutError, so this branch is normally unreachable.
+                        # Kept as a guard in case run_phase3_audio raises a bare
+                        # TimeoutError that escapes the helper's wrap.
                         _decision = await _phase_timeout_decision(3, PHASE_3_MAX_MIN, agent="notebooklm")
                         if _decision == "retry":
                             emit_event("phase_restart", phase=3, reason="user_retry_audio_timeout")
