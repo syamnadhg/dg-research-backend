@@ -18929,7 +18929,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Account → API Keys" instead of a mid-phase vision crash.
         if not resolve_api_key():
             _env_ok = False
-            _env_errors.append("Anthropic API key missing — add it in Account → API Keys (preferred), or set ANTHROPIC_API_KEY on the BE machine. Vision/CUA tiers can't run without it.")
+            _env_errors.append("Anthropic API key missing — add it in Account → API Keys (preferred), or set ANTHROPIC_API_KEY (or CUA_API_KEY) on the BE machine. Vision/CUA tiers can't run without it.")
         if _need_youtube:
             if not resolve_gemini_api_key():
                 _env_ok = False
