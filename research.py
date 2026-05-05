@@ -108,11 +108,11 @@ MAX_WAIT_DEEP = int(os.environ.get("MAX_WAIT_DEEP", "90"))       # minutes — P
 # terminates the run. Without these caps a dead laptop or stalled CUA
 # could keep the run going indefinitely (user reported a run continuing
 # overnight). Override via env for E2E with shorter ceilings.
-PHASE_1_MAX_MIN = int(os.environ.get("PHASE_1_MAX_MIN", "35"))   # brief gen typical 21-27m
-PHASE_2_MAX_MIN = int(os.environ.get("PHASE_2_MAX_MIN", "90"))   # 3 agents in parallel
-# Phase 3 is a single 40-min wall-clock guard wrapping upload + audio gen
-# (was two sub-step ceilings of 15m + 20m). One ceiling, one alert.
-PHASE_3_MAX_MIN = int(os.environ.get("PHASE_3_MAX_MIN", "40"))
+PHASE_1_MAX_MIN = int(os.environ.get("PHASE_1_MAX_MIN", "60"))   # advisory cap (soft-warn) — brief gen can run 30+ min on large PDFs / complex topics
+PHASE_2_MAX_MIN = int(os.environ.get("PHASE_2_MAX_MIN", "120"))  # advisory cap (soft-warn) — 3 agents in parallel, long DR runs legitimate
+# Phase 3 split into upload (hard-cap) + audio (advisory) sub-budgets.
+PHASE_3_UPLOAD_MAX_MIN = int(os.environ.get("PHASE_3_UPLOAD_MAX_MIN", "15"))  # NLM upload — bounded utility op
+PHASE_3_AUDIO_MAX_MIN = int(os.environ.get("PHASE_3_AUDIO_MAX_MIN", "90"))    # advisory cap (soft-warn) — podcast gen 30-60min on long sources
 PHASE_4_MAX_MIN = int(os.environ.get("PHASE_4_MAX_MIN", "15"))   # ffmpeg + YouTube
 
 
@@ -16121,7 +16121,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
             # Mid-poll auth check — NotebookLM session can expire during the
             # 45-min audio window. Without this, CUA keeps clicking on a
-            # logged-out page until PHASE_3_MAX_MIN exhausts. URL-only
+            # logged-out page until PHASE_3_AUDIO_MAX_MIN exhausts. URL-only
             # check (no tabs, no CUA) per the P0 sequential pattern.
             try:
                 current_url = (browser.page.url or "").lower()
@@ -18085,7 +18085,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # actually running. P2 = Claude/ChatGPT/Gemini deep research,
         # P3 = NotebookLM podcast gen. Generic fallback covers any
         # future phase that opts into soft-warn.
-        if phase == 2:
+        if phase == 1:
+            _example = "ChatGPT brief generation can legitimately take 30+ minutes for large PDFs or complex topics"
+        elif phase == 2:
             _example = "deep-research runs can legitimately take 1-2 hours"
         elif phase == 3:
             _example = "NotebookLM podcast generation can legitimately take 30-60 minutes on long sources"
@@ -18122,17 +18124,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         Returns the user's decision string. Does NOT write delivery.json
         status="stopped" — that's reserved for terminal stop paths only.
 
-        2026-05-04: this is the HARD path. Soft-warn coverage so far:
-          - P2 (deep research, 90m): soft-warn at the deadline so 1-2h
-            DR runs aren't bailed on.
-          - P3 audio sub-step (NotebookLM podcast gen, 40m): soft-warn
-            at the deadline so long-podcast generation isn't killed
-            on healthy runs (incident 2026-05-04: 41.8min healthy run
-            hit the hard cap; bundled into this carve-out).
-        P1, P3 upload, and P4 keep this hard-cancel + Retry/Skip
-        pause-for-decision flow — they're bounded utility ops where
-        the budget IS genuinely stuck (ChatGPT brief gen, NLM upload,
-        ffmpeg + YouTube upload)."""
+        2026-05-04: this is the HARD path. Soft-warn coverage:
+          - P1 (brief gen, 60m): soft-warn at the deadline so 30+min
+            briefs on large PDFs / complex topics aren't bailed on.
+          - P2 (deep research, 120m): soft-warn at the deadline so
+            1-2h DR runs aren't bailed on.
+          - P3 audio sub-step (NLM podcast gen, 90m): soft-warn at
+            the deadline so long-podcast generation isn't killed.
+        P3 upload (15m) and P4 (15m) keep this hard-cancel + Retry/
+        Skip pause-for-decision flow — they're bounded utility ops
+        (NLM upload click flow, ffmpeg + YouTube upload)."""
         log(f"Phase {phase}: active-time ceiling {max_min}min hit — surfacing to user as recoverable error", "WARN")
         actions = [
             {"id": "retry", "label": "Retry from checkpoint", "style": "primary",
@@ -18176,13 +18177,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         count toward the budget — so a user pausing for an hour doesn't
         kill a healthy phase.
 
-        soft_warn_only=False (default — P1/P3/P4 hard-cap behavior):
+        soft_warn_only=False (default — P3-upload + P4 hard-cap behavior):
           Cancels the coroutine when active-time exhausts and raises
           asyncio.TimeoutError. Caller runs `_phase_timeout_decision` to
           give the user Retry/Skip, and on Retry calls this helper AGAIN
           (factory creates a fresh coro). Existing behavior — unchanged.
 
-        soft_warn_only=True (P2 only — long-research advisory, 2026-05-04):
+        soft_warn_only=True (P1 + P2 + P3-audio — long-running advisory, 2026-05-04):
           Emits a pipeline_warning [Wait/Retry/Skip] (amber) at the
           deadline, DOES NOT cancel the coroutine, and continues polling
           for the user's decision while the run_task keeps doing work.
@@ -18748,9 +18749,26 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             p1 = await _await_phase_with_active_deadline(
                                 1, PHASE_1_MAX_MIN,
                                 lambda: run_phase1(browser, cua_client, current_topic, pdf_paths, verbose, feedback=fb1),
+                                soft_warn_only=True,  # 2026-05-04: long brief gens (30+m on large PDFs) are legitimate; warn but don't bail
                             )
                             break  # success — exit inner retry loop
+                        except _PhaseSoftDecision as _sd:
+                            if _sd.decision == "retry":
+                                emit_event("phase_restart", phase=1, reason="user_retry_after_soft_timeout")
+                                continue
+                            if _sd.decision == "skip":
+                                emit_event("phase_skipped", phase=1, reason="user_skip_after_soft_timeout")
+                                _p1_skipped_after_error = True
+                                p1 = None
+                                break
+                            log(f"[P1] Unexpected _PhaseSoftDecision.decision={_sd.decision!r}", "ERROR")
+                            raise
                         except asyncio.TimeoutError:
+                            # Legacy hard-path safety net — with soft_warn_only=True the
+                            # helper raises _PhaseSoftDecision instead of TimeoutError, so
+                            # this branch is normally unreachable. Kept as a guard in case
+                            # something inside run_phase1 raises a bare TimeoutError that
+                            # escapes the helper's wrap.
                             _decision = await _phase_timeout_decision(1, PHASE_1_MAX_MIN, agent="chatgpt")
                             if _decision == "retry":
                                 emit_event("phase_restart", phase=1, reason="user_retry_after_timeout")
@@ -19532,9 +19550,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=3, description="Uploading to NotebookLM + generating audio overview", agents=["notebooklm"])
             _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
             _p3_start = time.time()
-            # Phase 3 has two sub-steps (upload, audio) — both gated by
-            # the single PHASE_3_MAX_MIN budget (40 min default). Paused
-            # seconds don't count toward the active-time ceiling.
+            # Phase 3 has two sub-steps with separate budgets:
+            #   • upload (3a): PHASE_3_UPLOAD_MAX_MIN=15 — hard-cap, bounded utility op
+            #   • audio  (3b): PHASE_3_AUDIO_MAX_MIN=90 — soft-warn (advisory),
+            #     long-podcast generation is legitimate.
+            # Paused seconds don't count toward either active-time ceiling.
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             if not results:
                 for md_file in md_files:
@@ -19547,12 +19567,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             while True:  # timeout-retry loop
                 try:
                     p3 = await _await_phase_with_active_deadline(
-                        3, PHASE_3_MAX_MIN,
+                        3, PHASE_3_UPLOAD_MAX_MIN,
                         lambda: run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose),
                     )
                     break
                 except asyncio.TimeoutError:
-                    _decision = await _phase_timeout_decision(3, PHASE_3_MAX_MIN, agent="notebooklm")
+                    _decision = await _phase_timeout_decision(3, PHASE_3_UPLOAD_MAX_MIN, agent="notebooklm")
                     if _decision == "retry":
                         emit_event("phase_restart", phase=3, reason="user_retry_after_timeout")
                         continue
@@ -19626,7 +19646,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 while True:  # timeout-retry loop
                     try:
                         _p3_audio = await _await_phase_with_active_deadline(
-                            3, PHASE_3_MAX_MIN,
+                            3, PHASE_3_AUDIO_MAX_MIN,
                             lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
                             soft_warn_only=True,  # 2026-05-04: NLM audio gen legitimately runs 30-45m on long podcasts; warn but don't bail
                         )
@@ -19653,7 +19673,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # TimeoutError, so this branch is normally unreachable.
                         # Kept as a guard in case run_phase3_audio raises a bare
                         # TimeoutError that escapes the helper's wrap.
-                        _decision = await _phase_timeout_decision(3, PHASE_3_MAX_MIN, agent="notebooklm")
+                        _decision = await _phase_timeout_decision(3, PHASE_3_AUDIO_MAX_MIN, agent="notebooklm")
                         if _decision == "retry":
                             emit_event("phase_restart", phase=3, reason="user_retry_audio_timeout")
                             continue
@@ -19709,7 +19729,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     emit_event("phase_restart", phase=3, reason="user_retry_audio_missing")
                     try:
                         _p3_audio = await _await_phase_with_active_deadline(
-                            3, PHASE_3_MAX_MIN,
+                            3, PHASE_3_AUDIO_MAX_MIN,
                             lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
                         )
                         audio_path = _p3_audio.get("audio_path")
@@ -19819,7 +19839,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     emit_event("phase_restart", phase=4, reason="user_retry_audio")
                     try:
                         _p3_audio = await _await_phase_with_active_deadline(
-                            3, PHASE_3_MAX_MIN,
+                            3, PHASE_3_AUDIO_MAX_MIN,
                             lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
                         )
                         audio_path = _p3_audio.get("audio_path")
