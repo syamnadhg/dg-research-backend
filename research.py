@@ -6280,6 +6280,44 @@ def _scrub_for_narrator(s: str) -> str:
     return s
 
 
+# Trailing-stopword set for narrator output sanity-check. A narration
+# ending with one of these as its last word is mid-sentence (e.g.
+# "Reading two sources from") — emit-time fragments worth rejecting so
+# the FE doesn't render a half-thought as the live agent line.
+_NARR_STOPWORD_TAILS = frozenset({
+    "from", "to", "of", "the", "with", "on", "in", "for", "and", "or",
+    "about", "by", "into", "over", "through", "as", "at",
+})
+
+
+def _is_acceptable_narration(s: str) -> bool:
+    """Reject narration outputs that read as fragments. Three signals:
+    (1) under 5 words AND under 22 chars (catches 'Twenty', 'Engaged in',
+        'Reading sources'); (2) last word is a preposition/conjunction
+        stopword that betrays a mid-sentence cut ('Reading two sources
+        from'); (3) leading-tokenization artifact ('"d unambiguous...').
+
+    On reject we just skip this tick — the prior good narration stays
+    visible. The FE list-of-lines model (Commit 2) means we just don't
+    append a new line this tick.
+    """
+    if not s:
+        return False
+    words = s.split()
+    if len(words) < 5 and len(s) < 22:
+        return False
+    last = words[-1].rstrip(".!,?:;").lower() if words else ""
+    if last in _NARR_STOPWORD_TAILS:
+        return False
+    # Leading-tokenization artifact — Haiku occasionally returns a
+    # response that begins with a fragment like "d unambiguous..." or
+    # "'s research..." when the system prompt contains quoted strings.
+    head = s.lstrip()[:2]
+    if head in ('"d', "'d", '"s', "'s", '"t', "'t", '"r', "'r"):
+        return False
+    return True
+
+
 def _compact_event_for_narration(e: dict) -> str:
     """Flatten an event into one line for the narrator prompt. Skips
     high-cardinality fields and caps each value at 120 chars so a 20-event
@@ -6294,9 +6332,9 @@ def _compact_event_for_narration(e: dict) -> str:
     if ag:
         parts.append(f"agent={ag}")
     for k in ("status", "progress", "error", "message", "reason",
-              "sources", "sections", "partialTextLen", "elapsedSec",
-              "searches", "sectionsDone", "sectionsTotal", "currentFocus",
-              "websitesCount", "panelOpen", "artifactCount"):
+              "sources", "sections", "partialTextLen", "partialTextPreview",
+              "elapsedSec", "searches", "sectionsDone", "sectionsTotal",
+              "currentFocus", "websitesCount", "panelOpen", "artifactCount"):
         v = d.get(k)
         if v in (None, "", [], {}):
             continue
@@ -6308,6 +6346,13 @@ def _compact_event_for_narration(e: dict) -> str:
                 if not v:
                     continue
             s = json.dumps(v)[:120]
+        elif k == "partialTextPreview":
+            # Last 80 chars of the streaming preview — the most-recent
+            # token cluster is what the narrator should reference, not
+            # the stale opening of a long synthesis.
+            s = _scrub_for_narrator(str(v)[-80:])
+            if not s:
+                continue
         else:
             s = str(v)[:120]
             if k in ("progress", "currentFocus", "message", "reason"):
@@ -6315,6 +6360,25 @@ def _compact_event_for_narration(e: dict) -> str:
                 if not s:
                     continue
         parts.append(f"{k}={s}")
+    # Surface link_extracted events with a hostname + truncated label so
+    # the narrator can name the actual source ("Skimming sec.gov on
+    # Tesla 10-K") instead of just "Reading sources". Hostname keeps
+    # the input compact; the full URL would blow the 120-char cap.
+    if t == "link_extracted":
+        url = d.get("url") or ""
+        label = d.get("label") or d.get("title") or ""
+        if url:
+            try:
+                from urllib.parse import urlparse as _urlparse
+                host = (_urlparse(url).hostname or "").lower()
+                if host.startswith("www."):
+                    host = host[4:]
+            except Exception:
+                host = ""
+            if host:
+                parts.append(f"host={host}")
+        if label:
+            parts.append(f"label={str(label)[:40]}")
     return " | ".join(parts)
 
 
@@ -6547,6 +6611,12 @@ async def _narrator_loop(phase: int):
             # Reset the err flag once we recover so a later regression re-logs.
             _err_logged = False
             text = text.strip().strip('"').strip("`").strip()
+            # Quality gate — drop fragments / single-words / stopword-tail
+            # mid-sentence cuts before they hit the wire. See
+            # _is_acceptable_narration for the rules. On reject we just
+            # skip this tick; next tick (cadence seconds) retries.
+            if text and not _is_acceptable_narration(text):
+                text = ""
             if text and text != last_narration:
                 last_narration = text
                 try:
@@ -6655,6 +6725,12 @@ async def _narrator_loop(phase: int):
                     if not a_text or a_status >= 400:
                         continue
                     a_text = a_text.strip().strip('"').strip("`").strip()
+                    # Quality gate — same as phase narration. Rejected
+                    # outputs skip this tick; the agent card keeps the
+                    # prior good line until the next acceptable LLM
+                    # output lands.
+                    if a_text and not _is_acceptable_narration(a_text):
+                        continue
                     if a_text and a_text != last_agent_lines.get(akey):
                         last_agent_lines[akey] = a_text
                         try:
@@ -12150,11 +12226,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         f"narration=\"{_vision_narration_p2[:80]}\"", "INFO")
                     # Emit agent_narration so PhaseDropdown agent card updates
                     # mid-phase (the dedicated event stream Block 6 wired up).
-                    if _vision_narration_p2:
+                    # Same quality gate as the narrator loop — vision rarely
+                    # fragments but the symmetric coverage is cheap.
+                    _vn_text = (_vision_narration_p2 or "")[:140]
+                    if _vn_text and _is_acceptable_narration(_vn_text):
                         try:
                             emit_event("agent_narration", phase=2,
                                        agent=normalize_agent_key(name),
-                                       text=_vision_narration_p2[:140])
+                                       text=_vn_text)
                         except Exception as _en:
                             log(f"[{name}] agent_narration emit failed: {_en}", "DEBUG")
 
