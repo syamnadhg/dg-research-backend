@@ -18741,25 +18741,51 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 except CuaUnavailableError as cua_err:
                     # Structural Anthropic failure (billing cap / invalid
                     # key / 529). Surface a distinct alert so the user
-                    # doesn't chase a phantom auth issue. Default actions:
-                    # skip this platform (proceed with remaining) or stop.
+                    # doesn't chase a phantom auth issue.
+                    # 2026-05-05 (DGOPS-7357 follow-up): Skip removed.
+                    # Without CUA the pipeline can't tell login walls
+                    # from authenticated sessions, so skipping verification
+                    # is a footgun — it lets a logged-out platform flow
+                    # into Phase 1/2/3 where it crashes harder and later.
+                    # Only Retry. The global Settings → Skip login
+                    # verification toggle still bypasses the loop entirely
+                    # at the top of the platform-walk (line ~18677); that
+                    # path is the right escape hatch for "I know what I'm
+                    # doing, run without CUA on purpose".
                     log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
-                    fail_phase(0, "CUA vision check can't run",
-                               (f"{str(cua_err)[:180]} — paste a fresh key in Account → API Keys (preferred), "
-                                "raise the Anthropic workspace cap, swap CUA_API_KEY on the BE machine, "
-                                "or skip remaining verification."),
-                               agent=key)
+                    fail_phase(
+                        0, "CUA vision check can't run",
+                        (f"{str(cua_err)[:180]}\n\n"
+                         "This usually means one of three things:\n"
+                         "• Invalid or missing Anthropic key — add or rotate it in "
+                         "Account → API Keys (preferred, no restart), or set "
+                         "ANTHROPIC_API_KEY (or CUA_API_KEY) on the backend "
+                         "machine and restart.\n"
+                         "• Workspace usage cap or 400 overage — raise the cap in "
+                         "console.anthropic.com → Workspaces, wait for the "
+                         "monthly reset, OR paste a key from a different "
+                         "workspace (or a personal key) in Account → API Keys "
+                         "to bypass the capped one.\n"
+                         "• Anthropic temporarily overloaded (529) — wait a moment "
+                         "and click Retry.\n\n"
+                         "Without CUA verification, the pipeline can't reliably "
+                         "tell login walls from authenticated sessions, so we "
+                         "don't allow continuing without it. Click Retry once "
+                         "you've fixed the underlying issue."),
+                        agent=key,
+                        actions=[
+                            {"id": "retry", "label": "Retry", "style": "primary",
+                             "command": {"action": "retry_phase", "phase": 0}},
+                        ],
+                    )
                     _controls.request_pause()
                     emit_event("pipeline_paused", phase=0, reason="cua_unavailable")
                     await _controls.wait_if_paused()
                     if _controls.is_stop():
                         emit_event("pipeline_stopped", phase=0, reason="stopped during cua_unavailable")
                         return
-                    if _controls.skip_init_verify:
-                        log(f"Phase 0: SKIP_INIT_VERIFY during {label} (CUA unavailable) — skipping remaining", "INFO")
-                        _global_skip = True
-                        break
-                    # retry — clear flag + loop continues, cookie probe runs again
+                    # retry — clear flag + loop continues, fresh CUA call
+                    # picks up the new key.
                     _controls.consume_retry_phase(0)
                     _controls.retry_init_verify = False
                     continue
