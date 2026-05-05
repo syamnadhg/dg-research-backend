@@ -3458,6 +3458,20 @@ class PipelineRuntime:
         # Shape: { agent_key: { source_urls, sections, steps, searches,
         #                       observed_sources, partial_text_len, ... } }
         self.agent_progress_snapshots: dict = {}
+        # Per-agent time-series ring buffer feeding the FE in-tile graphs +
+        # the GraphAnalysis "All Agents" sparklines after persistence. Each
+        # entry: {"t": ms_since_phase_start, "sources", "chars",
+        # "sections", "searches", "sectionsDone", "sectionsTotal"}.
+        # Capped at 240 raw entries per agent; downsampled to 60 at
+        # finalize time before writing to Firestore agents map. The cap
+        # guards RAM on long P2 runs without an LRU dependency. Shape:
+        # { agent_key: list[dict] }.
+        self.agent_progress_history: dict = {}
+        # Per-agent extracted findings (real cited-source highlights, not
+        # just section headings). Populated by _extract_findings() after
+        # the markdown report is written for an agent. Shape:
+        # { agent_key: list[{"url": str, "snippet": str, "sourceTitle": str}] }
+        self.agent_findings: dict = {}
         # P2 → P3 handoff state. Populated at end of P2 (and as resume-safety
         # fallback at start of P3) by _build_phase2_to_phase3_handoff. P3
         # consumes these instead of doing its own per-agent reconciliation —
@@ -10529,6 +10543,15 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     # source delta get suppressed and starve the watchdog.
                     "progress_label": (progress.get("progress", "") or "")[:80],
                     "tool_uses_len": len(progress.get("tool_uses", []) or []),
+                    # Without these, a search-count change alone (or a
+                    # sectionsDone tick) gets suppressed by every other
+                    # field staying constant — leaving the FE chart
+                    # series flat through whole search bursts. The
+                    # graphs need these deltas to draw real curves.
+                    "searches": int(progress.get("searches", 0) or 0),
+                    "sections_done": int(progress.get("sections_done", 0) or 0),
+                    "sections_total": int(progress.get("sections_total", 0) or 0),
+                    "observed_sources": int(progress.get("observed_sources", 0) or 0),
                 }, sort_keys=True)
                 # Phase prefix: _last_progress is process-global, so without
                 # it a P1 entry could dedupe a P2 emit with the same key.
@@ -10604,6 +10627,25 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         elapsedSec=elapsed_sec,
                         expectedMinutes=expected_min,
                     )
+                    # Append a snapshot to the per-agent history ring so
+                    # post-completion graphs / sparklines have a real time
+                    # series, not just end-state scalars. Capped at 240 raw
+                    # entries; downsampled to 60 at finalize time.
+                    try:
+                        _hist = _runtime.agent_progress_history.setdefault(agent_key, [])
+                        _hist.append({
+                            "t": int(elapsed_sec * 1000),
+                            "sources": int(progress.get("sources", 0) or 0),
+                            "chars": int(_merged_partial_len or 0),
+                            "sections": int(len(progress.get("sections", []) or [])),
+                            "searches": int(progress.get("searches", 0) or 0),
+                            "sectionsDone": int(progress.get("sections_done", 0) or 0),
+                            "sectionsTotal": int(progress.get("sections_total", 0) or 0),
+                        })
+                        if len(_hist) > 240:
+                            del _hist[:len(_hist) - 240]
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -12374,6 +12416,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # source delta get suppressed and starve the watchdog.
                 "progress_label": (_progress_val or "")[:80],
                 "tool_uses_len": len(progress.get("tool_uses", []) or []),
+                # Same gap as P1 (research.py:~10515) — without these
+                # entries, a search-only or sectionsDone-only delta is
+                # suppressed and the FE graph series flat-lines through
+                # whole search bursts. Required for real-curve rendering.
+                "searches": int(progress.get("searches", 0) or 0),
+                "sections_done": int(progress.get("sections_done", 0) or 0),
+                "sections_total": int(progress.get("sections_total", 0) or 0),
+                "observed_sources": int(progress.get("observed_sources", 0) or 0),
             }, sort_keys=True)
             # Phase prefix: _last_progress is process-global, so without it
             # a P1 entry could dedupe a P2 emit with the same key.
@@ -12411,6 +12461,24 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     elapsedSec=elapsed_sec,
                     expectedMinutes=get_expected_minutes(2),
                     scrapeOk=scrape_ok)
+                # Per-agent progressHistory ring (mirrors P1 emit). Persisted
+                # post-run for the FE GraphAnalysis sparklines + post-reload
+                # in-tile chart restoration.
+                try:
+                    _hist_p2 = _runtime.agent_progress_history.setdefault(agent_key, [])
+                    _hist_p2.append({
+                        "t": int(elapsed_sec * 1000),
+                        "sources": int(progress.get("sources", 0) or 0),
+                        "chars": int(_partial_text_len or 0),
+                        "sections": int(len(progress.get("sections", []) or [])),
+                        "searches": int(progress.get("searches", 0) or 0),
+                        "sectionsDone": int(progress.get("sections_done", 0) or 0),
+                        "sectionsTotal": int(progress.get("sections_total", 0) or 0),
+                    })
+                    if len(_hist_p2) > 240:
+                        del _hist_p2[:len(_hist_p2) - 240]
+                except Exception:
+                    pass
                 # 2026-05-03: snapshot the rich fields so the P2 completion
                 # emit at extract_and_record_agent can ship the same data to
                 # the FE — without this, the `complete` event was bare and
@@ -17619,15 +17687,52 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
                 _snap = dict(getattr(_runtime, "agent_progress_snapshots", {}).get(platform, {}) or {})
             except Exception:
                 _snap = {}
+            # Downsample the per-agent progressHistory ring (cap 240) to
+            # 60 evenly-spaced points + first + last. The FE GraphAnalysis
+            # All-Agents sparklines + the post-reload chart restoration
+            # both consume this — without persistence, reopening a
+            # finished run shows flat "No data" because the in-memory
+            # ring is already gone.
+            try:
+                _raw_hist = list(getattr(_runtime, "agent_progress_history", {}).get(platform, []) or [])
+            except Exception:
+                _raw_hist = []
+            _down_hist: list = []
+            if len(_raw_hist) <= 60:
+                _down_hist = _raw_hist
+            elif _raw_hist:
+                _step = (len(_raw_hist) - 1) / 59.0
+                _seen: set = set()
+                for _i in range(60):
+                    _idx = min(int(round(_i * _step)), len(_raw_hist) - 1)
+                    if _idx not in _seen:
+                        _seen.add(_idx)
+                        _down_hist.append(_raw_hist[_idx])
+                # Always pin first + last so the curve endpoints land on
+                # real values, not the closest sampled neighbor.
+                if _down_hist and _down_hist[0] is not _raw_hist[0]:
+                    _down_hist[0] = _raw_hist[0]
+                if _down_hist and _down_hist[-1] is not _raw_hist[-1]:
+                    _down_hist[-1] = _raw_hist[-1]
+            try:
+                _findings = list(getattr(_runtime, "agent_findings", {}).get(platform, []) or [])
+            except Exception:
+                _findings = []
             agents[platform] = {
                 "sources": len(unique_urls),
                 "sourceUrls": unique_urls,
                 "sections": sections[:15],
                 "outputChars": len(content),
                 "completionTimeSec": existing.get("completionTimeSec", 0),
-                "findings": sections[:3] if sections else [],
+                # Real cited-source findings populated by C4b (extractor
+                # runs after each agent's markdown is written). Falls
+                # back to section headings when the extractor returns
+                # empty so legacy reads don't break — see C4b for the
+                # extractor wiring.
+                "findings": _findings if _findings else (sections[:3] if sections else []),
                 "searches": int(_snap.get("searches", 0) or existing.get("searches", 0) or 0),
                 "observedSources": int(_snap.get("observed_sources", 0) or existing.get("observedSources", 0) or 0),
+                "progressHistory": _down_hist,
             }
 
     # ── Phase timeline (for timeline graph) ──
