@@ -21890,7 +21890,8 @@ async def run_pair(profile_dir, wait_minutes=10):
     # ══════════════════════════════════════════════════════════════════════
     _setup_step(3, 4, "Browser logins")
     print(f"  {_c(_DIM, 'Walking through logins one platform at a time.')}")
-    print(f"  {_c(_DIM, 'Already-logged-in platforms (from a prior setup) are auto-detected.')}")
+    print(f"  {_c(_DIM, 'Each tab opens, you log in, then press Enter — vision verifies the session.')}")
+    print(f"  {_c(_DIM, 'If a Pro-tier check trips, you decide whether to continue, retry, or skip.')}")
     print("")
 
     browser = Browser(profile_dir, headless=False)
@@ -21922,7 +21923,7 @@ async def run_pair(profile_dir, wait_minutes=10):
         # Gmail + Google Docs dropped 2026-04-30 — P5 is FE-owned,
         # BE no longer drives either platform.
     ]
-    # ── Sequential per-platform login (cookie fast-path + press-Enter) ─────
+    # ── Sequential per-platform login (open → Enter → URL+CUA verify → Pro-tier gate) ──
     # SETUP-2026-04-19: replaces the earlier bulk-open-then-batch-verify
     # flow. Two problems with the old approach: (1) opening 7 tabs within
     # a few seconds reads as a robotic burst to Cloudflare scoring, and
@@ -21934,6 +21935,13 @@ async def run_pair(profile_dir, wait_minutes=10):
     results: dict[str, bool] = {}
     cancelled = False
     all_ok = False
+    # Pair-local "user already opted into Free" flag. Mirrors
+    # _controls.pro_warning_acknowledged in init/Phase 0 but stays
+    # scoped to this run_pair invocation — pair exits before any
+    # pipeline_run, so no cross-coupling. Continue-with-Free on one
+    # Pro platform suppresses the alert for the remaining platforms
+    # in the same setup pass. (DGOPS-7357 follow-up, 2026-05-05.)
+    pair_pro_acknowledged = False
 
     def _emit_row(_name, ok, label=""):
         mark = _c(_OK, "[ok]") if ok else _c(_WARN, "[--]")
@@ -22026,6 +22034,83 @@ async def run_pair(profile_dir, wait_minutes=10):
                 log(f"    CUA verify error for {key}: {e}", "WARN")
                 cua_ok = False
             if cua_ok:
+                # Pro-tier verify (DGOPS-7357 re-open). Login-OK is no longer
+                # the final gate for ChatGPT/Claude/Gemini — the OAuth-side-
+                # effect cookie can hydrate Gemini as the WORK account when
+                # the user wanted the personal one, and CUA only answers
+                # "logged in?", not "as whom?". Trust the user to fix the
+                # account in-tab; the Pro check at least catches the most
+                # common silent miscompare (work=Free, personal=Pro).
+                if (key in _PRO_TIER_PROMPT_BY_KEY
+                        and not pair_pro_acknowledged):
+                    print(f"  {_c(_DIM, 'Verifying subscription tier…')}")
+                    try:
+                        tier = await _cua_pro_tier_call(tab, key, _setup_cua_client)
+                    except CuaUnavailableError as cua_err:
+                        # Pre-pipeline: Phase 0 will re-check with the same
+                        # client and surface its own canonical alert. Don't
+                        # block setup on a transient billing/cap blip.
+                        log(f"    Setup pro_tier: CUA unavailable for {key} ({cua_err}) — skipping tier check", "WARN")
+                        tier = "unsure"
+                    except Exception as e:
+                        log(f"    Setup pro_tier: unexpected error for {key} ({e}) — assuming Pro (fail-open)", "WARN")
+                        tier = "unsure"
+                    if tier == "free":
+                        # 3-option terminal prompt. Free-tier was caught;
+                        # the user picks how to handle it.
+                        title, _details = _PRO_TIER_DETAILS_BY_KEY.get(
+                            key, (f"{name} Pro required", ""))
+                        print("")
+                        print(f"  {_c(_WARN, title)}")
+                        print(f"  {_c(_DIM, 'This account is on Free — Phase 1/2 quality will be degraded.')}")
+                        print(f"  {_c(_DIM, '  [c] continue with Free   [r] retry (sign in with Pro)   [s] skip this platform')}")
+                        choice = ""
+                        while True:
+                            try:
+                                choice = (await asyncio.to_thread(
+                                    input, f"  {_c(_ACCENT, '>')}  Choose [c/r/s] ")
+                                ).strip().lower()
+                            except (EOFError, KeyboardInterrupt):
+                                print("")
+                                log("Setup cancelled by user during Pro alert", "INFO")
+                                cancelled = True
+                                try:
+                                    await tab.close()
+                                except Exception:
+                                    pass
+                                break
+                            if choice in ("c", "continue", ""):
+                                pair_pro_acknowledged = True
+                                log(f"    Setup: user chose Continue with Free for {name}", "INFO")
+                                platform_ok = True
+                                break
+                            if choice in ("r", "retry"):
+                                log(f"    Setup: user chose Retry on {name} Free-tier alert — re-running login walk", "INFO")
+                                # Stay on this platform: same tab, user signs
+                                # out / signs back in with Pro, presses Enter
+                                # again. Fall through to the outer press-Enter
+                                # loop below via `continue`.
+                                platform_ok = False
+                                break
+                            if choice in ("s", "skip"):
+                                log(f"    Setup: user chose Skip for {name} (Free-tier)", "INFO")
+                                platform_ok = False
+                                break
+                            print(f"  {_c(_WARN, 'Pick c, r, or s.')}")
+                        if cancelled:
+                            break
+                        if choice in ("r", "retry"):
+                            # Don't break the press-Enter loop — `continue`
+                            # so the user gets the Press Enter prompt again
+                            # on the same tab after switching accounts.
+                            continue
+                        # c or s: leave the press-Enter loop with platform_ok
+                        # already set (True for c, False for s).
+                        break
+                    elif tier == "pro":
+                        log(f"    Setup: {name} Pro detected", "INFO")
+                    else:  # unsure → fail open
+                        log(f"    Setup: {name} tier UNSURE — assuming Pro (fail-open)", "INFO")
                 platform_ok = True
                 break
             print(f"  {_c(_WARN, 'CUA could not confirm login — try again and press Enter.')}")
