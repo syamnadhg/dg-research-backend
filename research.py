@@ -16186,239 +16186,196 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             log("Phase 3: HV gate on NotebookLM could not be cleared — aborting audio step", "ERROR")
             return {"audio_path": None}
 
-    # Wrap generation + polling in a retry loop so the user can re-trigger
-    # audio generation from scratch if the first attempt times out.
+    # 2026-05-06 (Stream 2 D1): single-attempt audio generation. The outer
+    # _await_phase_with_active_deadline(3, PHASE_3_AUDIO_MAX_MIN,
+    # soft_warn_only=True) at the call site (:20049) is the sole audio
+    # ceiling. User retry routes through that helper's
+    # _PhaseSoftDecision('retry') OR through the post-helper no-audio loop
+    # — no inner retry/timeout machinery here.
     audio_done = False
-    p3_audio_max_retries = 1
-    p3_audio_attempt = 0
 
-    while p3_audio_attempt <= p3_audio_max_retries and not audio_done and not _controls.is_stop():
-        if p3_audio_attempt > 0:
-            log(f"Phase 3: Retrying audio generation (attempt {p3_audio_attempt + 1}/{p3_audio_max_retries + 1})")
-            try:
-                emit_event("phase_restart", phase=3,
-                           reason="user_retry_audio",
-                           attempt=p3_audio_attempt + 1)
-            except Exception:
-                pass
-            # Reload notebook for a clean retry
-            try:
-                await browser.navigate(notebook_url)
-                await asyncio.sleep(4)
-            except Exception:
-                pass
+    # Pre-flight invariant check (2026-05-02). Per the user's
+    # no-delete constraint, we cannot recover from a duplicate-audio
+    # state — we have to prevent it. Two failure modes guarded:
+    #   (a) >1 audio card visible → orphaned + duplicate state we
+    #       can't safely resolve without deleting one. fail_phase.
+    #   (b) exactly 1 card AND not generating → completed orphan
+    #       from a prior run. fail_phase asks user to clean it up.
+    # The 5s sleep absorbs panel-render lag after the navigate/reload
+    # that preceded this loop iteration — without it the count can
+    # come back as 0 prematurely.
+    await asyncio.sleep(5)
+    existing_cards = await _count_nlm_audio_cards(browser.page)
+    already_generating = await _check_audio_generating(browser.page)
+    log(f"[Phase3] Pre-flight inventory: {existing_cards} audio card(s), generating={already_generating}")
 
-        # Pre-flight invariant check (2026-05-02). Per the user's
-        # no-delete constraint, we cannot recover from a duplicate-audio
-        # state — we have to prevent it. Two failure modes guarded:
-        #   (a) >1 audio card visible → orphaned + duplicate state we
-        #       can't safely resolve without deleting one. fail_phase.
-        #   (b) exactly 1 card AND not generating → completed orphan
-        #       from a prior run. fail_phase asks user to clean it up.
-        # The 5s sleep absorbs panel-render lag after the navigate/reload
-        # that preceded this loop iteration — without it the count can
-        # come back as 0 prematurely.
-        await asyncio.sleep(5)
-        existing_cards = await _count_nlm_audio_cards(browser.page)
-        already_generating = await _check_audio_generating(browser.page)
-        log(f"[Phase3] Pre-flight inventory: {existing_cards} audio card(s), generating={already_generating}")
+    if existing_cards >= 2:
+        fail_phase(3,
+                   f"NotebookLM Studio shows {existing_cards} audio entries (expected 0)",
+                   "Open the notebook, delete the extra audio entries manually, then retry. We never auto-delete to avoid removing the wrong one.",
+                   agent="notebooklm",
+                   can_retry=True)
+        return {"audio_path": None}
 
-        if existing_cards >= 2:
-            fail_phase(3,
-                       f"NotebookLM Studio shows {existing_cards} audio entries (expected 0)",
-                       "Open the notebook, delete the extra audio entries manually, then retry. We never auto-delete to avoid removing the wrong one.",
-                       agent="notebooklm",
-                       can_retry=True)
+    if existing_cards == 1 and not already_generating:
+        fail_phase(3,
+                   "NotebookLM Studio has 1 completed audio from a prior run",
+                   "Open the notebook, delete that audio entry manually, then retry. We never auto-delete to avoid touching the wrong one.",
+                   agent="notebooklm",
+                   can_retry=True)
+        return {"audio_path": None}
+
+    if already_generating:
+        log("Audio already generating — skipping Generate click")
+    else:
+        log("Starting audio generation (Long + Deep Dive)...")
+        _stop, _task = start_narration_ticker(
+            3, "notebooklm",
+            "Configuring audio overview (Long + Deep Dive) and clicking Generate",
+            interval=20)
+        try:
+            await agent_loop(cua_client, browser, PROMPT_AUDIO_GENERATE,
+                "Generate ONE audio overview. Select all sources, set Long + Deep Dive, click Generate ONCE. Say 'generating' when started.",
+                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+        finally:
+            await stop_narration_ticker(_stop, _task)
+
+    # Verify it started
+    verified = await wait_until_verified(
+        lambda page: _check_audio_generating(page),
+        browser.page, "Phase3-audio", browser=browser, cua_client=cua_client,
+        max_retries=10, interval=5, verbose=verbose)
+
+    if not verified:
+        log("Could not verify audio generation started", "WARN")
+
+    # Post-generate invariant check (2026-05-02). If CUA misclicked
+    # the Audio Overview tile body during the customize flow, the
+    # NLM Studio panel auto-fires a default short audio in addition
+    # to the one we explicitly requested — leaving the user with two
+    # in-flight entries. We can't delete (user constraint), so we
+    # fail_phase loud and ask the user to manually clean up the
+    # non-Deep-Dive entry. The 5s sleep gives the new card time to
+    # render in the panel before the count.
+    await asyncio.sleep(5)
+    post_gen_cards = await _count_nlm_audio_cards(browser.page)
+    log(f"[Phase3] Post-generate inventory: {post_gen_cards} audio card(s)")
+    if post_gen_cards > 1:
+        fail_phase(3,
+                   f"Duplicate audio overview detected — NotebookLM Studio shows {post_gen_cards} entries",
+                   "Likely a CUA misclick fired a default audio alongside the Deep Dive Long one. Open the notebook, delete the non-Deep-Dive entry manually, then retry.",
+                   agent="notebooklm",
+                   can_retry=True)
+        return {"audio_path": None}
+
+    # Minimum 2 minute wait — audio generation typically starts within 1-2 min;
+    # waiting 5 min was burning slack for no reason. First poll at 2 min is
+    # safe (NotebookLM has reliably emitted progress signals by then).
+    log("Waiting 2 minutes before first audio check (generation takes ~10-20 min)...")
+    interrupt = await _controls.interruptible_sleep(2 * 60, check_interval=10)
+    if interrupt == "stop":
+        log("[Phase3] STOP during initial wait — aborting", "WARN")
+        return {"audio_path": None}
+    if interrupt == "pause":
+        emit_event("pipeline_paused", phase=3)
+        await _controls.wait_if_paused()
+        if _controls.is_stop():
             return {"audio_path": None}
 
-        if existing_cards == 1 and not already_generating:
-            fail_phase(3,
-                       "NotebookLM Studio has 1 completed audio from a prior run",
-                       "Open the notebook, delete that audio entry manually, then retry. We never auto-delete to avoid touching the wrong one.",
-                       agent="notebooklm",
-                       can_retry=True)
-            return {"audio_path": None}
+    # Poll for completion — refresh + CUA check every 3 min. No inner cap;
+    # the outer _await_phase_with_active_deadline at :20049 (soft_warn_only=True)
+    # is the sole audio ceiling.
+    log("Polling for audio completion (every 3 min with refresh; outer soft-warn handles ceiling)...")
+    poll_start = time.time()
 
-        if already_generating:
-            log("Audio already generating — skipping Generate click")
-        else:
-            log("Starting audio generation (Long + Deep Dive)...")
-            _stop, _task = start_narration_ticker(
-                3, "notebooklm",
-                "Configuring audio overview (Long + Deep Dive) and clicking Generate",
-                interval=20)
-            try:
-                await agent_loop(cua_client, browser, PROMPT_AUDIO_GENERATE,
-                    "Generate ONE audio overview. Select all sources, set Long + Deep Dive, click Generate ONCE. Say 'generating' when started.",
-                    model=CUA_MODEL, max_iterations=15, verbose=verbose)
-            finally:
-                await stop_narration_ticker(_stop, _task)
+    while True:
+        # ── Stop/Pause check per cycle ──
+        if _controls.is_stop():
+            log("[Phase3] STOP requested — aborting audio poll")
+            break
+        if _controls.is_pause():
+            emit_event("pipeline_paused", phase=3)
+            await _controls.wait_if_paused()
+            if _controls.is_stop():
+                break
 
-        # Verify it started
-        verified = await wait_until_verified(
-            lambda page: _check_audio_generating(page),
-            browser.page, "Phase3-audio", browser=browser, cua_client=cua_client,
-            max_retries=10, interval=5, verbose=verbose)
+        # Refresh page every cycle (NotebookLM doesn't always auto-update)
+        try:
+            await browser.page.reload(wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(5)
+        except Exception:
+            pass
 
-        if not verified:
-            log("Could not verify audio generation started", "WARN")
+        # Mid-poll auth check — NotebookLM session can expire during the
+        # audio window. Without this, CUA keeps clicking on a logged-out
+        # page. URL-only check (no tabs, no CUA) per the P0 sequential pattern.
+        try:
+            current_url = (browser.page.url or "").lower()
+            if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
+                log(f"[Phase3] NotebookLM session expired mid-audio-poll: {current_url}")
+                emit_event("login_required", phase=3,
+                           platforms=["notebooklm"],
+                           platformLabels=["NotebookLM"],
+                           message="NotebookLM session expired during audio generation. Sign back in to resume.",
+                           attempt=1)
+                emit_event("pipeline_paused", phase=3, reason="notebooklm_login_expired")
+                await _controls.wait_if_paused()
+                if _controls.is_stop():
+                    break
+                # User logged back in: reload + continue polling.
+                try:
+                    await browser.page.reload(wait_until="domcontentloaded", timeout=15000)
+                    await asyncio.sleep(3)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-        # Post-generate invariant check (2026-05-02). If CUA misclicked
-        # the Audio Overview tile body during the customize flow, the
-        # NLM Studio panel auto-fires a default short audio in addition
-        # to the one we explicitly requested — leaving the user with two
-        # in-flight entries. We can't delete (user constraint), so we
-        # fail_phase loud and ask the user to manually clean up the
-        # non-Deep-Dive entry. The 5s sleep gives the new card time to
-        # render in the panel before the count.
-        await asyncio.sleep(5)
-        post_gen_cards = await _count_nlm_audio_cards(browser.page)
-        log(f"[Phase3] Post-generate inventory: {post_gen_cards} audio card(s)")
-        if post_gen_cards > 1:
-            fail_phase(3,
-                       f"Duplicate audio overview detected — NotebookLM Studio shows {post_gen_cards} entries",
-                       "Likely a CUA misclick fired a default audio alongside the Deep Dive Long one. Open the notebook, delete the non-Deep-Dive entry manually, then retry.",
-                       agent="notebooklm",
-                       can_retry=True)
-            return {"audio_path": None}
+        # DOM-first: read the audio card directly. Avoids CUA's
+        # page-wide-chrome confusion where unrelated NLM panel
+        # spinners triggered "still generating" answers even after
+        # the audio itself was done. CUA still runs as fallback.
+        dom_complete = await _check_audio_complete_dom(browser.page)
+        if dom_complete:
+            log("Audio generation complete ✓ (DOM-detected)")
+            audio_done = True
+            break
 
-        # Minimum 2 minute wait — audio generation typically starts within 1-2 min;
-        # waiting 5 min was burning slack for no reason. First poll at 2 min is
-        # safe (NotebookLM has reliably emitted progress signals by then).
-        log("Waiting 2 minutes before first audio check (generation takes ~10-20 min)...")
-        interrupt = await _controls.interruptible_sleep(2 * 60, check_interval=10)
+        # CUA fallback — strict: only "audio complete" counts
+        diag = await agent_loop(cua_client, browser, PROMPT_AUDIO_CHECK,
+            "Check: Has audio generation FINISHED? Is there a completed audio player "
+            "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
+            model=CUA_MODEL, max_iterations=3, verbose=verbose)
+        diag_text = (diag.get("text") or "").lower()
+
+        if "audio complete" in diag_text:
+            log("Audio generation complete ✓ (CUA-detected)")
+            audio_done = True
+            break
+
+        elapsed_min = 5 + int((time.time() - poll_start) / 60)
+        log(f"[Phase3] Audio still generating... ({elapsed_min}m total)")
+        # Live narration tick — without this the FE dropdown sits on the
+        # last pre-poll string ("Setting notebook to…") for the full audio
+        # window. Match the P2 round-robin cadence.
+        try:
+            emit_event("agent_progress", phase=3, agent="notebooklm",
+                       status="generating",
+                       progress=f"NotebookLM still generating audio overview… "
+                                f"({elapsed_min}m total / ~15m typical)",
+                       elapsedSec=elapsed_min * 60,
+                       expectedMinutes=15)
+        except Exception:
+            pass
+        interrupt = await _controls.interruptible_sleep(90, check_interval=10)
         if interrupt == "stop":
-            log("[Phase3] STOP during initial wait — aborting", "WARN")
-            return {"audio_path": None}
+            log("[Phase3] STOP during poll wait — aborting")
+            break
         if interrupt == "pause":
             emit_event("pipeline_paused", phase=3)
             await _controls.wait_if_paused()
             if _controls.is_stop():
-                return {"audio_path": None}
-
-        # Poll for completion — refresh + CUA check every 3 min, 45 min total timeout
-        log("Polling for audio completion (every 3 min with refresh, max 45 min total)...")
-        poll_start = time.time()
-        max_poll = 40 * 60  # 40 more min (45 total including initial 5 min wait)
-
-        while (time.time() - poll_start) < max_poll:
-            # ── Stop/Pause check per cycle ──
-            if _controls.is_stop():
-                log("[Phase3] STOP requested — aborting audio poll")
                 break
-            if _controls.is_pause():
-                emit_event("pipeline_paused", phase=3)
-                await _controls.wait_if_paused()
-                if _controls.is_stop():
-                    break
-
-            # Refresh page every cycle (NotebookLM doesn't always auto-update)
-            try:
-                await browser.page.reload(wait_until="domcontentloaded", timeout=15000)
-                await asyncio.sleep(5)
-            except Exception:
-                pass
-
-            # Mid-poll auth check — NotebookLM session can expire during the
-            # 45-min audio window. Without this, CUA keeps clicking on a
-            # logged-out page until PHASE_3_AUDIO_MAX_MIN exhausts. URL-only
-            # check (no tabs, no CUA) per the P0 sequential pattern.
-            try:
-                current_url = (browser.page.url or "").lower()
-                if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
-                    log(f"[Phase3] NotebookLM session expired mid-audio-poll: {current_url}")
-                    emit_event("login_required", phase=3,
-                               platforms=["notebooklm"],
-                               platformLabels=["NotebookLM"],
-                               message="NotebookLM session expired during audio generation. Sign back in to resume.",
-                               attempt=1)
-                    emit_event("pipeline_paused", phase=3, reason="notebooklm_login_expired")
-                    await _controls.wait_if_paused()
-                    if _controls.is_stop():
-                        break
-                    # User logged back in: reload + continue polling.
-                    try:
-                        await browser.page.reload(wait_until="domcontentloaded", timeout=15000)
-                        await asyncio.sleep(3)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            # DOM-first: read the audio card directly. Avoids CUA's
-            # page-wide-chrome confusion where unrelated NLM panel
-            # spinners triggered "still generating" answers even after
-            # the audio itself was done. CUA still runs as fallback.
-            dom_complete = await _check_audio_complete_dom(browser.page)
-            if dom_complete:
-                log("Audio generation complete ✓ (DOM-detected)")
-                audio_done = True
-                break
-
-            # CUA fallback — strict: only "audio complete" counts
-            diag = await agent_loop(cua_client, browser, PROMPT_AUDIO_CHECK,
-                "Check: Has audio generation FINISHED? Is there a completed audio player "
-                "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
-                model=CUA_MODEL, max_iterations=3, verbose=verbose)
-            diag_text = (diag.get("text") or "").lower()
-
-            if "audio complete" in diag_text:
-                log("Audio generation complete ✓ (CUA-detected)")
-                audio_done = True
-                break
-
-            elapsed_min = 5 + int((time.time() - poll_start) / 60)
-            log(f"[Phase3] Audio still generating... ({elapsed_min}m total)")
-            # Live narration tick — without this the FE dropdown sits on the
-            # last pre-poll string ("Setting notebook to…") for the full 45-min
-            # audio window. Match the P2 round-robin cadence.
-            try:
-                emit_event("agent_progress", phase=3, agent="notebooklm",
-                           status="generating",
-                           progress=f"NotebookLM still generating audio overview… "
-                                    f"({elapsed_min}m total / ~15m typical)",
-                           elapsedSec=elapsed_min * 60,
-                           expectedMinutes=15)
-            except Exception:
-                pass
-            interrupt = await _controls.interruptible_sleep(90, check_interval=10)
-            if interrupt == "stop":
-                log("[Phase3] STOP during poll wait — aborting")
-                break
-            if interrupt == "pause":
-                emit_event("pipeline_paused", phase=3)
-                await _controls.wait_if_paused()
-                if _controls.is_stop():
-                    break
-
-        # End of inner poll loop. If we broke out due to completion, exit
-        # the retry loop too. Otherwise (timeout without done), offer retry.
-        if audio_done or _controls.is_stop():
-            break
-
-        # Timeout: offer user [Retry audio] / [Skip audio]. Skip routes
-        # through the standard skip_phase command; retry restarts generation
-        # from scratch.
-        retries_left = max(0, p3_audio_max_retries - p3_audio_attempt)
-        fail_phase(3,
-                   f"NotebookLM audio generation timed out (45 min cap, attempt {p3_audio_attempt + 1}/{p3_audio_max_retries + 1})",
-                   "Retry regenerates from scratch. Skip proceeds with the written report + links only.",
-                   agent="notebooklm",
-                   can_retry=retries_left > 0)
-        if retries_left > 0:
-            # Wait up to 10 min for user choice. Default = skip (don't hang).
-            p3_audio_decision = await _controls.await_phase_decision(3)
-            log(f"Phase 3 audio timeout decision: {p3_audio_decision}")
-            if p3_audio_decision == "retry":
-                p3_audio_attempt += 1
-                continue
-            if p3_audio_decision == "stop":
-                break
-            # continue_anyway / skip / timeout → exit retry loop
-            break
-        else:
-            log("Phase 3: No audio retries left — proceeding without audio", "WARN")
-            break
 
     # Download audio
     audio_path = None
