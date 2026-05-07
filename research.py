@@ -3076,6 +3076,14 @@ class PipelineControls:
         # Phase 1 backstop at the ChatGPT Pro selector site. Per-run only — NOT
         # persisted to Firestore. A later Pro→Free downgrade should re-prompt.
         self.pro_warning_acknowledged: bool = False
+        # F3 (DGOPS-7449): tracks (phase, agent) tuples for every pro_required
+        # alert emitted this run so _clear_pro_required_alerts knows which
+        # alert_ids to overwrite-and-auto-clear when the user acknowledges
+        # Free. Without this, the Firestore-side alert document persists in
+        # the FE store after ack, and subsequent generic pauses (env-check,
+        # next platform login_required) display the stale Continue-with-Free
+        # button — user clicks it again, BE consumes continue_anyway again.
+        self.pro_alert_emitted: set[tuple[int, str]] = set()
 
     def request_stop(self):
         self.stop_event.set()
@@ -3205,6 +3213,7 @@ class PipelineControls:
         self.skipped_phases.clear()
         self.continue_anyway = False
         self.pro_warning_acknowledged = False
+        self.pro_alert_emitted.clear()
         self.retry_phase_requested.clear()
         self.retry_agents.clear()
         self.retry_agents_hard.clear()
@@ -6143,7 +6152,7 @@ _PRO_TIER_DETAILS_BY_KEY = {
 }
 
 
-def _emit_pro_required_alert(phase: int, agent: str):
+def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
     """Pro-tier alert with [Continue with Free, Retry] action set. Emits a
     pipeline_error directly (not via fail_phase) so we don't write a terminal
     'errored' status — the user hasn't failed the phase, just been asked to
@@ -6156,7 +6165,19 @@ def _emit_pro_required_alert(phase: int, agent: str):
     in with a Pro account.
 
     `agent` is the platform key ('chatgpt' / 'claude' / 'gemini'). The alert_id
-    embeds it so concurrent multi-platform Pro alerts don't collide."""
+    embeds it so concurrent multi-platform Pro alerts don't collide.
+
+    `source` (F3 / DGOPS-7449) is a debug breadcrumb identifying which gate
+    fired — e.g. "phase0/platform=chatgpt" or "phase1/setup_pro_backstop".
+    Surfaces in the log line and in the emitted event payload so the next
+    time a duplicate-alert regression hits, log archaeology answers "which
+    gate emitted?" in one step instead of bisecting commits."""
+    log(f"Pro-tier alert emit: phase={phase} agent={agent} source={source or 'unspecified'}", "INFO")
+    # Record this emission so _clear_pro_required_alerts knows which
+    # alert_ids to overwrite-and-auto-clear when the user acknowledges
+    # Free. Tuple key matches the alert_id shape so multi-agent runs
+    # (chatgpt + claude + gemini all Free) all get cleared at once.
+    _controls.pro_alert_emitted.add((phase, agent.lower()))
     title, details = _PRO_TIER_DETAILS_BY_KEY.get(
         agent.lower(),
         (f"{agent.title()} Pro required",
@@ -6173,7 +6194,59 @@ def _emit_pro_required_alert(phase: int, agent: str):
         ],
         dismissible=True,
         alert_id=f"phase{phase}_pro_required_{agent.lower()}",
+        source=source or None,
     )
+
+
+def _clear_pro_required_alerts(triggered_at_phase: int) -> None:
+    """F3 (DGOPS-7449): clear stale pro_required alert documents from the
+    FE store the moment the user acknowledges Free. Without this, the
+    actionable alert lingers in the phase-alert slot — when the pipeline
+    pauses again later in the run (env-check, next platform login_required,
+    Phase 1 setup), the SAME Continue-with-Free button is still visible
+    in the alert chrome. The user clicks it. BE happily consumes another
+    continue_anyway. User has clicked Continue 2-3 times for what they
+    perceive as one decision.
+
+    Mechanism: re-emit pipeline_warning with the SAME alert_id and
+    auto_clear_on_resume=True for every (phase, agent) that emitted a
+    pro_required this run. The FE phase-alert slot is keyed by phase, so
+    setPhaseAlert(phase, ...) overwrites the actionable pipeline_error
+    with this no-action transient. The very-next pipeline_resumed event
+    (already emitted on the line immediately following this call at every
+    ack site) triggers the FE's auto-clear sweep, dismissing the slot.
+
+    Net visible effect: the alert disappears the instant the user clicks
+    Continue. Multi-agent: every recorded alert is cleared in one pass.
+
+    NOT persisted: pro_alert_emitted is per-run and in-memory. A crash +
+    restart loses the set; alerts in the FE store from before the restart
+    would not be cleared. Out of scope for this ticket — a restart should
+    re-pair the run anyway."""
+    if not _controls.pro_alert_emitted:
+        return
+    cleared: list[tuple[int, str]] = []
+    for (alert_phase, agent) in list(_controls.pro_alert_emitted):
+        try:
+            emit_event(
+                "pipeline_warning",
+                phase=alert_phase,
+                agent=agent,
+                warning="Pro-tier acknowledgement — Free accepted",
+                details="Continuing on Free; suppressing further Pro alerts this run.",
+                actions=[],
+                dismissible=True,
+                alert_id=f"phase{alert_phase}_pro_required_{agent}",
+                auto_clear_on_resume=True,
+                source=f"clear/triggered_at_phase={triggered_at_phase}",
+            )
+            cleared.append((alert_phase, agent))
+        except Exception as e:
+            log(f"_clear_pro_required_alerts: failed to clear phase={alert_phase} agent={agent}: {e}", "WARN")
+    if cleared:
+        log(f"Pro-tier alerts cleared (triggered_at_phase={triggered_at_phase}): "
+            f"{', '.join(f'phase{p}/{a}' for (p, a) in cleared)}", "INFO")
+    _controls.pro_alert_emitted.clear()
 
 
 def emit_browser_recovery_status(phase: int, agent: str | None = None):
@@ -14219,7 +14292,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 log("Phase 1: Pro unavailable — user opted into Free at Phase 0 (continuing)", "INFO")
                 break
             log("Phase 1: Pro mode not available — Phase 0 was skipped or Pro was revoked; surfacing alert", "WARN")
-            _emit_pro_required_alert(phase=1, agent="chatgpt")
+            _emit_pro_required_alert(phase=1, agent="chatgpt", source="phase1/setup_pro_backstop")
             _controls.request_pause("pro_required")
             emit_event("pipeline_paused", phase=1, reason="pro_required")
             await _controls.wait_if_paused()
@@ -14237,6 +14310,10 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             chose_free = _controls.consume_continue_anyway()
             _controls.pro_warning_acknowledged = True
             log("Phase 1: user opted into Free — proceeding with Free-tier brief", "INFO")
+            # F3: clear stale pro_required alert documents from FE store BEFORE
+            # the resumed event fires (resumed is what triggers the auto-clear
+            # sweep on the FE). Order: flag → clear emit → resumed emit.
+            _clear_pro_required_alerts(triggered_at_phase=1)
             emit_event("pipeline_resumed", phase=1,
                        reason="continue_with_free" if chose_free else "resume")
             break
@@ -18888,7 +18965,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             emit_event("agent_progress", phase=0, agent=key,
                                        status="not_pro",
                                        progress=f"{label}: Pro NOT detected — Phase output will be degraded")
-                            _emit_pro_required_alert(phase=0, agent=key)
+                            _emit_pro_required_alert(phase=0, agent=key, source=f"phase0/platform={key}")
                             _controls.request_pause("pro_required")
                             emit_event("pipeline_paused", phase=0, reason="pro_required")
                             await _controls.wait_if_paused()
@@ -18915,6 +18992,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             if _controls.consume_continue_anyway():
                                 _controls.pro_warning_acknowledged = True
                                 log(f"Phase 0: user opted into Free — suppressing further Pro alerts this run", "INFO")
+                                # F3: clear stale pro_required alert documents
+                                # from FE store BEFORE the resumed event fires
+                                # (resumed triggers the FE auto-clear sweep).
+                                # Order: flag → clear emit → resumed emit.
+                                _clear_pro_required_alerts(triggered_at_phase=0)
                                 emit_event("pipeline_resumed", phase=0, reason="continue_with_free")
                                 emit_event("agent_progress", phase=0, agent=key,
                                            status="free_acknowledged",
@@ -18925,6 +19007,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 # then resumed via chat-box).
                                 _controls.pro_warning_acknowledged = True
                                 log(f"Phase 0: pro_required pause resumed without explicit choice — treating as Free-acknowledged", "INFO")
+                                # F3: same clear pattern — even on a generic
+                                # resume the user has effectively acknowledged
+                                # Free, so the actionable alert must go away.
+                                _clear_pro_required_alerts(triggered_at_phase=0)
                                 emit_event("pipeline_resumed", phase=0, reason="resume")
                         elif tier == "pro":
                             log(f"Phase 0: {label} Pro detected ✓", "INFO")
