@@ -2950,7 +2950,23 @@ def _start_cli_command_reader(loop):
             if not cmd:
                 continue
             if cmd in ("r", "resume"):
-                log("[CMD] resume")
+                # At a Phase 0 pro_required pause, a bare resume falls through
+                # to the post-pause "no explicit choice → Free-acknowledged"
+                # branch (line ~18877) — even if the user just upgraded to Pro
+                # in the browser. The web frontend's Retry button on the
+                # pro_required banner sets retry_phase(0); CLI 'r' must do the
+                # same so Phase 0 actually re-verifies ChatGPT/Gemini/Claude
+                # tier instead of silently downgrading to Free.
+                #
+                # Same logic applies for login_required (re-verify the platform
+                # with a fresh tab + emit phase_start for any UI consumers).
+                ph = getattr(_runtime, "phase", 0)
+                pr = getattr(_controls, "pause_reason", "") or ""
+                if ph == 0 and pr in ("pro_required", "login_required"):
+                    log(f"[CMD] resume → retry phase 0 ({pr})")
+                    loop.call_soon_threadsafe(_controls.request_retry_phase, 0)
+                else:
+                    log("[CMD] resume")
                 loop.call_soon_threadsafe(_controls.request_resume)
             elif cmd in ("s", "skip"):
                 ph = getattr(_runtime, "phase", 0)
