@@ -260,7 +260,7 @@ def resolve_gemini_api_key():
         5. os.environ GOOGLE_API_KEY
 
     Used by: narrator loop, vision URL extractor, nano-banana thumbnail
-    generation (Phase 4), and gemini_narrate.narrate_panel. Each consumer
+    generation (Phase 4), and narrate.narrate_panel. Each consumer
     calls this at use-time (not at module-load) because Firestore isn't
     initialized when research.py is first imported."""
     fs_keys = _read_firestore_api_keys()
@@ -7536,7 +7536,7 @@ def start_narrator(phase: int):
     except Exception:
         pass
     try:
-        import gemini_narrate as _vn
+        import narrate as _vn
         _vn.reset_phase_budget()
     except Exception:
         pass
@@ -8546,7 +8546,7 @@ async def scrape_progress_gemini(page):
             // Show-thinking expander detection — capture state in
             // r.thinking_visible (not panel_open) since Gemini's thinking
             // is INLINE below the response, not a right-side panel. The
-            // gemini_narrate vision crop targets the right edge of the
+            // narrate vision crop targets the right edge of the
             // viewport, which would be the wrong region here. Setting
             // panel_open=true would mis-trigger that crop. Use this flag
             // for FE narration context without invoking vision.
@@ -10918,7 +10918,7 @@ async def extract_source_urls_via_vision(page, agent_key: str,
     # Crop heuristic: ChatGPT/Gemini panels are right ~45%; Claude artifact
     # panel can be center/right depending on layout — keep full frame.
     try:
-        from gemini_narrate import _crop_right_fraction
+        from narrate import _crop_right_fraction
         if agent_key in ("chatgpt", "gemini"):
             png = _crop_right_fraction(png, 0.45)
     except Exception:
@@ -11241,7 +11241,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     stall_window_start = time.time()
                 # Vision fallback merge (Gemini Flash) — fills gaps when the
                 # DOM walker returns empty + provides richer narration. Cooldown
-                # / budget enforced inside gemini_narrate.narrate_panel. Two
+                # / budget enforced inside narrate.narrate_panel. Two
                 # triggers: (a) walker is empty/ET-state past the 60s warmup,
                 # or (b) every Nth poll for a fresh narration sentence even
                 # when the walker IS producing data.
@@ -11281,7 +11281,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 _vision_phase_signal = ""
                 if _vn_should_call:
                     try:
-                        import gemini_narrate as _vn
+                        import narrate as _vn
                         _vision_data = await _vn.narrate_panel(
                             page,
                             agent=normalize_agent_key(label),
@@ -11292,7 +11292,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             last_dom_steps_n=_vn_steps_n,
                         )
                     except Exception as _vne:
-                        log(f"[{label}] gemini_narrate failed: {_vne}", "DEBUG")
+                        log(f"[{label}] narrate failed: {_vne}", "DEBUG")
                         _vision_data = None
                 # Confidence floor lowered 0.4 → 0.3 (2026-04-29). The
                 # narrator self-tags low-confidence reads as < 0.4 when
@@ -11324,7 +11324,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     _so = int(_vision_data.get("sources_observed") or 0)
                     if _so > 0:
                         progress["observed_sources"] = _so
-                    log(f"[{label}] gemini_narrate hit: phase_signal={_vision_data.get('phase_signal')} "
+                    log(f"[{label}] narrate hit: phase_signal={_vision_data.get('phase_signal')} "
                         f"conf={_vision_data.get('confidence',0):.2f} steps+={len(_v_steps)} "
                         f"narration=\"{_vision_narration[:80]}\"", "INFO")
 
@@ -13046,7 +13046,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
 
             # ── Block 2: per-agent vision narration (P2 mirror of P1) ──
             # Same cooldown (90s) + budget (30/phase) enforced inside
-            # gemini_narrate. Two triggers: (a) DOM walker is empty past
+            # narrate. Two triggers: (a) DOM walker is empty past
             # 60s warmup, or (b) every Nth poll for a fresh narration even
             # when DOM IS producing data. Continuous narration throughout
             # the phase — not one-shot at end.
@@ -13082,7 +13082,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if _vn_should_call:
                 _vision_data_p2 = None
                 try:
-                    import gemini_narrate as _vn
+                    import narrate as _vn
                     _vision_data_p2 = await _vn.narrate_panel(
                         p["page"],
                         agent=normalize_agent_key(name),
@@ -13093,7 +13093,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         last_dom_steps_n=_vn_steps_n,
                     )
                 except Exception as _vne:
-                    log(f"[{name}] gemini_narrate failed: {_vne}", "DEBUG")
+                    log(f"[{name}] narrate failed: {_vne}", "DEBUG")
                     _vision_data_p2 = None
                 # Confidence floor lowered 0.4 → 0.3 (matches P1 block).
                 if _vision_data_p2 and float(_vision_data_p2.get("confidence", 0)) >= 0.3:
@@ -13118,7 +13118,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _so = int(_vision_data_p2.get("sources_observed") or 0)
                     if _so > 0:
                         progress["observed_sources"] = _so
-                    log(f"[{name}] gemini_narrate hit: phase_signal={_vision_data_p2.get('phase_signal')} "
+                    log(f"[{name}] narrate hit: phase_signal={_vision_data_p2.get('phase_signal')} "
                         f"conf={_vision_data_p2.get('confidence',0):.2f} steps+={len(_v_steps)} "
                         f"narration=\"{_vision_narration_p2[:80]}\"", "INFO")
                     # Emit agent_narration so PhaseDropdown agent card updates

@@ -1,10 +1,15 @@
-"""Gemini Flash narrator for the agent side-panel.
+"""Vision narrator for the agent side-panel (Gemini Flash backend).
 
 A standalone OBSERVING module — reads screenshots of the research panel
 (ChatGPT, Claude, or Gemini) via Gemini Flash and reports what the agent
 is doing right now. Sits next to vision.py (Anthropic Sonnet, ACTING tier
 that clicks/scrolls/types) and is intentionally separate so the
 narrate-vs-act split is unambiguous in logs and call sites.
+
+Renamed from gemini_narrate.py → narrate.py 2026-05-07. Env var names
+(GEMINI_NARRATE_*) preserved for backwards compatibility — anyone with
+those exported won't have to re-export. Internal log/logger strings
+were updated to "narrate:" for greppability against the new file name.
 
 Public surface:
   narrate_panel(page, *, agent, phase, last_dom_progress=None) -> dict | None
@@ -26,7 +31,7 @@ from typing import Any
 
 import requests
 
-logger = logging.getLogger("gemini_narrate")
+logger = logging.getLogger("narrate")
 
 
 GEMINI_MODEL_PRIMARY = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash")
@@ -145,8 +150,8 @@ async def narrate_panel(
       2. budget   -- never more than PHASE_BUDGET per phase.
     """
     # Prefer the user's Account-page key (Firestore apiKeys.gemini) over
-    # any env. Late import to dodge the research↔gemini_narrate cycle —
-    # gemini_narrate is imported by research.py, so by the time
+    # any env. Late import to dodge the research↔narrate cycle —
+    # narrate is imported by research.py, so by the time
     # narrate_panel runs, research.resolve_gemini_api_key is fully defined.
     api_key = ""
     try:
@@ -170,7 +175,7 @@ async def narrate_panel(
     if _M.calls_this_phase >= PHASE_BUDGET:
         _M.skipped_budget += 1
         if _M.calls_this_phase == PHASE_BUDGET:
-            logger.warning("gemini_narrate: phase budget %d exhausted", PHASE_BUDGET)
+            logger.warning("narrate: phase budget %d exhausted", PHASE_BUDGET)
         return None
 
     try:
@@ -211,7 +216,7 @@ async def narrate_panel(
             data["_model"] = model
             return data
         if result.get("status") == 429 and model == GEMINI_MODEL_PRIMARY:
-            logger.info("gemini_narrate: 429 on primary, retrying on fallback")
+            logger.info("narrate: 429 on primary, retrying on fallback")
             continue
         _M.failures += 1
         _M.last_error = result.get("error", "unknown")

@@ -392,7 +392,7 @@ Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min
 - **Per-agent narrator (the only writer now)** — every Phase 1/2 agent has a narrator worker that reads a bounded ring buffer of recent events (~50) and emits a `phase_narration` / `agent_narration` event about every 6s per active agent. Brain: **Anthropic Haiku 4.5** primary (`claude-haiku-4-5`); **Gemini 2.5 Flash** fallback on any 4xx/5xx/timeout/empty response so workspace-usage-limit windows don't blank the narrator for 24+ hours. Pre-04-30 used Gemini Pro 2.5; Pro echoed input verbatim at temp 0.2 — Haiku follows the no-parrot prompt rules more tightly. Cost envelope: ~200 input / 30 output tokens per call → <$0.02 per full pipeline run on Haiku.
 - **Anti-parroting prompt + chrome scrub.** The narrator system prompt (research.py:5904-5933) has explicit anti-pattern rules: don't echo input verbatim, don't start with "currently" or "Status:", skip chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md`). Above the narrator, `_compact_event_for_narration` (research.py:5550-5625) scrubs those same chrome strings out of the input window BEFORE the narrator sees them — scrape outputs (chip / step counts) are untouched.
 - **DOM scrape rules per platform:** Claude scrape (research.py:7116-7124) is panel-scoped to `aside` / `[class*="artifact"]` / `[class*="research"]` — dropped `.font-claude-message` and `.contents` heading selectors that grabbed conversation-chrome. ChatGPT P2 panel walker (research.py:7979-7984) dropped the loose `[class*="row" i]` selector and added a 23-verb `VERB_GATE` regex with min-length raised 4→12 to drop "OK" / "Done" single-word noise.
-- **Vision narrator (`gemini_narrate.py`) RETIRED.** `PHASE_BUDGET=0` by default — the per-agent narrator covers the same slot via DOM events without burning a separate Gemini call. Set `DG_VISION_NARRATE=1` to re-enable it as a coverage escape hatch.
+- **Vision narrator (`narrate.py`) RETIRED.** `PHASE_BUDGET=0` by default — the per-agent narrator covers the same slot via DOM events without burning a separate Gemini call. Set `DG_VISION_NARRATE=1` to re-enable it as a coverage escape hatch.
 - **BE phase-fallback tail.** When the narrator is silent (Haiku + Flash both failing, or 6s startup gap), research.py:9601-9604 emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. The FE renders this as a final tail under the agent narration (PhaseDropdown.tsx:1880-1885). No more dead silence on a working agent.
 
 > **Narration brain envs:** `DG_NARRATOR_USE_HAIKU` (default `1`; set `0` to skip Haiku and go straight to Flash), `DG_NARRATOR_HAIKU_MODEL` (default `claude-haiku-4-5`), `DG_VISION_NARRATE` (default `0`; set `1` to re-enable the retired vision narrator). All optional.
@@ -495,7 +495,7 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 | `BUG_REPORT_EMAIL` | (optional) | Where bug-report submissions land if FE bug-report uses the BE relay. FE has its own `BUG_REPORT_EMAIL` env on `/api/bug` — see FE README. |
 | `DG_NARRATOR_USE_HAIKU` | `1` | Enable Anthropic Haiku 4.5 as the narrator primary (Gemini Flash as fallback). Set `0` to use Flash directly. |
 | `DG_NARRATOR_HAIKU_MODEL` | `claude-haiku-4-5` | Haiku model id for the narrator. |
-| `DG_VISION_NARRATE` | `0` | Re-enable the retired vision narrator (`gemini_narrate.py`, `PHASE_BUDGET=80/phase`). Set `1` if a coverage gap appears in DOM-derived narration. |
+| `DG_VISION_NARRATE` | `0` | Re-enable the retired vision narrator (`narrate.py`, `PHASE_BUDGET=80/phase`). Set `1` if a coverage gap appears in DOM-derived narration. |
 | `DG_ORPHAN_MAX_AGE_HOURS` | `4` | Cutoff age for `--retire`'s "manual one-off `--serve` runs" preservation. |
 
 ## File Structure
@@ -505,7 +505,7 @@ research-automate/
 ├── research.py                 # Pipeline + FastAPI server
 ├── prompts.py                  # CUA prompts for each phase
 ├── vision.py                   # Anthropic Sonnet vision client (tier-2 acting): take_screenshot, vision_action, with_vision_fallback, shadow_observe_then_cua
-├── gemini_narrate.py           # Vision-tier panel narrator (PHASE_BUDGET=0 by default; retired 2026-04-30 — re-enable via DG_VISION_NARRATE=1)
+├── narrate.py           # Vision-tier panel narrator (PHASE_BUDGET=0 by default; retired 2026-04-30 — re-enable via DG_VISION_NARRATE=1)
 ├── vision_test.py              # Fixture replay tool: --capture saves PNG+JSON, --fixtures replays + asserts action-class agreement + bbox containment
 ├── requirements.txt            # Python dependencies (now includes patchright>=1.59)
 ├── firebase-service-account.json  # Firebase connection (not committed)
