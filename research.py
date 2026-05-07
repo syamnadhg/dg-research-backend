@@ -20621,6 +20621,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                      "url": "", "page": None}
             # Sub-step 3a: Upload to NotebookLM
             _p3a_user_skipped = False
+            # 2026-05-07 (Bug A1): narrow-retry budget for the upload step.
+            # When run_phase3_upload silently completes with a bogus URL
+            # (e.g. CUA returned 'blocked: Google Sign-in' because the user
+            # got logged out), looping just extract_notebooklm_url against
+            # that broken page never recovers. The link-extract decision
+            # branch below re-runs run_phase3_upload (up to MAX_REATTEMPTS
+            # additional times) when the URL clearly isn't on the NotebookLM
+            # domain. Total upload attempts = 1 + MAX_REATTEMPTS.
+            _p3_upload_attempt = 0
+            _P3_UPLOAD_MAX_REATTEMPTS = 1
             while True:  # timeout-retry loop
                 try:
                     p3 = await _await_phase_with_active_deadline(
@@ -20646,7 +20656,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # ARCHITECTURE 2026-04-18 (never-die): wrap the retry in a decision
             # loop so repeated extract failures surface as a phase alert with
             # Retry / Skip instead of silently terminating.
-            if not (notebook_url and validate_link("notebooklm", notebook_url)):
+            #
+            # 2026-05-07: when the user picked Skip at the upload-step timeout
+            # decision, notebook_url is empty by design — skip the entire
+            # link-extract block instead of falling through into a retry loop
+            # that would re-prompt for a notebook that doesn't exist.
+            if _p3a_user_skipped:
+                pass  # user skipped upload — nothing to extract
+            elif not (notebook_url and validate_link("notebooklm", notebook_url)):
                 log("[NotebookLM] Notebook URL missing/invalid — retrying via extractor (3×)", "WARN")
                 while True:
                     nb_res = await extract_with_retry(
@@ -20680,6 +20697,46 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     )
                     decision = await _controls.await_phase_decision(3)
                     if decision == "retry":
+                        # 2026-05-07 (Bug A1): if the URL we have isn't even on
+                        # the NotebookLM domain (sign-in redirect, blank, etc.),
+                        # the upload itself never landed — re-running just the
+                        # extractor against the same broken page recovers
+                        # nothing. Re-run run_phase3_upload from scratch. The
+                        # domain-substring gate is more lenient than
+                        # validate_link's "/notebook/" check, so a partial-
+                        # success URL on notebooklm.google.com (e.g. /home or
+                        # a non-canonical path) bypasses re-upload and falls
+                        # through to extractor-only retry — bounding the
+                        # re-upload to genuine "upload-never-happened" cases.
+                        # run_phase3_upload opens a fresh tab via
+                        # browser.new_tab(...) on every entry, so no manual
+                        # cleanup is needed between attempts.
+                        _url_looks_like_notebook = bool(
+                            notebook_url and "notebooklm.google.com" in notebook_url
+                        )
+                        if (not _url_looks_like_notebook
+                                and _p3_upload_attempt < _P3_UPLOAD_MAX_REATTEMPTS):
+                            _p3_upload_attempt += 1
+                            log(f"Phase 3 retry: URL '{notebook_url}' not on NotebookLM domain — "
+                                f"re-running run_phase3_upload "
+                                f"({_p3_upload_attempt}/{_P3_UPLOAD_MAX_REATTEMPTS})", "INFO")
+                            emit_event("phase_restart", phase=3, reason="user_retry_re_upload",
+                                       attempt=_p3_upload_attempt)
+                            try:
+                                p3 = await _await_phase_with_active_deadline(
+                                    3, PHASE_3_UPLOAD_MAX_MIN,
+                                    lambda: run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose),
+                                )
+                                links = p3.get("links", {})
+                                notebook_url = p3.get("notebook_url", "")
+                            except asyncio.TimeoutError:
+                                # Hard timeout on the re-upload — leave URLs
+                                # as-is and fall through to extractor retry.
+                                # User can hit Retry again, exhaust the
+                                # re-upload budget, and end up just looping
+                                # the extractor (no infinite re-upload).
+                                log("Phase 3 re-upload hit hard timeout — falling through to extractor retry", "WARN")
+                            continue
                         log("Phase 3 link extraction: user requested retry", "INFO")
                         emit_event("phase_restart", phase=3, reason="user_retry_link_extract", attempt=0)
                         continue
@@ -20946,6 +21003,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 return
             if audio_path:
                 _p4_user_skipped = False
+                # 2026-05-07 (Bug A2): narrow-retry budget for the upload step.
+                # Same shape as P3 A1 but with a YouTube-domain gate. Re-running
+                # run_phase4 is risky because YouTube upload is NOT idempotent
+                # (re-upload after partial-success can produce a duplicate
+                # video). Bound the regression: only re-upload when the URL is
+                # clearly NOT on a YouTube domain (sign-in redirect, blank,
+                # etc. — upload never landed). If the URL contains youtube.com
+                # or youtu.be, treat as partial-success and let extractor-only
+                # retry handle it. Total upload attempts = 1 + MAX_REATTEMPTS.
+                _p4_upload_attempt = 0
+                _P4_UPLOAD_MAX_REATTEMPTS = 1
                 while True:  # timeout-retry loop
                     try:
                         p4_result = await _await_phase_with_active_deadline(
@@ -21008,6 +21076,68 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         )
                         decision = await _controls.await_phase_decision(4)
                         if decision == "retry":
+                            # 2026-05-07 (Bug A2): if the URL we have isn't on a
+                            # YouTube domain (sign-in redirect, blank, etc.), the
+                            # upload itself never landed — re-running just the
+                            # extractor against the same broken page recovers
+                            # nothing. Re-run run_phase4 from scratch. The
+                            # domain-substring gate is more lenient than
+                            # validate_link's "watch?v=" / "youtu.be/" check, so
+                            # a partial-success URL on youtube.com (e.g. the
+                            # video uploaded but Studio extract returned a non-
+                            # canonical URL) bypasses re-upload and falls through
+                            # to extractor-only retry — bounding the duplicate-
+                            # video regression to genuine "upload-never-happened"
+                            # cases. Empty URL is treated as "upload didn't
+                            # land" (consistent with user's mental model); the
+                            # rare case of "upload landed but extract returned
+                            # empty" risks a duplicate video, but that's the
+                            # same idempotency risk the original code already
+                            # documents at the timeout-retry path above.
+                            #
+                            # Pass existing_youtube_url="" so run_phase4 doesn't
+                            # treat the bogus URL as a checkpointed video and
+                            # skip the upload step. Re-binding p4_result also
+                            # refreshes target_page for the next extract loop
+                            # iteration.
+                            _url_looks_like_youtube = bool(youtube_url and (
+                                "youtube.com" in youtube_url or "youtu.be" in youtube_url
+                            ))
+                            if (not _url_looks_like_youtube
+                                    and not _p4_user_skipped
+                                    and _p4_upload_attempt < _P4_UPLOAD_MAX_REATTEMPTS):
+                                _p4_upload_attempt += 1
+                                log(f"Phase 4 retry: URL '{youtube_url}' not on YouTube domain — "
+                                    f"re-running run_phase4 "
+                                    f"({_p4_upload_attempt}/{_P4_UPLOAD_MAX_REATTEMPTS})", "INFO")
+                                emit_event("phase_restart", phase=4, reason="user_retry_re_upload",
+                                           attempt=_p4_upload_attempt)
+                                try:
+                                    p4_result = await _await_phase_with_active_deadline(
+                                        4, PHASE_4_MAX_MIN,
+                                        lambda: run_phase4(browser, cua_client, audio_path, topic, queue_dir,
+                                                           links=links, notebook_url=notebook_url, verbose=verbose,
+                                                           existing_youtube_url=""),
+                                    )
+                                    youtube_url = p4_result.get("youtube_url", "")
+                                    # Pick up user-skip from the re-upload's
+                                    # ffmpeg-skip path. Without this, a user who
+                                    # skips during the re-upload would re-enter
+                                    # the extract loop with stale state.
+                                    _p4_user_skipped = _p4_user_skipped or bool(p4_result.get("user_skipped", False))
+                                    if _p4_user_skipped:
+                                        # User skipped during re-upload — exit
+                                        # the extract-retry loop cleanly. The
+                                        # success-path phase_complete + link
+                                        # emit at line ~21135 are gated on
+                                        # `not _p4_user_skipped`.
+                                        emit_event("phase_skipped", phase=4, reason="user_skip_re_upload")
+                                        break
+                                except asyncio.TimeoutError:
+                                    # Hard timeout on the re-upload — leave URL
+                                    # as-is, fall through to extractor retry.
+                                    log("Phase 4 re-upload hit hard timeout — falling through to extractor retry", "WARN")
+                                continue
                             log("Phase 4 link extraction: user requested retry", "INFO")
                             emit_event("phase_restart", phase=4, reason="user_retry_link_extract", attempt=0)
                             continue
