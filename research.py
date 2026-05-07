@@ -2955,10 +2955,19 @@ def _start_cli_command_reader(loop):
             elif cmd in ("s", "skip"):
                 ph = getattr(_runtime, "phase", 0)
                 log(f"[CMD] skip phase {ph}")
-                loop.call_soon_threadsafe(_controls.request_skip_phase, ph)
-                # request_skip_phase doesn't release the pause; mirror the
-                # Firestore handler at line ~2682 and resume.
-                loop.call_soon_threadsafe(_controls.request_resume)
+                if ph == 0:
+                    # Phase 0's verify loop watches _controls.skip_init_verify,
+                    # not the generic skipped_phases set. Without this branch
+                    # the user's "s" logs "skip phase 0" but Phase 0 keeps
+                    # looping on the same login_required platform forever.
+                    # request_skip_init_verify also releases the pause, so we
+                    # don't need a separate request_resume call below.
+                    loop.call_soon_threadsafe(_controls.request_skip_init_verify)
+                else:
+                    loop.call_soon_threadsafe(_controls.request_skip_phase, ph)
+                    # request_skip_phase doesn't release the pause; mirror the
+                    # Firestore handler at line ~2682 and resume.
+                    loop.call_soon_threadsafe(_controls.request_resume)
             elif cmd in ("q", "stop", "quit"):
                 log("[CMD] stop")
                 loop.call_soon_threadsafe(_controls.request_stop)
