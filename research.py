@@ -12776,7 +12776,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] CONFIRMED DONE — done-marker + 2 cycles flat "
                         f"(text={t1}, sources={s1}, steps={st1}, "
                         f"elapsed_since_marker={int(elapsed_done)}s). "
-                        f"Starting extract_and_record (attempt {p['extraction_attempts']}/3)")
+                        f"Starting extract_and_record (attempt {p['extraction_attempts']})")
                     _queue_dir = (Path(__file__).parent / "queues" / _tracks_dir.name) \
                                  if _tracks_dir else None
                     res = await extract_and_record_agent(
@@ -12805,18 +12805,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             f"in_app={(res.get('_in_app_url') or '')[:60]}, "
                             f"convo={(res.get('url') or '')[:60]}")
                         continue
-                    # Extraction produced nothing usable. Reset state so
-                    # we re-confirm before another attempt. After 3 failed
-                    # attempts surface a pipeline_error with Retry/Skip.
-                    log(f"[{name}] Extraction attempt {p['extraction_attempts']}/3 "
-                        f"returned no content — reverting to polling", "WARN")
+                    # E4 (DGOPS-7366) cost guardrail: empty extraction → surface
+                    # user decision on attempt 1, not 3. The DOM-primary
+                    # ladder in extract_chatgpt_response means a real
+                    # transient blip would be caught by the ladder itself,
+                    # not by retrying the whole extraction 3 times.
+                    log(f"[{name}] Extraction attempt {p['extraction_attempts']} "
+                        f"returned no content — surfacing user decision", "WARN")
                     p["flat_history"] = []
                     p["done_marker_first_at"] = 0.0
-                    if p["extraction_attempts"] >= 3:
+                    if p["extraction_attempts"] >= 1:
                         fail_agent(agent_key,
-                                   f"{name} extraction failed after 3 confirmed-done attempts",
-                                   ("Playwright confirmed done, but 3 extraction attempts returned "
-                                    "no content. Retry re-runs extraction; Skip drops this agent."))
+                                   f"{name} extraction failed",
+                                   ("Playwright confirmed done, but the extraction came back empty "
+                                    "(DOM HTML→MD, JS innerText, and CUA clipboard fallback all "
+                                    "returned no content). Retry re-runs extraction; Skip drops "
+                                    "this agent."))
                         decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
                         log(f"[{name}] Extraction-failed decision: {decision}")
                         if decision == "retry":
@@ -13190,30 +13194,23 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         f"{len(res['text'])} chars, "
                         f"in_app={(res.get('_in_app_url') or '')[:60]}")
                     continue
-                # Empty extraction → revert to polling. After 3 attempts, ask
-                # the user (retry with follow-up / skip / stop). Same UX as
-                # the previous inline empty-retries flow.
+                # E4 (DGOPS-7366) cost guardrail: empty extraction → ask the
+                # user immediately. The previous 3-attempt silent retry loop
+                # could burn 30+ min wall time and $5-10 in CUA spend on a
+                # Wayland clipboard-fail run that produced zero output. With
+                # DOM extraction now primary in extract_chatgpt_response, an
+                # empty result here means the canvas DOM is genuinely missing
+                # — alert once, decide once.
                 p.setdefault("empty_retries", 0)
                 p["empty_retries"] += 1
-                if p["empty_retries"] < 3 and elapsed < (max_wait_min * 60 * 0.95):
-                    log(f"[{name}] CUA said done but extraction empty "
-                        f"(retry {p['empty_retries']}/3) — reverting to polling", "WARN")
-                    p["done_count"] = 0
-                    p["cua_confirmed"] = False
-                    p["last_cua_check"] = time.time() + 60
-                    emit_event("agent_progress", phase=2,
-                               agent=name.lower().replace(" ", ""),
-                               status="still_researching",
-                               progress="Still working — extraction came back empty, retrying.",
-                               elapsedSec=int(elapsed),
-                               expectedMinutes=get_expected_minutes(2))
-                    continue
-                # 3 empty extractions — ask the user.
+                log(f"[{name}] CUA said done but extraction empty (attempt "
+                    f"{p['empty_retries']}) — surfacing user decision", "WARN")
                 ag_key_empty = name.lower().replace(" ", "")
                 fail_agent(ag_key_empty,
                            f"{name} finished but no readable text was extracted",
-                           ("CUA says the agent is done, but 3 extraction attempts came back empty. "
-                            "Retry runs the agent fresh; Skip drops this agent."))
+                           ("CUA says the agent is done, but the extraction came back empty "
+                            "(DOM HTML→MD, JS innerText, and CUA clipboard fallback all returned "
+                            "no content). Retry runs the agent fresh; Skip drops this agent."))
                 empty_decision = await _controls.await_agent_decision(ag_key_empty, timeout=300.0)
                 log(f"[{name}] Empty-final user decision: {empty_decision}")
                 if empty_decision == "stop":
@@ -13502,8 +13499,22 @@ async def _try_copy_button(page, browser, cua_client, label, verbose=False):
 
 
 async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
-    """Extract ChatGPT response — CUA artifact copy (primary) → Playwright ENLARGE
-    + DOM scrape (fallback) → JS innerText (last resort).
+    """Extract ChatGPT response. Strategy (E4 / DGOPS-7366):
+        Step 0  — Playwright opens the canvas/artifact (mounts the DOM target).
+        Method 1 (PRIMARY) — DOM HTML→MD scrape from the canvas. Works on
+                  every platform without touching the OS clipboard. Linux/
+                  Wayland needs this — its clipboard reads return 0 chars.
+        Method 2 — JS innerText fallback in case the HTML→MD selectors miss.
+        Method 3 (LAST RESORT) — CUA opens artifact + Ctrl+A/C → clipboard.
+                  Only runs if Methods 1 and 2 returned empty AND we have
+                  browser + cua_client. Defense-in-depth for canvas-DOM
+                  drift on Windows/macOS; Linux never reaches it because
+                  the DOM is reachable there too.
+
+    Phase 1 (brief extraction) calls this with browser=None / cua_client=None
+    so Method 3 is gated off — Method 1 is its sole path. Working today,
+    unchanged by this reorder.
+
     ChatGPT Deep Research outputs a document/artifact card, not regular chat text."""
     # Clear clipboard first so stale brief text doesn't get returned
     clear_clipboard()
@@ -13612,16 +13623,72 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     except Exception as _oe:
         log(f"[{label}] Post-completion artifact-open skipped: {_oe}", "DEBUG")
 
-    # Method 1 (PRIMARY): CUA opens the artifact/document and copies it.
-    # 2026-04-26: shadow-wrapped (#2c) and content-validated. Retry cap 1.
-    # Granularity choice: ONE shadow-wrap covering the CUA copy step only —
-    # Step 0 ENLARGE is pure DOM, no Vision benefit. Single observation per
-    # finalize keeps shadow-log volume sane (~1 event per agent per run).
+    # Method 1 (PRIMARY, E4 / DGOPS-7366): HTML→MD from the now-opened canvas.
+    # Works on every platform without touching the OS clipboard. Linux/Wayland
+    # specifically needs this — its clipboard reads return 0 chars even when
+    # CUA confirms a successful copy. 2000-char gate ensures we have an actual
+    # report, not just the chat acknowledgement preamble that lives at ~500 chars.
+    # Defensive selectors added 2026-05-07 for canvas-overlay structures we've
+    # seen drift through (main-scoped canvas, dialog-scoped prose).
+    md = await _extract_html_to_md(page, [
+        '.canvas-content', '.artifact-content', '[data-testid="canvas-content"]',
+        '[role="dialog"] .markdown', '[role="dialog"] .prose',
+        'main [class*="canvas"] .markdown',
+        'aside[role="dialog"] [class*="prose"]',
+        '[data-message-author-role="assistant"]:last-of-type .markdown',
+    ], label)
+    if md and len(md) > 2000:
+        if _is_sources_not_document(md, platform="chatgpt"):
+            log(f"[{label}] HTML→MD wrong-artifact ({len(md)} chars source-panel-shape) "
+                f"— skipping", "WARN")
+            try:
+                emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                           op="finalize_copy", length=len(md), tier="dom_html_md")
+            except Exception:
+                pass
+        else:
+            log(f"[{label}] Extracted via HTML→MD (canvas/artifact): {len(md)} chars")
+            return md
+
+    # Method 2: JS innerText — last assistant message or dialog-scoped content.
+    # Catches cases where the canvas DOM uses class names our HTML→MD selectors
+    # don't know about, but the assistant-role attribute is stable.
+    try:
+        text = await page.evaluate("""() => {
+            // Prefer dialog-scoped content (open canvas) over chat preamble.
+            const dlg = document.querySelector('[role="dialog"] .markdown, [role="dialog"] .prose');
+            if (dlg && dlg.innerText && dlg.innerText.length > 2000) return dlg.innerText;
+            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+            if (msgs.length > 0) return msgs[msgs.length - 1].innerText;
+            return '';
+        }""")
+        if text and len(text) > 2000:
+            if _is_sources_not_document(text, platform="chatgpt"):
+                log(f"[{label}] JS innerText wrong-artifact ({len(text)} chars "
+                    f"source-panel-shape) — skipping", "WARN")
+                try:
+                    emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                               op="finalize_copy", length=len(text), tier="dom_js")
+                except Exception:
+                    pass
+            else:
+                log(f"[{label}] Extracted via JS innerText: {len(text)} chars")
+                return text
+    except Exception:
+        pass
+
+    # Method 3 (LAST RESORT): CUA opens the artifact/document and copies it
+    # to the clipboard. Was Method 1 pre-E4 — moved last because Wayland
+    # returns 0 chars from get_clipboard regardless of how cleanly CUA
+    # executed Ctrl+A/Ctrl+C. Kept as defense-in-depth for canvas-DOM drift
+    # on Windows/macOS where get_clipboard is reliable. Shadow-wrapped (#2c)
+    # and content-validated. Inner retry cap 2 attempts; the OUTER caller's
+    # cost guardrail ensures we don't loop this whole function 3+ times.
     _cgpt_2c_attempts = 0
     while _cgpt_2c_attempts < 2 and browser and cua_client:
         _cgpt_2c_attempts += 1
         log(f"[{label}] CUA: Opening and copying Deep Research artifact "
-            f"(attempt {_cgpt_2c_attempts}/2)...")
+            f"(attempt {_cgpt_2c_attempts}/2 — DOM methods returned empty)...")
         await browser.switch_to_page(page)
         async def _cgpt_finalize_cua():
             return await asyncio.wait_for(
@@ -13673,55 +13740,8 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
                 except Exception:
                     pass
             continue
-        log(f"[{label}] Extracted via CUA artifact copy: {len(clipboard)} chars")
+        log(f"[{label}] Extracted via CUA artifact copy (last-resort): {len(clipboard)} chars")
         return clipboard
-
-    # Method 2: HTML→MD from the now-opened canvas / artifact content block.
-    # 2000-char gate (was 500): a 500-char preamble could pass; 2000 ensures we
-    # have an actual report, not just the chat acknowledgement preamble.
-    md = await _extract_html_to_md(page, [
-        '.canvas-content', '.artifact-content', '[data-testid="canvas-content"]',
-        '[role="dialog"] .markdown', '[role="dialog"] .prose',
-        '[data-message-author-role="assistant"]:last-of-type .markdown',
-    ], label)
-    if md and len(md) > 2000:
-        if _is_sources_not_document(md, platform="chatgpt"):
-            log(f"[{label}] HTML→MD wrong-artifact ({len(md)} chars source-panel-shape) "
-                f"— skipping", "WARN")
-            try:
-                emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
-                           op="finalize_copy", length=len(md), tier="dom_html_md")
-            except Exception:
-                pass
-        else:
-            log(f"[{label}] Extracted via HTML→MD (canvas/artifact): {len(md)} chars")
-            return md
-
-    # Method 3: JS — last assistant message (regular chat mode, not Deep Research).
-    # 2000-char gate same rationale as Method 2.
-    try:
-        text = await page.evaluate("""() => {
-            // Prefer dialog-scoped content (open canvas) over chat preamble.
-            const dlg = document.querySelector('[role="dialog"] .markdown, [role="dialog"] .prose');
-            if (dlg && dlg.innerText && dlg.innerText.length > 2000) return dlg.innerText;
-            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-            if (msgs.length > 0) return msgs[msgs.length - 1].innerText;
-            return '';
-        }""")
-        if text and len(text) > 2000:
-            if _is_sources_not_document(text, platform="chatgpt"):
-                log(f"[{label}] JS innerText wrong-artifact ({len(text)} chars "
-                    f"source-panel-shape) — skipping", "WARN")
-                try:
-                    emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
-                               op="finalize_copy", length=len(text), tier="dom_js")
-                except Exception:
-                    pass
-            else:
-                log(f"[{label}] Extracted via JS innerText: {len(text)} chars")
-                return text
-    except Exception:
-        pass
 
     try:
         emit_event("extract_failed", phase=2, agent="chatgpt",
