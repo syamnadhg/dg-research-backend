@@ -189,6 +189,12 @@ def _read_firestore_api_keys() -> dict:
         return {}
 
 
+_RESOLVED_KEY_CACHE = {"key": None, "ts": 0.0}
+_RESOLVED_KEY_TTL = 60.0  # seconds — long enough to absorb hot-path callers (narrator
+                          # ticks every 6s in P1/P2), short enough to pick up rotated
+                          # keys without a restart.
+
+
 def resolve_api_key(cli_key=None):
     """Resolve the CUA / Anthropic API key. Priority (highest first):
         1. --api-key CLI argument
@@ -208,10 +214,17 @@ def resolve_api_key(cli_key=None):
     if cli_key:
         log(f"[resolve_api_key] using --api-key CLI argument", "INFO")
         return cli_key
+    # Hot-path cache. Without it: every narrator tick (6s in P1/P2) triggers
+    # a Firestore RPC + 2 PowerShell subprocess spawns + an INFO log line.
+    # 60s TTL gives near-zero overhead while still picking up rotated keys
+    # within a minute.
+    if time.time() - _RESOLVED_KEY_CACHE["ts"] < _RESOLVED_KEY_TTL:
+        return _RESOLVED_KEY_CACHE["key"]
     # 2. Firestore Account page key
     fs_keys = _read_firestore_api_keys()
     if fs_keys.get("anthropic"):
         log(f"[resolve_api_key] using apiKeys.anthropic from Firestore (Account page)", "INFO")
+        _RESOLVED_KEY_CACHE.update(key=fs_keys["anthropic"], ts=time.time())
         return fs_keys["anthropic"]
     # 3 + 4. User-scope env (persistent)
     for var in ("CUA_API_KEY", "ANTHROPIC_API_KEY"):
@@ -222,13 +235,16 @@ def resolve_api_key(cli_key=None):
                 log(f"[resolve_api_key] {var}: Windows User-scope wins over shell env (shell had a stale value)", "INFO")
             else:
                 log(f"[resolve_api_key] using {var} from Windows User-scope", "INFO")
+            _RESOLVED_KEY_CACHE.update(key=key, ts=time.time())
             return key
     # 5 + 6. os.environ (shell-inherited)
     for var in ("CUA_API_KEY", "ANTHROPIC_API_KEY"):
         key = os.environ.get(var, "").strip()
         if key:
             log(f"[resolve_api_key] using {var} from shell env (no User-scope / Firestore key)", "INFO")
+            _RESOLVED_KEY_CACHE.update(key=key, ts=time.time())
             return key
+    _RESOLVED_KEY_CACHE.update(key=None, ts=time.time())
     return None
 
 
@@ -6478,7 +6494,7 @@ async def _narrator_loop(phase: int):
         if _USE_HAIKU:
             try:
                 import anthropic as _anth
-                _key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CUA_API_KEY")
+                _key = resolve_api_key()
                 if _key:
                     _cli = _anth.Anthropic(api_key=_key, timeout=5.0)
                     try:
