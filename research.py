@@ -18504,7 +18504,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         deadline_sec = float(max_min * 60)
         tick = 5.0
         soft_warn_emitted = False
-        soft_alert_id = f"phase{phase}_soft_timeout"
+        # 2026-05-06 (Stream 2 D4): per-invocation nonce so the FE dedup
+        # ledger (5-min/1-resurface) doesn't permanently silence the
+        # 2nd / 3rd soft-warn emission when callers re-invoke this helper
+        # (e.g., P3-audio retry-after-no-audio loop calls it up to 3
+        # times per pipeline run). Each helper call gets a fresh
+        # alert_id; FE treats them as distinct alerts, not duplicates.
+        soft_alert_id = f"phase{phase}_soft_timeout_{int(time.monotonic() * 1000)}"
         while not run_task.done():
             try:
                 await asyncio.sleep(tick)
@@ -20101,6 +20107,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _p3_audio = await _await_phase_with_active_deadline(
                             3, PHASE_3_AUDIO_MAX_MIN,
                             lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                            soft_warn_only=True,  # 2026-05-06 (Stream 2 D4): match primary call at :20018
                         )
                         audio_path = _p3_audio.get("audio_path")
                         _ao_url = _p3_audio.get("audio_overview_url", "")
@@ -20114,6 +20121,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                             notebook_url=notebook_url,
                                             audio_path=str(audio_path),
                                             audio_overview_url=audio_overview_url)
+                    except _PhaseSoftDecision as _sd:
+                        # User picked Retry/Skip on the soft-warn during the
+                        # retry attempt. Skip → exit the no-audio loop and
+                        # cascade P4 skip. Retry → fall through with
+                        # audio_path=None so the outer `while ... not audio_path:`
+                        # re-prompts (user can retry again or skip).
+                        log(f"Phase 3 audio retry soft decision: {_sd.decision}", "INFO")
+                        if _sd.decision == "skip":
+                            # Telemetry symmetric with the fail_phase-decision skip
+                            # path at :20146 and the primary helper soft-skip.
+                            emit_event("phase_skipped", phase=3, reason="user_skip_after_audio_retry_soft_timeout")
+                            _p3_audio_user_skipped = True
+                            _controls.skipped_phases.add(4)
+                            audio_path = None
+                            break
+                        audio_path = None
                     except asyncio.TimeoutError:
                         log("Phase 3 audio retry timed out", "WARN")
                         audio_path = None
@@ -20211,6 +20234,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _p3_audio = await _await_phase_with_active_deadline(
                             3, PHASE_3_AUDIO_MAX_MIN,
                             lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                            soft_warn_only=True,  # 2026-05-06 (Stream 2 D4): match primary call at :20018
                         )
                         audio_path = _p3_audio.get("audio_path")
                         _ao_url = _p3_audio.get("audio_overview_url", "")
@@ -20222,6 +20246,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                             notebook_url=notebook_url,
                                             audio_path=str(audio_path),
                                             audio_overview_url=audio_overview_url)
+                    except _PhaseSoftDecision as _sd:
+                        # User picked Retry/Skip on soft-warn during the P4
+                        # no-audio retry. Either way, leave audio_path=None
+                        # so the outer `while not audio_path:` re-prompts.
+                        log(f"Phase 4 audio retry soft decision: {_sd.decision}", "INFO")
+                        audio_path = None
                     except Exception as _ar:
                         log(f"Phase 4 audio retry failed: {_ar}", "WARN")
                         audio_path = None
