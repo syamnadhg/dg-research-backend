@@ -2984,12 +2984,21 @@ def _start_cli_command_reader(loop):
                     # request_skip_phase doesn't release the pause; mirror the
                     # Firestore handler at line ~2682 and resume.
                     loop.call_soon_threadsafe(_controls.request_resume)
-            elif cmd in ("q", "stop", "quit"):
-                log("[CMD] stop")
-                loop.call_soon_threadsafe(_controls.request_stop)
-                loop.call_soon_threadsafe(_controls.request_resume)
+            elif cmd in ("c", "continue"):
+                # "Continue with Free" — mirrors the web frontend's
+                # pro_required banner button. Only meaningful at a
+                # pro_required pause; gated to avoid leaking the
+                # continue_anyway flag into later phases that also
+                # consume it (Phase 1 Pro selector backstop @ 14220,
+                # etc.). To stop the pipeline, use Ctrl+C.
+                pr = getattr(_controls, "pause_reason", "") or ""
+                if pr == "pro_required":
+                    log("[CMD] continue with Free")
+                    loop.call_soon_threadsafe(_controls.set_continue_anyway)
+                else:
+                    log(f"[CMD] 'c' only valid at pro_required pause (current: '{pr or 'none'}')")
             else:
-                log("[CMD] unknown — type r/s/q (resume/skip/stop)")
+                log("[CMD] unknown — type r/s (resume/skip); c at pro_required pauses; Ctrl+C to stop")
     _threading.Thread(target=_reader, daemon=True, name="cli-cmd-reader").start()
 
 
@@ -3137,17 +3146,25 @@ class PipelineControls:
             # Discoverable, context-aware menu so CLI users have a working
             # recovery path without --serve. login_required gets a tailored
             # header instructing the user to log in via the open Chrome
-            # window before resuming.
+            # window before resuming. pro_required gets the extra `c`
+            # option to mirror the web frontend's "Continue with Free"
+            # button. Ctrl+C is the stop path (no `q` keystroke needed).
             reason = self.pause_reason or ""
             if reason == "login_required":
                 header = "[PAUSE] login_required — log in via the open browser, then:"
+                actions = "  r) resume (re-check after login)   s) skip phase"
+            elif reason == "pro_required":
+                header = "[PAUSE] pro_required — upgrade in the browser, then:"
+                actions = "  r) resume (re-check after upgrade)   s) skip phase   c) continue with Free"
             elif reason:
                 header = f"[PAUSE] {reason} — waiting."
+                actions = "  r) resume   s) skip phase"
             else:
                 header = "[PAUSE] pipeline paused — waiting."
+                actions = "  r) resume   s) skip phase"
             print(
                 f"\n{header}\n"
-                "  r) resume   s) skip phase   q) stop pipeline\n"
+                f"{actions}\n"
                 "> ",
                 flush=True,
             )
