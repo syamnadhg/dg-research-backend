@@ -4518,6 +4518,212 @@ _BAD_URL_PATTERNS = [
 ]
 
 
+# F4 / DGOPS-7451 — security constants for session-inheritance defenses.
+# 2026-05-05 incident: Gemini Deep Research running inside the patchright
+# profile inherited a persisted @distributedglobal.com Workspace session,
+# navigated to dg-security-monitor.web.app, fired onAuthStateChanged
+# silently, scraped 25k chars of dashboard data, auto-emailed it, and
+# auto-created a public share link. Fix has 4 layers: pair-flow account
+# separation (mitigation 2), run-start auth scrub (3), Playwright route
+# deny-list (4), public-share visibility event (5).
+
+_SECURITY_DENY_HOSTS = (
+    "web.app",
+    "firebaseapp.com",
+    "distributedglobal.com",
+    "dg-eng.com",
+)
+
+# Auth-management surfaces — scrubbed at run start. Distinct from agent
+# chat domains (gemini.google.com, notebooklm.google.com, etc.) which
+# carry the long-lived platform sessions and MUST be preserved.
+_SECURITY_AUTH_SCRUB_DOMAINS = (
+    "accounts.google.com",
+    "myaccount.google.com",
+)
+
+# Google auth cookie names — used by _detect_persisted_google_auth in the
+# pair flow to surface a prior Google account that would silently
+# authenticate the agent on Workspace-protected resources.
+_SECURITY_GOOGLE_AUTH_COOKIE_NAMES = (
+    "SAPISID", "APISID",
+    "__Secure-1PSID", "__Secure-3PSID",
+    "__Secure-1PSIDCC", "__Secure-3PSIDCC",
+    "__Secure-1PAPISID", "__Secure-3PAPISID",
+    "SID", "HSID", "SSID", "SIDCC", "LSID",
+)
+
+# Agent platform domains — explicitly preserved during scrub since the
+# user paired these intentionally. NotebookLM rides on google.com but
+# its session lives on its own subdomain, distinct from the
+# accounts.google.com auth-management surface scrubbed by F4.
+_SECURITY_PRESERVE_PLATFORM_DOMAINS = (
+    "gemini.google.com",
+    "notebooklm.google.com",
+    "studio.youtube.com",
+    "chatgpt.com",
+    "claude.ai",
+    "claude.site",
+)
+
+# Toggle for fast rollback if scrub breaks Gemini/NotebookLM login.
+# "broad" — clear cookies + localStorage/IDB on auth-scrub domains.
+# "narrow" — skip cookie clear; only purge localStorage firebase:authUser:* keys.
+SECURITY_SCRUB_MODE = "broad"
+
+
+def _matches_security_deny_host(host: str) -> str | None:
+    """Return the matching F4 deny-list pattern if the host endswith any of
+    the deny suffixes, else None. Suffix-match catches subdomains
+    (e.g. dg-security-monitor.web.app matches "web.app")."""
+    if not host:
+        return None
+    h = host.lower()
+    for pat in _SECURITY_DENY_HOSTS:
+        if h == pat or h.endswith("." + pat):
+            return pat
+    return None
+
+
+async def _detect_persisted_google_auth(context) -> dict | None:
+    """Inspect the browser context for a persisted Google account login.
+    Returns a redacted summary if any Google auth cookie is present, else
+    None. Used by --pair to refuse adding a second account silently
+    (F4 mitigation 2 / DGOPS-7451). Read-only — no navigation."""
+    try:
+        cookies = await context.cookies()
+    except Exception as e:
+        log(f"[security] cookie read failed during pair preflight: {e}", "WARN")
+        return None
+    matches: list[dict] = []
+    for c in cookies:
+        name = c.get("name") or ""
+        domain = (c.get("domain") or "").lower()
+        if name not in _SECURITY_GOOGLE_AUTH_COOKIE_NAMES:
+            continue
+        if not (domain.endswith(".google.com") or domain == "google.com"):
+            continue
+        # Permit platform-session cookies (Gemini/NotebookLM live on
+        # subdomains) — distinct from auth-management surfaces.
+        if any(domain == d or domain.endswith("." + d) for d in _SECURITY_PRESERVE_PLATFORM_DOMAINS):
+            continue
+        matches.append({"name": name, "domain": domain, "valueLen": len(c.get("value") or "")})
+    if not matches:
+        return None
+    return {
+        "cookieMatches": len(matches),
+        "sample": [f"{m['name']}@{m['domain']}=[redacted, {m['valueLen']} chars]" for m in matches[:3]],
+    }
+
+
+async def _scrub_persisted_google_auth(context, *, scope: str = "run", reason: str = "") -> dict:
+    """Clear persisted Google auth state (cookies + localStorage + IDB) from
+    the browser context BEFORE agents take control. F4 mitigation 3 /
+    DGOPS-7451. Returns a counts summary and emits security_scrub event.
+
+    Surfaces scrubbed:
+      - Cookies on accounts.google.com / myaccount.google.com (auth surfaces)
+      - Cookies in _SECURITY_GOOGLE_AUTH_COOKIE_NAMES on .google.com IF
+        NOT in _SECURITY_PRESERVE_PLATFORM_DOMAINS (preserves Gemini/NLM)
+      - Cookies on each _SECURITY_DENY_HOSTS entry (internal infra)
+      - localStorage / sessionStorage / IndexedDB on the same origins,
+        accessed via a one-shot hidden page navigation.
+
+    NARROW mode (SECURITY_SCRUB_MODE='narrow'): skip cookie clear; only
+    purge firebase:authUser:* / firebase:host:* localStorage keys on
+    deny-list domains. Use as a fast rollback if Gemini/NotebookLM
+    auth breaks under broad scrub.
+
+    Best-effort throughout — any one origin failing must not break the
+    pipeline. Errors logged, not raised."""
+    summary = {"scope": scope, "reason": reason, "mode": SECURITY_SCRUB_MODE,
+               "cookiesCleared": 0, "originsCleared": 0, "errors": []}
+
+    if SECURITY_SCRUB_MODE == "broad":
+        try:
+            cookies = await context.cookies()
+        except Exception as e:
+            summary["errors"].append(f"cookie read: {e}")
+            cookies = []
+        to_clear: list[dict] = []
+        for c in cookies:
+            domain = (c.get("domain") or "").lower()
+            # Auth-management surfaces — always scrub. These hold the
+            # account-management state (chooser, sign-in pages, multi-account
+            # selector). Distinct from the platform-app domains
+            # (gemini.google.com, notebooklm.google.com) where the durable
+            # chat sessions live.
+            if any(domain == d or domain.endswith("." + d) for d in _SECURITY_AUTH_SCRUB_DOMAINS):
+                to_clear.append(c); continue
+            # Internal deny-list — always scrub. Defense-in-depth: route
+            # handler at network layer already blocks the navigation, but
+            # also wipe any cookies that may already exist on those origins.
+            if _matches_security_deny_host(domain.lstrip(".")):
+                to_clear.append(c); continue
+            # NOTE: do NOT scrub Google auth cookies (__Secure-1PSID etc.)
+            # on .google.com apex. Gemini, NotebookLM, YouTube, Gmail, and
+            # Google Docs ALL share that apex session. Wiping it here
+            # would break Gemini/NotebookLM login at every pipeline start
+            # and force the user back through pair. The route deny-list
+            # at the network layer is the load-bearing defense for the
+            # 2026-05-05 incident vector — apex-cookie wipe is not needed.
+            # See advisor V2 callout in the F4 implementation review.
+        for c in to_clear:
+            try:
+                await context.clear_cookies(name=c.get("name"), domain=c.get("domain"))
+                summary["cookiesCleared"] += 1
+            except Exception as e:
+                summary["errors"].append(f"cookie clear {c.get('name')}@{c.get('domain')}: {e}")
+
+    # localStorage / sessionStorage / IDB — visit each origin and clear.
+    # Use a 404-stub URL so the page renders nothing executable; we only
+    # need same-origin scope for the clear JS. We only scrub the auth-
+    # management origins here. The deny-list origins are network-blocked
+    # by the route handler, so a goto there aborts and the evaluate would
+    # run on about:blank (silent no-op). Cookies on those origins are
+    # already covered above; storage scrub adds nothing.
+    scrub_origins = list(_SECURITY_AUTH_SCRUB_DOMAINS)
+    _page = None
+    try:
+        _page = await context.new_page()
+    except Exception as e:
+        summary["errors"].append(f"open scrub page: {e}")
+    if _page is not None:
+        for origin in scrub_origins:
+            try:
+                await _page.goto(f"https://{origin}/__f4_scrub_404", wait_until="domcontentloaded", timeout=8000)
+            except Exception:
+                pass  # 404 / network error is fine — we just need same-origin context.
+            try:
+                await _page.evaluate("""async () => {
+                    try { localStorage.clear(); } catch (e) {}
+                    try { sessionStorage.clear(); } catch (e) {}
+                    try {
+                        const dbs = (typeof indexedDB.databases === 'function')
+                            ? (await indexedDB.databases()) : [];
+                        for (const db of dbs) {
+                            if (db.name) { try { indexedDB.deleteDatabase(db.name); } catch (e) {} }
+                        }
+                    } catch (e) {}
+                }""")
+                summary["originsCleared"] += 1
+            except Exception as e:
+                summary["errors"].append(f"scrub {origin}: {e}")
+        try:
+            await _page.close()
+        except Exception:
+            pass
+
+    log(f"[security] scrub({scope}): cookies={summary['cookiesCleared']}, "
+        f"origins={summary['originsCleared']}, mode={SECURITY_SCRUB_MODE}, "
+        f"errors={len(summary['errors'])}", "INFO")
+    try:
+        emit_event("security_scrub", **summary)
+    except Exception:
+        pass
+    return summary
+
+
 def validate_link(platform: str, url: str) -> bool:
     """Check if a URL is a REAL shareable link for the given platform.
     Returns False for page URLs, studio URLs, and other non-shareable URLs."""
@@ -9326,6 +9532,44 @@ class Browser:
         self.context.on("page", self._attach_file_handler)
         self.context.on("page", self._guard_popup)
         self._attach_file_handler(self.page)
+
+        # F4 / DGOPS-7451 — security deny-list at the Playwright route layer.
+        # Blocks ANY navigation, sub-frame request, fetch, or XHR to internal
+        # infrastructure hostnames (web.app / firebaseapp.com /
+        # distributedglobal.com / dg-eng.com). Catches the "agent wanders into
+        # internal infra and rides a persisted Workspace session" class of
+        # leak at the network layer — which is exactly what happened on
+        # 2026-05-05 when Gemini Deep Research scraped dg-security-monitor.
+        async def _security_deny_route(route, request):
+            try:
+                from urllib.parse import urlparse
+                host = (urlparse(request.url).hostname or "").lower()
+                pattern = _matches_security_deny_host(host)
+                if pattern:
+                    log(f"[security] BLOCKED agent navigation to {host} "
+                        f"(matches deny-list *.{pattern}, url={request.url[:200]})", "WARN")
+                    try:
+                        emit_event("security_blocked_navigation",
+                                   host=host, pattern=pattern,
+                                   url=request.url[:300],
+                                   resourceType=request.resource_type)
+                    except Exception:
+                        pass
+                    await route.abort("blockedbyclient")
+                    return
+            except Exception as _e:
+                # Never let route handler exceptions leak — it would block
+                # all navigation. Fall through to continue_ on any error.
+                log(f"[security] route handler error (continuing): {_e}", "DEBUG")
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+        try:
+            await self.context.route("**/*", _security_deny_route)
+        except Exception as _re:
+            log(f"[security] failed to install route deny-list: {_re}", "WARN")
+
         log("Browser started (stealth: patchright + channel=chrome)")
 
     def _attach_file_handler(self, page):
@@ -11305,6 +11549,25 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                     share_verified = True
                     share_label = link_res.label or f"{name} public share"
                     log(f"[{name}] Inline share-link extracted ({_elapsed_share:.1f}s): {share_url}")
+                    # F4 / DGOPS-7451 — public share is anyone-with-link viewable.
+                    # On 2026-05-05 Gemini auto-created a share at
+                    # gemini.google.com/share/8e52f021efe3 that had to be
+                    # manually revoked. Surface a HIGH-severity event so the
+                    # operator sees the URL prominently in run output and
+                    # can revoke before propagation. (Auto-revoke is the
+                    # bonus follow-up — see DGOPS-7451 ticket.)
+                    log(f"[security] PUBLIC SHARE LINK EMITTED for {name}: {share_url}", "WARN")
+                    try:
+                        emit_event("public_share_detected",
+                                   phase=2, agent=agent_key,
+                                   url=share_url, label=share_label,
+                                   severity="HIGH",
+                                   message=(f"{name} emitted a public share URL — "
+                                            "anyone with this link can view the "
+                                            "research. Revoke from the agent's UI "
+                                            "if the run output shouldn't be public."))
+                    except Exception:
+                        pass
                 else:
                     err = (link_res.error if link_res else "no result")
                     log(f"[{name}] Inline share-link unverified ({err}, {_elapsed_share:.1f}s) "
@@ -18763,6 +19026,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         while True:
             try:
                 await browser.start()
+                # F4 / DGOPS-7451 — scrub any persisted Google auth state +
+                # internal-infra cookies/storage BEFORE Phase 0 runs. Closes
+                # the silent session-inheritance vector that let Gemini ride
+                # a persisted @distributedglobal.com Workspace session into
+                # dg-security-monitor.web.app on 2026-05-05.
+                try:
+                    await _scrub_persisted_google_auth(
+                        browser.context, scope="run_start",
+                        reason="DGOPS-7451 F4 — pre-pipeline auth scrub")
+                except Exception as _scrub_err:
+                    log(f"[security] run-start scrub failed (non-fatal): {_scrub_err}", "WARN")
                 break
             except Exception as _launch_err:
                 # Most common launch failures:
@@ -22163,6 +22437,54 @@ async def run_pair(profile_dir, wait_minutes=10):
 
     browser = Browser(profile_dir, headless=False)
     await browser.start()
+
+    # F4 / DGOPS-7451 — refuse to add a Google account to a profile that
+    # already has one signed in. Multi-account state in this profile is the
+    # exact root enabler of the 2026-05-05 incident: the user thought
+    # juk80x@gmail.com was selected, but jason.rogers@distributedglobal.com
+    # was still loaded and onAuthStateChanged silently fired with the work
+    # credential when Gemini navigated to dg-security-monitor.web.app.
+    # Detect read-only first; if a prior Google auth is present, surface a
+    # clear unpair-first message and exit before walking Stage 3 logins.
+    try:
+        prior = await _detect_persisted_google_auth(browser.context)
+    except Exception as _de:
+        log(f"[security] pair preflight detection failed (continuing): {_de}", "WARN")
+        prior = None
+    if prior:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        # F4 / DGOPS-7451 — recovery path. `--unpair` alone does NOT clear
+        # the persisted browser cookies (it preserves browser logins by
+        # design so a re-pair doesn't force the user back through ChatGPT/
+        # Claude logins). So instructing "just run --unpair" would loop
+        # the user — apex .google.com cookies would still be there and
+        # this refusal would re-trigger. Give the honest recovery steps.
+        print("")
+        print(f"  {_c(_BOLD, 'Refusing to pair: a Google account is already signed in to this profile.')}")
+        print(f"  {_c(_DIM,  'Multi-account state is unsafe — agents inherit any persisted Google session and can')}")
+        print(f"  {_c(_DIM,  'navigate to Workspace-protected resources silently. See DGOPS-7451 for context.')}")
+        print("")
+        print(f"  Detected: {prior['cookieMatches']} Google auth cookie(s)")
+        for s in prior.get("sample", []):
+            print(f"    • {s}")
+        print("")
+        print(f"  {_c(_BOLD, 'To re-pair (e.g. switching Google accounts):')}")
+        print(f"    1. {_c(_BOLD, 'python research.py --unpair')}  {_c(_DIM, '(clears Super Research pairing state)')}")
+        print(f"    2. {_c(_BOLD, 'Sign out of Google in the paired browser')}, OR delete the profile directory:")
+        print(f"       {_c(_DIM, str(Path.home() / '.super-research' / 'browser-profile'))}")
+        print(f"    3. {_c(_BOLD, 'python research.py --pair')}  {_c(_DIM, '(walks the platform logins again)')}")
+        print("")
+        try:
+            emit_event("security_pair_refused",
+                       reason="prior_google_auth_present",
+                       cookieMatches=prior["cookieMatches"],
+                       sample=prior.get("sample", []))
+        except Exception:
+            pass
+        return
 
     # CUA client for visual double-verification. Best-effort: if no key is
     # available, Step 2 falls back to Playwright-only verification (same as
