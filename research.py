@@ -5806,25 +5806,29 @@ def emit_event(event_type, phase=None, agent=None, **data):
         dur = data.get("durationSec", 0)
         if dur > 0:
             record_phase_duration(phase, dur, agent=agent or "")
-    # Tile/Icon Consistency (2026-05-01): persist per-phase + per-agent
-    # terminal status to root doc so listing tile + chat icons stay
-    # correct post-reload. Single point so every phase_complete /
-    # phase_skipped / agent_skipped emit auto-persists; no need to touch
-    # each call site individually. phase_complete OVERWRITES a prior
-    # "errored" — important when user picks Retry on a fail_phase alert
-    # and the retry succeeds. agent_skipped without a `reason` is
-    # treated as a config-skip and NOT persisted (config-skip stays
-    # derived from pipelineConfig — single source of truth).
+    # Tile/Icon Consistency (2026-05-01, updated 2026-05-06): persist
+    # per-phase + per-agent terminal status to root doc so listing tile +
+    # chat icons stay correct post-reload. Single point so every
+    # phase_complete / phase_skipped / agent_skipped emit auto-persists;
+    # no need to touch each call site individually. phase_complete
+    # OVERWRITES a prior "errored" — important when user picks Retry on
+    # a fail_phase alert and the retry succeeds. ALL agent_skipped emits
+    # now carry a `reason` (config-skips emit "Disabled in pipeline
+    # config" — research.py:19402, runtime skips emit "user_skip…") and
+    # all persist to root doc as dual-source defense-in-depth: the
+    # FE-side pipelineConfig snapshot can be missing on legacy docs or
+    # overwritten by the Settings cascade mid-run, so we want the icon
+    # to reflect the actual run config via persisted runtime status too.
     try:
         if event_type == "phase_complete" and isinstance(phase, int) and phase >= 0:
             _write_phase_terminal_status(phase, "complete")
         elif event_type == "phase_skipped" and isinstance(phase, int) and phase >= 0:
             _write_phase_terminal_status(phase, "skipped")
         elif event_type == "agent_skipped" and agent:
-            # `reason` is in `data`. Only runtime skips (have a reason)
-            # get persisted; config-skips emitted from
-            # `for da in disabled_agents` (no reason) stay derived
-            # from pipelineConfig.
+            # All agent_skipped emits carry a `reason` post-2026-05-06.
+            # Guard retained as defense in case a future caller forgets
+            # to pass reason — without it, persistence would silently
+            # drop and we'd regress to the pre-F2 bug.
             if data.get("reason"):
                 _write_agent_terminal_status(agent, "skipped")
     except Exception:
@@ -19400,7 +19404,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             emit_event("phase_start", phase=2, agents=enabled_agents, description="Parallel deep research across AI platforms")
             _update_firestore_research({"phase": 2, "currentPhase": 2, "status": "ongoing"})
             for da in disabled_agents:
-                emit_event("agent_skipped", phase=2, agent=da)
+                # F2 (2026-05-06): emit with `reason` so the emit_event hook
+                # at :5818-5833 persists agents[<da>].status="skipped" to the
+                # root doc. Pre-fix, the for-loop omitted reason and the hook
+                # gated persistence on truthy reason — leaving individually-
+                # config-skipped agents (e.g. Claude off, others on) without
+                # a runtime status. The FE could only fall back to deriving
+                # from pipelineConfig.agents which (per F1) wasn't reliably
+                # persisted either, so the listing tile rendered the skipped
+                # agent as completed (green ✓). Dual-source defense-in-depth.
+                emit_event("agent_skipped", phase=2, agent=da, reason="Disabled in pipeline config")
             _p2_start = time.time()
             # Active-time ceiling for Phase 2 — paused seconds don't count.
             # Per-phase login probe removed (2026-04-24) — Phase 0 is the
