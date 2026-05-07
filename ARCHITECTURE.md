@@ -314,8 +314,8 @@ Phase 2 agents are declared "done" only when BOTH conditions are met:
 | `pipeline_stopped` | `pipeline_stopped` branch (legacy paired event) | error panel with humanized error text |
 | `human_verification_required` | `human_verification_required` branch | per-AGENT (not phase) alert via `setAgentAlert` — listed here because it's part of the same alert system |
 | `agent_link_failed` | `agent_link_failed` branch | per-AGENT alert with `[Retry, Skip]` actions |
-| watchdog T2 silence (per-phase tier 2) | `startFirestoreListener` watchdog interval | warn-level dropdown alert with Dismiss only + OS notification. Pipeline keeps running — autonomous tier framework handles recovery. (C2 dropped the prior auto-pause + Retry/Skip behavior.) |
-| watchdog T3 silence (per-phase tier 3) | same | informational dropdown alert + OS notification, no actions. ChatContainer separately surfaces the checkpoint-resume CTA when status flips to `stopped_by_watchdog`. |
+| watchdog T1 silence (per-phase tier 1) | `startFirestoreListener` watchdog interval | warn-level dropdown alert with **Dismiss** only + OS notification. Heartbeat-gated: only fires when heartbeat-stale (>2 min) AND silence ≥ T1. Pipeline keeps running. |
+| watchdog T2 silence (per-phase tier 2) | same | warn-level dropdown alert with **Retry phase** + **Skip phase** + OS notification. Dedup gate (Stream 2) excludes same-phase T1 watchdog alertId so T2 cleanly replaces T1. Pipeline keeps running — T2 doesn't auto-stop. ChatContainer separately surfaces the checkpoint-resume CTA when status flips to `stopped_by_watchdog`. |
 | `ChatContainer.tsx` paused_backend_restart recovery | onMount Firestore read | warn panel: "Backend restarted mid-run — resume from the last checkpoint?" |
 | pre-Phase-0 start failure | `startPipelineViaFirestore` ack timeout in `startPipeline` | warn panel with `[Retry, Skip]` (`retry_start` / `skip_start`) |
 
