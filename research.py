@@ -2949,7 +2949,7 @@ def _start_cli_command_reader(loop):
                 loop.call_soon_threadsafe(_controls.request_resume)
             else:
                 log("[CMD] unknown — type r/s/q (resume/skip/stop)")
-    threading.Thread(target=_reader, daemon=True, name="cli-cmd-reader").start()
+    _threading.Thread(target=_reader, daemon=True, name="cli-cmd-reader").start()
 
 
 # ── Pipeline Controls (asyncio.Event based stop/pause/resume) ────────────────
