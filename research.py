@@ -6762,23 +6762,77 @@ _NARR_STOPWORD_TAILS = frozenset({
     "about", "by", "into", "over", "through", "as", "at",
 })
 
+# Refusal-style substrings — when present, the model is replying as a
+# chat assistant ("I don't have enough info, could you provide…") instead
+# of narrating. These leaked into the FE pre-2026-05-07 (screenshots
+# Narration 1/2). The SKIP escape hatch in the prompt is the primary
+# defense; this list catches near-misses where the model paraphrases
+# the refusal without using SKIP.
+_NARR_REFUSAL_SUBSTRINGS = (
+    "i don't have", "i do not have", "i cannot", "i can't",
+    "i am unable", "i'm unable", "i need", "i'd need",
+    "could you provide", "could you share", "please provide",
+    "lacks sufficient", "structured fields", "event payload",
+    "to construct a specific", "to write a precise", "to write a tight",
+    "without more", "more recent event", "more concrete", "more specific",
+    "the events show only", "the event log shows", "the entry shows only",
+    "the log indicates", "based on the data",
+)
+
+# WH-word leading tokens. A narration that starts with one of these is
+# question-shaped ("Could you provide…", "Is there…"), not declarative.
+_NARR_WH_LEADING = frozenset({
+    "who", "what", "why", "how", "where", "when",
+    "could", "can", "would", "will", "do", "does", "did",
+    "is", "are", "should", "may", "might",
+})
+
+# Hosts that should not be cited as "sources" — they ARE the agent UI
+# itself or its CDN. Filtered before passing hostnames into the narrator
+# prompt (otherwise narration says "scraping chatgpt.com" which is dumb).
+_HOST_DENYLIST = frozenset({
+    "chatgpt.com", "openai.com", "chat.openai.com", "oaiusercontent.com",
+    "claude.ai", "anthropic.com",
+    "gemini.google.com", "bard.google.com",
+    "notebooklm.google.com",
+})
+
 
 def _is_acceptable_narration(s: str) -> bool:
-    """Reject narration outputs that read as fragments. Three signals:
-    (1) under 5 words AND under 22 chars (catches 'Twenty', 'Engaged in',
-        'Reading sources'); (2) last word is a preposition/conjunction
-        stopword that betrays a mid-sentence cut ('Reading two sources
-        from'); (3) leading-tokenization artifact ('"d unambiguous...').
+    """Reject narration outputs that don't read as a single declarative
+    sentence. Signals:
+    (1) under 5 words AND under 22 chars (catches 'Twenty', 'Engaged in')
+    (2) total length > 160 chars (prompt budget is 110/140 — overflow
+        signals the model is composing prose, not one sentence)
+    (3) `?` in the last 30 chars — declarative narrations don't end in
+        a question
+    (4) leading WH-word (Could/Can/Would/Is/Are/...) — question shape
+    (5) refusal substrings ('I don't have', 'could you provide', ...) —
+        the model is replying as a chat assistant, not narrating
+    (6) trailing stopword betraying a mid-sentence cut ('Reading two
+        sources from')
+    (7) leading-tokenization artifact ('"d unambiguous...')
 
-    On reject we just skip this tick — the prior good narration stays
-    visible. The FE list-of-lines model (Commit 2) means we just don't
-    append a new line this tick.
-    """
+    On reject the caller should fall through to Tier-3 realistic
+    fallback (or Tier-4 deterministic template) rather than just
+    skipping the tick — a sustained refusal mode would otherwise leave
+    the FE narration frozen on stale text for minutes."""
     if not s:
         return False
     words = s.split()
     if len(words) < 5 and len(s) < 22:
         return False
+    if len(s) > 160:
+        return False
+    if "?" in s[-30:]:
+        return False
+    first = words[0].lower().rstrip(",.:;!?") if words else ""
+    if first in _NARR_WH_LEADING:
+        return False
+    s_lower = s.lower()
+    for needle in _NARR_REFUSAL_SUBSTRINGS:
+        if needle in s_lower:
+            return False
     last = words[-1].rstrip(".!,?:;").lower() if words else ""
     if last in _NARR_STOPWORD_TAILS:
         return False
@@ -6789,6 +6843,121 @@ def _is_acceptable_narration(s: str) -> bool:
     if head in ('"d', "'d", '"s', "'s", '"t', "'t", '"r', "'r"):
         return False
     return True
+
+
+def _is_skip_token(text: str) -> bool:
+    """Detect the SKIP escape-hatch token Haiku/Flash emits when data is
+    too thin to narrate honestly. Normalizes wrappers the model may add
+    (`SKIP.`, `"SKIP"`, `Output: SKIP`)."""
+    if not text:
+        return False
+    t = text.strip().strip('"').strip("'").strip("`").strip().lower()
+    if t in {"skip", "skip.", "skip!", "skip,"}:
+        return True
+    if t.startswith(("output: skip", "output:skip", "skip\n", "skip ")):
+        return True
+    return False
+
+
+def _phase_short_label(phase: int) -> str:
+    """Compact human label per phase, for the deterministic phase-narration
+    template that ships when Tier-2 (LLM) refuses or fails the gate. Static
+    text — the FE shows elapsed time below the dropdown separately, so no
+    counter suffix is needed here. Dedupe at emit site means this lands
+    once per phase if Tier-2 stays in refusal mode."""
+    return {
+        0: "the warmup phase, verifying every agent is logged in",
+        1: "brief generation, drafting a structured research brief",
+        2: "parallel deep research across ChatGPT, Gemini, and Claude",
+        3: "NotebookLM upload and audio overview generation",
+        4: "YouTube video render and upload",
+        5: "delivery — Doc creation and email dispatch",
+    }.get(phase, "running through the active phase")
+
+
+def _extract_top_hosts(events: list, limit: int = 2) -> list:
+    """Pull deduped non-UI hostnames from agent_progress.source_urls and
+    link_extracted events in the recent ring-buffer window. Used to feed
+    the narrator prompt's `hosts=` field so narration can cite the actual
+    sources the agents are reading instead of generic 'reading sources'.
+    """
+    try:
+        from urllib.parse import urlparse as _urlparse
+    except Exception:
+        return []
+    seen = []
+    seen_set = set()
+    for e in events:
+        d = e.get("data", {}) or {}
+        urls = []
+        v = d.get("source_urls") or d.get("sourceUrls")
+        if isinstance(v, list):
+            urls.extend(v)
+        if e.get("type") == "link_extracted":
+            single = d.get("url")
+            if single:
+                urls.append(single)
+        for u in urls:
+            if not isinstance(u, str):
+                continue
+            try:
+                host = (_urlparse(u).hostname or "").lower()
+                if host.startswith("www."):
+                    host = host[4:]
+            except Exception:
+                continue
+            if not host or host in _HOST_DENYLIST or host in seen_set:
+                continue
+            seen.append(host)
+            seen_set.add(host)
+            if len(seen) >= limit:
+                return seen
+    return seen
+
+
+# Tier-4 deterministic template variants — the absolute last-ditch
+# fallback when both Tier-2 (Haiku/Flash on real events) AND Tier-3
+# (LLM with hardcoded timeline) refuse or fail. Three phrasings per
+# (akey, phase) so consecutive emits don't collide on the dedupe
+# equality guard at line ~7131/~7207 (silent-emit trap).
+AGENT_TIER4_VARIANTS = {
+    ("chatgpt", 1): [
+        "ChatGPT is reasoning through the brief in extended thinking.",
+        "ChatGPT is shaping the brief outline with structured sections.",
+        "ChatGPT is consolidating the brief output and validating sources.",
+    ],
+    ("chatgpt", 2): [
+        "ChatGPT is sweeping the web for fresh sources on the topic.",
+        "ChatGPT is reading retrieved articles and pulling citations.",
+        "ChatGPT is synthesizing findings into the report sections.",
+    ],
+    ("claude", 2): [
+        "Claude is loading the brief and planning the research scope.",
+        "Claude is searching and reading sources into the artifact.",
+        "Claude is structuring the artifact with citations and sections.",
+    ],
+    ("gemini", 2): [
+        "Gemini is launching Deep Research from the Tools menu.",
+        "Gemini is browsing fresh sources into the activity panel.",
+        "Gemini is weaving findings into a structured report.",
+    ],
+}
+
+_tier4_counter = {}  # type: dict[str, int]
+
+
+def _tier4_template(akey: str, ph: int) -> str:
+    """Round-robin pick from AGENT_TIER4_VARIANTS so consecutive Tier-4
+    emits produce different strings (defeats the equality dedupe at the
+    emit sites). Counter keyed by (akey, ph) so a future entry like
+    ("chatgpt", 0) doesn't cross-contaminate ("chatgpt", 2)'s rotation."""
+    variants = AGENT_TIER4_VARIANTS.get((akey, ph))
+    if not variants:
+        return f"{akey.upper()} is processing the request."
+    key = (akey, ph)
+    counter = _tier4_counter.get(key, 0)
+    _tier4_counter[key] = counter + 1
+    return variants[counter % len(variants)]
 
 
 def _compact_event_for_narration(e: dict) -> str:
@@ -6848,10 +7017,43 @@ def _compact_event_for_narration(e: dict) -> str:
                     host = host[4:]
             except Exception:
                 host = ""
-            if host:
+            if host and host not in _HOST_DENYLIST:
                 parts.append(f"host={host}")
         if label:
             parts.append(f"label={str(label)[:40]}")
+    # Surface agent_progress.source_urls as `hosts=foo.com,bar.com` (top
+    # 2, deduped, agent UI hosts filtered). This is the primary signal
+    # for live browsing during P2 — link_extracted does NOT fire from
+    # agent browsing (it's only emitted from share-link extraction in
+    # P5), so without this the prompt's "weave hostnames" instruction
+    # would be no-op for the in-progress P2 narration.
+    if t == "agent_progress":
+        urls = d.get("source_urls") or d.get("sourceUrls")
+        if isinstance(urls, list) and urls:
+            try:
+                from urllib.parse import urlparse as _urlparse
+            except Exception:
+                _urlparse = None
+            if _urlparse is not None:
+                _hosts = []
+                _hosts_seen = set()
+                for u in urls:
+                    if not isinstance(u, str):
+                        continue
+                    try:
+                        h = (_urlparse(u).hostname or "").lower()
+                        if h.startswith("www."):
+                            h = h[4:]
+                    except Exception:
+                        continue
+                    if not h or h in _HOST_DENYLIST or h in _hosts_seen:
+                        continue
+                    _hosts.append(h)
+                    _hosts_seen.add(h)
+                    if len(_hosts) >= 2:
+                        break
+                if _hosts:
+                    parts.append(f"hosts={','.join(_hosts)}")
     return " | ".join(parts)
 
 
@@ -6982,45 +7184,73 @@ async def _narrator_loop(phase: int):
         return (text or "").strip(), resp.status_code
 
     async def _realistic_fallback(akey: str, ph: int, elapsed_sec: float,
-                                   last_status: str = "") -> str:
+                                   last_status: str = "", *,
+                                   recent_hosts=None) -> str:
         """Tier 3 fallback narration — when real data (DOM + vision) is sparse
-        or absent for an agent, ask Gemini to produce ONE realistic sentence
-        describing what the agent is *likely* doing right now based on phase
+        OR Tier-2 (LLM on real events) refused / failed the quality gate,
+        ask Haiku/Flash to produce ONE realistic sentence based on phase
         + elapsed time + the typical timeline. The output cites the actual
-        timeline stage (planning vs searching vs synthesizing), so it feels
-        real rather than a generic 'still working' template."""
+        timeline stage (planning vs searching vs synthesizing) so it feels
+        real rather than generic.
+
+        Tier-3 OWN output is also gated through `_is_acceptable_narration`
+        and `_is_skip_token` — if the model refuses again, return empty
+        and the caller falls through to Tier-4 deterministic template."""
         timeline = AGENT_PHASE_FLOWS.get((akey, ph))
         if not timeline:
             return ""
         elapsed_min = elapsed_sec / 60.0
         timeline_text = "\n".join(f"- {t}" for t in timeline)
+        hosts_block = ""
+        hosts_hint = ""
+        if recent_hosts:
+            hosts_block = (
+                f"Recently visited hosts: {', '.join(recent_hosts[:2])}\n\n"
+            )
+            hosts_hint = (
+                f" If natural, mention one host — 'skimming {recent_hosts[0]}' "
+                "beats 'reading sources'."
+            )
         fb_system = (
             f"You narrate what the {akey.upper()} agent is likely doing right now. "
             f"Elapsed: {elapsed_min:.1f} minutes. "
             f"Last known status: {last_status or 'unknown'}.\n\n"
             f"TYPICAL TIMELINE for {akey.upper()}:\n"
             f"{timeline_text}\n\n"
+            f"{hosts_block}"
             "Output ONE realistic sentence in present tense (<= 110 chars) "
             f"describing what's happening at minute {elapsed_min:.1f} of the "
             "timeline above. Reference the specific stage by what the agent "
-            "is doing (e.g. 'ChatGPT is mapping cluster overlaps across the "
-            "first 80 sources') — NOT by phase number.\n\n"
-            "FORBIDDEN OUTPUT PATTERNS — the response must NOT contain any of "
-            "these phrasings (they leaked into the post-completion dropdown "
-            "card and the user complained):\n"
-            "  - 'Super Research Phase' / 'in Phase N' / 'Phase 2'\n"
-            "  - 'currently' as a leading word / 'Status:' as a prefix\n"
-            "  - generic 'still working' / 'is still processing'\n"
+            f"is doing (e.g. 'ChatGPT is mapping cluster overlaps across the "
+            f"first 80 sources').{hosts_hint}\n\n"
+            "FORBIDDEN — your output is broadcast verbatim to the user. NEVER:\n"
+            "  - Questions or '?'.\n"
+            "  - Refusals ('I don't have', 'I cannot', 'lacks sufficient', "
+            "'Without more', 'I need').\n"
+            "  - First-person ('I '). You are not in the conversation.\n"
+            "  - Meta-references ('the events', 'the log', 'event payload',\n"
+            "    'structured fields').\n"
+            "  - 'Super Research Phase' / 'in Phase N' / 'Phase 2'.\n"
+            "  - Multi-sentence answers (one period only).\n"
+            "  - 'currently' as a leading word, 'Status:' prefix.\n"
+            "  - Generic 'still working' / 'is still processing'.\n\n"
             "Stage references like 'in the synthesis stage' or 'in extended "
             "thinking' are FINE — only the literal 'Phase N' pipeline-meta is "
-            "banned. Start with the agent name. No markdown, no em-dashes."
+            "banned. Start with the agent name. No markdown, no em-dashes. "
+            "If you cannot produce a clean sentence, output the literal token "
+            "SKIP and nothing else; a deterministic template will replace it."
         )
         fb_text, fb_status = await asyncio.to_thread(
             _call_narrator, fb_system, "", 200
         )
         if fb_status >= 400 or not fb_text:
             return ""
-        return fb_text.strip().strip('"').strip("`").strip()[:140]
+        fb_text = fb_text.strip().strip('"').strip("`").strip()
+        if _is_skip_token(fb_text):
+            return ""
+        if not _is_acceptable_narration(fb_text):
+            return ""
+        return fb_text[:140]
 
     try:
         while True:
@@ -7054,10 +7284,36 @@ async def _narrator_loop(phase: int):
             system = (
                 "You narrate ONE human sentence summarizing what the Super Research "
                 "pipeline is doing RIGHT NOW for a user watching the phase dropdown. "
-                f"Phase {phase}: {phase_ctx} {style_note} "
-                "Output exactly ONE sentence, <= 110 chars. No markdown. No prefix "
-                "like 'Currently' or 'Status:'. No em-dashes. If the events show "
-                "nothing new, say something like 'Still working on <last known step>.'"
+                f"Phase {phase}: {phase_ctx} {style_note}\n\n"
+                "HARD CONSTRAINTS — your output is broadcast verbatim to a human "
+                "user with zero post-processing. Every word ships.\n\n"
+                "OUTPUT SHAPE: Exactly ONE sentence. <= 110 chars. Subject = the "
+                "pipeline OR a specific agent (ChatGPT/Gemini/Claude). Verb = "
+                "present-progressive (is reading, is mapping, is drafting). "
+                "Object = a concrete thing from the events. Period. End.\n\n"
+                "NEVER (these ship to the user as-is):\n"
+                "  - Questions. No 'Could you', 'Can you', 'Would you', '?'.\n"
+                "  - First-person ('I '). You are not in the conversation.\n"
+                "  - Refusals or capability disclaimers ('I don't have', "
+                "'lacks sufficient', 'I cannot narrate', 'Without more', "
+                "'I need').\n"
+                "  - Meta about the input ('the events show', 'the log "
+                "indicates', 'structured fields', 'event payload', 'recent "
+                "entries', 'based on the data').\n"
+                "  - Multi-sentence answers (no second period followed by space).\n"
+                "  - Lists, bullets, em-dashes for enumeration, prefixes like "
+                "'Currently' or 'Status:'.\n"
+                "  - Generic stalls: 'still working', 'still processing', "
+                "'in progress'.\n\n"
+                "WHEN DATA IS THIN: Output the literal token  SKIP  on its own "
+                "and nothing else. A deterministic fallback will produce a "
+                "sentence from the typical phase flow. Your refusal would be "
+                "worse than silence.\n\n"
+                "WHEN DATA IS RICH: Cite specifics — counts, section names, "
+                "hostnames from `host=` or `hosts=` lines, focus areas from "
+                "`currentFocus`. Weave hostnames naturally: 'pulling Tesla "
+                "10-K filings from sec.gov' beats 'reading sources'. Cap at "
+                "1-2 hostnames per sentence."
             )
             event_lines = "\n".join(
                 f"- {_compact_event_for_narration(e)}" for e in recent[-20:]
@@ -7084,12 +7340,20 @@ async def _narrator_loop(phase: int):
             # Reset the err flag once we recover so a later regression re-logs.
             _err_logged = False
             text = text.strip().strip('"').strip("`").strip()
-            # Quality gate — drop fragments / single-words / stopword-tail
-            # mid-sentence cuts before they hit the wire. See
-            # _is_acceptable_narration for the rules. On reject we just
-            # skip this tick; next tick (cadence seconds) retries.
+            # SKIP escape hatch — model used the designated fallback signal
+            # because data was too thin to narrate honestly. Replace with
+            # a deterministic phase template so the FE never goes silent.
+            if _is_skip_token(text):
+                text = f"Super Research is in {_phase_short_label(phase)}."
+            # Quality gate — drop fragments / single-words / refusal text /
+            # stopword-tail mid-sentence cuts before they hit the wire. On
+            # reject, fall through to the same deterministic template (a
+            # sustained Tier-2 refusal mode would otherwise leave the FE
+            # narration frozen on stale text for minutes). Dedupe at emit
+            # site means this template lands once per phase if Tier-2 stays
+            # in refusal — subsequent ticks return clean output and resume.
             if text and not _is_acceptable_narration(text):
-                text = ""
+                text = f"Super Research is in {_phase_short_label(phase)}."
             if text and text != last_narration:
                 last_narration = text
                 try:
@@ -7122,12 +7386,24 @@ async def _narrator_loop(phase: int):
                         # Tier 3 fallback — only after 60s warmup so we don't
                         # produce bogus narration during the brief window where
                         # DOM scrape is settling and vision hasn't run yet.
+                        # (Rejection-triggered fallback below skips this gate.)
                         if elapsed_in_phase < 60:
                             continue
                         last_status = last_known_status_for_agent.get(akey, "")
+                        # Per-agent has no events; pull hosts from phase-wide
+                        # window so the fallback can still cite a real source
+                        # if any agent visited one in the recent ring buffer.
+                        recent_hosts_phase = _extract_top_hosts(recent)
                         fb_text = await _realistic_fallback(
-                            akey, phase, elapsed_in_phase, last_status
+                            akey, phase, elapsed_in_phase, last_status,
+                            recent_hosts=recent_hosts_phase,
                         )
+                        # Tier-4 deterministic template if Tier-3 LLM call
+                        # also refused/failed — round-robin rotation per
+                        # agent so consecutive Tier-4 emits don't collide
+                        # with the dedupe equality guard below.
+                        if not fb_text:
+                            fb_text = _tier4_template(akey, phase)
                         if fb_text and fb_text != last_agent_lines.get(akey):
                             last_agent_lines[akey] = fb_text
                             try:
@@ -7149,42 +7425,51 @@ async def _narrator_loop(phase: int):
                     )
                     a_system = (
                         f"You narrate ONE human sentence about what the {akey.upper()} "
-                        f"agent is doing RIGHT NOW.\n"
-                        "ANTI-PATTERNS — do NOT do these:\n"
-                        "  - DO NOT echo any phrase from the input verbatim. If "
-                        "the input contains 'research voice mode false positives', "
-                        "do NOT write 'researching voice mode false positives'. "
-                        "Paraphrase or skip.\n"
-                        "  - DO NOT start with 'currently' or 'Status:' or any "
-                        "prefix. Start with the agent name.\n"
-                        "  - DO NOT include UI chrome like 'You said:', 'Claude "
-                        "responded:', 'Gemini said', 'brief.md', or any line "
-                        "containing '<name> said' / '<name> responded' — treat "
-                        "those as noise from the chat thread and skip them.\n"
-                        "  - DO NOT reference the pipeline meta — phrasings like "
-                        "'Super Research Phase N', 'in Phase 2', 'Phase 1 of the "
-                        "pipeline' are noise that leaked into the post-completion "
-                        "dropdown card. Stage names like 'in the synthesis stage' "
-                        "or 'in extended thinking' are FINE; the agent name + "
-                        "'is now in <stage>' is FINE — only the literal 'Phase N' "
-                        "framing is banned. Describe what the agent is DOING.\n"
-                        "  - DO NOT default to 'still working' / 'is still "
-                        "processing' when data is sparse — pick the most "
-                        "specific recent status/step you have and paraphrase it.\n"
-                        "GOOD examples (paraphrase the underlying activity, "
-                        "don't quote the input):\n"
+                        f"agent is doing RIGHT NOW.\n\n"
+                        "HARD CONSTRAINTS — your output is broadcast verbatim to a "
+                        "human user with zero post-processing. Every word ships.\n\n"
+                        f"OUTPUT SHAPE: Exactly ONE sentence. <= 140 chars. Subject "
+                        f"= {akey.upper()}. Verb = present-progressive (is reading, "
+                        "is mapping, is drafting). Object = a concrete thing from "
+                        "the events. Period. End.\n\n"
+                        "NEVER (these ship to the user as-is):\n"
+                        "  - Questions. No 'Could you', 'Can you', 'Would you', '?'.\n"
+                        "  - First-person ('I '). You are not in the conversation.\n"
+                        "  - Refusals or capability disclaimers ('I don't have', "
+                        "'lacks sufficient', 'I cannot narrate', 'Without more', "
+                        "'I need').\n"
+                        "  - Meta about the input ('the events show', 'the log "
+                        "indicates', 'structured fields', 'event payload', 'recent "
+                        "entries', 'based on the data').\n"
+                        "  - Multi-sentence answers (no second period followed by space).\n"
+                        "  - Lists, bullets, em-dashes, prefixes ('Currently', 'Status:').\n"
+                        "  - Generic stalls: 'still working', 'still processing'.\n"
+                        "  - Pipeline meta: 'Super Research Phase N', 'in Phase 2', "
+                        "'Phase 1 of the pipeline'. Stage names like 'in the "
+                        "synthesis stage' / 'in extended thinking' / 'is now in "
+                        "<stage>' are FINE — only literal 'Phase N' is banned.\n"
+                        "  - Echoing input verbatim. If input contains 'research "
+                        "voice mode false positives', do NOT write 'researching "
+                        "voice mode false positives'. Paraphrase or output SKIP.\n"
+                        "  - UI chrome: 'You said:', '<name> responded:', 'brief.md'.\n\n"
+                        "WHEN DATA IS THIN: Output the literal token  SKIP  on its "
+                        "own and nothing else. A deterministic fallback will "
+                        "produce a sentence from the typical timeline. Your "
+                        "refusal would be worse than silence.\n\n"
+                        "WHEN DATA IS RICH: Weave structured fields (searches, "
+                        "sectionsDone/Total, currentFocus, partialTextLen) as "
+                        "paraphrased facts, not quoted strings. When events "
+                        "contain `host=<domain>` or `hosts=foo.com,bar.com`, "
+                        "weave 1-2 hostnames naturally — 'ChatGPT is skimming "
+                        "sec.gov filings on Tesla 10-K' beats 'ChatGPT is "
+                        "reading three sources'.\n\n"
+                        "GOOD examples (paraphrase activity, don't quote input):\n"
                         "  - 'Gemini is mapping discrepancy patterns across the "
                         "latest test runs while pulling fresh sources.'\n"
                         "  - 'Claude has woven 380 sources into a 7-section "
                         "outline so far.'\n"
                         "  - 'ChatGPT is narrowing in on the false-positive root "
-                        "cause via the docs cluster.'\n"
-                        "RULES: Output ONE sentence, <= 140 chars. No markdown. "
-                        "No em-dashes (use commas/periods). Weave structured "
-                        "fields (searches, sectionsDone/Total, currentFocus, "
-                        "partialTextLen) as paraphrased facts, not quoted "
-                        "strings. If data is sparse, describe the most recent "
-                        "concrete step you have — never generic copy.\n"
+                        "cause via the docs cluster on sec.gov.'\n\n"
                         f"SCOPE: ONLY {akey.upper()}'s progress. Don't compare agents."
                     )
                     a_user = (
@@ -7195,15 +7480,34 @@ async def _narrator_loop(phase: int):
                     if a_status == 429:
                         backoff_ticks_left = 3
                         break
-                    if not a_text or a_status >= 400:
-                        continue
-                    a_text = a_text.strip().strip('"').strip("`").strip()
-                    # Quality gate — same as phase narration. Rejected
-                    # outputs skip this tick; the agent card keeps the
-                    # prior good line until the next acceptable LLM
-                    # output lands.
-                    if a_text and not _is_acceptable_narration(a_text):
-                        continue
+                    a_text = (a_text or "").strip().strip('"').strip("`").strip()
+                    # SKIP escape hatch — model used the designated fallback
+                    # signal. Treat as rejected so the fallback chain runs.
+                    if _is_skip_token(a_text):
+                        a_text = ""
+                    # Quality gate — drop refusal text / fragments / overlength.
+                    elif a_text and not _is_acceptable_narration(a_text):
+                        a_text = ""
+                    # Empty result (Tier-2 refused, failed gate, or upstream
+                    # error) → fall through to Tier-3 realistic fallback. Bypass
+                    # the 60s warmup gate that applies to the no-events branch
+                    # — an active refusal is worse than t<60. Tier-3 takes the
+                    # recent_hosts hint so the fallback can cite real sources
+                    # when the agent has visited any.
+                    if not a_text:
+                        last_status = last_known_status_for_agent.get(akey, "")
+                        recent_hosts_for_agent = _extract_top_hosts(a_events)
+                        a_text = await _realistic_fallback(
+                            akey, phase, elapsed_in_phase, last_status,
+                            recent_hosts=recent_hosts_for_agent,
+                        )
+                        # Tier-4 deterministic template — Tier-3 calls the same
+                        # Haiku/Flash chain that just refused; if THAT also
+                        # failed/refused, use a pure-string template that
+                        # cannot be rejected. Round-robin rotation defeats
+                        # the equality dedupe at the emit site below.
+                        if not a_text:
+                            a_text = _tier4_template(akey, phase)
                     if a_text and a_text != last_agent_lines.get(akey):
                         last_agent_lines[akey] = a_text
                         try:
