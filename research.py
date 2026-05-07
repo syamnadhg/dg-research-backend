@@ -3518,7 +3518,7 @@ class PipelineRuntime:
         # and read by run_pipeline.finally to decide whether the auto-retry
         # path should bypass its `not resume_dir` gate. Browser crashes
         # always auto-retry — no human in the loop, no per-attempt cap;
-        # the worker 4h outer ceiling is the safety net.
+        # the worker 5h outer ceiling is the safety net.
         self.last_failure_kind: str = ""
 
     def reset(self):
@@ -20478,7 +20478,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     #     The recursion sets resume_dir, so a second failure of any kind
     #     normally surfaces a [Retry, Skip] alert.
     #   - Browser-crash retry is always-auto: bypass the resume_dir gate
-    #     so a recursive crash also auto-retries. Outer worker 4h ceiling
+    #     so a recursive crash also auto-retries. Outer worker 5h ceiling
     #     is the safety net against infinite chrome-death loops.
     _kind = getattr(_runtime, "last_failure_kind", "") or ""
     _is_browser_crash = (_kind == "browser_crash")
@@ -21055,9 +21055,12 @@ async def run_server(port=8000):
     # Q7 watchdog: if a single run exceeds this, we declare it stuck,
     # request_stop, mark the doc stopped_by_watchdog, and schedule a
     # process exit so the daemon-loop respawns a fresh worker that can
-    # drain the rest of the queue. Generous 4h ceiling — a healthy run
-    # is under 90min; this only fires for genuine deadlocks.
-    WORKER_OUTER_TIMEOUT_SEC = 4 * 60 * 60
+    # drain the rest of the queue. Generous 5h ceiling — a healthy run
+    # is under 90min; the 5h is sized to allow P1+P2+P3-audio soft-warn
+    # advisories (60+120+90 = 270 min) plus a couple of user Wait clicks
+    # before the deadlock backstop kicks in. 2026-05-06 (Stream 2 F12):
+    # bumped 4h → 5h.
+    WORKER_OUTER_TIMEOUT_SEC = 5 * 60 * 60
 
     async def _job_worker():
         """Process pipeline jobs one at a time from the queue."""
