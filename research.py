@@ -3434,11 +3434,15 @@ class PipelineControls:
 
     async def await_agent_decision(self, agent: str, timeout: float = 300.0) -> str:
         """Wait for user decision on a Phase 2 agent pipeline_warning
-        offering [Retry] / [Wait] / [Skip]. Returns:
+        offering [Retry] / [Wait] / [Skip] (and other context-specific
+        action sets). Returns:
             'retry'            — retry this agent with a follow-up prompt
             'wait_longer'      — extend the polling budget without nudging
             'continue_partial' — accept current output and finalize (legacy
                                   command, still handled for backward compat)
+            'continue_anyway'  — degraded-mode acknowledgement (E2 / DGOPS-7364
+                                  Claude chat-mode alert; user opted to send
+                                  in chat mode rather than skip).
             'skip'             — drop this agent entirely
             'stop'             — pipeline stopped
             'timeout'          — no decision in window (caller defaults to wait_longer)
@@ -3455,6 +3459,8 @@ class PipelineControls:
                 return "wait_longer"
             if self.consume_continue_partial(key):
                 return "continue_partial"
+            if self.consume_continue_anyway():
+                return "continue_anyway"
             if key in self.skipped_agents:
                 return "skip"
             await asyncio.sleep(0.5)
@@ -3531,6 +3537,13 @@ class PipelineRuntime:
         # final artifact. Initialized here so reset() always lands at False
         # (otherwise an attribute set externally would leak across runs).
         self.claude_artifact_panel_open = False
+        # E2 / DGOPS-7364 — per-agent mode tracking for Phase 2 setup. Written
+        # by start_agent_no_gemini_wait after Layer 1 + Layer 2 + pre-send
+        # re-evaluation. Read by extract_claude_response and the polling loop
+        # so chat-mode runs don't false-fire artifact-rejection logic.
+        # Shape: { agent_key: {"requested": "research", "actual": "research"|"chat"|"skipped",
+        #                       "user_acknowledged_chat": bool} }
+        self.agent_modes: dict = {}
         # 2026-05-03: per-agent live progress snapshot keyed by lowercase
         # platform name. Polling loop writes into this on every emit cycle
         # (research.py:~12091) so the P2 completion emit at
@@ -6453,6 +6466,57 @@ def _clear_pro_required_alerts(triggered_at_phase: int) -> None:
         log(f"Pro-tier alerts cleared (triggered_at_phase={triggered_at_phase}): "
             f"{', '.join(f'phase{p}/{a}' for (p, a) in cleared)}", "INFO")
     _controls.pro_alert_emitted.clear()
+
+
+def _emit_claude_chat_mode_alert():
+    """E2 / DGOPS-7364 — Claude Research-mode unavailable alert. Emitted
+    when setup_claude_dr (Layer 1) + CUA fallback (Layer 2) + pre-send
+    re-evaluation in ensure_deep_mode_active all confirm Research mode is
+    NOT active on Claude. Surfaces a degraded-mode decision to the user
+    instead of silently sending a chat-mode prompt that produces wrong-
+    output (regular chat reply where the prompt expected a Deep Research
+    artifact).
+
+    Uses pipeline_error semantics (not fail_phase / fail_agent) — same
+    pattern as _emit_pro_required_alert: we haven't FAILED the agent;
+    we're asking the user to decide between accepting degraded output,
+    skipping the agent, or stopping the run. fail_agent would write a
+    terminal 'errored' status which is wrong here.
+
+    Action set:
+      [Continue in chat mode] → continue_anyway → send in chat mode,
+                                 set agent_modes['claude'] sticky flag.
+      [Skip Claude]           → skip_agent claude → drop Phase 2B Claude
+                                 output; pipeline continues.
+      [Stop]                  → stop_pipeline → halt the run."""
+    emit_event(
+        "pipeline_error", phase=2, agent="claude",
+        error="Claude Research mode unavailable",
+        details=(
+            "Claude's Research mode setup failed: Playwright selectors "
+            "didn't find the Research tool, the CUA visual fallback also "
+            "couldn't enable it, and the just-before-send re-activation "
+            "didn't take. Continuing here would send the prompt in regular "
+            "chat mode — Claude returns a normal reply instead of the "
+            "multi-tool Deep Research artifact the pipeline expects.\n\n"
+            "• Continue in chat mode — accept the degraded output for "
+            "this run; Phase 2B will use Claude's chat reply as its result.\n"
+            "• Skip Claude — drop Phase 2B Claude output entirely; the "
+            "pipeline continues with ChatGPT and Gemini results.\n"
+            "• Stop — halt the run."
+        ),
+        actions=[
+            {"id": "continue_in_chat_mode", "label": "Continue in chat mode", "style": "default",
+             "command": {"action": "continue_anyway"}},
+            {"id": "skip_claude", "label": "Skip Claude", "style": "default",
+             "command": {"action": "skip_agent", "agent": "claude"}},
+            {"id": "stop", "label": "Stop", "style": "danger",
+             "command": {"action": "stop"}},
+        ],
+        dismissible=True,
+        alert_id="phase2_claude_chat_mode",
+        source="phase2/claude_setup_research_unavailable",
+    )
 
 
 def emit_browser_recovery_status(phase: int, agent: str | None = None):
@@ -14083,7 +14147,19 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     True we explicitly CLOSE artifact-1 first so the subsequent LAST-card click
     definitely opens a fresh panel onto artifact-2 (final report) — without
     this, relying on a panel-swap can race or no-op (artifact_count==1 case)
-    and silently extract artifact-1's references instead of the final report."""
+    and silently extract artifact-1's references instead of the final report.
+
+    E2 / DGOPS-7364 — when the run is in user-acknowledged chat mode (Research
+    setup couldn't be enabled and the operator chose Continue in chat mode),
+    Claude returns a regular chat reply with NO research artifact. Skip the
+    artifact-aware logic entirely and use the mode-agnostic DOM/JS extraction
+    tail. _is_sources_not_document rejection also bypassed in chat mode (it
+    expects the artifact shape that doesn't exist here)."""
+    # E2 / DGOPS-7364 — read sticky chat-mode flag set by start_agent_no_gemini_wait.
+    chat_mode = (getattr(_runtime, "agent_modes", {}) or {}).get("claude", {}).get("actual") == "chat"
+    if chat_mode:
+        log(f"[{label}] Running in CHAT MODE (user-acknowledged Research-unavailable) "
+            f"— bypassing artifact-aware extraction, using DOM/JS tail only")
     # Clear clipboard first so stale brief text doesn't get returned
     clear_clipboard()
     await asyncio.sleep(2)
@@ -14142,6 +14218,53 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             await asyncio.sleep(0.5)
     except Exception:
         pass
+    # E2 / DGOPS-7364 — chat mode early return.
+    # Claude in chat mode emits a regular assistant reply, NO artifact.
+    # The artifact-aware Methods 1-4 below all target aside / artifact-
+    # panel / [class*="artifact"] selectors that don't exist in chat mode,
+    # so they'd all return empty and the function would falsely report
+    # "All extraction methods failed". Instead, read the last assistant
+    # message via a tight selector list scoped to chat-turn content.
+    if chat_mode:
+        try:
+            md_chat = await _extract_html_to_md(page, [
+                '[data-message-author-role="assistant"]:last-of-type .markdown',
+                '[data-test-render-count] .font-claude-message:last-of-type',
+                '.font-claude-message:last-of-type',
+                'div[data-streamed]:last-of-type .markdown',
+                'div[data-is-streaming="false"]:last-of-type .markdown',
+            ], label)
+            if md_chat and len(md_chat) > 100:
+                log(f"[{label}] Extracted via chat-mode HTML→MD: {len(md_chat)} chars")
+                return md_chat
+        except Exception as _e:
+            log(f"[{label}] chat-mode HTML→MD failed: {_e}", "WARN")
+        # JS innerText tail for chat mode — broader pickup.
+        try:
+            text_chat = await page.evaluate("""() => {
+                const sels = [
+                    '[data-message-author-role="assistant"]',
+                    '.font-claude-message',
+                    '[data-test-render-count]',
+                ];
+                for (const s of sels) {
+                    const els = document.querySelectorAll(s);
+                    if (els.length > 0) {
+                        const last = els[els.length - 1];
+                        const t = last.innerText || '';
+                        if (t.length > 100) return t;
+                    }
+                }
+                return '';
+            }""")
+            if text_chat and len(text_chat) > 100:
+                log(f"[{label}] Extracted via chat-mode JS innerText: {len(text_chat)} chars")
+                return text_chat
+        except Exception as _e2:
+            log(f"[{label}] chat-mode JS innerText failed: {_e2}", "WARN")
+        log(f"[{label}] Chat-mode extraction returned no readable content", "WARN")
+        return ""
+    # Research-mode path below (unchanged from pre-E2 — the artifact-aware ladder).
     artifact_count = await _count_claude_artifacts(page)
     log(f"[{label}] Post-completion: found {artifact_count} artifact(s)")
 
@@ -14217,7 +14340,10 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     # the COPY call (action class: copy_open_artifact). Separate hotspots so
     # Vision agreement metrics stay distinct per action class. Retry cap 1.
     _claude_2d_attempts = 0
-    while _claude_2d_attempts < 2 and browser and cua_client:
+    # E2 / DGOPS-7364 — chat-mode skips this CUA artifact navigation entirely
+    # (no artifact exists; CUA would hunt for it and either time out or open
+    # the wrong content). Falls through to the mode-agnostic tail below.
+    while _claude_2d_attempts < 2 and browser and cua_client and not chat_mode:
         _claude_2d_attempts += 1
         log(f"[{label}] CUA: Navigating to final artifact "
             f"(attempt {_claude_2d_attempts}/2)...")
@@ -15330,9 +15456,27 @@ async def type_short_inline_prompt(page, platform, label):
         return False
 
 
-async def ensure_deep_mode_active(page, platform, label):
+async def ensure_deep_mode_active(page, platform, label) -> dict:
     """Just-before-send check: is the platform still in its required mode?
-    Re-activates if it has been toggled off. Returns the final state."""
+    Re-activates if it has been toggled off, then RE-EVALUATES state and
+    returns it.
+
+    E2 / DGOPS-7364 — return type was always-True; now returns a state
+    dict so the caller can gate Send on whether the required mode is
+    genuinely active (Claude specifically can fail Layer 1 + Layer 2 +
+    re-activation and still arrive here with research=False; old code
+    sent anyway, producing chat-mode output).
+
+    Returns:
+        {"platform": "chatgpt"|"gemini"|"claude",
+         "active": bool,                # platform-specific overall flag
+         # Claude only:
+         "hasExtended": bool, "researchOn": bool}
+
+    Errors are logged and treated as active=True (don't block the send
+    on a measurement failure — measurement bugs shouldn't gate Send).
+    The Claude branch is the only one whose caller actually gates on
+    the result for now per DGOPS-7364 scope."""
     platform_l = platform.lower()
     try:
         if platform_l == "chatgpt":
@@ -15351,7 +15495,7 @@ async def ensure_deep_mode_active(page, platform, label):
             if not active:
                 log(f"[{label}] Deep Research OFF before send — re-activating", "WARN")
                 await setup_chatgpt_dr(page)
-            return True
+            return {"platform": "chatgpt", "active": True}
         if platform_l == "gemini":
             active = await page.evaluate("""() => {
                 const pills = document.querySelectorAll('button, [role="button"], span');
@@ -15364,10 +15508,10 @@ async def ensure_deep_mode_active(page, platform, label):
             if not active:
                 log(f"[{label}] Gemini Deep Research chip OFF before send — re-activating", "WARN")
                 await setup_gemini_dr(page)
-            return True
+            return {"platform": "gemini", "active": True}
         if platform_l == "claude":
-            # Check BOTH: Opus Extended model AND Research tool are on
-            state = await page.evaluate("""() => {
+            # Check BOTH: Opus Extended model AND Research tool are on.
+            _claude_state_js = """() => {
                 const txt = (document.body.innerText || '').toLowerCase();
                 const hasExtended = txt.includes('opus') && txt.includes('extended');
                 // Research tool shows as a magnifying-glass icon / label near composer
@@ -15382,15 +15526,26 @@ async def ensure_deep_mode_active(page, platform, label):
                                 b.classList.contains('selected'));
                     });
                 return { hasExtended, researchOn };
-            }""")
+            }"""
+            state = await page.evaluate(_claude_state_js)
             if not state.get("hasExtended") or not state.get("researchOn"):
                 log(f"[{label}] Claude mode regressed before send "
                     f"(extended={state.get('hasExtended')}, research={state.get('researchOn')}) — re-activating", "WARN")
                 await setup_claude_dr(page)
-            return True
+                # E2 — re-evaluate AFTER the re-activation attempt so the
+                # caller sees the actual final state, not the pre-fix one.
+                # If Step 3A/3B selectors are still broken, researchOn will
+                # remain False and the caller pauses for user decision.
+                state = await page.evaluate(_claude_state_js)
+                log(f"[{label}] Claude mode post-re-activate: "
+                    f"extended={state.get('hasExtended')}, research={state.get('researchOn')}", "INFO")
+            ok = bool(state.get("hasExtended") and state.get("researchOn"))
+            return {"platform": "claude", "active": ok,
+                    "hasExtended": bool(state.get("hasExtended")),
+                    "researchOn": bool(state.get("researchOn"))}
     except Exception as e:
         log(f"[{label}] ensure_deep_mode_active error: {e}", "WARN")
-    return True
+    return {"platform": platform_l, "active": True}
 
 
 async def detect_human_verification(page, platform: str, label: str) -> tuple[bool, str]:
@@ -15931,7 +16086,60 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # ── Just-before-send: ensure the required mode is STILL active ──
     # Claude especially can silently drop Research tool / Extended model
     # between setup and send. Re-activate if needed.
-    await ensure_deep_mode_active(page, platform, label)
+    mode_state = await ensure_deep_mode_active(page, platform, label)
+
+    # ── E2 / DGOPS-7364 — Claude chat-mode gate ──
+    # If Layer 1 (setup_claude_dr) + Layer 2 (CUA validation) + the just-
+    # done pre-send re-activation have all failed to enable Research mode
+    # on Claude, do NOT silently send a regular chat prompt — that produces
+    # a wrong-output (chat reply) instead of a multi-tool Deep Research
+    # artifact. Pause and emit a phase_alert so the operator decides.
+    # ChatGPT/Gemini paths intentionally NOT gated here per ticket scope
+    # (filed separately if they ever exhibit the same regression).
+    if platform_l == "claude":
+        research_ok = bool((mode_state or {}).get("researchOn"))
+        if not research_ok:
+            log(f"[{label}] Research mode unavailable after Layer 1 + Layer 2 + "
+                f"pre-send re-activation — emitting chat-mode decision alert", "WARN")
+            _emit_claude_chat_mode_alert()
+            _controls.request_pause("claude_chat_mode")
+            emit_event("pipeline_paused", phase=2, agent="claude", reason="claude_chat_mode")
+            await _controls.wait_if_paused()
+            if _controls.is_stop():
+                emit_event("pipeline_stopped", phase=2, agent="claude",
+                           reason="user_stop_chat_mode")
+                return page, False
+            decision = await _controls.await_agent_decision("claude", timeout=600.0)
+            log(f"[{label}] Chat-mode user decision: {decision}", "INFO")
+            if decision == "stop":
+                emit_event("pipeline_stopped", phase=2, agent="claude",
+                           reason="user_stop_chat_mode")
+                return page, False
+            if decision == "skip":
+                _runtime.agent_modes["claude"] = {
+                    "requested": "research", "actual": "skipped",
+                    "user_acknowledged_chat": False,
+                }
+                emit_event("agent_skipped", phase=2, agent="claude",
+                           reason="research_unavailable_user_skip")
+                fail_agent(platform_l, "Claude skipped — Research unavailable",
+                           "User opted to skip Phase 2B Claude after Research mode "
+                           "could not be enabled.")
+                return page, False
+            # continue_anyway / timeout → proceed in chat mode with sticky flag.
+            _runtime.agent_modes["claude"] = {
+                "requested": "research", "actual": "chat",
+                "user_acknowledged_chat": True,
+            }
+            log(f"[{label}] Proceeding in CHAT MODE — user acknowledged "
+                f"(downstream extraction will use mode-agnostic path)", "WARN")
+            emit_event("pipeline_resumed", phase=2, agent="claude",
+                       reason="continue_chat_mode")
+        else:
+            _runtime.agent_modes["claude"] = {
+                "requested": "research", "actual": "research",
+                "user_acknowledged_chat": False,
+            }
 
     # Brief ready — now click Send
     await asyncio.sleep(1)
