@@ -11095,6 +11095,21 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                                "verified": True, "primary": True}])
         except Exception:
             pass
+        # F4 (2026-05-06): persist agent terminal status to root doc on
+        # the individual complete-emit instead of waiting for the bulk
+        # phase_complete write at :19641. On chat reopen mid-Phase-2,
+        # an agent that finished early (e.g. ChatGPT done while Claude
+        # is still researching) should already show as 100% complete in
+        # research.agents[k].status — pre-fix, only the message bucket
+        # carried the done state, and reopen rebuilt the bucket from
+        # Firestore which lacked the runtime status until phase_complete
+        # bulk-flushed all three. Idempotent with the bulk write — same
+        # field, same value. FE companion at usePipeline.ts agent_progress
+        # handler also writes this client-side for redundancy.
+        try:
+            _write_agent_terminal_status(agent_key, "complete")
+        except Exception:
+            pass
     else:
         # No content extracted OR no anchor OR Firestore write failed — emit
         # failed (FE keeps spinner, never flips ✓ without a reachable doc).
