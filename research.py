@@ -10223,6 +10223,15 @@ async def extract_source_urls_via_vision(page, agent_key: str,
     return filtered[:50]
 
 
+class _BriefStreamStalled(Exception):
+    """Raised by poll_until_done when ChatGPT's brief stream goes flat on
+    text + sources + steps for STALL_THRESHOLD_SEC. Distinct from a wall-
+    clock timeout so the P1 caller can show stall-specific copy
+    ('ChatGPT stream stalled — text + sources flat for 20 min') instead
+    of the legacy 'Brief generation timed out after 45 min' message."""
+    pass
+
+
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                           browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
@@ -10257,14 +10266,13 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     stall_window_start = None  # time.time() when ALL signals stopped growing
     STALL_THRESHOLD_SEC = 1200  # 20 min of multi-signal flatness → likely stuck
 
-    # Subtract paused_total from elapsed so a long user pause doesn't make
-    # this inner timer falsely fire after resume. Without this, a user who
-    # pauses for an hour during P1 would return to a poll loop that thinks
-    # MAX_WAIT_PRO=45min has elapsed and aborts before checking if the brief
-    # actually completed server-side. The outer active-time deadline
-    # (_await_phase_with_active_deadline) is the ultimate safety net but
-    # this inner check should also be pause-aware so it doesn't false-fire.
-    while (time.time() - wait_start - paused_total) < max_wait:
+    # 2026-05-06 (Stream 2 D2): no inner wall-clock cap. The outer
+    # _await_phase_with_active_deadline at the call site is the sole
+    # ceiling (P1: 60m advisory soft-warn). paused_total / max_wait
+    # accumulators kept as harmless dead state to preserve the function
+    # signature; only the multi-signal stall detector below raises
+    # _BriefStreamStalled.
+    while True:
         # ── Browser-crash detection ──
         # If the underlying tab closed unexpectedly (Chromium crash, OOM,
         # user closed it, profile lock fight) every page op below will
@@ -10771,11 +10779,11 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             # Stall surface: detector still says "running" but ALL three
             # signals (text + sources + steps) stopped growing for
             # STALL_THRESHOLD_SEC. Catches the "ChatGPT alive but frozen
-            # mid-stream" case proactively — raises into the phase retry-
-            # loop's `except asyncio.TimeoutError:` so the user gets the
-            # [Retry, Skip] alert. Multi-signal makes false alarms
-            # vanishingly rare: ChatGPT DR's researching phase always
-            # grows sources/steps even when text doesn't.
+            # mid-stream" case proactively — raises _BriefStreamStalled
+            # (Stream 2 D3) so the P1 caller can show stall-specific copy
+            # distinct from a wall-clock timeout. Multi-signal makes false
+            # alarms vanishingly rare: ChatGPT DR's researching phase
+            # always grows sources/steps even when text doesn't.
             if (stall_window_start is not None
                     and (time.time() - stall_window_start) > STALL_THRESHOLD_SEC):
                 _stall = int(time.time() - stall_window_start)
@@ -10783,7 +10791,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     f"sources={last_seen_sources}, steps={last_seen_steps_sig} — "
                     f"all flat for {_stall}s while detector says generating "
                     f"→ surfacing for user decision (Retry/Skip)", "WARN")
-                raise asyncio.TimeoutError(
+                raise _BriefStreamStalled(
                     f"phase {phase} response stalled "
                     f"(text={last_seen_len}, sources={last_seen_sources}, "
                     f"steps={last_seen_steps_sig}; flat for {_stall}s)"
@@ -10792,9 +10800,6 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
         elapsed_min = int(time.time() - wait_start) // 60
         log(f"[{label}] Still generating... ({elapsed_min}m elapsed)")
         await asyncio.sleep(poll_interval)
-
-    log(f"[{label}] Timeout ({max_wait_min}min)", "WARN")
-    return False
 
 
 # ── Round-Robin Polling (Phase 2) ─────────────────────────────────────────────
@@ -14236,40 +14241,44 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     _runtime.sub_state = "1_brief_generating"
     _runtime.register_page("chatgpt", browser.page, browser.page.url)
 
-    # Wait for response
-    log(f"Polling for response (every {POLL_PRO}s, max {MAX_WAIT_PRO}min)...")
-    completed = await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1", POLL_PRO, MAX_WAIT_PRO,
-        browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
-    # Unregister once brief is done
-    _runtime.unregister_page("chatgpt", final_status="done" if completed else "timeout")
-    # If the poll timed out (45 min default), tell the user we're still
-    # going to try extracting whatever streamed so far rather than trash
-    # the phase. The brief-short check below handles the "partial / empty"
-    # case; this emit just explains the timeout.
-    if not completed:
-        retries_left_p1t = max(0, 2 - _retry_count)
+    # Wait for response. 2026-05-06 (Stream 2 D2/D3): no inner wall-clock
+    # cap — the outer _await_phase_with_active_deadline(1, PHASE_1_MAX_MIN,
+    # soft_warn_only=True) is the sole P1 ceiling. Multi-signal stall
+    # detector inside poll_until_done raises _BriefStreamStalled if
+    # ChatGPT freezes mid-stream (text + sources + steps flat for 20m).
+    log(f"Polling for response (every {POLL_PRO}s)...")
+    try:
+        completed = await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1", POLL_PRO, MAX_WAIT_PRO,
+            browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
+    except _BriefStreamStalled as _bs:
+        log(f"Phase 1: brief stream stalled — {_bs}", "WARN")
+        _runtime.unregister_page("chatgpt", final_status="stalled")
+        retries_left_p1s = max(0, 2 - _retry_count)
         fail_phase(1,
-                   f"Brief generation timed out after {MAX_WAIT_PRO} min",
-                   "ChatGPT Pro + Thinking was still running at the wall-clock cap. Retry re-submits a fresh brief request. Skip drops Phase 1 and asks for a manual brief.",
+                   "ChatGPT stream stalled — text + sources flat for 20 min",
+                   "ChatGPT stopped streaming output mid-brief. Retry restarts the brief from scratch; Skip drops Phase 1 and asks for a manual brief.",
                    agent="chatgpt",
-                   can_retry=retries_left_p1t > 0)
-        if retries_left_p1t > 0:
-            p1t_decision = await _controls.await_phase_decision(1)
-            log(f"Phase 1 brief-timeout decision: {p1t_decision}")
-            if p1t_decision == "stop":
+                   can_retry=retries_left_p1s > 0)
+        if retries_left_p1s > 0:
+            p1s_decision = await _controls.await_phase_decision(1)
+            log(f"Phase 1 stall decision: {p1s_decision}")
+            if p1s_decision == "stop":
                 return None
-            if p1t_decision == "retry":
+            if p1s_decision == "retry":
                 try:
                     emit_event("phase_restart", phase=1,
-                               reason="user_retry_brief_timeout",
+                               reason="user_retry_brief_stall",
                                attempt=_retry_count + 2)
                 except Exception:
                     pass
-                _runtime.unregister_page("chatgpt", final_status="timeout-retrying")
                 return await run_phase1(browser, cua_client, topic, pdf_paths,
                                         verbose=verbose, feedback=feedback,
                                         _retry_count=_retry_count + 1)
-            # skip / timeout → fall through and extract whatever streamed
+            # skip → fall through and extract whatever streamed
+        completed = False
+    # Unregister once brief is done (also covers stall-skip fall-through;
+    # idempotent — safe to call even if already unregistered above).
+    _runtime.unregister_page("chatgpt", final_status="done" if completed else "stalled-skipped")
 
     # ── Mid-Phase-1 injection: if user sent context while brief was generating,
     #    submit it as a follow-up to ChatGPT and wait for the updated brief ──
@@ -14298,9 +14307,12 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             browser=browser, cua_client=cua_client, max_retries=10, interval=3, verbose=verbose)
         if verified_fu:
             log("Phase 1: Waiting for updated brief...")
-            await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1-followup",
-                POLL_PRO, 15,  # 15 min max for follow-up (shorter than initial)
-                browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
+            try:
+                await poll_until_done(browser.page, verify_chatgpt_generating, "Phase1-followup",
+                    POLL_PRO, 15,  # 15 min max — dead arg post-D2; kept for signature stability
+                    browser=browser, cua_client=cua_client, verbose=verbose, phase=1)
+            except _BriefStreamStalled as _bs_fu:
+                log(f"Phase 1 followup stalled — using pre-followup brief: {_bs_fu}", "WARN")
         else:
             log("Phase 1: Follow-up may not have triggered generation — using original brief", "WARN")
 
