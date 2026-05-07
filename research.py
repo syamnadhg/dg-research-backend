@@ -2487,13 +2487,20 @@ def _write_agent_terminal_status(agent_key: str, status: str):
                       because re-enable applies to future phases (P3+),
                       and only P2 has per-agent records — no real surface.
       - "errored"   → on fail_agent terminal (no successful retry by run end).
+      - "running"   → transient (NOT terminal) status written on user
+                      Retry intake to clear the persisted "errored" badge
+                      immediately. Helper name still says "terminal" for
+                      historic reasons — kept since renaming would touch
+                      every callsite. fail_agent overwrites with "errored"
+                      if the retry also fails; phase_complete overwrites
+                      with "complete" on success.
 
     Uses set+merge with dotted path so we don't clobber the rest of the
     agents map (other agents' sources/sourceUrls/etc.).
     """
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return
-    if not agent_key or status not in ("complete", "skipped", "errored"):
+    if not agent_key or status not in ("complete", "skipped", "errored", "running"):
         return
     try:
         _threading.Thread(
@@ -2532,12 +2539,23 @@ def _do_phase_terminal_status_write(phase_num: int, status: str):
 
 
 def _write_phase_terminal_status(phase_num: int, status: str):
-    """Persist a per-phase terminal status to the root research doc.
-    Mirror of _write_agent_terminal_status for phases. Used by tile +
-    chat phase icons to color the phase node correctly after reload.
+    """Persist a per-phase status to the root research doc. Mirror of
+    _write_agent_terminal_status for phases. Used by tile + chat phase
+    icons to color the phase node correctly after reload.
+
     Config skips (user toggled the phase off in pipelineConfig) are NOT
     written — they stay derived from pipelineConfig.skippedPhases so a
     re-enable mid-run isn't masked by stale "skipped" status.
+
+    Allowlist:
+      - "complete" / "skipped" / "errored" — terminal states, written
+                                             from phase_complete /
+                                             phase_skipped / fail_phase.
+      - "running" — transient pre-retry intake (helper name still says
+                    "terminal" for historic reasons). Written from the
+                    retry_phase command handler to clear the persisted
+                    "errored" badge before the retry runs. fail_phase
+                    rewrites "errored" if the retry also fails.
 
     Tile/Icon Consistency (2026-05-01). Fire-and-forget on a daemon
     thread (same B2 rationale as _write_agent_terminal_status). The
@@ -2548,7 +2566,7 @@ def _write_phase_terminal_status(phase_num: int, status: str):
     """
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return
-    if status not in ("complete", "skipped", "errored"):
+    if status not in ("complete", "skipped", "errored", "running"):
         return
     try:
         _threading.Thread(
@@ -2826,6 +2844,15 @@ def _start_command_listener(uid, research_id, loop):
                 except (TypeError, ValueError):
                     _ph = None
                 if _ph is not None:
+                    # Clear persisted "errored" status before the retry runs so
+                    # the FE tile + chat phase icon flip from red to neutral on
+                    # user intake. Without this the badge sticks until the next
+                    # phase_complete (or until another fail_phase rewrites it),
+                    # which means a successful retry leaves the red badge until
+                    # phase end. fail_phase rewrites "errored" if the retry
+                    # also fails — the volatile phaseAlerts repaint covers the
+                    # FE side. Fire-and-forget; safe to race with phase_complete.
+                    _write_phase_terminal_status(_ph, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_phase, _ph)
                     loop.call_soon_threadsafe(_controls.request_resume)
                     log(f"Command received: RETRY_PHASE phase={_ph}")
@@ -2851,6 +2878,11 @@ def _start_command_listener(uid, research_id, loop):
                 _ag_norm = _ag.lower()
                 _agent_pre_failed = _ag_norm in (_controls.skipped_agents or set())
                 if _ag and (_mode == "hard" or _agent_pre_failed):
+                    # Clear persisted "errored" badge so the FE flips from red
+                    # to neutral on user intake. fail_agent rewrites "errored"
+                    # if the retry also fails. Same race-class as the
+                    # retry_phase analog above; phase_complete may overwrite.
+                    _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent_hard, _ag)
                     if _agent_pre_failed:
                         # Drop the pre-fail skip marker so the hard-retry path
@@ -2863,6 +2895,9 @@ def _start_command_listener(uid, research_id, loop):
                     else:
                         log(f"Command received: RETRY_AGENT agent={_ag} mode=hard")
                 elif _ag:
+                    # Same rationale as the hard path above — clear persisted
+                    # "errored" before soft-retry dispatch so the badge flips.
+                    _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent, _ag)
                     log(f"Command received: RETRY_AGENT agent={_ag} mode=soft")
                 else:
