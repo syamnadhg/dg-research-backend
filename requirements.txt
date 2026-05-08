@@ -31,3 +31,11 @@ google-cloud-firestore>=2.0
 
 # Setup QR code rendering
 qrcode>=7.4
+
+# Testing — added 2026-05-07 to support F4 security tests (DGOPS-7451).
+# tests/test_f4_security.py runs pure-unit + mocked-context tests for
+# _matches_security_deny_host, _read_security_deny_hosts,
+# _detect_persisted_google_auth, _scrub_persisted_google_auth.
+# Run via `pytest tests/test_f4_security.py -v`.
+pytest>=8.0
+pytest-asyncio>=0.23
