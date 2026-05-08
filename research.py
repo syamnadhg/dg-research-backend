@@ -23395,6 +23395,14 @@ async def run_pair(profile_dir, wait_minutes=10):
                 # "logged in?", not "as whom?". Trust the user to fix the
                 # account in-tab; the Pro check at least catches the most
                 # common silent miscompare (work=Free, personal=Pro).
+                #
+                # Control-flow contract (refactored 2026-05-07 to address
+                # PR review C4 — original was correct but reviewers misread
+                # the break-then-fall-through pattern as a skip-bug).
+                # Each branch below now sets platform_ok + break EXPLICITLY,
+                # eliminating the dangling unconditional `platform_ok = True`
+                # at the end of the if cua_ok body that previously read as
+                # "always set True after any cua_ok=True". No behavior change.
                 if (key in _PRO_TIER_PROMPT_BY_KEY
                         and not pair_pro_acknowledged):
                     print(f"  {_c(_DIM, 'Verifying subscription tier…')}")
@@ -23463,10 +23471,20 @@ async def run_pair(profile_dir, wait_minutes=10):
                         break
                     elif tier == "pro":
                         log(f"    Setup: {name} Pro detected", "INFO")
+                        platform_ok = True
+                        break
                     else:  # unsure → fail open
                         log(f"    Setup: {name} tier UNSURE — assuming Pro (fail-open)", "INFO")
-                platform_ok = True
-                break
+                        platform_ok = True
+                        break
+                else:
+                    # Either pair_pro_acknowledged is True (user already
+                    # chose Continue-with-Free on a prior platform), or
+                    # this platform isn't in _PRO_TIER_PROMPT_BY_KEY (e.g.,
+                    # NotebookLM, where the pro-tier prompt doesn't apply).
+                    # CUA confirmed login — that's enough.
+                    platform_ok = True
+                    break
             print(f"  {_c(_WARN, 'CUA could not confirm login — try again and press Enter.')}")
 
         if cancelled:
