@@ -9351,6 +9351,97 @@ async def _read_claude_artifact_panel(page):
         return ""
 
 
+async def _try_claude_artifact_copy_button(page, label):
+    """Click Claude's artifact-panel Copy button. Returns clipboard
+    content (markdown) on success, "" on any failure.
+
+    Tier 2 of extract_claude_response (research-mode): scoped to the
+    artifact-panel header (aside / [class*="artifact-panel"] /
+    [class*="side-panel"]). Excludes Close/Dismiss/Publish/Share/X
+    buttons so we never click a panel-dismiss control by accident.
+
+    Cheap (single DOM click), agent-canonical (Claude's own button
+    returns the markdown its users see). Wayland-fragile — clipboard
+    returns 0 chars on Linux/Wayland regardless of click success — so
+    empty/short clip is silently treated as "fall through to next tier".
+    """
+    try:
+        # Clear clipboard FIRST so we measure only what THIS click writes.
+        # Avoids stale-clipboard false-positives when a prior step left
+        # something there.
+        try:
+            clear_clipboard()
+        except Exception:
+            pass
+
+        clicked = await page.evaluate("""() => {
+            const PANEL_ROOTS = [
+                'aside',
+                '[class*="artifact-panel"]',
+                '[class*="side-panel"]',
+                '[class*="right-panel"]',
+            ];
+            for (const root_sel of PANEL_ROOTS) {
+                const root = document.querySelector(root_sel);
+                if (!root) continue;
+                const buttons = root.querySelectorAll('button');
+                for (const b of buttons) {
+                    const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const txt = (b.textContent || '').trim().toLowerCase();
+                    // Defense-in-depth: never click Close / Dismiss / X /
+                    // Publish / Share — they live in the same panel header.
+                    if (aria.includes('close') || aria.includes('dismiss')) continue;
+                    if (aria.includes('publish') || aria.includes('share')) continue;
+                    if (txt === '×' || txt === 'x') continue;
+                    // Match Copy: aria-label exact "copy" or contains
+                    // "copy artifact"/"copy markdown"/"copy to clipboard",
+                    // or visible text "copy".
+                    const isCopy = (
+                        aria === 'copy' ||
+                        aria.includes('copy artifact') ||
+                        aria.includes('copy markdown') ||
+                        aria.includes('copy to clipboard') ||
+                        txt === 'copy'
+                    );
+                    if (isCopy) {
+                        b.click();
+                        return { ok: true, root: root_sel, aria, text: txt };
+                    }
+                }
+            }
+            return { ok: false };
+        }""")
+        if not clicked.get("ok"):
+            return ""
+
+        log(f"[{label}] Clicked artifact-panel Copy button "
+            f"(root={clicked.get('root')}, aria='{clicked.get('aria')}', "
+            f"text='{clicked.get('text')}')")
+        await asyncio.sleep(0.7)  # Let the clipboard write settle.
+
+        clip = get_clipboard() or ""
+        if len(clip) < 100:
+            log(f"[{label}] Copy button: clipboard returned {len(clip)} chars "
+                f"— too short, falling through", "WARN")
+            return ""
+
+        if _is_sources_not_document(clip, platform="claude"):
+            log(f"[{label}] Copy button: wrong artifact in clipboard "
+                f"({len(clip)} chars) — falling through", "WARN")
+            try:
+                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                           op="finalize_copy", length=len(clip),
+                           tier="copy_button")
+            except Exception:
+                pass
+            return ""
+
+        return clip
+    except Exception as e:
+        log(f"[{label}] Copy button error: {e} — falling through", "WARN")
+        return ""
+
+
 def _is_sources_not_document(text, *, platform="generic"):
     """Strict invariant guard for Phase 2 finalize extraction:
     extract_*_response must return the DOCUMENT (final report markdown),
@@ -14607,11 +14698,85 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                         pass
                     return panel_text
 
-    # Method 2: CUA opens the correct artifact and copies it.
+    # Method 2 (NEW 2026-05-07): artifact-panel Copy button. Cheap (single
+    # DOM click), agent-canonical (Claude renders the same markdown its
+    # users see), wrong-artifact-shape guarded. Falls through silently
+    # when the button isn't present, the click misfires, the clipboard
+    # returns empty (Wayland), or the contents look like a checklist
+    # rather than a document. Inserted between HTML→MD (Method 1) and the
+    # broader DOM/JS fallbacks so the cost-ordered ladder mirrors
+    # ChatGPT's pattern (free tiers first, expensive CUA last).
+    if not chat_mode:
+        copy_text = await _try_claude_artifact_copy_button(page, label)
+        if copy_text and len(copy_text) > 100:
+            log(f"[{label}] Extracted via artifact-panel Copy button: "
+                f"{len(copy_text)} chars")
+            return copy_text
+
+    # Method 3: HTML→MD (artifact-panel scoped — the prior list included
+    # `.font-claude-message` and `.contents .prose` which read the LEFT
+    # conversation column, admitting chat-transcript content. Now scoped
+    # to the right-side artifact panel only; chat-transcript guard in
+    # _is_sources_not_document catches anything that slips through.)
+    md = await _extract_html_to_md(page, [
+        '[data-testid="artifact-content"]',
+        '.artifact-content',
+        '.artifact-panel .contents',
+        'aside .markdown',
+        'aside .prose',
+        '[class*="artifact-panel"] [class*="content"]',
+        '[class*="artifact"] .ProseMirror',
+        '[class*="artifact"] [class*="rendered"]',
+    ], label)
+    if md and len(md) > 100:
+        if _is_sources_not_document(md, platform="claude"):
+            log(f"[{label}] HTML→MD wrong-artifact ({len(md)} chars) — skipping", "WARN")
+            try:
+                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                           op="finalize_copy", length=len(md), tier="dom_html_md")
+            except Exception:
+                pass
+        else:
+            return md
+
+    # Method 4: JS fallback (artifact-panel scoped — same narrowing as
+    # Method 3 above; chat-transcript guard catches stragglers).
+    try:
+        text = await page.evaluate("""() => {
+            const r = document.querySelectorAll(
+                '[data-testid="artifact-content"], .artifact-content, ' +
+                '.artifact-panel .contents, aside .markdown, aside .prose, ' +
+                '[class*="artifact-panel"] [class*="content"], ' +
+                '[class*="artifact"] .ProseMirror, [class*="artifact"] [class*="rendered"]'
+            );
+            if (r.length > 0) return r[r.length - 1].innerText;
+            return '';
+        }""")
+        if text and len(text) > 100:
+            if _is_sources_not_document(text, platform="claude"):
+                log(f"[{label}] JS wrong-artifact ({len(text)} chars) — skipping", "WARN")
+                try:
+                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                               op="finalize_copy", length=len(text), tier="dom_js")
+                except Exception:
+                    pass
+            else:
+                log(f"[{label}] Extracted via JS: {len(text)} chars")
+                return text
+    except Exception:
+        pass
+
+    # Method 5 (last resort): CUA opens the correct artifact and copies it.
     # 2026-04-26: split into TWO shadow-eval hotspots — `2d-nav` wraps the
     # NAVIGATE call (action class: click_last_artifact_card), `2d-copy` wraps
     # the COPY call (action class: copy_open_artifact). Separate hotspots so
     # Vision agreement metrics stay distinct per action class. Retry cap 1.
+    # 2026-05-07 reorder: moved from Method 2 → Method 5 (last resort).
+    # Cost-ordered: free DOM tiers run first, CUA only when all of them
+    # fail. Mirrors ChatGPT's CUA-last pattern. Wrong-artifact recovery
+    # (CUA's original purpose at the old Method 2 position) still works —
+    # it just runs after the free tiers reject the wrong-artifact content
+    # via _is_sources_not_document guards.
     _claude_2d_attempts = 0
     # E2 / DGOPS-7364 — chat-mode skips this CUA artifact navigation entirely
     # (no artifact exists; CUA would hunt for it and either time out or open
@@ -14704,59 +14869,6 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             continue
         log(f"[{label}] Extracted via CUA artifact copy: {len(clipboard)} chars")
         return clipboard
-
-    # Method 3: HTML→MD (artifact-panel scoped — the prior list included
-    # `.font-claude-message` and `.contents .prose` which read the LEFT
-    # conversation column, admitting chat-transcript content. Now scoped
-    # to the right-side artifact panel only; chat-transcript guard in
-    # _is_sources_not_document catches anything that slips through.)
-    md = await _extract_html_to_md(page, [
-        '[data-testid="artifact-content"]',
-        '.artifact-content',
-        '.artifact-panel .contents',
-        'aside .markdown',
-        'aside .prose',
-        '[class*="artifact-panel"] [class*="content"]',
-        '[class*="artifact"] .ProseMirror',
-        '[class*="artifact"] [class*="rendered"]',
-    ], label)
-    if md and len(md) > 100:
-        if _is_sources_not_document(md, platform="claude"):
-            log(f"[{label}] HTML→MD wrong-artifact ({len(md)} chars) — skipping", "WARN")
-            try:
-                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                           op="finalize_copy", length=len(md), tier="dom_html_md")
-            except Exception:
-                pass
-        else:
-            return md
-
-    # Method 4: JS fallback (artifact-panel scoped — same narrowing as
-    # Method 3 above; chat-transcript guard catches stragglers).
-    try:
-        text = await page.evaluate("""() => {
-            const r = document.querySelectorAll(
-                '[data-testid="artifact-content"], .artifact-content, ' +
-                '.artifact-panel .contents, aside .markdown, aside .prose, ' +
-                '[class*="artifact-panel"] [class*="content"], ' +
-                '[class*="artifact"] .ProseMirror, [class*="artifact"] [class*="rendered"]'
-            );
-            if (r.length > 0) return r[r.length - 1].innerText;
-            return '';
-        }""")
-        if text and len(text) > 100:
-            if _is_sources_not_document(text, platform="claude"):
-                log(f"[{label}] JS wrong-artifact ({len(text)} chars) — skipping", "WARN")
-                try:
-                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                               op="finalize_copy", length=len(text), tier="dom_js")
-                except Exception:
-                    pass
-            else:
-                log(f"[{label}] Extracted via JS: {len(text)} chars")
-                return text
-    except Exception:
-        pass
 
     try:
         emit_event("extract_failed", phase=2, agent="claude",
