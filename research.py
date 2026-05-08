@@ -193,6 +193,12 @@ _RESOLVED_KEY_CACHE = {"key": None, "ts": 0.0}
 _RESOLVED_KEY_TTL = 60.0  # seconds — long enough to absorb hot-path callers (narrator
                           # ticks every 6s in P1/P2), short enough to pick up rotated
                           # keys without a restart.
+_RESOLVED_KEY_NONE_TTL = 5.0  # seconds — shorter TTL when no key is found, so
+                              # users adding/rotating a key (Account page,
+                              # PowerShell SetEnvironmentVariable) recover
+                              # within ~5s instead of waiting out the full
+                              # 60s. Addresses PR review C1 (Copilot — None
+                              # caching blocked fast recovery on retry).
 
 
 def resolve_api_key(cli_key=None):
@@ -216,10 +222,16 @@ def resolve_api_key(cli_key=None):
         return cli_key
     # Hot-path cache. Without it: every narrator tick (6s in P1/P2) triggers
     # a Firestore RPC + 2 PowerShell subprocess spawns + an INFO log line.
-    # 60s TTL gives near-zero overhead while still picking up rotated keys
-    # within a minute.
-    if time.time() - _RESOLVED_KEY_CACHE["ts"] < _RESOLVED_KEY_TTL:
-        return _RESOLVED_KEY_CACHE["key"]
+    # Differentiated TTLs (PR review C1):
+    #   - 60s when a real key is cached — stable, hot-path absorption.
+    #   -  5s when None is cached — operator may have just added a key
+    #     (Account page / PowerShell SetEnvironmentVariable); a 60s blind
+    #     window blocks fast recovery on retry. Shorter TTL means a
+    #     freshly-added key is picked up almost immediately.
+    _cached_key = _RESOLVED_KEY_CACHE["key"]
+    _ttl = _RESOLVED_KEY_TTL if _cached_key is not None else _RESOLVED_KEY_NONE_TTL
+    if time.time() - _RESOLVED_KEY_CACHE["ts"] < _ttl:
+        return _cached_key
     # 2. Firestore Account page key
     fs_keys = _read_firestore_api_keys()
     if fs_keys.get("anthropic"):
