@@ -4575,12 +4575,48 @@ _BAD_URL_PATTERNS = [
 # separation (mitigation 2), run-start auth scrub (3), Playwright route
 # deny-list (4), public-share visibility event (5).
 
-_SECURITY_DENY_HOSTS = (
-    "web.app",
-    "firebaseapp.com",
-    "distributedglobal.com",
-    "dg-eng.com",
+# Default deny-list — tightened to DG-specific hostnames after PR review
+# C5 (Copilot). Previously included blanket suffix entries (`web.app`,
+# `firebaseapp.com`) which would block legitimate research sources hosted
+# on Firebase Hosting. Operators can extend via DG_SECURITY_DENY_HOSTS
+# env var (comma-separated) without code changes — addresses J1's "next
+# adjacent leak" concern, where a new internal app deployed to a TLD not
+# in the list would silently authenticate again. The audit-log event
+# payload (security_blocked_navigation) includes the requesting page's
+# referrer so post-hoc audit can answer "which page tried to navigate?"
+# — the early-warning signal Jason flagged.
+#
+# Examples of TLDs to watch when expanding the list: *.web.app /
+# *.firebaseapp.com / *.appspot.com / *.run.app / Vercel preview URLs /
+# custom DG-owned domains. Add specific known hostnames, not blanket
+# suffixes — the latter blocks legitimate research sources.
+_SECURITY_DENY_HOSTS_DEFAULT = (
+    "distributedglobal.com",        # DG corporate apex (incl. all subdomains)
+    "dg-eng.com",                    # DG engineering apex (incl. all subdomains)
+    "dg-security-monitor.web.app",  # Specific incident vector (2026-05-05)
 )
+
+
+def _read_security_deny_hosts() -> tuple:
+    """Read deny-list at module load. DG_SECURITY_DENY_HOSTS env var
+    (comma-separated) overrides the default list entirely. Operators
+    can extend without code change. Restart --serve for changes to take
+    effect."""
+    raw = os.environ.get("DG_SECURITY_DENY_HOSTS", "").strip()
+    if raw:
+        return tuple(h.strip().lower() for h in raw.split(",") if h.strip())
+    return _SECURITY_DENY_HOSTS_DEFAULT
+
+
+_SECURITY_DENY_HOSTS = _read_security_deny_hosts()
+
+# Emergency rollback (J2 principle preserved after SECURITY_SCRUB_MODE
+# was deleted in DGOPS-7451 fix — the route deny-list is now the only
+# load-bearing F4 defense, so operators need a kill switch in case it
+# ever blocks legit research). Default "1" (active). Set to "0" to
+# bypass M4 entirely. Restart --serve for changes to take effect.
+DG_SECURITY_DENY_LIST_ENABLED = os.environ.get(
+    "DG_SECURITY_DENY_LIST_ENABLED", "1") != "0"
 
 # Google auth cookie names — used by _detect_persisted_google_auth in the
 # pair flow to surface a prior Google account that would silently
@@ -9974,13 +10010,30 @@ class Browser:
                 host = (urlparse(request.url).hostname or "").lower()
                 pattern = _matches_security_deny_host(host)
                 if pattern:
+                    # Capture referrer for audit-log payload (PR review J1).
+                    # Answers "which page tried to navigate to the blocked
+                    # host?" — critical early-warning when the deny-list
+                    # has a gap (next internal app deployed to *.appspot.com
+                    # / *.run.app / custom DG domain). Best-effort: header
+                    # read can fail on some request types — fall through to
+                    # empty referrer rather than block the audit emit.
+                    referrer = ""
+                    try:
+                        hdrs = await request.all_headers()
+                        referrer = (hdrs.get("referer", "") or
+                                    hdrs.get("referrer", "") or "")
+                    except Exception:
+                        pass
                     log(f"[security] BLOCKED agent navigation to {host} "
-                        f"(matches deny-list *.{pattern}, url={request.url[:200]})", "WARN")
+                        f"(matches deny-list pattern={pattern}, "
+                        f"url={request.url[:200]}, "
+                        f"referrer={referrer[:120]})", "WARN")
                     try:
                         emit_event("security_blocked_navigation",
                                    host=host, pattern=pattern,
                                    url=request.url[:300],
-                                   resourceType=request.resource_type)
+                                   resourceType=request.resource_type,
+                                   referrer=referrer[:300])
                     except Exception:
                         pass
                     await route.abort("blockedbyclient")
@@ -9993,10 +10046,22 @@ class Browser:
                 await route.continue_()
             except Exception:
                 pass
-        try:
-            await self.context.route("**/*", _security_deny_route)
-        except Exception as _re:
-            log(f"[security] failed to install route deny-list: {_re}", "WARN")
+
+        # PR review J2 principle preserved via emergency env-gate. Default
+        # active. When DG_SECURITY_DENY_LIST_ENABLED=0, the deny-list is
+        # bypassed entirely (no install, no per-request overhead). The
+        # route deny-list is now the only load-bearing F4 defense (after
+        # storage scrub was removed in DGOPS-7451), so this gate matters
+        # for operators who need to disable it during incident response.
+        if DG_SECURITY_DENY_LIST_ENABLED:
+            try:
+                await self.context.route("**/*", _security_deny_route)
+            except Exception as _re:
+                log(f"[security] failed to install route deny-list: {_re}", "WARN")
+        else:
+            log("[security] route deny-list DISABLED via "
+                "DG_SECURITY_DENY_LIST_ENABLED=0 — M4 F4 defense is OFF",
+                "WARN")
 
         log("Browser started (stealth: patchright + channel=chrome)")
 
