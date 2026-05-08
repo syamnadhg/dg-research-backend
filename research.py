@@ -13418,9 +13418,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     p["flat_history"] = []
                     p["done_marker_first_at"] = 0.0
                 else:
-                    # Done-marker present — append snapshot. Need 3 snapshots
-                    # over ≥240s (2 polling cycles at 120s) all flat to extract.
-                    if p["done_marker_first_at"] == 0.0:
+                    # Done-marker present — append snapshot. Need 2 snapshots
+                    # over ≥30s all flat to extract (was 3 over ≥240s before
+                    # 2026-04-28 v2; see history block below).
+                    is_first_detection = (p["done_marker_first_at"] == 0.0)
+                    if is_first_detection:
                         p["done_marker_first_at"] = time.time()
                     p["flat_history"].append((
                         int(snap.get("text_len", 0) or 0),
@@ -13430,6 +13432,46 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     p["flat_history"] = p["flat_history"][-2:]
                     log(f"[{name}] Done-marker confirmed #{len(p['flat_history'])} — "
                         f"{dom_reason}; snap={snap}")
+                    # 2026-05-07 fast-confirm: on FIRST done-marker detection,
+                    # do an inline re-poll instead of waiting for the next
+                    # main-rotation tick (~120s at POLL_DEEP_RESEARCH cadence).
+                    # Without this, even though the 2-snapshot gate is
+                    # cheap to satisfy, the gap BETWEEN polling cycles is
+                    # the dominant post-completion wait — user-observed
+                    # "ChatGPT just finished but extraction hasn't started
+                    # yet". Sleep matches the elapsed_done floor (30s) so
+                    # the gate below clears in one shot. Trade-off: the
+                    # other pending agents' status updates are delayed by
+                    # ~30s on the iteration where any agent first detects
+                    # done-marker — one-time per agent, net win.
+                    if is_first_detection and len(p["flat_history"]) == 1:
+                        _confirm_secs = int(os.environ.get("DG_DONE_FAST_CONFIRM_SECS", "30"))
+                        log(f"[{name}] First done-marker — fast-confirm re-poll "
+                            f"in {_confirm_secs}s (skipping wait for next main-rotation tick)")
+                        await asyncio.sleep(_confirm_secs)
+                        try:
+                            dom_done2, dom_reason2, snap2 = await detect_fn(p["page"])
+                        except Exception as _de2:
+                            log(f"[{name}] fast-confirm detect_completion error: {_de2}", "WARN")
+                            dom_done2, dom_reason2, snap2 = (False, f"detect_error: {_de2}", {})
+                        if not dom_done2:
+                            # Done-marker disappeared during fast-confirm window —
+                            # agent transitioned between phases or streaming
+                            # resumed. Reset and let the main loop poll normally.
+                            p["flat_history"] = []
+                            p["done_marker_first_at"] = 0.0
+                            log(f"[{name}] Fast-confirm: done-marker lost after "
+                                f"{_confirm_secs}s — back to streaming. "
+                                f"Reason: {dom_reason2}")
+                            continue
+                        p["flat_history"].append((
+                            int(snap2.get("text_len", 0) or 0),
+                            int(snap2.get("sources", 0) or 0),
+                            int(snap2.get("steps", 0) or 0),
+                        ))
+                        p["flat_history"] = p["flat_history"][-2:]
+                        log(f"[{name}] Fast-confirm snapshot #2 captured — "
+                            f"{dom_reason2}; snap={snap2}")
                     elapsed_done = time.time() - p["done_marker_first_at"]
                     # 2026-04-28 v2: tightened gate — 2 snapshots over ≥30s
                     # (was 3 snapshots over ≥90s). Reason: at the default
