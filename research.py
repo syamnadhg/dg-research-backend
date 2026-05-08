@@ -4582,14 +4582,6 @@ _SECURITY_DENY_HOSTS = (
     "dg-eng.com",
 )
 
-# Auth-management surfaces — scrubbed at run start. Distinct from agent
-# chat domains (gemini.google.com, notebooklm.google.com, etc.) which
-# carry the long-lived platform sessions and MUST be preserved.
-_SECURITY_AUTH_SCRUB_DOMAINS = (
-    "accounts.google.com",
-    "myaccount.google.com",
-)
-
 # Google auth cookie names — used by _detect_persisted_google_auth in the
 # pair flow to surface a prior Google account that would silently
 # authenticate the agent on Workspace-protected resources.
@@ -4601,10 +4593,12 @@ _SECURITY_GOOGLE_AUTH_COOKIE_NAMES = (
     "SID", "HSID", "SSID", "SIDCC", "LSID",
 )
 
-# Agent platform domains — explicitly preserved during scrub since the
-# user paired these intentionally. NotebookLM rides on google.com but
-# its session lives on its own subdomain, distinct from the
-# accounts.google.com auth-management surface scrubbed by F4.
+# Agent platform domains — used by _detect_persisted_google_auth (M2)
+# to distinguish "user intentionally paired this account" from "different
+# Google account leaked into profile." Subdomains where Gemini /
+# NotebookLM / YouTube store their durable platform sessions are
+# exempted from M2's pair-flow auth detection so legitimate re-pair on
+# the same account doesn't trigger refusal.
 _SECURITY_PRESERVE_PLATFORM_DOMAINS = (
     "gemini.google.com",
     "notebooklm.google.com",
@@ -4613,11 +4607,6 @@ _SECURITY_PRESERVE_PLATFORM_DOMAINS = (
     "claude.ai",
     "claude.site",
 )
-
-# Toggle for fast rollback if scrub breaks Gemini/NotebookLM login.
-# "broad" — clear cookies + localStorage/IDB on auth-scrub domains.
-# "narrow" — skip cookie clear; only purge localStorage firebase:authUser:* keys.
-SECURITY_SCRUB_MODE = "broad"
 
 
 def _matches_security_deny_host(host: str) -> str | None:
@@ -4665,105 +4654,50 @@ async def _detect_persisted_google_auth(context) -> dict | None:
 
 
 async def _scrub_persisted_google_auth(context, *, scope: str = "run", reason: str = "") -> dict:
-    """Clear persisted Google auth state (cookies + localStorage + IDB) from
-    the browser context BEFORE agents take control. F4 mitigation 3 /
-    DGOPS-7451. Returns a counts summary and emits security_scrub event.
+    """Scrub cookies on internal-infra deny-list hosts BEFORE agents take
+    control. F4 mitigation 3 / DGOPS-7451 — defense-in-depth alongside
+    M4's network-layer route deny-list installed in Browser.start.
+    Never touches Google domains.
 
-    Surfaces scrubbed:
-      - Cookies on accounts.google.com / myaccount.google.com (auth surfaces)
-      - Cookies in _SECURITY_GOOGLE_AUTH_COOKIE_NAMES on .google.com IF
-        NOT in _SECURITY_PRESERVE_PLATFORM_DOMAINS (preserves Gemini/NLM)
-      - Cookies on each _SECURITY_DENY_HOSTS entry (internal infra)
-      - localStorage / sessionStorage / IndexedDB on the same origins,
-        accessed via a one-shot hidden page navigation.
+    Originally this function also wiped localStorage / sessionStorage /
+    IndexedDB on accounts.google.com + myaccount.google.com on every run,
+    plus cleared cookies on those auth-management surfaces. Removed
+    2026-05-07 — see commit "fix(F4): drop Google-domain auth scrub" —
+    after that storage wipe was found to cascade-invalidate Gemini /
+    NotebookLM / YouTube / Gmail / GoogleDoc sessions on every pipeline
+    run by removing cross-origin sign-in propagation state, even though
+    apex .google.com cookies were correctly preserved.
 
-    NARROW mode (SECURITY_SCRUB_MODE='narrow'): skip cookie clear; only
-    purge firebase:authUser:* / firebase:host:* localStorage keys on
-    deny-list domains. Use as a fast rollback if Gemini/NotebookLM
-    auth breaks under broad scrub.
+    The load-bearing defense for the 2026-05-05 incident vector is M4
+    (network-layer block on web.app / firebaseapp.com /
+    distributedglobal.com / dg-eng.com). M3 is now narrow defense-in-
+    depth — clears any leftover cookies on those internal-infra hosts so
+    state doesn't accumulate even though M4 would block any navigation
+    that tried to use them.
 
-    Best-effort throughout — any one origin failing must not break the
-    pipeline. Errors logged, not raised."""
-    summary = {"scope": scope, "reason": reason, "mode": SECURITY_SCRUB_MODE,
+    Best-effort throughout — any one cookie clear failing must not break
+    the pipeline. Errors logged, not raised."""
+    summary = {"scope": scope, "reason": reason,
                "cookiesCleared": 0, "originsCleared": 0, "errors": []}
 
-    if SECURITY_SCRUB_MODE == "broad":
-        try:
-            cookies = await context.cookies()
-        except Exception as e:
-            summary["errors"].append(f"cookie read: {e}")
-            cookies = []
-        to_clear: list[dict] = []
-        for c in cookies:
-            domain = (c.get("domain") or "").lower()
-            # Auth-management surfaces — always scrub. These hold the
-            # account-management state (chooser, sign-in pages, multi-account
-            # selector). Distinct from the platform-app domains
-            # (gemini.google.com, notebooklm.google.com) where the durable
-            # chat sessions live.
-            if any(domain == d or domain.endswith("." + d) for d in _SECURITY_AUTH_SCRUB_DOMAINS):
-                to_clear.append(c); continue
-            # Internal deny-list — always scrub. Defense-in-depth: route
-            # handler at network layer already blocks the navigation, but
-            # also wipe any cookies that may already exist on those origins.
-            if _matches_security_deny_host(domain.lstrip(".")):
-                to_clear.append(c); continue
-            # NOTE: do NOT scrub Google auth cookies (__Secure-1PSID etc.)
-            # on .google.com apex. Gemini, NotebookLM, YouTube, Gmail, and
-            # Google Docs ALL share that apex session. Wiping it here
-            # would break Gemini/NotebookLM login at every pipeline start
-            # and force the user back through pair. The route deny-list
-            # at the network layer is the load-bearing defense for the
-            # 2026-05-05 incident vector — apex-cookie wipe is not needed.
-            # See advisor V2 callout in the F4 implementation review.
-        for c in to_clear:
-            try:
-                await context.clear_cookies(name=c.get("name"), domain=c.get("domain"))
-                summary["cookiesCleared"] += 1
-            except Exception as e:
-                summary["errors"].append(f"cookie clear {c.get('name')}@{c.get('domain')}: {e}")
-
-    # localStorage / sessionStorage / IDB — visit each origin and clear.
-    # Use a 404-stub URL so the page renders nothing executable; we only
-    # need same-origin scope for the clear JS. We only scrub the auth-
-    # management origins here. The deny-list origins are network-blocked
-    # by the route handler, so a goto there aborts and the evaluate would
-    # run on about:blank (silent no-op). Cookies on those origins are
-    # already covered above; storage scrub adds nothing.
-    scrub_origins = list(_SECURITY_AUTH_SCRUB_DOMAINS)
-    _page = None
     try:
-        _page = await context.new_page()
+        cookies = await context.cookies()
     except Exception as e:
-        summary["errors"].append(f"open scrub page: {e}")
-    if _page is not None:
-        for origin in scrub_origins:
-            try:
-                await _page.goto(f"https://{origin}/__f4_scrub_404", wait_until="domcontentloaded", timeout=8000)
-            except Exception:
-                pass  # 404 / network error is fine — we just need same-origin context.
-            try:
-                await _page.evaluate("""async () => {
-                    try { localStorage.clear(); } catch (e) {}
-                    try { sessionStorage.clear(); } catch (e) {}
-                    try {
-                        const dbs = (typeof indexedDB.databases === 'function')
-                            ? (await indexedDB.databases()) : [];
-                        for (const db of dbs) {
-                            if (db.name) { try { indexedDB.deleteDatabase(db.name); } catch (e) {} }
-                        }
-                    } catch (e) {}
-                }""")
-                summary["originsCleared"] += 1
-            except Exception as e:
-                summary["errors"].append(f"scrub {origin}: {e}")
+        summary["errors"].append(f"cookie read: {e}")
+        cookies = []
+    to_clear: list[dict] = []
+    for c in cookies:
+        domain = (c.get("domain") or "").lower()
+        if _matches_security_deny_host(domain.lstrip(".")):
+            to_clear.append(c)
+    for c in to_clear:
         try:
-            await _page.close()
-        except Exception:
-            pass
+            await context.clear_cookies(name=c.get("name"), domain=c.get("domain"))
+            summary["cookiesCleared"] += 1
+        except Exception as e:
+            summary["errors"].append(f"cookie clear {c.get('name')}@{c.get('domain')}: {e}")
 
     log(f"[security] scrub({scope}): cookies={summary['cookiesCleared']}, "
-        f"origins={summary['originsCleared']}, mode={SECURITY_SCRUB_MODE}, "
         f"errors={len(summary['errors'])}", "INFO")
     try:
         emit_event("security_scrub", **summary)
