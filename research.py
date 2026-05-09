@@ -7077,6 +7077,42 @@ def _phase_short_label(phase: int) -> str:
     }.get(phase, "running through the active phase")
 
 
+_NARRATION_STOPWORDS = frozenset({
+    "is", "in", "of", "the", "a", "an", "and", "or", "with", "without",
+    "after", "before", "over", "under", "across", "into", "onto", "from",
+    "to", "as", "at", "for", "by", "on", "off", "no", "not", "yet", "so",
+    "now", "still", "while", "during", "having", "been", "be", "being",
+    "this", "that", "these", "those", "it", "its", "then", "than",
+})
+
+
+def _too_similar_to_recent(new_text: str, prev_text: str, threshold: float = 0.65) -> bool:
+    """Reject a fresh narration if it's a paraphrase of the previous one.
+    The exact-string dedupe at the emit site catches "ChatGPT is X" twice
+    in a row but misses "ChatGPT accumulated 198 chars over 5 minutes" vs
+    "ChatGPT has 198 tokens drafted after 5 minutes" — same idea, different
+    wording. Word-set Jaccard over content words (>=4 chars, no stopwords)
+    catches the user-reported "all five narrations say the same thing"
+    pattern during ChatGPT's extended-thinking window.
+    """
+    if not new_text or not prev_text:
+        return False
+    import re as _re
+    def _content(s: str) -> set[str]:
+        return {
+            w for w in (m.group(0).lower() for m in _re.finditer(r"[a-zA-Z]{4,}", s))
+            if w not in _NARRATION_STOPWORDS
+        }
+    new_words = _content(new_text)
+    prev_words = _content(prev_text)
+    if len(new_words) < 4 or len(prev_words) < 4:
+        return False
+    union = new_words | prev_words
+    if not union:
+        return False
+    return len(new_words & prev_words) / len(union) >= threshold
+
+
 def _extract_top_hosts(events: list, limit: int = 2) -> list:
     """Pull deduped non-UI hostnames from agent_progress.source_urls and
     link_extracted events in the recent ring-buffer window. Used to feed
@@ -7674,9 +7710,26 @@ async def _narrator_loop(phase: int):
                         "cause via the docs cluster on sec.gov.'\n\n"
                         f"SCOPE: ONLY {akey.upper()}'s progress. Don't compare agents."
                     )
+                    # Pass the previous narration so the model writes
+                    # something MEANINGFULLY DIFFERENT instead of
+                    # paraphrasing the same idea each tick — fixes the
+                    # user-reported "all five narrations say 198 chars
+                    # of partial output" pattern during ChatGPT's
+                    # extended-thinking window where state changes
+                    # little between ticks. The model emits SKIP if
+                    # there's nothing new to say; the emit-site
+                    # similarity gate below is a belt-and-suspenders
+                    # backstop if it ignores the instruction.
+                    prev_narration = last_agent_lines.get(akey, "")
+                    prev_narration_clause = (
+                        f"\n\nPREVIOUS NARRATION (do NOT repeat or paraphrase this — "
+                        f"if the agent's state hasn't materially changed, output SKIP):\n"
+                        f"\"{prev_narration}\""
+                    ) if prev_narration else ""
                     a_user = (
                         f"Recent events for {akey.upper()} (newest last):\n"
                         f"{a_lines or '[none]'}"
+                        f"{prev_narration_clause}"
                     )
                     a_text, a_status = await asyncio.to_thread(_call_narrator, a_system, a_user, 200)
                     if a_status == 429:
@@ -7710,7 +7763,14 @@ async def _narrator_loop(phase: int):
                         # the equality dedupe at the emit site below.
                         if not a_text:
                             a_text = _tier4_template(akey, phase)
-                    if a_text and a_text != last_agent_lines.get(akey):
+                    # Two-stage dedupe at emit: exact-equality (prior
+                    # behavior) + Jaccard similarity to the last emitted
+                    # narration (catches paraphrases that share the same
+                    # data points — "198 chars partial output" vs "198
+                    # tokens drafted"). Tier-4 templates are short and
+                    # phrased differently across rotations, so they pass
+                    # the similarity gate naturally.
+                    if a_text and a_text != last_agent_lines.get(akey) and not _too_similar_to_recent(a_text, last_agent_lines.get(akey, "")):
                         last_agent_lines[akey] = a_text
                         try:
                             emit_event("agent_narration", phase=phase,
