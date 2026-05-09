@@ -2808,9 +2808,13 @@ def _start_command_listener(uid, research_id, loop):
                 # Skip a stuck Phase 2 agent without stopping the rest of the
                 # phase. The polling loop consumes _controls.skipped_agents on
                 # its next tick: extracts partial output from that agent's
-                # page and drops it from `pending`.
+                # page and drops it from `pending`. notebooklm/youtube were
+                # added to the allowed list when the phase-time verify gate
+                # (BE-2) started routing per-platform Skip clicks here for
+                # P3/P4 alerts — the gate consumes skipped_agents in its own
+                # pause-wait loop and returns "skipped" to the caller.
                 _ag = (data.get("agent", "") or "").strip().lower()
-                if _ag in ("chatgpt", "gemini", "claude"):
+                if _ag in ("chatgpt", "gemini", "claude", "notebooklm", "youtube"):
                     loop.call_soon_threadsafe(_controls.request_skip_agent, _ag)
                     log(f"Command received: SKIP_AGENT agent={_ag}")
                 else:
@@ -3131,6 +3135,15 @@ class PipelineControls:
         # next platform login_required) display the stale Continue-with-Free
         # button — user clicks it again, BE consumes continue_anyway again.
         self.pro_alert_emitted: set[tuple[int, str]] = set()
+        # Per-platform Free-tier consent for the phase-time verify gate. When
+        # init verification is skipped (skip_init_verify=True) and a phase
+        # later prompts the user for a per-platform pro_required, "Continue
+        # with Free" sets free_tier_consent[platform]=True so subsequent
+        # phases for the SAME platform skip the pro check (the user already
+        # decided). Distinct from pro_warning_acknowledged (global, set by
+        # P0): _phase_verify_gate sets BOTH so the P1 ChatGPT Pro selector
+        # backstop at line ~15218 also picks up the consent.
+        self.free_tier_consent: dict[str, bool] = {}
 
     def request_stop(self):
         self.stop_event.set()
@@ -3261,6 +3274,7 @@ class PipelineControls:
         self.continue_anyway = False
         self.pro_warning_acknowledged = False
         self.pro_alert_emitted.clear()
+        self.free_tier_consent.clear()
         self.retry_phase_requested.clear()
         self.retry_agents.clear()
         self.retry_agents_hard.clear()
@@ -6497,6 +6511,198 @@ def _clear_pro_required_alerts(triggered_at_phase: int) -> None:
         log(f"Pro-tier alerts cleared (triggered_at_phase={triggered_at_phase}): "
             f"{', '.join(f'phase{p}/{a}' for (p, a) in cleared)}", "INFO")
     _controls.pro_alert_emitted.clear()
+
+
+_PLATFORM_LABEL_BY_KEY = {
+    "chatgpt":    "ChatGPT",
+    "gemini":     "Gemini",
+    "claude":     "Claude",
+    "notebooklm": "NotebookLM",
+    "youtube":    "YouTube Studio",
+}
+
+
+async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) -> str:
+    """Phase-time login + pro-tier re-verification gate. Triggered ONLY when
+    init verification was skipped (`_controls.skip_init_verify=True`). Each
+    phase invokes this for the platform it's about to use; if the platform
+    is logged-out or non-pro, the gate emits the same alerts as Phase 0
+    (`login_required` / `pro_required`) and blocks the phase until the user
+    decides. Returns:
+
+      'ok'      — verification passed (or fail-open on CUA outage)
+      'skipped' — user picked Skip on the alert (caller drops the platform)
+      'stop'    — pipeline stop received
+
+    No-op when skip_init_verify is False — preserves the 2026-04-24 design
+    where Phase 0 is the single login gate for the happy path. The gate
+    opens a fresh tab for verification and closes it on exit, so the
+    phase's own tab handling is unaffected.
+
+    Per-run consent flags:
+      - free_tier_consent[platform]=True suppresses the gate's pro check
+        for that platform on subsequent phases (set when user clicks
+        Continue with Free at phase-time).
+      - skipped_agents.add(platform) makes the gate return 'skipped' on
+        re-entry without re-prompting (set by Skip click at phase-time).
+
+    Notes:
+      - login_required at phase ≥ 1 reuses the same FE alert renderer as
+        P0; only the `phase` field changes. alert_id is scoped per-phase
+        per-platform so concurrent multi-platform alerts don't collide.
+      - pro_required reuses _emit_pro_required_alert which already routes
+        Skip → skip_agent at phase ≥ 1 (BE-1 commit).
+      - The ChatGPT-specific case: at P1, gate-skip routes the caller into
+        the manual_brief flow (caller responsibility). At P2, gate-skip
+        drops ChatGPT from enabled_agents but Gemini/Claude continue.
+    """
+    if not _controls.skip_init_verify:
+        return "ok"
+    if _controls.is_stop():
+        return "stop"
+    # Platform already gate-skipped or skip-clicked in a prior phase →
+    # don't re-prompt. The user already decided; respect that.
+    if agent_key in _controls.skipped_agents:
+        return "skipped"
+
+    label = _PLATFORM_LABEL_BY_KEY.get(agent_key, agent_key.title())
+    info = LOGIN_PLATFORMS.get(agent_key)
+    root = info["root"] if info else "about:blank"
+    log(f"Phase {phase}: re-verifying {label} (init was skipped — phase-time gate)", "INFO")
+
+    while True:
+        if _controls.is_stop():
+            return "stop"
+        if agent_key in _controls.skipped_agents:
+            return "skipped"
+
+        tab = None
+        try:
+            tab = await browser.new_tab(root)
+            # Settle for SPA hydration — same delay Phase 0 uses (line ~19894)
+            # to dodge the "loading shell" false-positive on Claude/Gemini.
+            await asyncio.sleep(4.0)
+
+            try:
+                current_url = (tab.url or "").lower()
+            except Exception:
+                current_url = ""
+
+            login_ok = True
+            if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
+                log(f"Phase {phase}: {label} on login URL ({current_url[:60]}) — not logged in", "INFO")
+                login_ok = False
+            else:
+                try:
+                    login_ok = await verify_login_cua(tab, agent_key, cua_client)
+                except CuaUnavailableError as cua_err:
+                    # CUA outage at phase-time is fail-open — the phase will
+                    # surface real failures via its own scraping/auth detection.
+                    # Different from P0 which fails-closed because P0 IS the
+                    # gate; here we already accept that init was skipped, so
+                    # adding another hard fail on CUA outage adds zero safety.
+                    log(f"Phase {phase}: CUA unavailable for {label} login check, fail-open: {cua_err}", "WARN")
+                    login_ok = True
+
+            if not login_ok:
+                emit_event("agent_progress", phase=phase, agent=agent_key,
+                           status="needs_login",
+                           progress=f"{label}: login required ✗ (phase-time check)")
+                emit_event("login_required",
+                           phase=phase,
+                           platforms=[agent_key],
+                           platformLabels=[label],
+                           machineName=socket.gethostname(),
+                           attempt=1,
+                           message=f"Log into {label} in the browser on your setup PC.",
+                           alert_id=f"phase{phase}_login_required_{agent_key}")
+                _controls.request_pause("login_required")
+                emit_event("pipeline_paused", phase=phase, reason="login_required")
+                await _controls.wait_if_paused()
+                if _controls.is_stop():
+                    emit_event("pipeline_stopped", phase=phase, reason="stopped during login_required")
+                    return "stop"
+                if agent_key in _controls.skipped_agents:
+                    emit_event("pipeline_resumed", phase=phase, reason="agent_skipped")
+                    return "skipped"
+                # Anything else (retry_phase, retry_init_verify, generic
+                # resume) → re-loop and re-verify with a fresh tab.
+                _controls.consume_retry_phase(phase)
+                _controls.retry_init_verify = False
+                emit_event("pipeline_resumed", phase=phase, reason="retry")
+                continue  # re-verify
+
+            # Login passed — pro-tier check (only platforms with Pro/Free split,
+            # and only if user hasn't already consented to Free for THIS
+            # platform in a prior phase).
+            if (agent_key in _PRO_TIER_PROMPT_BY_KEY
+                    and cua_client is not None
+                    and not _controls.free_tier_consent.get(agent_key, False)):
+                emit_event("agent_progress", phase=phase, agent=agent_key,
+                           status="checking_tier",
+                           progress=f"{label}: checking subscription tier… (phase-time check)")
+                try:
+                    tier = await _cua_pro_tier_call(tab, agent_key, cua_client)
+                except CuaUnavailableError as cua_err:
+                    log(f"Phase {phase}: CUA unavailable for {label} tier check — assuming Pro: {cua_err}", "WARN")
+                    tier = "unsure"
+
+                if tier == "free":
+                    log(f"Phase {phase}: {label} on Free tier — emitting pro_required alert", "INFO")
+                    emit_event("agent_progress", phase=phase, agent=agent_key,
+                               status="not_pro",
+                               progress=f"{label}: Pro NOT detected — Phase output will be degraded")
+                    _emit_pro_required_alert(phase=phase, agent=agent_key,
+                                             source=f"phase{phase}/verify_gate")
+                    _controls.request_pause("pro_required")
+                    emit_event("pipeline_paused", phase=phase, reason="pro_required")
+                    await _controls.wait_if_paused()
+                    if _controls.is_stop():
+                        emit_event("pipeline_stopped", phase=phase, reason="user_stop_pro_required")
+                        return "stop"
+                    if agent_key in _controls.skipped_agents:
+                        emit_event("pipeline_resumed", phase=phase, reason="agent_skipped")
+                        return "skipped"
+                    if _controls.consume_retry_phase(phase):
+                        # User clicked Retry on pro_required — they're (presumably)
+                        # signing in with a Pro account. Re-verify from scratch.
+                        log(f"Phase {phase}: user clicked Retry on {label} pro_required — re-verifying", "INFO")
+                        emit_event("pipeline_resumed", phase=phase, reason="pro_retry")
+                        continue  # re-loop, re-verify
+                    if _controls.consume_continue_anyway():
+                        _controls.free_tier_consent[agent_key] = True
+                        # Also set the global flag so the P1 ChatGPT Pro selector
+                        # backstop at line ~15218 picks it up — keeps the existing
+                        # P0-driven behavior intact for the skip-init-verify path.
+                        _controls.pro_warning_acknowledged = True
+                        log(f"Phase {phase}: user opted into Free for {label}", "INFO")
+                        _clear_pro_required_alerts(triggered_at_phase=phase)
+                        emit_event("pipeline_resumed", phase=phase, reason="continue_with_free")
+                        emit_event("agent_progress", phase=phase, agent=agent_key,
+                                   status="free_acknowledged",
+                                   progress=f"{label}: continuing on Free (user-acknowledged)")
+                    else:
+                        # Generic resume without explicit choice — treat as
+                        # Free-acknowledged for THIS platform (matches the P0
+                        # generic-resume semantics at line ~20028).
+                        _controls.free_tier_consent[agent_key] = True
+                        _controls.pro_warning_acknowledged = True
+                        log(f"Phase {phase}: pro_required pause resumed without explicit choice — treating as Free-acknowledged", "INFO")
+                        _clear_pro_required_alerts(triggered_at_phase=phase)
+                        emit_event("pipeline_resumed", phase=phase, reason="resume")
+                elif tier == "pro":
+                    log(f"Phase {phase}: {label} Pro detected ✓ (phase-time)", "INFO")
+                else:  # unsure → fail open
+                    log(f"Phase {phase}: {label} tier UNSURE — assuming Pro (fail-open)", "INFO")
+
+            # Verification cleared — return to caller.
+            emit_event("agent_progress", phase=phase, agent=agent_key,
+                       status="verified", progress=f"{label}: phase-time verify ✓")
+            return "ok"
+        finally:
+            if tab is not None:
+                try: await tab.close()
+                except Exception: pass
 
 
 def _emit_claude_chat_mode_alert():
@@ -20158,11 +20364,71 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                    durationSec=int(time.time() - _p0_start),
                    summary=_p0_summary)
 
+        # ══════════════════════ PHASE 1 verify gate (BE-2) ══════════════════════
+        # When init was skipped (skip_init_verify=True), re-verify ChatGPT
+        # login + Pro before P1 touches it. Skip routes into manual_brief
+        # flow inline — caller pre-populates brief_text + brief_artifact and
+        # marks _gate_skipped_p1=True so the dispatch chain steers into the
+        # SKIP branch (which then emits phase_skipped + creates BriefArtifact).
+        # No-op when init verified normally.
+        _gate_skipped_p1 = False
+        if (start_phase <= 1 and 1 not in skip_phases
+                and 1 not in _controls.skipped_phases
+                and _controls.skip_init_verify
+                and not _controls.is_stop()):
+            _p1_gate = await _phase_verify_gate(1, "chatgpt", browser, cua_client)
+            if _p1_gate == "stop":
+                emit_event("pipeline_stopped", phase=1, reason="user_stop_at_verify_gate")
+                return
+            if _p1_gate == "skipped":
+                # User picked Skip on the P1 ChatGPT verify alert. Per the
+                # ChatGPT-runs-twice design (P1 brief + P2 task), skip-at-P1
+                # cannot silently produce an empty brief — Phase 2 hard-fails
+                # with "No brief text available". Mirror the existing post-fail
+                # manual_brief flow at ~line 20554: emit manual_brief_required,
+                # block on extra_context (3h backstop), consume the user-typed
+                # brief, then steer the dispatch into SKIP so brief_artifact
+                # is created and Phase 2 runs with the manual brief.
+                log("Phase 1: verify gate skipped → manual brief flow", "INFO")
+                emit_event("manual_brief_required", phase=1,
+                           message="Type your research brief into chat, then press Resume.",
+                           actions=[],
+                           dismissible=True,
+                           alert_id="phase1_manual_brief_required")
+                _BRIEF_WAIT_BACKSTOP_S = 3 * 3600
+                _brief_wait_start = time.time()
+                while not _controls.peek_extra_context() and not _controls.is_stop():
+                    if (time.time() - _brief_wait_start) > _BRIEF_WAIT_BACKSTOP_S:
+                        log("Phase 1: manual brief wait exceeded 3h — auto-failing", "WARN")
+                        fail_phase(1,
+                                   "Manual brief not received in 3h",
+                                   "Phase 1 was waiting for you to type a research "
+                                   "brief into chat after skipping ChatGPT verification, "
+                                   "but no brief arrived in 3 hours. Retry to re-prompt "
+                                   "and start over, or Skip to abandon Phase 1.")
+                        emit_event("pipeline_stopped", phase=1,
+                                   reason="manual_brief_wait_backstop_3h")
+                        return
+                    await asyncio.sleep(0.5)
+                if _controls.is_stop():
+                    log("Phase 1: stop pressed during manual brief wait", "INFO")
+                    emit_event("pipeline_stopped", phase=1, reason="user_stop_during_manual_brief")
+                    return
+                brief_text = (_controls.pop_extra_context() or "").strip()
+                brief_url = ""
+                log(f"Phase 1: user supplied manual brief via gate ({len(brief_text)} chars)")
+                _gate_skipped_p1 = True
+
         # ══════════════════════ PHASE 1: Brief ══════════════════════
         p1 = None
         _user_skip_p1 = _controls.consume_phase_skip(1)
-        if 1 in skip_phases or _user_skip_p1:
-            _reason = "user_skip" if _user_skip_p1 else "Disabled in pipeline config"
+        if 1 in skip_phases or _user_skip_p1 or _gate_skipped_p1:
+            if _gate_skipped_p1:
+                _reason = "user_skip_at_verify_gate"
+            elif _user_skip_p1:
+                _reason = "user_skip"
+            else:
+                _reason = "Disabled in pipeline config"
             log(f"Phase 1: SKIPPED ({_reason})")
             emit_event("phase_skipped", phase=1, reason=_reason)
             # Phase-1-skip must still hydrate brief_text so Phase 2 has a
@@ -20555,6 +20821,34 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 return
             enabled_agents = [a for a, on in agents_cfg.items() if on]
             disabled_agents = [a for a, on in agents_cfg.items() if not on]
+            # ── P2 verify gate (BE-2) ──
+            # When init was skipped, re-verify each enabled agent's login +
+            # Pro before P2 runs. Skip drops just that agent from
+            # enabled_agents (P2 continues with the rest). All-skipped →
+            # fail_phase since P2 can't run with zero agents.
+            if _controls.skip_init_verify and not _controls.is_stop():
+                _p2_dropped_at_gate: list[str] = []
+                for _ag in list(enabled_agents):
+                    _p2_gate = await _phase_verify_gate(2, _ag, browser, cua_client)
+                    if _p2_gate == "stop":
+                        emit_event("pipeline_stopped", phase=2, reason="user_stop_at_verify_gate")
+                        return
+                    if _p2_gate == "skipped":
+                        _p2_dropped_at_gate.append(_ag)
+                        log(f"Phase 2: {_ag} dropped at verify gate", "INFO")
+                        emit_event("agent_skipped", phase=2, agent=_ag,
+                                   reason="user_skip_at_verify_gate")
+                if _p2_dropped_at_gate:
+                    enabled_agents = [a for a in enabled_agents if a not in _p2_dropped_at_gate]
+                if not enabled_agents:
+                    log("Phase 2: all agents skipped at verify gate — aborting", "WARN")
+                    fail_phase(2,
+                               "All Phase 2 agents skipped at verify gate",
+                               "All Phase 2 agents were skipped during phase-time "
+                               "login verification. Phase 2 cannot run with no agents.")
+                    emit_event("pipeline_stopped", phase=2,
+                               reason="all_agents_skipped_at_verify_gate")
+                    return
             emit_event("phase_start", phase=2, agents=enabled_agents, description="Parallel deep research across AI platforms")
             _update_firestore_research({"phase": 2, "currentPhase": 2, "status": "ongoing"})
             for da in disabled_agents:
@@ -21017,6 +21311,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 f"(add_context disabled for Phase 3+)", "WARN")
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
+        # ══════════════════════ PHASE 3 verify gate (BE-2) ══════════════════════
+        # When init was skipped, re-verify NotebookLM login before P3 runs.
+        # Skip cascades to P4 (no YouTube without podcast — same rule as the
+        # skip_phase command handler at ~line 2833). NLM has no Pro/Free
+        # split (not in _PRO_TIER_PROMPT_BY_KEY), so only login is checked.
+        if (start_phase <= 3 and 3 not in skip_phases
+                and 3 not in _controls.skipped_phases
+                and _controls.skip_init_verify
+                and not _controls.is_stop()):
+            _p3_gate = await _phase_verify_gate(3, "notebooklm", browser, cua_client)
+            if _p3_gate == "stop":
+                emit_event("pipeline_stopped", phase=3, reason="user_stop_at_verify_gate")
+                return
+            if _p3_gate == "skipped":
+                log("Phase 3: NLM verify gate skipped → cascade-skipping P4 (no YouTube without podcast)", "INFO")
+                _controls.skipped_phases.add(3)
+                _controls.skipped_phases.add(4)
         # ══════════════════════ PHASE 3: NotebookLM Processing (upload + audio) ══════════════════════
         audio_path = None
         _user_skip_p3 = _controls.consume_phase_skip(3)
@@ -21416,6 +21727,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _ = _controls.pop_extra_context()
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
+        # ══════════════════════ PHASE 4 verify gate (BE-2) ══════════════════════
+        # When init was skipped AND video is enabled, re-verify YouTube
+        # Studio login before P4 runs. Skip drops P4 only (P3 has already
+        # produced its outputs by this point). YouTube has no Pro tier
+        # check — only login is verified.
+        if (start_phase <= 4 and 4 not in skip_phases and video_enabled
+                and 4 not in _controls.skipped_phases
+                and _controls.skip_init_verify
+                and not _controls.is_stop()):
+            _p4_gate = await _phase_verify_gate(4, "youtube", browser, cua_client)
+            if _p4_gate == "stop":
+                emit_event("pipeline_stopped", phase=4, reason="user_stop_at_verify_gate")
+                return
+            if _p4_gate == "skipped":
+                log("Phase 4: YouTube verify gate skipped — dropping P4", "INFO")
+                _controls.skipped_phases.add(4)
         # ══════════════════════ PHASE 4: YouTube Upload ══════════════════════
         _user_skip_p4 = _controls.consume_phase_skip(4)
         if 4 in skip_phases or not video_enabled or _user_skip_p4:
