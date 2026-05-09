@@ -6389,16 +6389,22 @@ _PRO_TIER_DETAILS_BY_KEY = {
 
 
 def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
-    """Pro-tier alert with [Continue with Free, Retry] action set. Emits a
-    pipeline_error directly (not via fail_phase) so we don't write a terminal
-    'errored' status — the user hasn't failed the phase, just been asked to
-    confirm Free-tier degradation. The FE renders pipeline_error via the
-    unified PhaseAlertPanel, so no new event handler is needed.
+    """Pro-tier alert with [Continue with Free, Retry, Skip] action set.
+    Emits a pipeline_error directly (not via fail_phase) so we don't write a
+    terminal 'errored' status — the user hasn't failed the phase, just been
+    asked to confirm Free-tier degradation. The FE renders pipeline_error via
+    the unified PhaseAlertPanel, so no new event handler is needed.
 
     Stop is omitted by design: the chat-box Stop button is always reachable
     while paused, so adding a Stop action here would be a redundant affordance.
     Retry re-verifies login + tier on the same platform after the user signs
     in with a Pro account.
+
+    Skip is destination-aware: at P0 it routes to skip_init_verify (fully
+    bypassing init verification, with phases then re-verifying through
+    _phase_verify_gate); at phase ≥ 1 it routes to skip_agent (drops THIS
+    platform from the run while leaving the rest going). Same button label,
+    different downstream wiring keyed by phase.
 
     `agent` is the platform key ('chatgpt' / 'claude' / 'gemini'). The alert_id
     embeds it so concurrent multi-platform Pro alerts don't collide.
@@ -6427,6 +6433,14 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
              "command": {"action": "continue_anyway"}},
             {"id": "retry", "label": "Retry", "style": "primary",
              "command": {"action": "retry_phase", "phase": phase}},
+            # Skip: at P0 → skip_init_verify (handed off to per-phase
+            # _phase_verify_gate). At phase ≥ 1 → skip_agent for this
+            # platform only, leaving siblings to run normally. The agent-key
+            # in the command lets phase-time skip target one platform without
+            # touching the others (P2 has 3 concurrent agents).
+            {"id": "skip", "label": "Skip", "style": "default",
+             "command": ({"action": "skip_init_verify"} if phase == 0
+                         else {"action": "skip_agent", "agent": agent.lower()})},
         ],
         dismissible=True,
         alert_id=f"phase{phase}_pro_required_{agent.lower()}",
