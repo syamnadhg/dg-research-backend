@@ -20468,12 +20468,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Enforced via _await_phase_with_active_deadline at each call
             # below; budget is shared across the for _p1_attempt restart loop.
             # PHASE_1_MAX_MIN is the cap (env-overridable).
-            # Per-phase login probe removed (2026-04-24). Phase 0 is now
-            # the single source of truth for login state — if Phase 0
-            # marked a platform "ok" (cookie + DOM or CUA verdict), we
-            # trust it and proceed. On real session drift mid-run, the
-            # phase's own navigation + scraping will surface a real
-            # failure through fail_phase, which the alert panel handles.
+            # Per-phase login probe removed (2026-04-24) for the happy
+            # path. Phase 0 is the single source of truth for login state
+            # — if Phase 0 marked a platform "ok" (cookie + DOM or CUA
+            # verdict), we trust it and proceed. On real session drift
+            # mid-run, the phase's own navigation + scraping will surface
+            # a real failure through fail_phase, which the alert panel
+            # handles.
+            #
+            # 2026-05-08 follow-up: when init verification is skipped
+            # (skip_init_verify=True), _phase_verify_gate runs above this
+            # block to re-verify login + Pro on a per-platform basis,
+            # mirroring P0's flow. The "Phase 0 is the single gate"
+            # invariant holds for the verified-init path; the gate
+            # re-introduces phase-time verification ONLY for the explicit
+            # skip-init path, where the alternative is silent degradation.
             # ARCHITECTURE 2026-04-18: Never-die retry loop. Any fail_phase
             # inside this block awaits the user's Retry/Skip/Stop decision
             # via _controls.await_phase_decision(1). Retry loops back; Skip
