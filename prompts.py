@@ -562,30 +562,6 @@ If only one audio entry exists, download that one. If multiple entries exist
 and the labels are genuinely ambiguous, download the most recently completed
 entry (usually the topmost or latest-timestamped)."""
 
-# ── Phase 5: YouTube Upload ───────────────────────────────────────────────────
-
-PROMPT_YOUTUBE_UPLOAD = SYSTEM_BASE + """
-
-Task: Upload a video to YouTube Studio as UNLISTED + "Not made for kids" and save it. End state: a https://youtu.be/... link reported in your response.
-
-Flow (4-page dialog):
-1. Click "Create" (top right) → "Upload videos" → click the upload area. File dialogs are auto-handled.
-2. DETAILS page — set Title, set Description, click "Upload thumbnail" (auto-handled), scroll to Audience and select "No, it's not made for kids". Click NEXT.
-3. VIDEO ELEMENTS page — click NEXT (handle any required items first).
-4. CHECKS page — click NEXT (resolve any blockers first).
-5. VISIBILITY page — select "Unlisted" (not Public, not Private). Click the blue SAVE/PUBLISH at the bottom-right.
-
-ERROR HANDLING:
-- If a quota / age-restriction / 2FA / channel-not-monetized banner appears, say "upload blocked: <describe>" and STOP — do not retry.
-- If a copyright/Content-ID claim banner appears, say "upload blocked: copyright claim" and STOP.
-- If an "Upload failed, retry?" dialog appears, click Retry ONCE; if it fails a second time, say "upload failed: <describe>" and STOP.
-
-After save, the confirmation dialog shows a https://youtu.be/XXXXXXXXXXX link. Copy the real URL and reply exactly: "uploaded: <real url>".
-
-Non-negotiable: "No, it's not made for kids" + "Unlisted" + SAVE clicked. Never stop before Save. Never report the studio.youtube.com URL — always the short youtu.be URL from the confirmation.
-
-To scroll inside the dialog: click the content area, then Page Down or mouse wheel."""
-
 # ── Inline CUA Prompts (used as one-off fallbacks) ────────────────────────────
 
 # PROMPT_CLICK_SEND is defined earlier at top of this file (hardened with no-type guardrail)
@@ -593,42 +569,6 @@ To scroll inside the dialog: click the content area, then Page Down or mouse whe
 PROMPT_GEMINI_START_RESEARCH = SYSTEM_BASE + """
 
 Look at the Gemini page. If you see a 'Start research' button (blue button), click it. If the research plan is still being generated, wait a moment and check again. Click 'Start research' and say 'clicked'."""
-
-PROMPT_RECOVER_YOUTUBE_BLOCKER = SYSTEM_BASE + """
-
-CONTEXT: A prior CUA upload attempt failed to reach the "uploaded:" success state. Likely cause: an unexpected dialog or banner is sitting on top of the upload form (copyright/Content-ID claim, age-restriction prompt, "Upload failed - retry?" dialog, channel-not-monetized notice, quota error).
-
-Your task: Diagnose what's blocking and either RECOVER (proceed past it) or REPORT BLOCKED (declare an unrecoverable failure so the orchestrator can surface it).
-
-Steps:
-1. Take a careful look at the screen. Identify what's currently displayed:
-   - Are we on Details/Video Elements/Checks/Visibility page of the upload wizard?
-   - Is there a modal dialog covering the form?
-   - Is there a banner/toast at top or bottom of the page?
-   - What's the dominant text content on screen?
-
-2. Decide the recovery path:
-   (a) DISMISSIBLE (modal survey, "What's new" splash, generic toast): close it via X / Escape / Skip / Maybe later, then resume the upload from where we are. Say "recovered: dismissed <what>".
-   (b) RETRYABLE ("Upload failed, retry?" dialog): click Retry ONCE. If it offers retry again, do NOT retry a second time — say "upload blocked: retry exhausted" and STOP.
-   (c) RESOLVABLE-IN-FORM (e.g. "Audience required" banner because the kids checkbox isn't set): click into the form, set the missing field, return to the navigation flow. Say "recovered: filled <what>".
-   (d) BLOCKED (copyright claim, age-restriction, quota notice, 2FA, channel-not-monetized, login wall): say "upload blocked: <category>: <details>" and STOP. Examples:
-       - "upload blocked: copyright: Content-ID claim filed by <claimant>"
-       - "upload blocked: age_restricted: requires verification"
-       - "upload blocked: quota: daily upload limit reached"
-       - "upload blocked: channel: not monetized / not eligible for unlisted"
-       - "upload blocked: auth: 2FA required"
-
-3. If you successfully recover (paths a, b, c), continue the upload flow as needed:
-   - Set "No, it's not made for kids" if not already
-   - Click NEXT through any remaining steps
-   - On VISIBILITY page, select "Unlisted"
-   - Click SAVE/PUBLISH
-
-4. End-of-recovery state should be either:
-   - SUCCESS: "uploaded: <https://youtu.be/...>" (matching the original upload prompt's contract), OR
-   - BLOCKED: "upload blocked: <category>: <details>" (caller will surface to user)
-
-DO NOT silently retry failures. DO NOT click through unresponsive UIs. ALWAYS report a clear status."""
 
 
 # ── Claude Artifact Tracking & Extraction ────────────────────────────────────
