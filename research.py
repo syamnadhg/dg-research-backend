@@ -22219,15 +22219,31 @@ async def run_server(port=8000):
     # extra 600s here covers slow FE-P5 Doc+Email and any retry tail.
     BE_PHASES_TIMEOUT_SEC = 4200
 
-    async def _wait_for_prior_fe_completion():
+    async def _wait_for_prior_fe_completion(_current_job=None):
         """Hold the next dequeue until the prior run's FE-P5 reports
         completion via research.status=='completed', or the fallback
-        timer expires."""
+        timer expires.
+
+        `_current_job` is the just-dequeued job (passed in by the worker
+        BEFORE _QUEUE_STATE["current_job"] is set). Used to detect the
+        resume-of-same-rid edge case described below."""
         _puid = _QUEUE_STATE.get("last_completed_uid")
         _prid = _QUEUE_STATE.get("last_completed_rid")
         _pdone = int(_QUEUE_STATE.get("last_be_done_at") or 0)
         if not _firebase_db or not _puid or not _prid:
             return  # first run or missing context — nothing to wait on
+        # 2026-05-11: skip the gate when the dequeued job IS the same rid
+        # as the just-finished run. This happens on resume-from-checkpoint
+        # paths where Firestore re-enqueues the same rid after a BE crash
+        # or restart — the "prior" run from the gate's POV is actually
+        # the current dequeued run; waiting on its own FE-P5 would
+        # circular-deadlock (BE never starts → FE-P5 never fires → gate
+        # waits the full 4200s fallback). Resume semantics handle the
+        # state machine separately; the gate only matters for the
+        # successor-pipeline-after-different-prior case.
+        if _current_job and (_current_job.get("research_id") or "") == _prid:
+            log(f"[queue-gate] dequeued rid {_prid[:8]}… matches last_completed_rid — resume path, skipping wait")
+            return
         if _pdone <= 0:
             # Error path marker: prior run was watchdog-stopped /
             # errored / never reached BE PIPELINE COMPLETE. FE-P5
@@ -22279,7 +22295,9 @@ async def run_server(port=8000):
             # Without this gate, the next pipeline's BE phases race
             # against the prior pipeline's FE-P4/P5 (resource contention,
             # listener cross-pollination, the queue-pileup symptom).
-            await _wait_for_prior_fe_completion()
+            # Pass `job` so the gate can detect resume-of-same-rid and
+            # skip (otherwise circular deadlock — see helper docstring).
+            await _wait_for_prior_fe_completion(_current_job=job)
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
             log(f"Starting queued job: {job['topic'][:60]}")
