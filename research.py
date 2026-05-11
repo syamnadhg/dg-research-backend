@@ -1208,7 +1208,17 @@ _research_token = None  # ResearchToken: this backend instance's unique ID
 # Shared queue state: mutated by the job worker in run_server, read by the
 # Firestore start listener (module-level function) so queued research docs
 # know the current backend busy state + what they're waiting behind.
-_QUEUE_STATE = {"running": False, "current_job": None, "queue_ref": None, "recompute_fn": None}
+_QUEUE_STATE = {
+    "running": False, "current_job": None, "queue_ref": None, "recompute_fn": None,
+    # 2026-05-11: prior-run tracking for the FE-completion queue gate
+    # (BE_PHASES_TIMEOUT_SEC). The worker's finally{} block records the
+    # just-completed run's uid+rid+timestamp here so the NEXT dequeue can
+    # poll its Firestore status until FE-P5 flips it to "completed" (or
+    # the 4200s fallback fires). last_be_done_at=0 on error/timeout paths
+    # short-circuits the gate so a watchdog-stopped run doesn't wedge the
+    # queue for 70 min.
+    "last_completed_uid": None, "last_completed_rid": None, "last_be_done_at": 0,
+}
 
 
 def init_firebase():
@@ -19127,7 +19137,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Pre-fix this only wrote phase=4, leaving currentPhase stale
             # at 4 and the diagram painting YouTube as the active node
             # forever post-resume.
-            _update_firestore_research({"status": "ongoing", "phase": 5, "currentPhase": 5})
+            # 2026-05-11: same beDone marker as the main exit so the
+            # queue gate also fires for resume-from-checkpoint runs.
+            _update_firestore_research({
+                "status": "ongoing", "phase": 5, "currentPhase": 5,
+                "beDone": True, "beDoneAt": int(time.time() * 1000),
+            })
             return
         cp = load_checkpoint(queue_dir) or {}
         topic = topic or cp.get("topic", queue_dir.name.rsplit("_", 2)[0].replace("_", " "))
@@ -21513,6 +21528,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # user-visible research.status stays "ongoing" until FE-P5's
         # markFeP5Completed flips it to "completed".
         update_delivery(status="completed")
+        # 2026-05-11: write beDone marker so the queue gate
+        # (_wait_for_prior_fe_completion) knows BE handed off to FE.
+        # research.status stays "ongoing" until FE-P5 flips it to
+        # "completed" — that's the signal the gate actually waits on;
+        # beDoneAt anchors the 4200s fallback timer.
+        _update_firestore_research({"beDone": True, "beDoneAt": int(time.time() * 1000)})
         log(f"\n{'='*60}")
         log("BE PIPELINE COMPLETE — through Phase 3 (FE owns Phases 4 + 5)")
         log(f"  NotebookLM: {notebook_url or 'N/A'}")
@@ -22165,11 +22186,73 @@ async def run_server(port=8000):
     # before the deadlock backstop kicks in. 2026-05-06 (Stream 2 F12):
     # bumped 4h → 5h.
     WORKER_OUTER_TIMEOUT_SEC = 5 * 60 * 60
+    # 2026-05-11: queue gate — wait for prior run's FE-P5 to finish
+    # (status="completed") before dequeueing the next. Fallback timer
+    # caps the wait at 4200s (70min) from the prior run's beDoneAt so
+    # a closed-browser run can't permanently wedge the queue. Phases 4
+    # and 5 are FE-owned post-2026-05-10 — no BE budgets exist for
+    # them, no BE wall-clock watchdog iterates over them; this gate is
+    # the only BE-side primitive that knows the FE work is still in
+    # flight after BE PIPELINE COMPLETE has logged. Cloud Run's
+    # request cap is 3600s (set in apphosting.yaml timeoutSeconds); the
+    # extra 600s here covers slow FE-P5 Doc+Email and any retry tail.
+    BE_PHASES_TIMEOUT_SEC = 4200
+
+    async def _wait_for_prior_fe_completion():
+        """Hold the next dequeue until the prior run's FE-P5 reports
+        completion via research.status=='completed', or the fallback
+        timer expires."""
+        _puid = _QUEUE_STATE.get("last_completed_uid")
+        _prid = _QUEUE_STATE.get("last_completed_rid")
+        _pdone = int(_QUEUE_STATE.get("last_be_done_at") or 0)
+        if not _firebase_db or not _puid or not _prid:
+            return  # first run or missing context — nothing to wait on
+        if _pdone <= 0:
+            # Error path marker: prior run was watchdog-stopped /
+            # errored / never reached BE PIPELINE COMPLETE. FE-P5
+            # will never write "completed" for it, so don't block.
+            log("[queue-gate] prior run errored — skipping FE-completion wait")
+            return
+        deadline = _pdone + BE_PHASES_TIMEOUT_SEC * 1000
+        log(f"[queue-gate] waiting for prior run {_prid[:8]}… FE-P5 completion (fallback in {BE_PHASES_TIMEOUT_SEC}s)")
+        while True:
+            now_ms = int(time.time() * 1000)
+            if now_ms >= deadline:
+                log(f"[queue-gate] FE never reported completed in {BE_PHASES_TIMEOUT_SEC}s — force-dequeueing")
+                return
+            try:
+                snap = _firebase_db.collection("users").document(_puid) \
+                    .collection("researches").document(_prid).get()
+                if snap.exists:
+                    data = snap.to_dict() or {}
+                    status = data.get("status", "")
+                    fe_p5_state = data.get("feP5State", "")
+                    if status in ("completed", "stopped", "stopped_by_watchdog",
+                                  "cancelled", "terminated_by_user_discard", "errored"):
+                        log(f"[queue-gate] prior run terminal (status={status}) — dequeueing")
+                        return
+                    # 2026-05-11: markFeP5Failed writes feP5State="failed"
+                    # but doesn't flip research.status — so a thrown FE-P5
+                    # exception would hang the gate for the full 4200s.
+                    # Release the gate on this fast-fail marker too.
+                    if fe_p5_state == "failed":
+                        log("[queue-gate] prior run's FE-P5 failed — dequeueing")
+                        return
+            except Exception as e:
+                log(f"[queue-gate] Firestore read failed: {e}", "WARN")
+            await asyncio.sleep(2)
 
     async def _job_worker():
         """Process pipeline jobs one at a time from the queue."""
         while True:
             job = await _job_queue.get()
+            # 2026-05-11: gate on prior run's FE-P5 completion. Phases
+            # 4+5 are FE-owned — BE PIPELINE COMPLETE fires after P3,
+            # but the actual run isn't done until FE Doc+Email lands.
+            # Without this gate, the next pipeline's BE phases race
+            # against the prior pipeline's FE-P4/P5 (resource contention,
+            # listener cross-pollination, the queue-pileup symptom).
+            await _wait_for_prior_fe_completion()
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
             log(f"Starting queued job: {job['topic'][:60]}")
@@ -22246,9 +22329,16 @@ async def run_server(port=8000):
                             })
                     except Exception as e:
                         log(f"[worker-watchdog] doc update failed: {e}", "WARN")
+                # 2026-05-11: error path — daemon-restart will reset
+                # _QUEUE_STATE anyway, but flag for completeness.
+                _QUEUE_STATE["_errored"] = True
                 _schedule_server_exit("worker-watchdog")
             except Exception as e:
                 log(f"Pipeline job error: {e}", "ERROR")
+                # 2026-05-11: error path — flag so the next dequeue's
+                # gate doesn't block waiting for FE-P5 on a run that
+                # will never reach it.
+                _QUEUE_STATE["_errored"] = True
             finally:
                 # Capture before clearing — `current_job` is the job that
                 # just finished. We need its uid+rid to clear stale queue
@@ -22257,6 +22347,13 @@ async def run_server(port=8000):
                 completed = _QUEUE_STATE.get("current_job") or {}
                 _QUEUE_STATE["running"] = False
                 _QUEUE_STATE["current_job"] = None
+                # 2026-05-11: record what the next dequeue's gate needs.
+                # last_be_done_at=0 on error/watchdog paths short-circuits
+                # the gate (since FE-P5 will never write "completed").
+                _errored = _QUEUE_STATE.pop("_errored", False)
+                _QUEUE_STATE["last_completed_uid"] = completed.get("uid")
+                _QUEUE_STATE["last_completed_rid"] = completed.get("research_id")
+                _QUEUE_STATE["last_be_done_at"] = 0 if _errored else int(time.time() * 1000)
                 _job_queue.task_done()
                 # Clear the just-finished job's queue tracking fields from
                 # Firestore. `_flip_queued_to_ongoing` already deletes
