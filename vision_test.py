@@ -29,7 +29,7 @@ Fixture format — for each `NAME`, two adjacent files:
                                          "min_confidence": 0.6 }
 
 V1 done = 5/8 fixtures green + 3 live (#1 Gemini, #3 NotebookLM, #6 GDoc).
-See scratch/vision_hotspots.md for hotspot definitions.
+See ../VisionRecipe.md for current hotspot definitions + promotion roadmap.
 """
 
 from __future__ import annotations
