@@ -17589,7 +17589,12 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
             for _f in sorted(_docs_dir.iterdir()):
                 if not _f.is_file():
                     continue
-                if _f.stem in _DERIVED_STEMS:
+                # 2026-05-11: lowercase the stem to match _scan_p3_docs
+                # below — defensive in case a future write path drops a
+                # Capitalised filename onto disk (current code always
+                # writes lowercase, but the file is the source of truth
+                # for what NLM uploads so this guard is cheap).
+                if _f.stem.lower() in _DERIVED_STEMS:
                     continue
                 if _f.suffix.lower() not in (".md", ".txt", ".pdf", ".docx"):
                     continue
@@ -20883,15 +20888,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         doc_dir = queue_dir / "documents"
         # Source scan: include user-attached PDFs/DOCX/TXT alongside agent
         # MDs so Flow B (P1+P2 skipped, sources-only) doesn't trip the
-        # "no documents" gate. brief.md is still excluded — it's input,
-        # not a NotebookLM source.
+        # "no documents" gate. brief.md AND consolidated.md are excluded —
+        # brief.md is the P1 input (not a NotebookLM source) and
+        # consolidated.md is a P2 byproduct of claude+gemini concatenation
+        # used for the Documents page only. 2026-05-11 fix: on a
+        # checkpoint resume after PC death, `results` is empty and the
+        # synthesis loop at ~21117 used to hydrate results from this scan;
+        # consolidated.md slipped in as a fourth "agent" and the rebuilt
+        # NotebookLM notebook included it alongside chatgpt/claude/gemini.
+        _P3_DERIVED_STEMS = {"brief", "consolidated"}
         def _scan_p3_docs():
             if not doc_dir.exists():
                 return []
             return [f for f in doc_dir.iterdir()
                     if f.is_file()
                     and f.suffix.lower() in (".md", ".txt", ".pdf", ".docx")
-                    and f.stat().st_size > 100 and f.stem != "brief"]
+                    and f.stat().st_size > 100
+                    and f.stem.lower() not in _P3_DERIVED_STEMS]
         md_files = _scan_p3_docs()
         has_results = md_files or any(r.get("text") for r in results.values())
         # Flow B context detection: P2 was *deliberately* skipped (config or
@@ -21114,9 +21127,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # Paused seconds don't count toward either active-time ceiling.
             # Per-phase login probe removed (2026-04-24) — see Phase 1 note.
             if not results:
+                # 2026-05-11: only synthesize results for the three known
+                # agent stems. Pre-fix, the dict.get(stem, stem) fallback
+                # let an unrecognized stem (e.g. consolidated.md after a
+                # checkpoint resume) become a synthetic "consolidated"
+                # agent that flowed back through the P2→P3 handoff and
+                # was uploaded to NotebookLM as a fourth source. The
+                # _scan_p3_docs filter above already excludes brief/
+                # consolidated stems, but this allowlist is the
+                # belt-and-suspenders guard for anything else that ends
+                # up in documents/.
+                _AGENT_NAME_BY_STEM = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
                 for md_file in md_files:
                     stem = md_file.stem.lower()
-                    name = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}.get(stem, stem)
+                    name = _AGENT_NAME_BY_STEM.get(stem)
+                    if not name:
+                        continue
                     results[name] = {"status": "done", "text": md_file.read_text(encoding="utf-8"),
                                      "url": "", "page": None}
             # Sub-step 3a: Upload to NotebookLM
