@@ -305,12 +305,11 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
     have produced concrete findings; a refreshed title can reflect what
     was ACTUALLY researched, not what the user planned to research.
 
-    Trade-off: this overwrites research.title unconditionally. If the
-    user manually renamed the title between pipeline start and P2
-    completion (~30-50min window), the BE clobbers their rename. Rare
-    enough — most users don't rename mid-pipeline, and post-P2 a
-    refined title is usually preferred anyway. The user can re-rename
-    after P2 completes (the BE doesn't touch the title again).
+    User-edit guard (2026-05-11): reads research.titleLocked before
+    writing. The FE renameResearch sets titleLocked=true sticky-once on
+    the first user rename — once true, this helper bails without
+    writing. User's choice is final and never gets overwritten by any
+    automated path.
 
     Hard-capped to 3-7 words / ≤70 chars via _shape_title.
     """
@@ -322,6 +321,24 @@ def _refresh_research_title_async(topic, brief_text="", findings_text=""):
 
     def _worker():
         try:
+            # 2026-05-11: user-edit guard. titleLocked is sticky-once-true,
+            # set by FE renameResearch the moment the user manually renames.
+            # If true, never overwrite — the user's choice is final, even
+            # post-P2 with richer findings. Asymmetric with the FE startup
+            # /api/title (which has its own heuristic guard) — both honor
+            # the lock.
+            if _firebase_db and _fb_uid and _fb_research_id:
+                try:
+                    snap = _firebase_db.collection("users").document(_fb_uid) \
+                        .collection("researches").document(_fb_research_id).get()
+                    if snap.exists:
+                        data = snap.to_dict() or {}
+                        if bool(data.get("titleLocked")):
+                            log("[title-refresh] titleLocked=True — user renamed, skipping refresh", "INFO")
+                            return
+                except Exception as _re:
+                    log(f"[title-refresh] titleLocked read failed ({_re}) — bailing safe (no overwrite)", "WARN")
+                    return
             text = _try_llm_title(_topic, _brief, _findings)
             text = _shape_title(text)
             if text:
