@@ -22303,6 +22303,12 @@ async def run_server(port=8000):
                 actual_status = flip_outcome[len("skipped("):-1]
                 if actual_status in BAIL_STATUSES:
                     should_run = False
+                    # 2026-05-11: flag bail as errored so the queue gate
+                    # short-circuits on the next dequeue. Without this,
+                    # a bail on paused_backend_restart* (which is NOT in
+                    # the gate's terminal status set) would wedge the
+                    # next gate for the full 4200s fallback.
+                    _QUEUE_STATE["_errored"] = True
                     log(f"[worker] Bailing on job — actual_status={actual_status} (terminal/recovery), skipping run_pipeline to spare sibling browsers", "INFO")
                 else:
                     log(f"[worker] Proceeding despite skipped flip — actual_status={actual_status} is active (FE pre-flipped or normal mid-run resume)", "INFO")
@@ -22568,6 +22574,29 @@ async def run_server(port=8000):
     else:
         log("No ResearchToken found — run `python research.py --pair` to generate one", "WARN")
         log("Falling back to legacy pipeline_requests/ listener", "WARN")
+    # 2026-05-11: hoist queue-gate state rehydration above worker
+    # creation. The full disk-restore block at the bottom of serve
+    # (rehydrates pending + current_job) runs much later, after the
+    # Firestore start listener has already enqueued docs. If the
+    # worker had been created first, it could dequeue a Firestore-
+    # rehydrated job and call _wait_for_prior_fe_completion() with
+    # fresh-init _QUEUE_STATE (last_completed_uid=None → gate skips)
+    # BEFORE the disk snapshot's gate sub-object lands. That'd race
+    # the first post-restart pipeline against the previous run's
+    # in-flight FE-P5. Pure dict mutation here — no I/O dependency on
+    # the later block.
+    try:
+        if _pending_queue_path.exists():
+            _snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
+            _gate = _snap.get("gate") or {}
+            if _gate.get("last_completed_uid"):
+                _QUEUE_STATE["last_completed_uid"] = _gate.get("last_completed_uid")
+                _QUEUE_STATE["last_completed_rid"] = _gate.get("last_completed_rid")
+                _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
+                log(f"[queue-gate] pre-worker rehydrate: prior-run {(_gate.get('last_completed_rid') or '')[:8]}…")
+    except Exception as _e:
+        log(f"[queue-gate] pre-worker rehydrate failed (non-fatal): {_e}", "WARN")
+
     worker_task = asyncio.create_task(_job_worker())
     log("Job worker started (direct)")
     # Firestore start listener — must fire exactly once per serve session.
