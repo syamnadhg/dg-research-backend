@@ -22145,6 +22145,16 @@ async def run_server(port=8000):
                 "ts_ms": int(time.time() * 1000),
                 "current": current_job,
                 "pending": pending,
+                # 2026-05-11: persist the queue-gate's prior-run state so
+                # a daemon restart mid-FE-P5 doesn't lose the wait
+                # context. Without this, fresh _QUEUE_STATE after respawn
+                # means the gate skips and the next pipeline races
+                # against the in-flight FE-P5 of the prior run.
+                "gate": {
+                    "last_completed_uid": _QUEUE_STATE.get("last_completed_uid"),
+                    "last_completed_rid": _QUEUE_STATE.get("last_completed_rid"),
+                    "last_be_done_at": int(_QUEUE_STATE.get("last_be_done_at") or 0),
+                },
             }
             _pending_queue_path.write_text(
                 json.dumps(payload, indent=2), encoding="utf-8")
@@ -22771,6 +22781,17 @@ async def run_server(port=8000):
         try:
             if _pending_queue_path.exists():
                 snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
+                # 2026-05-11: rehydrate queue-gate state so the worker
+                # gate respects a still-in-flight FE-P5 across daemon
+                # restart. The "gate" key was added 2026-05-11; legacy
+                # snapshots without it default to empty (gate becomes a
+                # no-op for that one boot — same as fresh start).
+                _gate = snap.get("gate") or {}
+                if _gate.get("last_completed_uid"):
+                    _QUEUE_STATE["last_completed_uid"] = _gate.get("last_completed_uid")
+                    _QUEUE_STATE["last_completed_rid"] = _gate.get("last_completed_rid")
+                    _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
+                    log(f"[queue-gate] rehydrated prior-run state for {(_gate.get('last_completed_rid') or '')[:8]}…")
                 # Seed dedupe with anything Firestore-rehydration touched
                 # (queued + ongoing), then add what's currently in the
                 # in-memory queue (the rehydrated queued set).
