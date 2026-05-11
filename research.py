@@ -4280,13 +4280,6 @@ LOGIN_PLATFORMS = {
         'button[aria-label*="Create"]',
         '.mat-mdc-card-title',  # project cards on the home page
     ]},
-    "youtube":    {"root": "https://studio.youtube.com/", "markers": [
-        'ytcp-navigation-drawer',
-        'ytcp-button[id="create-icon"]',
-        'tp-yt-iron-icon[icon-id="channel-icon"]',
-        'ytcp-entity-avatar',
-        'tp-yt-paper-icon-button[aria-label*="Upload"]',
-    ]},
     "gmail":      {"root": "https://mail.google.com/mail/", "markers": [
         'div[gh="cm"]',
         'a[aria-label*="Compose"]',
@@ -4406,7 +4399,6 @@ _PLATFORM_DISPLAY = {
     "gemini":     "Google Gemini (gemini.google.com)",
     "claude":     "Claude (claude.ai)",
     "notebooklm": "Google NotebookLM (notebooklm.google.com)",
-    "youtube":    "YouTube Studio (studio.youtube.com)",
     "gmail":      "Gmail (mail.google.com)",
     "gdocs":      "Google Docs (docs.google.com)",
 }
@@ -6749,7 +6741,6 @@ _PLATFORM_LABEL_BY_KEY = {
     "gemini":     "Gemini",
     "claude":     "Claude",
     "notebooklm": "NotebookLM",
-    "youtube":    "YouTube Studio",
 }
 
 
@@ -7069,9 +7060,9 @@ def fail_agent(agent_key: str, title: str, details: str = "",
 
 PHASE_FLOW_CONTEXT = {
     0: ("Phase 0 is the warmup: launch a dedicated Chrome profile and probe "
-        "that ChatGPT, Gemini, Claude, NotebookLM, YouTube, Gmail, and "
-        "Google Docs are all logged in. With skipInitVerify the probe is a "
-        "cookie sniff (<10s); full verify is a per-platform CUA round (1-2 min)."),
+        "that ChatGPT, Gemini, Claude, and NotebookLM are all logged in. "
+        "With skipInitVerify the probe is a cookie sniff (<10s); full "
+        "verify is a per-platform CUA round (1-2 min)."),
     1: ("Phase 1 is brief generation. ChatGPT Pro with Extended Thinking "
         "drafts a detailed research brief from the topic + any PDFs. The "
         "flow is: open ChatGPT, clear any HV gate, select Pro + Thinking, "
@@ -7086,9 +7077,6 @@ PHASE_FLOW_CONTEXT = {
         "NotebookLM, rename the notebook, make it public, then generate a "
         "podcast-style audio overview where two AI hosts discuss the "
         "findings. Upload + audio gen together take 15-25 min."),
-    4: ("Phase 4 is video: render a thumbnail, wrap the audio + thumbnail "
-        "into an MP4 with ffmpeg, then upload the video to YouTube as "
-        "unlisted. Processing + URL extraction together take 3-8 min."),
     5: ("Phase 5 is delivery: create a Google Doc hub listing every output "
         "link (brief, reports, NotebookLM, YouTube), make it publicly "
         "shareable, and email the user a notification with every link via "
@@ -7303,7 +7291,6 @@ def _phase_short_label(phase: int) -> str:
         1: "brief generation, drafting a structured research brief",
         2: "parallel deep research across ChatGPT, Gemini, and Claude",
         3: "NotebookLM upload and audio overview generation",
-        4: "YouTube video render and upload",
         5: "delivery — Doc creation and email dispatch",
     }.get(phase, "running through the active phase")
 
@@ -19755,7 +19742,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 #
                 # Flow below: tab open → 4s settle → URL check → CUA.
                 # Vision is the single source of truth. Slower (~5-10s per
-                # platform × up to 7 = ~1 min worst case on cold starts)
+                # platform × up to 4 = ~40s worst case on cold starts)
                 # but it actually looks at what's on screen. Not a
                 # performance win we can afford to keep taking.
                 # STEALTH-2026-04-19: jitter between cold-start tab opens.
@@ -19998,13 +19985,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         if not resolve_api_key():
             _env_ok = False
             _env_errors.append("Anthropic API key missing — add it in Account → API Keys (preferred), or set ANTHROPIC_API_KEY (or CUA_API_KEY) on the BE machine. Vision/CUA tiers can't run without it.")
-        if _need_youtube:
-            if not resolve_gemini_api_key():
-                _env_ok = False
-                _env_errors.append("Gemini API key missing — add it in Account → API Keys, or set GOOGLE_API_KEY / GEMINI_API_KEY on the BE machine. Needed for the YouTube thumbnail.")
-            if not shutil.which("ffmpeg"):
-                _env_ok = False
-                _env_errors.append("ffmpeg not on PATH (needed for video encoding)")
         if not _env_ok:
             emit_event("login_required",
                        phase=0,
@@ -23083,7 +23063,7 @@ async def run_pair(profile_dir, wait_minutes=10):
     print()
 
     # ══════════════════════════════════════════════════════════════════════
-    # [3/4] BROWSER LOGINS — open 7 platform tabs and wait for real auth.
+    # [3/4] BROWSER LOGINS — open 4 platform tabs and wait for real auth.
     # ══════════════════════════════════════════════════════════════════════
     _setup_step(3, 4, "Browser logins")
     print(f"  {_c(_DIM, 'Walking through logins one platform at a time.')}")
