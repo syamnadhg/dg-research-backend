@@ -22156,8 +22156,19 @@ async def run_server(port=8000):
                     "last_be_done_at": int(_QUEUE_STATE.get("last_be_done_at") or 0),
                 },
             }
-            _pending_queue_path.write_text(
-                json.dumps(payload, indent=2), encoding="utf-8")
+            # 2026-05-11: atomic write — write to tmp, then os.replace
+            # (atomic on POSIX and Windows same-volume). Protects against
+            # the Q7 watchdog path where _schedule_server_exit's 3s timer
+            # can race os._exit(0) past a slow in-progress write_text(),
+            # leaving _pending_queue.json truncated. On respawn the
+            # truncated file fails json.loads and disk-restore silently
+            # skips, losing the gate state for the very FIRST post-restart
+            # dequeue (the case the boot-race fix already mitigates, but
+            # the truncated-file mode would also lose pending in-memory
+            # jobs not yet visible in Firestore).
+            _tmp_path = _pending_queue_path.with_suffix(".json.tmp")
+            _tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(str(_tmp_path), str(_pending_queue_path))
             return True
         except Exception as e:
             log(f"[pending_queue] persist failed: {e}", "WARN")
@@ -22231,8 +22242,14 @@ async def run_server(port=8000):
                 log(f"[queue-gate] FE never reported completed in {BE_PHASES_TIMEOUT_SEC}s — force-dequeueing")
                 return
             try:
-                snap = _firebase_db.collection("users").document(_puid) \
-                    .collection("researches").document(_prid).get()
+                # 2026-05-11: offload the blocking Firestore .get() to a
+                # worker thread so the gate's 2s poll doesn't block the
+                # event loop on the round-trip (50-200ms typical, longer
+                # under network contention). Keeps heartbeat / listener
+                # callbacks responsive while the gate waits.
+                _doc_ref = _firebase_db.collection("users").document(_puid) \
+                    .collection("researches").document(_prid)
+                snap = await asyncio.to_thread(_doc_ref.get)
                 if snap.exists:
                     data = snap.to_dict() or {}
                     status = data.get("status", "")
