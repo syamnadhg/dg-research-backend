@@ -3889,67 +3889,6 @@ class SessionExpiredError(Exception):
 # Keep selectors LOOSE — they should survive minor UI tweaks. We care about
 # "is this user authenticated" not "is a specific button present".
 
-# Fast-path auth-cookie signatures — used by cookie_login_hit() to skip
-# expensive tab-open + CUA verify when the profile already holds a
-# likely-valid session. Presence check only; expiry is respected when
-# set. A miss means "not sure, go verify properly" — a hit short-
-# circuits to "logged in" for probe/setup paths. Phase 0 preflight
-# (the one source-of-truth check) still runs full CUA even on a hit
-# because we don't want false positives corrupting the gate that
-# every subsequent phase trusts.
-_AUTH_COOKIE_SIGNATURES = {
-    "chatgpt":    {"names": ["__Secure-next-auth.session-token"],
-                   "domains": ["chatgpt.com", "openai.com"]},
-    "gemini":     {"names": ["__Secure-1PSID", "__Secure-3PSID"],
-                   "domains": ["google.com"]},
-    "notebooklm": {"names": ["__Secure-1PSID", "__Secure-3PSID"],
-                   "domains": ["google.com"]},
-    "youtube":    {"names": ["__Secure-1PSID", "__Secure-3PSID"],
-                   "domains": ["google.com", "youtube.com"]},
-    "gmail":      {"names": ["__Secure-1PSID", "__Secure-3PSID"],
-                   "domains": ["google.com"]},
-    "gdocs":      {"names": ["__Secure-1PSID", "__Secure-3PSID"],
-                   "domains": ["google.com"]},
-    "claude":     {"names": ["sessionKey"],
-                   "domains": ["claude.ai"]},
-}
-
-
-async def cookie_login_hit(browser_or_context, key: str) -> bool:
-    """Return True when the profile holds a cookie matching the platform's
-    auth signature (primary session token on the right domain, non-expired).
-    Callers treat True as 'skip the CUA/DOM verify — already logged in';
-    False means 'not sure' so they fall through to the full check. Cheap:
-    no network, no tab-open, no CUA spend.
-
-    Accepts either a Browser instance or a raw BrowserContext."""
-    sig = _AUTH_COOKIE_SIGNATURES.get(key)
-    if not sig:
-        return False
-    ctx = getattr(browser_or_context, "context", browser_or_context)
-    if ctx is None:
-        return False
-    try:
-        cookies = await ctx.cookies()
-    except Exception:
-        return False
-    now = time.time()
-    want_names = set(sig["names"])
-    want_hosts = sig["domains"]
-    for c in cookies:
-        if c.get("name") not in want_names:
-            continue
-        domain = (c.get("domain") or "").lstrip(".")
-        if not any(domain == h or domain.endswith("." + h) for h in want_hosts):
-            continue
-        exp = c.get("expires", -1)
-        # -1 = session cookie (persists per browser-session — good enough).
-        # Any other value is unix seconds; accept if still in the future.
-        if exp == -1 or exp > now:
-            return True
-    return False
-
-
 LOGIN_PLATFORMS = {
     # Markers must be AUTH-SPECIFIC: profile menus, account chips, chat history
     # lists, compose buttons. Never use generic input elements (textarea,
