@@ -287,6 +287,189 @@ def resolve_gemini_api_key():
     return ""
 
 
+# ── 2026-05-10: Research summary helper (writes Research.summary to Firestore) ──
+# Pre-fix, /researches cards always read "No summary available yet" because
+# the BE only wrote brief_text[:200] to meta.json (local disk) and never
+# propagated to the Firestore researches/{id} doc. This helper closes that
+# gap with a tight 1-2 sentence LLM-generated summary, written via the
+# existing _update_firestore_research path. Fire-and-forget on a daemon
+# thread so the pipeline never waits on the LLM call.
+def _generate_research_summary_async(topic, brief_text="", findings_text=""):
+    """Spawn a daemon thread that generates + persists Research.summary.
+
+    Goal: a 3-4 sentence "what the research found" paragraph for the
+    /researches card. Non-blocking — pipeline never waits. Fallback
+    cascade: Haiku 4.5 → Gemini Flash 2.5 → truncate → topic stub.
+
+    Per UX direction 2026-05-10: NO summary is written before research
+    completes. The single call site is after P2 builds consolidated.md
+    (all 3 agent reports merged) — by then the pipeline has the real
+    findings to summarize. P3 (podcast) and FE P4/P5 (YouTube + Doc +
+    email) are distribution-only — they add no new research content,
+    so no further summary refresh. The FE typewriter-animates the
+    summary on first appearance (researches/page.tsx).
+
+    Hard-capped to ≤80 words / ≤500 chars / ≤4 sentences via _shape_summary.
+    """
+    _topic = (topic or "").strip()[:200]
+    _brief = (brief_text or "").strip()[:600]
+    # Findings text gets a larger budget — it's the "what was discovered"
+    # signal, and Haiku/Flash benefit from more context to extract the
+    # actual thrust of the research. 5k chars ≈ 1.2k tokens — cheap.
+    _findings = (findings_text or "").strip()[:5000]
+    if not _topic and not _brief and not _findings:
+        return
+
+    def _worker():
+        try:
+            text = _try_llm_summary(_topic, _brief, _findings) or _fallback_summary(_topic, _brief, _findings)
+            text = _shape_summary(text)
+            if text:
+                _update_firestore_research({"summary": text})
+        except Exception as e:
+            try:
+                log(f"[summary] worker failed: {e}", "WARN")
+            except Exception:
+                pass
+
+    try:
+        _threading.Thread(target=_worker, name="research-summary", daemon=True).start()
+    except Exception as e:
+        try:
+            log(f"[summary] dispatch failed: {e}", "WARN")
+        except Exception:
+            pass
+
+
+def _try_llm_summary(topic, brief, findings=""):
+    """Haiku 4.5 first (consistent with narrator pattern), Gemini Flash
+    fallback. Returns empty string on any failure — caller falls through
+    to _fallback_summary (truncate). Targets 3-4 sentences summarizing
+    what the research actually found."""
+    system = (
+        "You write a research summary in 3-4 sentences. Aim for 60-80 words. "
+        "Summarize what the research found — concrete, specific, no hedging, "
+        "no marketing language. Write in plain prose, the same style as the "
+        "research report itself. No preamble, no labels, no markdown, no "
+        "lead-in phrase like 'This research...' or 'Summary:'. Just the "
+        "summary paragraph."
+    )
+    if findings:
+        user_msg = (
+            f"Topic: {topic}\n\n"
+            f"Research brief:\n{brief or '(brief not supplied)'}\n\n"
+            f"Consolidated findings (first 5000 chars):\n{findings}"
+        )
+    elif brief:
+        user_msg = f"Topic: {topic}\n\nBrief (first 600 chars):\n{brief}"
+    else:
+        user_msg = f"Topic: {topic}\n\n(No brief yet — produce a 1-sentence summary of the topic itself.)"
+    # Haiku 4.5
+    try:
+        import anthropic as _anth
+        _key = resolve_api_key()
+        if _key:
+            _cli = _anth.Anthropic(api_key=_key, timeout=8.0)
+            resp = _cli.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=400,
+                system=system,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            txt = "".join(
+                getattr(b, "text", "") for b in resp.content
+                if getattr(b, "type", "") == "text"
+            ).strip()
+            if txt:
+                return txt
+    except Exception as e:
+        try:
+            log(f"[summary] Haiku failed ({type(e).__name__}: {str(e)[:120]}) — trying Gemini Flash", "WARN")
+        except Exception:
+            pass
+    # Gemini Flash fallback
+    try:
+        gemini_key = resolve_gemini_api_key()
+        if not gemini_key:
+            return ""
+        import requests as _requests
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.5-flash:generateContent?key={gemini_key}"
+        )
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 400,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        resp = _requests.post(url, json=payload, timeout=8.0)
+        j = resp.json()
+        text = (
+            j.get("candidates", [{}])[0]
+             .get("content", {})
+             .get("parts", [{}])[0]
+             .get("text", "")
+        )
+        return (text or "").strip()
+    except Exception as e:
+        try:
+            log(f"[summary] Gemini Flash failed ({type(e).__name__}: {str(e)[:120]})", "WARN")
+        except Exception:
+            pass
+        return ""
+
+
+def _fallback_summary(topic, brief, findings=""):
+    """Last-resort summary: first sentence of findings, then brief, then
+    topic-based stub. Findings preferred (richer signal) when present."""
+    for source in (findings, brief):
+        if source:
+            snippet = source[:160].strip()
+            for boundary in (". ", "! ", "? "):
+                idx = snippet.rfind(boundary)
+                if idx >= 50:
+                    return snippet[:idx + 1]
+            return snippet
+    return f"Research on {topic}" if topic else ""
+
+
+def _shape_summary(text):
+    """Hard-cap shape: ≤4 sentences, ≤80 words, ≤500 chars. Strips
+    wrapping quotes and lead-in labels that the LLM sometimes emits."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if s and s[0] in ('"', "'", "`") and s[-1] in ('"', "'", "`"):
+        s = s[1:-1].strip()
+    for prefix in ("Summary:", "Summary -", "summary:", "**Summary**:", "**Summary:**"):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+            break
+    sentences = []
+    buf = ""
+    for ch in s:
+        buf += ch
+        if ch in ".!?" and len(sentences) < 4:
+            sentences.append(buf.strip())
+            buf = ""
+            if len(sentences) >= 4:
+                break
+    if buf.strip() and len(sentences) < 4:
+        sentences.append(buf.strip())
+    if sentences:
+        s = " ".join(sentences)
+    words = s.split()
+    if len(words) > 80:
+        s = " ".join(words[:80]).rstrip(",;:") + "…"
+    if len(s) > 500:
+        s = s[:497].rstrip() + "…"
+    return s
+
+
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}")
@@ -20291,6 +20474,98 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 agent_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
                 enabled_names = {agent_name_map.get(a, a) for a in enabled_agents}
                 results = {n: r for n, r in results.items() if n in enabled_names}
+            # ── 2026-05-10: Emit phase_complete:2 EARLY (before heavy persistence) ──
+            # The MD writes, consolidated.md build, save_meta enrichment, and
+            # P2→P3 handoff are BE-internal (FE doesn't gate on them). Emitting
+            # phase_complete:2 FIRST:
+            #   • Flips the P2 tile to green immediately on the FE.
+            #   • Auto-cancels the per-tick narrator (emit_event hook at
+            #     ~line 6225) so "Claude is refining..." stops echoing
+            #     while the user waits for P3.
+            #   • Writes the per-agent terminal status to the root doc so
+            #     reopen / tile listing renders correctly post-reload.
+            # The marker write also moves up (still gated on a clean finish)
+            # so crash-recovery resume sees P2 as done before the heavy
+            # persistence below has a chance to run. Resume from a crash in
+            # the heavy persistence block is safe: the only thing that hasn't
+            # finished is BE-internal disk/Firestore mirroring of agent MDs;
+            # the next BE run rebuilds them from results on resume, or P3
+            # rebuilds the handoff via its own safety-net call.
+            _p2_links: list[dict] = []
+            _p2_skipped_agents: list[str] = []
+            for name, r in results.items():
+                in_app = r.get("_in_app_url") or ""
+                if in_app and r.get("text"):
+                    _p2_links.append({
+                        "label": f"Read {name} report",
+                        "url": in_app,
+                        "verified": True,
+                        "primary": True,
+                    })
+                else:
+                    _p2_skipped_agents.append(name)
+            done_count = sum(1 for r in results.values() if r["status"] == "done")
+            total_chars = sum(len(r.get("text", "")) for r in results.values())
+            log(f"[Phase 2] Built {len(_p2_links)} in-app primary links, "
+                f"{len(_p2_skipped_agents)} agents skipped (no MD)")
+            # ── C8: phase_complete invariant — every non-skipped enabled agent ──
+            # ── should have an in-app primary link entry. Missing entries mean ──
+            # ── MD save itself failed for that agent — surface loudly.          ──
+            _linked_agents = set()
+            for _l in _p2_links:
+                _lbl = _l.get("label") or ""
+                _parts = _lbl.split(" ")
+                if len(_parts) >= 2 and _parts[0] == "Read":
+                    _linked_agents.add(_parts[1])
+            _expected_agents = set(results.keys()) - set(_p2_skipped_agents)
+            _missing_links = _expected_agents - _linked_agents
+            if _missing_links:
+                log(f"[Phase 2] phase_complete invariant breach: {sorted(_missing_links)} "
+                    f"are non-skipped but have no in-app primary link. Emitting "
+                    f"phase_complete anyway — these agents will render as unlinked. "
+                    f"Investigate why MD save / in-app URL build skipped them.", "ERROR")
+            emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
+                skippedAgents=_p2_skipped_agents,
+                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — "
+                        f"{len(_p2_links)} in-app primary links")
+            _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
+            # Tile/Icon Consistency (2026-05-01): write the phase-complete
+            # status to root doc so the listing-page tile + chat phase
+            # icons + in-chat config icons stay green post-reload.
+            _write_phase_terminal_status(2, "complete")
+            # Per-agent terminal status. "done" → "complete"; other statuses
+            # ("failed" / "skipped" / "paused") are written at their own emit
+            # sites, don't overwrite here.
+            for _ag_name, _ag_r in results.items():
+                _ag_status = (_ag_r.get("status") or "").lower()
+                _ag_key_lc = _ag_name.lower().replace(" ", "")
+                if _ag_status in ("done", "complete", "completed", "done_partial"):
+                    _write_agent_terminal_status(_ag_key_lc, "complete")
+            # Phase-2 completion marker — only on a CLEAN finish (not stop/pause).
+            # Tells detect_resume_phase that P2 actually finished, so resume
+            # doesn't re-run P2 mid-flight.
+            _p2_clean_finish = (not _controls.is_stop_or_pause())
+            if _p2_clean_finish:
+                try:
+                    (queue_dir / "phase2_complete.marker").write_text(
+                        json.dumps({
+                            "completedAt": int(time.time() * 1000),
+                            "doneCount": done_count,
+                            "totalAgents": len(results),
+                            "skippedAgents": list(_p2_skipped_agents),
+                        }),
+                        encoding="utf-8",
+                    )
+                except Exception as _mk_e:
+                    log(f"[Phase 2] failed to write phase2_complete.marker: {_mk_e}", "WARN")
+            else:
+                log("[Phase 2] stop/pause detected — skipping phase2_complete.marker so resume re-runs P2", "INFO")
+
+            # ── Heavy persistence (BE-internal, FE-invisible) ──
+            # Per-agent MD disk writes + Firestore documents subcollection,
+            # consolidated.md build, save_meta enrichment, P2→P3 handoff.
+            # Runs AFTER phase_complete:2 so the user sees P2 turn green
+            # immediately while this work completes invisibly.
             for name, r in results.items():
                 if r["text"]:
                     fname = name.lower().replace(" ", "") + ".md"
@@ -20326,7 +20601,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 (queue_dir / "documents" / "consolidated.md").write_text(_consolidated_md, encoding="utf-8")
                 save_document_to_firestore("consolidated", _consolidated_md, "Consolidated Report")
                 log(f"Consolidated report: {len(_consolidated_md)} chars")
-            done_count = sum(1 for r in results.values() if r["status"] == "done")
+                # 2026-05-10: kick off the final post-research summary using
+                # the consolidated findings (all 3 agent reports merged).
+                # Overwrites the earlier brief-based stub with a "what the
+                # research found" line — this is the version users see on
+                # /researches after the pipeline finishes. Non-blocking
+                # daemon thread; subsequent P3 (podcast) and FE P4/P5
+                # (distribution) phases add no new research content, so
+                # this is the final summary refresh.
+                try:
+                    _generate_research_summary_async(
+                        topic,
+                        brief_artifact.text if brief_artifact else "",
+                        _consolidated_md,
+                    )
+                except Exception as _sum_e:
+                    log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")
             log(f"\nPHASE 2 COMPLETE: {done_count}/{len(results)} agents finished")
             for name, r in results.items():
                 log(f"  {name:10s} status={r['status']:12s} text={len(r['text']):>6d} chars")
@@ -20366,98 +20656,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _build_phase2_to_phase3_handoff(results, queue_dir)
             except Exception as _hoe:
                 log(f"[Phase 2→3 handoff] build failed (P3 will rebuild on entry): {_hoe}", "WARN")
-            # Build _p2_links from per-agent in-app primaries — always present
-            # when MD landed. Public share URLs (when the workers got them)
-            # have already been emitted via link_extracted and the FE has
-            # merged them into the agent's links list independently.
-            _p2_links: list[dict] = []
-            _p2_skipped_agents: list[str] = []
-            for name, r in results.items():
-                in_app = r.get("_in_app_url") or ""
-                if in_app and r.get("text"):
-                    _p2_links.append({
-                        "label": f"Read {name} report",
-                        "url": in_app,
-                        "verified": True,
-                        "primary": True,
-                    })
-                else:
-                    _p2_skipped_agents.append(name)
-            done_count = sum(1 for r in results.values() if r["status"] == "done")
-            total_chars = sum(len(r.get("text", "")) for r in results.values())
-            log(f"[Phase 2] Built {len(_p2_links)} in-app primary links, "
-                f"{len(_p2_skipped_agents)} agents skipped (no MD)")
-            # ── C8: phase_complete invariant — every non-skipped enabled agent ──
-            # ── should have an in-app primary link entry. With the markdown-as- ──
-            # ── primary architecture (2026-04-25), the in-app /documents URL is ──
-            # ── always present when MD landed. Missing entries mean MD save     ──
-            # ── itself failed for that agent — surface loudly so it's caught.   ──
-            # Match by extracting the agent name from "Read {name} report" labels.
-            _linked_agents = set()
-            for _l in _p2_links:
-                _lbl = _l.get("label") or ""
-                # "Read ChatGPT report" → "ChatGPT"
-                _parts = _lbl.split(" ")
-                if len(_parts) >= 2 and _parts[0] == "Read":
-                    _linked_agents.add(_parts[1])
-            _expected_agents = set(results.keys()) - set(_p2_skipped_agents)
-            _missing_links = _expected_agents - _linked_agents
-            if _missing_links:
-                log(f"[Phase 2] phase_complete invariant breach: {sorted(_missing_links)} "
-                    f"are non-skipped but have no in-app primary link. Emitting "
-                    f"phase_complete anyway — these agents will render as unlinked. "
-                    f"Investigate why MD save / in-app URL build skipped them.", "ERROR")
-            emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
-                skippedAgents=_p2_skipped_agents,
-                summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — "
-                        f"{len(_p2_links)} in-app primary links")
-            _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
-            # Tile/Icon Consistency (2026-05-01): write the phase-complete
-            # status to root doc so the listing-page tile + chat phase
-            # icons + in-chat config icons stay green post-reload.
-            _write_phase_terminal_status(2, "complete")
-            # Also write per-agent terminal status. Each agent in `results`
-            # is one of: "done" (clean) → "complete"; "failed" / "stopped"
-            # / "paused" → leave alone (not terminal); "skipped" /
-            # "skipped_runtime" already had _write_agent_terminal_status
-            # called at the agent_skipped emit site, so don't overwrite.
-            # Match `name` (display) to lowercase agent key.
-            for _ag_name, _ag_r in results.items():
-                _ag_status = (_ag_r.get("status") or "").lower()
-                _ag_key_lc = _ag_name.lower().replace(" ", "")
-                if _ag_status in ("done", "complete", "completed", "done_partial"):
-                    _write_agent_terminal_status(_ag_key_lc, "complete")
-                # "skipped"/"failed"/"paused"/etc. left to their own emit
-                # sites (which already write the right status).
-            # Phase-2 completion marker for resume safety. The marker tells
-            # detect_resume_phase that Phase 2 actually finished — without
-            # it, the previous "any non-brief MD >100 bytes → Phase 3" rule
-            # would falsely jump to Phase 3 after a crash that killed 2/3
-            # agents mid-research with only one MD on disk.
-            #
-            # CRITICAL: only write the marker on a CLEAN P2 finish — every
-            # attempted agent reached a terminal state AND the user didn't
-            # request stop/pause. Stop/pause flow through this same code
-            # path (poll_all_agents_round_robin returns whatever it had),
-            # and writing the marker there would silently drop unfinished
-            # agents on resume. A legit "failed" status counts as terminal
-            # (resume won't re-run an agent that already failed cleanly).
-            _p2_clean_finish = (not _controls.is_stop_or_pause())
-            if _p2_clean_finish:
-                try:
-                    (queue_dir / "phase2_complete.marker").write_text(
-                        json.dumps({
-                            "completedAt": int(time.time() * 1000),
-                            "doneCount": done_count,
-                            "totalAgents": len(results),
-                            "skippedAgents": list(_p2_skipped_agents),
-                        }),
-                        encoding="utf-8",
-                    )
-                except Exception as _mk_e:
-                    log(f"[Phase 2] failed to write phase2_complete.marker: {_mk_e}", "WARN")
-            else:
-                log("[Phase 2] stop/pause detected — skipping phase2_complete.marker so resume re-runs P2", "INFO")
         else:
             log("Phase 2: Loading existing research files")
 
@@ -20651,6 +20849,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 f"(add_context disabled for Phase 3+)", "WARN")
 
         skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
+        # ── 2026-05-10: Eager phase_start:3 BEFORE the verify gate ──
+        # Pre-fix, the verify gate (when skip_init_verify=True) ran a 5-15s
+        # CUA call BEFORE phase_start:3 was emitted — FE saw P2 done + blank
+        # gap. Now: flip P3 to "running" first; the gate runs visibly under
+        # the P3 tile (the gate's own agent_progress notebooklm status emits
+        # at line ~6529 light up the dropdown). If the gate or downstream
+        # skip-check decides skip, the existing phase_skipped:3 emit at
+        # line ~20875 cleanly flips running → skipped via the FE's
+        # deterministic phaseId. The canonical phase_start:3 emit later in
+        # the elif at ~line 20939 is idempotent (same phaseId, just refreshes
+        # description).
+        if (start_phase <= 3
+                and 3 not in skip_phases
+                and 3 not in _controls.skipped_phases
+                and not _controls.is_stop()):
+            emit_event("phase_start", phase=3, description="Preparing NotebookLM…", agents=["notebooklm"])
+            _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
         # ══════════════════════ PHASE 3 verify gate (BE-2) ══════════════════════
         # When init was skipped, re-verify NotebookLM login before P3 runs.
         # Skip cascades to P4 (no YouTube without podcast — same rule as the
@@ -20944,9 +21159,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 update_delivery(audio_url=_audio_link)
                 if audio_overview_url:
                     emit_validated_link(3, "notebooklm", audio_overview_url, "Audio Overview", link_kind="audio")
-            # B2: save_meta runs ffprobe per podcast file inline (5s/file).
-            # Wrap so the per-file probes don't starve the heartbeat.
-            await asyncio.to_thread(save_meta, queue_dir, topic, 3)
+            # B2: save_meta runs ffprobe per podcast file inline (~5s/file).
+            # 2026-05-10: spawn on a daemon thread (NOT awaited) so the
+            # ffprobe doesn't gate phase_complete:3 emission. FE-P4 was
+            # waiting on this and the P3→P4 transition looked stuck for
+            # ~5s. save_meta only enriches meta.json with audio duration;
+            # no downstream phase reads from meta.json synchronously.
+            try:
+                _threading.Thread(
+                    target=save_meta,
+                    args=(queue_dir, topic, 3),
+                    name="p3-savemeta-ffprobe",
+                    daemon=True,
+                ).start()
+            except Exception as _smt_e:
+                log(f"[Phase 3] failed to dispatch save_meta thread: {_smt_e}", "WARN")
             # Build Phase 3 links — include both notebook and audio overview
             # Only include links that pass validation (no fake/placeholder URLs)
             _p3_links = []
