@@ -19945,6 +19945,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            progress="Verification skipped by user")
                 break  # break outer for
 
+        # 2026-05-11: bridge the silent gap between the last platform's
+        # CUA verdict and phase_complete:0. Without an emit here, the
+        # dropdown sat quiet after the final ✓ while env_check +
+        # preflight tab cleanup ran (~0.5-2s on a warm path; longer when
+        # resolve_api_key round-trips to Firestore for a per-user
+        # override). User reports a "stuck for a small instance" feel
+        # after the 2026-05-10 cutover dropped youtube/gmail/gdocs from
+        # preflight — 4 platforms make the trailing env-check window
+        # proportionally more visible than it was with 7. Skip when
+        # verification was globally bypassed (the _global_skip branch
+        # above emits its own status), and skip when no real platforms
+        # were verified (env-only path is too short to need a bridge).
+        if not _global_skip and preflight_platforms:
+            emit_event("agent_progress", phase=0, agent="system",
+                       status="Finalizing",
+                       progress="All sessions verified — handing off to the research phases…")
+
         # Env checks: required keys for the pipeline + ffmpeg for video.
         # Run these regardless of whether login verification was skipped —
         # missing env breaks the pipeline whether or not logins are verified.
