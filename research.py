@@ -270,10 +270,9 @@ def resolve_gemini_api_key():
         4. os.environ GEMINI_API_KEY
         5. os.environ GOOGLE_API_KEY
 
-    Used by: narrator loop, vision URL extractor, nano-banana thumbnail
-    generation (Phase 4), and narrate.narrate_panel. Each consumer
-    calls this at use-time (not at module-load) because Firestore isn't
-    initialized when research.py is first imported."""
+    Used by: narrator loop, vision URL extractor, and narrate.narrate_panel.
+    Each consumer calls this at use-time (not at module-load) because
+    Firestore isn't initialized when research.py is first imported."""
     fs_keys = _read_firestore_api_keys()
     if fs_keys.get("gemini"):
         return fs_keys["gemini"]
@@ -6142,8 +6141,8 @@ def start_narration_ticker(phase, agent, narration, interval=30, expected_minute
     long CUA waypoints leave the FE sitting on a stale pre-call string.
 
     Usage:
-        stop, task = start_narration_ticker(4, "youtube",
-                                            "Uploading video to YouTube Studio")
+        stop, task = start_narration_ticker(3, "notebooklm",
+                                            "Uploading sources to NotebookLM")
         try:
             await agent_loop(...)
         finally:
@@ -19405,17 +19404,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         _need_gemini = _agents_cfg.get("gemini", True)
         _need_claude = _agents_cfg.get("claude", True)
         _need_notebooklm = 3 not in skip_phases
-        _need_youtube = 4 not in skip_phases and config.get("videoEnabled", True) if isinstance(config, dict) else 4 not in skip_phases
-        # P5 (Doc + email) is FE-owned post-2026-04-30 — BE no longer
-        # opens Google Docs or Gmail, so neither needs login verification
-        # in the BE preflight. Removed from the platform list.
+        # P4 (YouTube) dropped 2026-05-10 — FE-owned via Data API, no BE
+        # browser involvement. P5 (Doc + email) dropped 2026-04-30 — FE-owned
+        # via Docs API + Resend. Neither needs login verification in the BE
+        # preflight; both use the OAuth refresh token in App Hosting Secrets.
 
         preflight_platforms = []
         if _need_chatgpt:    preflight_platforms.append(("ChatGPT", "chatgpt"))
         if _need_gemini:     preflight_platforms.append(("Gemini", "gemini"))
         if _need_claude:     preflight_platforms.append(("Claude", "claude"))
         if _need_notebooklm: preflight_platforms.append(("NotebookLM", "notebooklm"))
-        if _need_youtube:    preflight_platforms.append(("YouTube Studio", "youtube"))
 
         # Honor the user's preference (global Settings → Pipeline → Skip
         # login verification, plus any per-run override in pipeline_config).
