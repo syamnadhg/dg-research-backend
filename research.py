@@ -24040,10 +24040,27 @@ def run_daemon_loop(port: int = 8000):
         # in `_wait_for_port_free`'s inner sleep doesn't escape and
         # crash the wrapper.
         try:
+            # 2026-05-11: also sweep peer daemon-loop wrappers. Pre-fix
+            # this only killed stale --serve children but NOT peer
+            # --daemon-loop supervisors — so if someone (or an external
+            # tool) spawned a second wrapper, both wrappers' children
+            # raced for port 8000 in a permanent crash loop (winner
+            # served; loser kept exiting code 1 on EADDRINUSE and the
+            # daemon-loop respawned it every 5s). The "self_pid !=" guard
+            # is critical — we're a daemon-loop too; we'd otherwise kill
+            # ourselves.
             stale_serve: list[int] = []
+            stale_daemon: list[int] = []
             for pid, _cmd, role in _enumerate_research_py_procs():
-                if pid != self_pid and role == "serve":
+                if pid == self_pid:
+                    continue
+                if role == "serve":
                     stale_serve.append(pid)
+                elif role == "daemon-loop":
+                    stale_daemon.append(pid)
+            if stale_daemon:
+                killed = _kill_pids(stale_daemon)
+                log(f"[daemon-loop] Pre-restart sweep: killed {killed}/{len(stale_daemon)} peer daemon-loop wrappers ({stale_daemon})")
             if stale_serve:
                 killed = _kill_pids(stale_serve)
                 log(f"[daemon-loop] Pre-restart sweep: killed {killed}/{len(stale_serve)} stale --serve procs ({stale_serve})")
