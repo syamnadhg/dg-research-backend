@@ -939,7 +939,7 @@ class _SyncSpinnerCtx:
         self._thread.start()
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *_exc):
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.5)
@@ -983,7 +983,7 @@ class _AsyncSpinnerCtx:
         self._task = asyncio.create_task(self._spin())
         return self
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, *_exc):
         self._stop.set()
         if self._task is not None:
             try:
@@ -1688,7 +1688,7 @@ def _start_token_relink_watcher(token: str):
         return
     doc_ref = _firebase_db.collection("research_tokens").document(token)
 
-    def _on_snap(snapshots, changes, read_time):
+    def _on_snap(snapshots, changes, _read_time):
         try:
             for snap in snapshots:
                 data = snap.to_dict() or {}
@@ -1761,7 +1761,7 @@ def _start_device_command_listener(uid: str, device_id: str):
     except Exception as _sweep_err:
         log(f"[device-cmds] startup sweep failed: {_sweep_err}", "DEBUG")
 
-    def _on_snap(col_snapshot, changes, read_time):
+    def _on_snap(_col_snapshot, changes, _read_time):
         for change in changes:
             if change.type.name != "ADDED":
                 continue
@@ -2141,7 +2141,7 @@ def start_firestore_start_listener(job_queue, loop):
         col_ref = _firebase_db.collection("pipeline_requests")
         listener_label = "pipeline_requests/ (legacy — run --pair to get a ResearchToken)"
 
-    def on_snapshot(col_snapshot, changes, read_time):
+    def on_snapshot(_col_snapshot, changes, _read_time):
         for change in changes:
             if change.type.name != 'ADDED':
                 continue
@@ -3000,7 +3000,7 @@ def _start_command_listener(uid, research_id, loop):
     except Exception as _sweep_err:
         log(f"[commands] startup sweep failed: {_sweep_err}", "DEBUG")
 
-    def on_snapshot(col_snapshot, changes, read_time):
+    def on_snapshot(_col_snapshot, changes, _read_time):
         for change in changes:
             if change.type.name != 'ADDED':
                 continue
@@ -20291,15 +20291,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     except Exception:
                         pass
                 break
-                # Brief-short acknowledgement: run_phase1 already emitted a
-                # pipeline_warning with [continue_anyway] buttons when the
-                # brief is 100-500 chars. If the user pressed Continue, the
-                # command listener set the flag — consume it here just to
-                # clear the state (we proceed regardless). If the user hit
-                # Retry, they went through Stop + re-submit, which runs a
-                # fresh pipeline entirely.
-                if _controls.consume_continue_anyway():
-                    log("Phase 1: brief-short warning dismissed by user (continue_anyway)")
             # Save brief in documents/
             if _p1_skipped_after_error:
                 # User chose Skip after a brief-generation error — emit a
@@ -21567,7 +21558,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
 async def run_server(port=8000):
     """Start FastAPI server for real-time web app streaming."""
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI
     from fastapi.responses import JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
