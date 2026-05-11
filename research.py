@@ -294,6 +294,160 @@ def resolve_gemini_api_key():
 # gap with a tight 1-2 sentence LLM-generated summary, written via the
 # existing _update_firestore_research path. Fire-and-forget on a daemon
 # thread so the pipeline never waits on the LLM call.
+def _refresh_research_title_async(topic, brief_text="", findings_text=""):
+    """Spawn a daemon thread that refines Research.title post-research.
+
+    Goal: improve the title now that the pipeline has the actual research
+    findings, not just the raw user input. The FE's /api/title gave the
+    sidebar tile a clean 4-8 word title at startup based ONLY on the user's
+    input — which can be a paragraph-long brief with sections like
+    "Goal:" and "Already sorted (don't research):". Post-P2, the agents
+    have produced concrete findings; a refreshed title can reflect what
+    was ACTUALLY researched, not what the user planned to research.
+
+    Trade-off: this overwrites research.title unconditionally. If the
+    user manually renamed the title between pipeline start and P2
+    completion (~30-50min window), the BE clobbers their rename. Rare
+    enough — most users don't rename mid-pipeline, and post-P2 a
+    refined title is usually preferred anyway. The user can re-rename
+    after P2 completes (the BE doesn't touch the title again).
+
+    Hard-capped to 3-7 words / ≤70 chars via _shape_title.
+    """
+    _topic = (topic or "").strip()[:200]
+    _brief = (brief_text or "").strip()[:600]
+    _findings = (findings_text or "").strip()[:5000]
+    if not _topic and not _brief and not _findings:
+        return
+
+    def _worker():
+        try:
+            text = _try_llm_title(_topic, _brief, _findings)
+            text = _shape_title(text)
+            if text:
+                _update_firestore_research({"title": text, "updatedAt": int(time.time() * 1000)})
+        except Exception as e:
+            try:
+                log(f"[title-refresh] worker failed: {e}", "WARN")
+            except Exception:
+                pass
+
+    try:
+        _threading.Thread(target=_worker, name="research-title-refresh", daemon=True).start()
+    except Exception as e:
+        try:
+            log(f"[title-refresh] dispatch failed: {e}", "WARN")
+        except Exception:
+            pass
+
+
+def _try_llm_title(topic, brief, findings=""):
+    """Haiku 4.5 first, Gemini Flash fallback. Returns empty string on
+    any failure — caller falls through to skipping the title update."""
+    system = (
+        "Output ONLY a Title-Case research title, 3-7 words, no quotes "
+        "or prefixes, no trailing punctuation. Preserve named entities "
+        "(people, products, places, numbers) verbatim. Strip filler "
+        '("the", "a", "about", "what is", "how does"). When research '
+        "findings are provided, base the title on what was actually "
+        "found, not on the original question. Ignore any "
+        '"already sorted" / "out of scope" sections from the brief.'
+    )
+    if findings:
+        user_msg = (
+            f"Original topic: {topic}\n\n"
+            f"Brief excerpt:\n{brief or '(brief not supplied)'}\n\n"
+            f"Consolidated findings (first 5000 chars):\n{findings}\n\n"
+            f"Output: a Title-Case title (3-7 words) that reflects what the research found."
+        )
+    elif brief:
+        user_msg = f"Topic: {topic}\n\nBrief (first 600 chars):\n{brief}\n\nOutput: a Title-Case title (3-7 words)."
+    else:
+        user_msg = f"Topic: {topic}\n\nOutput: a Title-Case title (3-7 words)."
+    # Haiku 4.5
+    try:
+        import anthropic as _anth
+        _key = resolve_api_key()
+        if _key:
+            _cli = _anth.Anthropic(api_key=_key, timeout=8.0)
+            resp = _cli.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=40,
+                system=system,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            txt = "".join(
+                getattr(b, "text", "") for b in resp.content
+                if getattr(b, "type", "") == "text"
+            ).strip()
+            if txt:
+                return txt
+    except Exception as e:
+        try:
+            log(f"[title-refresh] Haiku failed ({type(e).__name__}: {str(e)[:120]}) — trying Gemini Flash", "WARN")
+        except Exception:
+            pass
+    # Gemini Flash fallback
+    try:
+        gemini_key = resolve_gemini_api_key()
+        if not gemini_key:
+            return ""
+        import requests as _requests
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.5-flash:generateContent?key={gemini_key}"
+        )
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 40,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        resp = _requests.post(url, json=payload, timeout=8.0)
+        j = resp.json()
+        text = (
+            j.get("candidates", [{}])[0]
+             .get("content", {})
+             .get("parts", [{}])[0]
+             .get("text", "")
+        )
+        return (text or "").strip()
+    except Exception as e:
+        try:
+            log(f"[title-refresh] Gemini Flash failed ({type(e).__name__}: {str(e)[:120]})", "WARN")
+        except Exception:
+            pass
+        return ""
+
+
+def _shape_title(text):
+    """Hard-cap: 3-7 words, ≤70 chars. Strips wrapping quotes / trailing
+    punctuation / "Title:" prefix that the LLM sometimes emits."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if s and s[0] in ('"', "'", "`") and s[-1] in ('"', "'", "`"):
+        s = s[1:-1].strip()
+    for prefix in ("Title:", "Title -", "title:", "**Title**:", "**Title:**"):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+            break
+    # Strip trailing punctuation (the LLM sometimes adds a period)
+    while s and s[-1] in ".!?,;:":
+        s = s[:-1].rstrip()
+    words = s.split()
+    if len(words) < 3:
+        return ""  # Too short to be a real title — let the FE keep what it has
+    if len(words) > 7:
+        s = " ".join(words[:7])
+    if len(s) > 70:
+        s = s[:70].rstrip()
+    return s
+
+
 def _generate_research_summary_async(topic, brief_text="", findings_text=""):
     """Spawn a daemon thread that generates + persists Research.summary.
 
@@ -20617,6 +20771,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     )
                 except Exception as _sum_e:
                     log(f"[summary] post-P2 dispatch failed: {_sum_e}", "WARN")
+                # 2026-05-11: also refresh research.title now that we have
+                # actual findings (not just the user's raw brief). The FE
+                # /api/title call at pipeline start gave us a 4-8 word
+                # startup title based ONLY on the user's input — often a
+                # paragraph with "Goal:" / "Already sorted" sections that
+                # produces a less-focused title. Post-P2 the agents have
+                # produced concrete findings; the refresh reflects what
+                # was actually researched.
+                try:
+                    _refresh_research_title_async(
+                        topic,
+                        brief_artifact.text if brief_artifact else "",
+                        _consolidated_md,
+                    )
+                except Exception as _tit_e:
+                    log(f"[title-refresh] post-P2 dispatch failed: {_tit_e}", "WARN")
             log(f"\nPHASE 2 COMPLETE: {done_count}/{len(results)} agents finished")
             for name, r in results.items():
                 log(f"  {name:10s} status={r['status']:12s} text={len(r['text']):>6d} chars")
