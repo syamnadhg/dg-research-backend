@@ -1159,10 +1159,6 @@ _AGENT_KEY_ALIASES = {
     "gemini": "gemini",
     "claude": "claude",
     "notebooklm": "notebooklm",
-    "youtube": "youtube",
-    "gdocs": "gdocs",
-    "gdoc": "gdocs",
-    "gmail": "gmail",
     "system": "system",
 }
 
@@ -4280,19 +4276,6 @@ LOGIN_PLATFORMS = {
         'button[aria-label*="Create"]',
         '.mat-mdc-card-title',  # project cards on the home page
     ]},
-    "gmail":      {"root": "https://mail.google.com/mail/", "markers": [
-        'div[gh="cm"]',
-        'a[aria-label*="Compose"]',
-        'div[role="main"][data-tab-id]',
-        'div[jsname][gh="mtb"]',  # mail toolbar
-        'a[aria-label*="Gmail"][role="button"]',
-    ]},
-    "gdocs":      {"root": "https://docs.google.com/document/u/0/", "markers": [
-        'a[aria-label*="Google Account"]',
-        '.docs-homescreen-gb-container',
-        'c-wiz[data-p]',  # main content container (only post-auth)
-        'div[role="main"][aria-label*="Docs home"]',
-    ]},
 }
 
 
@@ -4399,8 +4382,6 @@ _PLATFORM_DISPLAY = {
     "gemini":     "Google Gemini (gemini.google.com)",
     "claude":     "Claude (claude.ai)",
     "notebooklm": "Google NotebookLM (notebooklm.google.com)",
-    "gmail":      "Gmail (mail.google.com)",
-    "gdocs":      "Google Docs (docs.google.com)",
 }
 
 
@@ -7077,10 +7058,6 @@ PHASE_FLOW_CONTEXT = {
         "NotebookLM, rename the notebook, make it public, then generate a "
         "podcast-style audio overview where two AI hosts discuss the "
         "findings. Upload + audio gen together take 15-25 min."),
-    5: ("Phase 5 is delivery: create a Google Doc hub listing every output "
-        "link (brief, reports, NotebookLM, YouTube), make it publicly "
-        "shareable, and email the user a notification with every link via "
-        "Gmail."),
 }
 
 # Per-agent typical timeline used by Tier 3 realistic-fallback narration.
@@ -7291,7 +7268,6 @@ def _phase_short_label(phase: int) -> str:
         1: "brief generation, drafting a structured research brief",
         2: "parallel deep research across ChatGPT, Gemini, and Claude",
         3: "NotebookLM upload and audio overview generation",
-        5: "delivery — Doc creation and email dispatch",
     }.get(phase, "running through the active phase")
 
 
