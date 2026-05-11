@@ -480,7 +480,9 @@ def _generate_research_summary_async(topic, brief_text="", findings_text=""):
     so no further summary refresh. The FE typewriter-animates the
     summary on first appearance (researches/page.tsx).
 
-    Hard-capped to ≤80 words / ≤500 chars / ≤4 sentences via _shape_summary.
+    Hard-capped to ≤55 words / ≤320 chars / ≤3 sentences via
+    _shape_summary so the /researches tile renders the full text without
+    a mid-word truncation tail (2026-05-11 tighten from ≤80/500/4 caps).
     """
     _topic = (topic or "").strip()[:200]
     _brief = (brief_text or "").strip()[:600]
@@ -518,12 +520,16 @@ def _try_llm_summary(topic, brief, findings=""):
     to _fallback_summary (truncate). Targets 3-4 sentences summarizing
     what the research actually found."""
     system = (
-        "You write a research summary in 3-4 sentences. Aim for 60-80 words. "
-        "Summarize what the research found — concrete, specific, no hedging, "
-        "no marketing language. Write in plain prose, the same style as the "
+        "You write a research summary in 2-3 sentences. STRICT upper "
+        "bound: 50 words. Treat 45-50 as the target. Summarize what the "
+        "research found — concrete, specific, no hedging, no marketing "
+        "language. Every word must earn its place: prefer one strong "
+        "noun-phrase over a meandering clause; cut adjectives that don't "
+        "carry meaning. Write in plain prose, the same style as the "
         "research report itself. No preamble, no labels, no markdown, no "
         "lead-in phrase like 'This research...' or 'Summary:'. Just the "
-        "summary paragraph."
+        "summary paragraph, fully self-contained (no trailing fragment "
+        "or '...'  — the last sentence must complete cleanly)."
     )
     if findings:
         user_msg = (
@@ -609,8 +615,15 @@ def _fallback_summary(topic, brief, findings=""):
 
 
 def _shape_summary(text):
-    """Hard-cap shape: ≤4 sentences, ≤80 words, ≤500 chars. Strips
-    wrapping quotes and lead-in labels that the LLM sometimes emits."""
+    """Hard-cap shape: ≤3 sentences, ≤55 words, ≤320 chars. Strips
+    wrapping quotes and lead-in labels that the LLM sometimes emits.
+    Tightened 2026-05-11 from the previous ≤4/80/500 caps because the
+    /researches tile rendered the longer form with a mid-word "Android
+    UX coll..." truncation. Word-cap overruns now drop to the last
+    complete sentence boundary instead of mid-word; only when no
+    sentence boundary exists in the prefix do we fall back to the
+    ellipsis tail (single-sentence runaways, which the LLM prompt
+    actively discourages)."""
     s = (text or "").strip()
     if not s:
         return ""
@@ -624,20 +637,27 @@ def _shape_summary(text):
     buf = ""
     for ch in s:
         buf += ch
-        if ch in ".!?" and len(sentences) < 4:
+        if ch in ".!?" and len(sentences) < 3:
             sentences.append(buf.strip())
             buf = ""
-            if len(sentences) >= 4:
+            if len(sentences) >= 3:
                 break
-    if buf.strip() and len(sentences) < 4:
+    if buf.strip() and len(sentences) < 3:
         sentences.append(buf.strip())
     if sentences:
         s = " ".join(sentences)
     words = s.split()
-    if len(words) > 80:
-        s = " ".join(words[:80]).rstrip(",;:") + "…"
-    if len(s) > 500:
-        s = s[:497].rstrip() + "…"
+    if len(words) > 55:
+        # Drop to the last sentence boundary inside the 55-word prefix
+        # so we never end mid-word. Only if no boundary exists in the
+        # prefix do we fall back to the ellipsis tail.
+        _prefix = " ".join(words[:55])
+        _last_boundary = max(_prefix.rfind("."), _prefix.rfind("!"), _prefix.rfind("?"))
+        s = _prefix[:_last_boundary + 1] if _last_boundary > 0 else _prefix.rstrip(",;:") + "…"
+    if len(s) > 320:
+        _prefix = s[:320]
+        _last_boundary = max(_prefix.rfind("."), _prefix.rfind("!"), _prefix.rfind("?"))
+        s = _prefix[:_last_boundary + 1] if _last_boundary > 0 else _prefix[:317].rstrip() + "…"
     return s
 
 
