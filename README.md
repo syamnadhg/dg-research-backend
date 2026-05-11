@@ -31,7 +31,7 @@ The supervisor (`--resurrect` / `--retire`) currently uses Windows Task Schedule
   - **Claude Pro** ($20/mo per seat) — Phase 2 Claude agent uses Opus 4.7 + Research mode (Free tiers don't expose Opus or Research).
   - **Gemini Advanced** ($20/mo per seat, via Google One AI Premium) — Phase 2 Gemini agent uses 2.5 Pro / Deep Think + Deep Research.
   - The pipeline will *run* end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower. **Phase 0 vision-checks each platform's tier after login-verify and hard-flags the first non-Pro account it finds** with a `[Continue with Free] [Retry]` alert — sign out, sign in with a Pro account in the same browser, then click Retry to re-verify. Opting into Free for one platform suppresses the prompt for the rest of the run, so verify Pro is active in each platform's account/billing page before pairing to avoid surprises. (Stop is always reachable from the chat-box during a paused pipeline — no separate Stop button on the alert.)
-- *(Optional)* Gemini API key for Phase 4 nano-banana thumbnails. (Phase 5 — Google Doc creation + email — runs entirely in the frontend; no BE-side Resend setup needed.)
+- *(Optional)* Gemini API key for the narrator's Flash fallback. (Phase 4 — YouTube upload — and Phase 5 — Google Doc creation + email — both run entirely in the frontend; no BE-side Resend / YouTube / Docs setup needed.)
 
 ## Quick Start
 
@@ -188,9 +188,9 @@ export CUA_API_KEY="sk-ant-..."
 
 **`ANTHROPIC_API_KEY` is accepted as a fallback** — `resolve_api_key()` (research.py:181) checks `CUA_API_KEY` first, then `ANTHROPIC_API_KEY`, on both env and Windows User scope. Most Anthropic devs already have `ANTHROPIC_API_KEY` set globally, so it just works without setting a duplicate.
 
-`GEMINI_API_KEY` is **optional** — required only for Phase 4 nano-banana thumbnail generation. If unset, Phase 4 still uploads the audio video; the thumbnail step skips with a warning. (Same canonical wording in the env-var table below.)
+`GEMINI_API_KEY` is **optional** — used only as the narrator's Flash fallback when Haiku is unavailable. (The original P4 thumbnail use case is gone — P4 is FE-owned post-2026-05-10.)
 
-**Phase 5 (Google Doc + email) is FE-owned.** No BE setup needed. The frontend creates the Google Doc via the Docs API and sends the email via Resend, both using the deployment's own service account + Resend key — see the FE README for that side's env vars (`RESEND_API_KEY`, `NOTIFY_FROM_EMAIL`).
+**Phases 4 + 5 are FE-owned.** No BE setup needed for either. The frontend handles YouTube upload via `youtube.videos.insert` (Data API + OAuth refresh token, ffmpeg encode in Cloud Run) AND Google Doc creation via the Docs API AND email via Resend — see the FE README for that side's env vars (`GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`, `RESEND_API_KEY`, `NOTIFY_FROM_EMAIL`).
 
 `BUG_REPORT_EMAIL` is optional — see the env-var table.
 
@@ -225,14 +225,13 @@ Enable On Startup? [Y/n]:
 - **`n`** — skip; you'll run `python research.py --serve` manually after `--pair` finishes (and, on Linux/Mac, set up your own backgrounding via `nohup` / `tmux` / `screen` / your own systemd unit — see [§ Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending)).
 
 **`[4/4] Platform logins`**
-Opens 5 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds:
+Opens 4 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds:
 - ChatGPT (chatgpt.com)
 - Gemini (gemini.google.com)
 - Claude (claude.ai)
 - NotebookLM (notebooklm.google.com)
-- YouTube Studio (studio.youtube.com)
 
-> Phase 5 (Doc + email) runs in the frontend now, so Gmail and Google Docs are no longer in the BE login checklist.
+> Phases 4 + 5 run in the frontend now (YouTube via Data API, Doc + email via Docs API + Resend), so YouTube Studio, Gmail, and Google Docs are no longer in the BE login checklist.
 
 The checklist re-renders only when a platform flips — `[ok]` for logged in, `[  ]` for not yet. It also mirrors the live state to Firestore (`research_tokens/{token}.logins`, `setupState`) so the app can show your progress. Default timeout is 10 minutes; Ctrl+C cancels.
 
@@ -380,8 +379,8 @@ Multiple people can also share one backend. Share your ResearchToken — they pa
 | 1. Brief | ChatGPT Pro + Extended Thinking | ~25 min |
 | 2. Research | ChatGPT + Gemini + Claude (parallel) | ~49 min |
 | 3. Podcast | NotebookLM (upload + audio generation) | ~25 min |
-| 4. YouTube | YouTube Studio (video render + upload) | ~9 min |
-| 5. Report | Google Doc + email delivery (FE-owned: Docs API + Resend) | ~3 min |
+| 4. YouTube | FE-owned: Data API (ffmpeg encode + `youtube.videos.insert` via OAuth) | ~1-2 min |
+| 5. Report | FE-owned: Docs API + Resend | ~3 min |
 
 Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT Pro, Claude Pro, and Gemini Advanced are the assumed baseline — see [Before you start](#before-you-start-prerequisites-checklist) for per-seat costs. Phase 0 vision-checks each platform's tier after login-verify and hard-flags non-Pro accounts with `[Continue with Free] [Retry]` before Phase 1 starts; Retry re-verifies after you sign in with a Pro account in the same browser. If you `Continue with Free` (or have Phase 0 verification disabled in Settings), the pipeline runs end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower than what the per-agent timings, prompts, and waits were tuned against, so per-agent output is much shallower.
 
@@ -430,7 +429,7 @@ Every failure category — timeouts, CUA fallbacks, Anthropic 429/529 retries, s
 - **Phase 1** — brief timeout, brief paste retry per attempt, brief-short (offers `continue_anyway`), brief model error, manual-brief 3h backstop (auto-fail with `pipeline_stopped` reason `manual_brief_wait_backstop_3h`)
 - **Phase 2** — agent timeout (auto-skip with partial save if ≥200 chars; no human prompt needed since 2026-04-30 `be8f7b3`), send-button CUA fallback, paste outer-retry narration, full HV (human-verification) stage narration: detected → auto-clear 1/2 → 3 min cooldown → retry 2/2 → success/fail with Resume/Skip. HV cooldown is 180s (was 45s — providers need the time to release holds). Browser crashes auto-retry with a passive recovery banner; no Retry/Skip prompt.
 - **Phase 3** — per-agent share-link extraction failure, NotebookLM login-expired vs generic upload failure, "no MD files" gate, inter-phase gate (P2 produced no documents). Derived stems (`brief.md`, `consolidated.md`) are excluded from NotebookLM uploads via `_DERIVED_STEMS` filter (research.py:14627) — never uploads consolidated.md.
-- **Phase 4** — audio skip via command, poll-budget timeout, download-event timeout + fallback + final fail, Firebase Storage upload as best-effort (warning, not fatal)
+- **Phase 4** — owned by FE (YouTube upload via Data API). BE no longer surfaces P4 errors; see FE for the alert matrix (`uploadYouTube 401/403/quotaExceeded` map to OAuth-scope / quota-cap actionable copy).
 - **Phase 5** — owned by FE (Doc creation + email). BE no longer surfaces P5 errors; see FE for the alert matrix.
 - **Cross-cutting** — Anthropic 429/529 narrate as retrying; other API errors surface as `pipeline_warning` on the current phase
 
@@ -488,7 +487,7 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 | `CUA_MODEL` | `claude-opus-4-7` | Claude model for CUA |
 | `CUA_SCREEN_WIDTH` | `1280` | Browser viewport width |
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |
-| `GEMINI_API_KEY` | (optional; required only for Phase 4 nano-banana thumbnail generation) | Gemini API key. Phase 4 still uploads audio video without it; only the thumbnail step skips. Also used as the narrator's Flash fallback when Haiku is unavailable. |
+| `GEMINI_API_KEY` | (optional) | Gemini API key. Used only as the narrator's Flash fallback when Haiku is unavailable. (The earlier P4 thumbnail role is gone — P4 is FE-owned post-2026-05-10.) |
 | `MAX_WAIT_DEEP` | `90` | Max minutes to wait per Phase 2 agent |
 | `POLL_DEEP_RESEARCH` | `30` | Seconds between polling cycles |
 | `MIN_AGENT_WAIT_MIN` | `20` | Min minutes before CUA completion checks |
@@ -546,7 +545,7 @@ research-automate/
 
 **Anthropic workspace usage limit hit (CUA 400)** — Same fallback semantics as 401: narrator routes to Flash; CUA tier-3 is unavailable until the limit window resets (typically 24h). Pipeline keeps running on Playwright + Vision; specific platform actions that require CUA (e.g. some HV captcha clicks) may need manual help via the FE alerts.
 
-**Phase 4 audio failed but Phase 5 still matters** — Hit `[Skip]` on the Phase 4 alert (writes `skip_phase phase=4`); Phase 5 YouTube + Email proceed normally.
+**Phase 4 audio failed but Phase 5 still matters** — Hit `[Skip]` on the FE Phase 4 alert; FE-P4's fast-path skip emits `phase_skipped:4` and chains directly into FE-P5 (Doc + email) without a YouTube URL.
 
 **FE shows `paused_backend_restart_failed` red banner** — Backend tried to persist the in-flight queue on shutdown but the Firestore write failed. The `lastError` field on the research doc has the actual exception. Restart `--serve`; affected runs are kept on disk in `queues/` and can be resumed via the FE checkpoint banner once BE is back online.
 

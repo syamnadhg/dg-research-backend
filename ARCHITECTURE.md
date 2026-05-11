@@ -14,8 +14,8 @@ The pipeline has **6 phases** (0–5). Each phase has a backend execution step a
 | 1 | **Research Brief** | brief | Extended Thinking generates a comprehensive research brief from the user's topic |
 | 2 | **Deep Research** | chatgpt, gemini, claude | 3 agents research in parallel. Each produces a long-form report with sources |
 | 3 | **NotebookLM Processing** | notebooklm | Upload reports to NotebookLM + generate podcast-style audio overview |
-| 4 | **YouTube Upload** | youtube | Convert audio to video via ffmpeg, upload to YouTube as unlisted |
-| 5 | **Report & Notification** | gdocs, gmail | Create Google Doc hub with all links, send email notification |
+| 4 | **YouTube Upload** | youtube | **FE-owned (2026-05-10 cutover).** FE reads the P3 audio from Firebase Storage, ffmpeg-encodes a static-image+audio mp4 in Cloud Run, uploads to YouTube as unlisted via `youtube.videos.insert` (resumable, OAuth refresh token). BE no longer drives YouTube Studio. |
+| 5 | **Report & Notification** | gdocs, gmail | **FE-owned (2026-04-30 cutover).** Creates Google Doc hub with all links via `/api/createDoc`, sends email via `/api/notify-email` (Resend). BE no longer drives Gmail / Google Docs. |
 
 ---
 
@@ -32,7 +32,9 @@ Phase 0 (Init)
 
 **Dependency cascade:** Phase 3 off → Phase 4 auto-off (no audio to upload)
 
-> **Phase 4 fix plan (open).** Phase 4 (YouTube upload) currently has an open fix plan tracked in BE memory (`project_p4_fix_plan`) — a multi-commit sequence aimed at unblocking the YouTube path and the FE-P5 handoff. The dependency contract above ("REQUIRES Phase 3, videoEnabled") is unchanged by that work; the fix plan is about reliability of the upload itself.
+**Where each phase runs:**
+- Phases 0-3 run **BE-side** (Python daemon on user's PC — needs the local browser for ChatGPT / Gemini / Claude / NotebookLM).
+- Phases 4-5 run **FE-side** (Firebase App Hosting / Cloud Run — Data API + Resend, no browser needed). FE-P4 fires off BE's `phase_complete:3` (or `phase_skipped:3` for the no-audio path), then chains directly into FE-P5 on success or fast-path skip. BE exits cleanly after P3 with `delivery.status="completed"`; the user-visible `research.status` stays "ongoing" until FE-P5's `markFeP5Completed` flips it to "completed".
 
 ---
 
