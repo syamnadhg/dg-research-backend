@@ -8,6 +8,12 @@ Automates multi-agent deep research across 6 platforms. Tiered automation: Playw
 > The Firebase Admin SDK key (`firebase-service-account.json`) is **gitignored**
 > and emailed separately by the dev — see ["Firebase Admin Key" below](#firebase-admin-key-required--firebase-service-accountjson).
 
+## Google accounts: use personal accounts, not workspace ones
+
+The web app side accepts any Google sign-in. **The backend is different — use a personal Gmail/Google account here, not a Google Workspace one.** Phase 0 logs the backend's Chrome session into NotebookLM, ChatGPT, Claude, and Gemini on your behalf, and Workspace-managed accounts hit the admin-approval gate on each of those services. Personal accounts skip that prompt and let the pipeline run unattended. If you've already paired with a Workspace account and Phase 0 stalls on a "this app needs admin approval" screen, the fastest fix is `python research.py --unpair` then re-pair with a personal account.
+
+Pairing-side data scope: this backend pairs to a single web-app account at a time via `--pair`. The ResearchToken minted during pairing is bound to that uid; the backend rejects start requests whose `uid` doesn't match the token's `linkedUid`, so even if the token leaks it can't be used to drive runs against another user's research collection.
+
 ## Platform support
 
 | Platform | Server | `--pair` | `--resurrect` / `--retire` | `--unpair` |
