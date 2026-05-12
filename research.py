@@ -2962,6 +2962,14 @@ _DG_FE_BASE_URL = os.environ.get("DG_FE_BASE_URL", "").strip()
 _DG_FE_WEB_API_KEY = os.environ.get(
     "DG_FE_WEB_API_KEY", "AIzaSyDTjXwU_uOwGrsuf7nuJTfQAZg4dTjSAMk"
 ).strip()
+# Cloud Tasks queue path for the autonomous P4/P5 trigger. Format:
+#   projects/{project}/locations/{region}/queues/{queue}
+# Default targets the queue created on 2026-05-12 for the super-research
+# project. Override via env if you deploy to a different project or queue.
+_DG_FE_CLOUD_TASKS_QUEUE = os.environ.get(
+    "DG_FE_CLOUD_TASKS_QUEUE",
+    "projects/super-research-492814/locations/us-central1/queues/super-research-p4-trigger",
+).strip()
 
 
 def _mint_fe_id_token(uid):
@@ -2998,27 +3006,38 @@ def _mint_fe_id_token(uid):
         return None
 
 
-def _post_to_fe_p4_trigger(uid, research_id):
-    """Fire-and-forget POST to /api/uploadYouTube to kick off the
-    autonomous P4 + P5 chain. The route reads the rest of the payload
-    (audio_url, title, brief_url, etc.) from Firestore via Admin SDK,
-    so this body just carries `research_id`.
+def _fire_fe_p4_trigger(uid, research_id):
+    """Enqueue a Cloud Task that POSTs to /api/uploadYouTube to kick off
+    the autonomous P4 + P5 chain. Cloud Tasks owns delivery + retries +
+    timeouts — this function makes one fast API call (~50ms typical)
+    and returns; the BE worker loop never blocks on the network.
 
-    Retry: up to 2 attempts with 2s backoff. If all fail, write a
-    `needsFeTrigger` marker so the FE catch-up hook can re-fire on
-    next chat-open.
+    The task body carries `research_id` only; the route reads the rest
+    (audio_url, title, links, etc.) from Firestore via Admin SDK on
+    receipt. The task carries a freshly-minted user ID token in the
+    Authorization header so the route's `verifyRequest` resolves to the
+    right uid for Firestore path scoping.
 
-    Streaming response: the route emits a heartbeat byte within the
-    first ~100ms and then keeps the connection open for the full
-    encode + upload + Doc + email (up to ~60 min). We use a short
-    READ timeout so this helper returns once Cloud Run has acknowledged
-    the request, not after the work finishes — the actual work runs
-    independently on Cloud Run."""
+    Falls back to the `needsFeTrigger` marker path on any failure so
+    the FE catch-up hook can re-fire on next chat-open.
+
+    Returns True on successful enqueue, False otherwise. Sync (no
+    daemon thread needed — Cloud Tasks enqueue is a fast unary call)."""
     if not uid or not research_id:
         log(f"FE trigger: skip (uid={bool(uid)} rid={bool(research_id)})", "WARN")
         return False
     if not _DG_FE_BASE_URL:
         log("FE trigger: DG_FE_BASE_URL not configured — writing needsFeTrigger marker", "WARN")
+        try:
+            _update_firestore_research({
+                "needsFeTrigger": True,
+                "needsFeTriggerAt": int(time.time() * 1000),
+            })
+        except Exception:
+            pass
+        return False
+    if not _DG_FE_CLOUD_TASKS_QUEUE:
+        log("FE trigger: DG_FE_CLOUD_TASKS_QUEUE not configured — writing needsFeTrigger marker", "WARN")
         try:
             _update_firestore_research({
                 "needsFeTrigger": True,
@@ -3038,129 +3057,58 @@ def _post_to_fe_p4_trigger(uid, research_id):
         except Exception:
             pass
         return False
-    url = _DG_FE_BASE_URL.rstrip("/") + "/api/uploadYouTube"
-    payload = {"research_id": research_id}
-    # 2026-05-12: BE must drain the full streaming response. Closing the
-    # connection after 1 byte (the original "fire and forget" pattern)
-    # caused Cloud Run / App Hosting to abort the route's ReadableStream
-    # `start()` ~5s after disconnect — the route logged
-    # `[uploadYouTube] ffmpeg encode → /tmp/p4-…` and then silently died,
-    # losing the entire P4/P5 chain. Cloud Run's "we keep processing after
-    # disconnect" guarantee doesn't extend to active ReadableStreams in
-    # Next.js App Router. Fix: keep reading chunks (15s heartbeats + final
-    # JSON) until the server closes the stream OR the wall-clock budget
-    # expires. Daemon thread isolates this from the BE worker loop.
-    FE_TRIGGER_WALLCLOCK_SEC = 20 * 60  # 20min — covers slow encodes + Doc + Email
-    import requests as _req
-    for attempt in range(2):
-        try:
-            log(f"FE trigger: POST {url} (attempt {attempt + 1}) rid={research_id[:8]}…")
-            resp = _req.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {id_token}",
+    try:
+        from google.cloud import tasks_v2
+        from google.oauth2 import service_account
+        import json as _json
+        # Use the same service-account JSON Firebase Admin reads. ADC
+        # would also work on GCP-hosted environments, but here the BE
+        # runs on the user's PC so explicit credentials are required.
+        sa_path = Path(__file__).parent / "firebase-service-account.json"
+        if not sa_path.exists():
+            log("FE trigger: firebase-service-account.json missing — writing marker", "WARN")
+            try:
+                _update_firestore_research({
+                    "needsFeTrigger": True,
+                    "needsFeTriggerAt": int(time.time() * 1000),
+                })
+            except Exception:
+                pass
+            return False
+        _creds = service_account.Credentials.from_service_account_file(str(sa_path))
+        client = tasks_v2.CloudTasksClient(credentials=_creds)
+        url = _DG_FE_BASE_URL.rstrip("/") + "/api/uploadYouTube"
+        body = _json.dumps({"research_id": research_id}).encode("utf-8")
+        task = {
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": url,
+                "headers": {
                     "Content-Type": "application/json",
+                    "Authorization": f"Bearer {id_token}",
                 },
-                json=payload,
-                # (connect, read). 120s read covers the 15s heartbeat
-                # cadence with 8× headroom (Cloud Run heartbeats can jitter
-                # under GC pauses / cold scale-out / TCP coalescing); the
-                # wall-clock guard below caps total wait at 20 min even if
-                # the route hangs without ever closing the connection.
-                timeout=(30, 120),
-                stream=True,
-            )
-            log(f"FE trigger: POST connected status={resp.status_code} rid={research_id[:8]}…")
-            # Drain the stream — keeps the upstream connection alive so
-            # Cloud Run's request handler isn't aborted. Best-effort parse
-            # of the final JSON to surface P4/P5 outcome in BE logs.
-            _start_t = time.time()
-            _buf = bytearray()
-            _bytes_seen = 0
-            _abort = False
-            for chunk in resp.iter_content(chunk_size=8192, decode_unicode=False):
-                if chunk:
-                    _bytes_seen += len(chunk)
-                    # Final JSON arrives as the LAST chunk(s); heartbeats
-                    # are single spaces. Keep last ~64KB so the trailing
-                    # JSON survives even if the heartbeat trail is huge.
-                    _buf.extend(chunk)
-                    if len(_buf) > 65536:
-                        del _buf[:len(_buf) - 65536]
-                if time.time() - _start_t > FE_TRIGGER_WALLCLOCK_SEC:
-                    log(f"FE trigger: 20min wall-clock budget exceeded — closing (route may still finish independently)", "WARN")
-                    _abort = True
-                    break
-            try:
-                resp.close()
-            except Exception:
-                pass
-            if _abort:
-                # Even if we abort, the route may have completed off-stream
-                # and written Firestore. The FE catch-up path can verify.
-                return True
-            # Try to extract the final JSON outcome. Heartbeats are
-            # leading spaces — trim them off, then look for the trailing
-            # JSON object the route emits.
-            try:
-                _text = _buf.decode("utf-8", errors="ignore").lstrip()
-                if _text:
-                    import json as _json
-                    try:
-                        _outcome = _json.loads(_text)
-                    except Exception:
-                        # Heartbeat trail + JSON — try splitting on last "{"
-                        _idx = _text.rfind("{")
-                        _outcome = _json.loads(_text[_idx:]) if _idx >= 0 else None
-                    if isinstance(_outcome, dict):
-                        if _outcome.get("__error"):
-                            log(f"FE trigger: route returned error: {str(_outcome.get('error', ''))[:200]}", "WARN")
-                        elif _outcome.get("youtube_url"):
-                            log(f"FE trigger: P4+P5 complete via route — yt={_outcome.get('youtube_url', '')[:40]} doc={'yes' if (_outcome.get('p5') or {}).get('docUrl') else 'no'}")
-                        elif _outcome.get("p4_skipped"):
-                            log(f"FE trigger: P4 skipped server-side (reason={_outcome.get('p4_skip_reason', '?')}) — P5 still ran")
-                        elif _outcome.get("in_flight"):
-                            log("FE trigger: route reported in_flight (another caller owns it) — fine")
-                        elif _outcome.get("already_completed"):
-                            log("FE trigger: route reported already_completed — idempotent skip")
-            except Exception:
-                pass
-            log(f"FE trigger: drained {_bytes_seen}B in {int(time.time() - _start_t)}s rid={research_id[:8]}…")
-            return True
-        except Exception as e:
-            log(f"FE trigger: POST attempt {attempt + 1} failed: {e}", "WARN")
-            if attempt == 0:
-                try:
-                    time.sleep(2)
-                except Exception:
-                    pass
-    # All retries failed — leave a marker for FE catch-up on next reopen.
-    log("FE trigger: all retries failed — writing needsFeTrigger marker", "WARN")
-    try:
-        _update_firestore_research({
-            "needsFeTrigger": True,
-            "needsFeTriggerAt": int(time.time() * 1000),
-        })
-    except Exception:
-        pass
-    return False
-
-
-def _fire_fe_p4_trigger_async(uid, research_id):
-    """Kick off _post_to_fe_p4_trigger on a daemon thread so the BE
-    worker doesn't block on the network round-trip. Cloud Run's
-    long-running side runs independently of our connection."""
-    if not uid or not research_id:
-        return
-    try:
-        import threading as _thr
-        _thr.Thread(
-            target=_post_to_fe_p4_trigger,
-            args=(uid, research_id),
-            daemon=True,
-        ).start()
+                "body": body,
+            },
+            # 30-min per-task deadline. Route's typical happy-path is
+            # ~3-5 min (ffmpeg + YouTube + Doc + Email); the deadline
+            # is sized for slow encodes / Resend retries / unverified
+            # channel pre-flight failures. Per-task setting overrides
+            # the default 10-min dispatch deadline.
+            "dispatch_deadline": {"seconds": 1800},
+        }
+        response = client.create_task(parent=_DG_FE_CLOUD_TASKS_QUEUE, task=task)
+        log(f"FE trigger: Cloud Task enqueued name={response.name.rsplit('/', 1)[-1][:16]} rid={research_id[:8]}…")
+        return True
     except Exception as e:
-        log(f"FE trigger: failed to start thread: {e}", "WARN")
+        log(f"FE trigger: Cloud Tasks enqueue failed: {e}", "WARN")
+        try:
+            _update_firestore_research({
+                "needsFeTrigger": True,
+                "needsFeTriggerAt": int(time.time() * 1000),
+            })
+        except Exception:
+            pass
+        return False
 
 
 def _do_agent_terminal_status_write(agent_key: str, status: str):
@@ -19491,7 +19439,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # leave the chain dangling on the FE listener (which may not
             # be alive when this resume path runs from the daemon-loop).
             try:
-                _fire_fe_p4_trigger_async(_fb_uid, _fb_research_id)
+                _fire_fe_p4_trigger(_fb_uid, _fb_research_id)
             except Exception as _trig_err:
                 log(f"FE trigger dispatch failed on resume (non-fatal): {_trig_err}", "WARN")
             return
@@ -21897,16 +21845,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # beDoneAt anchors the 4200s fallback timer.
         _update_firestore_research({"beDone": True, "beDoneAt": int(time.time() * 1000)})
         # 2026-05-12: autonomous P4/P5 trigger. BE has finished its work
-        # through P3 (audio in Firebase Storage). Fire-and-forget POST to
-        # /api/uploadYouTube so Cloud Run runs P4 (YouTube upload) + P5
-        # (Doc + email) + flips status="completed" server-side. The
-        # queue gate (_wait_for_prior_fe_completion) waits on status,
-        # so this chain advances the queue even when the user's phone
-        # or tab isn't open. Daemon thread so the BE worker returns
-        # immediately and the next queued item can spool up after the
-        # gate clears.
+        # through P3 (audio in Firebase Storage). Enqueue a Cloud Task that
+        # POSTs to /api/uploadYouTube so Cloud Run runs P4 (YouTube upload)
+        # + P5 (Doc + email) + flips status="completed" server-side. The
+        # queue gate (_wait_for_prior_fe_completion) waits on status, so
+        # this chain advances the queue even when the user's phone or tab
+        # isn't open. Cloud Tasks owns delivery + retries; the call below
+        # is a fast unary RPC (~50ms typical) — no thread held.
         try:
-            _fire_fe_p4_trigger_async(_fb_uid, _fb_research_id)
+            _fire_fe_p4_trigger(_fb_uid, _fb_research_id)
         except Exception as _trig_err:
             log(f"FE trigger dispatch failed (non-fatal): {_trig_err}", "WARN")
         log(f"\n{'='*60}")

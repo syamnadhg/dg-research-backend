@@ -28,6 +28,11 @@ firebase-admin>=6.5
 # in 6+ places — pin it explicitly so the dep doesn't disappear if firebase-admin
 # ever drops it.
 google-cloud-firestore>=2.0
+# Cloud Tasks — used to enqueue the autonomous P4/P5 trigger after BE-P3.
+# Replaced the held-HTTP-connection pattern (which Cloud Run aborted ~5s
+# after BE disconnected) on 2026-05-12. BE fires a one-shot task; Cloud
+# Tasks owns delivery + retries; route runs the same P4+P5 chain.
+google-cloud-tasks>=2.16
 
 # Setup QR code rendering
 qrcode>=7.4
