@@ -1220,6 +1220,14 @@ _QUEUE_STATE = {
     "last_completed_uid": None, "last_completed_rid": None, "last_be_done_at": 0,
 }
 
+# 2026-05-11: queue gate fallback — wait at most this many seconds for the
+# prior run's FE-P5 to flip status="completed" before force-dequeueing the
+# next job. Hoisted to module scope (2026-05-12) so the Firestore start
+# listener (module-level) can reference the same constant when predicting
+# whether the gate will block at queue-banner time; the worker's existing
+# in-server reference resolves via normal global lookup.
+BE_PHASES_TIMEOUT_SEC = 4200
+
 
 def init_firebase():
     """Initialize Firebase Admin SDK from service-account JSON. Call once at server start.
@@ -2230,6 +2238,36 @@ def start_firestore_start_listener(job_queue, loop):
                 # actually cancels now, so no "couldn't cancel" message
                 # path is needed.)
                 current = _QUEUE_STATE.get("current_job") or {}
+                # 2026-05-12: also check the gate-pending job. Worker pops
+                # from job_queue then awaits _wait_for_prior_fe_completion
+                # BEFORE setting current_job — so a cancel that arrives
+                # while the worker is in the gate wait sees neither
+                # current_job nor a queue entry and silently no-ops. The
+                # gate_pending_job marker closes this gap.
+                gate_pending = _QUEUE_STATE.get("gate_pending_job") or {}
+                if gate_pending.get("research_id") == target_rid:
+                    log(f"Cancel: target {target_rid[:8]}… is in gate wait — requesting stop + flipping status", "INFO")
+                    loop.call_soon_threadsafe(_controls.request_stop)
+                    if _firebase_db:
+                        try:
+                            from google.cloud.firestore import DELETE_FIELD as _DF
+                            _firebase_db.collection("users").document(target_uid) \
+                                .collection("researches").document(target_rid) \
+                                .update({
+                                    "status": "stopped",
+                                    "summary": "Cancelled while queued",
+                                    "cancelled": True,
+                                    "queuePosition": _DF,
+                                    "queuedBehindRunId": _DF,
+                                    "queuedBehindTitle": _DF,
+                                })
+                        except Exception as ex:
+                            log(f"Cancel(gate-pending): failed to mark stopped: {ex}", "WARN")
+                    try:
+                        doc.reference.delete()
+                    except Exception:
+                        pass
+                    continue
                 if current.get("research_id") == target_rid:
                     log(f"Cancel: target {target_rid[:8]}… is the running job — requesting stop + scheduling exit", "INFO")
                     loop.call_soon_threadsafe(_controls.request_stop)
@@ -2267,6 +2305,34 @@ def start_firestore_start_listener(job_queue, loop):
                     continue
                 def _do_cancel(rid=target_rid, u=target_uid, dref=doc.reference):
                     try:
+                        # 2026-05-12: also re-check gate_pending_job. The
+                        # listener-thread initial check above could miss a
+                        # job that JUST entered the gate wait. Same fix as
+                        # the sync path.
+                        gate_pending_now = _QUEUE_STATE.get("gate_pending_job") or {}
+                        if gate_pending_now.get("research_id") == rid:
+                            log(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop", "INFO")
+                            _controls.request_stop()
+                            if _firebase_db:
+                                try:
+                                    from google.cloud.firestore import DELETE_FIELD as _DF
+                                    _firebase_db.collection("users").document(u) \
+                                        .collection("researches").document(rid) \
+                                        .update({
+                                            "status": "stopped",
+                                            "summary": "Cancelled while queued",
+                                            "cancelled": True,
+                                            "queuePosition": _DF,
+                                            "queuedBehindRunId": _DF,
+                                            "queuedBehindTitle": _DF,
+                                        })
+                                except Exception as ex:
+                                    log(f"Cancel(gate-pending-late): failed to mark stopped: {ex}", "WARN")
+                            try:
+                                dref.delete()
+                            except Exception:
+                                pass
+                            return
                         # Race-safe re-check: between the listener's initial
                         # current_job read (above) and this callback running on
                         # the asyncio loop, the worker may have completed its
@@ -2534,11 +2600,36 @@ def start_firestore_start_listener(job_queue, loop):
             # Generate run_id
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             log(f"Firestore start: uid={uid[:8]}... topic={topic[:40]} run_id={run_id}")
-            # Decide initial status: "ongoing" if worker is idle, else "queued"
-            # with position + behind-target so the chat banner + tile badge can
-            # tell the user which run must finish first.
+            # Decide initial status: "ongoing" if worker is idle AND the gate
+            # won't block, else "queued" with position + behind-target so the
+            # chat banner + tile badge can tell the user which run must
+            # finish first.
             is_busy = bool(_QUEUE_STATE.get("running")) or job_queue.qsize() > 0
-            if is_busy:
+            # 2026-05-12: also predict the queue gate. Even when the worker is
+            # idle and queue empty, `_wait_for_prior_fe_completion` can block
+            # the dequeue for up to BE_PHASES_TIMEOUT_SEC waiting on a prior
+            # run's FE-P5. Without surfacing this, the new run lands as
+            # status="ongoing" but with no phase_start:0 events for the entire
+            # gate window — the FE renders an "ongoing" chat with no Phase 0
+            # tile (the inconsistency the user flagged 2026-05-12). Compute
+            # the same predicate the gate uses so the user sees a queued
+            # banner during the wait instead of empty silence.
+            _gate_will_block = False
+            _gate_prid = _QUEUE_STATE.get("last_completed_rid") or ""
+            _gate_puid = _QUEUE_STATE.get("last_completed_uid") or ""
+            _gate_pdone = int(_QUEUE_STATE.get("last_be_done_at") or 0)
+            if (
+                not is_busy
+                and _gate_prid and _gate_puid and _gate_pdone > 0
+                # Skip when this rid IS the gate's prior rid (resume path —
+                # the helper at research.py:22457 skips the wait for this
+                # case, so we must NOT show a banner either).
+                and research_id != _gate_prid
+            ):
+                _gate_deadline = _gate_pdone + (BE_PHASES_TIMEOUT_SEC * 1000)
+                if int(time.time() * 1000) < _gate_deadline:
+                    _gate_will_block = True
+            if is_busy or _gate_will_block:
                 # Position in queue = current pending + 1 (this one)
                 position = job_queue.qsize() + 1
                 behind_rid = ""
@@ -2554,6 +2645,18 @@ def start_firestore_start_listener(job_queue, loop):
                             first = pending_list[0]
                             behind_rid = first.get("research_id") or ""
                             behind_title = (first.get("topic") or "")[:60]
+                    except Exception:
+                        pass
+                elif _gate_will_block:
+                    # Gate-blocked path: behind-target is the prior run whose
+                    # FE-P5 the gate is waiting on. Best-effort title read.
+                    behind_rid = _gate_prid
+                    try:
+                        _prior_doc = _firebase_db.collection("users").document(_gate_puid) \
+                            .collection("researches").document(_gate_prid).get()
+                        if _prior_doc.exists:
+                            _prior_data = _prior_doc.to_dict() or {}
+                            behind_title = (_prior_data.get("title") or _prior_data.get("topic") or "")[:60]
                     except Exception:
                         pass
                 status_payload = {
@@ -6779,6 +6882,17 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     # doc so the listing-page tile + chat phase icons stay red post-
     # reload. If a later Retry succeeds, phase_complete overwrites this.
     _write_phase_terminal_status(phase, "errored")
+    # 2026-05-12: flag the queue gate so the next dequeue short-circuits.
+    # Without this, run_pipeline returning cleanly after fail_phase leaves
+    # the worker's `finally` block setting `last_be_done_at = now` (the
+    # same as a successful run) — wedging the next queued run for the
+    # full 4200s fallback. The `except` path at research.py:22589 already
+    # sets this for raised exceptions; fail_phase covers the
+    # clean-return-after-fail path that the except never sees.
+    try:
+        _QUEUE_STATE["_errored"] = True
+    except Exception:
+        pass
 
 
 _PRO_TIER_DETAILS_BY_KEY = {
@@ -22409,17 +22523,10 @@ async def run_server(port=8000):
     # before the deadlock backstop kicks in. 2026-05-06 (Stream 2 F12):
     # bumped 4h → 5h.
     WORKER_OUTER_TIMEOUT_SEC = 5 * 60 * 60
-    # 2026-05-11: queue gate — wait for prior run's FE-P5 to finish
-    # (status="completed") before dequeueing the next. Fallback timer
-    # caps the wait at 4200s (70min) from the prior run's beDoneAt so
-    # a closed-browser run can't permanently wedge the queue. Phases 4
-    # and 5 are FE-owned post-2026-05-10 — no BE budgets exist for
-    # them, no BE wall-clock watchdog iterates over them; this gate is
-    # the only BE-side primitive that knows the FE work is still in
-    # flight after BE PIPELINE COMPLETE has logged. Cloud Run's
-    # request cap is 3600s (set in apphosting.yaml timeoutSeconds); the
-    # extra 600s here covers slow FE-P5 Doc+Email and any retry tail.
-    BE_PHASES_TIMEOUT_SEC = 4200
+    # BE_PHASES_TIMEOUT_SEC lives at module scope (research.py:1224) since
+    # 2026-05-12 so the Firestore start listener (also module-level) can
+    # predict whether the gate will block when assigning queue position.
+    # This block kept as a doc anchor — the constant itself moved.
 
     async def _wait_for_prior_fe_completion(_current_job=None):
         """Hold the next dequeue until the prior run's FE-P5 reports
@@ -22454,10 +22561,30 @@ async def run_server(port=8000):
             return
         deadline = _pdone + BE_PHASES_TIMEOUT_SEC * 1000
         log(f"[queue-gate] waiting for prior run {_prid[:8]}… FE-P5 completion (fallback in {BE_PHASES_TIMEOUT_SEC}s)")
+        # 2026-05-12: register the gate-pending job so cancel handlers can
+        # see it. Without this, a cancel that arrives while the worker is
+        # blocked in the gate wait silently no-ops — neither in job_queue
+        # (already popped) nor in current_job (not set until after gate).
+        # User saw "Cancel: rid=… removed_from_queue=False" with no status
+        # flip + no banner unmount. Cleared on gate return.
+        if _current_job:
+            _QUEUE_STATE["gate_pending_job"] = _current_job
         while True:
+            # 2026-05-12: honor explicit stop requests during gate wait.
+            # When the cancel handler matches gate_pending_job and calls
+            # request_stop, this poll loop exits cleanly so the worker can
+            # bail out of the gate and drop the job.
+            try:
+                if _controls.is_stop():
+                    log("[queue-gate] stop requested during gate wait — releasing", "INFO")
+                    _QUEUE_STATE.pop("gate_pending_job", None)
+                    return
+            except Exception:
+                pass
             now_ms = int(time.time() * 1000)
             if now_ms >= deadline:
                 log(f"[queue-gate] FE never reported completed in {BE_PHASES_TIMEOUT_SEC}s — force-dequeueing")
+                _QUEUE_STATE.pop("gate_pending_job", None)
                 return
             try:
                 # 2026-05-11: offload the blocking Firestore .get() to a
@@ -22475,6 +22602,7 @@ async def run_server(port=8000):
                     if status in ("completed", "stopped", "stopped_by_watchdog",
                                   "cancelled", "terminated_by_user_discard", "errored"):
                         log(f"[queue-gate] prior run terminal (status={status}) — dequeueing")
+                        _QUEUE_STATE.pop("gate_pending_job", None)
                         return
                     # 2026-05-11: markFeP5Failed writes feP5State="failed"
                     # but doesn't flip research.status — so a thrown FE-P5
@@ -22482,6 +22610,7 @@ async def run_server(port=8000):
                     # Release the gate on this fast-fail marker too.
                     if fe_p5_state == "failed":
                         log("[queue-gate] prior run's FE-P5 failed — dequeueing")
+                        _QUEUE_STATE.pop("gate_pending_job", None)
                         return
             except Exception as e:
                 log(f"[queue-gate] Firestore read failed: {e}", "WARN")
@@ -22500,6 +22629,24 @@ async def run_server(port=8000):
             # Pass `job` so the gate can detect resume-of-same-rid and
             # skip (otherwise circular deadlock — see helper docstring).
             await _wait_for_prior_fe_completion(_current_job=job)
+            # 2026-05-12: stop-requested-during-gate-wait shortcut. The
+            # cancel handler at research.py:2208 flips status="stopped"
+            # and request_stop()s when a cancel matches gate_pending_job.
+            # Honor it here so we don't proceed to launch a browser for
+            # an already-cancelled job. Clear the stop flag so the next
+            # job runs clean.
+            try:
+                if _controls.is_stop():
+                    log(f"[worker] job {job.get('research_id', '')[:8]}… cancelled during gate wait — skipping run_pipeline", "INFO")
+                    try:
+                        _controls.reset()
+                    except Exception:
+                        pass
+                    _job_queue.task_done()
+                    # Keep the queue running but drop this job entirely.
+                    continue
+            except Exception:
+                pass
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
             log(f"Starting queued job: {job['topic'][:60]}")
