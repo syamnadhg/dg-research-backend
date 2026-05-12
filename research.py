@@ -6779,6 +6779,17 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     # doc so the listing-page tile + chat phase icons stay red post-
     # reload. If a later Retry succeeds, phase_complete overwrites this.
     _write_phase_terminal_status(phase, "errored")
+    # 2026-05-12: flag the queue gate so the next dequeue short-circuits.
+    # Without this, run_pipeline returning cleanly after fail_phase leaves
+    # the worker's `finally` block setting `last_be_done_at = now` (the
+    # same as a successful run) — wedging the next queued run for the
+    # full 4200s fallback. The `except` path at research.py:22589 already
+    # sets this for raised exceptions; fail_phase covers the
+    # clean-return-after-fail path that the except never sees.
+    try:
+        _QUEUE_STATE["_errored"] = True
+    except Exception:
+        pass
 
 
 _PRO_TIER_DETAILS_BY_KEY = {
