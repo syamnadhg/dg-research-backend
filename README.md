@@ -8,6 +8,12 @@ Automates multi-agent deep research across 6 platforms. Tiered automation: Playw
 > The Firebase Admin SDK key (`firebase-service-account.json`) is **gitignored**
 > and emailed separately by the dev — see ["Firebase Admin Key" below](#firebase-admin-key-required--firebase-service-accountjson).
 
+## Access model
+
+Super Research is a **general-purpose product** — any authenticated Google user signs into the web app and creates their own data scope. Cross-user data is impossible by design: Firestore rules in the companion `super-research-frontend` repo are per-user-self-access (`request.auth.uid == uid` on every `users/{uid}/…` path) and the catch-all `match /{document=**}` denies everything else. The Firebase Auth Google provider is intentionally not domain-restricted (`hd` parameter omitted) since onboarding is open.
+
+This backend pairs to a single web-app account at a time via `--pair`. The ResearchToken minted during pairing is bound to your uid; the backend rejects start requests whose `uid` doesn't match the token's `linkedUid`, so even if the token leaked it cannot be used to drive runs against another user's research collection. See [DGOPS-7458](https://distributedglobal.atlassian.net/browse/DGOPS-7458) for the audit-trail confirming this intent.
+
 ## Platform support
 
 | Platform | Server | `--pair` | `--resurrect` / `--retire` | `--unpair` |
