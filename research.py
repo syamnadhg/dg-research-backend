@@ -20681,11 +20681,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # with "No brief text available" because Flow B has no brief by
         # design (the user attached source docs that go straight to NLM).
         _all_agents_off = not any(agents_cfg.values())
-        if 2 in skip_phases or _user_skip_p2 or _all_agents_off:
+        # 2026-05-12: also auto-skip P2 when P1 was skipped + no brief is
+        # available + the user supplied Flow B sources. Without this, the
+        # FE's "skip brief + pasted sources" UX hard-fails P2 just because
+        # the user didn't ALSO toggle every individual P2 agent icon off.
+        # Running P2 in this state is impossible (no brief to feed agents)
+        # so we choose to skip rather than crash the pipeline.
+        _flow_b_no_brief = (
+            (1 in skip_phases) and (not brief_text) and bool(user_sources)
+        )
+        if 2 in skip_phases or _user_skip_p2 or _all_agents_off or _flow_b_no_brief:
             if _user_skip_p2:
                 _reason = "user_skip"
             elif _all_agents_off:
                 _reason = "All Phase 2 agents disabled"
+            elif _flow_b_no_brief:
+                _reason = "Flow B (P1 skipped + sources attached, no brief to feed agents)"
             else:
                 _reason = "Disabled in pipeline config"
             log(f"Phase 2: SKIPPED ({_reason})")
