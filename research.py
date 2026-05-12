@@ -3040,6 +3040,17 @@ def _post_to_fe_p4_trigger(uid, research_id):
         return False
     url = _DG_FE_BASE_URL.rstrip("/") + "/api/uploadYouTube"
     payload = {"research_id": research_id}
+    # 2026-05-12: BE must drain the full streaming response. Closing the
+    # connection after 1 byte (the original "fire and forget" pattern)
+    # caused Cloud Run / App Hosting to abort the route's ReadableStream
+    # `start()` ~5s after disconnect — the route logged
+    # `[uploadYouTube] ffmpeg encode → /tmp/p4-…` and then silently died,
+    # losing the entire P4/P5 chain. Cloud Run's "we keep processing after
+    # disconnect" guarantee doesn't extend to active ReadableStreams in
+    # Next.js App Router. Fix: keep reading chunks (15s heartbeats + final
+    # JSON) until the server closes the stream OR the wall-clock budget
+    # expires. Daemon thread isolates this from the BE worker loop.
+    FE_TRIGGER_WALLCLOCK_SEC = 20 * 60  # 20min — covers slow encodes + Doc + Email
     import requests as _req
     for attempt in range(2):
         try:
@@ -3051,22 +3062,70 @@ def _post_to_fe_p4_trigger(uid, research_id):
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                # (connect, read) — we don't wait for the full encode.
-                # The route flushes a heartbeat byte immediately, and
-                # Cloud Run keeps the work going after our socket closes.
-                timeout=(30, 5),
+                # (connect, read). 120s read covers the 15s heartbeat
+                # cadence with 8× headroom (Cloud Run heartbeats can jitter
+                # under GC pauses / cold scale-out / TCP coalescing); the
+                # wall-clock guard below caps total wait at 20 min even if
+                # the route hangs without ever closing the connection.
+                timeout=(30, 120),
                 stream=True,
             )
-            # Drain the first byte so we know Cloud Run started serving.
-            try:
-                next(resp.iter_content(chunk_size=1, decode_unicode=False), None)
-            except Exception:
-                pass
-            log(f"FE trigger: POST accepted status={resp.status_code} rid={research_id[:8]}…")
+            log(f"FE trigger: POST connected status={resp.status_code} rid={research_id[:8]}…")
+            # Drain the stream — keeps the upstream connection alive so
+            # Cloud Run's request handler isn't aborted. Best-effort parse
+            # of the final JSON to surface P4/P5 outcome in BE logs.
+            _start_t = time.time()
+            _buf = bytearray()
+            _bytes_seen = 0
+            _abort = False
+            for chunk in resp.iter_content(chunk_size=8192, decode_unicode=False):
+                if chunk:
+                    _bytes_seen += len(chunk)
+                    # Final JSON arrives as the LAST chunk(s); heartbeats
+                    # are single spaces. Keep last ~64KB so the trailing
+                    # JSON survives even if the heartbeat trail is huge.
+                    _buf.extend(chunk)
+                    if len(_buf) > 65536:
+                        del _buf[:len(_buf) - 65536]
+                if time.time() - _start_t > FE_TRIGGER_WALLCLOCK_SEC:
+                    log(f"FE trigger: 20min wall-clock budget exceeded — closing (route may still finish independently)", "WARN")
+                    _abort = True
+                    break
             try:
                 resp.close()
             except Exception:
                 pass
+            if _abort:
+                # Even if we abort, the route may have completed off-stream
+                # and written Firestore. The FE catch-up path can verify.
+                return True
+            # Try to extract the final JSON outcome. Heartbeats are
+            # leading spaces — trim them off, then look for the trailing
+            # JSON object the route emits.
+            try:
+                _text = _buf.decode("utf-8", errors="ignore").lstrip()
+                if _text:
+                    import json as _json
+                    try:
+                        _outcome = _json.loads(_text)
+                    except Exception:
+                        # Heartbeat trail + JSON — try splitting on last "{"
+                        _idx = _text.rfind("{")
+                        _outcome = _json.loads(_text[_idx:]) if _idx >= 0 else None
+                    if isinstance(_outcome, dict):
+                        if _outcome.get("__error"):
+                            log(f"FE trigger: route returned error: {str(_outcome.get('error', ''))[:200]}", "WARN")
+                        elif _outcome.get("youtube_url"):
+                            log(f"FE trigger: P4+P5 complete via route — yt={_outcome.get('youtube_url', '')[:40]} doc={'yes' if (_outcome.get('p5') or {}).get('docUrl') else 'no'}")
+                        elif _outcome.get("p4_skipped"):
+                            log(f"FE trigger: P4 skipped server-side (reason={_outcome.get('p4_skip_reason', '?')}) — P5 still ran")
+                        elif _outcome.get("in_flight"):
+                            log("FE trigger: route reported in_flight (another caller owns it) — fine")
+                        elif _outcome.get("already_completed"):
+                            log("FE trigger: route reported already_completed — idempotent skip")
+            except Exception:
+                pass
+            log(f"FE trigger: drained {_bytes_seen}B in {int(time.time() - _start_t)}s rid={research_id[:8]}…")
             return True
         except Exception as e:
             log(f"FE trigger: POST attempt {attempt + 1} failed: {e}", "WARN")
