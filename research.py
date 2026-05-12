@@ -2831,6 +2831,176 @@ def _update_firestore_research(updates):
         log(f"Firestore research update failed: {e}", "WARN")
 
 
+# ════════════════════════════════════════════════════════════════════
+# Autonomous P4/P5 — BE→Cloud Run trigger (2026-05-12)
+#
+# After BE finishes P3 + writes beDone, fire-and-forget a POST to the
+# FE's /api/uploadYouTube. Cloud Run runs the full YouTube upload +
+# Doc + Email + status="completed" flip server-side — so the queue
+# advances and per-run state lands regardless of whether the user's
+# phone/tab is open.
+#
+# Auth: Admin SDK mints a custom token for the paired uid, exchanged
+# for a Firebase ID token via Identity Toolkit. The ID token rides in
+# the Authorization: Bearer header so the route's verifyRequest passes
+# with the correct uid (matching the Firestore path being written).
+#
+# DG_FE_BASE_URL — set the env var to your App Hosting URL (e.g.
+# `https://<backend>--super-research-492814.us-central1.hosted.app`).
+# If unset, the trigger writes a `needsFeTrigger` marker to Firestore
+# so the FE catch-up hook on next chat-open can re-fire the chain.
+#
+# DG_FE_WEB_API_KEY — Firebase Web API key for the project (NOT a
+# secret; it's also in the FE bundle). Defaults to the super-research
+# project key.
+# ════════════════════════════════════════════════════════════════════
+
+_DG_FE_BASE_URL = os.environ.get("DG_FE_BASE_URL", "").strip()
+_DG_FE_WEB_API_KEY = os.environ.get(
+    "DG_FE_WEB_API_KEY", "AIzaSyDTjXwU_uOwGrsuf7nuJTfQAZg4dTjSAMk"
+).strip()
+
+
+def _mint_fe_id_token(uid):
+    """Mint a Firebase ID token for `uid` via Admin custom-token +
+    Identity Toolkit signInWithCustomToken exchange. Returns the
+    idToken string on success, None on failure. Non-fatal: caller
+    falls back to the needsFeTrigger marker path."""
+    if not uid:
+        return None
+    if not _DG_FE_WEB_API_KEY:
+        log("FE trigger: DG_FE_WEB_API_KEY not configured", "WARN")
+        return None
+    try:
+        from firebase_admin import auth as _fb_auth
+        import requests as _req
+        ct = _fb_auth.create_custom_token(uid)
+        if isinstance(ct, bytes):
+            ct = ct.decode("utf-8")
+        url = (
+            "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken"
+            f"?key={_DG_FE_WEB_API_KEY}"
+        )
+        resp = _req.post(
+            url,
+            json={"token": ct, "returnSecureToken": True},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log(f"FE trigger: ID token exchange failed {resp.status_code}: {resp.text[:200]}", "WARN")
+            return None
+        return resp.json().get("idToken")
+    except Exception as e:
+        log(f"FE trigger: mint ID token failed: {e}", "WARN")
+        return None
+
+
+def _post_to_fe_p4_trigger(uid, research_id):
+    """Fire-and-forget POST to /api/uploadYouTube to kick off the
+    autonomous P4 + P5 chain. The route reads the rest of the payload
+    (audio_url, title, brief_url, etc.) from Firestore via Admin SDK,
+    so this body just carries `research_id`.
+
+    Retry: up to 2 attempts with 2s backoff. If all fail, write a
+    `needsFeTrigger` marker so the FE catch-up hook can re-fire on
+    next chat-open.
+
+    Streaming response: the route emits a heartbeat byte within the
+    first ~100ms and then keeps the connection open for the full
+    encode + upload + Doc + email (up to ~60 min). We use a short
+    READ timeout so this helper returns once Cloud Run has acknowledged
+    the request, not after the work finishes — the actual work runs
+    independently on Cloud Run."""
+    if not uid or not research_id:
+        log(f"FE trigger: skip (uid={bool(uid)} rid={bool(research_id)})", "WARN")
+        return False
+    if not _DG_FE_BASE_URL:
+        log("FE trigger: DG_FE_BASE_URL not configured — writing needsFeTrigger marker", "WARN")
+        try:
+            _update_firestore_research({
+                "needsFeTrigger": True,
+                "needsFeTriggerAt": int(time.time() * 1000),
+            })
+        except Exception:
+            pass
+        return False
+    id_token = _mint_fe_id_token(uid)
+    if not id_token:
+        log("FE trigger: mint ID token failed — writing needsFeTrigger marker", "WARN")
+        try:
+            _update_firestore_research({
+                "needsFeTrigger": True,
+                "needsFeTriggerAt": int(time.time() * 1000),
+            })
+        except Exception:
+            pass
+        return False
+    url = _DG_FE_BASE_URL.rstrip("/") + "/api/uploadYouTube"
+    payload = {"research_id": research_id}
+    import requests as _req
+    for attempt in range(2):
+        try:
+            log(f"FE trigger: POST {url} (attempt {attempt + 1}) rid={research_id[:8]}…")
+            resp = _req.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {id_token}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                # (connect, read) — we don't wait for the full encode.
+                # The route flushes a heartbeat byte immediately, and
+                # Cloud Run keeps the work going after our socket closes.
+                timeout=(30, 5),
+                stream=True,
+            )
+            # Drain the first byte so we know Cloud Run started serving.
+            try:
+                next(resp.iter_content(chunk_size=1, decode_unicode=False), None)
+            except Exception:
+                pass
+            log(f"FE trigger: POST accepted status={resp.status_code} rid={research_id[:8]}…")
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            log(f"FE trigger: POST attempt {attempt + 1} failed: {e}", "WARN")
+            if attempt == 0:
+                try:
+                    time.sleep(2)
+                except Exception:
+                    pass
+    # All retries failed — leave a marker for FE catch-up on next reopen.
+    log("FE trigger: all retries failed — writing needsFeTrigger marker", "WARN")
+    try:
+        _update_firestore_research({
+            "needsFeTrigger": True,
+            "needsFeTriggerAt": int(time.time() * 1000),
+        })
+    except Exception:
+        pass
+    return False
+
+
+def _fire_fe_p4_trigger_async(uid, research_id):
+    """Kick off _post_to_fe_p4_trigger on a daemon thread so the BE
+    worker doesn't block on the network round-trip. Cloud Run's
+    long-running side runs independently of our connection."""
+    if not uid or not research_id:
+        return
+    try:
+        import threading as _thr
+        _thr.Thread(
+            target=_post_to_fe_p4_trigger,
+            args=(uid, research_id),
+            daemon=True,
+        ).start()
+    except Exception as e:
+        log(f"FE trigger: failed to start thread: {e}", "WARN")
+
+
 def _do_agent_terminal_status_write(agent_key: str, status: str):
     """Inner sync write — kept separate so the public _write_*
     helpers can fire-and-forget on a daemon thread, avoiding the
@@ -19143,6 +19313,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 "status": "ongoing", "phase": 5, "currentPhase": 5,
                 "beDone": True, "beDoneAt": int(time.time() * 1000),
             })
+            # 2026-05-12: autonomous P4/P5 trigger also fires on resume-
+            # from-checkpoint so a Phoenix restart that lands here doesn't
+            # leave the chain dangling on the FE listener (which may not
+            # be alive when this resume path runs from the daemon-loop).
+            try:
+                _fire_fe_p4_trigger_async(_fb_uid, _fb_research_id)
+            except Exception as _trig_err:
+                log(f"FE trigger dispatch failed on resume (non-fatal): {_trig_err}", "WARN")
             return
         cp = load_checkpoint(queue_dir) or {}
         topic = topic or cp.get("topic", queue_dir.name.rsplit("_", 2)[0].replace("_", " "))
@@ -21534,6 +21712,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # "completed" — that's the signal the gate actually waits on;
         # beDoneAt anchors the 4200s fallback timer.
         _update_firestore_research({"beDone": True, "beDoneAt": int(time.time() * 1000)})
+        # 2026-05-12: autonomous P4/P5 trigger. BE has finished its work
+        # through P3 (audio in Firebase Storage). Fire-and-forget POST to
+        # /api/uploadYouTube so Cloud Run runs P4 (YouTube upload) + P5
+        # (Doc + email) + flips status="completed" server-side. The
+        # queue gate (_wait_for_prior_fe_completion) waits on status,
+        # so this chain advances the queue even when the user's phone
+        # or tab isn't open. Daemon thread so the BE worker returns
+        # immediately and the next queued item can spool up after the
+        # gate clears.
+        try:
+            _fire_fe_p4_trigger_async(_fb_uid, _fb_research_id)
+        except Exception as _trig_err:
+            log(f"FE trigger dispatch failed (non-fatal): {_trig_err}", "WARN")
         log(f"\n{'='*60}")
         log("BE PIPELINE COMPLETE — through Phase 3 (FE owns Phases 4 + 5)")
         log(f"  NotebookLM: {notebook_url or 'N/A'}")
