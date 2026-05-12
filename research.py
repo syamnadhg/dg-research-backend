@@ -1071,6 +1071,23 @@ def _warn_clipboard_tool_missing_once(platform_label: str, tried: list):
         pass
 
 
+# 2026-05-12: Wayland-clipboard gate. On Linux/Wayland, get_clipboard()
+# routinely returns 0 chars even when CUA executes Ctrl+A/Ctrl+C cleanly —
+# Wayland's clipboard isolation breaks the OS-clipboard tier (CUA + Ctrl+C)
+# of every Phase-2 extractor. X11 Linux clipboard works fine via xclip/xsel.
+# Phase-2 extractors gate their Tier-3 (CUA + clipboard) on this so Wayland
+# runs skip a path that's guaranteed to fail, and instead fall back to the
+# new Tier-1 (Copy button + clipboard event hijack) which captures the
+# markdown in-browser before it touches the OS clipboard at all.
+_IS_WAYLAND = (
+    sys.platform.startswith("linux")
+    and (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY", "").strip())
+    )
+)
+
+
 def get_clipboard():
     """Read clipboard text via the platform-native tool.
 
@@ -10194,97 +10211,6 @@ async def _read_claude_artifact_panel(page):
         return ""
 
 
-async def _try_claude_artifact_copy_button(page, label):
-    """Click Claude's artifact-panel Copy button. Returns clipboard
-    content (markdown) on success, "" on any failure.
-
-    Tier 2 of extract_claude_response (research-mode): scoped to the
-    artifact-panel header (aside / [class*="artifact-panel"] /
-    [class*="side-panel"]). Excludes Close/Dismiss/Publish/Share/X
-    buttons so we never click a panel-dismiss control by accident.
-
-    Cheap (single DOM click), agent-canonical (Claude's own button
-    returns the markdown its users see). Wayland-fragile — clipboard
-    returns 0 chars on Linux/Wayland regardless of click success — so
-    empty/short clip is silently treated as "fall through to next tier".
-    """
-    try:
-        # Clear clipboard FIRST so we measure only what THIS click writes.
-        # Avoids stale-clipboard false-positives when a prior step left
-        # something there.
-        try:
-            clear_clipboard()
-        except Exception:
-            pass
-
-        clicked = await page.evaluate("""() => {
-            const PANEL_ROOTS = [
-                'aside',
-                '[class*="artifact-panel"]',
-                '[class*="side-panel"]',
-                '[class*="right-panel"]',
-            ];
-            for (const root_sel of PANEL_ROOTS) {
-                const root = document.querySelector(root_sel);
-                if (!root) continue;
-                const buttons = root.querySelectorAll('button');
-                for (const b of buttons) {
-                    const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-                    const txt = (b.textContent || '').trim().toLowerCase();
-                    // Defense-in-depth: never click Close / Dismiss / X /
-                    // Publish / Share — they live in the same panel header.
-                    if (aria.includes('close') || aria.includes('dismiss')) continue;
-                    if (aria.includes('publish') || aria.includes('share')) continue;
-                    if (txt === '×' || txt === 'x') continue;
-                    // Match Copy: aria-label exact "copy" or contains
-                    // "copy artifact"/"copy markdown"/"copy to clipboard",
-                    // or visible text "copy".
-                    const isCopy = (
-                        aria === 'copy' ||
-                        aria.includes('copy artifact') ||
-                        aria.includes('copy markdown') ||
-                        aria.includes('copy to clipboard') ||
-                        txt === 'copy'
-                    );
-                    if (isCopy) {
-                        b.click();
-                        return { ok: true, root: root_sel, aria, text: txt };
-                    }
-                }
-            }
-            return { ok: false };
-        }""")
-        if not clicked.get("ok"):
-            return ""
-
-        log(f"[{label}] Clicked artifact-panel Copy button "
-            f"(root={clicked.get('root')}, aria='{clicked.get('aria')}', "
-            f"text='{clicked.get('text')}')")
-        await asyncio.sleep(0.7)  # Let the clipboard write settle.
-
-        clip = get_clipboard() or ""
-        if len(clip) < 100:
-            log(f"[{label}] Copy button: clipboard returned {len(clip)} chars "
-                f"— too short, falling through", "WARN")
-            return ""
-
-        if _is_sources_not_document(clip, platform="claude"):
-            log(f"[{label}] Copy button: wrong artifact in clipboard "
-                f"({len(clip)} chars) — falling through", "WARN")
-            try:
-                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                           op="finalize_copy", length=len(clip),
-                           tier="copy_button")
-            except Exception:
-                pass
-            return ""
-
-        return clip
-    except Exception as e:
-        log(f"[{label}] Copy button error: {e} — falling through", "WARN")
-        return ""
-
-
 def _is_sources_not_document(text, *, platform="generic"):
     """Strict invariant guard for Phase 2 finalize extraction:
     extract_*_response must return the DOCUMENT (final report markdown),
@@ -15022,85 +14948,275 @@ async def _extract_html_to_md(page, selectors, label):
     return ""
 
 
-async def _try_copy_button(page, browser, cua_client, label, verbose=False):
-    """Click the assistant message's copy button to put response text on
-    the clipboard. DOM (1 attempt with scoped selectors) → CUA fallback.
+async def _copy_via_hijack(
+    page,
+    label,
+    *,
+    canvas_root_selectors=None,
+    kebab_selectors=None,
+    menuitem_text_pattern=None,
+    direct_copy_selectors=None,
+    scoping_excludes=None,
+    wait_ms=5000,
+    min_chars=500,
+):
+    """Click an agent's Copy button while a JS hijack captures the
+    markdown the page writes to navigator.clipboard.writeText /
+    navigator.clipboard.write / synthetic copy event. Bypasses the OS
+    clipboard entirely — works on Wayland, X11, Windows, macOS.
 
-    Selector scoping (2026-04-29 dup-tabs hardening): the prior
-    `document.querySelectorAll('button')` + loose "copy" text match was
-    matching buttons OUTSIDE the assistant response — code-block "Copy
-    code" buttons, share-dialog "Copy link" buttons, social-share icons.
-    The wrong click could spawn a popup the popup-guard allowlist
-    permits (gemini.google.com/share/...) → user-visible duplicate
-    tab. We now require either an exact aria-label match or an exact
-    "Copy" textContent match, scoped to the main response container,
-    AND explicitly exclude buttons inside any dialog / code block /
-    sidebar wrapper. CUA fallback unchanged.
+    Closes DGOPS-7366 (ChatGPT canvas selector drift) AND the Wayland
+    0-char clipboard bug in one pattern: the agent's own Copy button is
+    the canonical-markdown emitter, and the hijack catches it before it
+    leaves the page context.
+
+    Two click patterns supported:
+    - direct_copy_selectors=[…]: click the first matching, visible,
+      non-excluded button.
+    - canvas_root_selectors + kebab_selectors + menuitem_text_pattern:
+      scope to a canvas root, click a kebab/more button, then click the
+      revealed menuitem whose text matches the regex pattern
+      (case-insensitive).
+
+    Robustness (per advisor cross-check 2026-05-12):
+    - Single atomic page.evaluate so install + click + capture + restore
+      runs in one JS lifetime. A thrown exception inside JS still hits
+      the `restoreAll()` in the wrapping try/catch.
+    - window.__dg_hijack_lock guard prevents concurrent hijacks on the
+      same page from clobbering each other.
+    - beforeunload listener auto-restores if the page navigates mid-
+      hijack.
+    - Hooks copy event (text/plain + text/html), navigator.clipboard.
+      writeText (legacy/string), navigator.clipboard.write (modern/
+      ClipboardItem). Belt-and-suspenders — agents use different paths.
+    - Scoping excludes (defaults: dialogs, code blocks, nav, code-copy
+      buttons) prevent the click from misfiring onto a "Copy code" or
+      "Copy link" button.
     """
-    matched_selector = ""
+    DEFAULT_EXCLUDES = [
+        'mat-dialog-container',
+        'pre code',
+        '[class*="code-block"]',
+        '[class*="codeblock"]',
+        'nav',
+        '[role="navigation"]',
+    ]
+    excludes = scoping_excludes if scoping_excludes is not None else DEFAULT_EXCLUDES
     try:
-        result = await page.evaluate("""() => {
-            // Containers known to wrap the assistant's response across
-            // ChatGPT / Gemini / Claude. Anything outside these is off-limits.
-            const ROOT_SELECTORS = [
-                'message-content', 'message-actions', 'message-actions-list',
-                '.model-response-text', '.response-container',
-                '[data-message-author-role="assistant"]',
-                '[data-testid*="message"]',
-            ];
-            const inside = (el, sel) => !!el.closest(sel);
-            const isExcluded = (b) => (
-                // Dialogs / modals that may contain "Copy link" buttons.
-                inside(b, '[role="dialog"]') ||
-                inside(b, 'mat-dialog-container') ||
-                // Code-block copy buttons (we want response text, not code).
-                /copy[\\s_-]*code/i.test(b.getAttribute('aria-label') || '') ||
-                /copy[\\s_-]*code/i.test(b.textContent || '') ||
-                // Sidebars / nav chrome that occasionally render a "Copy" item.
-                inside(b, 'aside, nav, [role="navigation"]')
-            );
-            const ariaExact = (b) => {
-                const a = (b.getAttribute('aria-label') || '').trim().toLowerCase();
-                return a === 'copy' || a === 'copy response' || a === 'copy message';
+        result = await page.evaluate(r"""(opts) => new Promise(async (resolve) => {
+            const {
+                canvas_root_selectors,
+                kebab_selectors,
+                menuitem_text_pattern,
+                direct_copy_selectors,
+                scoping_excludes,
+                wait_ms,
+            } = opts;
+            if (window.__dg_hijack_lock) {
+                resolve({ ok: false, reason: 'hijack_in_progress' });
+                return;
+            }
+            window.__dg_hijack_lock = true;
+
+            let capturedText = null;
+            let capturedHtml = null;
+            let captureSource = '';
+
+            const copyHandler = (e) => {
+                try {
+                    if (!e.clipboardData) return;
+                    const t = e.clipboardData.getData('text/plain');
+                    const h = e.clipboardData.getData('text/html');
+                    if (t && (!capturedText || t.length > capturedText.length)) {
+                        capturedText = t;
+                        captureSource = 'copy_event:text/plain';
+                    }
+                    if (h && (!capturedHtml || h.length > capturedHtml.length)) {
+                        capturedHtml = h;
+                        if (!capturedText) captureSource = 'copy_event:text/html';
+                    }
+                } catch {}
             };
-            const textExact = (b) => {
-                const t = (b.textContent || '').trim().toLowerCase();
-                return t === 'copy';
-            };
-            for (const root of ROOT_SELECTORS) {
-                const containers = document.querySelectorAll(root);
-                for (const c of containers) {
-                    const buttons = c.querySelectorAll('button');
-                    for (const b of buttons) {
-                        if (isExcluded(b)) continue;
-                        if (ariaExact(b) || textExact(b)) {
-                            b.click();
-                            return root + ' (' + (b.getAttribute('aria-label') || b.textContent.trim()) + ')';
+            document.addEventListener('copy', copyHandler, { capture: true });
+
+            const origWriteText = navigator.clipboard && navigator.clipboard.writeText
+                ? navigator.clipboard.writeText.bind(navigator.clipboard) : null;
+            if (origWriteText) {
+                navigator.clipboard.writeText = async (t) => {
+                    try {
+                        if (t && (!capturedText || t.length > capturedText.length)) {
+                            capturedText = t;
+                            captureSource = 'writeText';
+                        }
+                    } catch {}
+                    return origWriteText(t);
+                };
+            }
+
+            const origWrite = navigator.clipboard && navigator.clipboard.write
+                ? navigator.clipboard.write.bind(navigator.clipboard) : null;
+            if (origWrite) {
+                navigator.clipboard.write = async (items) => {
+                    try {
+                        for (const item of items || []) {
+                            for (const t of (item.types || [])) {
+                                try {
+                                    const blob = await item.getType(t);
+                                    const s = await blob.text();
+                                    if (t === 'text/plain' && s
+                                        && (!capturedText || s.length > capturedText.length)) {
+                                        capturedText = s;
+                                        captureSource = 'write:text/plain';
+                                    } else if (t === 'text/html' && s
+                                        && (!capturedHtml || s.length > capturedHtml.length)) {
+                                        capturedHtml = s;
+                                        if (!capturedText) captureSource = 'write:text/html';
+                                    }
+                                } catch {}
+                            }
+                        }
+                    } catch {}
+                    return origWrite(items);
+                };
+            }
+
+            const beforeUnload = () => restoreAll();
+            window.addEventListener('beforeunload', beforeUnload, { once: true });
+
+            function restoreAll() {
+                try { document.removeEventListener('copy', copyHandler, { capture: true }); } catch {}
+                if (origWriteText) {
+                    try { navigator.clipboard.writeText = origWriteText; } catch {}
+                }
+                if (origWrite) {
+                    try { navigator.clipboard.write = origWrite; } catch {}
+                }
+                try { window.removeEventListener('beforeunload', beforeUnload); } catch {}
+                window.__dg_hijack_lock = false;
+            }
+
+            function isExcluded(btn) {
+                if (!scoping_excludes) return false;
+                for (const ex of scoping_excludes) {
+                    try {
+                        if (btn.closest(ex)) return true;
+                    } catch {}
+                }
+                return false;
+            }
+
+            try {
+                let clickedSel = null;
+                if (direct_copy_selectors && direct_copy_selectors.length > 0) {
+                    for (const sel of direct_copy_selectors) {
+                        try {
+                            const btns = document.querySelectorAll(sel);
+                            for (const b of btns) {
+                                if (b.offsetWidth === 0 && b.offsetHeight === 0) continue;
+                                if (isExcluded(b)) continue;
+                                b.click();
+                                clickedSel = sel;
+                                break;
+                            }
+                            if (clickedSel) break;
+                        } catch {}
+                    }
+                }
+                if (!clickedSel && kebab_selectors && menuitem_text_pattern) {
+                    let canvasRoot = document;
+                    if (canvas_root_selectors) {
+                        for (const sel of canvas_root_selectors) {
+                            try {
+                                const r = document.querySelector(sel);
+                                if (r) { canvasRoot = r; break; }
+                            } catch {}
+                        }
+                    }
+                    let kebabSel = null;
+                    for (const sel of kebab_selectors) {
+                        try {
+                            const btns = canvasRoot.querySelectorAll(sel);
+                            for (const b of btns) {
+                                if (b.offsetWidth === 0 && b.offsetHeight === 0) continue;
+                                b.click();
+                                kebabSel = sel;
+                                break;
+                            }
+                            if (kebabSel) break;
+                        } catch {}
+                    }
+                    if (kebabSel) {
+                        await new Promise(r => setTimeout(r, 400));
+                        const pat = new RegExp(menuitem_text_pattern, 'i');
+                        const items = document.querySelectorAll(
+                            '[role="menuitem"], [role="menu"] button, [role="menu"] [role="button"]'
+                        );
+                        for (const it of items) {
+                            const txt = (it.textContent || '').trim();
+                            if (pat.test(txt)) {
+                                it.click();
+                                clickedSel = 'kebab(' + kebabSel + ') → menuitem(' + txt.slice(0, 40) + ')';
+                                break;
+                            }
                         }
                     }
                 }
+
+                if (!clickedSel) {
+                    restoreAll();
+                    resolve({ ok: false, reason: 'no_button_clicked' });
+                    return;
+                }
+
+                const start = Date.now();
+                while (Date.now() - start < wait_ms) {
+                    if (capturedText || capturedHtml) break;
+                    await new Promise(r => setTimeout(r, 100));
+                }
+
+                restoreAll();
+                resolve({
+                    ok: !!(capturedText || capturedHtml),
+                    text: capturedText,
+                    html: capturedHtml,
+                    source: captureSource,
+                    clicked: clickedSel,
+                });
+            } catch (e) {
+                restoreAll();
+                resolve({ ok: false, reason: 'error:' + (e && e.message || String(e)) });
             }
-            return '';
-        }""")
-        matched_selector = result or ""
-        if matched_selector:
-            log(f"[{label}] Copy button clicked via JS: {matched_selector}")
-            await asyncio.sleep(1)
-            return get_clipboard()
-    except Exception:
-        pass
+        })""", {
+            "canvas_root_selectors": canvas_root_selectors,
+            "kebab_selectors": kebab_selectors,
+            "menuitem_text_pattern": menuitem_text_pattern,
+            "direct_copy_selectors": direct_copy_selectors,
+            "scoping_excludes": excludes,
+            "wait_ms": wait_ms,
+        })
 
-    # CUA fallback
-    if browser and cua_client:
-        log(f"[{label}] Scoped DOM copy-button miss — falling back to CUA…")
-        await browser.switch_to_page(page)
-        await agent_loop(cua_client, browser, PROMPT_COPY_RESPONSE,
-            "Copy the AI response text to clipboard using the Copy button.",
-            model=CUA_MODEL, max_iterations=5, verbose=verbose)
-        await asyncio.sleep(1)
-        return get_clipboard()
-
-    return ""
+        if not result or not result.get("ok"):
+            log(f"[{label}] Copy hijack: {(result or {}).get('reason', 'no_capture')}", "DEBUG")
+            return ""
+        text = result.get("text") or ""
+        html = result.get("html") or ""
+        src = result.get("source", "")
+        clicked = result.get("clicked", "")
+        # Prefer text/plain (canonical markdown). Fall through to html→md
+        # if text was empty or below min_chars but html is rich.
+        if text and len(text) >= min_chars:
+            log(f"[{label}] Copy hijack captured {len(text)} chars via {src} (clicked: {clicked})")
+            return text
+        if html and len(html) >= max(200, min_chars // 4):
+            md = html_to_markdown(html)
+            if md and len(md) >= min_chars:
+                log(f"[{label}] Copy hijack captured {len(html)}B HTML → {len(md)} chars MD via {src} (clicked: {clicked})")
+                return md
+        log(f"[{label}] Copy hijack captured but too short (text={len(text)}, html={len(html)}, src={src})", "DEBUG")
+        return ""
+    except Exception as e:
+        log(f"[{label}] Copy hijack exception: {e}", "WARN")
+        return ""
 
 
 async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
@@ -15228,19 +15344,73 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     except Exception as _oe:
         log(f"[{label}] Post-completion artifact-open skipped: {_oe}", "DEBUG")
 
-    # Method 1 (PRIMARY, E4 / DGOPS-7366): HTML→MD from the now-opened canvas.
-    # Works on every platform without touching the OS clipboard. Linux/Wayland
-    # specifically needs this — its clipboard reads return 0 chars even when
-    # CUA confirms a successful copy. 2000-char gate ensures we have an actual
-    # report, not just the chat acknowledgement preamble that lives at ~500 chars.
-    # Defensive selectors added 2026-05-07 for canvas-overlay structures we've
-    # seen drift through (main-scoped canvas, dialog-scoped prose).
+    # Tier 1A (PRIMARY for P2, NEW 2026-05-12, DGOPS-7366): Copy button +
+    # clipboard event hijack. Click the canvas kebab → "Copy contents"
+    # while a JS hijack captures the markdown the page writes to
+    # navigator.clipboard. Bypasses the OS clipboard entirely — works on
+    # Wayland AND survives selector drift since the agent's own Copy
+    # button is the canonical-markdown emitter, not a class-name-dependent
+    # DOM scrape. min_chars=2000 mirrors the historical Method 1 gate so
+    # source-panel previews don't slip through.
+    md = await _copy_via_hijack(
+        page, label,
+        canvas_root_selectors=[
+            '[class*="canvas"]',
+            '[data-testid*="canvas"]',
+            'main [role="region"]',
+            '[role="dialog"]',
+        ],
+        kebab_selectors=[
+            'button[aria-haspopup="menu"]',
+            'button[aria-label*="more" i]',
+            'button[data-testid*="more"]',
+            'button[aria-label*="menu" i]',
+        ],
+        menuitem_text_pattern=r'copy contents?',
+        min_chars=2000,
+    )
+    if md and len(md) >= 2000 and not _is_sources_not_document(md, platform="chatgpt"):
+        log(f"[{label}] Extracted via Copy hijack (canvas → Copy contents): {len(md)} chars")
+        return md
+    if md and _is_sources_not_document(md, platform="chatgpt"):
+        log(f"[{label}] Copy hijack wrong-artifact ({len(md)} chars) — falling to Tier 2", "WARN")
+        try:
+            emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                       op="finalize_copy", length=len(md), tier="copy_hijack")
+        except Exception:
+            pass
+
+    # Tier 1B (NEW 2026-05-12): direct Copy button on the last assistant
+    # message. Serves P1 (brief, where there's no canvas → Tier 1A no-ops)
+    # AND P2 fallback when the kebab path didn't fire. Same hijack pattern.
+    md = await _copy_via_hijack(
+        page, label,
+        direct_copy_selectors=[
+            '[data-message-author-role="assistant"]:last-of-type button[aria-label*="copy" i]:not([aria-label*="code" i]):not([aria-label*="link" i])',
+            '[data-message-author-role="assistant"]:last-of-type button[data-testid*="copy"]',
+        ],
+        min_chars=500,
+    )
+    if md and len(md) >= 500 and not _is_sources_not_document(md, platform="chatgpt"):
+        log(f"[{label}] Extracted via Copy hijack (assistant-msg direct): {len(md)} chars")
+        return md
+
+    # Tier 2 (FALLBACK): HTML→MD from the canvas DOM. Drift-vulnerable
+    # but cheap. Was the primary path pre-2026-05-12; demoted to Tier 2
+    # after Copy hijack proved drift-tolerant + Wayland-safe.
     md = await _extract_html_to_md(page, [
         '.canvas-content', '.artifact-content', '[data-testid="canvas-content"]',
         '[role="dialog"] .markdown', '[role="dialog"] .prose',
+        '[role="dialog"] article',
+        '[role="dialog"] [class*="markdown-content"]',
         'main [class*="canvas"] .markdown',
+        'main [class*="canvas"] [class*="prose"]',
+        'main [class*="artifact"] [class*="prose"]',
+        '[data-testid*="canvas"] [class*="prose"]',
+        '[data-testid*="canvas"] [class*="markdown"]',
         'aside[role="dialog"] [class*="prose"]',
         '[data-message-author-role="assistant"]:last-of-type .markdown',
+        '[data-message-author-role="assistant"]:last-of-type [class*="prose"]',
     ], label)
     if md and len(md) > 2000:
         if _is_sources_not_document(md, platform="chatgpt"):
@@ -15255,42 +15425,12 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
             log(f"[{label}] Extracted via HTML→MD (canvas/artifact): {len(md)} chars")
             return md
 
-    # Method 2: JS innerText — last assistant message or dialog-scoped content.
-    # Catches cases where the canvas DOM uses class names our HTML→MD selectors
-    # don't know about, but the assistant-role attribute is stable.
-    try:
-        text = await page.evaluate("""() => {
-            // Prefer dialog-scoped content (open canvas) over chat preamble.
-            const dlg = document.querySelector('[role="dialog"] .markdown, [role="dialog"] .prose');
-            if (dlg && dlg.innerText && dlg.innerText.length > 2000) return dlg.innerText;
-            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-            if (msgs.length > 0) return msgs[msgs.length - 1].innerText;
-            return '';
-        }""")
-        if text and len(text) > 2000:
-            if _is_sources_not_document(text, platform="chatgpt"):
-                log(f"[{label}] JS innerText wrong-artifact ({len(text)} chars "
-                    f"source-panel-shape) — skipping", "WARN")
-                try:
-                    emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
-                               op="finalize_copy", length=len(text), tier="dom_js")
-                except Exception:
-                    pass
-            else:
-                log(f"[{label}] Extracted via JS innerText: {len(text)} chars")
-                return text
-    except Exception:
-        pass
-
-    # Method 3 (LAST RESORT): CUA opens the artifact/document and copies it
-    # to the clipboard. Was Method 1 pre-E4 — moved last because Wayland
-    # returns 0 chars from get_clipboard regardless of how cleanly CUA
-    # executed Ctrl+A/Ctrl+C. Kept as defense-in-depth for canvas-DOM drift
-    # on Windows/macOS where get_clipboard is reliable. Shadow-wrapped (#2c)
-    # and content-validated. Inner retry cap 2 attempts; the OUTER caller's
-    # cost guardrail ensures we don't loop this whole function 3+ times.
+    # Tier 3 (LAST RESORT, Win/Mac/X11 only): CUA opens the artifact and
+    # copies it to the OS clipboard. Gated off on Wayland — get_clipboard
+    # returns 0 chars there regardless of how cleanly CUA executes Ctrl+C.
+    # Shadow-wrapped (#2c) and content-validated. Inner retry cap 2 attempts.
     _cgpt_2c_attempts = 0
-    while _cgpt_2c_attempts < 2 and browser and cua_client:
+    while _cgpt_2c_attempts < 2 and browser and cua_client and not _IS_WAYLAND:
         _cgpt_2c_attempts += 1
         log(f"[{label}] CUA: Opening and copying Deep Research artifact "
             f"(attempt {_cgpt_2c_attempts}/2 — DOM methods returned empty)...")
@@ -15368,49 +15508,57 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     await asyncio.sleep(1)
 
     # Method 1: HTML → markdown from Gemini's response containers
+    # Tier 1 (PRIMARY, NEW 2026-05-12): Gemini's Copy button + hijack.
+    # Scoped to response containers so we don't misfire onto code-block
+    # Copy buttons or share-dialog Copy links (ported scoping logic from
+    # the deleted `_try_copy_button` helper — kept the dup-tab hardening
+    # via scoping_excludes).
+    md = await _copy_via_hijack(
+        page, label,
+        direct_copy_selectors=[
+            'message-content button[aria-label*="copy" i]',
+            '.model-response-text button[aria-label*="copy" i]',
+            '.response-container button[aria-label*="copy" i]',
+            'message-actions button[aria-label*="copy" i]',
+            '[data-test-id*="copy"]',
+        ],
+        scoping_excludes=[
+            '[role="dialog"]',
+            'mat-dialog-container',
+            'pre code',
+            '[class*="code-block"]',
+            'aside',
+            'nav',
+            '[role="navigation"]',
+        ],
+        min_chars=100,
+    )
+    if md and len(md) >= 100:
+        log(f"[{label}] Extracted via Copy hijack: {len(md)} chars")
+        return md
+
+    # Tier 2 (FALLBACK): HTML→MD from Gemini's response containers.
     md = await _extract_html_to_md(page, [
         'message-content', '.model-response-text', '.response-container',
     ], label)
     if md and len(md) > 100:
         log(f"[{label}] Extracted via HTML→MD: {len(md)} chars")
         return md
-    log(f"[{label}] HTML→MD returned {len(md or '')} chars — trying copy button", "WARN")
 
-    # Method 2: click Gemini's built-in Copy button
-    copied = await _try_copy_button(page, browser, cua_client, label, verbose)
-    if copied and len(copied) > 100:
-        log(f"[{label}] Extracted via copy button: {len(copied)} chars")
-        return copied
-    log(f"[{label}] Copy button returned {len(copied or '')} chars — trying JS", "WARN")
-
-    # Method 3: innerText from response containers
-    try:
-        text = await page.evaluate("""() => {
-            const r = document.querySelectorAll('message-content, .model-response-text, .response-container');
-            if (r.length > 0) return r[r.length - 1].innerText;
-            const turns = document.querySelectorAll('.conversation-turn');
-            if (turns.length > 0) return turns[turns.length - 1].innerText;
-            return '';
-        }""")
-        if text and len(text) > 100:
-            log(f"[{label}] Extracted via JS innerText: {len(text)} chars")
-            return text
-        log(f"[{label}] JS innerText returned {len(text or '')} chars — trying select-all", "WARN")
-    except Exception as _e:
-        log(f"[{label}] JS innerText error: {_e}", "WARN")
-
-    # Method 4: select-all + clipboard (last resort)
-    log(f"[{label}] Falling back to select-all clipboard", "WARN")
-    await page.keyboard.press("Control+a")
-    await asyncio.sleep(0.5)
-    await page.keyboard.press("Control+c")
-    await asyncio.sleep(1)
-    clip = get_clipboard() or ""
-    if clip and len(clip) > 100:
-        log(f"[{label}] Extracted via select-all clipboard: {len(clip)} chars")
-    else:
-        log(f"[{label}] All extraction methods failed — returning empty", "ERROR")
-    return clip
+    # Tier 3 (LAST RESORT, Win/Mac/X11 only): select-all + OS clipboard.
+    # Gated off on Wayland — get_clipboard returns 0 chars there.
+    if not _IS_WAYLAND:
+        log(f"[{label}] Falling back to select-all clipboard (Tier 3)", "WARN")
+        await page.keyboard.press("Control+a")
+        await asyncio.sleep(0.5)
+        await page.keyboard.press("Control+c")
+        await asyncio.sleep(1)
+        clip = get_clipboard() or ""
+        if clip and len(clip) > 100:
+            log(f"[{label}] Extracted via select-all clipboard: {len(clip)} chars")
+            return clip
+    log(f"[{label}] All extraction tiers failed (wayland={_IS_WAYLAND}) — returning empty", "ERROR")
+    return ""
 
 
 async def extract_claude_response(page, browser=None, cua_client=None, label="Claude", verbose=False,
@@ -15504,6 +15652,22 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     # "All extraction methods failed". Instead, read the last assistant
     # message via a tight selector list scoped to chat-turn content.
     if chat_mode:
+        # Tier 1 (NEW 2026-05-12): Copy hijack on the last assistant message
+        # Copy button. Same canonical-markdown advantages as the artifact
+        # path, just scoped to chat-mode assistant message.
+        md_chat = await _copy_via_hijack(
+            page, label,
+            direct_copy_selectors=[
+                '[data-message-author-role="assistant"]:last-of-type button[aria-label*="copy" i]:not([aria-label*="code" i]):not([aria-label*="link" i])',
+                '.font-claude-message:last-of-type button[aria-label*="copy" i]',
+                '[data-test-render-count]:last-of-type button[aria-label*="copy" i]',
+            ],
+            min_chars=100,
+        )
+        if md_chat and len(md_chat) >= 100:
+            log(f"[{label}] Extracted via Copy hijack (chat-mode): {len(md_chat)} chars")
+            return md_chat
+        # Tier 2 (FALLBACK): HTML→MD scoped to chat-turn content.
         try:
             md_chat = await _extract_html_to_md(page, [
                 '[data-message-author-role="assistant"]:last-of-type .markdown',
@@ -15517,29 +15681,6 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 return md_chat
         except Exception as _e:
             log(f"[{label}] chat-mode HTML→MD failed: {_e}", "WARN")
-        # JS innerText tail for chat mode — broader pickup.
-        try:
-            text_chat = await page.evaluate("""() => {
-                const sels = [
-                    '[data-message-author-role="assistant"]',
-                    '.font-claude-message',
-                    '[data-test-render-count]',
-                ];
-                for (const s of sels) {
-                    const els = document.querySelectorAll(s);
-                    if (els.length > 0) {
-                        const last = els[els.length - 1];
-                        const t = last.innerText || '';
-                        if (t.length > 100) return t;
-                    }
-                }
-                return '';
-            }""")
-            if text_chat and len(text_chat) > 100:
-                log(f"[{label}] Extracted via chat-mode JS innerText: {len(text_chat)} chars")
-                return text_chat
-        except Exception as _e2:
-            log(f"[{label}] chat-mode JS innerText failed: {_e2}", "WARN")
         log(f"[{label}] Chat-mode extraction returned no readable content", "WARN")
         return ""
     # Research-mode path below (unchanged from pre-E2 — the artifact-aware ladder).
@@ -15547,7 +15688,6 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     log(f"[{label}] Post-completion: found {artifact_count} artifact(s)")
 
     # ── Step 2 — EXPLICITLY open the LAST artifact card (= final report) ──
-    # Method 1 (PRIMARY): DOM-click the LAST artifact card + read panel content.
     # The "LAST" artifact is the final research report. For 2-artifact runs this
     # is artifact-2 (after Step 0's close-1, panel is now closed → click opens
     # fresh onto artifact-2). For 1-artifact runs this is just the one artifact.
@@ -15556,11 +15696,9 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         log(f"[{label}] Post-completion: opening artifact[{target_idx}] (final report)")
         clicked = await _click_claude_artifact(page, index=target_idx)
         if clicked:
-            # A1 (2026-05-01): replaced fixed 2s sleep with a content-driven
-            # wait — yields fast on a normal mount, gives slow renders up
-            # to 8s before falling through to CUA. The brittle sleep was a
-            # likely contributor to repeated 0-char extractions when the
-            # panel was visually open but content hadn't streamed in yet.
+            # A1 (2026-05-01): content-driven wait — yields fast on a
+            # normal mount, gives slow renders up to 8s before falling
+            # through to CUA.
             try:
                 await page.wait_for_selector(
                     'aside [class*="markdown"], aside .prose, '
@@ -15568,16 +15706,48 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                     '[class*="artifact-panel"] .prose',
                     timeout=8000)
             except Exception:
-                # Selector never appeared — fall back to a short fixed
-                # delay so we still try to read SOMETHING below before
-                # abandoning the DOM tier.
                 await asyncio.sleep(1.5)
+
+            # Tier 1 (NEW 2026-05-12, DGOPS-7366): Copy button + hijack on
+            # the artifact-panel Copy button. Canonical markdown straight
+            # from Claude's own copy pipeline, captured before it touches
+            # the OS clipboard so Wayland's 0-char bug doesn't matter.
+            md = await _copy_via_hijack(
+                page, label,
+                direct_copy_selectors=[
+                    'aside button[aria-label*="copy" i]',
+                    '[class*="artifact-panel"] button[aria-label*="copy" i]',
+                    '[class*="side-panel"] button[aria-label*="copy" i]',
+                    'button[data-testid="copy-artifact"]',
+                ],
+                scoping_excludes=[
+                    'pre code',
+                    '[class*="code-block"]',
+                    'nav',
+                    '[role="navigation"]',
+                ],
+                min_chars=500,
+            )
+            if md and len(md) >= 500 and not _is_sources_not_document(md, platform="claude"):
+                log(f"[{label}] Extracted via Copy hijack (artifact panel): {len(md)} chars")
+                return md
+            if md and _is_sources_not_document(md, platform="claude"):
+                log(f"[{label}] Copy hijack wrong-artifact ({len(md)} chars) — falling to Tier 2", "WARN")
+                try:
+                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                               op="finalize_copy", length=len(md), tier="copy_hijack")
+                except Exception:
+                    pass
+
+            # Tier 2 (FALLBACK): DOM panel read. Today's proven primary —
+            # works reliably when the artifact panel is open. Kept as a
+            # safety net for the rare case the Copy button is hidden or
+            # the hijack misses the write.
             panel_text = await _read_claude_artifact_panel(page)
             if panel_text and len(panel_text) > 500:
                 if _is_sources_not_document(panel_text, platform="claude"):
                     log(f"[{label}] DOM panel wrong-artifact "
-                        f"(checklist, {len(panel_text)} chars) — fall through to CUA",
-                        "WARN")
+                        f"(checklist, {len(panel_text)} chars) — fall through", "WARN")
                     try:
                         emit_event("wrong_artifact_rejected", phase=2, agent="claude",
                                    op="finalize_copy", length=len(panel_text),
@@ -15592,46 +15762,12 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 else:
                     log(f"[{label}] Extracted via DOM artifact panel ({target_idx}): "
                         f"{len(panel_text)} chars")
-                    # Try to also get clipboard copy for higher fidelity
-                    try:
-                        await page.evaluate("""() => {
-                            const copyBtn = document.querySelector(
-                                'aside button[aria-label*="Copy"], ' +
-                                '[class*="artifact-panel"] button[aria-label*="Copy"], ' +
-                                'button[data-testid="copy-artifact"]'
-                            );
-                            if (copyBtn) copyBtn.click();
-                        }""")
-                        await asyncio.sleep(1)
-                        clipboard = get_clipboard()
-                        if (clipboard and len(clipboard) > len(panel_text) * 0.8
-                                and not _is_sources_not_document(clipboard, platform="claude")):
-                            log(f"[{label}] Upgraded to clipboard copy: {len(clipboard)} chars")
-                            return clipboard
-                    except Exception:
-                        pass
                     return panel_text
 
-    # Method 2 (NEW 2026-05-07): artifact-panel Copy button. Cheap (single
-    # DOM click), agent-canonical (Claude renders the same markdown its
-    # users see), wrong-artifact-shape guarded. Falls through silently
-    # when the button isn't present, the click misfires, the clipboard
-    # returns empty (Wayland), or the contents look like a checklist
-    # rather than a document. Inserted between HTML→MD (Method 1) and the
-    # broader DOM/JS fallbacks so the cost-ordered ladder mirrors
-    # ChatGPT's pattern (free tiers first, expensive CUA last).
-    if not chat_mode:
-        copy_text = await _try_claude_artifact_copy_button(page, label)
-        if copy_text and len(copy_text) > 100:
-            log(f"[{label}] Extracted via artifact-panel Copy button: "
-                f"{len(copy_text)} chars")
-            return copy_text
-
-    # Method 3: HTML→MD (artifact-panel scoped — the prior list included
-    # `.font-claude-message` and `.contents .prose` which read the LEFT
-    # conversation column, admitting chat-transcript content. Now scoped
-    # to the right-side artifact panel only; chat-transcript guard in
-    # _is_sources_not_document catches anything that slips through.)
+    # Tier 3 (EXTRA FALLBACK, per user request 2026-05-12): HTML→MD —
+    # artifact-panel scoped. Cheap defense-in-depth before CUA. Was
+    # Tier 3 historically; kept here as belt-and-suspenders since the
+    # method is known to work.
     md = await _extract_html_to_md(page, [
         '[data-testid="artifact-content"]',
         '.artifact-content',
@@ -15653,34 +15789,9 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         else:
             return md
 
-    # Method 4: JS fallback (artifact-panel scoped — same narrowing as
-    # Method 3 above; chat-transcript guard catches stragglers).
-    try:
-        text = await page.evaluate("""() => {
-            const r = document.querySelectorAll(
-                '[data-testid="artifact-content"], .artifact-content, ' +
-                '.artifact-panel .contents, aside .markdown, aside .prose, ' +
-                '[class*="artifact-panel"] [class*="content"], ' +
-                '[class*="artifact"] .ProseMirror, [class*="artifact"] [class*="rendered"]'
-            );
-            if (r.length > 0) return r[r.length - 1].innerText;
-            return '';
-        }""")
-        if text and len(text) > 100:
-            if _is_sources_not_document(text, platform="claude"):
-                log(f"[{label}] JS wrong-artifact ({len(text)} chars) — skipping", "WARN")
-                try:
-                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                               op="finalize_copy", length=len(text), tier="dom_js")
-                except Exception:
-                    pass
-            else:
-                log(f"[{label}] Extracted via JS: {len(text)} chars")
-                return text
-    except Exception:
-        pass
-
-    # Method 5 (last resort): CUA opens the correct artifact and copies it.
+    # Tier 4 (LAST RESORT, Win/Mac/X11 only): CUA opens the correct
+    # artifact and copies it. Gated off on Wayland (get_clipboard
+    # returns 0 chars there regardless).
     # 2026-04-26: split into TWO shadow-eval hotspots — `2d-nav` wraps the
     # NAVIGATE call (action class: click_last_artifact_card), `2d-copy` wraps
     # the COPY call (action class: copy_open_artifact). Separate hotspots so
@@ -15695,7 +15806,7 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     # E2 / DGOPS-7364 — chat-mode skips this CUA artifact navigation entirely
     # (no artifact exists; CUA would hunt for it and either time out or open
     # the wrong content). Falls through to the mode-agnostic tail below.
-    while _claude_2d_attempts < 2 and browser and cua_client and not chat_mode:
+    while _claude_2d_attempts < 2 and browser and cua_client and not chat_mode and not _IS_WAYLAND:
         _claude_2d_attempts += 1
         log(f"[{label}] CUA: Navigating to final artifact "
             f"(attempt {_claude_2d_attempts}/2)...")
@@ -17408,24 +17519,41 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 emit_event("pipeline_stopped", phase=2, agent="claude",
                            reason="user_stop_chat_mode")
                 return page, False
-            decision = await _controls.await_agent_decision("claude", timeout=600.0)
+            # 2026-05-12: bumped timeout 600s → 3h (10800s). Claude Pro
+            # users get Research mode automatically — if we land here it's
+            # an exceptional state (Pro tier issue / Anthropic UI rev /
+            # locked region) that NEEDS human eyes on the alert. The old
+            # 10-min auto-continue silently degraded these runs to chat
+            # mode if the operator was AFK; per user request 2026-05-12
+            # we now wait long enough that a daily check-in catches it,
+            # and on timeout we SKIP the agent (rather than fall to chat
+            # mode) so a missed decision doesn't auto-degrade fidelity.
+            decision = await _controls.await_agent_decision("claude", timeout=10800.0)
             log(f"[{label}] Chat-mode user decision: {decision}", "INFO")
             if decision == "stop":
                 emit_event("pipeline_stopped", phase=2, agent="claude",
                            reason="user_stop_chat_mode")
                 return page, False
-            if decision == "skip":
+            if decision == "skip" or decision == "timeout":
                 _runtime.agent_modes["claude"] = {
-                    "requested": "research", "actual": "skipped",
+                    "requested": "research",
+                    "actual": "skipped",
                     "user_acknowledged_chat": False,
                 }
-                emit_event("agent_skipped", phase=2, agent="claude",
-                           reason="research_unavailable_user_skip")
+                _reason = ("research_unavailable_user_skip"
+                           if decision == "skip"
+                           else "research_unavailable_timeout_default_skip")
+                emit_event("agent_skipped", phase=2, agent="claude", reason=_reason)
                 fail_agent(platform_l, "Claude skipped — Research unavailable",
-                           "User opted to skip Phase 2B Claude after Research mode "
-                           "could not be enabled.")
+                           ("User opted to skip Phase 2B Claude after Research mode "
+                            "could not be enabled." if decision == "skip"
+                            else "Decision alert timed out after 3h — skipping Claude "
+                                 "rather than silently falling to chat mode."))
                 return page, False
-            # continue_anyway / timeout → proceed in chat mode with sticky flag.
+            # continue_anyway → proceed in chat mode with sticky flag.
+            # (Was the timeout default too; moved to explicit-only 2026-05-12
+            # so an AFK operator doesn't accidentally consent to lower-
+            # fidelity chat-mode output.)
             _runtime.agent_modes["claude"] = {
                 "requested": "research", "actual": "chat",
                 "user_acknowledged_chat": True,
