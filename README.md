@@ -8,11 +8,11 @@ Automates multi-agent deep research across 6 platforms. Tiered automation: Playw
 > The Firebase Admin SDK key (`firebase-service-account.json`) is **gitignored**
 > and emailed separately by the dev — see ["Firebase Admin Key" below](#firebase-admin-key-required--firebase-service-accountjson).
 
-## Access model
+## Google accounts: use personal accounts, not workspace ones
 
-Super Research is a **general-purpose product** — any authenticated Google user signs into the web app and creates their own data scope. Cross-user data is impossible by design: Firestore rules in the companion `super-research-frontend` repo are per-user-self-access (`request.auth.uid == uid` on every `users/{uid}/…` path) and the catch-all `match /{document=**}` denies everything else. The Firebase Auth Google provider is intentionally not domain-restricted (`hd` parameter omitted) since onboarding is open.
+The web app side accepts any Google sign-in. **The backend is different — use a personal Gmail/Google account here, not a Google Workspace one.** Phase 0 logs the backend's Chrome session into NotebookLM, ChatGPT, Claude, and Gemini on your behalf, and Workspace-managed accounts hit the admin-approval gate on each of those services. Personal accounts skip that prompt and let the pipeline run unattended. If you've already paired with a Workspace account and Phase 0 stalls on a "this app needs admin approval" screen, the fastest fix is `python research.py --unpair` then re-pair with a personal account.
 
-This backend pairs to a single web-app account at a time via `--pair`. The ResearchToken minted during pairing is bound to your uid; the backend rejects start requests whose `uid` doesn't match the token's `linkedUid`, so even if the token leaked it cannot be used to drive runs against another user's research collection. See [DGOPS-7458](https://distributedglobal.atlassian.net/browse/DGOPS-7458) for the audit-trail confirming this intent.
+Pairing-side data scope: this backend pairs to a single web-app account at a time via `--pair`. The ResearchToken minted during pairing is bound to that uid; the backend rejects start requests whose `uid` doesn't match the token's `linkedUid`, so even if the token leaks it can't be used to drive runs against another user's research collection.
 
 ## Platform support
 
