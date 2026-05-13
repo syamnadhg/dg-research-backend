@@ -7327,6 +7327,45 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None):
                    **base)
 
 
+# DGOPS-7367 (2026-05-13) — transient Chromium network error categories
+# the unstick-prophylaxis page-reload may encounter when claude.ai DNS
+# briefly fails. Pre-fix, ANY page.reload exception treated Claude as
+# unrecoverable on the very next CUA tick; the third reproduction in
+# 6 weeks (2026-05-11) finally surfaced the missing distinction. These
+# are the categories that justify retrying instead of dropping — every
+# one of them is the kind of error that self-heals in <10min in the
+# wild (residential DNS hiccup, brief WiFi disconnect, captive-portal
+# re-auth, etc.). Errors NOT in this list (ERR_INVALID_RESPONSE,
+# ERR_SSL_PROTOCOL_ERROR, ERR_BLOCKED_BY_*) indicate something durable
+# wrong with the page itself and stay on the immediate-drop path.
+_TRANSIENT_NET_ERRORS = (
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_TIMED_OUT",
+    "ERR_NETWORK_CHANGED",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_ADDRESS_UNREACHABLE",
+    "ERR_NAME_NOT_RESOLVED.",  # trailing-period variant seen in some Chromium builds
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_CONNECTION_RESET",
+)
+# Backoff schedule for transient network errors. 30s → 2m → 8m =
+# ~10.5min total recovery window before declaring permanent. Comfortably
+# under Phase 2's typical 90min budget and tracks the rhythm most
+# residential / coffee-shop DNS hiccups self-heal at.
+_DNS_BACKOFF_SECS = (30, 120, 480)
+
+
+def _is_transient_net_error(exc_or_text) -> bool:
+    """Return True if the given exception (or its repr) matches one of
+    the transient Chromium network error categories that warrant retry
+    instead of immediate agent drop. Used by the unstick-prophylaxis
+    path in poll_all_agents_round_robin to distinguish network blips
+    from genuine page failures (DGOPS-7367)."""
+    s = str(exc_or_text or "")
+    return any(code in s for code in _TRANSIENT_NET_ERRORS)
+
+
 def fail_agent(agent_key: str, title: str, details: str = "",
                include_wait: bool = False):
     """Template B: Phase 2 per-agent error alert. Emits pipeline_error
@@ -10176,6 +10215,68 @@ async def _click_claude_artifact(page, index=0):
         return False
 
 
+def _claude_artifact_frame_targets(page):
+    """Return frame targets worth scraping for Claude artifact content.
+
+    Always starts with the main page. Appends any iframe whose URL is
+    claude.ai / claude.site / about:blank (srcdoc-mounted sandboxes), plus
+    any frame whose URL is empty/unknown — Claude has historically used
+    blank-src iframes for some Document artifact variants and may again.
+
+    Mirrors `_chatgpt_dr_frame_targets` (DGOPS-7366) but for Claude
+    artifacts. Pre-fix, Run B 2026-05-12 had Claude Tier 2/3 both return
+    empty while CUA later copied 127k chars — strong signal that the
+    content was iframe-mounted and parent-document queries couldn't see
+    it. This helper restores Tier 2/3 reach into the artifact iframe."""
+    targets = [page]
+    try:
+        for frame in page.frames:
+            try:
+                src = (frame.url or "").lower()
+            except Exception:
+                continue
+            if frame is page.main_frame:
+                continue
+            # Claude artifact iframe variants we've seen + the about:blank
+            # srcdoc case (sandboxed inline HTML). The empty-URL case is a
+            # belt-and-suspenders catch for any future scheme.
+            if ("claude.ai" in src
+                    or "claude.site" in src
+                    or "anthropic" in src
+                    or src.startswith("about:")
+                    or src.startswith("blob:")
+                    or src == ""):
+                targets.append(frame)
+    except Exception:
+        pass
+    return targets
+
+
+_CLAUDE_PANEL_SELECTORS_JS = """[
+    '[data-testid="artifact-content"]',
+    '.artifact-content',
+    '.artifact-panel .contents',
+    'aside .prose', 'aside .markdown',
+    '[class*="artifact-panel"] [class*="content"]',
+    '[class*="artifact"] .ProseMirror',
+    '[class*="artifact"] [class*="rendered"]',
+    'aside [contenteditable="true"]',
+    'aside .tiptap',
+    'aside article',
+    'aside main',
+    '.markdown-body',
+    '.prose-message',
+    // iframe-side (when target is a Claude artifact frame): the
+    // artifact body mounts directly on common containers.
+    'main',
+    'article',
+    'body > div > article',
+    'body main',
+    '#root main',
+    '#root article',
+]"""
+
+
 async def _read_claude_artifact_panel(page):
     """Read content from the currently open artifact panel (right side).
 
@@ -10185,58 +10286,80 @@ async def _read_claude_artifact_panel(page):
     fallback flattens markdown structure to plain text, so a sentinel log is
     emitted to make the degradation visible (the FE would otherwise render
     a wall-of-text and we'd never know which extraction path produced it).
-    """
-    try:
-        # Step 1: try innerHTML → markdownify on each candidate panel.
-        html_blob = await page.evaluate("""() => {
-            const panelSelectors = [
-                '[data-testid="artifact-content"]',
-                '.artifact-content',
-                '.artifact-panel .contents',
-                'aside .prose', 'aside .markdown',
-                '[class*="artifact-panel"] [class*="content"]',
-                '[class*="artifact"] .ProseMirror',
-                '[class*="artifact"] [class*="rendered"]',
-            ];
-            for (const sel of panelSelectors) {
-                const el = document.querySelector(sel);
-                if (el && el.innerText.length > 50) return el.innerHTML;
-            }
-            const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
-            if (aside && aside.innerText.length > 200) return aside.innerHTML;
-            return '';
-        }""")
-        if html_blob and len(html_blob) > 200:
-            md = html_to_markdown(html_blob)
-            if md and len(md) > 100:
-                return md
-            # markdownify returned empty/short — fall through to innerText.
 
-        # Step 2: innerText fallback (preserves prior behavior). Markdown
-        # structure is lost here — log a sentinel so the operator knows the
-        # saved doc is plain text rather than properly formatted markdown.
-        text = await page.evaluate("""() => {
-            const panelSelectors = [
-                '[data-testid="artifact-content"]',
-                '.artifact-content',
-                '.artifact-panel .contents',
-                'aside .prose', 'aside .markdown',
-                '[class*="artifact-panel"] [class*="content"]',
-                '[class*="artifact"] .ProseMirror',
-                '[class*="artifact"] [class*="rendered"]',
-            ];
-            for (const sel of panelSelectors) {
-                const el = document.querySelector(sel);
-                if (el && el.innerText.length > 50) return el.innerText;
-            }
-            const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
-            if (aside && aside.innerText.length > 200) return aside.innerText;
-            return '';
-        }""")
-        if text:
-            log("[Claude] Artifact panel innerText fallback fired — markdown "
-                "structure lost. Saved doc will render as plain text.", "WARN")
-        return text
+    2026-05-13 (DGOPS-7367 advisor): iframe-aware + retry-on-empty. Pre-fix,
+    this function read only `document` and gave up on first miss. Run B
+    2026-05-12 had Claude content reachable to CUA's pixel-level Ctrl+A but
+    invisible to `document.querySelector` — almost certainly iframe-mounted.
+    Now walks `_claude_artifact_frame_targets` for innerHTML across page +
+    iframes, and retries once after 1.5s on the first empty pass to cover
+    slow mounts. Falls through to innerText only after both passes miss.
+    """
+    targets = _claude_artifact_frame_targets(page)
+    panel_selectors_arg = _CLAUDE_PANEL_SELECTORS_JS
+
+    async def _try_html(target):
+        try:
+            return await target.evaluate(f"""() => {{
+                const panelSelectors = {panel_selectors_arg};
+                for (const sel of panelSelectors) {{
+                    let el;
+                    try {{ el = document.querySelector(sel); }} catch (e) {{ continue; }}
+                    if (el && el.innerText.length > 50) return el.innerHTML;
+                }}
+                const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
+                if (aside && aside.innerText.length > 200) return aside.innerHTML;
+                if (document.body && document.body.innerText.length > 200) return document.body.innerHTML;
+                return '';
+            }}""")
+        except Exception:
+            return ""
+
+    async def _try_text(target):
+        try:
+            return await target.evaluate(f"""() => {{
+                const panelSelectors = {panel_selectors_arg};
+                for (const sel of panelSelectors) {{
+                    let el;
+                    try {{ el = document.querySelector(sel); }} catch (e) {{ continue; }}
+                    if (el && el.innerText.length > 50) return el.innerText;
+                }}
+                const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
+                if (aside && aside.innerText.length > 200) return aside.innerText;
+                if (document.body && document.body.innerText.length > 200) return document.body.innerText;
+                return '';
+            }}""")
+        except Exception:
+            return ""
+
+    try:
+        # Pass 1 — HTML across all targets.
+        for target in targets:
+            html_blob = await _try_html(target)
+            if html_blob and len(html_blob) > 200:
+                md = html_to_markdown(html_blob)
+                if md and len(md) > 100:
+                    return md
+        # Pass 2 — wait 1.5s then HTML retry. Covers slow artifact mounts
+        # where the wait_for_selector at the extractor entry timed out
+        # against a narrower selector than what we query here.
+        await asyncio.sleep(1.5)
+        for target in targets:
+            html_blob = await _try_html(target)
+            if html_blob and len(html_blob) > 200:
+                md = html_to_markdown(html_blob)
+                if md and len(md) > 100:
+                    return md
+        # Pass 3 — innerText fallback (preserves prior behavior). Markdown
+        # structure is lost here — log a sentinel so the operator knows
+        # the saved doc is plain text rather than properly formatted MD.
+        for target in targets:
+            text = await _try_text(target)
+            if text:
+                log("[Claude] Artifact panel innerText fallback fired — markdown "
+                    "structure lost. Saved doc will render as plain text.", "WARN")
+                return text
+        return ""
     except Exception as e:
         log(f"Artifact panel read failed: {e}", "WARN")
         return ""
@@ -13481,6 +13604,64 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # below). Increment ONCE per round-robin tick per agent.
             p["poll_cycles"] = p.get("poll_cycles", 0) + 1
 
+            # DGOPS-7367 (2026-05-13) — deferred DNS retry. If a previous
+            # page.reload tripped a transient network error, retry the
+            # reload now that the backoff window has elapsed. Schedule
+            # the next attempt on failure; clear state + rejoin rotation
+            # on success; exhaust → fall through to existing drop path.
+            # Runs BEFORE the spotlight + scrape body so a successful
+            # retry's fresh DOM is what this tick reads from.
+            if p.get("dns_retry_at") and time.time() >= p["dns_retry_at"]:
+                _attempt = p.get("dns_retry_attempts", 1)
+                log(f"[{name}] DNS retry attempt {_attempt}/{len(_DNS_BACKOFF_SECS)} — "
+                    f"re-attempting page.reload (was: {p.get('dns_last_error', '')[:80]})")
+                try:
+                    await p["page"].reload(wait_until="domcontentloaded", timeout=20000)
+                    await asyncio.sleep(3.0)
+                    log(f"[{name}] DNS retry {_attempt} SUCCEEDED — agent rejoining rotation")
+                    # Clear retry state, mark prophylaxis done so we don't
+                    # re-trigger the cycle=2 path, and delay the next CUA
+                    # check briefly so the post-reload DOM has a moment to
+                    # finish mounting before any verdict.
+                    p["dns_retry_at"] = 0
+                    p["dns_retry_attempts"] = 0
+                    p["error_source"] = None
+                    p["dns_last_error"] = ""
+                    p["claude_refreshed_once"] = True
+                    p["last_cua_check"] = time.time()
+                    try:
+                        emit_event("agent_progress", phase=2,
+                                   agent=normalize_agent_key(name),
+                                   status="generating",
+                                   progress=f"Recovered from network blip after {_attempt} retry",
+                                   elapsedSec=int(elapsed))
+                    except Exception:
+                        pass
+                except Exception as _re2:
+                    if _is_transient_net_error(_re2) and _attempt < len(_DNS_BACKOFF_SECS):
+                        _next_delay = _DNS_BACKOFF_SECS[_attempt]
+                        p["dns_retry_at"] = time.time() + _next_delay
+                        p["dns_retry_attempts"] = _attempt + 1
+                        p["dns_last_error"] = str(_re2)[:200]
+                        log(f"[{name}] DNS retry {_attempt} failed ({str(_re2)[:80]}); "
+                            f"next attempt in {_next_delay}s "
+                            f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})", "WARN")
+                    else:
+                        # Backoff exhausted OR non-transient error this time.
+                        # Clear retry state; let the existing CUA-error-drop
+                        # path run on the next tick. error_source flipped to
+                        # "network_exhausted" so the is_error gate (below)
+                        # knows we already gave network a chance.
+                        log(f"[{name}] DNS retries exhausted — falling through to "
+                            f"normal drop path (last error: {str(_re2)[:80]})", "WARN")
+                        p["dns_retry_at"] = 0
+                        p["error_source"] = "network_exhausted"
+                        p["claude_refreshed_once"] = True
+                # Either way, skip the rest of this agent's tick so the
+                # round-robin continues with siblings instead of running
+                # CUA against a freshly-reloaded (or still-broken) DOM.
+                continue
+
             # ── C6: cursor foreground + partial-content refresh ──
             # Bring this agent's tab to the front before any scrape/check so
             # its MutationObserver has the freshest token stream (Chromium
@@ -13609,14 +13790,34 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # first DOM probe meets a fresh DOM.
             if (name == "Claude"
                     and p.get("poll_cycles", 0) == 2
-                    and not p.get("claude_refreshed_once")):
+                    and not p.get("claude_refreshed_once")
+                    and not p.get("dns_retry_at")):
                 try:
                     log("[Claude] one-shot page refresh at cycle=2 (unstick prophylaxis)")
                     await p["page"].reload(wait_until="domcontentloaded", timeout=20000)
                     await asyncio.sleep(3.0)
+                    p["claude_refreshed_once"] = True
                 except Exception as _re:
-                    log(f"[Claude] refresh failed: {_re}", "WARN")
-                p["claude_refreshed_once"] = True
+                    # DGOPS-7367 (2026-05-13): if the reload tripped a
+                    # transient network error (DNS / connection hiccup),
+                    # don't write claude_refreshed_once and don't fall
+                    # through to the CUA-error-drop path. Schedule an
+                    # exponential-backoff retry instead — most residential
+                    # DNS blips self-heal in < 10min, well inside Phase 2's
+                    # budget. Non-transient errors (SSL, blocked, etc.)
+                    # keep today's behavior: mark refreshed-once, let CUA
+                    # diagnose, drop on `is_error` verdict.
+                    if _is_transient_net_error(_re):
+                        p["error_source"] = "network"
+                        p["dns_last_error"] = str(_re)[:200]
+                        p["dns_retry_attempts"] = 1
+                        p["dns_retry_at"] = time.time() + _DNS_BACKOFF_SECS[0]
+                        log(f"[Claude] transient network error during refresh "
+                            f"({str(_re)[:80]}) — scheduling retry in "
+                            f"{_DNS_BACKOFF_SECS[0]}s (attempt 1/{len(_DNS_BACKOFF_SECS)})", "WARN")
+                    else:
+                        log(f"[Claude] refresh failed (non-transient): {_re}", "WARN")
+                        p["claude_refreshed_once"] = True
 
             # 2026-05-03: lowered cycle gate 3→2 and elapsed 180s→90s for
             # parity with ChatGPT's panel-open gate at line ~11689.
@@ -14514,6 +14715,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # pending. Salvage whatever's on the page, fire fail_agent
             # once, drop the agent from rotation.
             if is_error:
+                # DGOPS-7367 (2026-05-13): defer drop while a transient
+                # network retry is pending. The retry path above will
+                # either rejoin the agent (success), or exhaust the
+                # backoff schedule and flip error_source to
+                # "network_exhausted" — at which point we DO want to fall
+                # through to the drop. is_error firing here against a
+                # chrome-error DOM mid-retry is the exact pre-fix failure
+                # mode: dropping immediately even though a 30s wait would
+                # have recovered.
+                if p.get("dns_retry_at") and p.get("error_source") == "network":
+                    _in = max(0, int(p["dns_retry_at"] - time.time()))
+                    log(f"[{name}] CUA reports error but DNS retry pending "
+                        f"(attempt {p.get('dns_retry_attempts')}/"
+                        f"{len(_DNS_BACKOFF_SECS)}, in {_in}s) — deferring drop", "INFO")
+                    continue
                 agent_key_err = normalize_agent_key(name)
                 log(f"[{name}] CUA reported CONCLUSION: ERROR — agent UI shows a failure state. "
                     f"Salvaging partial output and dropping from rotation.", "WARN")
@@ -15700,6 +15916,68 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         log(f"[{label}] Extracted via Copy hijack: {len(md)} chars")
         return md
 
+    # Tier 1B (NEW 2026-05-13): kebab → "Copy" menuitem fallback. Gemini
+    # uses Material CDK overlays — the share/export menu attaches to
+    # `cdk-overlay-container` outside the response scope, so the direct-
+    # selector list misses it. The kebab/menu-item path catches that
+    # surface. Same hijack semantics — captured before OS clipboard, so
+    # Wayland-safe.
+    md = await _copy_via_hijack(
+        page, label,
+        canvas_root_selectors=[
+            'message-content',
+            '.model-response-text',
+            '.response-container',
+            'message-actions',
+        ],
+        kebab_selectors=[
+            'message-actions button[aria-label*="more" i]',
+            'message-actions button[mattooltip*="more" i]',
+            'message-actions button[aria-haspopup="menu"]',
+            'message-actions button[aria-label*="actions" i]',
+            'button[aria-label*="more options" i]',
+            'button[mattooltip*="more options" i]',
+        ],
+        menuitem_text_pattern=r'copy(\s+(markdown|text|response|as\s+\w+|to\s+clipboard))?',
+        scoping_excludes=[
+            '[role="dialog"]',
+            'mat-dialog-container',
+            'pre code',
+            '[class*="code-block"]',
+            'aside',
+            'nav',
+            '[role="navigation"]',
+        ],
+        wait_ms=8000,
+        min_chars=100,
+    )
+    if md and len(md) >= 100:
+        log(f"[{label}] Extracted via Copy hijack (kebab → menuitem): {len(md)} chars")
+        return md
+
+    # Tier 1C (NEW 2026-05-13): one more direct-selector pass against
+    # the Material CDK overlay surface, in case the share/export menu
+    # opens but no kebab existed (some Gemini builds wire the menu via
+    # right-click / share button directly).
+    md = await _copy_via_hijack(
+        page, label,
+        direct_copy_selectors=[
+            'cdk-overlay-container [role="menu"] button[mattooltip*="copy" i]',
+            'cdk-overlay-container [role="menu"] button[aria-label*="copy" i]',
+            'mat-menu-panel button[aria-label*="copy" i]',
+            'mat-menu-panel button[mattooltip*="copy" i]',
+        ],
+        scoping_excludes=[
+            'pre code',
+            '[class*="code-block"]',
+        ],
+        wait_ms=4000,
+        min_chars=100,
+    )
+    if md and len(md) >= 100:
+        log(f"[{label}] Extracted via Copy hijack (CDK overlay): {len(md)} chars")
+        return md
+
     # Tier 2 (FALLBACK): HTML→MD from Gemini's response containers.
     md = await _extract_html_to_md(page, [
         'message-content', '.model-response-text', '.response-container',
@@ -15888,7 +16166,14 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             # top-right toolbar" CSS scope as a last resort. Excludes the
             # share/publish dialog so the hijack doesn't misfire onto a
             # "Copy link" button there.
-            md = await _copy_via_hijack(
+            # 2026-05-13: switched to `_copy_via_hijack_anyframe` and added
+            # a kebab/menuitem fallback. Some Claude builds tuck the Copy
+            # action behind a kebab in the artifact-panel toolbar (CUA was
+            # finding it at (1102, 24) in Run B). The anyframe wrapper also
+            # protects against the case where the artifact body mounts
+            # inside a same-host iframe (Claude has historically used both
+            # main-document and iframe variants for Document artifacts).
+            md = await _copy_via_hijack_anyframe(
                 page, label,
                 direct_copy_selectors=[
                     'aside button[aria-label*="copy" i]',
@@ -15923,6 +16208,33 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 ],
                 min_chars=500,
             )
+
+            # Tier 1B (NEW 2026-05-13): kebab/more-menu fallback. When the
+            # direct Copy button isn't surfaced in the toolbar, Claude has
+            # historically tucked it behind a "more" / kebab menu. Same
+            # _copy_via_hijack_anyframe path so we still capture before the
+            # OS clipboard, keeping Wayland safety.
+            if not md or len(md) < 500:
+                md = await _copy_via_hijack_anyframe(
+                    page, label,
+                    canvas_root_selectors=[
+                        'aside',
+                        '[class*="artifact-panel"]',
+                        '[class*="side-panel"]',
+                    ],
+                    kebab_selectors=[
+                        'aside button[aria-haspopup="menu"]',
+                        'aside button[aria-label*="more" i]',
+                        'aside button[aria-label*="menu" i]',
+                        'aside button[aria-label*="actions" i]',
+                        'aside button:has(svg[class*="ellipsis"])',
+                        'aside button:has(svg[class*="dots"])',
+                        'aside button:has(svg[class*="more"])',
+                        '[class*="artifact-panel"] button[aria-haspopup="menu"]',
+                    ],
+                    menuitem_text_pattern=r'copy(\s+(contents?|as\s+markdown|text|document|response))?',
+                    min_chars=500,
+                )
             if md and len(md) >= 500 and not _is_sources_not_document(md, platform="claude"):
                 log(f"[{label}] Extracted via Copy hijack (artifact panel): {len(md)} chars")
                 return md
