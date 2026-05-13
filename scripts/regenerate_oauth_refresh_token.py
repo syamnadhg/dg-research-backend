@@ -151,15 +151,20 @@ def main() -> int:
         )
         return 1
 
+    # ASCII-only output: Windows default console codepage (cp1252) can't
+    # encode "->" arrow or em-dash, which crashed the script AFTER the
+    # token was already captured. Result was a confusing "exit code 1"
+    # even though the OAuth flow succeeded. Stick to ASCII characters
+    # the cp1252 codepage handles cleanly.
     print("\n" + "=" * 70)
-    print("NEW REFRESH TOKEN — copy this entire line (no spaces):")
+    print("NEW REFRESH TOKEN -- copy this entire line (no spaces):")
     print("=" * 70)
     print(creds.refresh_token)
     print("=" * 70)
-    print("\nNext step — pick whichever path applies:")
+    print("\nNext step -- pick whichever path applies:")
     print()
     print("  A. Per-user OAuth (most users)")
-    print("     Open Super Research → Account → API Keys → Google OAuth.")
+    print("     Open Super Research -> Account -> API Keys -> Google OAuth.")
     print("     Paste Client ID, Client Secret, and the Refresh Token above.")
     print("     Click 'Save (validate + store)'.")
     print()
@@ -167,7 +172,7 @@ def main() -> int:
     print("     firebase apphosting:secrets:set GOOGLE_OAUTH_REFRESH_TOKEN")
     print("     Paste the token above when prompted. Cloud Run picks up the")
     print("     new version on the next /api/uploadYouTube or /api/createDoc")
-    print("     call — no redeploy needed.")
+    print("     call -- no redeploy needed.")
     print()
     print("Granted scopes:")
     for s in SCOPES:
