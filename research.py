@@ -18774,8 +18774,13 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
 
 # ── Phase 3 (audio): Audio Overview Generation ───────────────────────────────
 
-async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False):
-    """Phase 3 (step b): Generate long-form audio overview in NotebookLM + share public."""
+async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False, podcast_length="long"):
+    """Phase 3 (step b): Generate audio overview in NotebookLM + share public.
+
+    `podcast_length` (2026-05-13 feature): "short" / "default" / "long".
+    Drives the customize-panel Format/Length selection via the
+    make_prompt_audio_generate factory. Defaults to "long" for backward
+    compatibility with callers that don't yet pass the kwarg."""
     log("=" * 60)
     log("PHASE 3 (audio): Audio Overview Generation")
     log("=" * 60)
@@ -18843,14 +18848,26 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     if already_generating:
         log("Audio already generating — skipping Generate click")
     else:
-        log("Starting audio generation (Long + Deep Dive)...")
+        # 2026-05-13: per-variant format + length names for log / narrator
+        # / CUA task copy. Mirrors make_prompt_audio_generate's table.
+        _variant_label = {
+            "short": ("Brief", "the Brief format (no separate length step)"),
+            "default": ("Deep Dive", "Deep Dive + Default length"),
+            "long": ("Deep Dive", "Deep Dive + Long length"),
+        }.get(podcast_length, ("Deep Dive", "Deep Dive + Long length"))
+        _fmt_short, _human_desc = _variant_label
+        log(f"Starting audio generation ({_human_desc})...")
         _stop, _task = start_narration_ticker(
             3, "notebooklm",
-            "Configuring audio overview (Long + Deep Dive) and clicking Generate",
+            f"Configuring audio overview ({_human_desc}) and clicking Generate",
             interval=20)
         try:
-            await agent_loop(cua_client, browser, PROMPT_AUDIO_GENERATE,
-                "Generate ONE audio overview. Select all sources, set Long + Deep Dive, click Generate ONCE. Say 'generating' when started.",
+            _prompt = make_prompt_audio_generate(podcast_length)
+            _task_str = (
+                f"Generate ONE audio overview. Select all sources, set "
+                f"{_human_desc}, click Generate ONCE. Say 'generating' when started."
+            )
+            await agent_loop(cua_client, browser, _prompt, _task_str,
                 model=CUA_MODEL, max_iterations=15, verbose=verbose)
         finally:
             await stop_narration_ticker(_stop, _task)
@@ -20296,6 +20313,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         ac = pipeline_config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
         ve = pipeline_config.get("videoEnabled", True)
         ee = pipeline_config.get("emailEnabled", True)
+        # 2026-05-13 (feature): NotebookLM audio-overview length —
+        # "short" / "default" / "long". Default to "long" so pre-feature
+        # runs preserve the historical hardcoded behavior. The Phase 3
+        # audio-generation CUA prompt parameterizes its Length instruction
+        # on this value below.
+        pl_raw = pipeline_config.get("podcastLength", "long")
+        pl = pl_raw if pl_raw in ("short", "default", "long") else "long"
         if 3 in sp:
             sp.add(4)
         # Brief-on requires ≥1 P2 agent — otherwise the brief feeds nothing
@@ -20308,9 +20332,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         if 1 not in sp and not any(ac.values()):
             log("Config: brief on with 0 agents — auto-enabling ChatGPT", "WARN")
             ac["chatgpt"] = True
-        return sp, ac, ve, ee
+        return sp, ac, ve, ee, pl
 
-    skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
+    skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length = reload_config()
 
     # ── Preload data from previous phases (for resume) ──
     brief_text, brief_url = "", cp.get("brief_url", "")
@@ -21474,7 +21498,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if _controls.is_stop():
                 return
 
-        skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
+        skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length = reload_config()
         # ══════════════════════ PHASE 2: Deep Research ══════════════════════
         results = {}
         _user_skip_p2 = _controls.consume_phase_skip(2)
@@ -22071,7 +22095,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Dropping {len(dropped)} chars of residual extra_context post-P2 "
                 f"(add_context disabled for Phase 3+)", "WARN")
 
-        skip_phases, agents_cfg, video_enabled, email_enabled = reload_config()
+        skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length = reload_config()
         # ── 2026-05-10: Eager phase_start:3 BEFORE the verify gate ──
         # Pre-fix, the verify gate (when skip_init_verify=True) ran a 5-15s
         # CUA call BEFORE phase_start:3 was emitted — FE saw P2 done + blank
@@ -22346,7 +22370,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     try:
                         _p3_audio = await _await_phase_with_active_deadline(
                             3, PHASE_3_AUDIO_MAX_MIN,
-                            lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                            lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose, podcast_length=podcast_length),
                             soft_warn_only=True,  # 2026-05-04: NLM audio gen legitimately runs 30-45m on long podcasts; warn but don't bail
                         )
                         break
@@ -22441,7 +22465,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     try:
                         _p3_audio = await _await_phase_with_active_deadline(
                             3, PHASE_3_AUDIO_MAX_MIN,
-                            lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose),
+                            lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose, podcast_length=podcast_length),
                             soft_warn_only=True,  # 2026-05-06 (Stream 2 D4): match primary call at :20018
                         )
                         audio_path = _p3_audio.get("audio_path")
