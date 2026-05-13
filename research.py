@@ -14979,6 +14979,56 @@ async def _extract_html_to_md(page, selectors, label):
     return ""
 
 
+def _chatgpt_dr_frame_targets(page):
+    """Return the list of frame targets worth running hijack/HTML→MD
+    against for ChatGPT Deep Research. Always begins with the main page,
+    then appends any iframe whose URL matches the Deep Research sandbox.
+
+    Why this exists (2026-05-13): the DR canvas/artifact lives inside a
+    cross-origin sandboxed iframe (e.g.
+    `connector_openai_deep_research.web-sandbox.oaiusercontent.com`).
+    `page.evaluate` only sees the parent document, so every hijack
+    attempt against the parent logged `no_button_clicked` and every
+    HTML→MD scrape returned 0 chars — the chain fell through to CUA
+    (Tier 3) which doesn't work on Wayland. Iterating frames here lets
+    Tier 1 and Tier 2 actually reach the DR DOM.
+    """
+    targets = [page]
+    try:
+        for frame in page.frames:
+            try:
+                src = (frame.url or "").lower()
+            except Exception:
+                continue
+            if not src:
+                continue
+            if ("deep_research" in src
+                    or "oaiusercontent" in src
+                    or "web-sandbox.oaiusercontent" in src):
+                targets.append(frame)
+    except Exception:
+        pass
+    return targets
+
+
+async def _extract_html_to_md_anyframe(page, selectors, label):
+    """Frame-aware HTML→MD scrape. Tries the main page first, then any
+    iframe matching the ChatGPT Deep Research sandbox URL.
+
+    Mirrors `_extract_html_to_md` per-frame so the existing call-site
+    semantics (returns "" on miss, logs the first selector that landed)
+    stay intact. Sibling of `_chatgpt_dr_frame_targets`; same 2026-05-13
+    motivation."""
+    for target in _chatgpt_dr_frame_targets(page):
+        try:
+            md = await _extract_html_to_md(target, selectors, label)
+        except Exception:
+            md = ""
+        if md:
+            return md
+    return ""
+
+
 async def _copy_via_hijack(
     page,
     label,
@@ -15227,7 +15277,15 @@ async def _copy_via_hijack(
         })
 
         if not result or not result.get("ok"):
-            log(f"[{label}] Copy hijack: {(result or {}).get('reason', 'no_capture')}", "DEBUG")
+            # 2026-05-13 diagnostic: surface what (if anything) the hijack
+            # actually clicked. `no_capture` (button clicked, no clipboard
+            # write within wait_ms) is the silent-fail case we couldn't
+            # diagnose before — knowing the clicked selector lets us see
+            # whether the wrong button was hit or the right button just
+            # doesn't fire a copy event with hijackable mime types.
+            _rclick = (result or {}).get("clicked") or "—"
+            _rreason = (result or {}).get("reason") or "no_capture"
+            log(f"[{label}] Copy hijack: {_rreason} (clicked={_rclick})", "DEBUG")
             return ""
         text = result.get("text") or ""
         html = result.get("html") or ""
@@ -15248,6 +15306,31 @@ async def _copy_via_hijack(
     except Exception as e:
         log(f"[{label}] Copy hijack exception: {e}", "WARN")
         return ""
+
+
+async def _copy_via_hijack_anyframe(page, label, **kwargs):
+    """Frame-aware variant of _copy_via_hijack. Tries the main page first,
+    then each Deep Research sandbox iframe. Returns the first non-empty
+    capture. Same kwargs as the underlying helper.
+
+    2026-05-13: ChatGPT DR's Copy button + canvas live inside a cross-
+    origin sandbox iframe — every `_copy_via_hijack` call against the
+    main page found no buttons and Tier 1 was effectively dead. This
+    wrapper makes Tier 1 actually reachable so Wayland runs (where Tier 3
+    fails) have a working extraction path."""
+    last_attempt_logged = False
+    for target in _chatgpt_dr_frame_targets(page):
+        try:
+            md = await _copy_via_hijack(target, label, **kwargs)
+        except Exception as _e:
+            log(f"[{label}] Copy hijack on frame raised: {_e}", "DEBUG")
+            md = ""
+        if md:
+            return md
+        last_attempt_logged = True
+    if not last_attempt_logged:
+        log(f"[{label}] Copy hijack: no frame targets evaluated", "DEBUG")
+    return ""
 
 
 async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
@@ -15383,21 +15466,37 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     # button is the canonical-markdown emitter, not a class-name-dependent
     # DOM scrape. min_chars=2000 mirrors the historical Method 1 gate so
     # source-panel previews don't slip through.
-    md = await _copy_via_hijack(
+    #
+    # 2026-05-13: switched to `_copy_via_hijack_anyframe` so the hijack
+    # also runs inside the Deep Research sandbox iframe (where the actual
+    # Copy button + canvas live). Pre-fix, every hijack call landed on
+    # the parent document and logged `no_button_clicked` → Tier 3 (CUA)
+    # ran every time, which doesn't work on Wayland. Anyframe restores
+    # Tier 1 reliability.
+    md = await _copy_via_hijack_anyframe(
         page, label,
         canvas_root_selectors=[
             '[class*="canvas"]',
             '[data-testid*="canvas"]',
             'main [role="region"]',
             '[role="dialog"]',
+            # Inside the DR iframe the canvas root has no `canvas` class —
+            # match the markdown article/body containers used in the
+            # sandboxed renderer so the kebab walk has somewhere to scope.
+            'article',
+            'main',
         ],
         kebab_selectors=[
             'button[aria-haspopup="menu"]',
             'button[aria-label*="more" i]',
             'button[data-testid*="more"]',
             'button[aria-label*="menu" i]',
+            # DR sandbox renders the actions toolbar with icon-only
+            # buttons; pick up any 3-dot/kebab variant by SVG class too.
+            'button:has(svg[class*="ellipsis"])',
+            'button:has(svg[class*="dots"])',
         ],
-        menuitem_text_pattern=r'copy contents?',
+        menuitem_text_pattern=r'copy(\s+contents?|\s+as\s+markdown|\s+text)?',
         min_chars=2000,
     )
     if md and len(md) >= 2000 and not _is_sources_not_document(md, platform="chatgpt"):
@@ -15414,11 +15513,14 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     # Tier 1B (NEW 2026-05-12): direct Copy button on the last assistant
     # message. Serves P1 (brief, where there's no canvas → Tier 1A no-ops)
     # AND P2 fallback when the kebab path didn't fire. Same hijack pattern.
-    md = await _copy_via_hijack(
+    md = await _copy_via_hijack_anyframe(
         page, label,
         direct_copy_selectors=[
             '[data-message-author-role="assistant"]:last-of-type button[aria-label*="copy" i]:not([aria-label*="code" i]):not([aria-label*="link" i])',
             '[data-message-author-role="assistant"]:last-of-type button[data-testid*="copy"]',
+            # Iframe-side: DR document toolbar at top of canvas
+            'button[aria-label="Copy" i]',
+            'button[title="Copy" i]',
         ],
         min_chars=500,
     )
@@ -15429,7 +15531,13 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     # Tier 2 (FALLBACK): HTML→MD from the canvas DOM. Drift-vulnerable
     # but cheap. Was the primary path pre-2026-05-12; demoted to Tier 2
     # after Copy hijack proved drift-tolerant + Wayland-safe.
-    md = await _extract_html_to_md(page, [
+    # 2026-05-13: iframe-aware via `_extract_html_to_md_anyframe`. Inside
+    # the DR sandbox iframe the canvas root has no `canvas` class — the
+    # markdown body lives in `article` / `.markdown` / `.prose` containers
+    # the iframe renderer mounts directly. Adding those generic anchors
+    # (and falling through frames) means a same-origin scrape can succeed
+    # even when the iframe's class names diverge from chatgpt.com's own.
+    md = await _extract_html_to_md_anyframe(page, [
         '.canvas-content', '.artifact-content', '[data-testid="canvas-content"]',
         '[role="dialog"] .markdown', '[role="dialog"] .prose',
         '[role="dialog"] article',
@@ -15442,6 +15550,15 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         'aside[role="dialog"] [class*="prose"]',
         '[data-message-author-role="assistant"]:last-of-type .markdown',
         '[data-message-author-role="assistant"]:last-of-type [class*="prose"]',
+        # Iframe-side: DR document body markup. These selectors don't
+        # exist on chatgpt.com proper (the parent) so they only match
+        # when we descend into the DR sandbox frame.
+        'article',
+        '.markdown',
+        '.prose',
+        'main article',
+        'main .markdown',
+        'main .prose',
     ], label)
     if md and len(md) > 2000:
         if _is_sources_not_document(md, platform="chatgpt"):
@@ -15544,6 +15661,14 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # Copy buttons or share-dialog Copy links (ported scoping logic from
     # the deleted `_try_copy_button` helper — kept the dup-tab hardening
     # via scoping_excludes).
+    #
+    # 2026-05-13: bump wait_ms (5000 → 8000) and broaden selector list.
+    # Gemini's Copy button on the share-export menu sometimes copies via
+    # a deferred async path; pre-fix runs logged `no_capture` after
+    # successfully clicking the button. Longer window + extra DOM-target
+    # variants (kebab + share-export, aria-label="Copy" exact match) make
+    # Tier 1 land more consistently. HTML→MD Tier 2 already covers the
+    # residual `no_capture` cases so this is reliability-not-correctness.
     md = await _copy_via_hijack(
         page, label,
         direct_copy_selectors=[
@@ -15552,6 +15677,12 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             '.response-container button[aria-label*="copy" i]',
             'message-actions button[aria-label*="copy" i]',
             '[data-test-id*="copy"]',
+            # Exact-match + title-attr variants (Gemini sometimes renders
+            # aria-label="Copy" exactly, with no surrounding words)
+            'message-actions button[aria-label="Copy"]',
+            '.model-response-text button[aria-label="Copy"]',
+            'button[mattooltip*="copy" i]',
+            'button[mattooltip="Copy"]',
         ],
         scoping_excludes=[
             '[role="dialog"]',
@@ -15562,6 +15693,7 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             'nav',
             '[role="navigation"]',
         ],
+        wait_ms=8000,
         min_chars=100,
     )
     if md and len(md) >= 100:
@@ -15743,6 +15875,19 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             # the artifact-panel Copy button. Canonical markdown straight
             # from Claude's own copy pipeline, captured before it touches
             # the OS clipboard so Wayland's 0-char bug doesn't matter.
+            #
+            # 2026-05-13: broader selector set. The 2026-05-12 run logged
+            # every Claude hijack as `no_button_clicked` even though CUA
+            # then found a Copy button at (1102, 24) and clicked it
+            # successfully — meaning the button exists in the artifact
+            # panel's top toolbar but our `aria-label*="copy" i` filter
+            # didn't catch the exact aria-label/title Claude renders. The
+            # new list also covers `aria-label="Copy"` (exact, no
+            # substring match needed), `title="Copy"`, the document-icon
+            # variant, and a generic "first button in the artifact-panel
+            # top-right toolbar" CSS scope as a last resort. Excludes the
+            # share/publish dialog so the hijack doesn't misfire onto a
+            # "Copy link" button there.
             md = await _copy_via_hijack(
                 page, label,
                 direct_copy_selectors=[
@@ -15750,12 +15895,31 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                     '[class*="artifact-panel"] button[aria-label*="copy" i]',
                     '[class*="side-panel"] button[aria-label*="copy" i]',
                     'button[data-testid="copy-artifact"]',
+                    # Exact-match variants (some Claude builds render
+                    # aria-label="Copy" with no surrounding words)
+                    'aside button[aria-label="Copy"]',
+                    'aside button[title*="copy" i]',
+                    'aside button[title="Copy"]',
+                    # Document-icon / SVG-based artifact toolbars
+                    'aside button:has(svg[class*="copy" i])',
+                    'aside button:has(svg[class*="clipboard" i])',
+                    '[class*="artifact"] button:has(svg[class*="copy" i])',
+                    # Generic: any button in the artifact panel header
+                    # whose visible text is just "Copy" (rare but happens
+                    # on the icon+text variant)
+                    'aside header button',
+                    '[class*="artifact-panel"] header button',
                 ],
                 scoping_excludes=[
                     'pre code',
                     '[class*="code-block"]',
                     'nav',
                     '[role="navigation"]',
+                    # Don't grab Copy-link buttons inside the share dialog
+                    '[role="dialog"]',
+                    'mat-dialog-container',
+                    '[class*="dialog" i]',
+                    '[class*="modal" i]',
                 ],
                 min_chars=500,
             )
@@ -20996,8 +21160,39 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 log("No brief text available — cannot run Phase 2", "ERROR")
                 fail_phase(2, "No brief text available", "Phase 1 produced no brief; cannot run Phase 2.")
                 return
+            # 2026-05-13: defensive Firestore re-read of pipelineConfig.agents
+            # before deriving enabled_agents. User reported 2026-05-12 that a
+            # queued Run #2 with chatgpt+claude toggled off ran them anyway in
+            # the BE browser — the queue-doc config field must have lost the
+            # toggles between FE write and BE read. We can't fix the FE-side
+            # mystery from here, but the research doc's pipelineConfig.agents
+            # is the authoritative snapshot the FE persists at start time
+            # (usePipeline.ts:3509). Intersect agents_cfg with that snapshot
+            # so the BE honors whichever source says "skip" — most restrictive
+            # wins, no silent override of an explicit user toggle.
+            try:
+                if _firebase_db and _fb_uid and _fb_research_id:
+                    _rd_snap = _firebase_db.collection("users").document(_fb_uid) \
+                        .collection("researches").document(_fb_research_id).get()
+                    if _rd_snap.exists:
+                        _rd_data = _rd_snap.to_dict() or {}
+                        _pc_agents = ((_rd_data.get("pipelineConfig") or {}).get("agents") or {})
+                        if _pc_agents:
+                            _disk_cfg_str = {k: bool(v) for k, v in agents_cfg.items()}
+                            _fs_cfg_str = {k: bool(v) for k, v in _pc_agents.items()
+                                           if k in ("chatgpt", "claude", "gemini")}
+                            if _disk_cfg_str != _fs_cfg_str:
+                                log(f"[phase2-config-guard] disk agents_cfg={_disk_cfg_str} "
+                                    f"differs from Firestore pipelineConfig.agents={_fs_cfg_str} "
+                                    f"— taking intersection (skip wins)", "WARN")
+                            for _k, _on in _fs_cfg_str.items():
+                                if not _on and agents_cfg.get(_k, True):
+                                    agents_cfg[_k] = False
+            except Exception as _gerr:
+                log(f"[phase2-config-guard] Firestore re-read failed (non-fatal): {_gerr}", "WARN")
             enabled_agents = [a for a, on in agents_cfg.items() if on]
             disabled_agents = [a for a, on in agents_cfg.items() if not on]
+            log(f"[phase2] enabled_agents={enabled_agents} disabled_agents={disabled_agents}")
             # ── P2 verify gate (BE-2) ──
             # When init was skipped, re-verify each enabled agent's login +
             # Pro before P2 runs. Skip drops just that agent from
