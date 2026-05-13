@@ -13646,6 +13646,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         log(f"[{name}] DNS retry {_attempt} failed ({str(_re2)[:80]}); "
                             f"next attempt in {_next_delay}s "
                             f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})", "WARN")
+                        # DGOPS-7367 hardening (2026-05-13): emit
+                        # agent_progress so the FE 2-tier silence watchdog
+                        # + BE no-growth watchdog don't creep toward
+                        # "stalled" during the 480s attempt-3 wait. Without
+                        # this emit, a long backoff window looks identical
+                        # to a hung agent from the watchdog's POV.
+                        try:
+                            emit_event("agent_progress", phase=2,
+                                       agent=normalize_agent_key(name),
+                                       status="generating",
+                                       progress=f"Network blip — retrying in {_next_delay}s "
+                                                f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})",
+                                       elapsedSec=int(elapsed))
+                        except Exception:
+                            pass
                     else:
                         # Backoff exhausted OR non-transient error this time.
                         # Clear retry state; let the existing CUA-error-drop
@@ -13815,6 +13830,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         log(f"[Claude] transient network error during refresh "
                             f"({str(_re)[:80]}) — scheduling retry in "
                             f"{_DNS_BACKOFF_SECS[0]}s (attempt 1/{len(_DNS_BACKOFF_SECS)})", "WARN")
+                        # DGOPS-7367 hardening (2026-05-13): keep the
+                        # silence watchdogs satisfied during the initial
+                        # 30s wait + any future retry waits.
+                        try:
+                            emit_event("agent_progress", phase=2, agent="claude",
+                                       status="generating",
+                                       progress=f"Network blip during prophylaxis refresh — "
+                                                f"retrying in {_DNS_BACKOFF_SECS[0]}s "
+                                                f"(1/{len(_DNS_BACKOFF_SECS)})",
+                                       elapsedSec=int(elapsed))
+                        except Exception:
+                            pass
                     else:
                         log(f"[Claude] refresh failed (non-transient): {_re}", "WARN")
                         p["claude_refreshed_once"] = True
@@ -14607,6 +14634,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # Check completion — CUA-primary fallback (only if Playwright was
             # not confident within the MIN_WAIT + budget window). CUA checks
             # every 5 min per agent (cost-effective, actually works).
+            # DGOPS-7367 hardening (2026-05-13): skip CUA while a DNS retry
+            # is pending. Without this guard, CUA's 5-min check could fire
+            # at T+300 or T+600 during attempt-3's 480s backoff window and
+            # vote `is_done=True` against a chrome-error DOM (no stop button
+            # + no loading marker satisfies the "done" verdict). The
+            # is_error drop gate at L14730 only covers the `is_error`
+            # branch — a false-positive `is_done` would slip past and
+            # trigger the artifact-count nudge gate or hard-fail user-
+            # decision modal mid-recovery.
+            if p.get("dns_retry_at"):
+                continue
             if (time.time() - p.get("last_cua_check", 0)) < CUA_CHECK_INTERVAL:
                 # Not time for CUA check yet — skip this agent this cycle
                 continue
