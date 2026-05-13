@@ -10019,10 +10019,27 @@ async def _count_claude_artifacts(page):
                 'a[href*="/artifacts/"]',
                 'div[role="button"][class*="rounded"][class*="border"]',
             ];
+            // 2026-05-12: self-strip helper. Flow B attached .md/.pdf/.docx
+            // files render in Claude as preview cards with the same artifact-
+            // card DOM shape (rounded div role=button) — the ancestor-based
+            // attachment exclusion missed these when Claude didn't tag any
+            // parent with attachment/file/upload markers. Match on the
+            // element's own text + aria to catch them.
+            const _fileExtRe = /\\.(?:md|pdf|docx?|txt|csv|json|html?|rtf|odt|markdown)\\b/i;
+            const _looksLikeFile = (el) => {
+                const t = (el.textContent || '').trim().toLowerCase();
+                const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                if (_fileExtRe.test(t) || _fileExtRe.test(a)) return true;
+                if (/^(open|view)\\s+(?:file|attachment|document)\\b/i.test(a)) return true;
+                return false;
+            };
             const isUserOrAttachment = (el) => !!el.closest(
                 '[data-testid="user-message"], [data-message-author-role="user"], ' +
-                '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i]'
-            );
+                '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i], ' +
+                '[class*="upload" i], [data-testid*="upload"], ' +
+                '[class*="file-preview" i], [class*="file-card" i], ' +
+                '[aria-label*="attachment" i], [aria-label*="file " i]'
+            ) || _looksLikeFile(el);
             const isInAssistant = (el) => !!el.closest('.font-claude-message');
             let total = 0;
             // Pass 1: prefer matches inside assistant message scope.
@@ -10086,10 +10103,24 @@ async def _click_claude_artifact(page, index=0):
                 'a[href*="/artifacts/"]',
                 'div[role="button"][class*="rounded"][class*="border"]',
             ];
+            // 2026-05-12: self-strip helper for Flow B attached files.
+            // See _count_claude_artifacts for full rationale. f-string
+            // braces doubled (`{{`/`}}`) per the surrounding pattern.
+            const _fileExtRe = /\\.(?:md|pdf|docx?|txt|csv|json|html?|rtf|odt|markdown)\\b/i;
+            const _looksLikeFile = (el) => {{
+                const t = (el.textContent || '').trim().toLowerCase();
+                const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                if (_fileExtRe.test(t) || _fileExtRe.test(a)) return true;
+                if (/^(open|view)\\s+(?:file|attachment|document)\\b/i.test(a)) return true;
+                return false;
+            }};
             const isUserOrAttachment = (el) => !!el.closest(
                 '[data-testid="user-message"], [data-message-author-role="user"], ' +
-                '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i]'
-            );
+                '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i], ' +
+                '[class*="upload" i], [data-testid*="upload"], ' +
+                '[class*="file-preview" i], [class*="file-card" i], ' +
+                '[aria-label*="attachment" i], [aria-label*="file " i]'
+            ) || _looksLikeFile(el);
             const isInAssistant = (el) => !!el.closest('.font-claude-message');
             let cards = [];
             // Pass 1: prefer matches inside assistant message scope.
@@ -20794,7 +20825,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # last volatile per-agent status (e.g. "submitting"), which
                 # never matches the green-tick gate.
                 _write_phase_terminal_status(1, "skipped")
-                _write_agent_terminal_status("chatgpt", "skipped")
+                # 2026-05-12: REMOVED `_write_agent_terminal_status("chatgpt", "skipped")` —
+                # the `chatgpt` agent slot is shared between P1 (brief) and
+                # P2 (deep research). Writing P1's status there made the
+                # in-chat ChatGPT P2 config icon show a green/skipped badge
+                # before P2 ChatGPT had run. P1's status is fully captured by
+                # phases[1].status (read by the Brief icon, which has no
+                # `agent` field). P2 ChatGPT writes its own agents.chatgpt
+                # at P2 finalize (research.py:12716).
             elif _brief_from_file:
                 # Phase 1 bypassed via --brief-file (or frontend briefText).
                 # Persist to disk + Firestore. The user supplied the text;
@@ -20815,9 +20853,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     durationSec=int(time.time() - _p1_start), links=_p1_links,
                     summary=f"Research brief loaded from file ({brief_artifact.chars} chars)")
                 _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
-                # Tile/Icon Consistency — see _p1_skipped_after_error branch above.
                 _write_phase_terminal_status(1, "complete")
-                _write_agent_terminal_status("chatgpt", "complete")
+                # 2026-05-12: REMOVED `_write_agent_terminal_status("chatgpt", "complete")` —
+                # the chatgpt slot is shared with P2 deep research; writing
+                # P1's status there made the P2 ChatGPT config icon show
+                # green ✓ before P2 finished. See _p1_skipped_after_error
+                # branch above for the full rationale.
             else:
                 _brief_md = f"# Research Brief\n\n{brief_text}"
                 (queue_dir / "documents" / "brief.md").write_text(_brief_md, encoding="utf-8")
@@ -20848,9 +20889,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     links=_p1_links,
                     summary=f"Research brief generated ({brief_artifact.chars} chars, {len(brief_artifact.sections)} sections)")
                 _update_firestore_research({"phase": 1, "status": "ongoing", "links.phase1": _p1_links})
-                # Tile/Icon Consistency — see _p1_skipped_after_error branch above.
                 _write_phase_terminal_status(1, "complete")
-                _write_agent_terminal_status("chatgpt", "complete")
+                # 2026-05-12: REMOVED `_write_agent_terminal_status("chatgpt", "complete")` —
+                # see _p1_skipped_after_error branch above for rationale
+                # (chatgpt slot is shared with P2).
                 # 2026-04-25: P1 secondary "View on ChatGPT" link removed.
                 # The in-app /documents?open=…:brief primary is the only link
                 # surfaced to the FE. The conversation URL (brief_url, captured
@@ -20909,13 +20951,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         emit_event("phase_complete", phase=1,
                                    summary=f"Brief regenerated with user input ({len(brief_text)} chars)",
                                    links=[{"label": "ChatGPT Brief", "url": brief_url}] if brief_url else [])
-                        # Tile/Icon Consistency — see _p1_skipped_after_error
-                        # branch above. Resume-with-input regen still needs the
-                        # terminal write because the original P1 write (if any)
-                        # was for the pre-pause attempt; the regen produces a
-                        # fresh ChatGPT session whose completion must persist.
+                        # Resume-with-input regen still needs the terminal
+                        # phase write because the original P1 write (if any)
+                        # was for the pre-pause attempt.
                         _write_phase_terminal_status(1, "complete")
-                        _write_agent_terminal_status("chatgpt", "complete")
+                        # 2026-05-12: REMOVED `_write_agent_terminal_status("chatgpt", "complete")` —
+                        # chatgpt slot conflict with P2 (see other P1 branches).
             if _controls.is_stop():
                 return
 
