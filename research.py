@@ -10056,7 +10056,14 @@ async def _count_claude_artifacts(page):
                 'button[aria-label*="Open the artifact"]',
                 'button[aria-label*="research"]',
                 'a[href*="/artifacts/"]',
-                'div[role="button"][class*="rounded"][class*="border"]',
+                // 2026-05-13: dropped `div[role="button"][class*="rounded"][class*="border"]`
+                // from both _count_claude_artifacts and _click_claude_artifact —
+                // matched chat-row context-menu triggers in Run 1 (image:
+                // Star/Rename/Add to project/Delete popup) and grabbed the
+                // wrong target. The remaining selectors cover every artifact-
+                // card variant we have logs for; this fallback was a
+                // 2026-04-26 belt-and-suspenders that turned into a misclick
+                // magnet. Must drop from BOTH locations so count + click agree.
             ];
             // 2026-05-12: self-strip helper. Flow B attached .md/.pdf/.docx
             // files render in Claude as preview cards with the same artifact-
@@ -10140,7 +10147,14 @@ async def _click_claude_artifact(page, index=0):
                 'button[aria-label*="Open the artifact"]',
                 'button[aria-label*="research"]',
                 'a[href*="/artifacts/"]',
-                'div[role="button"][class*="rounded"][class*="border"]',
+                // 2026-05-13: dropped `div[role="button"][class*="rounded"][class*="border"]`
+                // from both _count_claude_artifacts and _click_claude_artifact —
+                // matched chat-row context-menu triggers in Run 1 (image:
+                // Star/Rename/Add to project/Delete popup) and grabbed the
+                // wrong target. The remaining selectors cover every artifact-
+                // card variant we have logs for; this fallback was a
+                // 2026-04-26 belt-and-suspenders that turned into a misclick
+                // magnet. Must drop from BOTH locations so count + click agree.
             ];
             // 2026-05-12: self-strip helper for Flow B attached files.
             // See _count_claude_artifacts for full rationale. f-string
@@ -10256,14 +10270,23 @@ _CLAUDE_PANEL_SELECTORS_JS = """[
     '[data-testid="artifact-content"]',
     '.artifact-content',
     '.artifact-panel .contents',
-    'aside .prose', 'aside .markdown',
+    // 2026-05-13: dropped `aside .prose`, `aside .markdown`,
+    // `aside [contenteditable="true"]`, `aside .tiptap`,
+    // `aside article`, `aside main` — bare-`aside` prefixes matched the
+    // LEFT navigation <aside> on claude.ai (Run 1 returned 5906 chars of
+    // "New chat / Search / Chats / Projects / Recents" nav text). The
+    // artifact panel uses [class*="artifact-panel"] / similar markers, NOT
+    // <aside>. Right-pane positioning is enforced at the panel-candidate
+    // gate below; here we just list the artifact-class-anchored selectors.
+    '[class*="artifact-panel"] .prose',
+    '[class*="artifact-panel"] .markdown',
+    '[class*="artifact-panel"] [contenteditable="true"]',
+    '[class*="artifact-panel"] .tiptap',
+    '[class*="artifact-panel"] article',
+    '[class*="artifact-panel"] main',
     '[class*="artifact-panel"] [class*="content"]',
     '[class*="artifact"] .ProseMirror',
     '[class*="artifact"] [class*="rendered"]',
-    'aside [contenteditable="true"]',
-    'aside .tiptap',
-    'aside article',
-    'aside main',
     '.markdown-body',
     '.prose-message',
     // iframe-side (when target is a Claude artifact frame): the
@@ -10298,18 +10321,56 @@ async def _read_claude_artifact_panel(page):
     targets = _claude_artifact_frame_targets(page)
     panel_selectors_arg = _CLAUDE_PANEL_SELECTORS_JS
 
+    # 2026-05-13: shared right-pane position-gated panel finder. Run 1
+    # had this function return 5906 chars of LEFT-nav text because the
+    # old fallback `aside, [class*="side-panel"], [class*="right-panel"]`
+    # matched claude.ai's navigation <aside>. The replacement requires
+    # (a) wider than 400px, (b) right edge past viewport-center, (c)
+    # innerText doesn't look like nav chrome (no "New chat / Recents /
+    # Topic Generator" markers in the first 500 chars).
+    _PANEL_GATE_JS = r"""
+        const NAV_MARKERS = /\b(new chat|recents?|projects|search|topic generator|starred|home|chats?\b)\b/i;
+        const _vw = window.innerWidth || document.documentElement.clientWidth;
+        const _candidates = Array.from(document.querySelectorAll(
+            '[class*="artifact-panel"], ' +
+            '[data-testid*="artifact-panel"], ' +
+            '[role="complementary"][class*="artifact" i], ' +
+            '[class*="right-panel"][class*="artifact" i], ' +
+            '[class*="side-panel"][class*="artifact" i], ' +
+            'div[class*="artifact"][class*="open" i]'
+        ));
+        function _isLikelyPanel(el) {
+            const r = el.getBoundingClientRect();
+            if (r.width < 400) return false;
+            if (r.right < _vw * 0.5) return false;
+            const head = (el.innerText || '').slice(0, 500);
+            if (NAV_MARKERS.test(head)) {
+                let _matches = 0;
+                const re = new RegExp(NAV_MARKERS.source, 'gi');
+                while (re.exec(head) !== null) _matches++;
+                if (_matches >= 2) return false;
+            }
+            return true;
+        }
+    """
+
     async def _try_html(target):
         try:
             return await target.evaluate(f"""() => {{
+                {_PANEL_GATE_JS}
                 const panelSelectors = {panel_selectors_arg};
                 for (const sel of panelSelectors) {{
                     let el;
                     try {{ el = document.querySelector(sel); }} catch (e) {{ continue; }}
                     if (el && el.innerText.length > 50) return el.innerHTML;
                 }}
-                const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
-                if (aside && aside.innerText.length > 200) return aside.innerHTML;
-                if (document.body && document.body.innerText.length > 200) return document.body.innerHTML;
+                // Right-pane-positioned fallback — only matches if a real
+                // artifact panel is on the right half of the viewport AND
+                // doesn't read like nav-chrome. Bare-`aside` fallback was
+                // removed 2026-05-13.
+                for (const el of _candidates) {{
+                    if (_isLikelyPanel(el) && el.innerText.length > 200) return el.innerHTML;
+                }}
                 return '';
             }}""")
         except Exception:
@@ -10318,15 +10379,16 @@ async def _read_claude_artifact_panel(page):
     async def _try_text(target):
         try:
             return await target.evaluate(f"""() => {{
+                {_PANEL_GATE_JS}
                 const panelSelectors = {panel_selectors_arg};
                 for (const sel of panelSelectors) {{
                     let el;
                     try {{ el = document.querySelector(sel); }} catch (e) {{ continue; }}
                     if (el && el.innerText.length > 50) return el.innerText;
                 }}
-                const aside = document.querySelector('aside, [class*="side-panel"], [class*="right-panel"]');
-                if (aside && aside.innerText.length > 200) return aside.innerText;
-                if (document.body && document.body.innerText.length > 200) return document.body.innerText;
+                for (const el of _candidates) {{
+                    if (_isLikelyPanel(el) && el.innerText.length > 200) return el.innerText;
+                }}
                 return '';
             }}""")
         except Exception:
@@ -10363,6 +10425,40 @@ async def _read_claude_artifact_panel(page):
     except Exception as e:
         log(f"Artifact panel read failed: {e}", "WARN")
         return ""
+
+
+def _looks_like_nav_sidebar(text: str) -> bool:
+    """Reject heuristic for extraction returning navigation-sidebar text
+    (e.g. claude.ai's left nav: New chat / Search / Chats / Projects /
+    Recents / Topic Generator…). Run 1 (2026-05-12 chat_1778684431400_1)
+    had `_read_claude_artifact_panel` fall back to a bare-`<aside>`
+    selector that matched the left nav and returned 5906 chars of
+    `New chat\\nSearch\\nChats\\nProjects\\nRecents\\nTopic Generator…`
+    text — passed all downstream guards because it had no checklist /
+    sources / wrong-artifact markers. This guard catches that shape.
+
+    Heuristics (must trip ALL to be considered nav):
+      - >=3 distinct nav markers in the first 500 chars
+      - <3 prose paragraphs (lines >100 chars)
+      - Total length < 8000 chars
+    """
+    if not text:
+        return False
+    head = text[:500]
+    nav_markers_re = re.compile(
+        r'\b(new\s+chat|recents?|projects|search|topic\s+generator|starred|chats?\b)\b',
+        re.IGNORECASE,
+    )
+    nav_hits = set(m.group(0).lower() for m in nav_markers_re.finditer(head))
+    if len(nav_hits) < 3:
+        return False
+    # Count prose paragraphs in full body (lines or blocks of >100 chars).
+    long_lines = sum(1 for ln in text.split('\n') if len(ln.strip()) > 100)
+    if long_lines >= 3:
+        return False
+    if len(text) >= 8000:
+        return False
+    return True
 
 
 def _is_sources_not_document(text, *, platform="generic"):
@@ -15712,85 +15808,14 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     except Exception as _oe:
         log(f"[{label}] Post-completion artifact-open skipped: {_oe}", "DEBUG")
 
-    # Tier 1A (PRIMARY for P2, NEW 2026-05-12, DGOPS-7366): Copy button +
-    # clipboard event hijack. Click the canvas kebab → "Copy contents"
-    # while a JS hijack captures the markdown the page writes to
-    # navigator.clipboard. Bypasses the OS clipboard entirely — works on
-    # Wayland AND survives selector drift since the agent's own Copy
-    # button is the canonical-markdown emitter, not a class-name-dependent
-    # DOM scrape. min_chars=2000 mirrors the historical Method 1 gate so
-    # source-panel previews don't slip through.
+    # 2026-05-13 TIER SWAP: HTML→MD promoted from old Tier 2 to NEW Tier 1.
+    # Rationale: hijack has 0 successes across the entire backend.log
+    # (52k+ lines) while HTML→MD lands 30k+ chars consistently for
+    # ChatGPT canvas content. HTML→MD is also Wayland-safe (no OS
+    # clipboard) so the swap doesn't lose Wayland coverage. Hijack stays
+    # as Tier 2 to catch any future drift in HTML→MD selectors.
     #
-    # 2026-05-13: switched to `_copy_via_hijack_anyframe` so the hijack
-    # also runs inside the Deep Research sandbox iframe (where the actual
-    # Copy button + canvas live). Pre-fix, every hijack call landed on
-    # the parent document and logged `no_button_clicked` → Tier 3 (CUA)
-    # ran every time, which doesn't work on Wayland. Anyframe restores
-    # Tier 1 reliability.
-    md = await _copy_via_hijack_anyframe(
-        page, label,
-        canvas_root_selectors=[
-            '[class*="canvas"]',
-            '[data-testid*="canvas"]',
-            'main [role="region"]',
-            '[role="dialog"]',
-            # Inside the DR iframe the canvas root has no `canvas` class —
-            # match the markdown article/body containers used in the
-            # sandboxed renderer so the kebab walk has somewhere to scope.
-            'article',
-            'main',
-        ],
-        kebab_selectors=[
-            'button[aria-haspopup="menu"]',
-            'button[aria-label*="more" i]',
-            'button[data-testid*="more"]',
-            'button[aria-label*="menu" i]',
-            # DR sandbox renders the actions toolbar with icon-only
-            # buttons; pick up any 3-dot/kebab variant by SVG class too.
-            'button:has(svg[class*="ellipsis"])',
-            'button:has(svg[class*="dots"])',
-        ],
-        menuitem_text_pattern=r'copy(\s+contents?|\s+as\s+markdown|\s+text)?',
-        min_chars=2000,
-    )
-    if md and len(md) >= 2000 and not _is_sources_not_document(md, platform="chatgpt"):
-        log(f"[{label}] Extracted via Copy hijack (canvas → Copy contents): {len(md)} chars")
-        return md
-    if md and _is_sources_not_document(md, platform="chatgpt"):
-        log(f"[{label}] Copy hijack wrong-artifact ({len(md)} chars) — falling to Tier 2", "WARN")
-        try:
-            emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
-                       op="finalize_copy", length=len(md), tier="copy_hijack")
-        except Exception:
-            pass
-
-    # Tier 1B (NEW 2026-05-12): direct Copy button on the last assistant
-    # message. Serves P1 (brief, where there's no canvas → Tier 1A no-ops)
-    # AND P2 fallback when the kebab path didn't fire. Same hijack pattern.
-    md = await _copy_via_hijack_anyframe(
-        page, label,
-        direct_copy_selectors=[
-            '[data-message-author-role="assistant"]:last-of-type button[aria-label*="copy" i]:not([aria-label*="code" i]):not([aria-label*="link" i])',
-            '[data-message-author-role="assistant"]:last-of-type button[data-testid*="copy"]',
-            # Iframe-side: DR document toolbar at top of canvas
-            'button[aria-label="Copy" i]',
-            'button[title="Copy" i]',
-        ],
-        min_chars=500,
-    )
-    if md and len(md) >= 500 and not _is_sources_not_document(md, platform="chatgpt"):
-        log(f"[{label}] Extracted via Copy hijack (assistant-msg direct): {len(md)} chars")
-        return md
-
-    # Tier 2 (FALLBACK): HTML→MD from the canvas DOM. Drift-vulnerable
-    # but cheap. Was the primary path pre-2026-05-12; demoted to Tier 2
-    # after Copy hijack proved drift-tolerant + Wayland-safe.
-    # 2026-05-13: iframe-aware via `_extract_html_to_md_anyframe`. Inside
-    # the DR sandbox iframe the canvas root has no `canvas` class — the
-    # markdown body lives in `article` / `.markdown` / `.prose` containers
-    # the iframe renderer mounts directly. Adding those generic anchors
-    # (and falling through frames) means a same-origin scrape can succeed
-    # even when the iframe's class names diverge from chatgpt.com's own.
+    # Tier 1 (NEW PRIMARY): HTML→MD from canvas/artifact DOM (iframe-aware).
     md = await _extract_html_to_md_anyframe(page, [
         '.canvas-content', '.artifact-content', '[data-testid="canvas-content"]',
         '[role="dialog"] .markdown', '[role="dialog"] .prose',
@@ -15817,15 +15842,87 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     if md and len(md) > 2000:
         if _is_sources_not_document(md, platform="chatgpt"):
             log(f"[{label}] HTML→MD wrong-artifact ({len(md)} chars source-panel-shape) "
-                f"— skipping", "WARN")
+                f"— falling to Tier 2", "WARN")
             try:
                 emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
                            op="finalize_copy", length=len(md), tier="dom_html_md")
             except Exception:
                 pass
+        elif _looks_like_nav_sidebar(md):
+            log(f"[{label}] HTML→MD looks-like-nav-sidebar ({len(md)} chars) — falling to Tier 2", "WARN")
         else:
             log(f"[{label}] Extracted via HTML→MD (canvas/artifact): {len(md)} chars")
             return md
+
+    # Tier 2A: Copy button + clipboard event hijack via kebab/download
+    # icon → "Copy contents" menu (canvas-scoped). Drift-tolerant since
+    # the agent's own Copy button emits canonical markdown, not a class-
+    # name-dependent DOM scrape. Iframe-aware via _copy_via_hijack_anyframe
+    # (DR artifact lives in a cross-origin sandbox iframe).
+    #
+    # 2026-05-13: ChatGPT's iframe-side toolbar exposes Copy via a
+    # download-shaped icon button that opens a 4-item menu: Copy contents,
+    # Export to markdown, Export to Word, Export to PDF. Selectors target
+    # both the download/export icon variants and the legacy kebab variants.
+    md = await _copy_via_hijack_anyframe(
+        page, label,
+        canvas_root_selectors=[
+            '[class*="canvas"]',
+            '[data-testid*="canvas"]',
+            'main [role="region"]',
+            '[role="dialog"]',
+            'article',
+            'main',
+        ],
+        kebab_selectors=[
+            # Download / export icon (user-described "download-like button")
+            'button[aria-label*="export" i]',
+            'button[aria-label*="download" i]',
+            'button[aria-label*="save" i]',
+            'button[title*="export" i]',
+            'button[title*="download" i]',
+            'button:has(svg[class*="download" i])',
+            'button:has(svg[class*="export" i])',
+            'button:has(svg[class*="save" i])',
+            # Legacy 3-dot / kebab variants
+            'button[aria-haspopup="menu"]',
+            'button[aria-label*="more" i]',
+            'button[data-testid*="more"]',
+            'button[aria-label*="menu" i]',
+            'button:has(svg[class*="ellipsis"])',
+            'button:has(svg[class*="dots"])',
+        ],
+        menuitem_text_pattern=r'(copy\s+contents?|copy\s+as\s+markdown|copy\s+text|export\s+(to\s+)?markdown|download\s+(as\s+)?markdown)',
+        min_chars=2000,
+    )
+    if md and len(md) >= 2000 and not _is_sources_not_document(md, platform="chatgpt"):
+        log(f"[{label}] Extracted via Copy hijack (canvas → menu): {len(md)} chars")
+        return md
+    if md and _is_sources_not_document(md, platform="chatgpt"):
+        log(f"[{label}] Copy hijack wrong-artifact ({len(md)} chars) — falling to Tier 2B", "WARN")
+        try:
+            emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                       op="finalize_copy", length=len(md), tier="copy_hijack")
+        except Exception:
+            pass
+
+    # Tier 2B: direct Copy button on the last assistant message. Serves
+    # P1 (brief, where there's no canvas → Tier 2A no-ops) AND P2
+    # fallback when the kebab/download path didn't fire. Same hijack pattern.
+    md = await _copy_via_hijack_anyframe(
+        page, label,
+        direct_copy_selectors=[
+            '[data-message-author-role="assistant"]:last-of-type button[aria-label*="copy" i]:not([aria-label*="code" i]):not([aria-label*="link" i])',
+            '[data-message-author-role="assistant"]:last-of-type button[data-testid*="copy"]',
+            # Iframe-side: DR document toolbar at top of canvas
+            'button[aria-label="Copy" i]',
+            'button[title="Copy" i]',
+        ],
+        min_chars=500,
+    )
+    if md and len(md) >= 500 and not _is_sources_not_document(md, platform="chatgpt"):
+        log(f"[{label}] Extracted via Copy hijack (assistant-msg direct): {len(md)} chars")
+        return md
 
     # Tier 3 (LAST RESORT, Win/Mac/X11 only): CUA opens the artifact and
     # copies it to the OS clipboard. Gated off on Wayland — get_clipboard
@@ -15909,20 +16006,27 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
-    # Method 1: HTML → markdown from Gemini's response containers
-    # Tier 1 (PRIMARY, NEW 2026-05-12): Gemini's Copy button + hijack.
-    # Scoped to response containers so we don't misfire onto code-block
-    # Copy buttons or share-dialog Copy links (ported scoping logic from
-    # the deleted `_try_copy_button` helper — kept the dup-tab hardening
-    # via scoping_excludes).
+    # 2026-05-13 TIER SWAP: HTML→MD promoted from old Tier 2 to NEW Tier 1.
+    # HTML→MD has shipped 24k–47k chars consistently across many runs;
+    # hijack has 0 successes (`Copy hijack captured` never logged). Per
+    # user spec: ship the proven path first; hijack becomes Tier 2 fallback.
     #
-    # 2026-05-13: bump wait_ms (5000 → 8000) and broaden selector list.
-    # Gemini's Copy button on the share-export menu sometimes copies via
-    # a deferred async path; pre-fix runs logged `no_capture` after
-    # successfully clicking the button. Longer window + extra DOM-target
-    # variants (kebab + share-export, aria-label="Copy" exact match) make
-    # Tier 1 land more consistently. HTML→MD Tier 2 already covers the
-    # residual `no_capture` cases so this is reliability-not-correctness.
+    # Tier 1 (NEW PRIMARY): HTML→MD from Gemini's response containers.
+    md = await _extract_html_to_md(page, [
+        'message-content', '.model-response-text', '.response-container',
+    ], label)
+    if md and len(md) > 100:
+        if _is_sources_not_document(md, platform="generic"):
+            log(f"[{label}] HTML→MD wrong-artifact — falling to Tier 2", "WARN")
+        elif _looks_like_nav_sidebar(md):
+            log(f"[{label}] HTML→MD looks-like-nav-sidebar — falling to Tier 2", "WARN")
+        else:
+            log(f"[{label}] Extracted via HTML→MD: {len(md)} chars")
+            return md
+
+    # Tier 2A: Copy hijack via direct Copy buttons. Scoped to response
+    # containers so we don't misfire onto code-block Copy buttons or
+    # share-dialog Copy links.
     md = await _copy_via_hijack(
         page, label,
         direct_copy_selectors=[
@@ -15954,12 +16058,12 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         log(f"[{label}] Extracted via Copy hijack: {len(md)} chars")
         return md
 
-    # Tier 1B (NEW 2026-05-13): kebab → "Copy" menuitem fallback. Gemini
-    # uses Material CDK overlays — the share/export menu attaches to
-    # `cdk-overlay-container` outside the response scope, so the direct-
-    # selector list misses it. The kebab/menu-item path catches that
-    # surface. Same hijack semantics — captured before OS clipboard, so
-    # Wayland-safe.
+    # Tier 2B (Share & Export menu — user-marked path): Gemini's Copy
+    # action is nested inside a "Share & Export" dropdown in the
+    # response toolbar (image: 2026-05-13). Two-step interaction: click
+    # the Share-&-Export button, then click "Copy contents" menuitem.
+    # Selectors target aria-label/mattooltip variants for the parent
+    # button + a permissive menuitem regex that matches "Copy contents".
     md = await _copy_via_hijack(
         page, label,
         canvas_root_selectors=[
@@ -15969,14 +16073,25 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             'message-actions',
         ],
         kebab_selectors=[
+            # Share & Export button — aria-label / mattooltip / title variants
+            'message-actions button[aria-label*="share & export" i]',
+            'message-actions button[mattooltip*="share & export" i]',
+            'message-actions button[aria-label*="share and export" i]',
+            'message-actions button[aria-label*="share" i]',
+            'message-actions button[aria-label*="export" i]',
+            'message-actions button[mattooltip*="share" i]',
+            'message-actions button[mattooltip*="export" i]',
+            '.response-container button[aria-label*="share" i]',
+            '.response-container button[aria-label*="export" i]',
+            # SVG-icon hint (Material icon for share)
+            'message-actions button:has(mat-icon[fonticon*="share" i])',
+            'message-actions button:has(mat-icon[fonticon*="export" i])',
+            'message-actions button:has(mat-icon[fonticon*="ios_share" i])',
+            # Legacy "more options" kebab as ultimate fallback
             'message-actions button[aria-label*="more" i]',
-            'message-actions button[mattooltip*="more" i]',
             'message-actions button[aria-haspopup="menu"]',
-            'message-actions button[aria-label*="actions" i]',
-            'button[aria-label*="more options" i]',
-            'button[mattooltip*="more options" i]',
         ],
-        menuitem_text_pattern=r'copy(\s+(markdown|text|response|as\s+\w+|to\s+clipboard))?',
+        menuitem_text_pattern=r'copy(\s+(contents?|response|markdown|text|to\s+clipboard))?',
         scoping_excludes=[
             '[role="dialog"]',
             'mat-dialog-container',
@@ -15990,13 +16105,13 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         min_chars=100,
     )
     if md and len(md) >= 100:
-        log(f"[{label}] Extracted via Copy hijack (kebab → menuitem): {len(md)} chars")
+        log(f"[{label}] Extracted via Copy hijack (Share & Export → menuitem): {len(md)} chars")
         return md
 
-    # Tier 1C (NEW 2026-05-13): one more direct-selector pass against
-    # the Material CDK overlay surface, in case the share/export menu
-    # opens but no kebab existed (some Gemini builds wire the menu via
-    # right-click / share button directly).
+    # Tier 2C: one more direct-selector pass against the Material CDK
+    # overlay surface, in case the share/export menu opens but the kebab
+    # path missed it (some Gemini builds wire the menu via right-click /
+    # share button directly).
     md = await _copy_via_hijack(
         page, label,
         direct_copy_selectors=[
@@ -16014,14 +16129,6 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     )
     if md and len(md) >= 100:
         log(f"[{label}] Extracted via Copy hijack (CDK overlay): {len(md)} chars")
-        return md
-
-    # Tier 2 (FALLBACK): HTML→MD from Gemini's response containers.
-    md = await _extract_html_to_md(page, [
-        'message-content', '.model-response-text', '.response-container',
-    ], label)
-    if md and len(md) > 100:
-        log(f"[{label}] Extracted via HTML→MD: {len(md)} chars")
         return md
 
     # Tier 3 (LAST RESORT, Win/Mac/X11 only): select-all + OS clipboard.
@@ -16131,9 +16238,29 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
     # "All extraction methods failed". Instead, read the last assistant
     # message via a tight selector list scoped to chat-turn content.
     if chat_mode:
-        # Tier 1 (NEW 2026-05-12): Copy hijack on the last assistant message
-        # Copy button. Same canonical-markdown advantages as the artifact
-        # path, just scoped to chat-mode assistant message.
+        # 2026-05-13 TIER SWAP (chat-mode branch): HTML→MD promoted to
+        # Tier 1; Copy hijack demoted to Tier 2. Hijack-first never
+        # succeeded in any prior log; HTML→MD is the proven path.
+        #
+        # Tier 1 (NEW PRIMARY): HTML→MD scoped to chat-turn content.
+        try:
+            md_chat = await _extract_html_to_md(page, [
+                '[data-message-author-role="assistant"]:last-of-type .markdown',
+                '[data-test-render-count] .font-claude-message:last-of-type',
+                '.font-claude-message:last-of-type',
+                'div[data-streamed]:last-of-type .markdown',
+                'div[data-is-streaming="false"]:last-of-type .markdown',
+            ], label)
+            if md_chat and len(md_chat) > 100:
+                if _looks_like_nav_sidebar(md_chat):
+                    log(f"[{label}] chat-mode HTML→MD looks-like-nav-sidebar — falling to Tier 2", "WARN")
+                else:
+                    log(f"[{label}] Extracted via chat-mode HTML→MD: {len(md_chat)} chars")
+                    return md_chat
+        except Exception as _e:
+            log(f"[{label}] chat-mode HTML→MD failed: {_e}", "WARN")
+
+        # Tier 2 (FALLBACK): Copy hijack on the last assistant message Copy button.
         md_chat = await _copy_via_hijack(
             page, label,
             direct_copy_selectors=[
@@ -16146,20 +16273,6 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         if md_chat and len(md_chat) >= 100:
             log(f"[{label}] Extracted via Copy hijack (chat-mode): {len(md_chat)} chars")
             return md_chat
-        # Tier 2 (FALLBACK): HTML→MD scoped to chat-turn content.
-        try:
-            md_chat = await _extract_html_to_md(page, [
-                '[data-message-author-role="assistant"]:last-of-type .markdown',
-                '[data-test-render-count] .font-claude-message:last-of-type',
-                '.font-claude-message:last-of-type',
-                'div[data-streamed]:last-of-type .markdown',
-                'div[data-is-streaming="false"]:last-of-type .markdown',
-            ], label)
-            if md_chat and len(md_chat) > 100:
-                log(f"[{label}] Extracted via chat-mode HTML→MD: {len(md_chat)} chars")
-                return md_chat
-        except Exception as _e:
-            log(f"[{label}] chat-mode HTML→MD failed: {_e}", "WARN")
         log(f"[{label}] Chat-mode extraction returned no readable content", "WARN")
         return ""
     # Research-mode path below (unchanged from pre-E2 — the artifact-aware ladder).
@@ -16187,111 +16300,22 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             except Exception:
                 await asyncio.sleep(1.5)
 
-            # Tier 1 (NEW 2026-05-12, DGOPS-7366): Copy button + hijack on
-            # the artifact-panel Copy button. Canonical markdown straight
-            # from Claude's own copy pipeline, captured before it touches
-            # the OS clipboard so Wayland's 0-char bug doesn't matter.
+            # 2026-05-13 TIER SWAP (research-mode branch): HTML→MD-paths
+            # promoted to Tier 1 + 2A. Hijack demoted to Tier 2B + 2C.
+            # Rationale: zero `Copy hijack captured` successes in any
+            # historical log across all 3 agents. HTML→MD via the smart
+            # `_read_claude_artifact_panel` (iframe-walk + nav-reject)
+            # plus the broader-selector `_extract_html_to_md` are the
+            # proven paths. Hijack stays as fallback to catch any future
+            # HTML→MD drift, but moved AFTER the proven paths.
             #
-            # 2026-05-13: broader selector set. The 2026-05-12 run logged
-            # every Claude hijack as `no_button_clicked` even though CUA
-            # then found a Copy button at (1102, 24) and clicked it
-            # successfully — meaning the button exists in the artifact
-            # panel's top toolbar but our `aria-label*="copy" i` filter
-            # didn't catch the exact aria-label/title Claude renders. The
-            # new list also covers `aria-label="Copy"` (exact, no
-            # substring match needed), `title="Copy"`, the document-icon
-            # variant, and a generic "first button in the artifact-panel
-            # top-right toolbar" CSS scope as a last resort. Excludes the
-            # share/publish dialog so the hijack doesn't misfire onto a
-            # "Copy link" button there.
-            # 2026-05-13: switched to `_copy_via_hijack_anyframe` and added
-            # a kebab/menuitem fallback. Some Claude builds tuck the Copy
-            # action behind a kebab in the artifact-panel toolbar (CUA was
-            # finding it at (1102, 24) in Run B). The anyframe wrapper also
-            # protects against the case where the artifact body mounts
-            # inside a same-host iframe (Claude has historically used both
-            # main-document and iframe variants for Document artifacts).
-            md = await _copy_via_hijack_anyframe(
-                page, label,
-                direct_copy_selectors=[
-                    'aside button[aria-label*="copy" i]',
-                    '[class*="artifact-panel"] button[aria-label*="copy" i]',
-                    '[class*="side-panel"] button[aria-label*="copy" i]',
-                    'button[data-testid="copy-artifact"]',
-                    # Exact-match variants (some Claude builds render
-                    # aria-label="Copy" with no surrounding words)
-                    'aside button[aria-label="Copy"]',
-                    'aside button[title*="copy" i]',
-                    'aside button[title="Copy"]',
-                    # Document-icon / SVG-based artifact toolbars
-                    'aside button:has(svg[class*="copy" i])',
-                    'aside button:has(svg[class*="clipboard" i])',
-                    '[class*="artifact"] button:has(svg[class*="copy" i])',
-                    # Generic: any button in the artifact panel header
-                    # whose visible text is just "Copy" (rare but happens
-                    # on the icon+text variant)
-                    'aside header button',
-                    '[class*="artifact-panel"] header button',
-                ],
-                scoping_excludes=[
-                    'pre code',
-                    '[class*="code-block"]',
-                    'nav',
-                    '[role="navigation"]',
-                    # Don't grab Copy-link buttons inside the share dialog
-                    '[role="dialog"]',
-                    'mat-dialog-container',
-                    '[class*="dialog" i]',
-                    '[class*="modal" i]',
-                ],
-                min_chars=500,
-            )
-
-            # Tier 1B (NEW 2026-05-13): kebab/more-menu fallback. When the
-            # direct Copy button isn't surfaced in the toolbar, Claude has
-            # historically tucked it behind a "more" / kebab menu. Same
-            # _copy_via_hijack_anyframe path so we still capture before the
-            # OS clipboard, keeping Wayland safety.
-            if not md or len(md) < 500:
-                md = await _copy_via_hijack_anyframe(
-                    page, label,
-                    canvas_root_selectors=[
-                        'aside',
-                        '[class*="artifact-panel"]',
-                        '[class*="side-panel"]',
-                    ],
-                    kebab_selectors=[
-                        'aside button[aria-haspopup="menu"]',
-                        'aside button[aria-label*="more" i]',
-                        'aside button[aria-label*="menu" i]',
-                        'aside button[aria-label*="actions" i]',
-                        'aside button:has(svg[class*="ellipsis"])',
-                        'aside button:has(svg[class*="dots"])',
-                        'aside button:has(svg[class*="more"])',
-                        '[class*="artifact-panel"] button[aria-haspopup="menu"]',
-                    ],
-                    menuitem_text_pattern=r'copy(\s+(contents?|as\s+markdown|text|document|response))?',
-                    min_chars=500,
-                )
-            if md and len(md) >= 500 and not _is_sources_not_document(md, platform="claude"):
-                log(f"[{label}] Extracted via Copy hijack (artifact panel): {len(md)} chars")
-                return md
-            if md and _is_sources_not_document(md, platform="claude"):
-                log(f"[{label}] Copy hijack wrong-artifact ({len(md)} chars) — falling to Tier 2", "WARN")
-                try:
-                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                               op="finalize_copy", length=len(md), tier="copy_hijack")
-                except Exception:
-                    pass
-
-            # Tier 2 (FALLBACK): DOM panel read. Today's proven primary —
-            # works reliably when the artifact panel is open. Kept as a
-            # safety net for the rare case the Copy button is hidden or
-            # the hijack misses the write.
+            # Tier 1 (NEW PRIMARY): smart panel reader — iframe-walk +
+            # retry + nav-shape reject. Reads from artifact-panel-scoped
+            # selectors only (no bare `aside` fallback as of 2026-05-13).
             panel_text = await _read_claude_artifact_panel(page)
             if panel_text and len(panel_text) > 500:
                 if _is_sources_not_document(panel_text, platform="claude"):
-                    log(f"[{label}] DOM panel wrong-artifact "
+                    log(f"[{label}] T1 panel wrong-artifact "
                         f"(checklist, {len(panel_text)} chars) — fall through", "WARN")
                     try:
                         emit_event("wrong_artifact_rejected", phase=2, agent="claude",
@@ -16304,35 +16328,120 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                         await asyncio.sleep(0.5)
                     except Exception:
                         pass
+                elif _looks_like_nav_sidebar(panel_text):
+                    log(f"[{label}] T1 panel looks-like-nav-sidebar "
+                        f"({len(panel_text)} chars) — fall through", "WARN")
                 else:
                     log(f"[{label}] Extracted via DOM artifact panel ({target_idx}): "
                         f"{len(panel_text)} chars")
                     return panel_text
 
-    # Tier 3 (EXTRA FALLBACK, per user request 2026-05-12): HTML→MD —
-    # artifact-panel scoped. Cheap defense-in-depth before CUA. Was
-    # Tier 3 historically; kept here as belt-and-suspenders since the
-    # method is known to work.
-    md = await _extract_html_to_md(page, [
-        '[data-testid="artifact-content"]',
-        '.artifact-content',
-        '.artifact-panel .contents',
-        'aside .markdown',
-        'aside .prose',
-        '[class*="artifact-panel"] [class*="content"]',
-        '[class*="artifact"] .ProseMirror',
-        '[class*="artifact"] [class*="rendered"]',
-    ], label)
-    if md and len(md) > 100:
-        if _is_sources_not_document(md, platform="claude"):
-            log(f"[{label}] HTML→MD wrong-artifact ({len(md)} chars) — skipping", "WARN")
-            try:
-                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                           op="finalize_copy", length=len(md), tier="dom_html_md")
-            except Exception:
-                pass
-        else:
-            return md
+            # Tier 2A: broader HTML→MD with artifact-anchored selectors.
+            # Same proven primitive, wider selector list as belt-and-
+            # suspenders against drift in the smart panel reader.
+            md = await _extract_html_to_md(page, [
+                '[data-testid="artifact-content"]',
+                '.artifact-content',
+                '.artifact-panel .contents',
+                # 2026-05-13: dropped bare `aside .markdown` / `aside .prose`
+                # — matched left-nav `<aside>` in Run 1 returning 5906
+                # chars of nav text. Use artifact-class-anchored variants
+                # only.
+                '[class*="artifact-panel"] .markdown',
+                '[class*="artifact-panel"] .prose',
+                '[class*="artifact-panel"] [class*="content"]',
+                '[class*="artifact"] .ProseMirror',
+                '[class*="artifact"] [class*="rendered"]',
+            ], label)
+            if md and len(md) > 100:
+                if _is_sources_not_document(md, platform="claude"):
+                    log(f"[{label}] T2A HTML→MD wrong-artifact ({len(md)} chars) — falling to T2B", "WARN")
+                    try:
+                        emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                                   op="finalize_copy", length=len(md), tier="dom_html_md")
+                    except Exception:
+                        pass
+                elif _looks_like_nav_sidebar(md):
+                    log(f"[{label}] T2A HTML→MD looks-like-nav-sidebar ({len(md)} chars) — falling to T2B", "WARN")
+                else:
+                    log(f"[{label}] Extracted via T2A HTML→MD: {len(md)} chars")
+                    return md
+
+            # Tier 2B: Copy hijack via direct Copy button. Broadened
+            # scoping per user-marked image (Copy button beside Publish
+            # in the artifact-panel header). Dropped bare `aside button…`
+            # selectors — Claude's artifact panel is NOT inside `<aside>`
+            # in modern DOM; the left nav is. Scoped to artifact-panel
+            # markers + dialog/share excludes.
+            md = await _copy_via_hijack_anyframe(
+                page, label,
+                direct_copy_selectors=[
+                    '[class*="artifact-panel"] button[aria-label="Copy"]',
+                    '[class*="artifact-panel"] button[aria-label*="copy" i]:not([aria-label*="link" i]):not([aria-label*="code" i])',
+                    '[class*="artifact-panel"] button[title="Copy"]',
+                    '[class*="artifact-panel"] button[title*="copy" i]',
+                    '[class*="side-panel"] button[aria-label*="copy" i]',
+                    '[class*="right-panel"] button[aria-label*="copy" i]',
+                    'button[data-testid="copy-artifact"]',
+                    'button[data-testid="artifact-copy"]',
+                    'button[data-testid*="copy" i][data-testid*="artifact" i]',
+                    # SVG-icon hints (clipboard/copy icons in panel toolbar)
+                    '[class*="artifact"] button:has(svg[class*="clipboard" i])',
+                    '[class*="artifact"] button:has(svg[class*="copy" i])',
+                    # Position-gated last resort: any header button in the
+                    # artifact panel's top toolbar region.
+                    '[class*="artifact-panel"] header button',
+                    '[class*="artifact-panel"] [class*="header"] button',
+                    '[class*="artifact-panel"] [class*="toolbar"] button',
+                ],
+                scoping_excludes=[
+                    'pre code',
+                    '[class*="code-block"]',
+                    'nav',
+                    '[role="navigation"]',
+                    # Don't grab Copy-link buttons inside dialogs / share
+                    '[role="dialog"]',
+                    'mat-dialog-container',
+                    '[class*="dialog" i]',
+                    '[class*="modal" i]',
+                    '[class*="publish" i]',
+                    '[class*="share" i] [class*="dialog" i]',
+                ],
+                min_chars=500,
+            )
+
+            # Tier 2C: kebab/more-menu fallback when Copy button is tucked
+            # behind a "more" menu instead of in the header toolbar.
+            if not md or len(md) < 500:
+                md = await _copy_via_hijack_anyframe(
+                    page, label,
+                    canvas_root_selectors=[
+                        '[class*="artifact-panel"]',
+                        '[class*="side-panel"]',
+                        '[class*="right-panel"]',
+                    ],
+                    kebab_selectors=[
+                        '[class*="artifact-panel"] button[aria-haspopup="menu"]',
+                        '[class*="artifact-panel"] button[aria-label*="more" i]',
+                        '[class*="artifact-panel"] button[aria-label*="menu" i]',
+                        '[class*="artifact-panel"] button[aria-label*="actions" i]',
+                        '[class*="artifact-panel"] button:has(svg[class*="ellipsis"])',
+                        '[class*="artifact-panel"] button:has(svg[class*="dots"])',
+                        '[class*="artifact-panel"] button:has(svg[class*="more"])',
+                    ],
+                    menuitem_text_pattern=r'copy(\s+(contents?|as\s+markdown|text|document|response))?',
+                    min_chars=500,
+                )
+            if md and len(md) >= 500 and not _is_sources_not_document(md, platform="claude"):
+                log(f"[{label}] Extracted via Copy hijack (artifact panel T2B/2C): {len(md)} chars")
+                return md
+            if md and _is_sources_not_document(md, platform="claude"):
+                log(f"[{label}] Copy hijack wrong-artifact ({len(md)} chars) — falling to Tier 3", "WARN")
+                try:
+                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                               op="finalize_copy", length=len(md), tier="copy_hijack")
+                except Exception:
+                    pass
 
     # Tier 4 (LAST RESORT, Win/Mac/X11 only): CUA opens the correct
     # artifact and copies it. Gated off on Wayland (get_clipboard
