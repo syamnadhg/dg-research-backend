@@ -489,6 +489,80 @@ Steps:
 
 # ── Phase 4: Audio Overview ───────────────────────────────────────────────────
 
+# 2026-05-13 (feature): podcast length is now configurable from the FE
+# Settings → Phase 3 segmented control. The prompt is constructed at runtime
+# so the literal Format/Length names inside the body match whatever the user
+# picked. Three variants:
+#   - "short"   → Format="Brief", no separate length step (~3–5 min)
+#   - "default" → Format="Deep Dive", Length="Default" (~10–15 min)
+#   - "long"    → Format="Deep Dive", Length="Longer" (~20–30 min, current)
+# The "short" variant solves the YouTube unverified-channel 15-min cap by
+# producing audio that always stays under the limit.
+
+_PROMPT_AUDIO_GENERATE_VARIANTS = {
+    "short": {"format": "Brief", "length": "Default",
+              "set_step_5": 'Set FORMAT = "Brief". Length is implied by the Brief format — do not look for a Length selector and do not skip Generate waiting on one.'},
+    "default": {"format": "Deep Dive", "length": "Default",
+                "set_step_5": 'Set FORMAT = "Deep Dive" and LENGTH = "Default" (the default length when the customize panel opens). Both must be confirmed visible before Generate.'},
+    "long": {"format": "Deep Dive", "length": "Long",
+             "set_step_5": 'Set FORMAT = "Deep Dive" and LENGTH = "Long". Both must be set explicitly — do not leave defaults.'},
+}
+
+
+def make_prompt_audio_generate(podcast_length: str = "long") -> str:
+    """Build PROMPT_AUDIO_GENERATE with the requested length variant.
+    Falls back to "long" for any unknown value so a misconfig can't break
+    audio generation entirely."""
+    v = _PROMPT_AUDIO_GENERATE_VARIANTS.get(podcast_length) or _PROMPT_AUDIO_GENERATE_VARIANTS["long"]
+    fmt = v["format"]
+    length = v["length"]
+    step5 = v["set_step_5"]
+    header = (
+        f'Your task: Generate EXACTLY ONE audio overview with FORMAT="{fmt}"'
+        + (f' and LENGTH="{length}"' if podcast_length != "short" else "")
+        + ". Anything else is a failure."
+    )
+    return SYSTEM_BASE + f"""
+
+{header}
+
+CRITICAL — NEVER CLICK THESE (any one of these creates an unwanted default audio):
+- The "Audio Overview" card body itself
+- The card's headline / title text
+- The card's thumbnail / play-icon area
+- Any "Generate" / "Create" button on the card BEFORE you've opened the customize panel
+- An existing audio entry that's already in the Studio panel (its play button, its row)
+
+You may ONLY click:
+- The gear / settings icon, "Customize" link, or three-dot menu on the Audio Overview card.
+- Inside the customize panel: the Format dropdown, the Length dropdown (if visible), and the final Generate button.
+
+Steps (do them in order, do not skip):
+
+1. Confirm all sources are checked in the Sources panel ("Select all" if present).
+
+2. SCAN the Studio panel and COUNT how many audio entries are visible right now.
+   - If the count is 0 → continue.
+   - If the count is ≥ 1 → say exactly: "abort: audio already present" and STOP. Do not click anything else.
+
+3. Find the Audio Overview card's gear / Customize / three-dot affordance and click ONLY that.
+   - If you cannot find a clear gear/Customize/three-dot control, say exactly: "abort: no customize affordance" and STOP. Do not click the card body as a fallback.
+
+4. WAIT for the customize panel to open. Confirm you can see a Format selector before any next click.
+   - If the panel doesn't open or the dropdown isn't visible, say exactly: "abort: customize did not open" and STOP.
+
+5. {step5}
+
+6. Click the Generate button inside the customize panel EXACTLY ONCE. Do not click it a second time, do not retry, do not click any other Generate-like button on the page.
+
+7. Say exactly: "generating" once a progress indicator appears for the new audio.
+
+If at any point you realize you've clicked the wrong thing and a default/unwanted audio has started generating, say exactly: "abort: misclick — default audio fired" and STOP. Do not try to click "stop" or "delete" — leave the page as-is and report."""
+
+
+# Backward-compat alias: existing imports of PROMPT_AUDIO_GENERATE keep the
+# previous "long" behavior. The Phase 3 audio call now uses
+# make_prompt_audio_generate(podcast_length) explicitly.
 PROMPT_AUDIO_GENERATE = SYSTEM_BASE + """
 
 Your task: Generate EXACTLY ONE audio overview with FORMAT="Deep Dive" and LENGTH="Long". Anything else is a failure.
