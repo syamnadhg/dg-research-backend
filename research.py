@@ -10427,6 +10427,80 @@ async def _read_claude_artifact_panel(page):
         return ""
 
 
+async def _extract_claude_via_published_page(page, browser, cua_client, label, verbose=False):
+    """Claude T2 (2026-05-13 enhancement): publish the artifact, open
+    the resulting claude.site URL in a new tab, HTML→MD scrape from the
+    clean full-page DOM, close the tab.
+
+    Why this beats every other in-chat path: the published page renders
+    JUST the report — no left-nav, no chat history, no artifact-panel
+    chrome, no iframe sandbox, no React component slots competing for
+    DOM space. Most drift-resistant scrape surface Claude offers.
+
+    Idempotency: publish_open_claude_artifact is idempotent for already-
+    published artifacts (clicking Publish on a published artifact just
+    retrieves the existing URL). The orchestrator's separate publish-
+    for-link-metadata call downstream stays safe — it'll find the
+    already-published state and return the same URL.
+
+    Failure modes (each falls through to ""):
+    - Publish path fails (CUA loop exhausted, no Publish button) →
+      no URL → tier skipped silently
+    - new_page() / goto() raises → tab cleanup in finally
+    - Scrape returns empty → falls through to Tier 3 (Copy hijack)
+
+    Returns markdown or "" on any failure. Caller decides whether to
+    accept it (length + junk gates).
+    """
+    if not browser:
+        return ""
+    try:
+        # Step 1: publish + grab the public URL. Reuses the existing
+        # helper so we don't duplicate publish DOM/CUA logic.
+        published_url = await publish_open_claude_artifact(
+            page, browser, cua_client, verbose=verbose,
+        )
+        if not published_url or "claude.site" not in published_url.lower():
+            log(f"[{label}] T2 publish didn't produce claude.site URL — fall through to Tier 3", "DEBUG")
+            return ""
+        log(f"[{label}] T2 published-page: navigating new tab to {published_url[:80]}")
+
+        # Step 2: open new tab, navigate, scrape. New tab keeps the
+        # main page state untouched so subsequent tiers (or the
+        # orchestrator's publish-for-link call) don't have to navigate
+        # back.
+        new_page = None
+        try:
+            new_page = await browser.context.new_page()
+            await new_page.goto(published_url, wait_until="domcontentloaded", timeout=20000)
+            # Claude's published page hydrates client-side — 2.5s settle.
+            await asyncio.sleep(2.5)
+            # Step 3: HTML→MD on the clean DOM. The published page mounts
+            # the report directly in <article> / <main> with no chrome,
+            # so the selector list is short and robust.
+            md = await _extract_html_to_md(new_page, [
+                'article',
+                'main article',
+                'main',
+                '[class*="artifact"] [class*="content"]',
+                '[class*="content"] article',
+                '.prose',
+                '.markdown',
+                'body main',
+                'body article',
+            ], label)
+            return md or ""
+        finally:
+            if new_page is not None:
+                try:
+                    await new_page.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        log(f"[{label}] T2 published-page extraction failed: {e}", "WARN")
+        return ""
+
+
 def _looks_like_nav_sidebar(text: str) -> bool:
     """Reject heuristic for extraction returning navigation-sidebar text
     (e.g. claude.ai's left nav: New chat / Search / Chats / Projects /
@@ -16336,9 +16410,46 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                         f"{len(panel_text)} chars")
                     return panel_text
 
-            # Tier 2A: broader HTML→MD with artifact-anchored selectors.
-            # Same proven primitive, wider selector list as belt-and-
-            # suspenders against drift in the smart panel reader.
+            # Tier 2 (2026-05-13): publish artifact + HTML→MD scrape on
+            # the resulting claude.site full-page. Per user direction —
+            # the published page renders the report on a clean DOM with
+            # zero chat/nav/iframe chrome, making it the most drift-
+            # resistant scrape surface after the in-chat smart reader.
+            # New tab keeps main-page state intact so subsequent tiers
+            # (and the orchestrator's downstream publish-for-link call)
+            # don't have to navigate back. Idempotent: subsequent publish
+            # finds the already-published artifact + returns same URL.
+            md_pub = await _extract_claude_via_published_page(
+                page, browser, cua_client, label, verbose=verbose,
+            )
+            _t2_accepted = False
+            if md_pub and len(md_pub) > 500:
+                if _is_sources_not_document(md_pub, platform="claude"):
+                    log(f"[{label}] T2 published-page wrong-artifact "
+                        f"({len(md_pub)} chars) — falling to Tier 3", "WARN")
+                elif _looks_like_nav_sidebar(md_pub):
+                    log(f"[{label}] T2 published-page looks-like-nav-sidebar "
+                        f"({len(md_pub)} chars) — falling to Tier 3", "WARN")
+                else:
+                    log(f"[{label}] Extracted via T2 published-page HTML→MD: {len(md_pub)} chars")
+                    return md_pub
+            # 2026-05-13 audit fix: if T2 fired but didn't return content,
+            # the publish-confirmation dialog may still be mounted on the
+            # main page (publish_open_claude_artifact opens it as a side
+            # effect). Dismiss with Escape + small settle before T3 scrapes,
+            # so dialog content doesn't bleed into the in-chat HTML→MD
+            # selectors. Best-effort; failures are silent.
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.4)
+            except Exception:
+                pass
+
+            # Tier 3 (was T2A): broader in-chat HTML→MD with artifact-
+            # anchored selectors. Same proven primitive, wider selector
+            # list as belt-and-suspenders against drift in the smart
+            # panel reader. Renamed from T2A to T3 after the new T2
+            # published-page fallback was inserted above.
             md = await _extract_html_to_md(page, [
                 '[data-testid="artifact-content"]',
                 '.artifact-content',
