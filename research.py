@@ -2175,8 +2175,51 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
             })
         return True
     except Exception as e:
-        log(f"Failed to sync {doc_type}.md to Firestore: {e}", "WARN")
+        # F5 (2026-05-13): include exception class + gRPC/HTTP status code
+        # so the next sync failure is diagnosable. google.api_core exceptions
+        # (DeadlineExceeded, ResourceExhausted, Unavailable, PermissionDenied,
+        # InvalidArgument…) carry .code (gRPC StatusCode). The bare {e} repr
+        # at the WARN log was hiding the category the operator needs to
+        # categorize transient-vs-persistent failure modes.
+        _code = getattr(e, "code", None)
+        _code_str = ""
+        if _code is not None:
+            _code_str = f" [code={getattr(_code, 'name', _code)}]"
+        log(f"Failed to sync {doc_type}.md to Firestore: "
+            f"{type(e).__name__}: {e}{_code_str}", "WARN")
         return False
+
+
+async def save_document_to_firestore_with_retry(
+    doc_type: str,
+    content: str,
+    name: str | None = None,
+    *,
+    label: str | None = None,
+    backoffs: tuple = (1.0, 4.0, 16.0),
+) -> bool:
+    """F5 (2026-05-13): retry-wrapped variant for the inline P2 agent sync
+    path. Absorbs transient Firestore blips (429 / Unavailable / network)
+    with exponential backoff. Returns True on first successful sync, False
+    after exhausting attempts.
+
+    `label` is the agent display name used in log lines (defaults to doc_type).
+    Caller is responsible for the agent_progress=failed emit on False return.
+    """
+    tag = label or doc_type
+    total = len(backoffs) + 1
+    for _attempt in range(total):
+        if save_document_to_firestore(doc_type, content, name):
+            return True
+        if _attempt < len(backoffs):
+            _sleep = backoffs[_attempt]
+            log(f"[{tag}] Firestore document sync attempt {_attempt + 1} failed — "
+                f"retrying in {_sleep:g}s", "WARN")
+            await asyncio.sleep(_sleep)
+        else:
+            log(f"[{tag}] Firestore document sync FAILED after {total} attempts — "
+                f"FE doc-reachable gate will not flip until next save attempt.", "ERROR")
+    return False
 
 
 def start_firestore_start_listener(job_queue, loop):
@@ -12959,16 +13002,20 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         except Exception as e:
             log(f"[{name}] Local MD save failed: {e}", "WARN")
         if local_saved:
-            for _attempt in range(2):
-                if save_document_to_firestore(agent_key, md_content, f"{name} Deep Research"):
-                    md_saved = True
-                    break
-                if _attempt == 0:
-                    log(f"[{name}] Firestore document sync attempt 1 failed — retrying in 2s", "WARN")
-                    await asyncio.sleep(2.0)
-                else:
-                    log(f"[{name}] Firestore document sync FAILED after retry — agent will be marked failed "
-                        f"(FE doc-reachable gate would never flip without the subcollection write).", "ERROR")
+            if _firebase_db and _fb_uid and _fb_research_id:
+                # F5 (2026-05-13): 4 attempts (1s/4s/16s backoff) replaces the
+                # prior 2-attempt/2s loop. Most transient Firestore blips
+                # (429 / Unavailable / network flap) resolve well inside 21s.
+                # Persistent failures (auth/quota/schema) still get caught and
+                # the agent flips to "errored" via the failed branch below.
+                md_saved = await save_document_to_firestore_with_retry(
+                    agent_key, md_content, f"{name} Deep Research", label=name)
+            else:
+                # Unpaired / local-only run — no Firestore configured, so the
+                # FE doc-reachable gate doesn't apply. Treat the local-disk
+                # save as authoritative success so downstream status="done"
+                # holds (preserves pre-F5 behaviour for headless runs).
+                md_saved = True
 
     # Conversation URL — captured NOW because the page may navigate during the
     # parallel share-link worker (Gemini's Share & Export modal can redirect).
@@ -13052,6 +13099,15 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                        progress=f"Content extraction failed — {_why} ({elapsed_sec}s)",
                        partialTextLen=max(int(n_chars), 0),
                        elapsedSec=int(elapsed_sec or 0))
+        except Exception:
+            pass
+        # F5 (2026-05-13): persist terminal "errored" on the root doc so
+        # post-reload tile/icon state shows the red badge instead of the
+        # last running snapshot. Mirrors fail_agent's behaviour at 7403.
+        # Idempotent with any user-initiated Retry path (retry writes
+        # "running"; subsequent success/failure overwrites this).
+        try:
+            _write_agent_terminal_status(agent_key, "errored")
         except Exception:
             pass
 
@@ -13250,12 +13306,20 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
         except Exception as _ufe:
             log(f"[{name}] Firestore link update failed (non-fatal): {_ufe}", "WARN")
 
+    # F5 (2026-05-13): status="done" now requires `md_saved=True`. Prior
+    # gate was `n_chars > 0` alone, which let Firestore-sync-failed agents
+    # report status="done" in the Phase 2 summary log while the FE
+    # doc-reachable gate sat unflipped (because the subcollection write
+    # never landed). Phase 2 finalize consumers (done_count, terminal-status
+    # backstop, _p2_links builder) all read this status — keeping them in
+    # sync with what the FE actually sees prevents the worst-of-both-worlds
+    # "log says done, FE says spinner" state inconsistency.
     return {
-        "status": "done" if n_chars > 0 else "failed",
+        "status": "done" if (n_chars > 0 and md_saved) else "failed",
         "text": text,
         "url": conversation_url,        # conversation URL — for resume reconnect
         "_in_app_url": _in_app_url,     # in-app /documents primary — FE link
-        "verified": (n_chars > 0),
+        "verified": (n_chars > 0 and md_saved),
         "page": page,
         "elapsed_sec": int(elapsed_sec or 0),
         "md_saved": md_saved,
@@ -21964,41 +22028,59 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # finished is BE-internal disk/Firestore mirroring of agent MDs;
             # the next BE run rebuilds them from results on resume, or P3
             # rebuilds the handoff via its own safety-net call.
+            # F5 (2026-05-13): three-way split (linked / errored / skipped)
+            # so Firestore-sync-failed agents don't get phantom "Read X report"
+            # links pointing at unreachable docs. Bucketing rules:
+            #   - has text AND verified (md_saved) → linked
+            #   - has text AND NOT verified         → errored (sync failed)
+            #   - no text                           → skipped (extraction failed)
+            # Linked is the only bucket that surfaces a link button on the FE.
             _p2_links: list[dict] = []
+            _p2_errored_agents: list[str] = []
             _p2_skipped_agents: list[str] = []
             for name, r in results.items():
                 in_app = r.get("_in_app_url") or ""
-                if in_app and r.get("text"):
+                if in_app and r.get("text") and r.get("verified"):
                     _p2_links.append({
                         "label": f"Read {name} report",
                         "url": in_app,
                         "verified": True,
                         "primary": True,
                     })
+                elif r.get("text"):
+                    # Extraction succeeded locally but Firestore sync failed —
+                    # red badge already drives the FE state via the failed
+                    # branch in extract_and_record_agent (agent_progress=failed
+                    # + _write_agent_terminal_status=errored).
+                    _p2_errored_agents.append(name)
                 else:
                     _p2_skipped_agents.append(name)
             done_count = sum(1 for r in results.values() if r["status"] == "done")
             total_chars = sum(len(r.get("text", "")) for r in results.values())
             log(f"[Phase 2] Built {len(_p2_links)} in-app primary links, "
-                f"{len(_p2_skipped_agents)} agents skipped (no MD)")
-            # ── C8: phase_complete invariant — every non-skipped enabled agent ──
-            # ── should have an in-app primary link entry. Missing entries mean ──
-            # ── MD save itself failed for that agent — surface loudly.          ──
+                f"{len(_p2_errored_agents)} errored (sync failed), "
+                f"{len(_p2_skipped_agents)} skipped (no MD)")
+            # ── C8: phase_complete invariant — every non-skipped non-errored ──
+            # ── enabled agent should have an in-app primary link entry.       ──
+            # ── Missing entries mean MD save itself failed mysteriously.      ──
             _linked_agents = set()
             for _l in _p2_links:
                 _lbl = _l.get("label") or ""
                 _parts = _lbl.split(" ")
                 if len(_parts) >= 2 and _parts[0] == "Read":
                     _linked_agents.add(_parts[1])
-            _expected_agents = set(results.keys()) - set(_p2_skipped_agents)
+            _expected_agents = (
+                set(results.keys()) - set(_p2_skipped_agents) - set(_p2_errored_agents)
+            )
             _missing_links = _expected_agents - _linked_agents
             if _missing_links:
                 log(f"[Phase 2] phase_complete invariant breach: {sorted(_missing_links)} "
-                    f"are non-skipped but have no in-app primary link. Emitting "
+                    f"have text + verified=True but no in-app primary link. Emitting "
                     f"phase_complete anyway — these agents will render as unlinked. "
-                    f"Investigate why MD save / in-app URL build skipped them.", "ERROR")
+                    f"Investigate the in-app URL build path.", "ERROR")
             emit_event("phase_complete", phase=2, durationSec=int(time.time() - _p2_start), links=_p2_links,
                 skippedAgents=_p2_skipped_agents,
+                erroredAgents=_p2_errored_agents,
                 summary=f"{done_count}/{len(results)} agents completed — {total_chars:,} chars — "
                         f"{len(_p2_links)} in-app primary links")
             _update_firestore_research({"phase": 2, "links.phase2": _p2_links})
