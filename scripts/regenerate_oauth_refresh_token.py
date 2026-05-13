@@ -1,39 +1,54 @@
-"""One-shot helper to regenerate the Google OAuth refresh token used by the
-FE for Phase 4 (YouTube upload) and Phase 5 (Doc + email).
+"""One-shot helper to (re-)generate the Google OAuth refresh token used by
+the FE for Phase 4 (YouTube upload) and Phase 5 (Google Doc + Drive +
+email).
 
-Background:
-    The FE's `/api/uploadYouTube` and `/api/createDoc` routes authenticate as
-    a Workspace user (the project owner) via an OAuth refresh token held in
-    Firebase App Hosting Secret Manager as `GOOGLE_OAUTH_REFRESH_TOKEN`.
+Two paths cover this script:
 
-    Before the 2026-05-10 P4 cutover the token only needed:
-        drive + documents
-    After the cutover it must also include:
-        youtube.upload
+1. **Per-user OAuth** — every signed-in user can plug in their own Google
+   credentials in the Super Research web app at Account → API Keys →
+   Google OAuth, so THEIR Docs / YouTube uploads land in their own
+   account. Run this script to generate the refresh token, then paste
+   the printed token into the Account page along with the matching
+   Client ID + Client Secret.
 
-    A refresh token cannot be "re-scoped" in place — you have to re-run
-    OAuth consent with the new combined scope set, then replace the secret.
+2. **Default fallback** (project owner only) — the shared OAuth identity
+   used when a user hasn't set their own. Held in Firebase App Hosting
+   Secret Manager as `GOOGLE_OAUTH_REFRESH_TOKEN`. Run this script with
+   the project owner's OAuth client, then update the secret via:
+       firebase apphosting:secrets:set GOOGLE_OAUTH_REFRESH_TOKEN
+
+The 7-day expiry problem (only personal-Gmail External + Testing-mode
+apps): re-run this script weekly to get a fresh token. Workspace
+Internal-user-type apps don't expire — no script run needed.
 
 Usage:
-    1. Make sure GOOGLE_OAUTH_CLIENT_ID + GOOGLE_OAUTH_CLIENT_SECRET are
-       available as env vars OR pass them via --client-id / --client-secret.
-    2. Run:
-           python scripts/regenerate_oauth_refresh_token.py
-    3. A browser tab opens for Google consent — sign in as the project owner
-       (sammy.guli@distributedglobal.com) and approve the three scopes.
-    4. The script prints the new refresh token. Copy it.
-    5. Update the App Hosting secret:
-           firebase apphosting:secrets:set GOOGLE_OAUTH_REFRESH_TOKEN
-       Paste the token at the prompt. App Hosting picks up the new version
-       on the next request to /api/uploadYouTube or /api/createDoc — no
-       redeploy needed.
+    # Interactive — prompts for Client ID + Client Secret:
+    python scripts/regenerate_oauth_refresh_token.py
+
+    # Non-interactive — flags or env vars:
+    python scripts/regenerate_oauth_refresh_token.py \\
+        --client-id "..." --client-secret "..."
+
+    GOOGLE_OAUTH_CLIENT_ID=... GOOGLE_OAUTH_CLIENT_SECRET=... \\
+        python scripts/regenerate_oauth_refresh_token.py
+
+Cloud Console prerequisites (one-time setup before first run):
+    1. Pick a project in the Google account whose Drive/YouTube you want
+       data to land in
+    2. Enable APIs: YouTube Data API v3, Google Drive API, Google Docs API
+    3. OAuth consent screen: External user type, add the 3 scopes below,
+       add yourself as a Test user
+    4. Create an OAuth client — type **Desktop app** (no redirect URI
+       config needed) OR **Web application** with redirect URI
+       `http://localhost:8765/`
+    5. Create a YouTube channel on the account (required for video upload)
 
 Why a local script vs the OAuth Playground:
-    - Uses YOUR OAuth client (same one App Hosting uses), so the refresh
-      token is bound to the right project + redirect URIs.
-    - Reproducible — re-run any time you need to rotate or add a scope.
+    - Reproducible: ~3 minutes to regen the token whenever it expires
+    - Uses YOUR OAuth client directly, no third-party hop
+    - Same script for both setup paths above
 
-Dependencies:
+Dependencies (auto-detected; install once if missing):
     pip install google-auth google-auth-oauthlib
 """
 
@@ -70,23 +85,26 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # Interactive fallback when neither flag nor env var supplies a value.
+    # Most users running this script will be following the in-app help modal,
+    # which doesn't ask them to set env vars first — prompt instead so the
+    # script "just works" on a fresh terminal.
+    if not args.client_id:
+        try:
+            args.client_id = input("Client ID: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.", file=sys.stderr)
+            return 1
+    if not args.client_secret:
+        try:
+            args.client_secret = input("Client Secret: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.", file=sys.stderr)
+            return 1
+
     if not args.client_id or not args.client_secret:
         print(
-            "ERROR: missing OAuth client credentials. Pass --client-id and "
-            "--client-secret, or set GOOGLE_OAUTH_CLIENT_ID + "
-            "GOOGLE_OAUTH_CLIENT_SECRET in your env first.",
-            file=sys.stderr,
-        )
-        print(
-            "\nTo fetch the existing values from App Hosting Secret Manager:",
-            file=sys.stderr,
-        )
-        print(
-            "    firebase apphosting:secrets:access GOOGLE_OAUTH_CLIENT_ID",
-            file=sys.stderr,
-        )
-        print(
-            "    firebase apphosting:secrets:access GOOGLE_OAUTH_CLIENT_SECRET",
+            "ERROR: Client ID and Client Secret are both required.",
             file=sys.stderr,
         )
         return 2
@@ -138,10 +156,18 @@ def main() -> int:
     print("=" * 70)
     print(creds.refresh_token)
     print("=" * 70)
-    print("\nNext step — update App Hosting Secret Manager:")
-    print("    firebase apphosting:secrets:set GOOGLE_OAUTH_REFRESH_TOKEN")
-    print("Paste the token above when prompted. App Hosting picks up the new")
-    print("version on the next /api/uploadYouTube or /api/createDoc call.")
+    print("\nNext step — pick whichever path applies:")
+    print()
+    print("  A. Per-user OAuth (most users)")
+    print("     Open Super Research → Account → API Keys → Google OAuth.")
+    print("     Paste Client ID, Client Secret, and the Refresh Token above.")
+    print("     Click 'Save (validate + store)'.")
+    print()
+    print("  B. Default fallback (project owner only)")
+    print("     firebase apphosting:secrets:set GOOGLE_OAUTH_REFRESH_TOKEN")
+    print("     Paste the token above when prompted. Cloud Run picks up the")
+    print("     new version on the next /api/uploadYouTube or /api/createDoc")
+    print("     call — no redeploy needed.")
     print()
     print("Granted scopes:")
     for s in SCOPES:

@@ -503,6 +503,70 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 | `DG_VISION_NARRATE` | `0` | Re-enable the retired vision narrator (`narrate.py`, `PHASE_BUDGET=80/phase`). Set `1` if a coverage gap appears in DOM-derived narration. |
 | `DG_ORPHAN_MAX_AGE_HOURS` | `4` | Cutoff age for `--retire`'s "manual one-off `--serve` runs" preservation. |
 
+## Google OAuth refresh-token regeneration (Docs / Drive / YouTube)
+
+The FE's Phase 4 (YouTube upload) and Phase 5 (Doc + Drive + email) routes
+authenticate against Google APIs via an OAuth refresh token. Two paths,
+same script:
+
+- **Per-user OAuth** — every signed-in web-app user can plug their own Google
+  credentials in Account → API Keys → Google OAuth so THEIR Docs and YouTube
+  uploads land in their own account. The walkthrough lives in-app (info
+  button next to the section title). The script below produces the refresh
+  token piece of that triple.
+- **Default fallback** (project owner only) — the shared identity used when
+  a user hasn't set their own. Held in Firebase App Hosting Secret Manager
+  as `GOOGLE_OAUTH_REFRESH_TOKEN`.
+
+### When to run
+
+- First-time setup for either path
+- Refresh token expired (every 7 days for External + Testing-mode OAuth
+  apps — Workspace Internal apps don't expire)
+- After rotating an OAuth client or adding a new scope
+
+### Cloud Console prerequisites (one-time per Google account)
+
+1. Pick a project in the Google account whose Drive/YouTube should hold
+   the data
+2. Enable APIs: YouTube Data API v3, Google Drive API, Google Docs API
+3. OAuth consent screen → External → app name + emails → add 3 scopes:
+   `https://www.googleapis.com/auth/drive`,
+   `https://www.googleapis.com/auth/documents`,
+   `https://www.googleapis.com/auth/youtube.upload` → add yourself as a
+   Test user
+4. Credentials → Create OAuth client ID → **Desktop app** type (recommended;
+   no redirect URI config needed) OR **Web application** with redirect URI
+   `http://localhost:8765/`
+5. Sign in to youtube.com as the same account and create a channel if one
+   doesn't exist (required for video upload)
+
+### Running the script
+
+```bash
+# Interactive — prompts for Client ID + Client Secret:
+python scripts/regenerate_oauth_refresh_token.py
+
+# Non-interactive — flags or env vars:
+python scripts/regenerate_oauth_refresh_token.py \
+    --client-id "..." --client-secret "..."
+```
+
+A browser tab opens for Google consent. After approving, the script prints
+the new Refresh Token. The script tells you exactly where to paste it
+(Account page for per-user, `firebase apphosting:secrets:set` for the
+default fallback).
+
+First run only: `pip install google-auth google-auth-oauthlib` if the
+script complains.
+
+### Why a script vs OAuth Playground
+
+Playground works but is browser-only and not reproducible. The script lives
+in the BE repo (which users already have for `--pair` / `--serve`), uses
+your own OAuth client directly, and runs in ~30 seconds — easy to re-run
+weekly when an External + Testing-mode token revokes.
+
 ## File Structure
 
 ```
