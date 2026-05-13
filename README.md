@@ -527,19 +527,61 @@ same script:
 
 ### Cloud Console prerequisites (one-time per Google account)
 
-1. Pick a project in the Google account whose Drive/YouTube should hold
-   the data
-2. Enable APIs: YouTube Data API v3, Google Drive API, Google Docs API
-3. OAuth consent screen → External → app name + emails → add 3 scopes:
-   `https://www.googleapis.com/auth/drive`,
-   `https://www.googleapis.com/auth/documents`,
-   `https://www.googleapis.com/auth/youtube.upload` → add yourself as a
-   Test user
-4. Credentials → Create OAuth client ID → **Desktop app** type (recommended;
-   no redirect URI config needed) OR **Web application** with redirect URI
-   `http://localhost:8765/`
-5. Sign in to youtube.com as the same account and create a channel if one
-   doesn't exist (required for video upload)
+The new Google Auth Platform UI splits the old "OAuth consent screen" into a
+sidebar with **Branding · Audience · Clients · Data Access · Verification
+Center · Settings**. This walkthrough covers the steps in that order — same
+content as the in-app help modal at FE Account → API Keys → Google OAuth.
+
+**1. Create a Cloud project.** Open
+[console.cloud.google.com](https://console.cloud.google.com) signed in as the
+Google account whose Drive/YouTube should hold the data. Top bar → project
+selector → **New Project** → name it anything (e.g. `sr-personal-oauth`).
+Wait for the new project to be selected in the top bar before continuing.
+
+**2. Enable 3 APIs.** Click each link below, then the blue **Enable** button:
+
+- https://console.cloud.google.com/apis/library/youtube.googleapis.com
+- https://console.cloud.google.com/apis/library/drive.googleapis.com
+- https://console.cloud.google.com/apis/library/docs.googleapis.com
+
+**3. Initial OAuth setup.** Open
+[Google Auth Platform overview](https://console.cloud.google.com/auth/overview)
+→ **Get Started**. Fill app name (`Super Research`), user support email, dev
+contact email. **User type = External**. Save. You land on the Auth Platform
+dashboard with the sidebar mentioned above.
+
+**4. Audience → add test user.** Sidebar → **Audience** (or direct:
+https://console.cloud.google.com/auth/audience). Verify *User type = External*
+and *Publishing status = Testing*. Test users section → **+ Add users** →
+enter the Gmail → **Save**.
+
+**5. Data Access → add 3 scopes.** Sidebar → **Data Access** (or direct:
+https://console.cloud.google.com/auth/scopes). Click **Add or remove scopes**
+(top of page). In the side panel that opens, scroll to **"Manually add
+scopes"** at the bottom. Paste exactly:
+
+```
+https://www.googleapis.com/auth/drive
+https://www.googleapis.com/auth/documents
+https://www.googleapis.com/auth/youtube.upload
+```
+
+Click **Add to table** below the text area → 3 rows appear in the top table
+→ **Update** (bottom of side panel) → **Save** (top of Data Access page).
+
+**6. Clients → create OAuth client.** Sidebar → **Clients** (or direct:
+https://console.cloud.google.com/auth/clients). Click **+ Create client**.
+**Application type = Desktop app** (recommended — no redirect URI config).
+*Alternative: Web application* with authorized redirect URI
+`http://localhost:8765/` (matches the script's `--port` default; only
+needed if your org disallows Desktop-app clients). Name: `Super Research
+Personal`. Create. Copy **Client ID** + **Client Secret** from the dialog.
+
+**7. YouTube channel.** Sign in to youtube.com as the same Google account.
+Avatar → "Create a channel" if missing. Then visit
+https://www.youtube.com/verify and phone-verify the channel (required for
+uploads longer than 15 minutes; Super Research podcasts are typically
+30–60 min).
 
 ### Running the script
 
