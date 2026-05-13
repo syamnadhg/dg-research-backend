@@ -7216,11 +7216,21 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
                 emit_event("pipeline_resumed", phase=phase, reason="retry")
                 continue  # re-verify
 
-            # Login passed — pro-tier check (only platforms with Pro/Free split,
-            # and only if user hasn't already consented to Free for THIS
-            # platform in a prior phase).
+            # Login passed — pro-tier check. Two short-circuits before we
+            # touch CUA (both also save the `[resolve_api_key]` log line +
+            # _cua_pro_tier_call round-trip):
+            #   1. Global ack: user clicked "Continue with Free" at Phase 0 or
+            #      Phase 1 setup-Pro backstop, setting `pro_warning_acknowledged`.
+            #      That ack semantically means "suppress further Pro alerts this
+            #      run" (matching Phase 0 platform-check gate at :21201 + Phase 1
+            #      backstop at :16939). F3 (DGOPS-7449, 2026-05-13) — pre-fix,
+            #      this gate ran the CUA tier check and re-emitted pro_required
+            #      after a P0 ack, costing the user a second Continue click.
+            #   2. Per-platform consent: a prior phase's verify_gate already
+            #      collected ack for THIS specific platform (see :7257 below).
             if (agent_key in _PRO_TIER_PROMPT_BY_KEY
                     and cua_client is not None
+                    and not _controls.pro_warning_acknowledged
                     and not _controls.free_tier_consent.get(agent_key, False)):
                 emit_event("agent_progress", phase=phase, agent=agent_key,
                            status="checking_tier",
