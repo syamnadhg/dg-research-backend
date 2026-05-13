@@ -20529,6 +20529,54 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 config_path.write_text(json.dumps(pipeline_config, indent=2), encoding="utf-8")
             except Exception:
                 pass
+        # 2026-05-13: Firestore overlay — read pipelineConfig from research doc
+        # and merge restrictively (skip wins, agents-off wins, video/email-off
+        # wins, podcastLength latest wins). Catches queued-state toggles that
+        # don't propagate via writeCommand (30s stale-command gate at line
+        # ~3348 discards old writes; the BE command listener also isn't
+        # attached until the run picks up its slot, so writes from the
+        # queued window land in Firestore but never reach _config_updates).
+        # The research doc's pipelineConfig is the FE's authoritative snapshot,
+        # updated synchronously on every toggle regardless of run status.
+        try:
+            if _firebase_db and _fb_uid and _fb_research_id:
+                _rd_snap = _firebase_db.collection("users").document(_fb_uid) \
+                    .collection("researches").document(_fb_research_id).get()
+                if _rd_snap.exists:
+                    _pc = (_rd_snap.to_dict() or {}).get("pipelineConfig") or {}
+                    # skippedPhases (FE field name) or skipPhases (BE) — accept either
+                    _fs_skip_raw = _pc.get("skippedPhases") if "skippedPhases" in _pc else _pc.get("skipPhases")
+                    if isinstance(_fs_skip_raw, list):
+                        _curr_skip = set(pipeline_config.get("skipPhases") or [])
+                        _fs_skip = {int(x) for x in _fs_skip_raw if isinstance(x, (int, float))}
+                        _added = _fs_skip - _curr_skip
+                        if _added:
+                            log(f"[config-overlay] FS adds skip phases {sorted(_added)} (disk had {sorted(_curr_skip)})", "WARN")
+                            pipeline_config["skipPhases"] = sorted(_curr_skip | _fs_skip)
+                    # agents — skip wins (FS off overrides disk on, never the reverse)
+                    _fs_agents = _pc.get("agents") or {}
+                    if _fs_agents:
+                        _curr_agents = dict(pipeline_config.get("agents") or {})
+                        for _k in ("chatgpt", "gemini", "claude"):
+                            if _k in _fs_agents and not bool(_fs_agents[_k]) and _curr_agents.get(_k, True):
+                                log(f"[config-overlay] FS agents.{_k}=false overrides disk", "WARN")
+                                _curr_agents[_k] = False
+                        pipeline_config["agents"] = _curr_agents
+                    # videoEnabled / emailEnabled — false wins
+                    if "videoEnabled" in _pc and not bool(_pc["videoEnabled"]) and pipeline_config.get("videoEnabled", True):
+                        log("[config-overlay] FS videoEnabled=false overrides", "WARN")
+                        pipeline_config["videoEnabled"] = False
+                    if "emailEnabled" in _pc and not bool(_pc["emailEnabled"]) and pipeline_config.get("emailEnabled", True):
+                        log("[config-overlay] FS emailEnabled=false overrides", "WARN")
+                        pipeline_config["emailEnabled"] = False
+                    # podcastLength — latest wins (any valid value)
+                    _fs_pl = _pc.get("podcastLength")
+                    if isinstance(_fs_pl, str) and _fs_pl in ("short", "default", "long"):
+                        if _fs_pl != pipeline_config.get("podcastLength"):
+                            log(f"[config-overlay] FS podcastLength={_fs_pl} overrides disk={pipeline_config.get('podcastLength')}", "WARN")
+                            pipeline_config["podcastLength"] = _fs_pl
+        except Exception as _overlay_err:
+            log(f"[config-overlay] Firestore re-read failed (non-fatal): {_overlay_err}", "WARN")
         sp = set(pipeline_config.get("skipPhases", []))
         ac = pipeline_config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
         ve = pipeline_config.get("videoEnabled", True)
@@ -20549,8 +20597,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # combo here. Auto-enable ChatGPT silently rather than fail —
         # preserves the brief's investment, matches the FE auto-enable on
         # the skip-brief Settings toggle, and makes downstream phases work.
-        if 1 not in sp and not any(ac.values()):
-            log("Config: brief on with 0 agents — auto-enabling ChatGPT", "WARN")
+        # 2026-05-13: also require `2 not in sp` — when the user explicitly
+        # toggles all P2 agents off, the FE cascades by adding 2 to
+        # skippedPhases (ChatInput.tsx:312). Honoring that explicit intent
+        # means we must NOT silently re-enable ChatGPT just because ac is
+        # all-False; the user wants P2 skipped wholesale. Without this gate
+        # the new Firestore overlay would correctly disable all 3 agents,
+        # then this branch would clobber the user's explicit toggle.
+        if 1 not in sp and 2 not in sp and not any(ac.values()):
+            log("Config: brief on with 0 agents (not explicit skip) — auto-enabling ChatGPT", "WARN")
             ac["chatgpt"] = True
         return sp, ac, ve, ee, pl
 
@@ -21754,36 +21809,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 log("No brief text available — cannot run Phase 2", "ERROR")
                 fail_phase(2, "No brief text available", "Phase 1 produced no brief; cannot run Phase 2.")
                 return
-            # 2026-05-13: defensive Firestore re-read of pipelineConfig.agents
-            # before deriving enabled_agents. User reported 2026-05-12 that a
-            # queued Run #2 with chatgpt+claude toggled off ran them anyway in
-            # the BE browser — the queue-doc config field must have lost the
-            # toggles between FE write and BE read. We can't fix the FE-side
-            # mystery from here, but the research doc's pipelineConfig.agents
-            # is the authoritative snapshot the FE persists at start time
-            # (usePipeline.ts:3509). Intersect agents_cfg with that snapshot
-            # so the BE honors whichever source says "skip" — most restrictive
-            # wins, no silent override of an explicit user toggle.
-            try:
-                if _firebase_db and _fb_uid and _fb_research_id:
-                    _rd_snap = _firebase_db.collection("users").document(_fb_uid) \
-                        .collection("researches").document(_fb_research_id).get()
-                    if _rd_snap.exists:
-                        _rd_data = _rd_snap.to_dict() or {}
-                        _pc_agents = ((_rd_data.get("pipelineConfig") or {}).get("agents") or {})
-                        if _pc_agents:
-                            _disk_cfg_str = {k: bool(v) for k, v in agents_cfg.items()}
-                            _fs_cfg_str = {k: bool(v) for k, v in _pc_agents.items()
-                                           if k in ("chatgpt", "claude", "gemini")}
-                            if _disk_cfg_str != _fs_cfg_str:
-                                log(f"[phase2-config-guard] disk agents_cfg={_disk_cfg_str} "
-                                    f"differs from Firestore pipelineConfig.agents={_fs_cfg_str} "
-                                    f"— taking intersection (skip wins)", "WARN")
-                            for _k, _on in _fs_cfg_str.items():
-                                if not _on and agents_cfg.get(_k, True):
-                                    agents_cfg[_k] = False
-            except Exception as _gerr:
-                log(f"[phase2-config-guard] Firestore re-read failed (non-fatal): {_gerr}", "WARN")
+            # Note: pre-2026-05-13 had an inline phase2-config-guard here that
+            # re-read pipelineConfig.agents from Firestore. That logic is now
+            # in reload_config() above (the [config-overlay] block) so every
+            # phase entry — not just P2 — benefits. agents_cfg already
+            # reflects the FS overlay by the time we reach this line.
             enabled_agents = [a for a, on in agents_cfg.items() if on]
             disabled_agents = [a for a, on in agents_cfg.items() if not on]
             log(f"[phase2] enabled_agents={enabled_agents} disabled_agents={disabled_agents}")
