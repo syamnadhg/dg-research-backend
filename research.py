@@ -1959,6 +1959,20 @@ _phase_averages: dict[int, float] = {}  # phase → avg duration in seconds
 # (2026-04-15 data + pipeline design targets). Updated as real data arrives.
 _DEFAULT_PHASE_MINUTES = {0: 0.2, 1: 27, 2: 55, 3: 15, 4: 8, 5: 4}
 
+# 2026-05-14: Phase 3 audio generation varies with podcast_length mode.
+# (low, high) ranges in minutes. Narration uses both ends in the user-
+# visible string ("5–10m typical"); the structured `expectedMinutes`
+# emit field uses the high end (FE displays a single number for the
+# progress-bar label, and overestimating beats underestimating —
+# avoids panicking the user when actual exceeds estimate). Matches the
+# Settings UI copy at FE settings/page.tsx ("Short ≈ 5–10 · Default ≈
+# 10–20 · Long ≈ 30–45").
+_AUDIO_TYPICAL_RANGE_MIN = {
+    "short":   (5, 10),
+    "default": (10, 20),
+    "long":    (30, 45),
+}
+
 
 def load_analytics():
     """Load run_analytics.json and compute per-phase average durations."""
@@ -19164,12 +19178,15 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # last pre-poll string ("Setting notebook to…") for the full audio
         # window. Match the P2 round-robin cadence.
         try:
+            _len_key = (podcast_length or "default").lower()
+            _typ_low, _typ_high = _AUDIO_TYPICAL_RANGE_MIN.get(
+                _len_key, _AUDIO_TYPICAL_RANGE_MIN["default"])
             emit_event("agent_progress", phase=3, agent="notebooklm",
                        status="generating",
                        progress=f"NotebookLM still generating audio overview… "
-                                f"({elapsed_min}m total / ~15m typical)",
+                                f"({elapsed_min}m total / {_typ_low}–{_typ_high}m typical)",
                        elapsedSec=elapsed_min * 60,
-                       expectedMinutes=15)
+                       expectedMinutes=_typ_high)
         except Exception:
             pass
         interrupt = await _controls.interruptible_sleep(90, check_interval=10)
