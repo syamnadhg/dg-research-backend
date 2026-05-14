@@ -321,6 +321,134 @@ CRITICAL: DO NOT type any text, DO NOT paste any text, DO NOT enter messages int
 
 # ── Response Extraction ───────────────────────────────────────────────────────
 
+PROMPT_CHATGPT_DOWNLOAD_MD = SYSTEM_BASE + """
+
+You are looking at a ChatGPT Deep Research conversation. The final report
+is rendered as an artifact card in the conversation (title like "Venom OS
+Architecture Research Report", "Research complete" badge above it).
+
+GOAL: Trigger a Markdown download of the artifact via these steps.
+
+WORKFLOW:
+1. **Close any open side panel** — if there's a sources / activity panel
+   visible on the right side of the screen (separate from the main
+   conversation column), click its X / Close button or press Escape to
+   dismiss it. The artifact card needs to be unobstructed.
+
+2. **Click the enlarge button on the artifact card** — at the top-right
+   of the artifact card there's a SMALL ICON button (about 20×20 px,
+   "diagonal arrows" or "expand" style icon). Click it once. The canvas
+   opens full-page covering the conversation.
+
+3. **Locate the download icon** — once the canvas is full-page, in the
+   top-right area there are TWO small icons side by side. The LEFT one
+   is a download arrow icon (down-arrow into a box). The right one is
+   a Share icon (chain links / connected dots).
+   Click the DOWNLOAD icon (down-arrow), NOT the Share icon.
+
+4. **A dropdown menu appears** with these options:
+       Copy contents
+       Export to Markdown
+       Export to Word
+       Export to PDF
+   Click "Export to Markdown" (its accessible name is "Export to Markdown").
+   The browser will download a .md file.
+
+HARD CONSTRAINTS:
+- DO NOT click "Share" — it's a different button next to the download icon.
+- DO NOT click "Copy contents", "Export to Word", or "Export to PDF".
+- DO NOT click anywhere in the canvas content text.
+- DO NOT type anything; this is click-only.
+- ONE click per step. If a step fails, try once more, then stop.
+- If the canvas is already open full-page, skip to step 3.
+- Stop after 12 iterations.
+
+When you've clicked "Export to Markdown", output: "downloaded"."""
+
+
+PROMPT_CLAUDE_DOWNLOAD_MD = SYSTEM_BASE + """
+
+You are looking at a Claude conversation with an artifact panel open on
+the right side. The artifact panel shows the final research report
+(long-form prose with multiple section headings, NOT a checklist).
+
+GOAL: Trigger a Markdown download of the artifact via these steps.
+
+WORKFLOW:
+1. **Confirm the right artifact is open** — the panel should show prose
+   content with headings like "Title and Document Metadata", or section
+   headers from the research topic. If it shows a "Sources tracking"
+   checklist or "Research Progress" view, that's the WRONG artifact —
+   the LAST/bottom artifact card in the conversation needs to be clicked
+   first. Click it and wait for the right panel to update.
+
+2. **Locate the artifact panel header** — at the top of the right panel
+   you'll see three controls side by side:
+       [Copy] [▼] [Published]
+   The middle element is a SMALL DOWN-ARROW button (chevron-down icon,
+   about 20×20 px). It sits BETWEEN the Copy button and the Published
+   button.
+
+3. **Click the down-arrow button** (NOT the "Copy" button, NOT the
+   "Published" button — only the small chevron between them).
+   A dropdown menu opens with options:
+       Download as Markdown
+       Download as PDF
+
+4. **Click "Download as Markdown"** (it's rendered as a link with the
+   accessible name "Download as Markdown"). The browser will download a
+   .md file.
+
+HARD CONSTRAINTS:
+- DO NOT click the "Copy" button — that copies to clipboard; we want a
+  file download.
+- DO NOT click "Download as PDF" — only Markdown.
+- DO NOT click "Publish" / "Published" or any other header button.
+- DO NOT click anywhere in the panel content.
+- DO NOT type anything; this is click-only.
+- ONE click per step.
+- Stop after 10 iterations.
+
+When you've clicked "Download as Markdown", output: "downloaded"."""
+
+
+PROMPT_GEMINI_COPY_CONTENTS = SYSTEM_BASE + """
+
+You are looking at a Gemini Deep Research response. The page shows the
+research report content in the main column. In the top-right of the
+response area, there's a row of action buttons including a "Share &
+Export" button.
+
+GOAL: Click the page's "Copy contents" action so the report markdown
+gets written to the browser clipboard (a separate JS hook captures it).
+
+WORKFLOW:
+1. **Locate the "Share & Export" button** — top-right of the report
+   panel, near a "Create" button. It's a pill-shaped button with the
+   text "Share & Export" and a chevron-down indicator. Same row as
+   "Contents", "Create", and the close X button.
+
+2. **Click "Share & Export"** — a dropdown menu opens with options:
+       Share
+       Export to Docs
+       Copy contents
+       Print  (may also include other items)
+
+3. **Click "Copy contents"** — it has a small clipboard/copy icon next
+   to the text "Copy contents". The menu item's CSS class includes
+   "copy-button" if you can see DevTools.
+
+HARD CONSTRAINTS:
+- DO NOT click "Share" — that opens a sharing dialog.
+- DO NOT click "Export to Docs" — that creates a Google Doc instead.
+- DO NOT click "Print" or "Contents" (the table-of-contents nav).
+- DO NOT click "Create" (that's an unrelated AI feature).
+- ONE click per step.
+- Stop after 8 iterations.
+
+When you've clicked "Copy contents", output: "copied"."""
+
+
 PROMPT_COPY_ARTIFACT_CHATGPT = SYSTEM_BASE + """
 
 Your task: Copy the ChatGPT research document content.
