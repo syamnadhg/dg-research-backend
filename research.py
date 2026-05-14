@@ -1071,23 +1071,6 @@ def _warn_clipboard_tool_missing_once(platform_label: str, tried: list):
         pass
 
 
-# 2026-05-12: Wayland-clipboard gate. On Linux/Wayland, get_clipboard()
-# routinely returns 0 chars even when CUA executes Ctrl+A/Ctrl+C cleanly —
-# Wayland's clipboard isolation breaks the OS-clipboard tier (CUA + Ctrl+C)
-# of every Phase-2 extractor. X11 Linux clipboard works fine via xclip/xsel.
-# Phase-2 extractors gate their Tier-3 (CUA + clipboard) on this so Wayland
-# runs skip a path that's guaranteed to fail, and instead fall back to the
-# new Tier-1 (Copy button + clipboard event hijack) which captures the
-# markdown in-browser before it touches the OS clipboard at all.
-_IS_WAYLAND = (
-    sys.platform.startswith("linux")
-    and (
-        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
-        or bool(os.environ.get("WAYLAND_DISPLAY", "").strip())
-    )
-)
-
-
 def get_clipboard():
     """Read clipboard text via the platform-native tool.
 
@@ -6838,8 +6821,8 @@ _HOTSPOT_TO_OP = {
     "7c":      "open_activity_panel",
     "7c-p1":   "open_activity_panel_p1",
     "7d":      "open_artifact_1",
-    # 2c / 2d (finalize hotspots) have no emit_tier_transition wired —
-    # they fall through to the default-1 path below.
+    # Any future shadow-wrapped hotspot ID not in this map falls through
+    # to the default-1 path below.
 }
 
 
@@ -15804,31 +15787,6 @@ async def _copy_via_hijack(
     except Exception as e:
         log(f"[{label}] Copy hijack exception: {e}", "WARN")
         return ""
-
-
-async def _copy_via_hijack_anyframe(page, label, **kwargs):
-    """Frame-aware variant of _copy_via_hijack. Tries the main page first,
-    then each Deep Research sandbox iframe. Returns the first non-empty
-    capture. Same kwargs as the underlying helper.
-
-    2026-05-13: ChatGPT DR's Copy button + canvas live inside a cross-
-    origin sandbox iframe — every `_copy_via_hijack` call against the
-    main page found no buttons and Tier 1 was effectively dead. This
-    wrapper makes Tier 1 actually reachable so Wayland runs (where Tier 3
-    fails) have a working extraction path."""
-    last_attempt_logged = False
-    for target in _chatgpt_dr_frame_targets(page):
-        try:
-            md = await _copy_via_hijack(target, label, **kwargs)
-        except Exception as _e:
-            log(f"[{label}] Copy hijack on frame raised: {_e}", "DEBUG")
-            md = ""
-        if md:
-            return md
-        last_attempt_logged = True
-    if not last_attempt_logged:
-        log(f"[{label}] Copy hijack: no frame targets evaluated", "DEBUG")
-    return ""
 
 
 async def _extract_via_download(
