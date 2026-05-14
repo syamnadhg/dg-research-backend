@@ -194,7 +194,7 @@ export CUA_API_KEY="sk-ant-..."
 
 **`ANTHROPIC_API_KEY` is accepted as a fallback** — `resolve_api_key()` (research.py:181) checks `CUA_API_KEY` first, then `ANTHROPIC_API_KEY`, on both env and Windows User scope. Most Anthropic devs already have `ANTHROPIC_API_KEY` set globally, so it just works without setting a duplicate.
 
-`GEMINI_API_KEY` is **optional** — used only as the narrator's Flash fallback when Haiku is unavailable. (The original P4 thumbnail use case is gone — P4 is FE-owned post-2026-05-10.)
+`GEMINI_API_KEY` is **optional** on the BE side — used only as the narrator's Flash fallback when Haiku is unavailable. (P4 thumbnail generation lives on the FE: `web/src/lib/album-art.ts` calls Gemini image-gen from inside `/api/uploadYouTube` using the FE-side env key or the user's per-prefs key. BE never owned a thumbnail role post-2026-05-10.)
 
 **Phases 4 + 5 are FE-owned.** No BE setup needed for either. The frontend handles YouTube upload via `youtube.videos.insert` (Data API + OAuth refresh token, ffmpeg encode in Cloud Run) AND Google Doc creation via the Docs API AND email via Resend — see the FE README for that side's env vars (`GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`, `RESEND_API_KEY`, `NOTIFY_FROM_EMAIL`).
 
@@ -392,7 +392,7 @@ Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT P
 
 ## Phase + per-agent narration (consolidated 2026-04-30)
 
-Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for 5–15 min), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. The narration system was consolidated 2026-04-30 from four overlapping writers down to a single per-agent narrator with a backend-fallback tail. Result: cheaper, less duplication, less parroting.
+Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for **5–10 min on Short, 10–20 on Default, 30–45 on Long** mode — `_AUDIO_TYPICAL_RANGE_MIN` in research.py drives the in-chat ETA narration), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. The narration system was consolidated 2026-04-30 from four overlapping writers down to a single per-agent narrator with a backend-fallback tail. Result: cheaper, less duplication, less parroting.
 
 - **Per-agent narrator (the only writer now)** — every Phase 1/2 agent has a narrator worker that reads a bounded ring buffer of recent events (~50) and emits a `phase_narration` / `agent_narration` event about every 6s per active agent. Brain: **Anthropic Haiku 4.5** primary (`claude-haiku-4-5`); **Gemini 2.5 Flash** fallback on any 4xx/5xx/timeout/empty response so workspace-usage-limit windows don't blank the narrator for 24+ hours. Pre-04-30 used Gemini Pro 2.5; Pro echoed input verbatim at temp 0.2 — Haiku follows the no-parrot prompt rules more tightly. Cost envelope: ~200 input / 30 output tokens per call → <$0.02 per full pipeline run on Haiku.
 - **Anti-parroting prompt + chrome scrub.** The narrator system prompt (research.py:5904-5933) has explicit anti-pattern rules: don't echo input verbatim, don't start with "currently" or "Status:", skip chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md`). Above the narrator, `_compact_event_for_narration` (research.py:5550-5625) scrubs those same chrome strings out of the input window BEFORE the narrator sees them — scrape outputs (chip / step counts) are untouched.
@@ -493,7 +493,7 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 | `CUA_MODEL` | `claude-opus-4-7` | Claude model for CUA |
 | `CUA_SCREEN_WIDTH` | `1280` | Browser viewport width |
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |
-| `GEMINI_API_KEY` | (optional) | Gemini API key. Used only as the narrator's Flash fallback when Haiku is unavailable. (The earlier P4 thumbnail role is gone — P4 is FE-owned post-2026-05-10.) |
+| `GEMINI_API_KEY` | (optional) | Gemini API key. Used only as the narrator's Flash fallback when Haiku is unavailable. (P4 thumbnail generation lives on the FE — `web/src/lib/album-art.ts` — and uses the FE-side env / per-user-pref Gemini key, not this BE one.) |
 | `MAX_WAIT_DEEP` | `90` | Max minutes to wait per Phase 2 agent |
 | `POLL_DEEP_RESEARCH` | `30` | Seconds between polling cycles |
 | `MIN_AGENT_WAIT_MIN` | `20` | Min minutes before CUA completion checks |
@@ -510,7 +510,7 @@ authenticate against Google APIs via an OAuth refresh token. Two paths,
 same script:
 
 - **Per-user OAuth** — every signed-in web-app user can plug their own Google
-  credentials in Account → API Keys → Google OAuth so THEIR Docs and YouTube
+  credentials in Account → API Config → Google Account → Advanced — bring your own GCP project so THEIR Docs and YouTube
   uploads land in their own account. The walkthrough lives in-app (info
   button next to the section title). The script below produces the refresh
   token piece of that triple.
@@ -530,7 +530,7 @@ same script:
 The new Google Auth Platform UI splits the old "OAuth consent screen" into a
 sidebar with **Branding · Audience · Clients · Data Access · Verification
 Center · Settings**. This walkthrough covers the steps in that order — same
-content as the in-app help modal at FE Account → API Keys → Google OAuth.
+content as the in-app help modal at FE Account → API Config → Google Account → Advanced — bring your own GCP project.
 
 **1. Create a Cloud project.** Open
 [console.cloud.google.com](https://console.cloud.google.com) signed in as the

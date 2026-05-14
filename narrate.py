@@ -199,6 +199,7 @@ async def narrate_panel(
     _M.calls_this_phase += 1
     _M.calls_total += 1
 
+    last_error = "unknown"
     for model in (GEMINI_MODEL_PRIMARY, GEMINI_MODEL_FALLBACK):
         result = await asyncio.to_thread(
             _call_gemini, api_key, model, png, user_msg
@@ -215,14 +216,25 @@ async def narrate_panel(
             data["_source"] = "vision"
             data["_model"] = model
             return data
-        if result.get("status") == 429 and model == GEMINI_MODEL_PRIMARY:
-            logger.info("narrate: 429 on primary, retrying on fallback")
+        last_error = result.get("error", "unknown")
+        # Fall through to the fallback model on the primary regardless of
+        # error kind (429, 5xx, timeout, parse error). Pre-2026-05-14 only
+        # 429 retried — every other primary failure short-circuited with
+        # `return None` and the fallback model was effectively dead code.
+        if model == GEMINI_MODEL_PRIMARY:
+            status = result.get("status")
+            logger.info(
+                "narrate: primary failed (status=%s err=%s) — trying fallback",
+                status, last_error,
+            )
             continue
-        _M.failures += 1
-        _M.last_error = result.get("error", "unknown")
-        return None
+        # Fallback also failed — break out so the unified failure tally
+        # below counts ONE failure for the overall narrate() call (the
+        # phase budget already debited one slot at the top).
+        break
 
     _M.failures += 1
+    _M.last_error = last_error
     return None
 
 

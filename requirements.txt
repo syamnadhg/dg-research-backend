@@ -46,7 +46,7 @@ pytest>=8.0
 pytest-asyncio>=0.23
 
 # OAuth refresh-token regeneration script — scripts/regenerate_oauth_refresh_token.py.
-# Used by FE Account → API Keys → Google OAuth setup flow (per-user OAuth) and
+# Used by the Advanced per-user OAuth setup flow (Account → API Config → Google Account → Advanced) and
 # by the project owner for the shared default in Secret Manager. Pinned here so
 # pip install -r requirements.txt covers the script's deps and users don't hit
 # ModuleNotFoundError on first run. google-auth ships transitively via firebase-

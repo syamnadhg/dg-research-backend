@@ -635,11 +635,16 @@ async def _harvest_fixture(
         return None
     try:
         base = os.path.join("tests", "fixtures", "vision", "auto", hotspot_id)
-        os.makedirs(base, exist_ok=True)
         name = f"{run_id or 'run'}_{int(time.time())}.png"
         full = os.path.join(base, name)
-        with open(full, "wb") as f:
-            f.write(image_bytes)
+        # File I/O off the event loop — `image_bytes` can be several MB.
+        # Sync write was defeating shadow-mode's parallel-with-CUA property
+        # when fixture-auto is on.
+        def _write():
+            os.makedirs(base, exist_ok=True)
+            with open(full, "wb") as f:
+                f.write(image_bytes)
+        await asyncio.to_thread(_write)
         return full
     except Exception as exc:
         logger.debug("fixture harvest failed: %s", exc)

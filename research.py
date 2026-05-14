@@ -4824,11 +4824,12 @@ async def _cua_login_call(page, platform: str, cua_client) -> tuple[bool, str]:
         return (False, f"API error: {e}")
 
 
-_PRO_TIER_PROMPT_BY_KEY = {
-    "chatgpt": "PROMPT_DETECT_CHATGPT_PRO",
-    "claude":  "PROMPT_DETECT_CLAUDE_PRO",
-    "gemini":  "PROMPT_DETECT_GEMINI_PRO",
-}
+# Set membership only — every caller uses this for "is this platform in
+# the pro-tier-detection list" and then resolves the actual prompt via
+# `prompt_map` below. Previous shape mapped key→prompt-name-as-string
+# but the string was never used, just truthiness-checked, which invited
+# confusion.
+_PRO_TIER_PLATFORMS = frozenset({"chatgpt", "claude", "gemini"})
 
 
 async def _cua_pro_tier_call(page, platform: str, cua_client) -> str:
@@ -4843,8 +4844,7 @@ async def _cua_pro_tier_call(page, platform: str, cua_client) -> str:
     alert rather than silently degrading.
     """
     pname = platform.lower()
-    prompt_attr = _PRO_TIER_PROMPT_BY_KEY.get(pname)
-    if not prompt_attr:
+    if pname not in _PRO_TIER_PLATFORMS:
         return "unsure"  # No prompt for this platform — caller should not have called us
     try:
         from prompts import (
@@ -7224,7 +7224,7 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
             #      after a P0 ack, costing the user a second Continue click.
             #   2. Per-platform consent: a prior phase's verify_gate already
             #      collected ack for THIS specific platform (see :7257 below).
-            if (agent_key in _PRO_TIER_PROMPT_BY_KEY
+            if (agent_key in _PRO_TIER_PLATFORMS
                     and cua_client is not None
                     and not _controls.pro_warning_acknowledged
                     and not _controls.free_tier_consent.get(agent_key, False)):
@@ -11513,7 +11513,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
             elif "workspace api usage limits" in low or ("400" in err and "usage limit" in low):
                 log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
                 _cap_detail = err[:200] or "Workspace cap hit on the current Anthropic key."
-                _cap_hint = "Paste a different key in Account → API Keys (preferred), raise the cap in the Anthropic Console, or wait for reset."
+                _cap_hint = "Paste a different key in Account → API Config (preferred), raise the cap in the Anthropic Console, or wait for reset."
                 if _phase == 2 and _agent:
                     fail_agent(_agent, "Claude API workspace cap hit", f"{_cap_detail} {_cap_hint}")
                 else:
@@ -11521,7 +11521,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 return {"status": "error", "text": str(e)}
             elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
                 log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
-                _bad_key_hint = "Paste a fresh key in Account → API Keys (preferred, no restart), or update CUA_API_KEY on the BE machine and restart."
+                _bad_key_hint = "Paste a fresh key in Account → API Config (preferred, no restart), or update CUA_API_KEY on the BE machine and restart."
                 if _phase == 2 and _agent:
                     fail_agent(_agent, "Claude API key rejected", _bad_key_hint)
                 else:
@@ -21228,13 +21228,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         (f"{str(cua_err)[:180]}\n\n"
                          "This usually means one of three things:\n"
                          "• Invalid or missing Anthropic key — add or rotate it in "
-                         "Account → API Keys (preferred, no restart), or set "
+                         "Account → API Config (preferred, no restart), or set "
                          "ANTHROPIC_API_KEY (or CUA_API_KEY) on the backend "
                          "machine and restart.\n"
                          "• Workspace usage cap or 400 overage — raise the cap in "
                          "console.anthropic.com → Workspaces, wait for the "
                          "monthly reset, OR paste a key from a different "
-                         "workspace (or a personal key) in Account → API Keys "
+                         "workspace (or a personal key) in Account → API Config "
                          "to bypass the capped one.\n"
                          "• Anthropic temporarily overloaded (529) — wait a moment "
                          "and click Retry.\n\n"
@@ -21271,7 +21271,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # Research output (ChatGPT/Claude/Gemini). Skipped if
                     # the user already opted into Free on a prior platform
                     # in this run, or if no CUA client is available.
-                    if (key in _PRO_TIER_PROMPT_BY_KEY
+                    if (key in _PRO_TIER_PLATFORMS
                             and cua_client is not None
                             and not _controls.pro_warning_acknowledged):
                         emit_event("agent_progress", phase=0, agent=key,
@@ -21422,10 +21422,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Anthropic / CUA — needed across phases for vision tier-2 + tier-3
         # (CUA fallback). Hard requirement for any non-trivial run; surface
         # the error before phase 1 so the user gets a clear "add it via
-        # Account → API Keys" instead of a mid-phase vision crash.
+        # Account → API Config" instead of a mid-phase vision crash.
         if not resolve_api_key():
             _env_ok = False
-            _env_errors.append("Anthropic API key missing — add it in Account → API Keys (preferred), or set ANTHROPIC_API_KEY (or CUA_API_KEY) on the BE machine. Vision/CUA tiers can't run without it.")
+            _env_errors.append("Anthropic API key missing — add it in Account → API Config (preferred), or set ANTHROPIC_API_KEY (or CUA_API_KEY) on the BE machine. Vision/CUA tiers can't run without it.")
         if not _env_ok:
             emit_event("login_required",
                        phase=0,
@@ -22522,7 +22522,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # When init was skipped, re-verify NotebookLM login before P3 runs.
         # Skip cascades to P4 (no YouTube without podcast — same rule as the
         # skip_phase command handler at ~line 2833). NLM has no Pro/Free
-        # split (not in _PRO_TIER_PROMPT_BY_KEY), so only login is checked.
+        # split (not in _PRO_TIER_PLATFORMS), so only login is checked.
         if (start_phase <= 3 and 3 not in skip_phases
                 and 3 not in _controls.skipped_phases
                 and _controls.skip_init_verify
@@ -24984,7 +24984,7 @@ async def run_pair(profile_dir, wait_minutes=10):
                 # eliminating the dangling unconditional `platform_ok = True`
                 # at the end of the if cua_ok body that previously read as
                 # "always set True after any cua_ok=True". No behavior change.
-                if (key in _PRO_TIER_PROMPT_BY_KEY
+                if (key in _PRO_TIER_PLATFORMS
                         and not pair_pro_acknowledged):
                     print(f"  {_c(_DIM, 'Verifying subscription tier…')}")
                     try:
@@ -25061,7 +25061,7 @@ async def run_pair(profile_dir, wait_minutes=10):
                 else:
                     # Either pair_pro_acknowledged is True (user already
                     # chose Continue-with-Free on a prior platform), or
-                    # this platform isn't in _PRO_TIER_PROMPT_BY_KEY (e.g.,
+                    # this platform isn't in _PRO_TIER_PLATFORMS (e.g.,
                     # NotebookLM, where the pro-tier prompt doesn't apply).
                     # CUA confirmed login — that's enough.
                     platform_ok = True
