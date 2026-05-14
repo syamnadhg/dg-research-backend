@@ -4217,6 +4217,19 @@ class PipelineControls:
                 return "stop"
             if self.consume_retry_agent(key):
                 return "retry"
+            # 2026-05-14: also drain the HARD-retry set. The FE's
+            # fail_agent Retry button sends mode=hard, which the command
+            # handler routes to request_retry_agent_hard → retry_agents_hard.
+            # Without this check, clicks on the human-intervention Retry
+            # button were silently dropped (added to a set nobody read),
+            # and this loop eventually timed out — see 2026-05-13 trace
+            # where a Claude extraction-fail retry waited 5min then logged
+            # decision=stop. For extraction-fail callers, soft vs hard
+            # retry semantically converge ("re-run the tier ladder"); the
+            # mode bit only matters for in-flight Phase 2 stalls handled
+            # elsewhere.
+            if self.consume_retry_agent_hard(key):
+                return "retry"
             if self.consume_wait_longer_agent(key):
                 return "wait_longer"
             if self.consume_continue_partial(key):
@@ -16476,142 +16489,176 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         target_idx = max(0, artifact_count - 1)  # Last artifact = final report
         log(f"[{label}] Post-completion: opening artifact[{target_idx}] (final report)")
         clicked = await _click_claude_artifact(page, index=target_idx)
-        if clicked:
-            # A1 (2026-05-01): content-driven wait — yields fast on a
-            # normal mount, gives slow renders up to 8s before falling
-            # through to CUA.
+        # 2026-05-14: when the DOM pre-click can't resolve a real artifact
+        # button (Claude's `[data-testid*="artifact"]` selector can match
+        # research-tracking cards, context-menu triggers, etc.), fall back
+        # to CUA to open the LAST artifact card before running the tiers.
+        # Without this fallback the entire tier ladder used to skip
+        # silently — see 2026-05-13 run where T1/T2/T3 all returned in the
+        # same second as the count log because every tier was nested
+        # inside `if clicked:`. T1 and T2 require the artifact panel open
+        # (Copy/down-arrow trio for T1, Publish button for T2); T3 has its
+        # own navigate preamble so it can recover even when this CUA
+        # fallback also misses.
+        if not clicked and browser and cua_client and not chat_mode:
+            log(f"[{label}] DOM pre-click missed — CUA fallback to open last artifact", "WARN")
             try:
-                await page.wait_for_selector(
-                    'aside [class*="markdown"], aside .prose, '
-                    '[class*="artifact-panel"] [class*="markdown"], '
-                    '[class*="artifact-panel"] .prose',
-                    timeout=8000)
-            except Exception:
+                await asyncio.wait_for(
+                    agent_loop(cua_client, browser,
+                        PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                        f"There are {artifact_count} artifact(s) in this "
+                        f"conversation. Open the LAST (bottom) artifact card "
+                        f"— that's the final research report.",
+                        model=CUA_MODEL, max_iterations=8,
+                        verbose=verbose, target_page=page),
+                    timeout=120.0)
+                clicked = True
                 await asyncio.sleep(1.5)
+            except asyncio.TimeoutError:
+                log(f"[{label}] CUA fallback open timed out after 120s", "WARN")
+            except Exception as _fe:
+                log(f"[{label}] CUA fallback open raised: {_fe}", "WARN")
 
-            # 2026-05-13 ARCHITECTURE: collapsed from 4-tier ladder (panel-
-            # reader + publish + html-md + copy-hijack + CUA-OS-clipboard)
-            # into exactly 3 Wayland-safe tiers per user sign-off. Removes
-            # the _IS_WAYLAND gate (Tier 3 now uses a JS clipboard hijack
-            # that works on every backend) and removes the OS-clipboard
-            # `get_clipboard()` read entirely.
+        # A1 (2026-05-01): content-driven wait — yields fast on a
+        # normal mount, gives slow renders up to 8s before falling
+        # through to CUA. Forgiving — if panel never mounts, T3's own
+        # navigate preamble still has a shot.
+        try:
+            await page.wait_for_selector(
+                'aside [class*="markdown"], aside .prose, '
+                '[class*="artifact-panel"] [class*="markdown"], '
+                '[class*="artifact-panel"] .prose',
+                timeout=8000)
+        except Exception:
+            await asyncio.sleep(1.5)
 
-            # ── Tier 1 (CUA-driven download): Download as Markdown ──
-            # CUA finds the small down-arrow button next to the Copy button
-            # in the artifact-panel header (Copy/▼/Published trio per user
-            # screenshot), clicks it, then clicks "Download as Markdown".
-            # Playwright expect_download() captures the .md file. Selector-
-            # free; CUA's vision handles DOM drift. Wayland-safe.
-            if browser and cua_client:
-                md_dl = await _extract_via_cua_download(
-                    page, browser, cua_client, label,
-                    PROMPT_CLAUDE_DOWNLOAD_MD,
-                    "The artifact panel is open on the right showing the final "
-                    "research report. Click the small down-arrow button next to "
-                    "the Copy button, then click Download as Markdown.",
-                    max_iterations=10, cua_timeout_s=120.0,
-                    download_timeout_ms=30000, min_chars=500, verbose=verbose,
-                )
-                if md_dl and len(md_dl) >= 500:
-                    if _is_sources_not_document(md_dl, platform="claude"):
-                        log(f"[{label}] T1 CUA download wrong-artifact "
-                            f"({len(md_dl)} chars) — falling to Tier 2", "WARN")
-                        try:
-                            emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                                       op="finalize_copy", length=len(md_dl),
-                                       tier="cua_download_md")
-                        except Exception:
-                            pass
-                    else:
-                        log(f"[{label}] Extracted via T1 CUA download (.md): {len(md_dl)} chars")
-                        return md_dl
+        # 2026-05-13 ARCHITECTURE: collapsed from 4-tier ladder (panel-
+        # reader + publish + html-md + copy-hijack + CUA-OS-clipboard)
+        # into exactly 3 Wayland-safe tiers per user sign-off. Removes
+        # the _IS_WAYLAND gate (Tier 3 now uses a JS clipboard hijack
+        # that works on every backend) and removes the OS-clipboard
+        # `get_clipboard()` read entirely.
+        # 2026-05-14: tiers de-indented out of the prior `if clicked:`
+        # gate so a missed pre-click doesn't silently skip everything.
 
-            # ── Tier 2: publish + claude.site full-page HTML→MD ──
-            # Publish artifact + open the resulting claude.site URL in a
-            # new tab + HTML→MD scrape on the clean DOM. Zero chat/nav/
-            # iframe chrome. New tab keeps main-page state intact.
-            # Idempotent across calls.
-            md_pub = await _extract_claude_via_published_page(
-                page, browser, cua_client, label, verbose=verbose,
+        # ── Tier 1 (CUA-driven download): Download as Markdown ──
+        # CUA finds the small down-arrow button next to the Copy button
+        # in the artifact-panel header (Copy/▼/Published trio per user
+        # screenshot), clicks it, then clicks "Download as Markdown".
+        # Playwright expect_download() captures the .md file. Selector-
+        # free; CUA's vision handles DOM drift. Wayland-safe.
+        if browser and cua_client:
+            md_dl = await _extract_via_cua_download(
+                page, browser, cua_client, label,
+                PROMPT_CLAUDE_DOWNLOAD_MD,
+                "The artifact panel should be open on the right showing the "
+                "final research report. If it isn't open yet, click the LAST "
+                "artifact card in the chat to open it first. Then click the "
+                "small down-arrow button next to the Copy button, and click "
+                "Download as Markdown.",
+                max_iterations=12, cua_timeout_s=150.0,
+                download_timeout_ms=30000, min_chars=500, verbose=verbose,
             )
-            if md_pub and len(md_pub) > 500:
-                if _is_sources_not_document(md_pub, platform="claude"):
-                    log(f"[{label}] T2 published-page wrong-artifact "
-                        f"({len(md_pub)} chars) — falling to Tier 3", "WARN")
-                elif _looks_like_nav_sidebar(md_pub):
-                    log(f"[{label}] T2 published-page looks-like-nav-sidebar "
-                        f"({len(md_pub)} chars) — falling to Tier 3", "WARN")
+            if md_dl and len(md_dl) >= 500:
+                if _is_sources_not_document(md_dl, platform="claude"):
+                    log(f"[{label}] T1 CUA download wrong-artifact "
+                        f"({len(md_dl)} chars) — falling to Tier 2", "WARN")
+                    try:
+                        emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                                   op="finalize_copy", length=len(md_dl),
+                                   tier="cua_download_md")
+                    except Exception:
+                        pass
                 else:
-                    log(f"[{label}] Extracted via T2 published-page HTML→MD: {len(md_pub)} chars")
-                    return md_pub
-            # If T2 fired but didn't return content, the publish-confirm
-            # dialog may still be mounted on the main page. Dismiss with
-            # Escape so dialog content doesn't bleed into T3 state.
+                    log(f"[{label}] Extracted via T1 CUA download (.md): {len(md_dl)} chars")
+                    return md_dl
+
+        # ── Tier 2: publish + claude.site full-page HTML→MD ──
+        # Publish artifact + open the resulting claude.site URL in a
+        # new tab + HTML→MD scrape on the clean DOM. Zero chat/nav/
+        # iframe chrome. New tab keeps main-page state intact.
+        # Idempotent across calls.
+        md_pub = await _extract_claude_via_published_page(
+            page, browser, cua_client, label, verbose=verbose,
+        )
+        if md_pub and len(md_pub) > 500:
+            if _is_sources_not_document(md_pub, platform="claude"):
+                log(f"[{label}] T2 published-page wrong-artifact "
+                    f"({len(md_pub)} chars) — falling to Tier 3", "WARN")
+            elif _looks_like_nav_sidebar(md_pub):
+                log(f"[{label}] T2 published-page looks-like-nav-sidebar "
+                    f"({len(md_pub)} chars) — falling to Tier 3", "WARN")
+            else:
+                log(f"[{label}] Extracted via T2 published-page HTML→MD: {len(md_pub)} chars")
+                return md_pub
+        # If T2 fired but didn't return content, the publish-confirm
+        # dialog may still be mounted on the main page. Dismiss with
+        # Escape so dialog content doesn't bleed into T3 state.
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.4)
+        except Exception:
+            pass
+
+        # ── Tier 3 (LAST RESORT, Wayland-safe): CUA + clipboard hijack ──
+        # _run_with_clipboard_hijack installs the JS hook before CUA's
+        # Ctrl+A/C so the page's own copy event is intercepted in-DOM.
+        # No OS clipboard read → Wayland-safe. Trigger chains the
+        # existing two CUA prompts: navigate to LAST artifact (if
+        # multiple), then Ctrl+A/C inside the open panel. No retry
+        # loop, no shadow-wrap, no _IS_WAYLAND gate — helper owns
+        # retry policy. Helper timeout_ms set ABOVE the inner CUA
+        # wait_for budget so the inner caps fire first.
+        if browser and cua_client and not chat_mode:
+            async def _claude_t3_trigger():
+                await browser.switch_to_page(page)
+                if artifact_count >= 2:
+                    try:
+                        await asyncio.wait_for(
+                            agent_loop(cua_client, browser,
+                                PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                                f"There are {artifact_count} artifacts in this "
+                                f"conversation. Open the LAST (bottom) artifact — "
+                                f"that's the final research report.",
+                                model=CUA_MODEL, max_iterations=8,
+                                verbose=verbose, target_page=page),
+                            timeout=180.0)
+                        await asyncio.sleep(1)
+                    except asyncio.TimeoutError:
+                        log(f"[{label}] T3 CUA nav timed out after 180s", "WARN")
+                    except Exception as _ne:
+                        log(f"[{label}] T3 CUA nav raised: {_ne}", "WARN")
+                await asyncio.wait_for(
+                    agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
+                        "Copy the full content of the artifact currently open "
+                        "in the right panel to clipboard.",
+                        model=CUA_MODEL, max_iterations=12,
+                        verbose=verbose, target_page=page),
+                    timeout=180.0)
+                await asyncio.sleep(1)
+
+            log(f"[{label}] CUA: Tier 3 navigate + copy with clipboard hijack")
             try:
-                await page.keyboard.press("Escape")
-                await asyncio.sleep(0.4)
-            except Exception:
-                pass
-
-            # ── Tier 3 (LAST RESORT, Wayland-safe): CUA + clipboard hijack ──
-            # _run_with_clipboard_hijack installs the JS hook before CUA's
-            # Ctrl+A/C so the page's own copy event is intercepted in-DOM.
-            # No OS clipboard read → Wayland-safe. Trigger chains the
-            # existing two CUA prompts: navigate to LAST artifact (if
-            # multiple), then Ctrl+A/C inside the open panel. No retry
-            # loop, no shadow-wrap, no _IS_WAYLAND gate — helper owns
-            # retry policy. Helper timeout_ms set ABOVE the inner CUA
-            # wait_for budget so the inner caps fire first.
-            if browser and cua_client and not chat_mode:
-                async def _claude_t3_trigger():
-                    await browser.switch_to_page(page)
-                    if artifact_count >= 2:
-                        try:
-                            await asyncio.wait_for(
-                                agent_loop(cua_client, browser,
-                                    PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
-                                    f"There are {artifact_count} artifacts in this "
-                                    f"conversation. Open the LAST (bottom) artifact — "
-                                    f"that's the final research report.",
-                                    model=CUA_MODEL, max_iterations=8,
-                                    verbose=verbose, target_page=page),
-                                timeout=180.0)
-                            await asyncio.sleep(1)
-                        except asyncio.TimeoutError:
-                            log(f"[{label}] T3 CUA nav timed out after 180s", "WARN")
-                        except Exception as _ne:
-                            log(f"[{label}] T3 CUA nav raised: {_ne}", "WARN")
-                    await asyncio.wait_for(
-                        agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
-                            "Copy the full content of the artifact currently open "
-                            "in the right panel to clipboard.",
-                            model=CUA_MODEL, max_iterations=12,
-                            verbose=verbose, target_page=page),
-                        timeout=180.0)
-                    await asyncio.sleep(1)
-
-                log(f"[{label}] CUA: Tier 3 navigate + copy with clipboard hijack")
-                try:
-                    md_hj = await _run_with_clipboard_hijack(
-                        page, label, _claude_t3_trigger,
-                        timeout_ms=400000, min_chars=500,
-                    )
-                except Exception as _te:
-                    log(f"[{label}] T3 clipboard-hijack raised: {_te}", "WARN")
-                    md_hj = ""
-                if md_hj and len(md_hj) >= 500:
-                    if _is_sources_not_document(md_hj, platform="claude"):
-                        log(f"[{label}] T3 hijack wrong-artifact "
-                            f"({len(md_hj)} chars) — rejecting", "WARN")
-                        try:
-                            emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                                       op="finalize_copy", length=len(md_hj),
-                                       tier="clipboard_hijack")
-                        except Exception:
-                            pass
-                    else:
-                        log(f"[{label}] Extracted via T3 clipboard hijack: {len(md_hj)} chars")
-                        return md_hj
+                md_hj = await _run_with_clipboard_hijack(
+                    page, label, _claude_t3_trigger,
+                    timeout_ms=400000, min_chars=500,
+                )
+            except Exception as _te:
+                log(f"[{label}] T3 clipboard-hijack raised: {_te}", "WARN")
+                md_hj = ""
+            if md_hj and len(md_hj) >= 500:
+                if _is_sources_not_document(md_hj, platform="claude"):
+                    log(f"[{label}] T3 hijack wrong-artifact "
+                        f"({len(md_hj)} chars) — rejecting", "WARN")
+                    try:
+                        emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                                   op="finalize_copy", length=len(md_hj),
+                                   tier="clipboard_hijack")
+                    except Exception:
+                        pass
+                else:
+                    log(f"[{label}] Extracted via T3 clipboard hijack: {len(md_hj)} chars")
+                    return md_hj
 
     try:
         emit_event("extract_failed", phase=2, agent="claude",
@@ -18085,6 +18132,107 @@ async def check_hv_gate(browser, cua_client, platform: str, label: str,
         return False
 
 
+async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=20):
+    """Detect the agent's own in-page Retry button after Send and click it once.
+
+    When Deep Research kicks off but immediately fails (rate limit, internal
+    error, brief-parse failure), the agent UI shows a 'Research stopped' /
+    'Research failed' / 'Something went wrong' message with a Retry (or
+    Regenerate / Try again) button right below it in the assistant area.
+    This guard auto-clicks that button ONCE so the round-robin watchdog
+    doesn't have to escalate to a human-intervention alert for what is
+    effectively a transient agent-side glitch.
+
+    Scope:
+      - Only fires when the page actually shows failure-message text — no
+        click happens on a healthy research start.
+      - Buttons must live inside an assistant message area (not composer /
+        toolbar / footer), with aria-label or text matching retry words.
+      - Single click per call; idempotent.
+
+    Returns True if a button was clicked, False otherwise. Wayland-safe
+    (pure DOM click, no clipboard reads)."""
+    platform_l = (platform or "").lower()
+    deadline = asyncio.get_event_loop().time() + max_wait_s
+    poll_n = 0
+    # Failure-message regex — covers ChatGPT / Claude / Gemini wording
+    # variants seen across recent runs. Word-boundary-loose because some
+    # UIs render the text with extra punctuation.
+    fail_re = (
+        r"research\\s+stopped|research\\s+failed|"
+        r"failed\\s+to\\s+(?:generate|complete|run|continue)|"
+        r"something\\s+went\\s+wrong|encountered\\s+an?\\s+(?:issue|error)|"
+        r"unable\\s+to\\s+(?:continue|complete|generate)|"
+        r"couldn'?t\\s+complete|response\\s+stopped|"
+        r"this\\s+research\\s+(?:was\\s+)?(?:stopped|interrupted)"
+    )
+    while asyncio.get_event_loop().time() < deadline:
+        poll_n += 1
+        try:
+            clicked = await page.evaluate(
+                f"""() => {{
+                    const failPattern = new RegExp(`{fail_re}`, 'i');
+                    // 2026-05-14: dropped 'resume' — too generic, could match
+                    // Claude's resume-conversation button (unrelated to
+                    // research-fail recovery).
+                    const retryWords = /(?:^|\\s)(retry|regenerate|try\\s+again|rerun|restart)\\b/i;
+                    const isInComposerOrToolbar = (el) => !!el.closest(
+                        '[data-testid*="composer"], [data-testid*="prompt-textarea"], ' +
+                        '[contenteditable="true"], form[data-message-id], ' +
+                        '[role="toolbar"], footer, [class*="composer" i], ' +
+                        '[class*="input-area" i], [class*="message-input" i]'
+                    );
+                    const isAssistantScoped = (el) => !!el.closest(
+                        '[data-message-author-role="assistant"], .font-claude-message, ' +
+                        '[data-testid*="conversation-turn"]'
+                    );
+                    const isVisible = (el) => {{
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 16 || r.height < 16) return false;
+                        const cs = getComputedStyle(el);
+                        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                        if (parseFloat(cs.opacity) < 0.1) return false;
+                        return true;
+                    }};
+                    // First confirm the failure-text actually shows on the page.
+                    // No fail-text → not the failure case this guard is for.
+                    const bodyText = document.body ? (document.body.innerText || '') : '';
+                    if (!failPattern.test(bodyText)) return '';
+                    const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    for (const b of btns) {{
+                        if (isInComposerOrToolbar(b)) continue;
+                        if (!isVisible(b)) continue;
+                        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                        const txt = (b.textContent || '').trim().toLowerCase();
+                        if (!(retryWords.test(aria) || retryWords.test(txt))) continue;
+                        // Require either assistant-scope OR a fail-text token
+                        // inside the nearest block. Without one of those a
+                        // composer regenerate icon outside the toolbar can
+                        // sneak through.
+                        if (!isAssistantScoped(b)) {{
+                            const parent = b.closest('div, section, article, li, [role="dialog"]');
+                            if (!parent || !failPattern.test(parent.innerText || '')) continue;
+                        }}
+                        b.click();
+                        return aria || txt || 'matched';
+                    }}
+                    return '';
+                }}"""
+            )
+            if clicked:
+                log(f"[{label}] In-page Retry auto-clicked: '{clicked}' (poll {poll_n})", "INFO")
+                try:
+                    emit_event("inpage_retry_clicked", phase=2, agent=platform_l,
+                               match=str(clicked)[:60])
+                except Exception:
+                    pass
+                return True
+        except Exception as _pe:
+            log(f"[{label}] In-page retry probe raised: {_pe}", "DEBUG")
+        await asyncio.sleep(1.5)
+    return False
+
+
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
                                      brief, label, platform, verbose=False,
                                      brief_path=None):
@@ -18252,6 +18400,29 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 emit_event("pipeline_stopped", phase=2, agent="claude",
                            reason="user_stop_chat_mode")
                 return page, False
+            # 2026-05-14: the chat-mode alert action set is
+            # [Continue in chat mode] / [Skip Claude] / [Stop] — there is
+            # NO Retry button here. But await_agent_decision now also
+            # drains the hard-retry set (so the human-intervention Retry
+            # on other Claude alerts auto-resumes the pipeline). To stay
+            # safe if a stray retry_agent command lands while this wait
+            # is active, surface a SKIP rather than silently falling
+            # through to continue_anyway (which would auto-degrade the
+            # agent to chat mode without consent).
+            if decision == "retry":
+                log(f"[{label}] Retry requested on chat-mode alert (no retry path here) "
+                    f"— treating as Skip to avoid silent chat-mode degradation", "WARN")
+                _runtime.agent_modes["claude"] = {
+                    "requested": "research", "actual": "skipped",
+                    "user_acknowledged_chat": False,
+                }
+                emit_event("agent_skipped", phase=2, agent="claude",
+                           reason="retry_on_chat_mode_alert_unsupported")
+                fail_agent(platform_l, "Claude skipped — retry not supported in chat-mode alert",
+                           "Retry isn't a valid action on the Research-mode-unavailable "
+                           "alert. The agent was skipped to avoid silently running in "
+                           "chat mode without your consent.")
+                return page, False
             if decision == "skip" or decision == "timeout":
                 _runtime.agent_modes["claude"] = {
                     "requested": "research",
@@ -18358,6 +18529,19 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 log(f"[{label}] Send-decision wait errored: {_e}", "WARN")
 
     await asyncio.sleep(3)
+    # 2026-05-14: in-page Retry auto-click guard (Fix #515). If the agent
+    # immediately shows a 'Research stopped' / 'Failed' message after Send,
+    # click its in-page Retry button once. Avoids escalating a transient
+    # agent-side glitch to a human-intervention alert.
+    try:
+        retried = await _try_inpage_retry_on_research_fail(
+            page, platform, label, max_wait_s=20,
+        )
+        if retried:
+            log(f"[{label}] In-page Retry auto-click handled — research re-kicked", "INFO")
+            await asyncio.sleep(2)
+    except Exception as _re:
+        log(f"[{label}] In-page Retry guard raised (non-fatal): {_re}", "DEBUG")
     return page, True
 
 
