@@ -9484,11 +9484,18 @@ async def scrape_progress_gemini(page):
             // 3. Streaming attribute (Gemini marks actively streaming content)
             if (!isActive && document.querySelector('[data-is-streaming="true"], .loading-indicator, .streaming')) isActive = true;
             // 4. Animation detection (spinning/pulsing elements indicate active work)
+            // Use getAnimations() + playState === 'running' instead of CSS
+            // animationName !== 'none'. CSS animationName remains set on
+            // elements whose animations finished or never started, causing
+            // persistent UI chrome (avatars, fade-ins) to read as active long
+            // after generation completed.
             if (!isActive) {
                 const animated = document.querySelectorAll('[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"]');
                 for (const el of animated) {
-                    const cs = window.getComputedStyle(el);
-                    if (cs.animationName && cs.animationName !== 'none' && el.offsetParent !== null) { isActive = true; break; }
+                    if (el.offsetParent === null) continue;
+                    if (typeof el.getAnimations !== 'function') continue;
+                    const anims = el.getAnimations();
+                    if (anims.some(a => a.playState === 'running')) { isActive = true; break; }
                 }
             }
             // 5. Research progress panel still showing active steps
@@ -11662,12 +11669,22 @@ async def verify_chatgpt_generating(page) -> bool:
             // "Researching..." state, but no host-level stop button + a stale
             // "Thought for" badge made the host check return false 15× and the
             // outer loop spawned a 2nd ChatGPT tab.
+            // 2026-05-14 (refined): use getAnimations() + playState === 'running'.
+            // CSS animationName remains set on elements with completed/never-
+            // run animations, so the prior check returned true forever on
+            // persistent UI chrome (avatars, fade-ins) and caused Phase 1
+            // brief verify to read as "generating" for 27 min after the brief
+            // actually completed, leading the multi-signal stall watchdog to
+            // fire as a false alarm. Visibility gate added to skip hidden
+            // animated nodes that some component libraries keep mounted.
             const animated = document.querySelectorAll(
                 '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], [class*="streaming"]'
             );
             for (const el of animated) {
-                const style = window.getComputedStyle(el);
-                if (style.animationName && style.animationName !== 'none') return true;
+                if (el.offsetParent === null) continue;
+                if (typeof el.getAnimations !== 'function') continue;
+                const anims = el.getAnimations();
+                if (anims.some(a => a.playState === 'running')) return true;
             }
             // Body-level DR keyword sweep — narrowed to present-progressive
             // phrases that don't survive the finished response. Removed
@@ -11723,12 +11740,17 @@ async def verify_chatgpt_generating(page) -> bool:
                             // and the outer loop spawned a 2nd tab. E2E 2026-05-14:
                             // CUA had clicked Start research and the iframe was
                             // visibly rendering when this returned false 15×.
+                            // 2026-05-14 (refined): use getAnimations() + playState ===
+                            // 'running' to avoid false-positives from completed
+                            // animations whose CSS animationName remains set.
                             const animated = document.querySelectorAll(
                                 '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], [class*="streaming"]'
                             );
                             for (const el of animated) {
-                                const style = window.getComputedStyle(el);
-                                if (style.animationName && style.animationName !== 'none') return true;
+                                if (el.offsetParent === null) continue;
+                                if (typeof el.getAnimations !== 'function') continue;
+                                const anims = el.getAnimations();
+                                if (anims.some(a => a.playState === 'running')) return true;
                             }
                             const bl = (document.body?.innerText || '').toLowerCase();
                             // "Thought for X seconds" badge persists while DR
@@ -11771,11 +11793,16 @@ async def verify_gemini_generating(page) -> bool:
             }
             // Animation/streaming indicators
             if (document.querySelector('[data-is-streaming="true"], .loading-indicator')) return true;
-            // CSS animation on any element (spinning, pulsing)
+            // CSS animation on any element (spinning, pulsing).
+            // 2026-05-14: use getAnimations() + playState === 'running' so
+            // persisted-but-completed CSS animations on UI chrome don't
+            // false-positive (see verify_chatgpt_generating note).
             const animated = document.querySelectorAll('[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"]');
             for (const el of animated) {
-                const style = window.getComputedStyle(el);
-                if (style.animationName && style.animationName !== 'none') return true;
+                if (el.offsetParent === null) continue;
+                if (typeof el.getAnimations !== 'function') continue;
+                const anims = el.getAnimations();
+                if (anims.some(a => a.playState === 'running')) return true;
             }
             return false;
         }""")
@@ -11800,11 +11827,16 @@ async def verify_claude_generating(page) -> bool:
             }
             // Streaming/animation indicators
             if (document.querySelector('[data-is-streaming="true"]')) return true;
-            // CSS animation check (Claude uses spinning asterisk, pulsing indicators)
+            // CSS animation check (Claude uses spinning asterisk, pulsing indicators).
+            // 2026-05-14: use getAnimations() + playState === 'running' so
+            // persisted-but-completed CSS animations on UI chrome don't
+            // false-positive (see verify_chatgpt_generating note).
             const animated = document.querySelectorAll('[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], [class*="streaming"]');
             for (const el of animated) {
-                const style = window.getComputedStyle(el);
-                if (style.animationName && style.animationName !== 'none') return true;
+                if (el.offsetParent === null) continue;
+                if (typeof el.getAnimations !== 'function') continue;
+                const anims = el.getAnimations();
+                if (anims.some(a => a.playState === 'running')) return true;
             }
             return false;
         }""")
@@ -16186,7 +16218,17 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
             "Close any open side panel, open the canvas, then click the "
             "download icon and choose Export to Markdown.",
             max_iterations=12, cua_timeout_s=180.0,
-            download_timeout_ms=30000, min_chars=500, verbose=verbose,
+            # download_timeout_ms must exceed cua_timeout_s, since
+            # page.expect_download() starts its clock when the `async with`
+            # enters — which is BEFORE the CUA loop runs. With the prior
+            # 30s value, ChatGPT's CUA loop (which takes ~30-45s to reach
+            # the final 'Export to Markdown' click) would race the
+            # listener: the listener expired ~2s before the click fired,
+            # so the actual download wasn't captured and T1 silently
+            # fell back to T3 clipboard hijack (which loses markdown
+            # structure). cua_timeout_s + 15s grace covers the final
+            # click + download-event RTT.
+            download_timeout_ms=195000, min_chars=500, verbose=verbose,
         )
         if md and len(md) >= 500:
             if _is_sources_not_document(md, platform="chatgpt"):
@@ -16599,7 +16641,10 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 "small down-arrow button next to the Copy button, and click "
                 "Download as Markdown.",
                 max_iterations=12, cua_timeout_s=150.0,
-                download_timeout_ms=30000, min_chars=500, verbose=verbose,
+                # See ChatGPT T1 note above: download_timeout_ms must
+                # exceed cua_timeout_s so the listener stays alive past
+                # the final click. cua_timeout_s + 15s grace.
+                download_timeout_ms=165000, min_chars=500, verbose=verbose,
             )
             if md_dl and len(md_dl) >= 500:
                 if _is_sources_not_document(md_dl, platform="claude"):
@@ -18206,7 +18251,11 @@ async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=2
         r"something\\s+went\\s+wrong|encountered\\s+an?\\s+(?:issue|error)|"
         r"unable\\s+to\\s+(?:continue|complete|generate)|"
         r"couldn'?t\\s+complete|response\\s+stopped|"
-        r"this\\s+research\\s+(?:was\\s+)?(?:stopped|interrupted)"
+        r"this\\s+research\\s+(?:was\\s+)?(?:stopped|interrupted)|"
+        r"sorry,?\\s+(?:i'?m\\s+|i\\s+)?can'?t\\s+help|"
+        r"i\\s+can'?t\\s+help\\s+(?:you\\s+)?with\\s+that|"
+        r"can'?t\\s+help\\s+(?:you\\s+)?with\\s+that\\s+at\\s+this\\s+time|"
+        r"i'?m\\s+(?:unable|not\\s+able)\\s+to\\s+help"
     )
     while asyncio.get_event_loop().time() < deadline:
         poll_n += 1
@@ -18226,7 +18275,14 @@ async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=2
                     );
                     const isAssistantScoped = (el) => !!el.closest(
                         '[data-message-author-role="assistant"], .font-claude-message, ' +
-                        '[data-testid*="conversation-turn"]'
+                        '[data-testid*="conversation-turn"], ' +
+                        // Gemini custom-element + class selectors for the model
+                        // response bubble. Without these the refusal-text
+                        // assistant-scope check returned false and the function
+                        // skipped the regenerate-button click that the soft-
+                        // refusal regex had just matched.
+                        'message-content, model-response, ' +
+                        '.model-response-text, .response-container'
                     );
                     const isVisible = (el) => {{
                         const r = el.getBoundingClientRect();
@@ -18575,9 +18631,13 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # immediately shows a 'Research stopped' / 'Failed' message after Send,
     # click its in-page Retry button once. Avoids escalating a transient
     # agent-side glitch to a human-intervention alert.
+    # Gemini gets a longer window because its "show thinking" path can
+    # take 30-60s before producing a soft-refusal ("Sorry, I can't help…")
+    # — the 20s default missed it and the user had to retry manually.
+    _retry_wait_s = 90 if platform_l == "gemini" else 20
     try:
         retried = await _try_inpage_retry_on_research_fail(
-            page, platform, label, max_wait_s=20,
+            page, platform, label, max_wait_s=_retry_wait_s,
         )
         if retried:
             log(f"[{label}] In-page Retry auto-click handled — research re-kicked", "INFO")
