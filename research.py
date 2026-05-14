@@ -15831,6 +15831,278 @@ async def _copy_via_hijack_anyframe(page, label, **kwargs):
     return ""
 
 
+async def _extract_via_download(
+    page,
+    label,
+    trigger_selectors,
+    menu_item_text_pattern,
+    *,
+    timeout_ms=15000,
+    min_chars=500,
+):
+    """Tier 2 (ChatGPT) / Tier 1 (Claude) primitive — click a download/
+    export menu trigger, pick a matching menu item, intercept the
+    Playwright download event, read the file as UTF-8. Returns "" on any
+    failure. Wayland-safe — no OS clipboard involvement.
+
+    Flow: trigger button → ~600ms for menu mount → menu item matching
+    `menu_item_text_pattern` (case-insensitive) → expect_download wraps
+    the menu item click → download.path() → file read → delete to keep
+    Playwright's temp dir clean.
+    """
+    import re as _re
+    pat = _re.compile(menu_item_text_pattern, _re.IGNORECASE)
+    menu_root_sel = '[role="menu"], [role="menuitem"], mat-menu-panel, [class*="menu"]'
+    menu_opened = False
+
+    # ── Step 1: find + click trigger ──
+    trigger_handle = None
+    try:
+        for sel in trigger_selectors:
+            try:
+                els = await page.query_selector_all(sel)
+            except Exception:
+                continue
+            for el in els:
+                try:
+                    if not await el.is_visible():
+                        continue
+                    if not await el.is_enabled():
+                        continue
+                except Exception:
+                    continue
+                trigger_handle = el
+                break
+            if trigger_handle:
+                break
+        if not trigger_handle:
+            log(f"[{label}] Download extract: no trigger button matched {trigger_selectors[:3]}…", "WARN")
+            return ""
+        try:
+            await trigger_handle.click()
+        except Exception as e:
+            log(f"[{label}] Download extract: trigger click failed: {e}", "WARN")
+            return ""
+
+        # ── Step 2: wait for menu, locate matching item ──
+        await asyncio.sleep(0.6)
+        menu_opened = True
+        item_handle = None
+        try:
+            candidates = await page.query_selector_all(menu_root_sel)
+        except Exception:
+            candidates = []
+        # Flatten: each candidate may itself be a menu OR an item. Scan text
+        # on the candidate AND its descendant buttons/menuitems.
+        for c in candidates:
+            try:
+                if not await c.is_visible():
+                    continue
+            except Exception:
+                continue
+            try:
+                inner = await c.query_selector_all(
+                    '[role="menuitem"], button, [role="button"], a'
+                )
+            except Exception:
+                inner = []
+            scan = inner if inner else [c]
+            for it in scan:
+                try:
+                    txt = (await it.inner_text()).strip()
+                except Exception:
+                    continue
+                if txt and pat.search(txt):
+                    item_handle = it
+                    break
+            if item_handle:
+                break
+        if not item_handle:
+            log(f"[{label}] Download extract: no menu item matched /{menu_item_text_pattern}/i", "WARN")
+            return ""
+
+        # ── Step 3: expect_download wrapping the menu item click ──
+        download = None
+        try:
+            async with page.expect_download(timeout=timeout_ms) as dl_info:
+                try:
+                    await item_handle.click()
+                except Exception as e:
+                    log(f"[{label}] Download extract: menu item click failed: {e}", "WARN")
+                    return ""
+            download = await dl_info.value
+        except Exception as e:
+            log(f"[{label}] Download extract: no download event within {timeout_ms}ms: {e}", "WARN")
+            return ""
+
+        # ── Step 4: read the downloaded file + clean up Playwright tmp ──
+        content = ""
+        try:
+            path = await download.path()
+            if not path:
+                log(f"[{label}] Download extract: download.path() returned None", "WARN")
+                return ""
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            log(f"[{label}] Download extract: file read failed: {e}", "WARN")
+            return ""
+        finally:
+            if download is not None:
+                try:
+                    await download.delete()
+                except Exception:
+                    pass
+
+        if len(content) < min_chars:
+            log(f"[{label}] Download extract: captured {len(content)} chars < min {min_chars}", "WARN")
+            return ""
+        log(f"[{label}] Download extract captured {len(content)} chars")
+        return content
+    finally:
+        # Best-effort menu dismiss if we opened one but didn't fire a download.
+        if menu_opened:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+
+async def _run_with_clipboard_hijack(
+    page,
+    label,
+    trigger,
+    *,
+    timeout_ms=30000,
+    min_chars=500,
+):
+    """Tier 3 primitive — install JS clipboard hooks, run a caller-supplied
+    async trigger (Playwright keyboard chord, button click, CUA agent_loop
+    — anything that ends in a `copy` event or navigator.clipboard.write*),
+    then read the captured text back from a window global. Wayland-safe
+    — never reads the OS clipboard.
+
+    Generalisation of `_copy_via_hijack`: the in-page click is no longer
+    baked into the JS evaluate, so the trigger can be Python-side. Uses
+    a separate `__dg_cb_*` global namespace so concurrent use with the
+    older `_copy_via_hijack` on the same page won't clobber either side.
+
+    `timeout_ms` bounds the trigger's run time. Set it ABOVE the trigger's
+    own internal wait_for cap when wrapping a CUA loop (e.g. 200000 around
+    an inner wait_for(180.0)) — otherwise the helper kills CUA prematurely.
+    """
+    install_ok = False
+    try:
+        # ── Step 1: install hooks ──
+        try:
+            await page.evaluate(r"""() => {
+                if (window.__dg_cb_hijack_active) return false;
+                window.__dg_cb_hijack_active = true;
+                window.__dg_cb_captured_text = '';
+
+                const copyHandler = (e) => {
+                    try {
+                        if (!e.clipboardData) return;
+                        const t = e.clipboardData.getData('text/plain') || '';
+                        if (t && t.length > (window.__dg_cb_captured_text || '').length) {
+                            window.__dg_cb_captured_text = t;
+                        }
+                    } catch {}
+                };
+                document.addEventListener('copy', copyHandler, { capture: true });
+
+                const origWriteText = navigator.clipboard && navigator.clipboard.writeText
+                    ? navigator.clipboard.writeText.bind(navigator.clipboard) : null;
+                if (origWriteText) {
+                    navigator.clipboard.writeText = async (t) => {
+                        try {
+                            if (t && t.length > (window.__dg_cb_captured_text || '').length) {
+                                window.__dg_cb_captured_text = t;
+                            }
+                        } catch {}
+                        return origWriteText(t);
+                    };
+                }
+
+                const origWrite = navigator.clipboard && navigator.clipboard.write
+                    ? navigator.clipboard.write.bind(navigator.clipboard) : null;
+                if (origWrite) {
+                    navigator.clipboard.write = async (items) => {
+                        try {
+                            for (const item of items || []) {
+                                for (const ty of (item.types || [])) {
+                                    try {
+                                        const blob = await item.getType(ty);
+                                        const s = await blob.text();
+                                        if (ty === 'text/plain' && s
+                                            && s.length > (window.__dg_cb_captured_text || '').length) {
+                                            window.__dg_cb_captured_text = s;
+                                        }
+                                    } catch {}
+                                }
+                            }
+                        } catch {}
+                        return origWrite(items);
+                    };
+                }
+
+                const beforeUnload = () => { try { window.__dg_unhook?.(); } catch {} };
+                window.addEventListener('beforeunload', beforeUnload, { once: true });
+
+                window.__dg_unhook = () => {
+                    try { document.removeEventListener('copy', copyHandler, { capture: true }); } catch {}
+                    if (origWriteText) {
+                        try { navigator.clipboard.writeText = origWriteText; } catch {}
+                    }
+                    if (origWrite) {
+                        try { navigator.clipboard.write = origWrite; } catch {}
+                    }
+                    try { window.removeEventListener('beforeunload', beforeUnload); } catch {}
+                    window.__dg_cb_hijack_active = false;
+                };
+                return true;
+            }""")
+            install_ok = True
+        except Exception as e:
+            log(f"[{label}] Clipboard hijack: install failed: {e}", "WARN")
+            return ""
+
+        # ── Step 2: run trigger (Playwright/CUA/whatever the caller wants) ──
+        try:
+            await asyncio.wait_for(trigger(), timeout=timeout_ms / 1000.0)
+        except asyncio.TimeoutError:
+            log(f"[{label}] Clipboard hijack: trigger exceeded {timeout_ms}ms", "WARN")
+        except Exception as e:
+            log(f"[{label}] Clipboard hijack: trigger raised: {e}", "WARN")
+
+        # ── Step 3: poll for async clipboard writes ──
+        captured = ""
+        for _ in range(5):
+            try:
+                captured = await page.evaluate(
+                    "() => window.__dg_cb_captured_text || ''"
+                )
+            except Exception as e:
+                log(f"[{label}] Clipboard hijack: read failed: {e}", "WARN")
+                return ""
+            if captured and len(captured) >= min_chars:
+                break
+            await asyncio.sleep(0.2)
+
+        if not captured or len(captured) < min_chars:
+            log(f"[{label}] Clipboard hijack: captured {len(captured or '')} chars < min {min_chars}", "WARN")
+            return ""
+        log(f"[{label}] Clipboard hijack captured {len(captured)} chars")
+        return captured
+    finally:
+        # Restore originals even on exception / context death.
+        if install_ok:
+            try:
+                await page.evaluate("() => { try { window.__dg_unhook && window.__dg_unhook(); } catch {} }")
+            except Exception:
+                pass
+
+
 async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
     """Extract ChatGPT response. Strategy (E4 / DGOPS-7366):
         Step 0  — Playwright opens the canvas/artifact (mounts the DOM target).
@@ -16002,138 +16274,90 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
             log(f"[{label}] Extracted via HTML→MD (canvas/artifact): {len(md)} chars")
             return md
 
-    # Tier 2A: Copy button + clipboard event hijack via kebab/download
-    # icon → "Copy contents" menu (canvas-scoped). Drift-tolerant since
-    # the agent's own Copy button emits canonical markdown, not a class-
-    # name-dependent DOM scrape. Iframe-aware via _copy_via_hijack_anyframe
-    # (DR artifact lives in a cross-origin sandbox iframe).
-    #
-    # 2026-05-13: ChatGPT's iframe-side toolbar exposes Copy via a
-    # download-shaped icon button that opens a 4-item menu: Copy contents,
-    # Export to markdown, Export to Word, Export to PDF. Selectors target
-    # both the download/export icon variants and the legacy kebab variants.
-    md = await _copy_via_hijack_anyframe(
+    # ── Tier 2 (2026-05-13 rewrite): Download menu → Export to Markdown ──
+    # Click the canvas's download/export icon → menu opens (4 items per
+    # user screenshot: Copy contents, Export to Markdown, Export to Word,
+    # Export to PDF) → click "Export to Markdown" → Playwright
+    # expect_download() captures the .md file. Wayland-safe (no OS
+    # clipboard). Scoped to canvas/dialog first to avoid page-chrome
+    # share/export buttons.
+    md = await _extract_via_download(
         page, label,
-        canvas_root_selectors=[
-            '[class*="canvas"]',
-            '[data-testid*="canvas"]',
-            'main [role="region"]',
-            '[role="dialog"]',
-            'article',
-            'main',
-        ],
-        kebab_selectors=[
-            # Download / export icon (user-described "download-like button")
-            'button[aria-label*="export" i]',
+        trigger_selectors=[
+            '[role="dialog"] button[aria-label*="download" i]',
+            '[role="dialog"] button[aria-label*="export" i]',
+            '[role="dialog"] button[title*="download" i]',
+            '[role="dialog"] button[title*="export" i]',
+            '[class*="canvas"] button[aria-label*="download" i]',
+            '[class*="canvas"] button[aria-label*="export" i]',
+            '[data-testid*="canvas"] button[aria-label*="download" i]',
+            '[data-testid*="canvas"] button[aria-label*="export" i]',
             'button[aria-label*="download" i]',
+            'button[aria-label*="export" i]',
             'button[aria-label*="save" i]',
-            'button[title*="export" i]',
             'button[title*="download" i]',
+            'button[title*="export" i]',
             'button:has(svg[class*="download" i])',
             'button:has(svg[class*="export" i])',
             'button:has(svg[class*="save" i])',
-            # Legacy 3-dot / kebab variants
-            'button[aria-haspopup="menu"]',
-            'button[aria-label*="more" i]',
-            'button[data-testid*="more"]',
-            'button[aria-label*="menu" i]',
-            'button:has(svg[class*="ellipsis"])',
-            'button:has(svg[class*="dots"])',
         ],
-        menuitem_text_pattern=r'(copy\s+contents?|copy\s+as\s+markdown|copy\s+text|export\s+(to\s+)?markdown|download\s+(as\s+)?markdown)',
-        min_chars=2000,
-    )
-    if md and len(md) >= 2000 and not _is_sources_not_document(md, platform="chatgpt"):
-        log(f"[{label}] Extracted via Copy hijack (canvas → menu): {len(md)} chars")
-        return md
-    if md and _is_sources_not_document(md, platform="chatgpt"):
-        log(f"[{label}] Copy hijack wrong-artifact ({len(md)} chars) — falling to Tier 2B", "WARN")
-        try:
-            emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
-                       op="finalize_copy", length=len(md), tier="copy_hijack")
-        except Exception:
-            pass
-
-    # Tier 2B: direct Copy button on the last assistant message. Serves
-    # P1 (brief, where there's no canvas → Tier 2A no-ops) AND P2
-    # fallback when the kebab/download path didn't fire. Same hijack pattern.
-    md = await _copy_via_hijack_anyframe(
-        page, label,
-        direct_copy_selectors=[
-            '[data-message-author-role="assistant"]:last-of-type button[aria-label*="copy" i]:not([aria-label*="code" i]):not([aria-label*="link" i])',
-            '[data-message-author-role="assistant"]:last-of-type button[data-testid*="copy"]',
-            # Iframe-side: DR document toolbar at top of canvas
-            'button[aria-label="Copy" i]',
-            'button[title="Copy" i]',
-        ],
+        menu_item_text_pattern=r"export\s+to\s+markdown",
+        timeout_ms=15000,
         min_chars=500,
     )
-    if md and len(md) >= 500 and not _is_sources_not_document(md, platform="chatgpt"):
-        log(f"[{label}] Extracted via Copy hijack (assistant-msg direct): {len(md)} chars")
-        return md
+    if md and len(md) >= 500:
+        if _is_sources_not_document(md, platform="chatgpt"):
+            log(f"[{label}] Download export wrong-artifact ({len(md)} chars) — falling to Tier 3", "WARN")
+            try:
+                emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                           op="finalize_copy", length=len(md), tier="download_export_md")
+            except Exception:
+                pass
+        else:
+            log(f"[{label}] Extracted via download menu (Export to Markdown): {len(md)} chars")
+            return md
 
-    # Tier 3 (LAST RESORT, Win/Mac/X11 only): CUA opens the artifact and
-    # copies it to the OS clipboard. Gated off on Wayland — get_clipboard
-    # returns 0 chars there regardless of how cleanly CUA executes Ctrl+C.
-    # Shadow-wrapped (#2c) and content-validated. Inner retry cap 2 attempts.
-    _cgpt_2c_attempts = 0
-    while _cgpt_2c_attempts < 2 and browser and cua_client and not _IS_WAYLAND:
-        _cgpt_2c_attempts += 1
-        log(f"[{label}] CUA: Opening and copying Deep Research artifact "
-            f"(attempt {_cgpt_2c_attempts}/2 — DOM methods returned empty)...")
-        await browser.switch_to_page(page)
-        async def _cgpt_finalize_cua():
-            return await asyncio.wait_for(
+    # ── Tier 3 (LAST RESORT, Wayland-safe): CUA + JS clipboard hijack ──
+    # _run_with_clipboard_hijack installs the JS hook before CUA's Ctrl+A/C
+    # so the page's own copy event is intercepted in-DOM. No OS clipboard
+    # read → works on Wayland/X11/Win/Mac uniformly. Single attempt — the
+    # helper owns retry policy. Helper timeout_ms set ABOVE the inner CUA
+    # wait_for(180) so the inner cap fires first, not the helper.
+    if browser and cua_client:
+        async def _cgpt_t3_trigger():
+            await browser.switch_to_page(page)
+            await asyncio.wait_for(
                 agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CHATGPT,
                     "Open the research report document and copy its full "
                     "content to clipboard.",
-                    model=CUA_MODEL,
-                    max_iterations=12 if _cgpt_2c_attempts == 1 else 16,
+                    model=CUA_MODEL, max_iterations=12,
                     verbose=verbose, target_page=page),
                 timeout=180.0)
+
+        log(f"[{label}] CUA: Opening and copying Deep Research artifact "
+            f"(Tier 3 — DOM + download methods returned empty)...")
         try:
-            await _shadow_observed_cua(
-                page, hotspot_id="2c", phase=2, platform="chatgpt",
-                current_step="copy_open_artifact",
-                context_hint=f"finalize attempt {_cgpt_2c_attempts}; step0 enlarge already tried",
-                expected_outcome="canvas overlay visible, copy succeeded, "
-                                 "clipboard holds long-form report markdown",
-                cua_coro_factory=_cgpt_finalize_cua)
+            md = await _run_with_clipboard_hijack(
+                page, label, _cgpt_t3_trigger,
+                timeout_ms=200000, min_chars=500)
         except asyncio.TimeoutError:
-            log(f"[{label}] CUA finalize timed out after 180s "
-                f"(attempt {_cgpt_2c_attempts})", "WARN")
-            continue
+            log(f"[{label}] CUA finalize timed out after 180s", "WARN")
+            md = ""
         except Exception as _e:
             log(f"[{label}] CUA finalize raised: {_e}", "WARN")
-            continue
-        await asyncio.sleep(1)
-        clipboard = get_clipboard()
-        if not clipboard or len(clipboard) <= 500:
-            log(f"[{label}] CUA copy got {len(clipboard or '')} chars "
-                f"(attempt {_cgpt_2c_attempts})", "WARN")
-            continue
-        if _is_sources_not_document(clipboard, platform="chatgpt"):
-            log(f"[{label}] CUA copy returned WRONG ARTIFACT "
-                f"(source-panel/preview, {len(clipboard)} chars) — rejecting "
-                f"(attempt {_cgpt_2c_attempts}/2)", "WARN")
-            try:
-                emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
-                           op="finalize_copy", attempt=_cgpt_2c_attempts,
-                           length=len(clipboard), tier="cua")
-            except Exception:
-                pass
-            if _cgpt_2c_attempts < 2:
+            md = ""
+        if md and len(md) >= 500:
+            if _is_sources_not_document(md, platform="chatgpt"):
+                log(f"[{label}] CUA hijack returned WRONG ARTIFACT "
+                    f"(source-panel/preview, {len(md)} chars) — rejecting", "WARN")
                 try:
-                    await page.keyboard.press("Escape")
-                    await asyncio.sleep(0.4)
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(0.6)
-                    clear_clipboard()
+                    emit_event("wrong_artifact_rejected", phase=2, agent="chatgpt",
+                               op="finalize_copy", length=len(md), tier="cua_hijack")
                 except Exception:
                     pass
-            continue
-        log(f"[{label}] Extracted via CUA artifact copy (last-resort): {len(clipboard)} chars")
-        return clipboard
+            else:
+                log(f"[{label}] Extracted via CUA + clipboard hijack (last-resort): {len(md)} chars")
+                return md
 
     try:
         emit_event("extract_failed", phase=2, agent="chatgpt",
@@ -16146,20 +16370,27 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 
 
 async def extract_gemini_response(page, browser=None, cua_client=None, label="Gemini", verbose=False):
-    """Dedicated Gemini extractor — HTML→MD → copy button → JS → clipboard.
-    Each method emits an explicit log line so the path that succeeded (or
-    the one that silently returned empty) is visible in the run log.
+    """Dedicated Gemini extractor — 3 Wayland-safe tiers:
+      Tier 1: HTML→MD from Gemini's response containers (proven primary).
+      Tier 2: Share & Export → "Copy contents" via JS clipboard hijack.
+      Tier 3: Ctrl+A / Ctrl+C with JS clipboard hijack (no OS clipboard).
+    Each tier emits an explicit log line so the path that succeeded (or
+    silently returned empty) is visible in the run log.
     Returns the markdown/text or "" on total failure."""
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
-    # 2026-05-13 TIER SWAP: HTML→MD promoted from old Tier 2 to NEW Tier 1.
-    # HTML→MD has shipped 24k–47k chars consistently across many runs;
-    # hijack has 0 successes (`Copy hijack captured` never logged). Per
-    # user spec: ship the proven path first; hijack becomes Tier 2 fallback.
-    #
-    # Tier 1 (NEW PRIMARY): HTML→MD from Gemini's response containers.
+    # 2026-05-13 ARCHITECTURE: collapsed from 5 tiers (1 + 2A/2B/2C + 3) to
+    # exactly 3 Wayland-safe tiers. Old Tier 2A (direct Copy blind hunt)
+    # and 2C (CDK overlay guess) never matched in any historical run; old
+    # Tier 3's OS clipboard read was Wayland-gated and useless on Linux.
+    # New Tier 3 uses a JS clipboard hijack around Ctrl+A/C, which works
+    # on every platform.
+
+    # ── Tier 1: HTML→MD from Gemini's response containers ──
+    # Has shipped 23k–47k chars consistently across many runs — keep
+    # as primary.
     md = await _extract_html_to_md(page, [
         'message-content', '.model-response-text', '.response-container',
     ], label)
@@ -16172,46 +16403,13 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             log(f"[{label}] Extracted via HTML→MD: {len(md)} chars")
             return md
 
-    # Tier 2A: Copy hijack via direct Copy buttons. Scoped to response
-    # containers so we don't misfire onto code-block Copy buttons or
-    # share-dialog Copy links.
-    md = await _copy_via_hijack(
-        page, label,
-        direct_copy_selectors=[
-            'message-content button[aria-label*="copy" i]',
-            '.model-response-text button[aria-label*="copy" i]',
-            '.response-container button[aria-label*="copy" i]',
-            'message-actions button[aria-label*="copy" i]',
-            '[data-test-id*="copy"]',
-            # Exact-match + title-attr variants (Gemini sometimes renders
-            # aria-label="Copy" exactly, with no surrounding words)
-            'message-actions button[aria-label="Copy"]',
-            '.model-response-text button[aria-label="Copy"]',
-            'button[mattooltip*="copy" i]',
-            'button[mattooltip="Copy"]',
-        ],
-        scoping_excludes=[
-            '[role="dialog"]',
-            'mat-dialog-container',
-            'pre code',
-            '[class*="code-block"]',
-            'aside',
-            'nav',
-            '[role="navigation"]',
-        ],
-        wait_ms=8000,
-        min_chars=100,
-    )
-    if md and len(md) >= 100:
-        log(f"[{label}] Extracted via Copy hijack: {len(md)} chars")
-        return md
-
-    # Tier 2B (Share & Export menu — user-marked path): Gemini's Copy
-    # action is nested inside a "Share & Export" dropdown in the
-    # response toolbar (image: 2026-05-13). Two-step interaction: click
-    # the Share-&-Export button, then click "Copy contents" menuitem.
-    # Selectors target aria-label/mattooltip variants for the parent
-    # button + a permissive menuitem regex that matches "Copy contents".
+    # ── Tier 2: Share & Export → "Copy contents" via clipboard hijack ──
+    # Gemini's Copy action is nested inside a "Share & Export" dropdown in
+    # the response toolbar (per user screenshot). Two-step interaction via
+    # the existing _copy_via_hijack helper: click Share & Export, then click
+    # "Copy contents" menuitem. JS hijack captures the page's clipboard
+    # write — Wayland-safe. TARGETED selectors only; the old blind
+    # "more options" / aria-haspopup fallback is removed.
     md = await _copy_via_hijack(
         page, label,
         canvas_root_selectors=[
@@ -16221,7 +16419,6 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             'message-actions',
         ],
         kebab_selectors=[
-            # Share & Export button — aria-label / mattooltip / title variants
             'message-actions button[aria-label*="share & export" i]',
             'message-actions button[mattooltip*="share & export" i]',
             'message-actions button[aria-label*="share and export" i]',
@@ -16231,13 +16428,9 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             'message-actions button[mattooltip*="export" i]',
             '.response-container button[aria-label*="share" i]',
             '.response-container button[aria-label*="export" i]',
-            # SVG-icon hint (Material icon for share)
             'message-actions button:has(mat-icon[fonticon*="share" i])',
             'message-actions button:has(mat-icon[fonticon*="export" i])',
             'message-actions button:has(mat-icon[fonticon*="ios_share" i])',
-            # Legacy "more options" kebab as ultimate fallback
-            'message-actions button[aria-label*="more" i]',
-            'message-actions button[aria-haspopup="menu"]',
         ],
         menuitem_text_pattern=r'copy(\s+(contents?|response|markdown|text|to\s+clipboard))?',
         scoping_excludes=[
@@ -16253,45 +16446,42 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         min_chars=100,
     )
     if md and len(md) >= 100:
-        log(f"[{label}] Extracted via Copy hijack (Share & Export → menuitem): {len(md)} chars")
+        log(f"[{label}] Extracted via Copy hijack (Share & Export → Copy contents): {len(md)} chars")
         return md
 
-    # Tier 2C: one more direct-selector pass against the Material CDK
-    # overlay surface, in case the share/export menu opens but the kebab
-    # path missed it (some Gemini builds wire the menu via right-click /
-    # share button directly).
-    md = await _copy_via_hijack(
-        page, label,
-        direct_copy_selectors=[
-            'cdk-overlay-container [role="menu"] button[mattooltip*="copy" i]',
-            'cdk-overlay-container [role="menu"] button[aria-label*="copy" i]',
-            'mat-menu-panel button[aria-label*="copy" i]',
-            'mat-menu-panel button[mattooltip*="copy" i]',
-        ],
-        scoping_excludes=[
-            'pre code',
-            '[class*="code-block"]',
-        ],
-        wait_ms=4000,
-        min_chars=100,
-    )
-    if md and len(md) >= 100:
-        log(f"[{label}] Extracted via Copy hijack (CDK overlay): {len(md)} chars")
-        return md
-
-    # Tier 3 (LAST RESORT, Win/Mac/X11 only): select-all + OS clipboard.
-    # Gated off on Wayland — get_clipboard returns 0 chars there.
-    if not _IS_WAYLAND:
-        log(f"[{label}] Falling back to select-all clipboard (Tier 3)", "WARN")
+    # ── Tier 3 (LAST RESORT, Wayland-safe): Ctrl+A/C + clipboard hijack ──
+    # JS clipboard hijack intercepts the browser's own copy event before
+    # the OS clipboard is touched, so this works on Wayland, X11, Windows,
+    # and macOS uniformly. No _IS_WAYLAND gate (that was the old OS-
+    # clipboard path's limitation). First click the response container to
+    # ensure focus is on the response (not the composer); otherwise Ctrl+A
+    # would select only the composer's input text.
+    async def _gemini_t3_trigger():
+        # Focus the response area before select-all. Without this, focus
+        # may still be in the composer and Ctrl+A selects only the
+        # composer's text (the old Tier 3 inherited this failure mode).
+        try:
+            await page.click('message-content, .model-response-text', timeout=2000)
+        except Exception:
+            # Best-effort — proceed even if click missed; the response
+            # area is typically already focused after a completed turn.
+            pass
+        await asyncio.sleep(0.3)
         await page.keyboard.press("Control+a")
         await asyncio.sleep(0.5)
         await page.keyboard.press("Control+c")
-        await asyncio.sleep(1)
-        clip = get_clipboard() or ""
-        if clip and len(clip) > 100:
-            log(f"[{label}] Extracted via select-all clipboard: {len(clip)} chars")
-            return clip
-    log(f"[{label}] All extraction tiers failed (wayland={_IS_WAYLAND}) — returning empty", "ERROR")
+        await asyncio.sleep(0.5)
+
+    log(f"[{label}] Falling back to select-all + clipboard hijack (Tier 3)", "WARN")
+    md = await _run_with_clipboard_hijack(
+        page, label, _gemini_t3_trigger,
+        timeout_ms=30000, min_chars=100,
+    )
+    if md and len(md) >= 100:
+        log(f"[{label}] Extracted via select-all + clipboard hijack: {len(md)} chars")
+        return md
+
+    log(f"[{label}] All extraction tiers failed — returning empty", "ERROR")
     return ""
 
 
@@ -16448,55 +16638,68 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             except Exception:
                 await asyncio.sleep(1.5)
 
-            # 2026-05-13 TIER SWAP (research-mode branch): HTML→MD-paths
-            # promoted to Tier 1 + 2A. Hijack demoted to Tier 2B + 2C.
-            # Rationale: zero `Copy hijack captured` successes in any
-            # historical log across all 3 agents. HTML→MD via the smart
-            # `_read_claude_artifact_panel` (iframe-walk + nav-reject)
-            # plus the broader-selector `_extract_html_to_md` are the
-            # proven paths. Hijack stays as fallback to catch any future
-            # HTML→MD drift, but moved AFTER the proven paths.
-            #
-            # Tier 1 (NEW PRIMARY): smart panel reader — iframe-walk +
-            # retry + nav-shape reject. Reads from artifact-panel-scoped
-            # selectors only (no bare `aside` fallback as of 2026-05-13).
-            panel_text = await _read_claude_artifact_panel(page)
-            if panel_text and len(panel_text) > 500:
-                if _is_sources_not_document(panel_text, platform="claude"):
-                    log(f"[{label}] T1 panel wrong-artifact "
-                        f"(checklist, {len(panel_text)} chars) — fall through", "WARN")
+            # 2026-05-13 ARCHITECTURE: collapsed from 4-tier ladder (panel-
+            # reader + publish + html-md + copy-hijack + CUA-OS-clipboard)
+            # into exactly 3 Wayland-safe tiers per user sign-off. Removes
+            # the _IS_WAYLAND gate (Tier 3 now uses a JS clipboard hijack
+            # that works on every backend) and removes the OS-clipboard
+            # `get_clipboard()` read entirely.
+
+            # ── Tier 1 (NEW PRIMARY): Download as Markdown ──
+            # The small icon button beside the Copy button in the artifact-
+            # panel header opens a menu with "Download as Markdown" / PDF
+            # (per user screenshot). Playwright expect_download() captures
+            # the .md file. Direct file capture is the highest-fidelity
+            # scrape surface — zero HTML→MD drift, zero clipboard backend
+            # dependency. Wayland-safe.
+            md_dl = await _extract_via_download(
+                page, label,
+                trigger_selectors=[
+                    # Scoped to artifact panel — strongest match. Exclude
+                    # aria-label*="copy" so we don't grab the Copy button
+                    # itself (which lives next to the download icon).
+                    '[class*="artifact-panel"] button[aria-label*="download" i]:not([aria-label*="copy" i])',
+                    '[class*="artifact-panel"] button[aria-label*="more" i]:not([aria-label*="copy" i])',
+                    '[class*="artifact-panel"] button[aria-label*="menu" i]:not([aria-label*="copy" i])',
+                    '[class*="artifact-panel"] button[aria-label*="options" i]:not([aria-label*="copy" i])',
+                    '[class*="artifact-panel"] button[aria-haspopup="menu"]:not([aria-label*="copy" i])',
+                    '[class*="artifact-panel"] header button[aria-haspopup="menu"]:not([aria-label*="copy" i])',
+                    '[class*="artifact-panel"] [class*="header"] button[aria-haspopup="menu"]:not([aria-label*="copy" i])',
+                    '[class*="side-panel"] button[aria-label*="download" i]',
+                    '[class*="right-panel"] button[aria-label*="download" i]',
+                    # SVG-icon hints (download/chevron/ellipsis) — the
+                    # marked icon in the user-supplied screenshot
+                    '[class*="artifact-panel"] button:has(svg[class*="download" i])',
+                    '[class*="artifact-panel"] button:has(svg[class*="chevron-down" i])',
+                    '[class*="artifact-panel"] button:has(svg[class*="ellipsis"])',
+                    '[class*="artifact-panel"] button:has(svg[class*="dots"])',
+                ],
+                menu_item_text_pattern=r'download\s+as\s+markdown',
+                timeout_ms=15000,
+                min_chars=500,
+            )
+            if md_dl and len(md_dl) >= 500:
+                if _is_sources_not_document(md_dl, platform="claude"):
+                    log(f"[{label}] T1 download wrong-artifact "
+                        f"({len(md_dl)} chars) — falling to Tier 2", "WARN")
                     try:
                         emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                                   op="finalize_copy", length=len(panel_text),
-                                   tier="dom_panel")
+                                   op="finalize_copy", length=len(md_dl),
+                                   tier="download_md")
                     except Exception:
                         pass
-                    try:
-                        await _close_claude_artifact_panel(page)
-                        await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
-                elif _looks_like_nav_sidebar(panel_text):
-                    log(f"[{label}] T1 panel looks-like-nav-sidebar "
-                        f"({len(panel_text)} chars) — fall through", "WARN")
                 else:
-                    log(f"[{label}] Extracted via DOM artifact panel ({target_idx}): "
-                        f"{len(panel_text)} chars")
-                    return panel_text
+                    log(f"[{label}] Extracted via T1 download (.md): {len(md_dl)} chars")
+                    return md_dl
 
-            # Tier 2 (2026-05-13): publish artifact + HTML→MD scrape on
-            # the resulting claude.site full-page. Per user direction —
-            # the published page renders the report on a clean DOM with
-            # zero chat/nav/iframe chrome, making it the most drift-
-            # resistant scrape surface after the in-chat smart reader.
-            # New tab keeps main-page state intact so subsequent tiers
-            # (and the orchestrator's downstream publish-for-link call)
-            # don't have to navigate back. Idempotent: subsequent publish
-            # finds the already-published artifact + returns same URL.
+            # ── Tier 2: publish + claude.site full-page HTML→MD ──
+            # Publish artifact + open the resulting claude.site URL in a
+            # new tab + HTML→MD scrape on the clean DOM. Zero chat/nav/
+            # iframe chrome. New tab keeps main-page state intact.
+            # Idempotent across calls.
             md_pub = await _extract_claude_via_published_page(
                 page, browser, cua_client, label, verbose=verbose,
             )
-            _t2_accepted = False
             if md_pub and len(md_pub) > 500:
                 if _is_sources_not_document(md_pub, platform="claude"):
                     log(f"[{label}] T2 published-page wrong-artifact "
@@ -16507,232 +16710,74 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 else:
                     log(f"[{label}] Extracted via T2 published-page HTML→MD: {len(md_pub)} chars")
                     return md_pub
-            # 2026-05-13 audit fix: if T2 fired but didn't return content,
-            # the publish-confirmation dialog may still be mounted on the
-            # main page (publish_open_claude_artifact opens it as a side
-            # effect). Dismiss with Escape + small settle before T3 scrapes,
-            # so dialog content doesn't bleed into the in-chat HTML→MD
-            # selectors. Best-effort; failures are silent.
+            # If T2 fired but didn't return content, the publish-confirm
+            # dialog may still be mounted on the main page. Dismiss with
+            # Escape so dialog content doesn't bleed into T3 state.
             try:
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(0.4)
             except Exception:
                 pass
 
-            # Tier 3 (was T2A): broader in-chat HTML→MD with artifact-
-            # anchored selectors. Same proven primitive, wider selector
-            # list as belt-and-suspenders against drift in the smart
-            # panel reader. Renamed from T2A to T3 after the new T2
-            # published-page fallback was inserted above.
-            md = await _extract_html_to_md(page, [
-                '[data-testid="artifact-content"]',
-                '.artifact-content',
-                '.artifact-panel .contents',
-                # 2026-05-13: dropped bare `aside .markdown` / `aside .prose`
-                # — matched left-nav `<aside>` in Run 1 returning 5906
-                # chars of nav text. Use artifact-class-anchored variants
-                # only.
-                '[class*="artifact-panel"] .markdown',
-                '[class*="artifact-panel"] .prose',
-                '[class*="artifact-panel"] [class*="content"]',
-                '[class*="artifact"] .ProseMirror',
-                '[class*="artifact"] [class*="rendered"]',
-            ], label)
-            if md and len(md) > 100:
-                if _is_sources_not_document(md, platform="claude"):
-                    log(f"[{label}] T2A HTML→MD wrong-artifact ({len(md)} chars) — falling to T2B", "WARN")
-                    try:
-                        emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                                   op="finalize_copy", length=len(md), tier="dom_html_md")
-                    except Exception:
-                        pass
-                elif _looks_like_nav_sidebar(md):
-                    log(f"[{label}] T2A HTML→MD looks-like-nav-sidebar ({len(md)} chars) — falling to T2B", "WARN")
-                else:
-                    log(f"[{label}] Extracted via T2A HTML→MD: {len(md)} chars")
-                    return md
+            # ── Tier 3 (LAST RESORT, Wayland-safe): CUA + clipboard hijack ──
+            # _run_with_clipboard_hijack installs the JS hook before CUA's
+            # Ctrl+A/C so the page's own copy event is intercepted in-DOM.
+            # No OS clipboard read → Wayland-safe. Trigger chains the
+            # existing two CUA prompts: navigate to LAST artifact (if
+            # multiple), then Ctrl+A/C inside the open panel. No retry
+            # loop, no shadow-wrap, no _IS_WAYLAND gate — helper owns
+            # retry policy. Helper timeout_ms set ABOVE the inner CUA
+            # wait_for budget so the inner caps fire first.
+            if browser and cua_client and not chat_mode:
+                async def _claude_t3_trigger():
+                    await browser.switch_to_page(page)
+                    if artifact_count >= 2:
+                        try:
+                            await asyncio.wait_for(
+                                agent_loop(cua_client, browser,
+                                    PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                                    f"There are {artifact_count} artifacts in this "
+                                    f"conversation. Open the LAST (bottom) artifact — "
+                                    f"that's the final research report.",
+                                    model=CUA_MODEL, max_iterations=8,
+                                    verbose=verbose, target_page=page),
+                                timeout=180.0)
+                            await asyncio.sleep(1)
+                        except asyncio.TimeoutError:
+                            log(f"[{label}] T3 CUA nav timed out after 180s", "WARN")
+                        except Exception as _ne:
+                            log(f"[{label}] T3 CUA nav raised: {_ne}", "WARN")
+                    await asyncio.wait_for(
+                        agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
+                            "Copy the full content of the artifact currently open "
+                            "in the right panel to clipboard.",
+                            model=CUA_MODEL, max_iterations=12,
+                            verbose=verbose, target_page=page),
+                        timeout=180.0)
+                    await asyncio.sleep(1)
 
-            # Tier 2B: Copy hijack via direct Copy button. Broadened
-            # scoping per user-marked image (Copy button beside Publish
-            # in the artifact-panel header). Dropped bare `aside button…`
-            # selectors — Claude's artifact panel is NOT inside `<aside>`
-            # in modern DOM; the left nav is. Scoped to artifact-panel
-            # markers + dialog/share excludes.
-            md = await _copy_via_hijack_anyframe(
-                page, label,
-                direct_copy_selectors=[
-                    '[class*="artifact-panel"] button[aria-label="Copy"]',
-                    '[class*="artifact-panel"] button[aria-label*="copy" i]:not([aria-label*="link" i]):not([aria-label*="code" i])',
-                    '[class*="artifact-panel"] button[title="Copy"]',
-                    '[class*="artifact-panel"] button[title*="copy" i]',
-                    '[class*="side-panel"] button[aria-label*="copy" i]',
-                    '[class*="right-panel"] button[aria-label*="copy" i]',
-                    'button[data-testid="copy-artifact"]',
-                    'button[data-testid="artifact-copy"]',
-                    'button[data-testid*="copy" i][data-testid*="artifact" i]',
-                    # SVG-icon hints (clipboard/copy icons in panel toolbar)
-                    '[class*="artifact"] button:has(svg[class*="clipboard" i])',
-                    '[class*="artifact"] button:has(svg[class*="copy" i])',
-                    # Position-gated last resort: any header button in the
-                    # artifact panel's top toolbar region.
-                    '[class*="artifact-panel"] header button',
-                    '[class*="artifact-panel"] [class*="header"] button',
-                    '[class*="artifact-panel"] [class*="toolbar"] button',
-                ],
-                scoping_excludes=[
-                    'pre code',
-                    '[class*="code-block"]',
-                    'nav',
-                    '[role="navigation"]',
-                    # Don't grab Copy-link buttons inside dialogs / share
-                    '[role="dialog"]',
-                    'mat-dialog-container',
-                    '[class*="dialog" i]',
-                    '[class*="modal" i]',
-                    '[class*="publish" i]',
-                    '[class*="share" i] [class*="dialog" i]',
-                ],
-                min_chars=500,
-            )
-
-            # Tier 2C: kebab/more-menu fallback when Copy button is tucked
-            # behind a "more" menu instead of in the header toolbar.
-            if not md or len(md) < 500:
-                md = await _copy_via_hijack_anyframe(
-                    page, label,
-                    canvas_root_selectors=[
-                        '[class*="artifact-panel"]',
-                        '[class*="side-panel"]',
-                        '[class*="right-panel"]',
-                    ],
-                    kebab_selectors=[
-                        '[class*="artifact-panel"] button[aria-haspopup="menu"]',
-                        '[class*="artifact-panel"] button[aria-label*="more" i]',
-                        '[class*="artifact-panel"] button[aria-label*="menu" i]',
-                        '[class*="artifact-panel"] button[aria-label*="actions" i]',
-                        '[class*="artifact-panel"] button:has(svg[class*="ellipsis"])',
-                        '[class*="artifact-panel"] button:has(svg[class*="dots"])',
-                        '[class*="artifact-panel"] button:has(svg[class*="more"])',
-                    ],
-                    menuitem_text_pattern=r'copy(\s+(contents?|as\s+markdown|text|document|response))?',
-                    min_chars=500,
-                )
-            if md and len(md) >= 500 and not _is_sources_not_document(md, platform="claude"):
-                log(f"[{label}] Extracted via Copy hijack (artifact panel T2B/2C): {len(md)} chars")
-                return md
-            if md and _is_sources_not_document(md, platform="claude"):
-                log(f"[{label}] Copy hijack wrong-artifact ({len(md)} chars) — falling to Tier 3", "WARN")
+                log(f"[{label}] CUA: Tier 3 navigate + copy with clipboard hijack")
                 try:
-                    emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                               op="finalize_copy", length=len(md), tier="copy_hijack")
-                except Exception:
-                    pass
-
-    # Tier 4 (LAST RESORT, Win/Mac/X11 only): CUA opens the correct
-    # artifact and copies it. Gated off on Wayland (get_clipboard
-    # returns 0 chars there regardless).
-    # 2026-04-26: split into TWO shadow-eval hotspots — `2d-nav` wraps the
-    # NAVIGATE call (action class: click_last_artifact_card), `2d-copy` wraps
-    # the COPY call (action class: copy_open_artifact). Separate hotspots so
-    # Vision agreement metrics stay distinct per action class. Retry cap 1.
-    # 2026-05-07 reorder: moved from Method 2 → Method 5 (last resort).
-    # Cost-ordered: free DOM tiers run first, CUA only when all of them
-    # fail. Mirrors ChatGPT's CUA-last pattern. Wrong-artifact recovery
-    # (CUA's original purpose at the old Method 2 position) still works —
-    # it just runs after the free tiers reject the wrong-artifact content
-    # via _is_sources_not_document guards.
-    _claude_2d_attempts = 0
-    # E2 / DGOPS-7364 — chat-mode skips this CUA artifact navigation entirely
-    # (no artifact exists; CUA would hunt for it and either time out or open
-    # the wrong content). Falls through to the mode-agnostic tail below.
-    while _claude_2d_attempts < 2 and browser and cua_client and not chat_mode and not _IS_WAYLAND:
-        _claude_2d_attempts += 1
-        log(f"[{label}] CUA: Navigating to final artifact "
-            f"(attempt {_claude_2d_attempts}/2)...")
-        await browser.switch_to_page(page)
-        if artifact_count >= 2:
-            async def _claude_2d_nav_cua():
-                return await asyncio.wait_for(
-                    agent_loop(cua_client, browser,
-                        PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
-                        f"There are {artifact_count} artifacts in this "
-                        f"conversation. Open the LAST (bottom) artifact — "
-                        f"that's the final research report.",
-                        model=CUA_MODEL,
-                        max_iterations=8 if _claude_2d_attempts == 1 else 12,
-                        verbose=verbose, target_page=page),
-                    timeout=180.0)
-            try:
-                await _shadow_observed_cua(
-                    page, hotspot_id="2d-nav", phase=2, platform="claude",
-                    current_step="click_last_artifact_card",
-                    context_hint=f"finalize nav attempt {_claude_2d_attempts}; "
-                                 f"artifact_count={artifact_count}",
-                    expected_outcome="right-panel mounts final report "
-                                     "(multi-section prose, NOT checklist)",
-                    cua_coro_factory=_claude_2d_nav_cua)
-            except asyncio.TimeoutError:
-                log(f"[{label}] CUA nav timed out after 180s "
-                    f"(attempt {_claude_2d_attempts})", "WARN")
-                continue
-            except Exception as _ne:
-                log(f"[{label}] CUA nav raised: {_ne}", "WARN")
-                continue
-            await asyncio.sleep(1)
-        async def _claude_2d_copy_cua():
-            return await asyncio.wait_for(
-                agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
-                    "Copy the full content of the artifact currently open "
-                    "in the right panel to clipboard.",
-                    model=CUA_MODEL,
-                    max_iterations=12 if _claude_2d_attempts == 1 else 16,
-                    verbose=verbose, target_page=page),
-                timeout=180.0)
-        try:
-            await _shadow_observed_cua(
-                page, hotspot_id="2d-copy", phase=2, platform="claude",
-                current_step="copy_open_artifact",
-                context_hint=f"finalize copy attempt {_claude_2d_attempts}; "
-                             f"artifact_count={artifact_count}",
-                expected_outcome="clipboard holds long-form report markdown "
-                                 "(>=2 headings, prose, no [x]/[ ] checklist)",
-                cua_coro_factory=_claude_2d_copy_cua)
-        except asyncio.TimeoutError:
-            log(f"[{label}] CUA copy timed out after 180s "
-                f"(attempt {_claude_2d_attempts})", "WARN")
-            continue
-        except Exception as _ce:
-            log(f"[{label}] CUA copy raised: {_ce}", "WARN")
-            continue
-        await asyncio.sleep(1)
-        clipboard = get_clipboard()
-        if not clipboard or len(clipboard) <= 500:
-            log(f"[{label}] CUA copy got {len(clipboard or '')} chars "
-                f"(attempt {_claude_2d_attempts})", "WARN")
-            continue
-        if _is_sources_not_document(clipboard, platform="claude"):
-            log(f"[{label}] CUA copy returned WRONG ARTIFACT "
-                f"(checklist/tracking, {len(clipboard)} chars) — rejecting "
-                f"(attempt {_claude_2d_attempts}/2)", "WARN")
-            try:
-                emit_event("wrong_artifact_rejected", phase=2, agent="claude",
-                           op="finalize_copy", attempt=_claude_2d_attempts,
-                           length=len(clipboard), tier="cua")
-            except Exception:
-                pass
-            if _claude_2d_attempts < 2:
-                try:
-                    await _close_claude_artifact_panel(page)
-                    await asyncio.sleep(0.6)
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(0.6)
-                    artifact_count = await _count_claude_artifacts(page)
-                    clear_clipboard()
-                except Exception:
-                    pass
-            continue
-        log(f"[{label}] Extracted via CUA artifact copy: {len(clipboard)} chars")
-        return clipboard
+                    md_hj = await _run_with_clipboard_hijack(
+                        page, label, _claude_t3_trigger,
+                        timeout_ms=400000, min_chars=500,
+                    )
+                except Exception as _te:
+                    log(f"[{label}] T3 clipboard-hijack raised: {_te}", "WARN")
+                    md_hj = ""
+                if md_hj and len(md_hj) >= 500:
+                    if _is_sources_not_document(md_hj, platform="claude"):
+                        log(f"[{label}] T3 hijack wrong-artifact "
+                            f"({len(md_hj)} chars) — rejecting", "WARN")
+                        try:
+                            emit_event("wrong_artifact_rejected", phase=2, agent="claude",
+                                       op="finalize_copy", length=len(md_hj),
+                                       tier="clipboard_hijack")
+                        except Exception:
+                            pass
+                    else:
+                        log(f"[{label}] Extracted via T3 clipboard hijack: {len(md_hj)} chars")
+                        return md_hj
 
     try:
         emit_event("extract_failed", phase=2, agent="claude",
