@@ -11653,18 +11653,35 @@ async def verify_chatgpt_generating(page) -> bool:
                 const label = (b.getAttribute('aria-label') || '').toLowerCase();
                 if (label.includes('stop')) return true;
             }
+            // 2026-05-14: CSS-animation fallback (mirrors verify_gemini_generating /
+            // verify_claude_generating). Catches the gap between "Thought for X
+            // seconds" badge appearing and the iframe-scoped stop button rendering
+            // — the previous code's 'thought for ' short-circuit was firing as a
+            // false done-signal during that window. E2E hit this: CUA clicked
+            // Start research on the clarification panel, research went to
+            // "Researching..." state, but no host-level stop button + a stale
+            // "Thought for" badge made the host check return false 15× and the
+            // outer loop spawned a 2nd ChatGPT tab.
+            const animated = document.querySelectorAll(
+                '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], [class*="streaming"]'
+            );
+            for (const el of animated) {
+                const style = window.getComputedStyle(el);
+                if (style.animationName && style.animationName !== 'none') return true;
+            }
             // Body-level DR keyword sweep — narrowed to present-progressive
             // phrases that don't survive the finished response. Removed
             // 'deep research' (the model badge persists), 'sources found'
             // (appears in finished summary), 'researching' (could be in any
             // narrative). Kept the unambiguous in-progress phrases.
             const bl = (document.body?.innerText || '').toLowerCase();
-            // Strong done signal: "Thought for X seconds" badge renders only
-            // AFTER the thinking phase completes. With no Stop button found
-            // above, its presence means the response is fully settled.
-            if (bl.includes('thought for ')) return false;
+            // "Thought for X seconds" badge persists while DR continues; it's
+            // NOT a definitive done signal. With stop button + cards + buttons
+            // + CSS-animation checks above all negative, treat the page as
+            // settled — but only if no in-progress keyword appears below.
             const hostKws = ['sources and counting', 'searching the web', 'reading sources'];
             if (hostKws.some(k => bl.includes(k))) return true;
+            if (bl.includes('thought for ')) return false;
             return !!document.querySelector('.result-streaming, [data-is-streaming="true"]');
         }""")
         if host_hit:
@@ -11697,22 +11714,33 @@ async def verify_chatgpt_generating(page) -> bool:
                                 '[role="progressbar"], [class*="progress"], [class*="spinner"], ' +
                                 '[class*="loading"], [data-is-streaming="true"]'
                             )) return true;
+                            // 2026-05-14: CSS-animation fallback (mirrors verify_gemini /
+                            // verify_claude). ChatGPT DR's "Researching..." state has
+                            // animated text-shimmer + dot-flashing inside the iframe
+                            // that don't always have a [class*="spinner"] marker at
+                            // the exact poll moment — without this fallback the
+                            // iframe walk returned false during legitimate research
+                            // and the outer loop spawned a 2nd tab. E2E 2026-05-14:
+                            // CUA had clicked Start research and the iframe was
+                            // visibly rendering when this returned false 15×.
+                            const animated = document.querySelectorAll(
+                                '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], [class*="streaming"]'
+                            );
+                            for (const el of animated) {
+                                const style = window.getComputedStyle(el);
+                                if (style.animationName && style.animationName !== 'none') return true;
+                            }
                             const bl = (document.body?.innerText || '').toLowerCase();
-                            // Strong done signal: "Thought for X seconds" badge
-                            // renders only AFTER thinking completes. With no Stop
-                            // button or spinner detected above, its presence means
-                            // the response is settled — treat as definitively done.
+                            // "Thought for X seconds" badge persists while DR
+                            // continues — it's NOT a definitive done signal. With
+                            // stop button + spinner + CSS animation all negative
+                            // above, treat the iframe as settled. Keyword fallthrough
+                            // intentionally not re-added: inside the DR iframe, body
+                            // text IS the rendered brief itself (could legitimately
+                            // contain "after reading sources" / "searching the web"),
+                            // and any keyword match would re-introduce the same
+                            // false-positive class as the deleted length>200 fallback.
                             if (bl.includes('thought for ')) return false;
-                            // Removed keyword fallthrough entirely. Inside the DR
-                            // iframe, body text IS the rendered brief itself —
-                            // the brief can legitimately contain phrases like
-                            // "after reading sources" or "searching the web", and
-                            // any keyword match would re-introduce the same
-                            // false-positive class as the deleted length>200
-                            // fallback. Visual markers above (stop button,
-                            // progressbar/spinner/streaming) are reliable signals
-                            // for "still active" inside the iframe; keywords add
-                            // risk without unique coverage.
                             return false;
                         }""")
                         if active:
