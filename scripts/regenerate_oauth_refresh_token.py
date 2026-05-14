@@ -4,12 +4,13 @@ email).
 
 Two paths cover this script:
 
-1. **Per-user OAuth** — every signed-in user can plug in their own Google
-   credentials in the Super Research web app at Account → API Keys →
-   Google OAuth, so THEIR Docs / YouTube uploads land in their own
-   account. Run this script to generate the refresh token, then paste
-   the printed token into the Account page along with the matching
-   Client ID + Client Secret.
+1. **Per-user OAuth (Advanced — bring your own GCP project)** — most users
+   should just click "Connect Google Account" in the Super Research web app
+   at Account → API Config → Google Account (the one-click shared-client
+   flow). This script is only needed for the Advanced path where a user
+   wants their own GCP project — paste the printed token into Account →
+   API Config → Google Account → Advanced along with the matching Client
+   ID + Client Secret.
 
 2. **Default fallback** (project owner only) — the shared OAuth identity
    used when a user hasn't set their own. Held in Firebase App Hosting
