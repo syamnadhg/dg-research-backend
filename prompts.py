@@ -666,9 +666,18 @@ Steps:
 2. Look at the Claude conversation in the LEFT panel. Scroll down to
    find artifact preview cards — rectangular inline cards with a
    document icon and title.
-3. Count how many artifact cards you see. If ZERO artifacts exist,
-   say "no artifacts" and STOP. Otherwise click the FIRST (top-most)
-   artifact card. It opens in the RIGHT panel.
+   IMPORTANT: SKIP `brief.md` and any attachment card. The card titled
+   `brief.md` is the user's attached brief file (uploaded with their
+   prompt, typically inside or above the user's message bubble) — it
+   is NOT a Claude artifact. Also skip any card whose title is a
+   filename (ends in .md, .pdf, .docx, .txt, .csv, .json, .html).
+   Claude artifacts live INSIDE Claude's response area (below the
+   user's message) with topic-related titles like "Sources tracking"
+   or "Research Report on …".
+3. Count how many CLAUDE-GENERATED artifact cards you see (excluding
+   attachment cards from step 2). If ZERO Claude artifacts exist, say
+   "no artifacts" and STOP. Otherwise click the FIRST (top-most)
+   Claude artifact card. It opens in the RIGHT panel.
 4. Read the content in the right panel. Report ALL of the following:
    - Any URLs or links mentioned (full URLs starting with http)
    - Any numbered steps or bullet points describing analysis/research activity
@@ -691,6 +700,8 @@ CRITICAL RULES:
 - Do NOT close the panel after reading — the polling loop reuses it.
 - If the FIRST artifact panel is already open (from a prior poll),
   do NOT click any card; just read.
+- IGNORE the user's attached `brief.md` file and any other attachment
+  chip — they are not Claude artifacts.
 - If you cannot find any artifacts, say "no artifacts" and STOP."""
 
 PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT = SYSTEM_BASE + """
@@ -853,13 +864,25 @@ early and updates it live as it researches.
 
 WHAT TO LOOK FOR:
 - An artifact card embedded in the LEFT conversation column (Claude's
-  response area).
+  response area, BELOW the user's message bubble).
 - Title usually contains "Research", "Sources", "Tracking", or the topic
   name with a checklist preview underneath.
 - It is the FIRST/EARLIEST artifact card if multiple exist — visually
   higher up in the conversation.
 - DO NOT pick the last/bottom artifact card — that is the final report and
   must NOT be opened by this step.
+
+SKIP these — they are NOT Claude artifacts:
+- The card titled `brief.md` — this is the user's attached brief file
+  uploaded with their prompt. It typically sits inside or above the
+  user's message bubble at the top of the conversation.
+- Any card whose title is a filename (ends in .md, .pdf, .docx, .txt,
+  .csv, .json, .html) — these are user-attached files, NOT artifacts.
+- Any card inside the user's message bubble or attachment-chip area.
+
+Claude artifact cards have topic-related titles (e.g. "Research Report
+on …", "Sources tracking", "Comprehensive research …", or "Boom! Your
+research report is ready") — NOT filenames.
 
 VERIFY STATE FIRST (do this BEFORE any click):
 - If the right side panel is ALREADY showing artifact content with a
@@ -877,6 +900,8 @@ ACTION (only if first artifact found AND not already open):
 - If clicked but panel did NOT mount: output "panel: click_failed".
 
 HARD CONSTRAINTS:
+- DO NOT click `brief.md` or any attachment card. If the only visible
+  card is an attachment (e.g. `brief.md`), output "panel: not_found".
 - DO NOT click the LAST artifact card. Only the FIRST.
 - DO NOT click the composer at the bottom.
 - DO NOT click the send button.
