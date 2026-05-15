@@ -15529,7 +15529,17 @@ def html_to_markdown(html):
 
 
 async def _extract_html_to_md(page, selectors, label):
-    """Extract response HTML from page, convert to clean markdown."""
+    """Extract response HTML from page, convert to clean markdown.
+
+    Returns a tuple-like sequence via the existing string return, but emits
+    DEBUG telemetry on miss so the caller (and the next E2E) can see
+    selector-level hit counts. Previously every miss was silent — when T2
+    fell through on P2 ChatGPT we had no way to tell whether (a) no
+    selectors matched, (b) selectors matched but innerHTML was too short,
+    or (c) html_to_markdown returned an empty string."""
+    biggest_html_len = 0
+    biggest_sel = ""
+    matched_sels = 0
     for sel in selectors:
         try:
             html = await page.evaluate(f"""() => {{
@@ -15537,6 +15547,11 @@ async def _extract_html_to_md(page, selectors, label):
                 if (els.length > 0) return els[els.length - 1].innerHTML;
                 return '';
             }}""")
+            if html:
+                matched_sels += 1
+                if len(html) > biggest_html_len:
+                    biggest_html_len = len(html)
+                    biggest_sel = sel
             if html and len(html) > 200:
                 md_text = html_to_markdown(html)
                 if md_text and len(md_text) > 100:
@@ -15544,6 +15559,16 @@ async def _extract_html_to_md(page, selectors, label):
                     return md_text
         except Exception:
             continue
+    # Miss path — log what we found so the next failing E2E doesn't leave
+    # us blind. matched_sels=0 means no selector hit any element (most
+    # likely cause: DOM uses different class/data-testid conventions);
+    # matched_sels>0 with biggest_html_len<=200 means content selectors
+    # matched but the elements were empty/sparse (likely the wrong
+    # container — narrow your selectors). INFO level so it survives
+    # default log-level filters in prod.
+    log(f"[{label}] HTML→MD miss: tried={len(selectors)} sels, matched={matched_sels}, "
+        f"biggest_html_len={biggest_html_len}"
+        + (f" (sel='{biggest_sel}')" if biggest_sel else ""), "INFO")
     return ""
 
 
@@ -15586,14 +15611,78 @@ async def _extract_html_to_md_anyframe(page, selectors, label):
     Mirrors `_extract_html_to_md` per-frame so the existing call-site
     semantics (returns "" on miss, logs the first selector that landed)
     stay intact. Sibling of `_chatgpt_dr_frame_targets`; same 2026-05-13
-    motivation."""
-    for target in _chatgpt_dr_frame_targets(page):
+    motivation.
+
+    DR-iframe density fallback (2026-05-14): when none of the supplied
+    selectors matched a rich-enough container INSIDE the DR sandbox
+    iframe, ask the iframe for its largest text-rich block (single
+    element with the most non-whitespace text content, excluding nav/
+    toolbar/composer chrome). Catches the "DR canvas uses plain divs,
+    none of our `.markdown`/`.prose` selectors match" case that silently
+    fell through to T3 clipboard hijack — and gives T2 a real chance to
+    win even on DOM-drifted pages.
+
+    Intentionally NOT applied to the main page: the conversation thread
+    is a giant text-rich `<div>` (prompt + prior assistant turns) that
+    would falsely outrank the DR document on cumulative textContent."""
+    targets = _chatgpt_dr_frame_targets(page)
+    for idx, target in enumerate(targets):
         try:
             md = await _extract_html_to_md(target, selectors, label)
         except Exception:
             md = ""
         if md:
             return md
+        # Density fallback runs ONLY inside the DR sandbox iframe (idx > 0;
+        # idx == 0 is the main page target which contains the chat thread).
+        if idx == 0:
+            continue
+        try:
+            html = await target.evaluate(r"""() => {
+                // Chrome exclusion via TAGS + ARIA roles + data-testid (no
+                // class-substring matches — those false-excluded real
+                // content nodes named "section-header", "response-header-
+                // wrapper", etc.).
+                const isChrome = (el) => !!el.closest(
+                    'nav, header, footer, aside, ' +
+                    '[role="navigation"], [role="banner"], ' +
+                    '[role="contentinfo"], [role="toolbar"], ' +
+                    '[data-testid*="composer"], [data-testid*="sidebar"]'
+                );
+                let best = null;
+                let bestLen = 0;
+                // article/main/section are usually <100 nodes; div is the
+                // long-tail. Cap div iteration at 500 to avoid O(n*subtree)
+                // walks on huge thread-like DOMs.
+                const tags = ['article', 'main', 'section', 'div'];
+                const CAP_PER_TAG = 500;
+                for (const tag of tags) {
+                    const allEls = document.querySelectorAll(tag);
+                    const limit = Math.min(allEls.length, CAP_PER_TAG);
+                    for (let i = 0; i < limit; i++) {
+                        const el = allEls[i];
+                        if (isChrome(el)) continue;
+                        const txt = (el.textContent || '').trim();
+                        if (txt.length <= bestLen) continue;
+                        // Skip wrappers that are just the page-body parent
+                        // of the real content; require some structure
+                        // (>=2 child text-bearing nodes) to bias toward
+                        // content-rich containers over the body root.
+                        const childCount = el.children?.length || 0;
+                        if (childCount < 2) continue;
+                        bestLen = txt.length;
+                        best = el;
+                    }
+                }
+                return best ? best.innerHTML : '';
+            }""")
+            if html and len(html) > 200:
+                md_text = html_to_markdown(html)
+                if md_text and len(md_text) > 500:
+                    log(f"[{label}] Extracted via HTML→MD density fallback: {len(md_text)} chars (iframe target {idx})")
+                    return md_text
+        except Exception:
+            pass
     return ""
 
 
