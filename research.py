@@ -15886,7 +15886,12 @@ async def _extract_via_cua_download(
     *,
     max_iterations=12,
     cua_timeout_s=180.0,
-    download_timeout_ms=30000,
+    # Must be >= cua_timeout_s * 1000 + a small grace, because
+    # page.expect_download() starts its clock when the async-with enters
+    # (BEFORE the CUA loop runs). With the prior 30s default, a future
+    # caller using defaults would race the listener vs the CUA loop's
+    # cua_timeout_s=180s wall-clock cap. cua_timeout_s + 15s grace.
+    download_timeout_ms=195000,
     min_chars=500,
     verbose=False,
 ):
