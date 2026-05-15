@@ -1210,6 +1210,16 @@ _research_token = None  # ResearchToken: this backend instance's unique ID
 # know the current backend busy state + what they're waiting behind.
 _QUEUE_STATE = {
     "running": False, "current_job": None, "queue_ref": None, "recompute_fn": None,
+    # 2026-05-15: persist_fn exposes the run_server closure
+    # `_persist_pending_queue` to the module-scope device-cmd listener
+    # (research.py:1766) so hard_reset can flush a clean snapshot to disk
+    # before os._exit. _hard_reset_lock makes the gate-state clear+persist
+    # atomic w.r.t. the worker's `finally` writes — without it, a worker
+    # finishing between the device-cmd's clear (memory) and persist (disk)
+    # would resurrect the wedged values to disk. Both initialised inside
+    # run_server (research.py:24049-24051) before the device-cmd listener
+    # starts at research.py:24898.
+    "persist_fn": None, "_hard_reset_lock": None,
     # 2026-05-11: prior-run tracking for the FE-completion queue gate
     # (BE_PHASES_TIMEOUT_SEC). The worker's finally{} block records the
     # just-completed run's uid+rid+timestamp here so the NEXT dequeue can
@@ -1858,7 +1868,17 @@ def _start_device_command_listener(uid: str, device_id: str):
                 #      blob.upload_from_filename leaves a half-written
                 #      blob whose Firestore audios/{id} doc already
                 #      points at it.
-                #   3. Schedule os._exit via _schedule_server_exit with
+                #   3. Clear the queue-gate state (last_completed_*) so
+                #      daemon-loop's respawn rehydrates a clean slate.
+                #      Without this, the next --serve picks up the same
+                #      stale prior-run pointer and re-engages the wedge
+                #      that prompted the reset in the first place.
+                #      Race-guarded by _QUEUE_STATE["_hard_reset_lock"]:
+                #      the worker `finally` acquires the same lock
+                #      around its gate-state writes + persist call so
+                #      a worker finishing within our exit window can't
+                #      interleave between our clear and our persist.
+                #   4. Schedule os._exit via _schedule_server_exit with
                 #      a 1.5s grace (shorter than the 3s default for
                 #      research stop because we have less to ack —
                 #      no pipeline_stopped emit owed). The daemon-
@@ -1871,6 +1891,11 @@ def _start_device_command_listener(uid: str, device_id: str):
                 # is the authoritative stop, and the device-cmd
                 # listener doesn't have an asyncio loop reference.
                 # File-sentinel + os._exit is the contract.
+                #
+                # 2026-05-15: set the race-guard FIRST so any concurrent
+                # worker-finally execution (between here and os._exit)
+                # respects it.
+                _QUEUE_STATE["_hard_reset_in_progress"] = True
                 try:
                     if _tracks_dir is not None:
                         _stop_path = Path(__file__).parent / "queues" / _tracks_dir.name / ".stop"
@@ -1891,6 +1916,34 @@ def _start_device_command_listener(uid: str, device_id: str):
                         log("[device-cmds] HARD_RESET: uploads drained")
                 except Exception as _ue:
                     log(f"[device-cmds] HARD_RESET: upload-settle check failed: {_ue}", "WARN")
+                # 2026-05-15: clear queue-gate state + persist clean
+                # snapshot under the hard-reset lock so the worker
+                # `finally` block (research.py:~24400) can't race
+                # between our clear and our persist. _persist_pending_queue
+                # is a closure inside run_server, so we look it up via
+                # _QUEUE_STATE["persist_fn"] (set at the function-def
+                # tail, research.py:~24153). The atomic .tmp + os.replace
+                # write inside that helper means a mid-write os._exit
+                # can't corrupt _pending_queue.json — either the OLD file
+                # (replace not committed) or NEW (clean) survives.
+                try:
+                    _hr_lock = _QUEUE_STATE.get("_hard_reset_lock")
+                    _persist_fn = _QUEUE_STATE.get("persist_fn")
+                    if _hr_lock is None or _persist_fn is None:
+                        # Pre-run_server-init hard_reset (boot-time race).
+                        # No worker yet → no race risk → no lock needed
+                        # AND no in-memory gate state to clear yet, so the
+                        # disk snapshot (if any) lives on. Best-effort log.
+                        log("[device-cmds] HARD_RESET: pre-init — gate clear skipped (no run_server yet)", "WARN")
+                    else:
+                        with _hr_lock:
+                            _QUEUE_STATE["last_completed_uid"] = None
+                            _QUEUE_STATE["last_completed_rid"] = None
+                            _QUEUE_STATE["last_be_done_at"] = 0
+                            _persist_fn(current_job=None)
+                        log("[device-cmds] HARD_RESET: cleared queue-gate state and persisted clean snapshot")
+                except Exception as _ge:
+                    log(f"[device-cmds] HARD_RESET: gate clear/persist failed: {_ge}", "WARN")
                 log("[device-cmds] HARD_RESET: scheduling exit in 1.5s — daemon-loop will respawn")
                 _schedule_server_exit("device-hard-reset", delay_sec=1.5)
                 continue
@@ -22135,16 +22188,59 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         while not _controls.peek_extra_context() and not _controls.is_stop():
                             if (time.time() - _brief_wait_start) > _BRIEF_WAIT_BACKSTOP_S:
                                 log("Phase 1: manual brief wait exceeded 3h — auto-failing", "WARN")
+                                # 2026-05-15: previously this path emitted
+                                # fail_phase (recoverable alert with
+                                # [Retry, Skip]) THEN immediately
+                                # pipeline_stopped + return — tearing down
+                                # the run while the user saw Retry/Skip
+                                # buttons that did nothing. Honor the
+                                # never-die contract: fail_phase emits the
+                                # actionable alert, await the user's
+                                # decision, and act on it. Mirrors the
+                                # pattern at research.py:22131-22146.
                                 fail_phase(1,
                                            "Manual brief not received in 3h",
                                            "Phase 1 was waiting for you to type a research "
                                            "brief into chat, but no brief arrived in 3 hours. "
-                                           "Retry to re-prompt and start over, or Skip to "
+                                           "Retry to wait another 3 hours, or Skip to "
                                            "abandon Phase 1.")
+                                _bs_decision = await _controls.await_phase_decision(1)
+                                if _bs_decision == "retry":
+                                    emit_event("phase_restart", phase=1,
+                                               reason="user_retry_after_brief_wait_backstop")
+                                    _brief_wait_start = time.time()
+                                    continue
+                                if _bs_decision == "skip":
+                                    emit_event("phase_skipped", phase=1,
+                                               reason="user_skip_after_brief_wait_backstop")
+                                    _p1_skipped_after_error = True
+                                    # Break out of the inner backstop loop.
+                                    # The post-while skip-propagation check
+                                    # below carries _p1_skipped_after_error
+                                    # out through the outer `while True:` so
+                                    # downstream skip handling (stub
+                                    # phase_complete, empty brief artifact,
+                                    # P2 continues without a brief) actually
+                                    # runs — `return` here would discard the
+                                    # flag and exit run_phase1 prematurely.
+                                    break
+                                # "stop" / "timeout" — terminate the run.
+                                # pipeline_stopped emit matches the
+                                # canonical pattern at research.py:22128.
                                 emit_event("pipeline_stopped", phase=1,
-                                           reason="manual_brief_wait_backstop_3h")
+                                           reason=f"user_{_bs_decision}_after_brief_wait_backstop")
                                 return
                             await asyncio.sleep(0.5)
+                        # 2026-05-15: skip-after-backstop propagation.
+                        # When the 3h-backstop skip branch breaks the inner
+                        # loop with _p1_skipped_after_error=True, exit the
+                        # outer `while True:` so the run_phase1 tail at
+                        # ~line 22275 sees the flag and emits the stub
+                        # phase_complete + sets up an empty brief artifact.
+                        # Without this guard we'd fall through to the
+                        # "user typed a brief" path below and reset the flag.
+                        if _p1_skipped_after_error:
+                            break
                         if _controls.is_stop():
                             log("Phase 1: stop pressed during manual brief wait", "INFO")
                             emit_event("pipeline_stopped", phase=1, reason="user_stop_during_manual_brief")
@@ -23997,6 +24093,14 @@ async def run_server(port=8000):
     # Expose the recompute helper to the module-level Firestore listener so
     # the cancel-queued action can also trigger a position refresh.
     _QUEUE_STATE["recompute_fn"] = _recompute_queue_positions
+    # 2026-05-15: initialise the hard-reset lock here, before the device-cmd
+    # listener thread is spawned at research.py:24898. The lock makes the
+    # gate-state clear+persist (in the device-cmd thread) atomic w.r.t. the
+    # worker `finally` block writes (in the asyncio main thread). Without it,
+    # a worker finishing between the clear (line 1916-1918) and the persist
+    # (line 1919) of hard_reset would write stale uid_X back to _QUEUE_STATE,
+    # which the persist would then snapshot to disk — defeating the reset.
+    _QUEUE_STATE["_hard_reset_lock"] = _threading.Lock()
 
     # ── pending_queue.json (Phoenix T3 resume) ─────────────────────────────
     # The in-memory _job_queue (asyncio.Queue) is lost when the BE process
@@ -24007,6 +24111,9 @@ async def run_server(port=8000):
     # this is a belt-and-suspenders fallback for racing/network-blocked cases.
     _pending_queue_path = queues_root / "_pending_queue.json"
 
+    # Forward declaration so the module-scope device-cmd listener at
+    # research.py:1766 can call this closure via _QUEUE_STATE["persist_fn"].
+    # The assignment happens immediately after the function body below.
     def _persist_pending_queue(current_job=None):
         """Snapshot _job_queue contents (+ optional current_job) to disk.
         Returns True on success, False on persist failure. Never raises.
@@ -24075,6 +24182,12 @@ async def run_server(port=8000):
                     except Exception as _fe:
                         log(f"[pending_queue] Firestore alert emit failed: {_fe}", "WARN")
             return False
+
+    # 2026-05-15: expose the persist closure to the module-scope device-cmd
+    # listener at research.py:1766 so hard_reset can flush a clean snapshot
+    # to disk before os._exit (the listener can't directly close over this
+    # function — it lives in a different scope).
+    _QUEUE_STATE["persist_fn"] = _persist_pending_queue
 
     # Outer wall-clock ceiling for a single pipeline run. Phase budgets
     # inside run_pipeline are cooperative — long Playwright/CUA awaits
@@ -24317,9 +24430,31 @@ async def run_server(port=8000):
                 # last_be_done_at=0 on error/watchdog paths short-circuits
                 # the gate (since FE-P5 will never write "completed").
                 _errored = _QUEUE_STATE.pop("_errored", False)
-                _QUEUE_STATE["last_completed_uid"] = completed.get("uid")
-                _QUEUE_STATE["last_completed_rid"] = completed.get("research_id")
-                _QUEUE_STATE["last_be_done_at"] = 0 if _errored else int(time.time() * 1000)
+                # 2026-05-15: skip gate-state writes if a hard_reset is
+                # in progress. Without this guard, a worker finishing
+                # within hard_reset's exit window resurrects the wedged
+                # prior-run pointer the user just clicked Reset Backend
+                # to escape. The lock acquisition makes the check-and-act
+                # atomic w.r.t. hard_reset's clear+persist (research.py:
+                # ~1920) — without the lock, a thread schedule between
+                # our flag-read and our state-write lets hard_reset's
+                # clear land BEFORE our write, and our write resurrects
+                # the uid_X we should be discarding.
+                _hr_lock = _QUEUE_STATE.get("_hard_reset_lock")
+                if _hr_lock is not None:
+                    with _hr_lock:
+                        if not _QUEUE_STATE.get("_hard_reset_in_progress"):
+                            _QUEUE_STATE["last_completed_uid"] = completed.get("uid")
+                            _QUEUE_STATE["last_completed_rid"] = completed.get("research_id")
+                            _QUEUE_STATE["last_be_done_at"] = 0 if _errored else int(time.time() * 1000)
+                else:
+                    # Lock not initialised yet (impossible at runtime: the
+                    # worker only runs inside run_server, which sets up
+                    # the lock at research.py:~24058 before launching the
+                    # worker — kept as belt-and-braces).
+                    _QUEUE_STATE["last_completed_uid"] = completed.get("uid")
+                    _QUEUE_STATE["last_completed_rid"] = completed.get("research_id")
+                    _QUEUE_STATE["last_be_done_at"] = 0 if _errored else int(time.time() * 1000)
                 _job_queue.task_done()
                 # Clear the just-finished job's queue tracking fields from
                 # Firestore. `_flip_queued_to_ongoing` already deletes
@@ -24348,7 +24483,19 @@ async def run_server(port=8000):
                 _recompute_queue_positions()
                 # Re-snapshot post-completion (current cleared, pending may
                 # have been cancelled/reordered).
-                _persist_pending_queue(current_job=None)
+                # 2026-05-15: re-check the hard-reset flag under the same
+                # lock as hard_reset's clear+persist. Without the lock, a
+                # hard_reset can fire between our flag-check and our
+                # persist, and we'd snapshot stale memory to disk AFTER
+                # hard_reset already wrote a clean snapshot — racing past
+                # the very write the lock was added to protect.
+                _hr_lock2 = _QUEUE_STATE.get("_hard_reset_lock")
+                if _hr_lock2 is not None:
+                    with _hr_lock2:
+                        if not _QUEUE_STATE.get("_hard_reset_in_progress"):
+                            _persist_pending_queue(current_job=None)
+                else:
+                    _persist_pending_queue(current_job=None)
 
     # Worker + Firestore start listener are launched below in the direct
     # startup path (before `await server.serve()`). We used to ALSO register
