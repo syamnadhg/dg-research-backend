@@ -11698,6 +11698,17 @@ async def verify_chatgpt_generating(page) -> bool:
             // settled — but only if no in-progress keyword appears below.
             const hostKws = ['sources and counting', 'searching the web', 'reading sources'];
             if (hostKws.some(k => bl.includes(k))) return true;
+            // 2026-05-14 (post-E2E): post-Start "Researching..." status (with
+            // the literal ellipsis) is the definitive in-progress signal
+            // shown inside the DR clarification card after the user/CUA
+            // clicks Start. It MUST beat the 'thought for ' short-circuit
+            // below — otherwise the badge ("Thought for X seconds") that
+            // also persists during active research wins and verify returns
+            // false 15× while the agent is really running, triggering the
+            // false-alarm fail_agent banner. The ellipsis distinguishes the
+            // live status pattern from any narrative "researching" prose
+            // that finished responses might contain.
+            if (bl.includes('researching...')) return true;
             if (bl.includes('thought for ')) return false;
             return !!document.querySelector('.result-streaming, [data-is-streaming="true"]');
         }""")
@@ -11753,6 +11764,14 @@ async def verify_chatgpt_generating(page) -> bool:
                                 if (anims.some(a => a.playState === 'running')) return true;
                             }
                             const bl = (document.body?.innerText || '').toLowerCase();
+                            // 2026-05-14 (post-E2E): the post-Start status bar inside
+                            // the DR iframe shows literal "Researching..." (with
+                            // ellipsis) while research is active. The ellipsis is
+                            // what makes this safe — bare "researching" would
+                            // false-positive on narrative prose, but the ellipsis
+                            // pattern is the live status indicator, not story text.
+                            // Must beat the 'thought for ' short-circuit below.
+                            if (bl.includes('researching...')) return true;
                             // "Thought for X seconds" badge persists while DR
                             // continues — it's NOT a definitive done signal. With
                             // stop button + spinner + CSS animation all negative
@@ -11891,7 +11910,17 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
 
             # Parse carefully — avoid false positives from "not still generating"
             has_stop = ("stop" in diag_text and "yes" in diag_text)
-            has_loading = ("loading" in diag_text or "spinning" in diag_text or "animation" in diag_text) and "yes" in diag_text
+            # 2026-05-14: "progress bar" added as an alternate positive
+            # signal. The post-Start DR card consistently surfaces a
+            # progress bar in CUA's screenshot description, and unlike
+            # "loading"/"spinning"/"animation" it doesn't require the
+            # CUA's prompt to have answered "yes" — the phrase only
+            # appears when the bar is actually present. Belt for the
+            # case where DOM verify is still buggy.
+            has_loading = (
+                ("loading" in diag_text or "spinning" in diag_text or "animation" in diag_text)
+                and "yes" in diag_text
+            ) or "progress bar" in diag_text
             says_generating = "still generating" in diag_text and "not still generating" not in diag_text and "no" not in diag_text.split("still generating")[0][-20:]
             if has_stop or has_loading or says_generating:
                 log(f"[{label}] ✓ CUA confirms generating")
@@ -18721,23 +18750,28 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 log(f"[{label}] Send-decision wait errored: {_e}", "WARN")
 
     await asyncio.sleep(3)
-    # 2026-05-14: in-page Retry auto-click guard (Fix #515). If the agent
-    # immediately shows a 'Research stopped' / 'Failed' message after Send,
-    # click its in-page Retry button once. Avoids escalating a transient
-    # agent-side glitch to a human-intervention alert.
-    # Gemini gets a longer window because its "show thinking" path can
-    # take 30-60s before producing a soft-refusal ("Sorry, I can't help…")
-    # — the 20s default missed it and the user had to retry manually.
-    _retry_wait_s = 90 if platform_l == "gemini" else 20
-    try:
-        retried = await _try_inpage_retry_on_research_fail(
-            page, platform, label, max_wait_s=_retry_wait_s,
-        )
-        if retried:
-            log(f"[{label}] In-page Retry auto-click handled — research re-kicked", "INFO")
-            await asyncio.sleep(2)
-    except Exception as _re:
-        log(f"[{label}] In-page Retry guard raised (non-fatal): {_re}", "DEBUG")
+    # 2026-05-14: in-page Retry auto-click guard (Fix #515) — Gemini-only.
+    # When Gemini's "show thinking" path lands on a soft-refusal screen
+    # ("Sorry, I can't help…") this clicks the in-page Retry button so
+    # the round-robin watchdog doesn't escalate a transient soft-refusal
+    # to a human-intervention alert.
+    #
+    # Originally invoked for all 3 platforms (Fix #515). Re-scoped on
+    # 2026-05-14 to Gemini-only: ChatGPT/Claude soft-refusals are rarer,
+    # and the fail-text regex could (rarely) match unrelated body text
+    # on a healthy "Researching..." page, risking a false-fire that
+    # closes a working DR session. Watchdog + verify recover real
+    # failures for ChatGPT/Claude.
+    if platform_l == "gemini":
+        try:
+            retried = await _try_inpage_retry_on_research_fail(
+                page, platform, label, max_wait_s=90,
+            )
+            if retried:
+                log(f"[{label}] In-page Retry auto-click handled — research re-kicked", "INFO")
+                await asyncio.sleep(2)
+        except Exception as _re:
+            log(f"[{label}] In-page Retry guard raised (non-fatal): {_re}", "DEBUG")
     return page, True
 
 
@@ -18810,17 +18844,39 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             log("[2A] ChatGPT Deep Research is running ✓")
             await inject_agent_observer(chatgpt_page, "chatgpt")
         else:
-            log("[2A] ChatGPT failed after 2 attempts", "ERROR")
-            # Mark as terminally failed so the round-robin doesn't sit on it
-            # forever waiting for events that will never arrive.
-            emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
-                       progress="ChatGPT setup/paste failed — agent did not start.")
-            fail_agent("chatgpt", "ChatGPT failed to start after 2 attempts",
-                       "Setup or brief paste failed twice. Retry to open a fresh tab.")
+            # 2026-05-14: page-alive gating before fail_agent. If the URL
+            # transitioned to /c/<id>, the brief WAS submitted and a
+            # conversation was started — verify just couldn't read the
+            # active state (cross-origin DR iframe). The round-robin
+            # poller at poll_all_agents_round_robin already handles the
+            # "verified=False but page exists" case (line ~13515), so we
+            # hand off without firing the false-alarm banner that would
+            # tempt the user into a hard retry that closes the working
+            # tab. The fail_agent path remains for genuinely dead pages
+            # (still on the bare chatgpt.com URL).
+            _chatgpt_url = ""
             try:
-                _controls.skipped_agents.add("chatgpt")
+                _chatgpt_url = (chatgpt_page.url or "").lower() if chatgpt_page else ""
             except Exception:
                 pass
+            _chatgpt_alive = "chatgpt.com/c/" in _chatgpt_url
+            if _chatgpt_alive:
+                log("[2A] verify_chatgpt_generating returned False but page is at /c/<id> — handing off to round-robin polling (no fail_agent banner)", "WARN")
+                emit_event("agent_progress", phase=2, agent="chatgpt", status="generating",
+                           progress="ChatGPT DR submitted — verifying via round-robin polling")
+                await inject_agent_observer(chatgpt_page, "chatgpt")
+            else:
+                log("[2A] ChatGPT failed after 2 attempts", "ERROR")
+                # Mark as terminally failed so the round-robin doesn't sit on it
+                # forever waiting for events that will never arrive.
+                emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
+                           progress="ChatGPT setup/paste failed — agent did not start.")
+                fail_agent("chatgpt", "ChatGPT failed to start after 2 attempts",
+                           "Setup or brief paste failed twice. Retry to open a fresh tab.")
+                try:
+                    _controls.skipped_agents.add("chatgpt")
+                except Exception:
+                    pass
     else:
         log("\n--- 2A: ChatGPT SKIPPED (disabled in config) ---")
 
@@ -18860,15 +18916,32 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             log("[2B] Claude is running ✓")
             await inject_agent_observer(claude_page, "claude")
         else:
-            log("[2B] Claude failed after 2 attempts", "ERROR")
-            emit_event("agent_progress", phase=2, agent="claude", status="failed",
-                       progress="Claude setup/paste failed — agent did not start.")
-            fail_agent("claude", "Claude failed to start after 2 attempts",
-                       "Setup or brief paste failed twice. Retry to open a fresh tab.")
+            # 2026-05-14: mirror Fix #5 from ChatGPT 2A. If the URL
+            # transitioned from claude.ai/new to claude.ai/chat/<id>, the
+            # brief was submitted and a conversation started — verify just
+            # couldn't read the active state. Hand off to round-robin
+            # polling without firing the false-alarm banner.
+            _claude_url = ""
             try:
-                _controls.skipped_agents.add("claude")
+                _claude_url = (claude_page.url or "").lower() if claude_page else ""
             except Exception:
                 pass
+            _claude_alive = "claude.ai/chat/" in _claude_url
+            if _claude_alive:
+                log("[2B] verify_claude_generating returned False but page is at /chat/<id> — handing off to round-robin polling (no fail_agent banner)", "WARN")
+                emit_event("agent_progress", phase=2, agent="claude", status="generating",
+                           progress="Claude DR submitted — verifying via round-robin polling")
+                await inject_agent_observer(claude_page, "claude")
+            else:
+                log("[2B] Claude failed after 2 attempts", "ERROR")
+                emit_event("agent_progress", phase=2, agent="claude", status="failed",
+                           progress="Claude setup/paste failed — agent did not start.")
+                fail_agent("claude", "Claude failed to start after 2 attempts",
+                           "Setup or brief paste failed twice. Retry to open a fresh tab.")
+                try:
+                    _controls.skipped_agents.add("claude")
+                except Exception:
+                    pass
     else:
         log("\n--- 2B: Claude SKIPPED (disabled in config) ---")
 
