@@ -19493,10 +19493,55 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 f"Generate ONE audio overview. Select all sources, set "
                 f"{_human_desc}, click Generate ONCE. Say 'generating' when started."
             )
-            await agent_loop(cua_client, browser, _prompt, _task_str,
+            _ag_result = await agent_loop(cua_client, browser, _prompt, _task_str,
                 model=CUA_MODEL, max_iterations=15, verbose=verbose)
         finally:
             await stop_narration_ticker(_stop, _task)
+
+        # 2026-05-14: capture CUA abort signals. The audio-generate prompt
+        # (prompts.py:674-688) instructs CUA to emit exact "abort: …"
+        # strings when it detects unsafe states (no customize affordance,
+        # customize panel never opened, default audio fired by misclick,
+        # or audio already present). Previously the caller ignored the
+        # return value, so a CUA-detected misclick would fall through to
+        # the post-generate invariant — which runs too early to catch a
+        # delayed-rendering default audio card. Surfacing the abort lets
+        # the user retry from a clean state instead of polling a confused
+        # dual-audio panel for the full audio window.
+        _ag_text = (_ag_result.get("text") or "").lower() if isinstance(_ag_result, dict) else ""
+        if "abort:" in _ag_text:
+            # Race vs. pre-flight: the inventory at :19454 saw 0 cards, but
+            # CUA arrived and saw an entry already present. Most likely a
+            # left-over from a prior run that the pre-flight missed due to
+            # panel-render lag — surface a distinct message so the user
+            # knows to clean up the panel.
+            if "audio already present" in _ag_text:
+                fail_phase(
+                    3,
+                    "NotebookLM already has an audio overview at start of Phase 3",
+                    "CUA aborted because the Studio panel surfaced an existing audio "
+                    "entry after our pre-flight check passed (panel-render lag). "
+                    "Open the notebook, delete any lingering audio, then retry.",
+                    agent="notebooklm",
+                    can_retry=True,
+                )
+            else:
+                # Other abort phrases: no_customize_affordance,
+                # customize_did_not_open, misclick_default_fired. Fail
+                # loud with the verbatim phrase so the user/log makes the
+                # cause obvious.
+                _reason_phrase = _ag_text.split("abort:", 1)[1].split("\n", 1)[0].strip()[:160]
+                fail_phase(
+                    3,
+                    f"Phase 3 audio generation aborted by CUA — {_reason_phrase or 'unknown reason'}",
+                    "The audio-generation step bailed out early to avoid an unsafe NotebookLM state "
+                    "(missing customize affordance, default audio fired from a misclick, etc.). "
+                    "Retry to try again; if it keeps aborting, open the notebook directly and "
+                    "generate the audio overview manually.",
+                    agent="notebooklm",
+                    can_retry=True,
+                )
+            return {"audio_path": None}
 
     # Verify it started
     verified = await wait_until_verified(
@@ -19588,6 +19633,33 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                     pass
         except Exception:
             pass
+
+        # Mid-poll duplicate detection (2026-05-14). The post-generate
+        # +5s invariant at :19518 only catches duplicates that render
+        # immediately. In practice the misclick-fired default audio
+        # can take 5-10 min to appear in the Studio panel — long after
+        # the post-gen check has passed. Recount every poll cycle so
+        # a duplicate caught mid-flight surfaces inside 3-4 min instead
+        # of polling for the full audio window with a confused download
+        # picker at the end.
+        #
+        # 3-min elapsed gate absorbs panel-render lag for the FIRST
+        # card; without it a normal single-audio run could trip the
+        # check on the first poll when the card is still pending.
+        if (time.time() - poll_start) >= 180:
+            _live_cards = await _count_nlm_audio_cards(browser.page)
+            if _live_cards > 1:
+                log(f"[Phase3] Mid-poll duplicate detected: {_live_cards} audio card(s) visible — failing phase so user can clean up", "ERROR")
+                fail_phase(
+                    3,
+                    f"Duplicate audio detected mid-generation — NotebookLM Studio shows {_live_cards} entries",
+                    "NotebookLM started a second audio (likely a CUA misclick on the Audio Overview card). "
+                    "Open the notebook, delete the non-target audio entry manually, then retry. "
+                    "We don't auto-delete in-flight audios to avoid removing the wrong one.",
+                    agent="notebooklm",
+                    can_retry=True,
+                )
+                return {"audio_path": None}
 
         # DOM-first: read the audio card directly. Avoids CUA's
         # page-wide-chrome confusion where unrelated NLM panel
@@ -19724,17 +19796,27 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # uses a notebook-level API that doesn't depend on card count.
     if audio_done and audio_path:
         try:
-            cleanup = await _cleanup_nlm_keep_long_deep_dive(browser.page)
-            log(f"[Phase3] NLM strict-keep cleanup: {cleanup}")
+            cleanup = await _cleanup_nlm_keep_requested_audio(browser.page, podcast_length)
+            log(f"[Phase3] NLM strict-keep cleanup ({podcast_length}): {cleanup}")
         except Exception as _ce:
             log(f"[Phase3] NLM cleanup failed: {_ce}", "WARN")
         try:
             await asyncio.sleep(2)  # let DOM settle after deletes
             dd_count = await _count_nlm_deep_dive_cards(browser.page)
             total_count = await _count_nlm_audio_cards(browser.page)
-            log(f"[Phase3] Post-cleanup inventory: {dd_count} Deep Dive / {total_count} total audio card(s)")
-            if dd_count != 1 or total_count != 1:
-                log(f"[Phase3] Post-cleanup invariant warning: {dd_count} Deep Dive + {total_count} total (expected 1 + 1) — proceeding with share-link extract anyway since audio is already on disk", "WARN")
+            log(f"[Phase3] Post-cleanup inventory ({podcast_length}): {dd_count} Deep Dive / {total_count} total audio card(s)")
+            # Length-aware invariant (2026-05-14):
+            #   "long"    → expect 1 Deep Dive + 1 total
+            #   "default" → cleanup skipped (indistinguishable), accept any total ≥ 1
+            #   "short"   → expect 0 Deep Dive + 1 total (Brief, not Deep Dive)
+            if podcast_length == "long":
+                _ok = (dd_count == 1 and total_count == 1)
+            elif podcast_length == "short":
+                _ok = (dd_count == 0 and total_count == 1)
+            else:
+                _ok = (total_count >= 1)
+            if not _ok:
+                log(f"[Phase3] Post-cleanup invariant warning ({podcast_length}): {dd_count} Deep Dive + {total_count} total — proceeding with share-link extract anyway since audio is already on disk", "WARN")
         except Exception as _ie:
             log(f"[Phase3] Post-cleanup invariant check failed: {_ie}", "WARN")
 
@@ -20036,19 +20118,28 @@ async def _count_nlm_deep_dive_cards(page) -> int:
         return 0
 
 
-async def _cleanup_nlm_keep_long_deep_dive(page) -> dict:
+async def _cleanup_nlm_keep_requested_audio(page, podcast_length: str = "long") -> dict:
     """Strict-keep cleanup. Identifies the SINGLE NLM Studio audio card
-    that matches our explicit request (Long + Deep Dive) and deletes
-    every other audio card around it. If the keep target is missing or
+    that matches the user-requested `podcast_length` and deletes every
+    other audio card around it. If the keep target is missing or
     ambiguous, deletes NOTHING and reports the skip reason — the caller
-    can then fail_phase rather than risk nuking the real audio.
+    can then surface the issue to the user rather than risk nuking the
+    real audio.
 
-    Replaces the older _cleanup_nlm_default_audio (2026-05-02) which
-    keyed only on "deep dive" — a too-loose filter that risked deleting
-    the real audio if NLM ever shipped a "Deep Dive Short" default.
-    Strict here means the keep target must contain BOTH "deep dive"
-    AND "long" in its visible text (or, as a secondary signal, a
-    duration of ≥15 minutes which only Long Deep Dives reach).
+    2026-05-14: length-aware. Previously hardcoded to "long Deep Dive"
+    which broke when the user picked "default" / "short" via the chat
+    long-press. Length-specific keep predicates below.
+
+    Length predicates:
+      - "long":    hasDeepDive AND (hasLong OR durationMin >= 15)
+      - "default": SKIP — both the requested Deep-Dive-Default and the
+                   misclick-fired default audio are Deep Dive, so we
+                   can't distinguish them by text. Log + warn instead
+                   of risking the wrong delete.
+      - "short":   NOT hasDeepDive AND durationMin < 10
+                   (Brief format ≈ 3-5min; auto-fired default is also
+                   Deep Dive so the !hasDeepDive predicate isolates the
+                   Brief target cleanly when present.)
 
     Safety rails:
       - keep_candidates count must be EXACTLY 1; 0 → skip, >1 → skip.
@@ -20059,7 +20150,8 @@ async def _cleanup_nlm_keep_long_deep_dive(page) -> dict:
         so the caller doesn't have to re-scan.
 
     Returns a dict with keys:
-      scanned, kept_idx, deleted, remaining_after, skipped_reason.
+      scanned, kept_idx, deleted, remaining_after, skipped_reason,
+      podcast_length (echoed for telemetry).
     """
     result = {
         "scanned": 0,
@@ -20067,9 +20159,26 @@ async def _cleanup_nlm_keep_long_deep_dive(page) -> dict:
         "deleted": 0,
         "remaining_after": None,
         "skipped_reason": None,
+        "podcast_length": podcast_length,
     }
+
+    # "default" length: indistinguishable from the misclick-fired audio.
+    # Skip cleanup entirely rather than risk a wrong delete — the caller
+    # surfaces this via the post-cleanup invariant check.
+    if podcast_length == "default":
+        result["skipped_reason"] = "default_length_indistinguishable"
+        result["remaining_after"] = await _count_nlm_audio_cards(page)
+        try:
+            emit_event("nlm_cleanup_skipped", phase=3,
+                       reason="default_length_indistinguishable",
+                       podcast_length=podcast_length)
+        except Exception:
+            pass
+        return result
+
     try:
-        cards = await page.evaluate("""() => {
+        cards = await page.evaluate(f"""() => {{
+            const podcastLength = {json.dumps(podcast_length)};
             const panel = document.querySelector(
                 '[aria-label*="Studio" i], [data-testid*="studio" i], aside'
             ) || document.body;
@@ -20079,7 +20188,7 @@ async def _cleanup_nlm_keep_long_deep_dive(page) -> dict:
                 + '[data-testid*="audio"], [data-testid*="overview-item"]'
             );
             const out = [];
-            candidates.forEach((el, i) => {
+            candidates.forEach((el, i) => {{
                 if (el.offsetParent === null) return;
                 const t = (el.innerText || '').toLowerCase();
                 const isAudio = t.includes('audio overview')
@@ -20087,27 +20196,38 @@ async def _cleanup_nlm_keep_long_deep_dive(page) -> dict:
                     || t.includes('podcast');
                 const isConfigTile = t.includes('customize');
                 if (!isAudio || isConfigTile) return;
-                // Strict keep predicate: deep dive AND (long OR duration >= 15min).
-                // The default auto-fired audio is short (~5-7 min) and is never
-                // tagged "long" — so the keep filter excludes it cleanly.
+                // Length-aware keep predicate (2026-05-14):
+                //   "long"  → deep dive AND (long-tag OR duration >= 15min)
+                //   "short" → NOT deep dive AND duration < 10min (Brief)
+                // "default" never reaches this block (early return above).
                 const hasDeepDive = t.includes('deep dive');
                 const hasLong = t.includes('long');
                 const durMatch = t.match(/(\\d+):(\\d+)/);
                 const durMinutes = durMatch ? parseInt(durMatch[1], 10) : 0;
-                const isLongDuration = durMinutes >= 15;
-                const isKeep = hasDeepDive && (hasLong || isLongDuration);
+                let isKeep = false;
+                if (podcastLength === "short") {{
+                    // Brief format audio: not Deep Dive AND short duration.
+                    // durMinutes==0 happens when NLM hasn't rendered the
+                    // duration yet — accept that as a candidate so we
+                    // don't lose track of an in-flight Brief.
+                    isKeep = !hasDeepDive && (durMinutes === 0 || durMinutes < 10);
+                }} else {{
+                    // "long" (and any unknown value falls back here)
+                    const isLongDuration = durMinutes >= 15;
+                    isKeep = hasDeepDive && (hasLong || isLongDuration);
+                }}
                 el.setAttribute('data-cleanup-idx', String(i));
-                out.push({
+                out.push({{
                     idx: i,
                     isKeep: isKeep,
                     hasDeepDive: hasDeepDive,
                     hasLong: hasLong,
                     durationMin: durMinutes,
                     snippet: t.slice(0, 100),
-                });
-            });
+                }});
+            }});
             return out;
-        }""") or []
+        }}""") or []
 
         result["scanned"] = len(cards)
         keep_candidates = [c for c in cards if c["isKeep"]]
