@@ -19558,15 +19558,26 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # to the one we explicitly requested — leaving the user with two
     # in-flight entries. We can't delete (user constraint), so we
     # fail_phase loud and ask the user to manually clean up the
-    # non-Deep-Dive entry. The 5s sleep gives the new card time to
-    # render in the panel before the count.
+    # unwanted entry. The 5s sleep gives the new card time to render
+    # in the panel before the count.
     await asyncio.sleep(5)
     post_gen_cards = await _count_nlm_audio_cards(browser.page)
     log(f"[Phase3] Post-generate inventory: {post_gen_cards} audio card(s)")
     if post_gen_cards > 1:
+        # 2026-05-14: length-aware cleanup instruction. The misclick-fired
+        # auto-default is NLM's current default settings, which depends
+        # on the user's last customize — so we can't promise which one it
+        # is. We CAN promise which one the user wanted (from podcast_length)
+        # and tell the user to keep that one.
+        _kept = {
+            "short": "Brief (~3–5 min, not Deep Dive)",
+            "default": "Deep Dive · Default (~10–15 min)",
+            "long": "Deep Dive · Long (~20–30 min)",
+        }.get(podcast_length, "Deep Dive · Long (~20–30 min)")
         fail_phase(3,
                    f"Duplicate audio overview detected — NotebookLM Studio shows {post_gen_cards} entries",
-                   "Likely a CUA misclick fired a default audio alongside the Deep Dive Long one. Open the notebook, delete the non-Deep-Dive entry manually, then retry.",
+                   f"Likely a CUA misclick fired a default audio alongside the {_kept} one you requested. "
+                   f"Open the notebook, KEEP the {_kept} entry, delete the other one manually, then retry.",
                    agent="notebooklm",
                    can_retry=True)
         return {"audio_path": None}
@@ -19650,12 +19661,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             _live_cards = await _count_nlm_audio_cards(browser.page)
             if _live_cards > 1:
                 log(f"[Phase3] Mid-poll duplicate detected: {_live_cards} audio card(s) visible — failing phase so user can clean up", "ERROR")
+                # 2026-05-14: length-aware operator instruction.
+                _kept = {
+                    "short": "Brief (~3–5 min, not Deep Dive)",
+                    "default": "Deep Dive · Default (~10–15 min)",
+                    "long": "Deep Dive · Long (~20–30 min)",
+                }.get(podcast_length, "Deep Dive · Long (~20–30 min)")
                 fail_phase(
                     3,
                     f"Duplicate audio detected mid-generation — NotebookLM Studio shows {_live_cards} entries",
-                    "NotebookLM started a second audio (likely a CUA misclick on the Audio Overview card). "
-                    "Open the notebook, delete the non-target audio entry manually, then retry. "
-                    "We don't auto-delete in-flight audios to avoid removing the wrong one.",
+                    f"NotebookLM started a second audio (likely a CUA misclick on the Audio Overview card). "
+                    f"Open the notebook, KEEP the {_kept} entry you requested, delete the other one manually, then retry. "
+                    f"We don't auto-delete in-flight audios to avoid removing the wrong one.",
                     agent="notebooklm",
                     can_retry=True,
                 )
@@ -19671,8 +19688,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             audio_done = True
             break
 
-        # CUA fallback — strict: only "audio complete" counts
-        diag = await agent_loop(cua_client, browser, PROMPT_AUDIO_CHECK,
+        # CUA fallback — strict: only "audio complete" counts.
+        # 2026-05-14: prompt is length-aware so CUA looks at the SAME
+        # card the generate step produced (not a hardcoded Long + Deep
+        # Dive that doesn't exist for short/default runs).
+        diag = await agent_loop(cua_client, browser, make_prompt_audio_check(podcast_length),
             "Check: Has audio generation FINISHED? Is there a completed audio player "
             "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
             model=CUA_MODEL, max_iterations=3, verbose=verbose)
@@ -19742,7 +19762,12 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             "Downloading audio overview .m4a from NotebookLM",
             interval=20)
         try:
-            await agent_loop(cua_client, browser, PROMPT_AUDIO_DOWNLOAD,
+            # 2026-05-14: length-aware download prompt — CUA targets the
+            # SAME card the generate step created (Brief / Deep Dive Default
+            # / Long Deep Dive), not the hardcoded Long + Deep Dive that
+            # would either not exist (short) or pick the wrong card if a
+            # parallel Deep Dive misclick existed (default).
+            await agent_loop(cua_client, browser, make_prompt_audio_download(podcast_length),
                 "Download the audio file.", model=CUA_MODEL, max_iterations=8, verbose=verbose)
         finally:
             await stop_narration_ticker(_stop_d, _task_d)

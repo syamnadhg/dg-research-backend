@@ -728,16 +728,47 @@ Steps (do them in order, do not skip):
 
 If at any point you realize you've clicked the wrong thing and a default/unwanted audio has started generating, say exactly: "abort: misclick — default audio fired" and STOP. Do not try to click "stop" or "delete" — leave the page as-is and report."""
 
-PROMPT_AUDIO_CHECK = SYSTEM_BASE + """
+# Per-variant target descriptors used by the audio CHECK + DOWNLOAD prompt
+# factories below. Mirrors _PROMPT_AUDIO_GENERATE_VARIANTS so the
+# completion/download CUA tasks point at the SAME card the generate task
+# created — critical for short/default runs where a hardcoded "Long + Deep
+# Dive" target would either send CUA hunting for an audio that doesn't
+# exist (short) or pick the wrong card if a misclick spawned a parallel
+# Deep Dive (default).
+_PROMPT_AUDIO_TARGET_VARIANTS = {
+    "short": {
+        "card_desc": "the Brief audio overview you generated",
+        "match_hint": "the one whose label says 'Brief' or whose duration is short (~3–5 min) — NOT a Deep Dive entry",
+        "ambiguity_rule": "If only one audio entry exists, target that one. If multiple entries exist, target the BRIEF entry (short duration / no 'Deep Dive' label).",
+    },
+    "default": {
+        "card_desc": "the Deep Dive · Default audio overview you generated",
+        "match_hint": "the one whose label says 'Deep Dive' WITHOUT the 'Long' length qualifier (typical Default duration ~10–15 min)",
+        "ambiguity_rule": "If only one audio entry exists, target that one. If multiple entries exist with similar Deep Dive labels, target the most recently completed entry (usually the topmost or latest-timestamped).",
+    },
+    "long": {
+        "card_desc": "the Long + Deep Dive audio overview you generated",
+        "match_hint": "the one whose label, duration, or thumbnail matches a long-form deep dive (typically 15+ minutes)",
+        "ambiguity_rule": "If only one audio entry exists, target that one. If multiple entries exist and labels are ambiguous, target the LONGEST-DURATION entry.",
+    },
+}
+
+
+def make_prompt_audio_check(podcast_length: str = "long") -> str:
+    """Build the audio-completion-check prompt with the right length-specific
+    target description so CUA looks at the SAME card the generate step
+    produced (not a hardcoded Long + Deep Dive that may not exist for
+    short/default runs)."""
+    v = _PROMPT_AUDIO_TARGET_VARIANTS.get(podcast_length) or _PROMPT_AUDIO_TARGET_VARIANTS["long"]
+    return SYSTEM_BASE + f"""
 
 Check if the NotebookLM audio overview has FINISHED generating.
 
-Look ONLY at the audio overview CARD inside the Studio panel — the card
-that shows the Long + Deep Dive audio you generated. IGNORE other panel
-chrome, sidebars, banners, source-list spinners, or page-level loading
-indicators (NotebookLM regularly shows ambient progress on unrelated UI
-elements while the audio itself is fully done — these false-positives are
-the most common cause of 45-min poll timeouts).
+Look ONLY at the audio overview CARD inside the Studio panel — {v['card_desc']}.
+IGNORE other panel chrome, sidebars, banners, source-list spinners, or
+page-level loading indicators (NotebookLM regularly shows ambient progress
+on unrelated UI elements while the audio itself is fully done — these
+false-positives are the most common cause of 45-min poll timeouts).
 
 On the audio overview card only:
 1. Is there a progress bar, "Generating..." text, or spinning indicator on the card itself? → say "still generating"
@@ -745,24 +776,33 @@ On the audio overview card only:
 
 CRITICAL: Say "audio complete" as soon as the audio CARD itself is finished. A spinner on a different card, panel, or banner does NOT count — only the audio card's own state matters."""
 
-PROMPT_AUDIO_DOWNLOAD = SYSTEM_BASE + """
 
-Download the Long + Deep Dive audio overview that was just generated.
+def make_prompt_audio_download(podcast_length: str = "long") -> str:
+    """Build the audio-download prompt with the right length-specific target
+    description so CUA downloads the SAME card the generate step produced
+    (not the hardcoded Long + Deep Dive)."""
+    v = _PROMPT_AUDIO_TARGET_VARIANTS.get(podcast_length) or _PROMPT_AUDIO_TARGET_VARIANTS["long"]
+    return SYSTEM_BASE + f"""
+
+Download {v['card_desc']}.
 
 If the Studio panel shows multiple audio entries (for example an auto-fired
-short default alongside the Long + Deep Dive one), target ONLY the Long +
-Deep Dive entry — the one whose label, duration, or thumbnail matches a
-long-form deep dive (typically 15+ minutes). Do NOT click any other audio
-entry's play button, download button, or three-dot menu.
+default alongside the one you generated), target ONLY {v['card_desc']} —
+{v['match_hint']}. Do NOT click any other audio entry's play button,
+download button, or three-dot menu.
 
 Steps:
-1. Locate the Long + Deep Dive audio entry in the Studio panel.
+1. Locate the correct audio entry in the Studio panel.
 2. On THAT entry, open its three-dot menu (or find its download affordance).
 3. Click Download. Say "downloaded" when the download begins.
 
-If only one audio entry exists, download that one. If multiple entries exist
-and the labels are genuinely ambiguous, download the most recently completed
-entry (usually the topmost or latest-timestamped)."""
+{v['ambiguity_rule']}"""
+
+
+# Backward-compat aliases — keep the previous "long" behavior for any
+# importer that hasn't been updated to call the factory with podcast_length.
+PROMPT_AUDIO_CHECK = make_prompt_audio_check("long")
+PROMPT_AUDIO_DOWNLOAD = make_prompt_audio_download("long")
 
 # ── Inline CUA Prompts (used as one-off fallbacks) ────────────────────────────
 
