@@ -7492,6 +7492,89 @@ def _is_transient_net_error(exc_or_text) -> bool:
     return any(code in s for code in _TRANSIENT_NET_ERRORS)
 
 
+async def _advance_dns_backoff(p, name, now, elapsed):
+    """Advance the DNS retry state machine for one agent. Returns True
+    if a retry was attempted (caller should skip the rest of this tick
+    via `continue`), False if no retry was due.
+
+    DGOPS-7367 — refactored from inline (poll_all_agents_round_robin) on
+    2026-05-18 for unit testability (DGOPS-7335 PR review ask).
+
+    State machine:
+      Entry guard: `p["dns_retry_at"]` set AND `now >= dns_retry_at`.
+      Reload succeeds → clear retry state, rejoin rotation, emit progress.
+      Reload raises transient + attempts left → schedule next backoff,
+        emit progress (keeps FE silence + BE no-growth watchdogs quiet
+        during long 480s waits).
+      Reload raises non-transient OR attempts exhausted → flip
+        `error_source` to "network_exhausted" so the is_error gate on
+        the next tick falls through to the normal drop path.
+
+    Mutates `p` in place. Takes `now` (caller's `time.time()`) so tests
+    can pass deterministic timestamps. `elapsed` is the agent's wall-
+    clock elapsed seconds, used only for the emit_event payload.
+    Calls module-level `log` / `emit_event` / `_is_transient_net_error`
+    / `normalize_agent_key`. Tests can mock these via `unittest.mock.patch`.
+
+    Behavior note vs original inline block: `now` is captured at the
+    call site and used for BOTH the `last_cua_check` write and the
+    `dns_retry_at` computation on transient-fail. The original inline
+    block called `time.time()` again AFTER the awaited `page.reload`
+    (~20s) + `asyncio.sleep(3.0)` — so the refactor schedules the
+    next CUA check / next retry up to ~23s earlier than the original.
+    Not safety-relevant (CUA-check throttle is ~5min; next retry
+    earlier-not-later is the safer drift direction)."""
+    import asyncio as _asyncio
+    if not (p.get("dns_retry_at") and now >= p["dns_retry_at"]):
+        return False
+    _attempt = p.get("dns_retry_attempts", 1)
+    log(f"[{name}] DNS retry attempt {_attempt}/{len(_DNS_BACKOFF_SECS)} — "
+        f"re-attempting page.reload (was: {p.get('dns_last_error', '')[:80]})")
+    try:
+        await p["page"].reload(wait_until="domcontentloaded", timeout=20000)
+        await _asyncio.sleep(3.0)
+        log(f"[{name}] DNS retry {_attempt} SUCCEEDED — agent rejoining rotation")
+        p["dns_retry_at"] = 0
+        p["dns_retry_attempts"] = 0
+        p["error_source"] = None
+        p["dns_last_error"] = ""
+        p["claude_refreshed_once"] = True
+        p["last_cua_check"] = now
+        try:
+            emit_event("agent_progress", phase=2,
+                       agent=normalize_agent_key(name),
+                       status="generating",
+                       progress=f"Recovered from network blip after {_attempt} retry",
+                       elapsedSec=int(elapsed))
+        except Exception:
+            pass
+    except Exception as _re2:
+        if _is_transient_net_error(_re2) and _attempt < len(_DNS_BACKOFF_SECS):
+            _next_delay = _DNS_BACKOFF_SECS[_attempt]
+            p["dns_retry_at"] = now + _next_delay
+            p["dns_retry_attempts"] = _attempt + 1
+            p["dns_last_error"] = str(_re2)[:200]
+            log(f"[{name}] DNS retry {_attempt} failed ({str(_re2)[:80]}); "
+                f"next attempt in {_next_delay}s "
+                f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})", "WARN")
+            try:
+                emit_event("agent_progress", phase=2,
+                           agent=normalize_agent_key(name),
+                           status="generating",
+                           progress=f"Network blip — retrying in {_next_delay}s "
+                                    f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})",
+                           elapsedSec=int(elapsed))
+            except Exception:
+                pass
+        else:
+            log(f"[{name}] DNS retries exhausted — falling through to "
+                f"normal drop path (last error: {str(_re2)[:80]})", "WARN")
+            p["dns_retry_at"] = 0
+            p["error_source"] = "network_exhausted"
+            p["claude_refreshed_once"] = True
+    return True
+
+
 def fail_agent(agent_key: str, title: str, details: str = "",
                include_wait: bool = False):
     """Template B: Phase 2 per-agent error alert. Emits pipeline_error
@@ -14010,77 +14093,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # below). Increment ONCE per round-robin tick per agent.
             p["poll_cycles"] = p.get("poll_cycles", 0) + 1
 
-            # DGOPS-7367 (2026-05-13) — deferred DNS retry. If a previous
-            # page.reload tripped a transient network error, retry the
-            # reload now that the backoff window has elapsed. Schedule
-            # the next attempt on failure; clear state + rejoin rotation
-            # on success; exhaust → fall through to existing drop path.
-            # Runs BEFORE the spotlight + scrape body so a successful
-            # retry's fresh DOM is what this tick reads from.
-            if p.get("dns_retry_at") and time.time() >= p["dns_retry_at"]:
-                _attempt = p.get("dns_retry_attempts", 1)
-                log(f"[{name}] DNS retry attempt {_attempt}/{len(_DNS_BACKOFF_SECS)} — "
-                    f"re-attempting page.reload (was: {p.get('dns_last_error', '')[:80]})")
-                try:
-                    await p["page"].reload(wait_until="domcontentloaded", timeout=20000)
-                    await asyncio.sleep(3.0)
-                    log(f"[{name}] DNS retry {_attempt} SUCCEEDED — agent rejoining rotation")
-                    # Clear retry state, mark prophylaxis done so we don't
-                    # re-trigger the cycle=2 path, and delay the next CUA
-                    # check briefly so the post-reload DOM has a moment to
-                    # finish mounting before any verdict.
-                    p["dns_retry_at"] = 0
-                    p["dns_retry_attempts"] = 0
-                    p["error_source"] = None
-                    p["dns_last_error"] = ""
-                    p["claude_refreshed_once"] = True
-                    p["last_cua_check"] = time.time()
-                    try:
-                        emit_event("agent_progress", phase=2,
-                                   agent=normalize_agent_key(name),
-                                   status="generating",
-                                   progress=f"Recovered from network blip after {_attempt} retry",
-                                   elapsedSec=int(elapsed))
-                    except Exception:
-                        pass
-                except Exception as _re2:
-                    if _is_transient_net_error(_re2) and _attempt < len(_DNS_BACKOFF_SECS):
-                        _next_delay = _DNS_BACKOFF_SECS[_attempt]
-                        p["dns_retry_at"] = time.time() + _next_delay
-                        p["dns_retry_attempts"] = _attempt + 1
-                        p["dns_last_error"] = str(_re2)[:200]
-                        log(f"[{name}] DNS retry {_attempt} failed ({str(_re2)[:80]}); "
-                            f"next attempt in {_next_delay}s "
-                            f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})", "WARN")
-                        # DGOPS-7367 hardening (2026-05-13): emit
-                        # agent_progress so the FE 2-tier silence watchdog
-                        # + BE no-growth watchdog don't creep toward
-                        # "stalled" during the 480s attempt-3 wait. Without
-                        # this emit, a long backoff window looks identical
-                        # to a hung agent from the watchdog's POV.
-                        try:
-                            emit_event("agent_progress", phase=2,
-                                       agent=normalize_agent_key(name),
-                                       status="generating",
-                                       progress=f"Network blip — retrying in {_next_delay}s "
-                                                f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})",
-                                       elapsedSec=int(elapsed))
-                        except Exception:
-                            pass
-                    else:
-                        # Backoff exhausted OR non-transient error this time.
-                        # Clear retry state; let the existing CUA-error-drop
-                        # path run on the next tick. error_source flipped to
-                        # "network_exhausted" so the is_error gate (below)
-                        # knows we already gave network a chance.
-                        log(f"[{name}] DNS retries exhausted — falling through to "
-                            f"normal drop path (last error: {str(_re2)[:80]})", "WARN")
-                        p["dns_retry_at"] = 0
-                        p["error_source"] = "network_exhausted"
-                        p["claude_refreshed_once"] = True
-                # Either way, skip the rest of this agent's tick so the
-                # round-robin continues with siblings instead of running
-                # CUA against a freshly-reloaded (or still-broken) DOM.
+            # DGOPS-7367 (2026-05-13) — deferred DNS retry tick. State-
+            # machine lives in `_advance_dns_backoff` (research.py:~7494),
+            # extracted from this inline block on 2026-05-18 for unit-test
+            # coverage. Runs BEFORE the spotlight + scrape body so a
+            # successful retry's fresh DOM is what this tick reads from.
+            if await _advance_dns_backoff(p, name, time.time(), elapsed):
                 continue
 
             # ── C6: cursor foreground + partial-content refresh ──
@@ -16372,7 +16390,24 @@ async def _run_with_clipboard_hijack(
 
 
 async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
-    """Extract ChatGPT response — 3 Wayland-safe tiers (rewritten 2026-05-14):
+    """Extract ChatGPT response — 3 Wayland-safe tiers (rewritten 2026-05-14).
+
+    Per-agent extraction model is intentionally divergent (the PR body's
+    "T1 = X, T2 = Y, T3 = Z" describes the META-pattern — DOM → CUA →
+    clipboard-hijack — not a uniform per-agent mapping):
+      - ChatGPT (this fn): CUA download → HTML→MD → CUA copy hijack
+      - Gemini (`extract_gemini_response`, research.py:16539): HTML→MD →
+        Share&Export hijack → Ctrl+A/C hijack
+      - Claude (`extract_claude_response`, research.py:16640): two-mode —
+        3 tiers in Deep Research artifact-aware mode (T1 CUA-download →
+        T2 publish + HTML→MD on claude.site → T3 CUA + clipboard hijack;
+        collapsed from a 4-tier ladder on 2026-05-13). Targets the LAST
+        artifact since DR produces 2 (tracking checklist + final report).
+        Chat-mode branch has its own Tier 1/2 (HTML→MD primary, Copy
+        hijack fallback) — fires when Research wasn't enabled and the
+        operator continued in chat.
+
+    ChatGPT-specific tier ordering:
       Tier 1: CUA-driven download flow (close source panel, open canvas
               full-page, click download icon, click "Export to Markdown",
               expect_download captures the .md). Selector-free; CUA does
