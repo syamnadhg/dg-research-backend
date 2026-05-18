@@ -25349,13 +25349,12 @@ async def run_pair(profile_dir, wait_minutes=10):
     await browser.start()
 
     # F4 / DGOPS-7451 — refuse to add a Google account to a profile that
-    # already has one signed in. Multi-account state in this profile is the
-    # exact root enabler of the 2026-05-05 incident: the user thought
-    # juk80x@gmail.com was selected, but jason.rogers@distributedglobal.com
-    # was still loaded and onAuthStateChanged silently fired with the work
-    # credential when Gemini navigated to dg-security-monitor.web.app.
-    # Detect read-only first; if a prior Google auth is present, surface a
-    # clear unpair-first message and exit before walking Stage 3 logins.
+    # already has one signed in. Multi-account state in this profile is
+    # the root enabler of the session-inheritance class of incident this
+    # safety check defends against; full incident context lives in
+    # DGOPS-7451. Detect read-only first; if a prior Google auth is
+    # present, surface a clear unpair-first message and exit before
+    # walking Stage 3 logins.
     try:
         prior = await _detect_persisted_google_auth(browser.context)
     except Exception as _de:
