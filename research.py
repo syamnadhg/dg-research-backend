@@ -1529,14 +1529,22 @@ def generate_device_id():
 
 
 def _detect_supervised() -> bool:
-    """Probe Windows Task Scheduler for the SuperResearchBackend task. The
-    scheduled task is the actual source of truth for supervised mode —
-    the device doc is just a Firestore mirror that can drift (e.g., after
-    unlink deletes the doc but the task lives on). Returns False on
-    non-Windows platforms or when schtasks isn't available."""
-    import platform as _platform
-    if _platform.system() != "Windows":
-        return False
+    """Dispatcher — routes to platform-specific probes. The scheduled task
+    / launchd job / systemd unit is the actual source of truth for
+    supervised mode; the Firestore device doc is just a mirror that can
+    drift (e.g., after unlink deletes the doc but the task lives on).
+    Returns False on Unsupported."""
+    plat = _supervisor_platform()
+    if plat == "Windows":
+        return _detect_supervised_windows()
+    if plat == "Darwin":
+        return _detect_supervised_macos()
+    return False
+
+
+def _detect_supervised_windows() -> bool:
+    """Probe Windows Task Scheduler for the SuperResearchBackend task.
+    Returns False on schtasks failure or task not found."""
     import subprocess as _sp
     try:
         result = _sp.run(
@@ -25678,7 +25686,10 @@ async def run_pair(profile_dir, wait_minutes=10):
             if ok:
                 supervised_armed = True
                 _write_supervised_flag(True)
-                print(f"  {_c(_OK, '✓')}  Scheduled Task pinned to login ({_SUPERVISOR_TASK_NAME})")
+                if _supervisor_platform() == "Darwin":
+                    print(f"  {_c(_OK, '✓')}  LaunchAgent installed ({_SUPERVISOR_PLIST_LABEL})")
+                else:
+                    print(f"  {_c(_OK, '✓')}  Scheduled Task pinned to login ({_SUPERVISOR_TASK_NAME})")
                 if killed_serves:
                     plural = "es" if killed_serves != 1 else ""
                     print(f"  {_c(_DIM, f'     Stopped {killed_serves} running --serve process{plural} to free port 8000.')}")
@@ -25691,9 +25702,15 @@ async def run_pair(profile_dir, wait_minutes=10):
                     print(f"  {_c(_DIM, '     The scheduled task still fires at next login as a fallback.')}")
                 print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
             else:
-                if info == "non-Windows":
-                    print(f"  {_c(_WARN, '⚠')}  On Startup is Windows-only today.")
-                    print(f"  {_c(_DIM, '     macOS / Linux desktop: tracked as task #355 (launchd + systemd-user).')}")
+                if info == "unsupported":
+                    import platform as _platform_step4
+                    plat_name = _platform_step4.system()
+                    if plat_name in ("Darwin", "Linux"):
+                        print(f"  {_c(_WARN, '⚠')}  On Startup is gated behind DG_ALLOW_CROSS_PLATFORM=1.")
+                        print(f"  {_c(_DIM, '     PR1 (macOS) merged; PR2 (Linux) coming shortly.')}")
+                        print(f"  {_c(_DIM, '     See PersistenceRecipe.md §4 Scratch.')}")
+                    else:
+                        print(f"  {_c(_WARN, '⚠')}  Only Windows / macOS / Linux desktop is supported.")
                 else:
                     print(f"  {_c(_WARN, '⚠')}  Could not enable On Startup: {info}")
                 print(f"  {_c(_DIM, '     Run manually with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
@@ -25713,8 +25730,8 @@ async def run_pair(profile_dir, wait_minutes=10):
                 print(f"  {_c(_OK, '✓')}  Removed leftover Scheduled Task ({_SUPERVISOR_TASK_NAME})")
             elif task_info == "missing":
                 print(f"  {_c(_DIM, '     No scheduled task was installed.')}")
-            elif task_info == "non-Windows":
-                pass  # silent — schtasks is Windows-only
+            elif task_info in ("non-Windows", "unsupported"):
+                pass  # silent — no supervisor artifact to remove on this platform
             else:
                 print(f"  {_c(_WARN, '⚠')}  schtasks teardown: {task_info}")
             if killed_procs:
@@ -25958,7 +25975,9 @@ def _console_python_exe() -> str:
     """Return python.exe (console interpreter) sibling of the current
     interpreter, falling back to sys.executable. Used by daemon-loop when
     spawning --serve so uvicorn keeps predictable stdio semantics even when
-    daemon-loop itself is running under pythonw.exe."""
+    daemon-loop itself is running under pythonw.exe. Platform-agnostic —
+    on POSIX the `pythonw.exe` check fails and the function falls through
+    to `sys.executable`, which is the right answer there too."""
     cur = Path(sys.executable)
     if cur.name.lower() == "pythonw.exe":
         sib = cur.parent / "python.exe"
@@ -25967,7 +25986,275 @@ def _console_python_exe() -> str:
     return str(cur)
 
 
+# ── POSIX-shared helpers (macOS in PR1, reused by Linux in PR2) ────────────
+
+def _enumerate_research_py_procs_posix() -> list[tuple[int, str, str]]:
+    """POSIX sibling of `_enumerate_research_py_procs_windows`. Reads
+    `ps -ww -eo pid=,command=` and matches the `research.py` substring.
+    `-ww` (BSD wide) prevents the default ~80-char cmdline truncation
+    that would otherwise mask long invocations. Role logic mirrors
+    Windows: --daemon-loop → daemon-loop, --serve → serve, else other."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["ps", "-ww", "-eo", "pid=,command="],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    results: list[tuple[int, str, str]] = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line or "research.py" not in line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        cmd = parts[1]
+        if "--daemon-loop" in cmd:
+            role = "daemon-loop"
+        elif "--serve" in cmd:
+            role = "serve"
+        else:
+            role = "other"
+        results.append((pid, cmd, role))
+    return results
+
+
+def _proc_age_seconds_posix(pid: int) -> "float | None":
+    """POSIX sibling of `_proc_age_seconds_windows`. Reads
+    `ps -o etime= -p <pid>` and parses via `_parse_etime`. Returns None
+    on unknown pid or unparseable output."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["ps", "-o", "etime=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return _parse_etime(r.stdout or "")
+
+
+def _kill_pids_posix(pids: list[int]) -> int:
+    """POSIX sibling of `_kill_pids_windows`. SIGTERM each PID, wait 1s,
+    SIGKILL survivors. Returns count confirmed terminated via kill(0) probe."""
+    import signal as _signal
+    import time as _t
+    if not pids:
+        return 0
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    _t.sleep(1.0)
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    confirmed = 0
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            confirmed += 1
+    return confirmed
+
+
+# ── macOS launchd helpers (PR1 — gated behind DG_ALLOW_CROSS_PLATFORM=1) ────
+
+def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
+    """macOS sibling of `_arm_supervisor_quiet_windows`. Writes the launchd
+    user agent plist at ~/Library/LaunchAgents/com.dgresearch.supervisor.plist
+    and bootstraps it into gui/$(id -u). Returns the same tuple shape as the
+    Windows path: (installed_ok, daemon_pid_or_None, info, killed_serve_count).
+
+    `PATH` stays in plist's `EnvironmentVariables` because launchd does not
+    inherit shell env and needs it to locate python3. All other env vars
+    (Vision, CUA, API key) live in `.dg-supervisor.env` and are loaded by
+    Python via `--env-file` before subcommand dispatch.
+
+    EUID guard: refuses to install if running under sudo — would write the
+    plist to /root/Library/... and leave it un-managed by the actual user."""
+    import subprocess as _sp
+    import os as _os
+
+    if _os.geteuid() == 0:
+        return False, None, "refuse: do not run under sudo (user agent must be in your own home)", 0
+
+    _seed_env_file_if_missing()
+
+    script_dir = Path(__file__).parent
+    log_dir = script_dir / "logs"
+    try:
+        log_dir.mkdir(exist_ok=True)
+        _SUPERVISOR_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return False, None, f"could not create dirs: {e}", 0
+
+    python_exe = sys.executable
+    script_path = str(Path(__file__).resolve())
+    env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+    plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{_SUPERVISOR_PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{python_exe}</string>
+    <string>{script_path}</string>
+    <string>--daemon-loop</string>
+    <string>--env-file</string>
+    <string>{env_file}</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>{script_dir}</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>{log_dir / 'supervisor.out.log'}</string>
+  <key>StandardErrorPath</key>
+  <string>{log_dir / 'supervisor.err.log'}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+"""
+    try:
+        _SUPERVISOR_PLIST_PATH.write_text(plist_xml, encoding="utf-8")
+    except Exception as e:
+        return False, None, f"plist write failed: {e}", 0
+
+    uid = _os.getuid()
+    domain = f"gui/{uid}"
+    label = f"{domain}/{_SUPERVISOR_PLIST_LABEL}"
+
+    # Bootout first (idempotent — clears any prior install). Errors ignored.
+    try:
+        _sp.run(["launchctl", "bootout", label],
+                capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+    # Bootstrap into gui/$uid so the agent runs in the Aqua session (Chrome
+    # needs that scope for display + clipboard).
+    try:
+        r = _sp.run(["launchctl", "bootstrap", domain, str(_SUPERVISOR_PLIST_PATH)],
+                    capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False, None, f"bootstrap failed: {(r.stderr or r.stdout).strip()[:120]}", 0
+    except Exception as e:
+        return False, None, f"bootstrap exception: {e}", 0
+
+    # Enable + kickstart (best-effort — bootstrap usually starts the job,
+    # kickstart forces a run regardless).
+    try:
+        _sp.run(["launchctl", "enable", label],
+                capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+    try:
+        _sp.run(["launchctl", "kickstart", "-k", label],
+                capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+    # Sweep stale --serve procs (port 8000 conflict).
+    procs = _enumerate_research_py_procs_posix()
+    plain_serve_pids = [pid for pid, _c, role in procs if role == "serve"]
+    killed_serve = _kill_pids_posix(plain_serve_pids) if plain_serve_pids else 0
+
+    # Wait for daemon-loop pid (launchctl returns before child materializes).
+    daemon_pid = _wait_for_daemon_loop(_enumerate_research_py_procs_posix, timeout_s=5.0)
+    if daemon_pid is not None:
+        return True, daemon_pid, "", killed_serve
+    return True, None, "daemon-loop did not appear within 5s", killed_serve
+
+
+def _disarm_supervisor_macos() -> "tuple[str, int]":
+    """macOS sibling of `_disarm_supervisor_quiet_windows`. Bootout the
+    launchd user agent, delete the plist, kill survivors. Returns
+    (status, killed_total)."""
+    import subprocess as _sp
+    import os as _os
+
+    if _os.geteuid() == 0:
+        return "refuse: do not run under sudo", 0
+
+    uid = _os.getuid()
+    label = f"gui/{uid}/{_SUPERVISOR_PLIST_LABEL}"
+
+    status = "no-task"
+    try:
+        r = _sp.run(["launchctl", "bootout", label],
+                    capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            status = "removed"
+        elif "could not find" in (r.stderr or "").lower() or "no such" in (r.stderr or "").lower():
+            status = "no-task"
+        else:
+            status = (r.stderr or r.stdout or "bootout returned non-zero").strip()[:100]
+    except Exception as e:
+        status = f"bootout exception: {e}"
+
+    # Delete plist regardless of bootout outcome.
+    try:
+        if _SUPERVISOR_PLIST_PATH.exists():
+            _SUPERVISOR_PLIST_PATH.unlink()
+    except Exception as e:
+        if status == "removed":
+            status = f"removed (plist unlink warning: {e})"
+
+    killed = _kill_until_clean(_enumerate_research_py_procs_posix, _kill_pids_posix)
+    return status, killed
+
+
+def _detect_supervised_macos() -> bool:
+    """macOS sibling of `_detect_supervised_windows`. `launchctl print
+    gui/$uid/<label>` returns 0 iff the agent is bootstrapped in the
+    user's Aqua session. Returns False on any error / not bootstrapped."""
+    import subprocess as _sp
+    import os as _os
+    try:
+        uid = _os.getuid()
+        r = _sp.run(["launchctl", "print", f"gui/{uid}/{_SUPERVISOR_PLIST_LABEL}"],
+                    capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
+    """Dispatcher — routes to `_enumerate_research_py_procs_windows` or
+    `_enumerate_research_py_procs_posix`. Returns [] on Unsupported."""
+    plat = _supervisor_platform()
+    if plat == "Windows":
+        return _enumerate_research_py_procs_windows()
+    if plat in ("Darwin", "Linux"):
+        return _enumerate_research_py_procs_posix()
+    return []
+
+
+def _enumerate_research_py_procs_windows() -> list[tuple[int, str, str]]:
     """Return [(pid, cmdline, role), ...] for every python.exe / pythonw.exe
     whose command line references this script. role ∈ {'daemon-loop',
     'serve', 'other'}. Single source of truth for --resurrect (what's
@@ -25975,7 +26262,7 @@ def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
 
     Matches on "research.py" substring so subprocess invocations launched
     from different cwd styles (absolute, relative, with/without quotes)
-    all get caught. Safe on non-Windows — returns [] when wmic is absent.
+    all get caught.
 
     Includes pythonw.exe because the Scheduled Task action runs the
     supervisor under the no-console interpreter."""
@@ -26027,7 +26314,17 @@ def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
     return results
 
 
-def _proc_age_seconds(pid: int) -> float | None:
+def _proc_age_seconds(pid: int) -> "float | None":
+    """Dispatcher — routes to `_proc_age_seconds_windows` or `_proc_age_seconds_posix`."""
+    plat = _supervisor_platform()
+    if plat == "Windows":
+        return _proc_age_seconds_windows(pid)
+    if plat in ("Darwin", "Linux"):
+        return _proc_age_seconds_posix(pid)
+    return None
+
+
+def _proc_age_seconds_windows(pid: int) -> "float | None":
     """Return seconds since process creation, or None if unknown.
     Best-effort via wmic CreationDate (yyyymmddHHMMSS.ffffff±zzz)."""
     try:
@@ -26050,6 +26347,16 @@ def _proc_age_seconds(pid: int) -> float | None:
 
 
 def _kill_pids(pids: list[int]) -> int:
+    """Dispatcher — routes to `_kill_pids_windows` or `_kill_pids_posix`."""
+    plat = _supervisor_platform()
+    if plat == "Windows":
+        return _kill_pids_windows(pids)
+    if plat in ("Darwin", "Linux"):
+        return _kill_pids_posix(pids)
+    return 0
+
+
+def _kill_pids_windows(pids: list[int]) -> int:
     """taskkill /F each PID. Returns count that successfully terminated.
     Silent on individual failures — caller can re-enumerate to confirm."""
     killed = 0
@@ -26366,7 +26673,21 @@ def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
         return False, f"PS error: {e}"
 
 
-def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
+def _arm_supervisor_quiet() -> "tuple[bool, int | None, str, int]":
+    """Dispatcher — routes to `_arm_supervisor_quiet_windows` or
+    `_arm_supervisor_macos`. Returns the same 4-tuple shape regardless
+    of platform: (installed_ok, daemon_pid_or_None, info, killed_serve_count)."""
+    plat = _supervisor_platform()
+    if plat == "Windows":
+        return _arm_supervisor_quiet_windows()
+    if plat == "Darwin":
+        return _arm_supervisor_macos()
+    # Linux falls through to PR2; everything else (Unsupported) returns a
+    # consistent "not supported" tuple so callers don't need platform branches.
+    return False, None, "unsupported", 0
+
+
+def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
     """Install the SuperResearchBackend scheduled task AND spawn a detached
     daemon-loop. No terminal narration — callers do their own.
 
@@ -26467,8 +26788,19 @@ def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
     return True, None, "daemon-loop did not appear within 5s", killed_serve_count
 
 
-def _disarm_supervisor_quiet() -> tuple[str, int]:
-    """Inverse of _arm_supervisor_quiet. Removes the Scheduled Task AND
+def _disarm_supervisor_quiet() -> "tuple[str, int]":
+    """Dispatcher — routes to `_disarm_supervisor_quiet_windows` or
+    `_disarm_supervisor_macos`. Returns (status, killed_total) on all platforms."""
+    plat = _supervisor_platform()
+    if plat == "Windows":
+        return _disarm_supervisor_quiet_windows()
+    if plat == "Darwin":
+        return _disarm_supervisor_macos()
+    return "unsupported", 0
+
+
+def _disarm_supervisor_quiet_windows() -> "tuple[str, int]":
+    """Inverse of _arm_supervisor_quiet_windows. Removes the Scheduled Task AND
     kills every daemon-loop + --serve process. No terminal narration —
     callers do their own.
 
@@ -26526,11 +26858,45 @@ def run_resurrect():
 
     _branded_header("resurgam", _BOLD + _BRIGHT, "the backend rises")
 
-    if _platform.system() != "Windows":
+    plat = _supervisor_platform()
+    if plat == "Darwin":
+        # PR1: macOS install via _arm_supervisor_macos. Minimal UX (no context
+        # strip / step numbers — parity-of-mechanism, not parity-of-UX).
+        # Polish deferred to a follow-up once smoke tests pass on real hardware.
+        init_firebase()
+        paired_uid = load_paired_uid()
+        if not paired_uid:
+            print(f"  {_c(_WARN, '⚠')} Device not paired. Run --pair first.")
+            return
+        print(f"  {_c(_OK, '✓')}  Pairing complete")
+        _seed_env_file_if_missing()
+        ok, daemon_pid, info, killed_serve = _arm_supervisor_macos()
+        if not ok:
+            print(f"  {_c(_WARN, '⚠')}  launchd install failed: {info}")
+            return
+        print(f"  {_c(_OK, '✓')}  LaunchAgent installed ({_SUPERVISOR_PLIST_LABEL})")
+        if killed_serve:
+            print(f"  {_c(_DIM, f'     Stopped {killed_serve} stale --serve process(es).')}")
+        if daemon_pid is not None:
+            print(f"  {_c(_OK, '✓')}  Backend started (PID {daemon_pid}, supervised by launchd)")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  {info or 'daemon-loop did not appear within 5s'} — launchd will retry (KeepAlive=true).")
+        _write_supervised_flag(True)
+        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
         print()
-        print(f"  {_c(_WARN, 'Only supported on Windows today.')}")
-        print(f"  {_c(_DIM, 'macOS / Linux desktop: cross-platform background runners are tracked')}")
-        print(f"  {_c(_DIM, 'as task #355 (launchd + systemd-user). See PersistenceRecipe.md.')}")
+        print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  {_c(_DIM, '--serve respawns on any exit.')}")
+        return
+
+    if plat != "Windows":
+        # Unsupported (Linux or other) — or Darwin/Linux without DG_ALLOW_CROSS_PLATFORM=1.
+        print()
+        plat_name = _platform.system()
+        if plat_name in ("Darwin", "Linux"):
+            print(f"  {_c(_WARN, '⚠')} Cross-platform supervisor is experimental — gated behind DG_ALLOW_CROSS_PLATFORM=1.")
+            print(f"  {_c(_DIM, '     Set the env var and retry. PR1 (macOS) merged; PR2 (Linux) coming shortly.')}")
+        else:
+            print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
+        print(f"  {_c(_DIM, '     See PersistenceRecipe.md.')}")
         return
 
     # Seed `.dg-supervisor.env` from scripts/dg-supervisor.env.example so the
@@ -26746,9 +27112,34 @@ def run_retire():
 
     _branded_header("requiescat", _BOLD + _RED, "let the loop rest")
 
-    if _platform.system() != "Windows":
+    plat = _supervisor_platform()
+    if plat == "Darwin":
+        # PR1: macOS teardown via _disarm_supervisor_macos. Minimal UX.
+        init_firebase()
+        status, killed_total = _disarm_supervisor_macos()
+        if status == "removed":
+            print(f"  {_c(_OK, '✓')}  LaunchAgent removed ({_SUPERVISOR_PLIST_LABEL})")
+        elif status == "no-task":
+            print(f"  {_c(_DIM, '     No LaunchAgent was installed.')}")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  bootout returned: {status}")
+        if killed_total:
+            plural = "es" if killed_total != 1 else ""
+            print(f"  {_c(_OK, '✓')}  Stopped {killed_total} process{plural}")
+        else:
+            print(f"  {_c(_DIM, '     No daemon-loop / --serve processes were running.')}")
+        _write_supervised_flag(False)
+        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+        return
+
+    if plat != "Windows":
         print()
-        print(f"  {_c(_WARN, 'Only supported on Windows today.')}")
+        plat_name = _platform.system()
+        if plat_name in ("Darwin", "Linux"):
+            print(f"  {_c(_WARN, '⚠')} Cross-platform supervisor is experimental — gated behind DG_ALLOW_CROSS_PLATFORM=1.")
+            print(f"  {_c(_DIM, '     Set the env var and retry. PR1 (macOS) merged; PR2 (Linux) coming shortly.')}")
+        else:
+            print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
         return
 
     init_firebase()
@@ -26995,7 +27386,8 @@ def run_unpair():
 
     # ── [2/5] Stop supervisor + serve ──
     _setup_step(2, total, "Stopping running processes")
-    if _platform.system() == "Windows":
+    plat = _supervisor_platform()
+    if plat == "Windows":
         cmd = ["schtasks", "/Delete", "/TN", _SUPERVISOR_TASK_NAME, "/F"]
         try:
             result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
@@ -27008,6 +27400,30 @@ def run_unpair():
                 print(f"  {_c(_WARN, '⚠')}  schtasks returned non-zero — continuing.")
         except Exception as e:
             print(f"  {_c(_WARN, '⚠')}  schtasks error (continuing): {e}")
+    elif plat == "Darwin":
+        # launchctl bootout + plist removal. The subsequent kill loop
+        # below handles process termination cross-platform via dispatchers.
+        if os.geteuid() == 0:
+            print(f"  {_c(_WARN, '⚠')}  Refusing under sudo — user agent must be in your own home.")
+        else:
+            uid = os.getuid()
+            label = f"gui/{uid}/{_SUPERVISOR_PLIST_LABEL}"
+            try:
+                r = _subprocess.run(["launchctl", "bootout", label],
+                                    capture_output=True, text=True, timeout=10)
+                if r.returncode == 0:
+                    print(f"  {_c(_OK, '✓')}  LaunchAgent removed ({_SUPERVISOR_PLIST_LABEL})")
+                elif "could not find" in (r.stderr or "").lower() or "no such" in (r.stderr or "").lower():
+                    print(f"  {_c(_DIM, '     No LaunchAgent was installed.')}")
+                else:
+                    print(f"  {_c(_WARN, '⚠')}  bootout: {(r.stderr or r.stdout).strip()[:80]}")
+            except Exception as e:
+                print(f"  {_c(_WARN, '⚠')}  bootout exception: {e}")
+            try:
+                if _SUPERVISOR_PLIST_PATH.exists():
+                    _SUPERVISOR_PLIST_PATH.unlink()
+            except Exception:
+                pass
 
     # Loop-until-clean pattern so a daemon-loop mid-respawn of --serve
     # still gets fully caught.
