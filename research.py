@@ -130,9 +130,14 @@ _PS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platf
 
 def _read_user_scope_env(name: str) -> str:
     """Read a Windows User-scope env var via PowerShell. Empty string
-    on non-Windows or failure. Persistent across shells — settable via
-    the Account page sync (preferred) or PowerShell
-    SetEnvironmentVariable(..., 'User')."""
+    on non-Windows or failure. Persistent across shells — settable
+    manually via `setx NAME value` or PowerShell
+    `[System.Environment]::SetEnvironmentVariable(name, value, 'User')`.
+
+    NOT set by the FE Account page (that path writes to Firestore —
+    see `_read_firestore_api_keys`). This function exists as a
+    legacy / advanced alternative for operators who prefer Windows
+    user-scope env over Firestore or the .env file."""
     if sys.platform != "win32":
         return ""
     try:
@@ -3811,6 +3816,17 @@ def _start_cli_command_reader(loop):
                 elif pr == "claude_chat_mode":
                     log("[CMD] resume → continue Claude in chat mode")
                     loop.call_soon_threadsafe(_controls.set_continue_anyway)
+                elif pr == "agent_link_failed":
+                    # DGOPS-7710-followup: wait_for_agent_decision polls
+                    # pop_agent_decision; without this branch the CLI dispatcher
+                    # only called request_resume and pop returned None → caller
+                    # defaulted to "skip". `r` here means "retry the agent".
+                    log("[CMD] resume → retry agent (link_failed alert)")
+                    loop.call_soon_threadsafe(_controls.set_agent_decision, "retry")
+                # human_verification_required `r` falls through to plain
+                # resume — the poll loop at line ~18430 already detects
+                # is_pause()==False and re-checks the browser. No special
+                # flag needed; behavior preserved.
                 else:
                     log("[CMD] resume")
                 loop.call_soon_threadsafe(_controls.request_resume)
@@ -3820,11 +3836,27 @@ def _start_cli_command_reader(loop):
                 # await_agent_decision loop checks `skipped_agents`; plain
                 # request_skip_phase sets `skipped_phases` (wrong set) and
                 # the coroutine hangs.
+                #
+                # DGOPS-7710-followup: agent_link_failed and
+                # human_verification_required pauses also need per-agent
+                # signaling — the former checks pop_agent_decision, the
+                # latter checks skipped_agents (with pause_target_agent
+                # naming the specific platform).
                 ph = getattr(_runtime, "phase", 0)
                 pr = getattr(_controls, "pause_reason", "") or ""
                 if pr == "claude_chat_mode":
                     log("[CMD] skip → skip Claude agent (chat-mode alert)")
                     loop.call_soon_threadsafe(_controls.request_skip_agent, "claude")
+                    loop.call_soon_threadsafe(_controls.request_resume)
+                elif pr == "agent_link_failed":
+                    log("[CMD] skip → skip agent (link_failed alert)")
+                    loop.call_soon_threadsafe(_controls.set_agent_decision, "skip")
+                    loop.call_soon_threadsafe(_controls.request_resume)
+                elif pr == "human_verification_required":
+                    tgt = getattr(_controls, "pause_target_agent", "") or ""
+                    log(f"[CMD] skip → skip {tgt or '<unknown>'} agent (verification alert)")
+                    if tgt:
+                        loop.call_soon_threadsafe(_controls.request_skip_agent, tgt)
                     loop.call_soon_threadsafe(_controls.request_resume)
                 elif ph == 0:
                     log(f"[CMD] skip phase {ph}")
@@ -3928,6 +3960,14 @@ class PipelineControls:
         # menu reads this to print a context-aware header (e.g. "login_required —
         # log in via the browser, then…"). Cleared on resume.
         self.pause_reason: str = ""
+        # DGOPS-7710-followup (2026-05-18): per-pause target agent. Set by
+        # pause sites that need the CLI dispatcher to know WHICH agent the
+        # user is acting on (e.g. human_verification_required pauses one
+        # platform — `s` means "skip THIS agent", but dispatcher doesn't
+        # know which one without this field). Cleared on resume. Set BEFORE
+        # request_pause so the dispatcher's pause_reason snapshot reads it
+        # atomically with reason.
+        self.pause_target_agent: str = ""
         # User clicked "Continue with Free" on a Phase 0 pro_required alert.
         # Suppresses subsequent platforms' Pro alerts in the same run, plus the
         # Phase 1 backstop at the ChatGPT Pro selector site. Per-run only — NOT
@@ -3961,12 +4001,17 @@ class PipelineControls:
 
     def request_resume(self):
         self.pause_reason = ""
+        self.pause_target_agent = ""
         self.pause_event.clear()
         self.resume_event.set()
 
     def set_agent_decision(self, decision: str):
         """Called from command listener when user chooses retry/skip/stop
-        for an agent_link_failed prompt. Also releases the pause."""
+        for an agent_link_failed prompt. Whitelist-guards the value; only
+        retry/skip/stop are written. NOTE: does NOT release the pause —
+        callers must invoke `request_resume()` separately (the dispatcher
+        at research.py:3819-3854 does this explicitly for both `r` and `s`
+        branches at agent_link_failed pauses)."""
         if decision in ("retry", "skip", "stop"):
             self.pending_agent_decision = decision
 
@@ -4024,12 +4069,25 @@ class PipelineControls:
             # option to mirror the web frontend's "Continue with Free"
             # button. Ctrl+C is the stop path (no `q` keystroke needed).
             reason = self.pause_reason or ""
+            target = self.pause_target_agent or ""
             if reason == "login_required":
                 header = "[PAUSE] login_required — log in via the open browser, then:"
                 actions = "  r) resume (re-check after login)   s) skip phase"
             elif reason == "pro_required":
                 header = "[PAUSE] pro_required — upgrade in the browser, then:"
                 actions = "  r) resume (re-check after upgrade)   s) skip phase   c) continue with Free"
+            elif reason == "claude_chat_mode":
+                header = "[PAUSE] claude_chat_mode — Research unavailable; continue in chat mode?"
+                actions = "  r) resume (continue in chat mode)   s) skip Claude agent"
+            elif reason == "agent_link_failed":
+                header = f"[PAUSE] agent_link_failed — {target or 'agent'} link failed."
+                actions = f"  r) resume (retry {target or 'agent'})   s) skip {target or 'agent'}"
+            elif reason == "human_verification_required":
+                header = f"[PAUSE] human_verification_required — solve in browser for {target or 'agent'}, then:"
+                actions = f"  r) resume (re-check verification)   s) skip {target or 'agent'}"
+            elif reason == "cua_unavailable":
+                header = "[PAUSE] cua_unavailable — fix Anthropic key/cap, then:"
+                actions = "  r) resume (retry CUA)   s) skip verification (bail to Phase 1)"
             elif reason:
                 header = f"[PAUSE] {reason} — waiting."
                 actions = "  r) resume   s) skip phase"
@@ -4070,6 +4128,7 @@ class PipelineControls:
         self.pause_event.clear()
         self.resume_event.clear()
         self.pause_reason = ""
+        self.pause_target_agent = ""
         self.extra_context.clear()
         self._config_updates.clear()
         self.pending_agent_decision = None
@@ -6417,7 +6476,12 @@ async def wait_for_agent_decision(agent: str, reason: str, phase: int = 2,
     _controls.pending_agent_decision = None
     emit_event("agent_link_failed", phase=phase, agent=agent,
                reason=reason, options=list(options))
-    _controls.request_pause()
+    # DGOPS-7710-followup: pause with explicit reason + target agent so the
+    # CLI dispatcher can discriminate (without this, CLI `r` falls through
+    # to the generic branch which only calls request_resume, leaving
+    # pop_agent_decision() returning None → caller defaults to "skip").
+    _controls.pause_target_agent = (agent or "").strip().lower()
+    _controls.request_pause("agent_link_failed")
     emit_event("pipeline_paused", phase=phase, reason="agent_link_failed", agent=agent)
     log(f"[{agent}] Waiting for user decision (retry/skip) — reason: {reason}")
     await _controls.wait_if_paused()
@@ -18388,7 +18452,12 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                platformLabel=platform.capitalize(),
                reason=reason or "Human verification challenge",
                message=f"{platform.capitalize()} is asking for human verification. I tried and couldn't clear it — solve it in the browser and tap Resume, or Skip this agent.")
-    _controls.request_pause()
+    # DGOPS-7710-followup: pause with explicit reason + target agent so the
+    # CLI dispatcher's `s` can target THIS platform via request_skip_agent
+    # (the poll loop below checks skipped_agents; without target_agent, CLI
+    # `s` sets skipped_phases — wrong set — and silently does nothing).
+    _controls.pause_target_agent = (platform_key or "").strip().lower()
+    _controls.request_pause("human_verification_required")
     emit_event("pipeline_paused", phase=phase, reason="human_verification_required", agent=platform_key)
 
     # Poll every 5s — if the user solves the challenge without tapping Resume,
@@ -18418,7 +18487,10 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                            platformLabel=platform.capitalize(),
                            reason=reason or "Human verification challenge",
                            message=f"{platform.capitalize()} still shows verification. Solve it first, then Resume.")
-                _controls.request_pause()
+                # Re-set target_agent (request_resume cleared it on the
+                # initial resume) so CLI `s` still targets this platform.
+                _controls.pause_target_agent = (platform_key or "").strip().lower()
+                _controls.request_pause("human_verification_required")
                 continue
             log(f"[{label}] Verification cleared ✓")
             emit_event("pipeline_resumed", phase=phase, reason="human_verification_cleared", agent=platform_key)
@@ -21793,12 +21865,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                              "command": {"action": "retry_phase", "phase": 0}},
                         ],
                     )
-                    _controls.request_pause()
+                    _controls.request_pause("cua_unavailable")
                     emit_event("pipeline_paused", phase=0, reason="cua_unavailable")
                     await _controls.wait_if_paused()
                     if _controls.is_stop():
                         emit_event("pipeline_stopped", phase=0, reason="stopped during cua_unavailable")
                         return
+                    # DGOPS-7710-followup: honor skip_init_verify so CLI `s`
+                    # (or FE Skip-verification toggle) breaks out of the CUA
+                    # retry loop. Without this check the function just falls
+                    # through to consume_retry_phase and continues, ignoring
+                    # the user's skip signal. Mirrors the login_required
+                    # pattern at line ~21700.
+                    if _controls.skip_init_verify:
+                        log(f"Phase 0: SKIP_INIT_VERIFY during cua_unavailable — bailing CUA loop", "INFO")
+                        _global_skip = True
+                        break
                     # retry — clear flag + loop continues, fresh CUA call
                     # picks up the new key.
                     _controls.consume_retry_phase(0)

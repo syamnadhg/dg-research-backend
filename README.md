@@ -19,11 +19,11 @@ Pairing-side data scope: this backend pairs to a single web-app account at a tim
 | Platform | Server | `--pair` | `--resurrect` / `--retire` | `--unpair` |
 |----------|--------|----------|----------------------------|------------|
 | Windows 10 / 11 | Full | Full | Full (Scheduled Task) | Full |
-| macOS | Full (manual `nohup`/`tmux`/`launchd` user agent) | Full | Coming shortly | Step-1/3 only (no supervisor) |
-| Linux desktop (X11/Wayland) | Full (manual `nohup`/`tmux`/`systemd --user`) | Full | Coming shortly | Step-1/3 only (no supervisor) |
+| macOS | Full | Full | Full — launchd user agent (gated behind `DG_ALLOW_CROSS_PLATFORM=1` pending smoke tests) | Full |
+| Linux desktop (X11/Wayland) | Full | Full | Full — systemd-user unit (gated behind `DG_ALLOW_CROSS_PLATFORM=1` pending smoke tests) | Full |
 | Linux headless / WSL / Docker | **Unsupported** — Chrome needs a real display + user session for CAPTCHA / 2FA / login refresh |
 
-The supervisor (`--resurrect` / `--retire`) currently uses Windows Task Scheduler. macOS launchd + Linux systemd-user supervisors are coming shortly. See [Linux/Mac backgrounding](#linuxmac-backgrounding-stop-gap) below for stop-gap options.
+The supervisor (`--resurrect` / `--retire`) is now cross-platform: Scheduled Task on Windows, launchd user agent on macOS (`~/Library/LaunchAgents/com.dgresearch.supervisor.plist`), systemd-user unit on Linux (`~/.config/systemd/user/dgresearch-supervisor.service`). macOS + Linux are **gated behind `DG_ALLOW_CROSS_PLATFORM=1`** until smoke tests pass on real hardware (Track C PR3). All three platforms share the same `--env-file` config flow (see [`.dg-supervisor.env`](#step-2-environment) below). Linux also requires `sudo loginctl enable-linger $USER` so the user-systemd manager survives logout; `--resurrect` probes and surfaces a WARN if Linger=no.
 
 ## Before you start (prerequisites checklist)
 
@@ -184,13 +184,13 @@ If Chrome itself isn't installed, install it first:
 
 The supervisor reads env vars from `.dg-supervisor.env` (created automatically on first `--resurrect` from `scripts/dg-supervisor.env.example`). Edit that file to set Vision/CUA config; no shell-rc / `setx` needed.
 
-**Anthropic API key** — required for browser automation. Three options:
+**Anthropic API key** — required for browser automation. Three options, **all platforms**:
 
-- **(recommended on Windows)** "Account → API Config" in the web app — writes to Windows user-scope env via `setx`. The backend reads it via `resolve_api_key()` (research.py:203), which always wins over any other env source. No manual env-var management.
-- **(Mac/Linux, or Windows users who prefer files)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` in `.dg-supervisor.env`.
-- **(legacy)** Set `CUA_API_KEY` or `ANTHROPIC_API_KEY` in your shell rc / PowerShell user-scope env directly. Still works; `resolve_api_key()` accepts either name on both env and user-scope.
+- **(recommended, all platforms)** "Account → API Config" in the web app — writes the key to **Firestore** (`users/{uid}/settings/prefs.apiKeys.anthropic`). The backend reads it via `resolve_api_key()` (research.py:203) which prefers Firestore over every other env source. Works on Windows, macOS, Linux — same UI, same flow. No restart required after rotating; backend re-reads on next call (60s cache).
+- **(file-based, all platforms)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` in `.dg-supervisor.env`. Loaded by `--env-file` at supervisor startup; survives reboots via the persistence supervisor. Good for un-paired backends or operators who prefer files.
+- **(advanced / legacy)** Set `CUA_API_KEY` or `ANTHROPIC_API_KEY` in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). Still works; `resolve_api_key()` accepts either name. Used to be the only path before the Account page UI shipped.
 
-**Don't set the key in multiple places with different values** — pick one. `resolve_api_key()` prefers Firestore (Account page) → user-scope env → `os.environ` (the .env file loads here), so a stale shell value won't override a freshly-set Account-page key.
+**Don't set the key in multiple places with different values** — pick one. `resolve_api_key()` priority chain: CLI `--api-key` → **Firestore (Account page)** → Windows user-scope env → `os.environ` (the `.env` file loads here). Firestore wins, so a stale shell/file value won't override a freshly-set Account-page key.
 
 **Other config** (Vision tier, CUA model overrides, shadow log path) also lives in `.dg-supervisor.env`. See `scripts/dg-supervisor.env.example` for the documented template + key descriptions.
 
@@ -288,11 +288,15 @@ Keep `--serve` running while you use the app. If the server stops, the web app's
 python research.py --resurrect
 ```
 
-Registers a Windows Scheduled Task that runs a **daemon-loop wrapper** — a tiny supervisor process that (re-)starts `--serve` whenever it exits for any reason: crash, stop button, logout, reboot, etc. The task is set to ONLOGON + AT STARTUP with unlimited duration, so the backend is effectively always-on while the PC is powered.
+Registers an OS-native supervisor that runs a **daemon-loop wrapper** — a tiny supervisor process that (re-)starts `--serve` whenever it exits for any reason: crash, stop button, logout, reboot, etc.
 
-The Account page's **Indestructible** toggle reflects the real scheduled task state (`schtasks /Query`), so the toggle survives unlink+relink. Turn it off from the same page if you ever want to stop auto-restart.
+- **Windows**: Scheduled Task (`SuperResearchBackend`), ONLOGON + PT5M re-fire, `MultipleInstances=IgnoreNew`. Worst-case downtime: ~5s on `--serve` exit, ~5min on daemon-loop exit.
+- **macOS**: launchd user agent at `~/Library/LaunchAgents/com.dgresearch.supervisor.plist`, `KeepAlive=true` + `ThrottleInterval=10`. Bootstrapped into `gui/$(id -u)` so Chrome gets the Aqua session.
+- **Linux**: systemd user unit at `~/.config/systemd/user/dgresearch-supervisor.service`, `Restart=always` + `RestartSec=10` + `PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR` so Chrome can render in the graphical session. Requires `sudo loginctl enable-linger $USER` once — `--resurrect` probes and surfaces a WARN if Linger=no.
 
-> **Cross-platform supervisors** — macOS launchd + Linux systemd-user equivalents are coming shortly. Until they ship, `--resurrect` is a no-op outside Windows; use the manual stop-gaps below.
+The Account page's **Indestructible** toggle reflects the real installed-task state, so the toggle survives unlink+relink. Turn it off from the same page if you ever want to stop auto-restart.
+
+> **Cross-platform gating** — macOS + Linux supervisors are gated behind `DG_ALLOW_CROSS_PLATFORM=1` until smoke tests pass on real hardware (Track C PR3). Set the env flag and re-run `--resurrect` to install. Without the gate, `--resurrect` on macOS/Linux prints a "Cross-platform supervisor is experimental — gated behind DG_ALLOW_CROSS_PLATFORM=1" message and returns. The Latin header still fires on all platforms so you know the verb reached.
 
 ### Linux/Mac backgrounding (stop-gap)
 
@@ -312,7 +316,10 @@ python research.py --serve
 # Ctrl-b d to detach. Reattach with: tmux attach -t superresearch
 ```
 
-**Linux — `systemd --user` (DIY for now; native supervisor coming shortly):**
+**Linux — `systemd --user` (DIY alternative; native supervisor via `--resurrect` is preferred):**
+
+The native supervisor (`python research.py --resurrect`, gated behind `DG_ALLOW_CROSS_PLATFORM=1`) installs an equivalent unit at `~/.config/systemd/user/dgresearch-supervisor.service` automatically. Use this DIY ini only if you want to manage the unit yourself or pin a specific path:
+
 ```ini
 # ~/.config/systemd/user/superresearch.service
 [Unit]
@@ -329,7 +336,7 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 ```
-Then: `loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now superresearch.service`. (The native supervisor coming shortly will install all this for you automatically — same env file, same `--env-file` invocation.)
+Then: `loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now superresearch.service`.
 
 ### Step 5b (disable On Startup): `--retire`
 
