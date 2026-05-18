@@ -1539,6 +1539,8 @@ def _detect_supervised() -> bool:
         return _detect_supervised_windows()
     if plat == "Darwin":
         return _detect_supervised_macos()
+    if plat == "Linux":
+        return _detect_supervised_linux()
     return False
 
 
@@ -25686,8 +25688,11 @@ async def run_pair(profile_dir, wait_minutes=10):
             if ok:
                 supervised_armed = True
                 _write_supervised_flag(True)
-                if _supervisor_platform() == "Darwin":
+                _step4_plat = _supervisor_platform()
+                if _step4_plat == "Darwin":
                     print(f"  {_c(_OK, '✓')}  LaunchAgent installed ({_SUPERVISOR_PLIST_LABEL})")
+                elif _step4_plat == "Linux":
+                    print(f"  {_c(_OK, '✓')}  systemd user unit installed ({_SUPERVISOR_UNIT_NAME})")
                 else:
                     print(f"  {_c(_OK, '✓')}  Scheduled Task pinned to login ({_SUPERVISOR_TASK_NAME})")
                 if killed_serves:
@@ -25707,7 +25712,7 @@ async def run_pair(profile_dir, wait_minutes=10):
                     plat_name = _platform_step4.system()
                     if plat_name in ("Darwin", "Linux"):
                         print(f"  {_c(_WARN, '⚠')}  On Startup is gated behind DG_ALLOW_CROSS_PLATFORM=1.")
-                        print(f"  {_c(_DIM, '     PR1 (macOS) merged; PR2 (Linux) coming shortly.')}")
+                        print(f"  {_c(_DIM, '     PR1 (macOS) + PR2 (Linux) merged; PR3 (drop gate) pending smoke tests.')}")
                         print(f"  {_c(_DIM, '     See PersistenceRecipe.md §4 Scratch.')}")
                     else:
                         print(f"  {_c(_WARN, '⚠')}  Only Windows / macOS / Linux desktop is supported.")
@@ -26243,6 +26248,194 @@ def _detect_supervised_macos() -> bool:
         return False
 
 
+# ── Linux systemd-user helpers (PR2 — gated behind DG_ALLOW_CROSS_PLATFORM=1) ──
+
+def _check_linger_status() -> str:
+    """Probe `loginctl show-user $USER --property=Linger`. Returns
+    'yes' | 'no' | 'unknown'. Linger=yes means the systemd user manager
+    survives logout — required for the supervisor to keep daemon-loop
+    alive across user sessions. If 'no', the user needs to run
+    `sudo loginctl enable-linger $USER` manually (we don't escalate)."""
+    import subprocess as _sp
+    try:
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        if not user:
+            return "unknown"
+        r = _sp.run(["loginctl", "show-user", user, "--property=Linger"],
+                    capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return "unknown"
+        out = (r.stdout or "").strip().lower()
+        if "linger=yes" in out:
+            return "yes"
+        if "linger=no" in out:
+            return "no"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _arm_supervisor_linux() -> "tuple[bool, int | None, str, int]":
+    """Linux sibling of `_arm_supervisor_macos`. Writes a systemd user
+    unit at ~/.config/systemd/user/dgresearch-supervisor.service and
+    enables it via `systemctl --user enable --now`. Returns
+    (installed_ok, daemon_pid_or_None, info, killed_serve_count).
+
+    `PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR` lets the
+    supervisor see the graphical session — Chrome needs that for the
+    visible browser window. Without this the service starts but Chrome
+    has nowhere to render.
+
+    Linger probe: WARN-only if `loginctl Linger=no`. User must run
+    `sudo loginctl enable-linger $USER` themselves; we don't escalate.
+    Without linger, daemon-loop dies at logout (the user-session systemd
+    manager is reaped).
+
+    EUID guard: refuses under sudo — unit would land in
+    /root/.config/systemd/user/ (wrong manager)."""
+    import subprocess as _sp
+    import os as _os
+
+    if _os.geteuid() == 0:
+        return False, None, "refuse: do not run under sudo (user unit must be in your own home)", 0
+
+    _seed_env_file_if_missing()
+
+    # Linger probe — warn but don't fail. Without linger the supervisor
+    # works while user is logged in but dies on logout. Acceptable for
+    # PR2; user can enable linger separately.
+    linger = _check_linger_status()
+    if linger == "no":
+        log("[supervisor-linux] loginctl Linger=no for this user. Run "
+            "`sudo loginctl enable-linger $USER` so daemon-loop survives "
+            "logout.", "WARN")
+
+    script_dir = Path(__file__).parent
+    log_dir = script_dir / "logs"
+    try:
+        log_dir.mkdir(exist_ok=True)
+        _SUPERVISOR_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return False, None, f"could not create dirs: {e}", 0
+
+    python_exe = sys.executable
+    script_path = str(Path(__file__).resolve())
+    env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+    # systemd `ExecStart=` is whitespace-tokenized — any path with a space
+    # (we live under "DG Research") must be double-quoted or systemd will
+    # split `/home/.../DG` from `Research/research.py` and try to exec a
+    # non-existent script in a tight Restart=always loop. `WorkingDirectory=`
+    # and `StandardOutput=append:<path>` take single values (not tokenized)
+    # but we quote consistently for hygiene.
+    unit_content = f"""[Unit]
+Description=DG Super Research Backend Supervisor
+After=network-online.target graphical-session.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory={script_dir}
+ExecStart="{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"
+Restart=always
+RestartSec=10
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR
+
+StandardOutput=append:{log_dir}/supervisor.out.log
+StandardError=append:{log_dir}/supervisor.err.log
+
+[Install]
+WantedBy=default.target
+"""
+    try:
+        _SUPERVISOR_UNIT_PATH.write_text(unit_content, encoding="utf-8")
+    except Exception as e:
+        return False, None, f"unit write failed: {e}", 0
+
+    # daemon-reload picks up the new unit (systemd doesn't auto-scan).
+    try:
+        _sp.run(["systemctl", "--user", "daemon-reload"],
+                capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+    # enable --now sets WantedBy=default.target AND starts immediately.
+    try:
+        r = _sp.run(["systemctl", "--user", "enable", "--now", _SUPERVISOR_UNIT_NAME],
+                    capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False, None, f"systemctl enable --now failed: {(r.stderr or r.stdout).strip()[:120]}", 0
+    except Exception as e:
+        return False, None, f"systemctl exception: {e}", 0
+
+    # Sweep stale --serve procs (port 8000 conflict).
+    procs = _enumerate_research_py_procs_posix()
+    plain_serve_pids = [pid for pid, _c, role in procs if role == "serve"]
+    killed_serve = _kill_pids_posix(plain_serve_pids) if plain_serve_pids else 0
+
+    daemon_pid = _wait_for_daemon_loop(_enumerate_research_py_procs_posix, timeout_s=5.0)
+    if daemon_pid is not None:
+        return True, daemon_pid, "", killed_serve
+    return True, None, "daemon-loop did not appear within 5s", killed_serve
+
+
+def _disarm_supervisor_linux() -> "tuple[str, int]":
+    """Linux sibling of `_disarm_supervisor_macos`. `systemctl --user
+    disable --now`, delete unit file, daemon-reload, kill survivors."""
+    import subprocess as _sp
+    import os as _os
+
+    if _os.geteuid() == 0:
+        return "refuse: do not run under sudo", 0
+
+    status = "no-task"
+    try:
+        r = _sp.run(["systemctl", "--user", "disable", "--now", _SUPERVISOR_UNIT_NAME],
+                    capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            status = "removed"
+        else:
+            combined = ((r.stderr or "") + (r.stdout or "")).lower()
+            if "does not exist" in combined or "no such file" in combined or "not loaded" in combined:
+                status = "no-task"
+            else:
+                status = (r.stderr or r.stdout or "systemctl returned non-zero").strip()[:100]
+    except Exception as e:
+        status = f"systemctl exception: {e}"
+
+    # Delete unit file regardless.
+    try:
+        if _SUPERVISOR_UNIT_PATH.exists():
+            _SUPERVISOR_UNIT_PATH.unlink()
+    except Exception as e:
+        if status == "removed":
+            status = f"removed (unit unlink warning: {e})"
+
+    # daemon-reload to forget the unit.
+    try:
+        _sp.run(["systemctl", "--user", "daemon-reload"],
+                capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+    killed = _kill_until_clean(_enumerate_research_py_procs_posix, _kill_pids_posix)
+    return status, killed
+
+
+def _detect_supervised_linux() -> bool:
+    """Linux sibling of `_detect_supervised_macos`. `systemctl --user
+    is-enabled <unit>` returns 0 iff the unit is enabled. Returns False
+    on any error / not enabled."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["systemctl", "--user", "is-enabled", _SUPERVISOR_UNIT_NAME],
+                    capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
     """Dispatcher — routes to `_enumerate_research_py_procs_windows` or
     `_enumerate_research_py_procs_posix`. Returns [] on Unsupported."""
@@ -26674,16 +26867,19 @@ def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
 
 
 def _arm_supervisor_quiet() -> "tuple[bool, int | None, str, int]":
-    """Dispatcher — routes to `_arm_supervisor_quiet_windows` or
-    `_arm_supervisor_macos`. Returns the same 4-tuple shape regardless
-    of platform: (installed_ok, daemon_pid_or_None, info, killed_serve_count)."""
+    """Dispatcher — routes to `_arm_supervisor_quiet_windows`,
+    `_arm_supervisor_macos`, or `_arm_supervisor_linux`. Returns the same
+    4-tuple shape regardless of platform: (installed_ok, daemon_pid_or_None,
+    info, killed_serve_count)."""
     plat = _supervisor_platform()
     if plat == "Windows":
         return _arm_supervisor_quiet_windows()
     if plat == "Darwin":
         return _arm_supervisor_macos()
-    # Linux falls through to PR2; everything else (Unsupported) returns a
-    # consistent "not supported" tuple so callers don't need platform branches.
+    if plat == "Linux":
+        return _arm_supervisor_linux()
+    # Unsupported returns a consistent "not supported" tuple so callers
+    # don't need platform branches.
     return False, None, "unsupported", 0
 
 
@@ -26789,13 +26985,16 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
 
 
 def _disarm_supervisor_quiet() -> "tuple[str, int]":
-    """Dispatcher — routes to `_disarm_supervisor_quiet_windows` or
-    `_disarm_supervisor_macos`. Returns (status, killed_total) on all platforms."""
+    """Dispatcher — routes to `_disarm_supervisor_quiet_windows`,
+    `_disarm_supervisor_macos`, or `_disarm_supervisor_linux`. Returns
+    (status, killed_total) on all platforms."""
     plat = _supervisor_platform()
     if plat == "Windows":
         return _disarm_supervisor_quiet_windows()
     if plat == "Darwin":
         return _disarm_supervisor_macos()
+    if plat == "Linux":
+        return _disarm_supervisor_linux()
     return "unsupported", 0
 
 
@@ -26887,13 +27086,46 @@ def run_resurrect():
         print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  {_c(_DIM, '--serve respawns on any exit.')}")
         return
 
+    if plat == "Linux":
+        # PR2: systemd-user install via _arm_supervisor_linux. Minimal UX.
+        # Linger probe surfaces a WARN if Linger=no (user must enable
+        # separately; we don't sudo-escalate).
+        init_firebase()
+        paired_uid = load_paired_uid()
+        if not paired_uid:
+            print(f"  {_c(_WARN, '⚠')} Device not paired. Run --pair first.")
+            return
+        print(f"  {_c(_OK, '✓')}  Pairing complete")
+        _seed_env_file_if_missing()
+        if _check_linger_status() == "no":
+            print(f"  {_c(_WARN, '⚠')}  loginctl Linger=no — daemon-loop will die at logout.")
+            print(f"  {_c(_DIM, '     Run:')} {_c(_BOLD, 'sudo loginctl enable-linger $USER')}")
+            print(f"  {_c(_DIM, '     (continuing anyway — supervisor still works while logged in)')}")
+        ok, daemon_pid, info, killed_serve = _arm_supervisor_linux()
+        if not ok:
+            print(f"  {_c(_WARN, '⚠')}  systemctl install failed: {info}")
+            return
+        print(f"  {_c(_OK, '✓')}  systemd user unit installed ({_SUPERVISOR_UNIT_NAME})")
+        if killed_serve:
+            print(f"  {_c(_DIM, f'     Stopped {killed_serve} stale --serve process(es).')}")
+        if daemon_pid is not None:
+            print(f"  {_c(_OK, '✓')}  Backend started (PID {daemon_pid}, supervised by systemd)")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  {info or 'daemon-loop did not appear within 5s'} — systemd will retry (Restart=always).")
+        _write_supervised_flag(True)
+        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+        print()
+        print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  {_c(_DIM, '--serve respawns on any exit.')}")
+        return
+
     if plat != "Windows":
-        # Unsupported (Linux or other) — or Darwin/Linux without DG_ALLOW_CROSS_PLATFORM=1.
+        # Unsupported — Darwin/Linux without DG_ALLOW_CROSS_PLATFORM=1, or
+        # truly unsupported platform (FreeBSD, etc.).
         print()
         plat_name = _platform.system()
         if plat_name in ("Darwin", "Linux"):
             print(f"  {_c(_WARN, '⚠')} Cross-platform supervisor is experimental — gated behind DG_ALLOW_CROSS_PLATFORM=1.")
-            print(f"  {_c(_DIM, '     Set the env var and retry. PR1 (macOS) merged; PR2 (Linux) coming shortly.')}")
+            print(f"  {_c(_DIM, '     Set the env var and retry. PR1 (macOS) + PR2 (Linux) merged; PR3 (drop gate) pending smoke tests.')}")
         else:
             print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
         print(f"  {_c(_DIM, '     See PersistenceRecipe.md.')}")
@@ -27132,12 +27364,31 @@ def run_retire():
         print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
         return
 
+    if plat == "Linux":
+        # PR2: systemd-user teardown via _disarm_supervisor_linux. Minimal UX.
+        init_firebase()
+        status, killed_total = _disarm_supervisor_linux()
+        if status == "removed":
+            print(f"  {_c(_OK, '✓')}  systemd user unit removed ({_SUPERVISOR_UNIT_NAME})")
+        elif status == "no-task":
+            print(f"  {_c(_DIM, '     No systemd unit was installed.')}")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  systemctl disable returned: {status}")
+        if killed_total:
+            plural = "es" if killed_total != 1 else ""
+            print(f"  {_c(_OK, '✓')}  Stopped {killed_total} process{plural}")
+        else:
+            print(f"  {_c(_DIM, '     No daemon-loop / --serve processes were running.')}")
+        _write_supervised_flag(False)
+        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+        return
+
     if plat != "Windows":
         print()
         plat_name = _platform.system()
         if plat_name in ("Darwin", "Linux"):
             print(f"  {_c(_WARN, '⚠')} Cross-platform supervisor is experimental — gated behind DG_ALLOW_CROSS_PLATFORM=1.")
-            print(f"  {_c(_DIM, '     Set the env var and retry. PR1 (macOS) merged; PR2 (Linux) coming shortly.')}")
+            print(f"  {_c(_DIM, '     Set the env var and retry. PR1 (macOS) + PR2 (Linux) merged; PR3 (drop gate) pending smoke tests.')}")
         else:
             print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
         return
@@ -27422,6 +27673,35 @@ def run_unpair():
             try:
                 if _SUPERVISOR_PLIST_PATH.exists():
                     _SUPERVISOR_PLIST_PATH.unlink()
+            except Exception:
+                pass
+    elif plat == "Linux":
+        # systemctl --user disable --now + unit unlink. Kill loop below
+        # handles process termination cross-platform via dispatchers.
+        if os.geteuid() == 0:
+            print(f"  {_c(_WARN, '⚠')}  Refusing under sudo — user unit must be in your own home.")
+        else:
+            try:
+                r = _subprocess.run(["systemctl", "--user", "disable", "--now", _SUPERVISOR_UNIT_NAME],
+                                    capture_output=True, text=True, timeout=15)
+                if r.returncode == 0:
+                    print(f"  {_c(_OK, '✓')}  systemd unit removed ({_SUPERVISOR_UNIT_NAME})")
+                else:
+                    combined = ((r.stderr or "") + (r.stdout or "")).lower()
+                    if "does not exist" in combined or "no such" in combined or "not loaded" in combined:
+                        print(f"  {_c(_DIM, '     No systemd unit was installed.')}")
+                    else:
+                        print(f"  {_c(_WARN, '⚠')}  systemctl disable: {(r.stderr or r.stdout).strip()[:80]}")
+            except Exception as e:
+                print(f"  {_c(_WARN, '⚠')}  systemctl exception: {e}")
+            try:
+                if _SUPERVISOR_UNIT_PATH.exists():
+                    _SUPERVISOR_UNIT_PATH.unlink()
+            except Exception:
+                pass
+            try:
+                _subprocess.run(["systemctl", "--user", "daemon-reload"],
+                                capture_output=True, text=True, timeout=10)
             except Exception:
                 pass
 
