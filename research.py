@@ -3789,18 +3789,45 @@ def _start_cli_command_reader(loop):
                 #
                 # Same logic applies for login_required (re-verify the platform
                 # with a fresh tab + emit phase_start for any UI consumers).
+                #
+                # DGOPS-7710 (F6, 2026-05-18): claude_chat_mode pause needs a
+                # DIFFERENT consume path — Phase 2B's `await_agent_decision`
+                # (line 4274) polls consume_continue_anyway / skipped_agents,
+                # NOT phase-level flags. Plain `request_resume` releases
+                # wait_if_paused but await_agent_decision then hangs for the
+                # 3h timeout. CLI `r` here means [Continue in chat mode] (the
+                # FE button equivalent); set continue_anyway BEFORE resume.
+                # Narrow race note: pause_reason is read here in the CLI
+                # thread; if the coroutine cleared it (e.g., timeout fired
+                # between the read and dispatch), continue_anyway leaks to
+                # the next consumer (Phase 1 Pro backstop). Acceptable —
+                # consume_continue_anyway is one-shot and the leak window
+                # is microseconds.
                 ph = getattr(_runtime, "phase", 0)
                 pr = getattr(_controls, "pause_reason", "") or ""
                 if ph == 0 and pr in ("pro_required", "login_required"):
                     log(f"[CMD] resume → retry phase 0 ({pr})")
                     loop.call_soon_threadsafe(_controls.request_retry_phase, 0)
+                elif pr == "claude_chat_mode":
+                    log("[CMD] resume → continue Claude in chat mode")
+                    loop.call_soon_threadsafe(_controls.set_continue_anyway)
                 else:
                     log("[CMD] resume")
                 loop.call_soon_threadsafe(_controls.request_resume)
             elif cmd in ("s", "skip"):
+                # DGOPS-7710 (F6, 2026-05-18): claude_chat_mode pause's `s`
+                # means [Skip Claude] (per-agent), NOT skip-phase. The
+                # await_agent_decision loop checks `skipped_agents`; plain
+                # request_skip_phase sets `skipped_phases` (wrong set) and
+                # the coroutine hangs.
                 ph = getattr(_runtime, "phase", 0)
-                log(f"[CMD] skip phase {ph}")
-                if ph == 0:
+                pr = getattr(_controls, "pause_reason", "") or ""
+                if pr == "claude_chat_mode":
+                    log("[CMD] skip → skip Claude agent (chat-mode alert)")
+                    loop.call_soon_threadsafe(_controls.request_skip_agent, "claude")
+                    loop.call_soon_threadsafe(_controls.request_resume)
+                elif ph == 0:
+                    log(f"[CMD] skip phase {ph}")
                     # Phase 0's verify loop watches _controls.skip_init_verify,
                     # not the generic skipped_phases set. Without this branch
                     # the user's "s" logs "skip phase 0" but Phase 0 keeps
@@ -3809,6 +3836,7 @@ def _start_cli_command_reader(loop):
                     # don't need a separate request_resume call below.
                     loop.call_soon_threadsafe(_controls.request_skip_init_verify)
                 else:
+                    log(f"[CMD] skip phase {ph}")
                     loop.call_soon_threadsafe(_controls.request_skip_phase, ph)
                     # request_skip_phase doesn't release the pause; mirror the
                     # Firestore handler at line ~2682 and resume.
@@ -16739,11 +16767,13 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         pass
     # E2 / DGOPS-7364 — chat mode early return.
     # Claude in chat mode emits a regular assistant reply, NO artifact.
-    # The artifact-aware Methods 1-4 below all target aside / artifact-
-    # panel / [class*="artifact"] selectors that don't exist in chat mode,
-    # so they'd all return empty and the function would falsely report
-    # "All extraction methods failed". Instead, read the last assistant
-    # message via a tight selector list scoped to chat-turn content.
+    # The artifact-aware Tiers 1-3 below (Research-mode path, line ~16877
+    # onward — CUA download / publish + claude.site / CUA + clipboard
+    # hijack) all target aside / artifact-panel / [class*="artifact"]
+    # selectors that don't exist in chat mode, so they'd all return empty
+    # and the function would falsely report "All extraction methods
+    # failed". Instead, read the last assistant message via a tight
+    # selector list scoped to chat-turn content.
     if chat_mode:
         # 2026-05-13 TIER SWAP (chat-mode branch): HTML→MD promoted to
         # Tier 1; Copy hijack demoted to Tier 2. Hijack-first never
