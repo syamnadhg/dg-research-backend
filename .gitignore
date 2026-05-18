@@ -6,6 +6,7 @@ __pycache__/
 dist/
 build/
 .env
+.dg-supervisor.env
 
 # Firebase Admin SDK key — NEVER commit. Sammy emails this personally.
 # Drop it at: research-automate/firebase-service-account.json

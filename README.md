@@ -182,19 +182,19 @@ If Chrome itself isn't installed, install it first:
 
 ### Step 2: Environment
 
-Set your Anthropic API key (required for browser automation):
+The supervisor reads env vars from `.dg-supervisor.env` (created automatically on first `--resurrect` from `scripts/dg-supervisor.env.example`). Edit that file to set Vision/CUA config; no shell-rc / `setx` needed.
 
-```bash
-# Windows (PowerShell)
-[System.Environment]::SetEnvironmentVariable("CUA_API_KEY", "sk-ant-...", "User")
+**Anthropic API key** — required for browser automation. Three options:
 
-# macOS/Linux
-export CUA_API_KEY="sk-ant-..."
-```
+- **(recommended on Windows)** "Account → API Config" in the web app — writes to Windows user-scope env via `setx`. The backend reads it via `resolve_api_key()` (research.py:203), which always wins over any other env source. No manual env-var management.
+- **(Mac/Linux, or Windows users who prefer files)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` in `.dg-supervisor.env`.
+- **(legacy)** Set `CUA_API_KEY` or `ANTHROPIC_API_KEY` in your shell rc / PowerShell user-scope env directly. Still works; `resolve_api_key()` accepts either name on both env and user-scope.
 
-**`ANTHROPIC_API_KEY` is accepted as a fallback** — `resolve_api_key()` (research.py:181) checks `CUA_API_KEY` first, then `ANTHROPIC_API_KEY`, on both env and Windows User scope. Most Anthropic devs already have `ANTHROPIC_API_KEY` set globally, so it just works without setting a duplicate.
+**Don't set the key in multiple places with different values** — pick one. `resolve_api_key()` prefers Firestore (Account page) → user-scope env → `os.environ` (the .env file loads here), so a stale shell value won't override a freshly-set Account-page key.
 
-`GEMINI_API_KEY` is **optional** on the BE side — used only as the narrator's Flash fallback when Haiku is unavailable. (P4 thumbnail generation lives on the FE: `web/src/lib/album-art.ts` calls Gemini image-gen from inside `/api/uploadYouTube` using the FE-side env key or the user's per-prefs key. BE never owned a thumbnail role post-2026-05-10.)
+**Other config** (Vision tier, CUA model overrides, shadow log path) also lives in `.dg-supervisor.env`. See `scripts/dg-supervisor.env.example` for the documented template + key descriptions.
+
+`GEMINI_API_KEY` is **optional** on the BE side — used only as the narrator's Flash fallback when Haiku is unavailable. Set it in `.dg-supervisor.env` if you want it persisted. (P4 thumbnail generation lives on the FE: `web/src/lib/album-art.ts` calls Gemini image-gen from inside `/api/uploadYouTube` using the FE-side env key or the user's per-prefs key. BE never owned a thumbnail role post-2026-05-10.)
 
 **Phases 4 + 5 are FE-owned.** No BE setup needed for either. The frontend handles YouTube upload via `youtube.videos.insert` (Data API + OAuth refresh token, ffmpeg encode in Cloud Run) AND Google Doc creation via the Docs API AND email via Resend — see the FE README for that side's env vars (`GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`, `RESEND_API_KEY`, `NOTIFY_FROM_EMAIL`).
 
@@ -322,15 +322,14 @@ After=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=%h/super-research-backend
-ExecStart=/usr/bin/python3 %h/super-research-backend/research.py --serve
+ExecStart=/usr/bin/python3 %h/super-research-backend/research.py --serve --env-file %h/super-research-backend/.dg-supervisor.env
 Restart=always
 RestartSec=10
-Environment=CUA_API_KEY=sk-ant-...
 
 [Install]
 WantedBy=default.target
 ```
-Then: `loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now superresearch.service`. (The native supervisor coming shortly will install all this for you automatically.)
+Then: `loginctl enable-linger $USER && systemctl --user daemon-reload && systemctl --user enable --now superresearch.service`. (The native supervisor coming shortly will install all this for you automatically — same env file, same `--env-file` invocation.)
 
 ### Step 5b (disable On Startup): `--retire`
 
@@ -485,9 +484,11 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 
 ## Environment Variables
 
+> **Recommended path**: set these in `.dg-supervisor.env` (auto-loaded by the supervisor at startup via `--env-file`; see [Step 2](#step-2-environment) above). The shell-env path below still works for manual debugging or legacy shell-rc setups — `resolve_api_key()` honors both.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CUA_API_KEY` | (required) | Anthropic API key for browser automation. `ANTHROPIC_API_KEY` is also accepted as a fallback (research.py:181). |
+| `CUA_API_KEY` | (required) | Anthropic API key for browser automation. `ANTHROPIC_API_KEY` is also accepted as a fallback (research.py:203). |
 | `ANTHROPIC_API_KEY` | (fallback for `CUA_API_KEY`) | Standard Anthropic env var; auto-detected if `CUA_API_KEY` isn't set. Also drives the narrator's Haiku 4.5 primary brain. |
 | `RESEARCH_TOKEN` | (from pair) | Override ResearchToken (for Docker/CI) |
 | `CUA_MODEL` | `claude-opus-4-7` | Claude model for CUA |
@@ -517,8 +518,10 @@ research-automate/
 ├── research_config.json        # Your ResearchToken (generated by --pair)
 ├── run_analytics.json          # Historical phase durations (auto-updated)
 ├── ARCHITECTURE.md             # Backend architecture + Frontend ↔ Backend API contract
+├── .dg-supervisor.env          # Per-machine env config (gitignored; seeded from scripts/dg-supervisor.env.example on first --resurrect)
 ├── scripts/
-│   ├── run_supervisor.cmd      # CMD wrapper for the daemon-loop (env-var inheritance + Scheduled Task entry point)
+│   ├── dg-supervisor.env.example  # Committed env-file template — install-time copied to .dg-supervisor.env if absent
+│   ├── run_supervisor.cmd      # Manual-debug CMD helper (NOT wired into the Scheduled Task — supervisor invokes pythonw directly with --env-file)
 │   └── vision_shadow_report.py # Per-hotspot agreement table from logs/vision_shadow.jsonl
 ├── tests/fixtures/vision/      # V1 Vision fixtures (PNG + JSON pairs); auto/ subdir is gitignored
 ├── queues/                     # Active/completed pipeline runs (per-topic dirs)

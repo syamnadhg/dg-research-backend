@@ -266,7 +266,22 @@ class VisionClient:
         call_budget: int = DEFAULT_CALL_BUDGET,
         on_action: Callable[[ActionResult, dict], Awaitable[None]] | None = None,
     ) -> None:
-        key = api_key or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CUA_API_KEY")
+        key = api_key
+        if not key:
+            # Lazy import — research imports vision, so vision must import
+            # research lazily to avoid a circular import at module-load.
+            # Routes through the canonical precedence chain (Firestore →
+            # user-scope env → os.environ). Eliminates the two-ladder split
+            # with research.py:25404 (which now also uses resolve_api_key).
+            try:
+                from research import resolve_api_key as _resolve_api_key
+                key = _resolve_api_key()
+            except Exception:
+                pass
+        if not key:
+            # Last-resort flat read — covers standalone callers (e.g.
+            # vision_test.py) where the research module isn't loaded.
+            key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CUA_API_KEY")
         if not key:
             raise RuntimeError(
                 "VisionClient: no API key. Pass api_key= or set ANTHROPIC_API_KEY."

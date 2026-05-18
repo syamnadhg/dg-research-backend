@@ -25401,7 +25401,11 @@ async def run_pair(profile_dir, wait_minutes=10):
     # DOM checks AND CUA vision before Step 2 clears it — matches Phase 0
     # init rigor.
     _setup_cua_client = None
-    _setup_cua_api_key = os.environ.get("CUA_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    # Route through `resolve_api_key()` (research.py:203) so this site honors
+    # the full precedence chain (Firestore → user-scope env → os.environ),
+    # not just flat os.environ. Was previously a two-ladder inconsistency
+    # with vision.py:269 — both now go through the same resolver.
+    _setup_cua_api_key = resolve_api_key()
     if _setup_cua_api_key:
         try:
             import anthropic as _anthropic
@@ -25772,6 +25776,169 @@ async def run_pair(profile_dir, wait_minutes=10):
 # needs for the logged-in agents.
 
 _SUPERVISOR_TASK_NAME = "SuperResearchBackend"
+
+# ── Cross-platform supervisor scaffolding (Track C, 2026-05-18) ────────────
+# Per-platform bodies live in `*_windows` / `*_macos` / `*_linux` siblings;
+# dispatchers at the original names route via `_supervisor_platform()`.
+# macOS + Linux gated behind `DG_ALLOW_CROSS_PLATFORM=1` until smoke tests
+# pass on real hardware. See PersistenceRecipe.md §4 Scratch for the
+# PR1/PR2 scaffolding + PR0/PR3 (paired-with-Track-B) roadmap.
+
+_SUPERVISOR_PLIST_LABEL = "com.dgresearch.supervisor"
+_SUPERVISOR_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_SUPERVISOR_PLIST_LABEL}.plist"
+_SUPERVISOR_UNIT_NAME = "dgresearch-supervisor.service"
+_SUPERVISOR_UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / _SUPERVISOR_UNIT_NAME
+
+# Per-machine env file consumed by the supervisor at startup. See PR-Env in
+# PersistenceRecipe.md §3.6. Values applied via `os.environ.setdefault()` —
+# existing process env (Windows user-scope from "Account → API Config") wins
+# for `resolve_api_key` callers (research.py:204-218). Missing file is fail-
+# soft (Vision defaults to off per research.py:66, CUA fallthrough is safe).
+_SUPERVISOR_ENV_FILE_DEFAULT_PATH = Path(__file__).parent / ".dg-supervisor.env"
+
+
+def _load_env_file(path) -> dict[str, str]:
+    """Parse `KEY=value` lines from `path`; apply via `os.environ.setdefault`.
+
+    Tolerates `#` comments, blank lines, whitespace around `=`, matching
+    outer quotes. UTF-8 BOM tolerated via `encoding="utf-8-sig"`. Missing
+    file → WARN + {}. Malformed lines → WARN + skip. Returns the subset of
+    keys actually applied (skips keys already present in os.environ — so the
+    existing Windows user-scope env wins for the resolve_api_key chain).
+    """
+    if path is None:
+        return {}
+    p = Path(path) if not isinstance(path, Path) else path
+    if not p.exists():
+        log(f"[env] {p} not found — supervisor starts without persisted env vars", "WARN")
+        return {}
+    applied: dict[str, str] = {}
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except Exception as e:
+        log(f"[env] failed to read {p}: {e}", "WARN")
+        return {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if "=" not in s:
+            log(f"[env] {p}:{lineno} skipped (no '='): {s[:60]}", "WARN")
+            continue
+        k, _, v = s.partition("=")
+        k = k.strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        if not k or not all(c.isalnum() or c == "_" for c in k):
+            log(f"[env] {p}:{lineno} skipped (bad key): {k!r}", "WARN")
+            continue
+        if k not in os.environ:
+            os.environ[k] = v
+            applied[k] = v
+    return applied
+
+
+def _seed_env_file_if_missing() -> bool:
+    """Copy scripts/dg-supervisor.env.example to .dg-supervisor.env if absent.
+    On POSIX, chmod 0600 (API key sensitivity). Idempotent — no-op if target
+    exists. Returns True if a fresh seed was written. Called by `--resurrect`
+    so first-time install lays down a documented, all-commented env file."""
+    target = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+    if target.exists():
+        return False
+    example = Path(__file__).parent / "scripts" / "dg-supervisor.env.example"
+    if not example.exists():
+        log(f"[env] no example template at {example} — skipping seed", "WARN")
+        return False
+    try:
+        target.write_text(example.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    except Exception as e:
+        log(f"[env] failed to seed {target}: {e}", "WARN")
+        return False
+    if sys.platform != "win32":
+        try:
+            os.chmod(target, 0o600)
+        except Exception as e:
+            log(f"[env] could not chmod 0600 {target}: {e}", "WARN")
+    log(f"[env] seeded {target} from scripts/dg-supervisor.env.example", "INFO")
+    return True
+
+
+def _supervisor_platform() -> str:
+    """Return 'Windows' | 'Darwin' | 'Linux' | 'Unsupported'.
+
+    Centralizes the `DG_ALLOW_CROSS_PLATFORM=1` gate so every dispatch site
+    is one branch, not one branch + one flag check. PR3 drops the gate by
+    deleting the env-flag block.
+    """
+    import platform as _p
+    sysname = _p.system()
+    if sysname == "Windows":
+        return "Windows"
+    if sysname in ("Darwin", "Linux"):
+        if os.environ.get("DG_ALLOW_CROSS_PLATFORM") != "1":
+            return "Unsupported"
+        return sysname
+    return "Unsupported"
+
+
+def _parse_etime(s: str) -> "float | None":
+    """Parse `ps -o etime=` output. Accepts 'MM:SS', 'HH:MM:SS', 'DD-HH:MM:SS'."""
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        if "-" in s:
+            days, rest = s.split("-", 1)
+            d = int(days)
+        else:
+            d = 0
+            rest = s
+        parts = rest.split(":")
+        if len(parts) == 3:
+            h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
+        elif len(parts) == 2:
+            h, m, sec = 0, int(parts[0]), int(parts[1])
+        else:
+            return None
+        return float(d * 86400 + h * 3600 + m * 60 + sec)
+    except (ValueError, IndexError):
+        return None
+
+
+def _wait_for_daemon_loop(enumerate_fn, timeout_s: float = 5.0) -> "int | None":
+    """Poll `enumerate_fn()` every 0.5s until a daemon-loop pid appears, or
+    timeout. launchctl / systemctl return before the spawned process has
+    materialized, so callers that need the pid poll via this helper."""
+    import time as _t
+    deadline = _t.time() + timeout_s
+    while _t.time() < deadline:
+        _t.sleep(0.5)
+        for pid, _cmd, role in enumerate_fn():
+            if role == "daemon-loop":
+                return pid
+    return None
+
+
+def _kill_until_clean(enumerate_fn, kill_fn, timeout_s: float = 8.0) -> int:
+    """Loop kill+re-enumerate until no daemon-loop or serve procs remain,
+    or timeout. Skips the calling process so we don't kill ourselves.
+    Returns total kills."""
+    import time as _t
+    self_pid = os.getpid()
+    killed_total = 0
+    deadline = _t.time() + timeout_s
+    while True:
+        procs = [p for p in enumerate_fn() if p[0] != self_pid]
+        daemon_pids = [pid for pid, _cmd, role in procs if role == "daemon-loop"]
+        serve_pids = [pid for pid, _cmd, role in procs if role == "serve"]
+        if not daemon_pids and not serve_pids:
+            return killed_total
+        killed_total += kill_fn(daemon_pids) + kill_fn(serve_pids)
+        if _t.time() >= deadline:
+            return killed_total
+        _t.sleep(0.5)
 
 
 def _supervisor_python_exe() -> str:
@@ -26229,12 +26396,22 @@ def _arm_supervisor_quiet() -> tuple[bool, int | None, str, int]:
     if _platform.system() != "Windows":
         return False, None, "non-Windows", 0
 
+    # Seed `.dg-supervisor.env` from scripts/dg-supervisor.env.example if
+    # the user hasn't created one yet. Idempotent — no-op when target exists.
+    _seed_env_file_if_missing()
+
     # pythonw.exe (no-console subsystem) keeps the supervisor invisible at
     # logon — under the `/IT` interactive token, console-mode python.exe
-    # would otherwise pop a visible daemon-loop terminal.
+    # would otherwise pop a visible daemon-loop terminal. Scheduled Task
+    # invokes pythonw DIRECTLY (NOT via a cmd.exe /c wrapper) — the cmd
+    # intermediary would flash a console window on every PT5M trigger
+    # fire. The same quoted-path pattern as before; --env-file is an extra
+    # quoted arg that Python loads via _load_env_file() before subcommand
+    # dispatch.
     python_exe = _supervisor_python_exe()
     script_path = str(Path(__file__).resolve())
-    task_run = f'"{python_exe}" "{script_path}" --daemon-loop'
+    env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+    task_run = f'"{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"'
 
     cmd = [
         "schtasks", "/Create",
@@ -26356,19 +26533,28 @@ def run_resurrect():
         print(f"  {_c(_DIM, 'as task #355 (launchd + systemd-user). See PersistenceRecipe.md.')}")
         return
 
+    # Seed `.dg-supervisor.env` from scripts/dg-supervisor.env.example so the
+    # user-facing happy path lays down a documented config file at install
+    # time. Idempotent — no-op when target exists.
+    _seed_env_file_if_missing()
+
     # pythonw.exe (no-console subsystem) keeps the supervisor invisible at
     # logon — under the `/IT` interactive token, console-mode python.exe
     # would otherwise pop a visible daemon-loop terminal. Falls back to
     # sys.executable if pythonw.exe isn't installed alongside.
     python_exe = _supervisor_python_exe()
     script_path = str(Path(__file__).resolve())
+    env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
     # Use the full path to python.exe so the task runs even if PATH isn't set
     # up for the scheduler's session. Quote both to tolerate spaces.
     # Launch the daemon-loop wrapper (not --serve directly) so the backend
     # auto-restarts on any exit — including the os._exit(0) that the Stop
     # button calls for Chromium cleanup. Without this, the scheduled task
     # only fires once per logon and the backend stays dead after Stop.
-    task_run = f'"{python_exe}" "{script_path}" --daemon-loop'
+    # --env-file directs research.py to load .dg-supervisor.env via
+    # _load_env_file() before subcommand dispatch (parity with the
+    # _arm_supervisor_quiet install path).
+    task_run = f'"{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"'
 
     # Initialize Firebase so the flag write later succeeds. Cheap no-op if
     # the sa file is missing — we just skip the flag.
@@ -26920,7 +27106,21 @@ def main():
         help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
     parser.add_argument("--daemon-loop", action="store_true",
         help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the On Startup scheduled task.")
+    parser.add_argument("--env-file", default=None,
+        help=f"Path to KEY=value env file. Default: <script_dir>/.dg-supervisor.env (silently skipped if missing).")
     args = parser.parse_args()
+
+    # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand
+    # (--serve, --daemon-loop, --resurrect, etc.) inherits the same values.
+    # `os.environ.setdefault` semantics — existing process env wins, which
+    # preserves Windows user-scope env priority for `resolve_api_key` callers.
+    if args.env_file:
+        _load_env_file(args.env_file)
+    elif _SUPERVISOR_ENV_FILE_DEFAULT_PATH.exists():
+        # Silently auto-load if default file exists. No WARN on first-run
+        # where the user hasn't created it yet (the path-exists check here
+        # sidesteps `_load_env_file`'s missing-file WARN).
+        _load_env_file(_SUPERVISOR_ENV_FILE_DEFAULT_PATH)
 
     if args.resurrect:
         run_resurrect()
