@@ -43,7 +43,10 @@ scratch/
 
 # Vision fixtures — hotspot screenshots may contain authed-session UI
 # (email addresses, account chips). Captured locally during E2E via
-# `python vision_test.py --capture NAME`. The README stays in the repo
-# so the schema is discoverable.
+# `python vision_test.py --capture NAME` (manual) AND auto-harvested
+# into tests/fixtures/vision/auto/<hotspot>/ by vision.py when
+# DG_VISION_FIXTURE_AUTO=1. The README stays in the repo so the schema
+# is discoverable.
 tests/fixtures/vision/*.png
 tests/fixtures/vision/*.json
+tests/fixtures/vision/auto/

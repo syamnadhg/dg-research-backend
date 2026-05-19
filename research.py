@@ -1292,7 +1292,6 @@ def init_firebase():
 
 
 _start_listener = None  # Global start-command listener
-_heartbeat_task = None  # Async task: writes lastHeartbeat every 5s
 # Q8 observability: track when our heartbeat last successfully landed, +
 # how many consecutive writes have failed. /api/health surfaces the
 # timestamp so the FE can sanity-check "device offline despite localhost
