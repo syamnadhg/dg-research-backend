@@ -184,17 +184,18 @@ If Chrome itself isn't installed, install it first:
 
 The supervisor reads env vars from `.dg-supervisor.env` (created automatically on first `--resurrect` from `scripts/dg-supervisor.env.example`). Edit that file to set Vision/CUA config; no shell-rc / `setx` needed.
 
-**Anthropic API key** — required for browser automation. Three options, **all platforms**:
+**API keys** — Anthropic powers the agents (CUA + Vision) and is **required** for browser automation. Gemini powers narration + acts as the Haiku fallback for title refinement, and is **optional** (narrator silently disables without it). Four ways to set either, **all platforms**:
 
-- **(recommended, all platforms)** "Account → API Config" in the web app — writes the key to **Firestore** (`users/{uid}/settings/prefs.apiKeys.anthropic`). The backend reads it via `resolve_api_key()` (research.py:203) which prefers Firestore over every other env source. Works on Windows, macOS, Linux — same UI, same flow. No restart required after rotating; backend re-reads on next call (60s cache).
-- **(file-based, all platforms)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` in `.dg-supervisor.env`. Loaded by `--env-file` at supervisor startup; survives reboots via the persistence supervisor. Good for un-paired backends or operators who prefer files.
-- **(advanced / legacy)** Set `CUA_API_KEY` or `ANTHROPIC_API_KEY` in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). Still works; `resolve_api_key()` accepts either name. Used to be the only path before the Account page UI shipped.
+- **(easiest — recommended)** **`--pair` Stage 4/5 auto-prompt.** At the end of pairing, `--pair` checks whether each key is already resolvable from any source; for missing keys it prompts with `[paste / S=skip]`. On paste it writes Firestore + `os.environ` + busts the resolver cache so Stage 5 supervisor arming sees the key immediately. Skip is first-class per key (skip Gemini if you don't have one; skip Anthropic if you'll set it later via the web app).
+- **(equivalent — set later, or rotate)** "Account → API Config" in the web app — same Firestore target (`users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}`). Works on Windows, macOS, Linux — same UI, same flow. No restart required after rotating; backend re-reads on next call (60s cache).
+- **(file-based, all platforms)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` and/or `GEMINI_API_KEY=AIza...` in `.dg-supervisor.env`. Loaded by `--env-file` at supervisor startup; survives reboots via the persistence supervisor. Good for un-paired backends or operators who prefer files.
+- **(advanced / legacy)** Set in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). `resolve_api_key()` accepts `CUA_API_KEY` or `ANTHROPIC_API_KEY`; `resolve_gemini_api_key()` accepts `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
 
-**Don't set the key in multiple places with different values** — pick one. `resolve_api_key()` priority chain: CLI `--api-key` → **Firestore (Account page)** → Windows user-scope env → `os.environ` (the `.env` file loads here). Firestore wins, so a stale shell/file value won't override a freshly-set Account-page key.
+**Don't set the same key in multiple places with different values** — pick one. Priority chain: CLI `--api-key` → **Firestore (pair-prompt or Account page — same target)** → Windows user-scope env → `os.environ` (the `.env` file loads here). Firestore wins, so a stale shell/file value won't override a freshly-set Firestore key.
 
 **Other config** (Vision tier, CUA model overrides, shadow log path) also lives in `.dg-supervisor.env`. See `scripts/dg-supervisor.env.example` for the documented template + key descriptions.
 
-`GEMINI_API_KEY` is **optional** on the BE side — used only as the narrator's Flash fallback when Haiku is unavailable. Set it in `.dg-supervisor.env` if you want it persisted. (P4 thumbnail generation lives on the FE: `web/src/lib/album-art.ts` calls Gemini image-gen from inside `/api/uploadYouTube` using the FE-side env key or the user's per-prefs key. BE never owned a thumbnail role post-2026-05-10.)
+> P4 thumbnail generation lives on the FE: `web/src/lib/album-art.ts` calls Gemini image-gen from inside `/api/uploadYouTube` using the FE-side env key or the user's per-prefs key. BE never owned a thumbnail role post-2026-05-10.
 
 **Phases 4 + 5 are FE-owned.** No BE setup needed for either. The frontend handles YouTube upload via `youtube.videos.insert` (Data API + OAuth refresh token, ffmpeg encode in Cloud Run) AND Google Doc creation via the Docs API AND email via Resend — see the FE README for that side's env vars (`GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`, `RESEND_API_KEY`, `NOTIFY_FROM_EMAIL`).
 
@@ -206,31 +207,28 @@ The supervisor reads env vars from `.dg-supervisor.env` (created automatically o
 python research.py --pair
 ```
 
-The flow has **four** gated stages — each waits for the previous to confirm before advancing:
+The flow has **five** gated stages — each waits for the previous to confirm before advancing. (The terminal renumbered from 4 to 5 stages with the 2026-05-18 pair-prompt addition.)
 
-**`[1/4] Research token`**
-Mints a new ResearchToken (UUID) or reuses the one in `research_config.json`. The token registers in Firestore (`research_tokens/{token}`) with `status: active`, `machineName`, `createdAt`, `lastHeartbeat`. The token is printed and an ASCII QR renders immediately below it. Delete `research_config.json` if you want to mint a fresh one. **Stage 2 is gated on the token being linked from the web app.**
-
-**`[2/4] Link token to your app account` — this gate blocks the rest**
-The flow waits (polling Firestore every 3s) until your app actually links the token to an authenticated user. Two equally-good ways:
+**`[1/5] Token setup` — mint + render QR + wait for app to link**
+Mints a new ResearchToken (UUID) or reuses the one in `research_config.json`. The token registers in Firestore (`research_tokens/{token}`) with `status: active`, `machineName`, `createdAt`, `lastHeartbeat`. The token is printed and an ASCII QR renders immediately below it; the flow then polls Firestore every 3s waiting for your app to link the token to an authenticated user. Two equally-good ways to link:
 - **Scan** — in the Super Research app: chat → *Connect* bubble → *Scan QR* button, OR Account → Pipeline Connection → small QR icon beside the paste field. Point the phone camera at the terminal QR.
 - **Paste** — copy the token line printed above the QR and paste it into Account → Pipeline Connection → *Paste your ResearchToken* → *Link*.
 
-> **Don't have a web app account yet?** The Super Research app lives at the deployment URL the dev shares with you (Google sign-in only). If you weren't invited yet, ping the dev. The app is required for stages 2 and 3 — `--pair` will sit on its polling loop until you link.
+> **Don't have a web app account yet?** The Super Research app lives at the deployment URL the dev shares with you (Google sign-in only). If you weren't invited yet, ping the dev. The app is required for this stage — `--pair` will sit on its polling loop until you link.
 
-Once the app writes the token to your `users/{uid}/settings.researchToken` field, the flow resolves your email via Firebase Auth and prints `[ok] Linked — you@example.com`. Default link timeout is 10 minutes.
+Once the app writes the token to your `users/{uid}/settings.researchToken` field, the flow resolves your email via Firebase Auth and prints `[ok] Linked — you@example.com`. Default link timeout is 10 minutes. Delete `research_config.json` if you want to mint a fresh token on the next run.
 
-**`[3/4] On Startup` — supervised auto-restart prompt (Windows-only today)**
+**`[2/5] On Startup` — supervised auto-restart prompt**
 After the link lands, `--pair` prompts:
 
 ```
 Enable On Startup? [Y/n]:
 ```
 
-- **`Y` (default)** — calls `--resurrect` inline, registers the Windows Scheduled Task, and the backend self-restarts on every reboot / crash. Equivalent to running `python research.py --resurrect` after `--pair` finishes. Windows-only; on macOS/Linux this prompt skips with a "supported on Windows today" notice.
+- **`Y` (default)** — opts into supervised mode; actual arming is **deferred to Stage 5** so an aborted login can't leave Firestore flagged as supervised while platforms are half-logged-in.
 - **`n`** — skip; you'll run `python research.py --serve` manually after `--pair` finishes (and, on Linux/Mac, set up your own backgrounding via `nohup` / `tmux` / `screen` / your own systemd unit — see [§ Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending)).
 
-**`[4/4] Platform logins`**
+**`[3/5] Browser logins`**
 Opens 4 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds:
 - ChatGPT (chatgpt.com)
 - Gemini (gemini.google.com)
@@ -243,25 +241,43 @@ The checklist re-renders only when a platform flips — `[ok]` for logged in, `[
 
 > **Markers only tick after real auth.** `verify_login()` checks only auth-specific DOM (profile menus, account chips, chat-history lists). Generic chat-input elements are excluded because they show up on logged-out landing pages too.
 
+**`[4/5] API keys` — Anthropic + Gemini detect-or-prompt** *(new 2026-05-18)*
+After logins, `--pair` runs `resolve_api_key()` and `resolve_gemini_api_key()` to check whether each key is already resolvable from any source (Firestore, Windows user-scope, shell env, or `.dg-supervisor.env`). For each missing key, it prompts:
+
+```
+Anthropic  — get one at https://console.anthropic.com/settings/keys
+>  Paste Anthropic key (sk-ant-...) or [S]kip:
+```
+
+On paste it writes Firestore (`users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}` — same path the Account page writes to), sets both env-var names per key in `os.environ` (`ANTHROPIC_API_KEY` + `CUA_API_KEY`, or `GEMINI_API_KEY` + `GOOGLE_API_KEY`), and busts `_RESOLVED_KEY_CACHE` so the next resolver call picks up the change immediately.
+
+Skip is first-class per key — pair finishes regardless. Missing Anthropic surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
+
+**`[5/5] Ready` — arm supervisor (if opted in) + final message**
+If you said `Y` to On Startup back in Stage 2, the supervisor is armed now (Windows Scheduled Task, macOS LaunchAgent, or Linux systemd-user unit depending on platform — Mac/Linux gated behind `DG_ALLOW_CROSS_PLATFORM=1` pending smoke tests). If you said `n`, any leftover scheduled task is torn down so the machine genuinely matches "unsupervised". Final banner branches on whether the supervisor is live.
+
 ### Step 4: After pair succeeds
 
-When all 5 are `[ok]`, the flow:
+When all 4 platform logins clear and the Stage 4/5 API key prompt resolves, the flow:
 
 1. Closes the browser
 2. Writes `research_config.json` locally (if not already present)
 3. Keeps the token registered in Firestore
-4. **Exits the Python process — pair does not stay running.**
+4. Arms the supervisor inline if you said `Y` to On Startup back in Stage 2 (Windows Scheduled Task / macOS LaunchAgent / Linux systemd-user unit), or tears down any leftover scheduled task if you said `n`
+5. **Exits the Python process — pair does not stay running.**
 
-You'll see a final banner explaining this:
+The final banner branches on whether the supervisor is live:
+
 ```
-PAIR COMPLETE — all 5 platforms verified.
-
-What happens now:
-  · Browser has been closed.
-  · ResearchToken is saved locally AND registered with Firebase.
-  · This process will exit; pair does not stay running.
-
-Next step — start the server:
+✓  Paired with you@example.com
+✓  All 4 platforms logged in
+✓  Browser closed
+✓  Anthropic key saved to your account  (or "Skipped — set later via Account → API Config")
+✓  Gemini key saved to your account     (or "Skipped — set later via Account → API Config")
+...
+The bond is forged.  The backend is live — running in the background.        # if supervisor armed
+                                          OR
+The bond is forged.  Start the backend in this terminal to accept jobs:       # if unsupervised
     python research.py --serve
 ```
 
