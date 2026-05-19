@@ -25231,6 +25231,127 @@ async def run_server(port=8000):
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
+def _save_api_key_to_firestore(uid: str, key_name: str, value: str) -> bool:
+    """Merge-write users/{uid}/settings/prefs.apiKeys.{key_name} = value.
+
+    Targets the same Firestore path the FE Account page writes to, so the
+    pair-time prompt and the web app stay one source of truth (no .env file
+    write — that would create a third source and drift on rotation).
+
+    Returns True on success, False on any failure. On failure the caller
+    keeps the in-memory os.environ assignment so the current pair / serve
+    session still has the key; the user can re-save from the Account page
+    later for cross-device durability."""
+    if not (_firebase_db and uid):
+        return False
+    try:
+        _firebase_db.collection("users").document(uid) \
+            .collection("settings").document("prefs").set(
+                {"apiKeys": {key_name: value}}, merge=True,
+            )
+        log(f"[pair] saved apiKeys.{key_name} to Firestore for uid={uid[:8]}…", "INFO")
+        return True
+    except Exception as e:
+        log(f"[pair] Firestore write of apiKeys.{key_name} failed: {e}", "WARN")
+        return False
+
+
+async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
+    """Single-key paste loop for --pair Stage 4/5.
+
+    Returns the trimmed key string on paste, or "" on skip / Ctrl+C / EOF.
+    Skip is first-class — pair completes regardless; missing keys surface
+    at first-job via the cua_unavailable / narrator-disabled paths (both
+    already user-recoverable from the FE alert)."""
+    print(f"  {_c(_BOLD, label)}  {_c(_DIM, f'— get one at {help_url}')}")
+    while True:
+        try:
+            raw = await asyncio.to_thread(
+                input,
+                f"  {_c(_ACCENT, '>')}  Paste {label} key ({example})  {_c(_DIM, 'or [S]kip:')} ",
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+        s = (raw or "").strip()
+        # Strip surrounding quotes — users often copy from .env-style snippets
+        if len(s) >= 2 and s[0] in ('"', "'") and s[-1] == s[0]:
+            s = s[1:-1].strip()
+        if not s:
+            print(f"  {_c(_WARN, '     Enter a key or type s to skip.')}")
+            continue
+        if s.lower() in ("s", "skip"):
+            return ""
+        # Loose sanity: real keys are well over 20 chars and contain no whitespace
+        if len(s) < 20 or any(ch.isspace() for ch in s):
+            print(f"  {_c(_WARN, '     That does not look like a valid key. Try again or type s to skip.')}")
+            continue
+        return s
+
+
+async def _pair_prompt_api_keys(uid: str):
+    """Stage 4/5 of --pair: detect-or-prompt for Anthropic + Gemini.
+
+    Per key: if any source already resolves (Firestore / Windows user-scope
+    env / shell env / .dg-supervisor.env via _load_env_file), skip the
+    prompt and tell the user we're using that. Otherwise prompt with
+    paste-or-skip. On paste: write Firestore (canonical, cross-device) +
+    os.environ (in-memory for this session) + bust _RESOLVED_KEY_CACHE so
+    the change is picked up immediately by Stage 5 supervisor arming.
+
+    Anthropic and Gemini are independent — skipping one doesn't affect the
+    other. Pair always completes; degraded modes (cua_unavailable for
+    missing Anthropic, narration disabled for missing Gemini) are
+    user-recoverable via FE alert + Account → API Config."""
+    # ── Anthropic ─────────────────────────────────────────────────────────
+    if resolve_api_key():
+        print(f"  {_c(_OK, '✓')}  Anthropic key {_c(_DIM, 'already configured — using existing source.')}")
+    else:
+        key = await _pair_prompt_one_key(
+            label="Anthropic",
+            example="sk-ant-...",
+            help_url="https://console.anthropic.com/settings/keys",
+        )
+        if key:
+            ok = _save_api_key_to_firestore(uid, "anthropic", key)
+            os.environ["ANTHROPIC_API_KEY"] = key
+            os.environ["CUA_API_KEY"] = key
+            _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
+            if ok:
+                print(f"  {_c(_OK, '✓')}  Saved to your account {_c(_DIM, '— synced across your devices.')}")
+            else:
+                print(f"  {_c(_WARN, '⚠')}  Could not sync to your account — applied to this session only.")
+                print(f"  {_c(_DIM, '     Save permanently from the web app: Account → API Config.')}")
+        else:
+            print(f"  {_c(_DIM, '─')}  Skipped Anthropic — set later from the web app (Account → API Config).")
+
+    print()
+
+    # ── Gemini ────────────────────────────────────────────────────────────
+    if resolve_gemini_api_key():
+        print(f"  {_c(_OK, '✓')}  Gemini key {_c(_DIM, 'already configured — using existing source.')}")
+    else:
+        key = await _pair_prompt_one_key(
+            label="Gemini",
+            example="AIza...",
+            help_url="https://aistudio.google.com/app/apikey",
+        )
+        if key:
+            ok = _save_api_key_to_firestore(uid, "gemini", key)
+            os.environ["GEMINI_API_KEY"] = key
+            os.environ["GOOGLE_API_KEY"] = key
+            # resolve_gemini_api_key() has no cache — nothing to bust. If a
+            # Gemini cache is ever added (mirroring _RESOLVED_KEY_CACHE), add
+            # the equivalent reset here so this site doesn't silently break.
+            if ok:
+                print(f"  {_c(_OK, '✓')}  Saved to your account {_c(_DIM, '— synced across your devices.')}")
+            else:
+                print(f"  {_c(_WARN, '⚠')}  Could not sync to your account — applied to this session only.")
+                print(f"  {_c(_DIM, '     Save permanently from the web app: Account → API Config.')}")
+        else:
+            print(f"  {_c(_DIM, '─')}  Skipped Gemini — set later from the web app (Account → API Config).")
+
+
 async def run_pair(profile_dir, wait_minutes=10):
     """Guided setup: generate/reuse ResearchToken, render ASCII QR, open
     login tabs, auto-verify per-platform login every 30s, exit cleanly when
@@ -25248,7 +25369,7 @@ async def run_pair(profile_dir, wait_minutes=10):
     # [1/4] TOKEN SETUP — mint, register in Firestore, render QR, wait for
     #       the app to claim the link. All token-side work lives here.
     # ══════════════════════════════════════════════════════════════════════
-    _setup_step(1, 4, "Token setup")
+    _setup_step(1, 5, "Token setup")
 
     firebase_ok = init_firebase()
     if not firebase_ok:
@@ -25466,7 +25587,7 @@ async def run_pair(profile_dir, wait_minutes=10):
     #       succeed, so an aborted login can't leave Firestore with
     #       supervised=true while platforms are half-logged-in.
     # ══════════════════════════════════════════════════════════════════════
-    _setup_step(2, 4, "On Startup")
+    _setup_step(2, 5, "On Startup")
     print(f"  {_c(_DIM, 'Keep the backend running in the background?')}")
     print(f"  {_c(_DIM, 'It will auto-start when you log in and stay alive through crashes')}")
     print(f"  {_c(_DIM, 'and reboots. You can turn it off anytime with --retire.')}")
@@ -25496,7 +25617,7 @@ async def run_pair(profile_dir, wait_minutes=10):
     # ══════════════════════════════════════════════════════════════════════
     # [3/4] BROWSER LOGINS — open 4 platform tabs and wait for real auth.
     # ══════════════════════════════════════════════════════════════════════
-    _setup_step(3, 4, "Browser logins")
+    _setup_step(3, 5, "Browser logins")
     print(f"  {_c(_DIM, 'Walking through logins one platform at a time.')}")
     print(f"  {_c(_DIM, 'Each tab opens, you log in, then press Enter — vision verifies the session.')}")
     print(f"  {_c(_DIM, 'If a Pro-tier check trips, you decide whether to continue, retry, or skip.')}")
@@ -25814,13 +25935,29 @@ async def run_pair(profile_dir, wait_minutes=10):
     print("")
     if all_ok:
         # ══════════════════════════════════════════════════════════════════════
-        # [4/4] READY — pair is complete. If the user opted into On Startup
+        # [4/5] API KEYS — detect-or-prompt for Anthropic + Gemini. Each
+        #       key is independently skippable. On paste we write to
+        #       Firestore (canonical, cross-device, matches FE Account
+        #       page) + os.environ (current session) + bust the resolver
+        #       cache so supervisor arming picks up the new key without
+        #       restart. NOT written to .dg-supervisor.env — that would
+        #       create a 3rd source of truth and drift on rotation.
+        # ══════════════════════════════════════════════════════════════════════
+        _setup_step(4, 5, "API keys")
+        print(f"  {_c(_DIM, 'Anthropic powers the agents (CUA + Vision).  Gemini powers narration.')}")
+        print(f"  {_c(_DIM, 'Already-set keys are detected and reused. Skip to set later via the web app.')}")
+        print()
+        await _pair_prompt_api_keys(linked_uid)
+        print()
+
+        # ══════════════════════════════════════════════════════════════════════
+        # [5/5] READY — pair is complete. If the user opted into On Startup
         #       back in step 2, arm the supervisor NOW (deferred from step 2
         #       so an aborted login couldn't leave Firestore flagged as
         #       supervised while platforms were half-logged-in). Final
         #       message branches on whether the supervisor is live.
         # ══════════════════════════════════════════════════════════════════════
-        _setup_step(4, 4, "Ready")
+        _setup_step(5, 5, "Ready")
         print(f"  {_c(_OK, '✓')}  Paired with {_c(_BOLD, linked_email or '—')}")
         print(f"  {_c(_OK, '✓')}  All {len(services)} platforms logged in")
         print(f"  {_c(_OK, '✓')}  Browser closed")
