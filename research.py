@@ -742,16 +742,17 @@ def _branded_header(tagline_text: str, tagline_color: str, tagline_gloss: str):
 def _setup_logo():
     """Branded header for --pair. Thin wrapper around _branded_header so
     --pair wears the same crown as the other four commands, plus a compact
-    4-step preview line so the user sees the whole arc before step [1/4]
+    5-step preview line so the user sees the whole arc before step [1/5]
     starts."""
     _branded_header("vinculum", _BOLD + _ACCENT, "the bond is forged")
     print()
     print(
-        f"  {_c(_DIM, 'Four steps:')}   "
+        f"  {_c(_DIM, 'Five steps:')}   "
         f"{_c(_ACCENT, '1')} Token   {_c(_DIM, '→')}   "
         f"{_c(_ACCENT, '2')} On StartUp   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '3')} Logins   {_c(_DIM, '→')}   "
-        f"{_c(_ACCENT, '4')} Serve"
+        f"{_c(_ACCENT, '3')} API Keys   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '4')} Logins   {_c(_DIM, '→')}   "
+        f"{_c(_ACCENT, '5')} Ready"
     )
 
 
@@ -25542,14 +25543,15 @@ async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
 
 
 async def _pair_prompt_api_keys(uid: str):
-    """Stage 4/5 of --pair: detect-or-prompt for Anthropic + Gemini.
+    """Stage 3/5 of --pair: detect-or-prompt for Anthropic + Gemini.
 
     Per key: if any source already resolves (Firestore / Windows user-scope
     env / shell env / .dg-supervisor.env via _load_env_file), skip the
     prompt and tell the user we're using that. Otherwise prompt with
     paste-or-skip. On paste: write Firestore (canonical, cross-device) +
     os.environ (in-memory for this session) + bust _RESOLVED_KEY_CACHE so
-    the change is picked up immediately by Stage 5 supervisor arming.
+    the change is picked up immediately by Stage 4 browser-login CUA
+    init AND by Stage 5 supervisor arming.
 
     Anthropic and Gemini are independent — skipping one doesn't affect the
     other. Pair always completes; degraded modes (cua_unavailable for
@@ -25617,8 +25619,17 @@ async def run_pair(profile_dir, wait_minutes=10):
     """
     _setup_logo()
 
+    # Snapshot pre-pair state for the F4 / DGOPS-7451 relaxation downstream.
+    # The F4 cookie check refuses pair when prior Google auth is present —
+    # but only the "switching accounts mid-life" case is the actual DGOPS-7451
+    # risk. First-pair on a fresh device (no _initial_paired_uid) OR re-pair
+    # to the same account (uid matches) are both safe; cookies are presumably
+    # from the user about to claim the link. Captured here before Stage 1
+    # writes new state to research_config.json / device_config.json.
+    _initial_paired_uid = load_paired_uid()
+
     # ══════════════════════════════════════════════════════════════════════
-    # [1/4] TOKEN SETUP — mint, register in Firestore, render QR, wait for
+    # [1/5] TOKEN SETUP — mint, register in Firestore, render QR, wait for
     #       the app to claim the link. All token-side work lives here.
     # ══════════════════════════════════════════════════════════════════════
     _setup_step(1, 5, "Token setup")
@@ -25833,9 +25844,9 @@ async def run_pair(profile_dir, wait_minutes=10):
     print()
 
     # ══════════════════════════════════════════════════════════════════════
-    # [2/4] ON STARTUP — ask whether to enable On Startup mode. We only
+    # [2/5] ON STARTUP — ask whether to enable On Startup mode. We only
     #       CAPTURE the answer here; the actual arming (schtasks install
-    #       + detached daemon-loop spawn) happens in step 4 AFTER logins
+    #       + detached daemon-loop spawn) happens in Stage 5 AFTER logins
     #       succeed, so an aborted login can't leave Firestore with
     #       supervised=true while platforms are half-logged-in.
     # ══════════════════════════════════════════════════════════════════════
@@ -25862,14 +25873,37 @@ async def run_pair(profile_dir, wait_minutes=10):
     if enable_on_startup:
         print(f"  {_c(_OK, '✓')}  On Startup will be enabled after the logins finish.")
     else:
-        print(f"  {_c(_DIM, '     Skipped. You will run --serve manually in step 4.')}")
+        print(f"  {_c(_DIM, '     Skipped. You will run --serve manually in step 5.')}")
         print(f"  {_c(_DIM, '     Enable later with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
     print()
 
     # ══════════════════════════════════════════════════════════════════════
-    # [3/4] BROWSER LOGINS — open 4 platform tabs and wait for real auth.
+    # [3/5] API KEYS — detect-or-prompt for Anthropic + Gemini BEFORE
+    #       browser logins so the keys (especially Anthropic) are available
+    #       for the CUA + Vision verification path during Stage 4. Without
+    #       this ordering, login verification falls back to Playwright-only
+    #       (less rigorous) and the Pro-tier check can't run at all.
+    #       Each key is independently skippable; pair continues either way.
+    #       On paste: writes Firestore (canonical, cross-device, matches FE
+    #       Account page) + os.environ (current session) + busts the
+    #       resolver cache so the very-next resolve_api_key() call (in the
+    #       CUA-client init at the top of Stage 4) sees the new key.
+    #       NOT written to .dg-supervisor.env — would create a 3rd source
+    #       of truth and drift on rotation.
     # ══════════════════════════════════════════════════════════════════════
-    _setup_step(3, 5, "Browser logins")
+    _setup_step(3, 5, "API keys")
+    print(f"  {_c(_DIM, 'Anthropic powers the agents (CUA + Vision).  Gemini powers narration.')}")
+    print(f"  {_c(_DIM, 'Already-set keys are detected and reused. Skip to set later via the web app.')}")
+    print()
+    await _pair_prompt_api_keys(linked_uid)
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # [4/5] BROWSER LOGINS — open 4 platform tabs and wait for real auth.
+    #       Uses CUA + Vision when Anthropic key was set in Stage 3 (above),
+    #       or falls back to Playwright-only if user skipped.
+    # ══════════════════════════════════════════════════════════════════════
+    _setup_step(4, 5, "Browser logins")
     print(f"  {_c(_DIM, 'Walking through logins one platform at a time.')}")
     print(f"  {_c(_DIM, 'Each tab opens, you log in, then press Enter — vision verifies the session.')}")
     print(f"  {_c(_DIM, 'If a Pro-tier check trips, you decide whether to continue, retry, or skip.')}")
@@ -25883,68 +25917,91 @@ async def run_pair(profile_dir, wait_minutes=10):
     # the root enabler of the session-inheritance class of incident this
     # safety check defends against; full incident context lives in
     # DGOPS-7451. Detect read-only first; if a prior Google auth is
-    # present, surface a clear unpair-first message and exit before
-    # walking Stage 3 logins.
+    # present AND it points to a different account than the one just
+    # claimed (account_switch case), surface a clear unpair-first message
+    # and exit before walking Stage 4 logins. First-pair / same-account
+    # re-pair pass through with a passive notice.
     try:
         prior = await _detect_persisted_google_auth(browser.context)
     except Exception as _de:
         log(f"[security] pair preflight detection failed (continuing): {_de}", "WARN")
         prior = None
     if prior:
+        # F4 / DGOPS-7451 relaxation (2026-05-18): refuse pair only when the
+        # device was previously paired to a DIFFERENT account. That's the
+        # actual incident-class risk (silent account switch mid-life). On
+        # first-pair (no prior `_initial_paired_uid`) OR re-pair to the
+        # same account, the existing cookies are presumably from the user
+        # about to claim THIS link — refusing here creates a catch-22 with
+        # --unpair preserving the profile.
+        _account_mismatch = bool(_initial_paired_uid) and (_initial_paired_uid != linked_uid)
+        if _account_mismatch:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            print("")
+            print(f"  {_c(_BOLD, 'Refusing to pair: switching to a different account, but prior Google auth still present.')}")
+            print(f"  {_c(_DIM,  'Multi-account state is unsafe — agents inherit any persisted Google session and can')}")
+            print(f"  {_c(_DIM,  'navigate to Workspace-protected resources silently. See DGOPS-7451 for context.')}")
+            print("")
+            print(f"  Detected: {prior['cookieMatches']} Google auth cookie(s)  ·  prior uid: {_initial_paired_uid[:8]}…  ·  new uid: {linked_uid[:8]}…")
+            for s in prior.get("sample", []):
+                print(f"    • {s}")
+            print("")
+            print(f"  {_c(_BOLD, 'To complete this account switch:')}")
+            print(f"    1. {_c(_BOLD, 'python research.py --unpair --deep')}  {_c(_DIM, '(clears pairing state + browser profile)')}")
+            print(f"    2. {_c(_BOLD, 'python research.py --pair')}  {_c(_DIM, '(re-runs the full flow with a fresh browser)')}")
+            print("")
+            try:
+                emit_event("security_pair_refused",
+                           reason="account_switch_with_prior_cookies",
+                           cookieMatches=prior["cookieMatches"],
+                           priorPairedUid=_initial_paired_uid,
+                           newLinkedUid=linked_uid,
+                           sample=prior.get("sample", []))
+            except Exception:
+                pass
+            return
+        # First-pair or same-account re-pair — allow cookies through with
+        # a passive notice. The Google session is presumed to belong to
+        # the user about to authenticate, not a leaked third-party login.
+        _reason = "first_pair" if not _initial_paired_uid else "same_account_repair"
+        log(f"[security] {prior['cookieMatches']} prior Google auth cookie(s) detected — "
+            f"allowing pair through ({_reason}). Account-switch refusal still active for "
+            f"future re-pair to a different uid.", "INFO")
         try:
-            await browser.close()
-        except Exception:
-            pass
-        # F4 / DGOPS-7451 — recovery path. `--unpair` alone does NOT clear
-        # the persisted browser cookies (it preserves browser logins by
-        # design so a re-pair doesn't force the user back through ChatGPT/
-        # Claude logins). So instructing "just run --unpair" would loop
-        # the user — apex .google.com cookies would still be there and
-        # this refusal would re-trigger. Give the honest recovery steps.
-        print("")
-        print(f"  {_c(_BOLD, 'Refusing to pair: a Google account is already signed in to this profile.')}")
-        print(f"  {_c(_DIM,  'Multi-account state is unsafe — agents inherit any persisted Google session and can')}")
-        print(f"  {_c(_DIM,  'navigate to Workspace-protected resources silently. See DGOPS-7451 for context.')}")
-        print("")
-        print(f"  Detected: {prior['cookieMatches']} Google auth cookie(s)")
-        for s in prior.get("sample", []):
-            print(f"    • {s}")
-        print("")
-        print(f"  {_c(_BOLD, 'To re-pair (e.g. switching Google accounts):')}")
-        print(f"    1. {_c(_BOLD, 'python research.py --unpair')}  {_c(_DIM, '(clears Super Research pairing state)')}")
-        print(f"    2. {_c(_BOLD, 'Sign out of Google in the paired browser')}, OR delete the profile directory:")
-        print(f"       {_c(_DIM, str(Path.home() / '.super-research' / 'browser-profile'))}")
-        print(f"    3. {_c(_BOLD, 'python research.py --pair')}  {_c(_DIM, '(walks the platform logins again)')}")
-        print("")
-        try:
-            emit_event("security_pair_refused",
-                       reason="prior_google_auth_present",
+            emit_event("security_pair_allowed_with_prior_cookies",
+                       reason=_reason,
                        cookieMatches=prior["cookieMatches"],
-                       sample=prior.get("sample", []))
+                       linkedUid=linked_uid)
         except Exception:
             pass
-        return
 
     # CUA client for visual double-verification. Best-effort: if no key is
-    # available, Step 2 falls back to Playwright-only verification (same as
-    # before). With a key present, each platform has to pass BOTH Playwright
-    # DOM checks AND CUA vision before Step 2 clears it — matches Phase 0
-    # init rigor.
+    # available, Stage 4 (Browser logins) falls back to Playwright-only
+    # verification (same as before). With a key present — set in Stage 3
+    # via the API-key prompt OR already resolved via Firestore / user-scope
+    # env / shell rc / .dg-supervisor.env — each platform has to pass BOTH
+    # Playwright DOM checks AND CUA vision before Stage 4 clears it.
+    # Matches Phase 0 init rigor.
     _setup_cua_client = None
     # Route through `resolve_api_key()` (research.py:203) so this site honors
     # the full precedence chain (Firestore → user-scope env → os.environ),
     # not just flat os.environ. Was previously a two-ladder inconsistency
-    # with vision.py:269 — both now go through the same resolver.
+    # with vision.py:269 — both now go through the same resolver. After the
+    # 2026-05-18 stage reorder, Stage 3 also busts `_RESOLVED_KEY_CACHE` so
+    # a freshly-pasted key is visible here without restart.
     _setup_cua_api_key = resolve_api_key()
     if _setup_cua_api_key:
         try:
             import anthropic as _anthropic
             _setup_cua_client = _anthropic.Anthropic(api_key=_setup_cua_api_key)
-            log("Setup Step 2: CUA vision verifier enabled — each platform will be double-checked.", "INFO")
+            log("Setup Stage 4: CUA vision verifier enabled — each platform will be double-checked.", "INFO")
         except Exception as e:
-            log(f"Setup Step 2: Could not init CUA client ({e}) — Playwright-only verification.", "WARN")
+            log(f"Setup Stage 4: Could not init CUA client ({e}) — Playwright-only verification.", "WARN")
     else:
-        log("Setup Step 2: No CUA_API_KEY — Playwright-only verification (less rigorous).", "WARN")
+        log("Setup Stage 4: No CUA_API_KEY — Playwright-only verification (less rigorous). Re-run --pair and paste a key at Stage 3 to enable CUA.", "WARN")
 
     services = [
         ("ChatGPT",        "https://chatgpt.com",           "chatgpt"),
@@ -26186,22 +26243,6 @@ async def run_pair(profile_dir, wait_minutes=10):
 
     print("")
     if all_ok:
-        # ══════════════════════════════════════════════════════════════════════
-        # [4/5] API KEYS — detect-or-prompt for Anthropic + Gemini. Each
-        #       key is independently skippable. On paste we write to
-        #       Firestore (canonical, cross-device, matches FE Account
-        #       page) + os.environ (current session) + bust the resolver
-        #       cache so supervisor arming picks up the new key without
-        #       restart. NOT written to .dg-supervisor.env — that would
-        #       create a 3rd source of truth and drift on rotation.
-        # ══════════════════════════════════════════════════════════════════════
-        _setup_step(4, 5, "API keys")
-        print(f"  {_c(_DIM, 'Anthropic powers the agents (CUA + Vision).  Gemini powers narration.')}")
-        print(f"  {_c(_DIM, 'Already-set keys are detected and reused. Skip to set later via the web app.')}")
-        print()
-        await _pair_prompt_api_keys(linked_uid)
-        print()
-
         # ══════════════════════════════════════════════════════════════════════
         # [5/5] READY — pair is complete. If the user opted into On Startup
         #       back in step 2, arm the supervisor NOW (deferred from step 2
@@ -28071,7 +28112,7 @@ def run_retire():
     ])
 
 
-def run_unpair():
+def run_unpair(deep: bool = False):
     """Fully disconnect this machine from Super Research — opposite of --pair.
 
     Semantics: after --unpair, this PC appears NOWHERE in the Super Research
@@ -28081,10 +28122,15 @@ def run_unpair():
     registers a new device from scratch — there's no quiet "rejoin" path
     that resurrects the old identity.
 
-    Preserved on disk (delete manually for a truly clean machine):
+    Preserved by default (delete manually for a truly clean machine):
       • Chrome profile at ~/.super-research/browser-profile/ (your logins)
       • Pipeline history in queues/
       • firebase-service-account.json (needed to re-pair)
+
+    With `deep=True` (CLI: `--unpair --deep`), ALSO wipes the Chrome profile
+    directory so the next `--pair` starts with a fresh browser. Use this when
+    re-pairing to a different account or when the F4 cookie check refuses
+    pair due to stale Google auth.
 
     This is the destructive counterpart to the app's "unlink" action, which
     only clears linkedUid on the token doc and leaves the device/token
@@ -28304,13 +28350,40 @@ def run_unpair():
     else:
         print(f"  {_c(_OK, '✓')}  No research.py process remains")
 
+    # Deep cleanup: also wipe the Playwright browser profile if --unpair
+    # --deep was passed. Default --unpair preserves the profile so a
+    # re-pair on the same account doesn't force the user back through
+    # ChatGPT/Gemini/Claude/NotebookLM logins. --deep is for the explicit
+    # "I want a fresh browser, e.g. switching accounts" case + the F4
+    # cookie-refusal recovery path.
+    browser_wiped = False
+    if deep:
+        try:
+            import shutil as _shutil
+            if PROFILE_DIR.exists():
+                _shutil.rmtree(str(PROFILE_DIR), ignore_errors=True)
+                browser_wiped = not PROFILE_DIR.exists()
+                if browser_wiped:
+                    log(f"Browser profile wiped: {PROFILE_DIR}", "INFO")
+                else:
+                    log(f"Browser profile wipe partial — some files survived at {PROFILE_DIR}", "WARN")
+        except Exception as _de:
+            log(f"Browser profile wipe failed: {_de}", "WARN")
+
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  The bond dissolves.')}  {_c(_DIM, 'This machine is no longer paired.')}")
     print()
-    print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
-    print(f"       {_c(_DIM, '• Chrome profile at ~/.super-research/browser-profile/  (your logins)')}")
-    print(f"       {_c(_DIM, '• Research history in queues/')}")
-    print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
+    if browser_wiped:
+        print(f"  {_c(_OK, '✓')}  Chrome profile wiped (`--deep`) — fresh browser on next --pair.")
+        print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
+        print(f"       {_c(_DIM, '• Research history in queues/')}")
+        print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
+    else:
+        print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
+        print(f"       {_c(_DIM, '• Chrome profile at ~/.super-research/browser-profile/  (your logins)')}")
+        print(f"       {_c(_DIM, '• Research history in queues/')}")
+        print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
+        print(f"       {_c(_DIM, '  Add --deep to also wipe the Chrome profile next time.')}")
     _render_next_actions([
         ("python research.py --pair", "reconnect this machine (mints a fresh token)"),
     ])
@@ -28336,6 +28409,10 @@ def main():
         help="Disable On Startup: remove the auto-start scheduled task and stop the background backend")
     parser.add_argument("--unpair", action="store_true",
         help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
+    parser.add_argument("--deep", action="store_true",
+        help="With --unpair: also wipe the Playwright browser profile at ~/.super-research/browser-profile/ "
+             "(clears ChatGPT/Gemini/Claude/NotebookLM logins). Useful when re-pairing to a different account "
+             "or when the F4 cookie check refuses pair due to stale Google auth. Default: preserve the profile.")
     parser.add_argument("--daemon-loop", action="store_true",
         help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the On Startup scheduled task.")
     parser.add_argument("--env-file", default=None,
@@ -28363,7 +28440,7 @@ def main():
         return
 
     if args.unpair:
-        run_unpair()
+        run_unpair(deep=bool(args.deep))
         return
 
     if args.daemon_loop:

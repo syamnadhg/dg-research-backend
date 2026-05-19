@@ -228,8 +228,20 @@ Enable On Startup? [Y/n]:
 - **`Y` (default)** — opts into supervised mode; actual arming is **deferred to Stage 5** so an aborted login can't leave Firestore flagged as supervised while platforms are half-logged-in.
 - **`n`** — skip; you'll run `python research.py --serve` manually after `--pair` finishes (and, on Linux/Mac, set up your own backgrounding via `nohup` / `tmux` / `screen` / your own systemd unit — see [§ Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending)).
 
-**`[3/5] Browser logins`**
-Opens 4 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds:
+**`[3/5] API keys` — Anthropic + Gemini detect-or-prompt** *(reordered to position 3 on 2026-05-18 so CUA + Vision are available for Stage 4)*
+`--pair` runs `resolve_api_key()` and `resolve_gemini_api_key()` to check whether each key is already resolvable from any source (Firestore, Windows user-scope, shell env, or `.dg-supervisor.env`). For each missing key, it prompts:
+
+```
+Anthropic  — get one at https://console.anthropic.com/settings/keys
+>  Paste Anthropic key (sk-ant-...) or [S]kip:
+```
+
+On paste it writes Firestore (`users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}` — same path the Account page writes to), sets both env-var names per key in `os.environ` (`ANTHROPIC_API_KEY` + `CUA_API_KEY`, or `GEMINI_API_KEY` + `GOOGLE_API_KEY`), and busts `_RESOLVED_KEY_CACHE` so the very next `resolve_api_key()` call (at the top of Stage 4 browser-login CUA init) sees the new key.
+
+Skip is first-class per key — pair finishes regardless. Missing Anthropic falls back to **Playwright-only** verification in Stage 4 (less rigorous; no Pro-tier check) and surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
+
+**`[4/5] Browser logins`**
+Opens 4 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds. With the Anthropic key set or detected in Stage 3, each platform passes BOTH Playwright DOM checks AND CUA vision before clearing — matches Phase 0 init rigor. Without the key, falls back to Playwright-only (logged in the BE as "Setup Stage 4: No CUA_API_KEY — Playwright-only verification (less rigorous)"):
 - ChatGPT (chatgpt.com)
 - Gemini (gemini.google.com)
 - Claude (claude.ai)
@@ -241,24 +253,14 @@ The checklist re-renders only when a platform flips — `[ok]` for logged in, `[
 
 > **Markers only tick after real auth.** `verify_login()` checks only auth-specific DOM (profile menus, account chips, chat-history lists). Generic chat-input elements are excluded because they show up on logged-out landing pages too.
 
-**`[4/5] API keys` — Anthropic + Gemini detect-or-prompt** *(new 2026-05-18)*
-After logins, `--pair` runs `resolve_api_key()` and `resolve_gemini_api_key()` to check whether each key is already resolvable from any source (Firestore, Windows user-scope, shell env, or `.dg-supervisor.env`). For each missing key, it prompts:
-
-```
-Anthropic  — get one at https://console.anthropic.com/settings/keys
->  Paste Anthropic key (sk-ant-...) or [S]kip:
-```
-
-On paste it writes Firestore (`users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}` — same path the Account page writes to), sets both env-var names per key in `os.environ` (`ANTHROPIC_API_KEY` + `CUA_API_KEY`, or `GEMINI_API_KEY` + `GOOGLE_API_KEY`), and busts `_RESOLVED_KEY_CACHE` so the next resolver call picks up the change immediately.
-
-Skip is first-class per key — pair finishes regardless. Missing Anthropic surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
+> **F4 / DGOPS-7451 cookie check** *(relaxed 2026-05-18)*: when Stage 4 opens the browser, it inspects the Playwright profile for persisted Google auth cookies. The relaxed semantics: refuse pair only when the device was previously paired to a DIFFERENT account (`account_switch_with_prior_cookies`). First-pair on a fresh device OR re-pair to the same account both allow cookies through with a passive log line + `security_pair_allowed_with_prior_cookies` event — the existing Google session is presumed to belong to the user about to claim THIS link. Strict "any cookie → refuse" was creating a catch-22 with `--unpair` preserving the profile. For the account-switch refuse case, the message points to `--unpair --deep` (below) which wipes the profile cleanly.
 
 **`[5/5] Ready` — arm supervisor (if opted in) + final message**
 If you said `Y` to On Startup back in Stage 2, the supervisor is armed now (Windows Scheduled Task, macOS LaunchAgent, or Linux systemd-user unit depending on platform — Mac/Linux gated behind `DG_ALLOW_CROSS_PLATFORM=1` pending smoke tests). If you said `n`, any leftover scheduled task is torn down so the machine genuinely matches "unsupervised". Final banner branches on whether the supervisor is live.
 
 ### Step 4: After pair succeeds
 
-When all 4 platform logins clear and the Stage 4/5 API key prompt resolves, the flow:
+When all 4 platform logins clear, the flow:
 
 1. Closes the browser
 2. Writes `research_config.json` locally (if not already present)
@@ -374,10 +376,11 @@ Idempotent: works whether or not the task/loop was installed. Manual one-off `py
 
 Turning off the **On Startup** toggle in the app → Account page runs the same teardown remotely.
 
-### Step 5c (full disconnect): `--unpair`
+### Step 5c (full disconnect): `--unpair` *(with `--deep` 2026-05-18)*
 
 ```bash
-python research.py --unpair
+python research.py --unpair          # default: preserves the Playwright browser profile (your platform logins survive)
+python research.py --unpair --deep   # also wipes ~/.super-research/browser-profile/ for a fresh-browser re-pair
 ```
 
 The "I'm done with this PC" command — wipes everything `--retire` wipes, AND removes the device from the registry. After `--unpair`, this PC appears NOWHERE in the Super Research app's device list.
@@ -388,6 +391,8 @@ Four-step:
 2. **Removes the device doc** from `users/{uid}/devices/{deviceId}`.
 3. **Wipes `research_config.json` + `device_config.json`** locally.
 4. **Final-state verification** — if anything survived, prints the surviving PIDs so you can taskkill manually.
+
+**With `--deep`**, an additional step removes the Playwright profile directory (`~/.super-research/browser-profile/`) via `shutil.rmtree(..., ignore_errors=True)`. Use this when re-pairing to a different account or when the F4 cookie check refused pair due to stale Google auth. The default preserves the profile so a re-pair on the same account doesn't force you back through ChatGPT/Gemini/Claude/NotebookLM logins.
 
 To bring this PC back: re-run `--pair` to mint a fresh ResearchToken and re-pair with your account.
 
