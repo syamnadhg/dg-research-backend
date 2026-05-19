@@ -291,7 +291,11 @@ The server runs on port 8000 with:
 - A **30s heartbeat** → updates `research_tokens/{token}.lastHeartbeat` AND the paired `users/{uid}/devices/{deviceId}.lastHeartbeat` so the app's Account page and sidebar device switcher both show the right online/offline dot.
 - A **token-doc watcher** for sub-second relink: if you unlink this device from the app and paste the token back, the device tile reappears in well under a second instead of waiting up to 30s for the next heartbeat to self-heal it.
 - A **Firestore queue listener** — picks up jobs from `research_tokens/{token}/queue/`. Single-worker per backend: if you fire a second topic on the same PC while the first is running, the second lands in an explicit `queued` state (with a chat banner + Cancel button in the app) until the first finishes.
-- A **command listener** for stop / pause / resume / config / add_context / agent_decision / **continue_anyway** / **retry_phase** / **skip_phase**.
+- A **command listener** for `stop` / `pause` / `resume` / `config` / `add_context` / `agent_decision` / `continue_anyway` / `retry_phase` / `skip_phase` / `skip_init_verify` / `retry_init_verify` / `skip_agent` / `retry_agent` / `continue_partial_agent` / `poke_agent` / `wait_longer_agent` / `dismiss_alert` / `discard_run` / `ping`. **Dispatcher resume-contract (2026-05-18):** every action that acknowledges a paused alert calls `_controls.request_resume()` so the pipeline doesn't stay paused after the user clicks the action button. A static-analysis test (`tests/test_dispatcher_resume_contract.py`) asserts the rule on every required-resume action and rejects accidental `request_resume` on non-pause actions (`pause`, `stop`, `discard_run`, `ping`, `add_context`, `config`, `dismiss_alert`).
+
+- **CLI dispatcher pause-reason routing** (DGOPS-7710 / F6 + 3 follow-up fixes) — when an alert pauses the BE with a `pause_reason` (`agent_link_failed`, `human_verification_required`, `cua_unavailable`, `claude_chat_mode`, `login_required`, `pro_required`), the CLI `r` / `s` keystrokes route to the correct alert-specific helpers (`set_agent_decision`, `set_continue_anyway`, `request_skip_agent`, `request_skip_init_verify`) **plus** `request_resume`, so manual operator intervention always releases the pause. The same routing pattern is mirrored on the Firestore command bus.
+
+- **Phase 2 Claude clarification auto-reply** — when a vague brief makes Claude respond with chat-text clarifying questions instead of starting Deep Research (signature: tail of last message matches "Once you ... I'll launch the research"), the polling loop auto-types `"Up to Claude to decide for the best output."` + Send so the agent proceeds without operator intervention. 5-condition heuristic (one-shot per agent) gates the trigger; see `_claude_asking_clarification` + `_claude_send_clarification_reply` near `poll_all_agents_round_robin`. Without this, the BE used to wait for an artifact that never appeared and eventually surfaced a generic "Hit a snag" alert at the wall-clock cap.
 - A **local HTTP API** on `http://localhost:8000` for the CLI + any direct calls.
 
 Keep `--serve` running while you use the app. If the server stops, the web app's 60s watchdog detects it, marks running tiles as stopped, and prevents a reload from resurrecting the pipeline.
@@ -519,8 +523,8 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |
 | `GEMINI_API_KEY` | (optional) | Gemini API key. Used only as the narrator's Flash fallback when Haiku is unavailable. (P4 thumbnail generation lives on the FE — `web/src/lib/album-art.ts` — and uses the FE-side env / per-user-pref Gemini key, not this BE one.) |
 | `MAX_WAIT_DEEP` | `90` | Max minutes to wait per Phase 2 agent |
-| `POLL_DEEP_RESEARCH` | `30` | Seconds between polling cycles |
-| `MIN_AGENT_WAIT_MIN` | `20` | Min minutes before CUA completion checks |
+| `POLL_DEEP_RESEARCH` | `120` | Seconds between polling cycles (Phase 2 round-robin) |
+| `MIN_AGENT_WAIT_MIN` | `5` | Minimum minutes from research-start before CUA completion check is allowed to fire |
 | `BUG_REPORT_EMAIL` | (optional) | Where bug-report submissions land if FE bug-report uses the BE relay. FE has its own `BUG_REPORT_EMAIL` env on `/api/bug` — see FE README. |
 | `DG_NARRATOR_USE_HAIKU` | `1` | Enable Anthropic Haiku 4.5 as the narrator primary (Gemini Flash as fallback). Set `0` to use Flash directly. |
 | `DG_NARRATOR_HAIKU_MODEL` | `claude-haiku-4-5` | Haiku model id for the narrator. |
