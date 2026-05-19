@@ -26803,18 +26803,30 @@ def _disarm_supervisor_macos() -> "tuple[str, int]":
 
 
 def _detect_supervised_macos() -> bool:
-    """macOS sibling of `_detect_supervised_windows`. `launchctl print
-    gui/$uid/<label>` returns 0 iff the agent is bootstrapped in the
-    user's Aqua session. Returns False on any error / not bootstrapped."""
+    """macOS sibling of `_detect_supervised_windows`. Probes both `launchctl
+    print gui/$uid/<label>` (definitive but session-scoped) AND `launchctl
+    list <label>` (legacy fallback that works in some session-detached
+    contexts). Returns True if either returns 0; False on any error /
+    not bootstrapped. Belt-and-suspenders parity with the Linux probe at
+    research.py:_detect_supervised_linux."""
     import subprocess as _sp
     import os as _os
+    print_ok = False
+    list_ok = False
     try:
         uid = _os.getuid()
         r = _sp.run(["launchctl", "print", f"gui/{uid}/{_SUPERVISOR_PLIST_LABEL}"],
                     capture_output=True, text=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
+        print_ok = (r.returncode == 0)
+    except Exception as e:
+        log(f"[supervisor-macos] launchctl print probe failed: {e}", "WARN")
+    try:
+        r = _sp.run(["launchctl", "list", _SUPERVISOR_PLIST_LABEL],
+                    capture_output=True, text=True, timeout=5)
+        list_ok = (r.returncode == 0)
+    except Exception as e:
+        log(f"[supervisor-macos] launchctl list probe failed: {e}", "WARN")
+    return print_ok or list_ok
 
 
 # ── Linux systemd-user helpers ──────────────────────────────────────────────
@@ -26993,16 +27005,40 @@ def _disarm_supervisor_linux() -> "tuple[str, int]":
 
 
 def _detect_supervised_linux() -> bool:
-    """Linux sibling of `_detect_supervised_macos`. `systemctl --user
-    is-enabled <unit>` returns 0 iff the unit is enabled. Returns False
-    on any error / not enabled."""
+    """Linux sibling of `_detect_supervised_macos`. Probes BOTH `is-enabled`
+    and `is-active` because `is-enabled` alone returns non-zero in legitimate
+    "supervisor is running fine" states like `static`, `enabled-runtime`, or
+    `linked`, and on Crostini-style transient managers where the unit auto-
+    starts via `WantedBy=default.target` but `is-enabled` reports `linked`.
+    The toggle should reflect "is the supervisor going to keep --serve alive",
+    which is satisfied if EITHER the unit is enabled OR currently active.
+
+    Returns True if either check returns 0; False otherwise (including
+    timeout / DBus unavailable / systemctl missing)."""
     import subprocess as _sp
+    enabled_ok = False
+    active_ok = False
     try:
         r = _sp.run(["systemctl", "--user", "is-enabled", _SUPERVISOR_UNIT_NAME],
                     capture_output=True, text=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
+        # `is-enabled` returns 0 for enabled / static / alias / generated.
+        # `enabled-runtime` / `linked` / `linked-runtime` exit 0 in current
+        # systemd, but legacy versions exited non-zero on those. Fall back
+        # to stdout parse so older systemd doesn't trip us.
+        out = (r.stdout or "").strip().lower()
+        enabled_ok = (r.returncode == 0) or out in {
+            "enabled", "enabled-runtime", "static", "linked",
+            "linked-runtime", "alias", "generated",
+        }
+    except Exception as e:
+        log(f"[supervisor-linux] is-enabled probe failed: {e}", "WARN")
+    try:
+        r = _sp.run(["systemctl", "--user", "is-active", _SUPERVISOR_UNIT_NAME],
+                    capture_output=True, text=True, timeout=5)
+        active_ok = (r.returncode == 0) or (r.stdout or "").strip() == "active"
+    except Exception as e:
+        log(f"[supervisor-linux] is-active probe failed: {e}", "WARN")
+    return enabled_ok or active_ok
 
 
 def _enumerate_research_py_procs() -> list[tuple[int, str, str]]:
