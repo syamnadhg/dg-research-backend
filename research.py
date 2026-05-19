@@ -26285,14 +26285,7 @@ async def run_pair(profile_dir, wait_minutes=10):
                 print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
             else:
                 if info == "unsupported":
-                    import platform as _platform_step4
-                    plat_name = _platform_step4.system()
-                    if plat_name in ("Darwin", "Linux"):
-                        print(f"  {_c(_WARN, '⚠')}  On Startup is gated behind DG_ALLOW_CROSS_PLATFORM=1.")
-                        print(f"  {_c(_DIM, '     PR1 (macOS) + PR2 (Linux) merged; PR3 (drop gate) pending smoke tests.')}")
-                        print(f"  {_c(_DIM, '     See PersistenceRecipe.md §4 Scratch.')}")
-                    else:
-                        print(f"  {_c(_WARN, '⚠')}  Only Windows / macOS / Linux desktop is supported.")
+                    print(f"  {_c(_WARN, '⚠')}  Only Windows / macOS / Linux desktop is supported.")
                 else:
                     print(f"  {_c(_WARN, '⚠')}  Could not enable On Startup: {info}")
                 print(f"  {_c(_DIM, '     Run manually with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
@@ -26379,9 +26372,9 @@ _SUPERVISOR_TASK_NAME = "SuperResearchBackend"
 # ── Cross-platform supervisor scaffolding (Track C, 2026-05-18) ────────────
 # Per-platform bodies live in `*_windows` / `*_macos` / `*_linux` siblings;
 # dispatchers at the original names route via `_supervisor_platform()`.
-# macOS + Linux gated behind `DG_ALLOW_CROSS_PLATFORM=1` until smoke tests
-# pass on real hardware. See PersistenceRecipe.md §4 Scratch for the
-# PR1/PR2 scaffolding + PR0/PR3 (paired-with-Track-B) roadmap.
+# All three platforms are first-class supported as of the 2026-05-18 gate
+# drop. Windows uses a Scheduled Task; macOS uses launchd; Linux uses a
+# systemd-user unit. Detailed wire-in spec in PersistenceRecipe.md.
 
 _SUPERVISOR_PLIST_LABEL = "com.dgresearch.supervisor"
 _SUPERVISOR_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_SUPERVISOR_PLIST_LABEL}.plist"
@@ -26467,17 +26460,16 @@ def _seed_env_file_if_missing() -> bool:
 def _supervisor_platform() -> str:
     """Return 'Windows' | 'Darwin' | 'Linux' | 'Unsupported'.
 
-    Centralizes the `DG_ALLOW_CROSS_PLATFORM=1` gate so every dispatch site
-    is one branch, not one branch + one flag check. PR3 drops the gate by
-    deleting the env-flag block.
+    Centralizes the platform dispatch so every site is one branch. macOS
+    launchd + Linux systemd-user are first-class supported supervisors
+    (2026-05-18 — DG_ALLOW_CROSS_PLATFORM=1 gate retired after Linux smoke
+    verified the daemon-loop + --serve spawn chain on Crostini). The gate
+    served its purpose protecting users from untested code; with smoke
+    in hand, the cross-platform paths are production behavior.
     """
     import platform as _p
     sysname = _p.system()
-    if sysname == "Windows":
-        return "Windows"
-    if sysname in ("Darwin", "Linux"):
-        if os.environ.get("DG_ALLOW_CROSS_PLATFORM") != "1":
-            return "Unsupported"
+    if sysname in ("Windows", "Darwin", "Linux"):
         return sysname
     return "Unsupported"
 
@@ -26653,7 +26645,7 @@ def _kill_pids_posix(pids: list[int]) -> int:
     return confirmed
 
 
-# ── macOS launchd helpers (PR1 — gated behind DG_ALLOW_CROSS_PLATFORM=1) ────
+# ── macOS launchd helpers ───────────────────────────────────────────────────
 
 def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
     """macOS sibling of `_arm_supervisor_quiet_windows`. Writes the launchd
@@ -26825,7 +26817,7 @@ def _detect_supervised_macos() -> bool:
         return False
 
 
-# ── Linux systemd-user helpers (PR2 — gated behind DG_ALLOW_CROSS_PLATFORM=1) ──
+# ── Linux systemd-user helpers ──────────────────────────────────────────────
 
 def _check_linger_status() -> str:
     """Probe `loginctl show-user $USER --property=Linger`. Returns
@@ -27721,16 +27713,10 @@ def run_resurrect():
         return
 
     if plat != "Windows":
-        # Unsupported — Darwin/Linux without DG_ALLOW_CROSS_PLATFORM=1, or
-        # truly unsupported platform (FreeBSD, etc.).
+        # Truly unsupported platform (FreeBSD, headless WSL without GUI, etc.)
+        # macOS / Linux are handled by the Darwin / Linux branches above.
         print()
-        plat_name = _platform.system()
-        if plat_name in ("Darwin", "Linux"):
-            print(f"  {_c(_WARN, '⚠')} Cross-platform supervisor is experimental — gated behind DG_ALLOW_CROSS_PLATFORM=1.")
-            print(f"  {_c(_DIM, '     Set the env var and retry. PR1 (macOS) + PR2 (Linux) merged; PR3 (drop gate) pending smoke tests.')}")
-        else:
-            print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
-        print(f"  {_c(_DIM, '     See PersistenceRecipe.md.')}")
+        print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
         return
 
     # Seed `.dg-supervisor.env` from scripts/dg-supervisor.env.example so the
@@ -27997,13 +27983,10 @@ def run_retire():
         return
 
     if plat != "Windows":
+        # Truly unsupported platform (FreeBSD, headless WSL without GUI, etc.)
+        # macOS / Linux are handled by the Darwin / Linux branches above.
         print()
-        plat_name = _platform.system()
-        if plat_name in ("Darwin", "Linux"):
-            print(f"  {_c(_WARN, '⚠')} Cross-platform supervisor is experimental — gated behind DG_ALLOW_CROSS_PLATFORM=1.")
-            print(f"  {_c(_DIM, '     Set the env var and retry. PR1 (macOS) + PR2 (Linux) merged; PR3 (drop gate) pending smoke tests.')}")
-        else:
-            print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
+        print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
         return
 
     init_firebase()
@@ -28493,7 +28476,7 @@ def run_commands_help():
         print(f"  {_c(_DIM, '• macOS supervisor: ~/Library/LaunchAgents/com.dgresearch.supervisor.plist')}")
     elif _plat == "Linux":
         print(f"  {_c(_DIM, '• Linux supervisor: ~/.config/systemd/user/dgresearch-supervisor.service')}")
-        print(f"  {_c(_DIM, '  (Mac/Linux gated behind DG_ALLOW_CROSS_PLATFORM=1 pending Track C smoke)')}")
+        print(f"  {_c(_DIM, '  (Cross-platform supervisor: Windows Scheduled Task / macOS LaunchAgent / Linux systemd-user)')}")
     else:
         print(f"  {_c(_DIM, '• Windows supervisor: Scheduled Task `SuperResearchBackend`')}")
     print(f"  {_c(_DIM, '• Config file: .dg-supervisor.env  (template at scripts/dg-supervisor.env.example)')}")

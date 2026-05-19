@@ -19,11 +19,11 @@ Pairing-side data scope: this backend pairs to a single web-app account at a tim
 | Platform | Server | `--pair` | `--resurrect` / `--retire` | `--unpair` |
 |----------|--------|----------|----------------------------|------------|
 | Windows 10 / 11 | Full | Full | Full (Scheduled Task) | Full |
-| macOS | Full | Full | Full — launchd user agent (gated behind `DG_ALLOW_CROSS_PLATFORM=1` pending smoke tests) | Full |
-| Linux desktop (X11/Wayland) | Full | Full | Full — systemd-user unit (gated behind `DG_ALLOW_CROSS_PLATFORM=1` pending smoke tests) | Full |
+| macOS | Full | Full | Full — launchd user agent | Full |
+| Linux desktop (X11/Wayland) | Full | Full | Full — systemd-user unit | Full |
 | Linux headless / WSL / Docker | **Unsupported** — Chrome needs a real display + user session for CAPTCHA / 2FA / login refresh |
 
-The supervisor (`--resurrect` / `--retire`) is now cross-platform: Scheduled Task on Windows, launchd user agent on macOS (`~/Library/LaunchAgents/com.dgresearch.supervisor.plist`), systemd-user unit on Linux (`~/.config/systemd/user/dgresearch-supervisor.service`). macOS + Linux are **gated behind `DG_ALLOW_CROSS_PLATFORM=1`** until smoke tests pass on real hardware (Track C PR3). All three platforms share the same `--env-file` config flow (see [`.dg-supervisor.env`](#step-2-environment) below). Linux also requires `sudo loginctl enable-linger $USER` so the user-systemd manager survives logout; `--resurrect` probes and surfaces a WARN if Linger=no.
+The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all three desktop OSes: Scheduled Task on Windows, launchd user agent on macOS (`~/Library/LaunchAgents/com.dgresearch.supervisor.plist`), systemd-user unit on Linux (`~/.config/systemd/user/dgresearch-supervisor.service`). All three share the same `--env-file` config flow (see [`.dg-supervisor.env`](#step-2-environment) below). Linux also requires `sudo loginctl enable-linger $USER` so the user-systemd manager survives logout; `--resurrect` probes and surfaces a WARN if Linger=no.
 
 ## Before you start (prerequisites checklist)
 
@@ -258,7 +258,7 @@ The checklist re-renders only when a platform flips — `[ok]` for logged in, `[
 > **F4 / DGOPS-7451 cookie check** *(relaxed 2026-05-18)*: when Stage 4 opens the browser, it inspects the Playwright profile for persisted Google auth cookies. The relaxed semantics: refuse pair only when the device was previously paired to a DIFFERENT account (`account_switch_with_prior_cookies`). First-pair on a fresh device OR re-pair to the same account both allow cookies through with a passive log line + `security_pair_allowed_with_prior_cookies` event — the existing Google session is presumed to belong to the user about to claim THIS link. Strict "any cookie → refuse" was creating a catch-22 with `--unpair` preserving the profile. For the account-switch refuse case, the message points to `--unpair --deep` (below) which wipes the profile cleanly.
 
 **`[5/5] Ready` — arm supervisor (if opted in) + final message**
-If you said `Y` to On Startup back in Stage 2, the supervisor is armed now (Windows Scheduled Task, macOS LaunchAgent, or Linux systemd-user unit depending on platform — Mac/Linux gated behind `DG_ALLOW_CROSS_PLATFORM=1` pending smoke tests). If you said `n`, any leftover scheduled task is torn down so the machine genuinely matches "unsupervised". Final banner branches on whether the supervisor is live.
+If you said `Y` to On Startup back in Stage 2, the supervisor is armed now — Windows Scheduled Task, macOS LaunchAgent (`~/Library/LaunchAgents/com.dgresearch.supervisor.plist`), or Linux systemd-user unit (`~/.config/systemd/user/dgresearch-supervisor.service`) depending on platform. If you said `n`, any leftover scheduled task / launchd agent / systemd unit is torn down so the machine genuinely matches "unsupervised". Final banner branches on whether the supervisor is live.
 
 ### Step 4: After pair succeeds
 
@@ -320,7 +320,7 @@ Registers an OS-native supervisor that runs a **daemon-loop wrapper** — a tiny
 
 The Account page's **Indestructible** toggle reflects the real installed-task state, so the toggle survives unlink+relink. Turn it off from the same page if you ever want to stop auto-restart.
 
-> **Cross-platform gating** — macOS + Linux supervisors are gated behind `DG_ALLOW_CROSS_PLATFORM=1` until smoke tests pass on real hardware (Track C PR3). Set the env flag and re-run `--resurrect` to install. Without the gate, `--resurrect` on macOS/Linux prints a "Cross-platform supervisor is experimental — gated behind DG_ALLOW_CROSS_PLATFORM=1" message and returns. The Latin header still fires on all platforms so you know the verb reached.
+> **Cross-platform supervisor** — Windows uses a Scheduled Task; macOS installs `~/Library/LaunchAgents/com.dgresearch.supervisor.plist`; Linux installs `~/.config/systemd/user/dgresearch-supervisor.service` (run `loginctl enable-linger $USER` so the daemon-loop survives logout — the installer prints a WARN if linger=no but doesn't sudo-escalate). All three are first-class supported as of 2026-05-18. The Latin header (`resurgam · the backend rises`) fires on all platforms so you know the verb reached.
 
 ### Linux/Mac backgrounding (stop-gap)
 
@@ -342,7 +342,7 @@ python research.py --serve
 
 **Linux — `systemd --user` (DIY alternative; native supervisor via `--resurrect` is preferred):**
 
-The native supervisor (`python research.py --resurrect`, gated behind `DG_ALLOW_CROSS_PLATFORM=1`) installs an equivalent unit at `~/.config/systemd/user/dgresearch-supervisor.service` automatically. Use this DIY ini only if you want to manage the unit yourself or pin a specific path:
+The native supervisor (`python research.py --resurrect`) installs an equivalent unit at `~/.config/systemd/user/dgresearch-supervisor.service` automatically. Use this DIY ini only if you want to manage the unit yourself or pin a specific path:
 
 ```ini
 # ~/.config/systemd/user/superresearch.service
