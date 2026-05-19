@@ -26904,6 +26904,38 @@ def _arm_supervisor_linux() -> "tuple[bool, int | None, str, int]":
     python_exe = sys.executable
     script_path = str(Path(__file__).resolve())
     env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+
+    # Capture display env from the CURRENT shell (the one running
+    # --resurrect / --pair). Bake these into the unit's Environment=
+    # lines so the supervisor has DISPLAY on every container restart —
+    # PassEnvironment alone is a race condition: on Crostini and other
+    # Linux desktops without a full DE, the user-systemd manager auto-
+    # fires enabled units BEFORE Sommelier / the graphical session
+    # populates DISPLAY in the manager env. By the time PassEnvironment
+    # runs there's nothing to pass. Hardcoding from --resurrect's shell
+    # gives reboot-safe behavior. 2026-05-19 — caught during Linux
+    # Chromebook smoke when Playwright failed to launch Chromium under
+    # the systemd-spawned --serve despite working from terminal.
+    _shell_disp    = (os.environ.get("DISPLAY") or "").strip()
+    _shell_wayland = (os.environ.get("WAYLAND_DISPLAY") or "").strip()
+    _shell_xauth   = (os.environ.get("XAUTHORITY") or "").strip()
+    _shell_xdg_rt  = (os.environ.get("XDG_RUNTIME_DIR") or "").strip()
+    env_lines = []
+    if _shell_disp:
+        env_lines.append(f'Environment="DISPLAY={_shell_disp}"')
+    if _shell_wayland:
+        env_lines.append(f'Environment="WAYLAND_DISPLAY={_shell_wayland}"')
+    if _shell_xauth:
+        env_lines.append(f'Environment="XAUTHORITY={_shell_xauth}"')
+    if _shell_xdg_rt:
+        env_lines.append(f'Environment="XDG_RUNTIME_DIR={_shell_xdg_rt}"')
+    if not env_lines:
+        log("[supervisor-linux] no DISPLAY in the calling shell — unit "
+            "will rely on PassEnvironment only. If browser launch fails "
+            "post-reboot, re-run --resurrect from a graphical-session "
+            "terminal so DISPLAY is captured.", "WARN")
+    env_block = "\n".join(env_lines)
+
     # systemd `ExecStart=` is whitespace-tokenized — any path with a space
     # (we live under "DG Research") must be double-quoted or systemd will
     # split `/home/.../DG` from `Research/research.py` and try to exec a
@@ -26923,7 +26955,8 @@ WorkingDirectory={script_dir}
 ExecStart="{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"
 Restart=always
 RestartSec=10
-PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR
+{env_block}
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR
 
 StandardOutput=append:{log_dir}/supervisor.out.log
 StandardError=append:{log_dir}/supervisor.err.log
@@ -26942,6 +26975,25 @@ WantedBy=default.target
                 capture_output=True, text=True, timeout=10)
     except Exception:
         pass
+
+    # Belt-and-suspenders: import current shell's graphical-session env
+    # into the user-systemd manager BEFORE enabling the unit. Fixes the
+    # immediate post-resurrect run on machines where the manager hadn't
+    # picked up DISPLAY yet. The embedded Environment= lines above handle
+    # reboot-survival; this handles "I just installed and want it to
+    # work without restart" UX. Idempotent — safe to no-op if vars are
+    # missing from the shell.
+    _import_vars = []
+    if _shell_disp:    _import_vars.append("DISPLAY")
+    if _shell_wayland: _import_vars.append("WAYLAND_DISPLAY")
+    if _shell_xauth:   _import_vars.append("XAUTHORITY")
+    if _shell_xdg_rt:  _import_vars.append("XDG_RUNTIME_DIR")
+    if _import_vars:
+        try:
+            _sp.run(["systemctl", "--user", "import-environment", *_import_vars],
+                    capture_output=True, text=True, timeout=10)
+        except Exception as _ie:
+            log(f"[supervisor-linux] import-environment failed (non-fatal): {_ie}", "WARN")
 
     # enable --now sets WantedBy=default.target AND starts immediately.
     try:
@@ -28497,6 +28549,11 @@ def run_commands_help():
          "One-shot Anthropic key override (bypasses Firestore / env resolve)"),
     ])
 
+    _section("Diagnostics", [
+        ("python research.py --doctor",
+         "Diagnose + auto-repair common issues (pair state / Chromium / supervisor / DISPLAY / port 8000)"),
+    ])
+
     _section("Internal / Debug", [
         ("python research.py --daemon-loop",
          "Wrapper that keeps --serve alive; spawned by the supervisor"),
@@ -28518,7 +28575,305 @@ def run_commands_help():
     else:
         print(f"  {_c(_DIM, '• Windows supervisor: Scheduled Task `SuperResearchBackend`')}")
     print(f"  {_c(_DIM, '• Config file: .dg-supervisor.env  (template at scripts/dg-supervisor.env.example)')}")
+    print(f"  {_c(_DIM, '• Pipeline broken? Run')}  {_c(_BOLD, 'python research.py --doctor')}  {_c(_DIM, 'to diagnose + auto-fix.')}")
     print(f"  {_c(_DIM, '• Full docs: README.md   ·   ARCHITECTURE.md')}")
+    print()
+
+
+def run_doctor():
+    """Diagnostic + auto-repair for common Super Research issues.
+
+    Runs platform-aware checks and applies safe auto-fixes where possible.
+    Designed to be the first thing a user runs when something feels wrong —
+    surfaces the actual root cause (DISPLAY not propagated through systemd,
+    stale supervisor unit, port-bound by another process, missing Chromium
+    binary, etc.) instead of leaving them to grep logs.
+
+    No destructive operations — never deletes user data, never unpairs,
+    never modifies firebase-service-account.json. Worst case: restarts the
+    supervisor + imports the calling shell's graphical-session env into
+    the user-systemd manager (Linux only)."""
+    import subprocess as _sp
+
+    _branded_header("medicus", _BOLD + _ACCENT, "diagnose + heal")
+    print()
+
+    plat = _supervisor_platform()
+    issues_found = 0
+    fixes_applied = 0
+    manual_actions: list[str] = []
+
+    def _ok(label: str, detail: str = ""):
+        suffix = f"  {_c(_DIM, '· ' + detail)}" if detail else ""
+        print(f"  {_c(_OK, '✓')}  {label}{suffix}")
+
+    def _warn(label: str, detail: str = ""):
+        nonlocal issues_found
+        issues_found += 1
+        suffix = f"  {_c(_DIM, '· ' + detail)}" if detail else ""
+        print(f"  {_c(_WARN, '⚠')}  {label}{suffix}")
+
+    def _fail(label: str, detail: str = ""):
+        nonlocal issues_found
+        issues_found += 1
+        suffix = f"  {_c(_DIM, '· ' + detail)}" if detail else ""
+        print(f"  {_c(_ERR, '✗')}  {label}{suffix}")
+
+    def _fix(label: str):
+        nonlocal fixes_applied
+        fixes_applied += 1
+        print(f"     {_c(_ACCENT, '→')} {label}")
+
+    # ── [1] Platform + pair state ──
+    print(f"  {_c(_BOLD, 'Platform + pair state')}")
+    print(f"  {_c(_DIM, '─' * 58)}")
+    if plat == "Unsupported":
+        _fail(f"Platform unsupported ({sys.platform})", "Only Windows / macOS / Linux desktop.")
+        print()
+        print(f"  {_c(_DIM, 'Cannot continue diagnostics on this platform.')}")
+        return
+    _ok(f"Platform: {plat}")
+
+    paired_uid = load_paired_uid()
+    token = load_research_token()
+    device_id = load_device_id()
+    if paired_uid and token and device_id:
+        _ok("Pair state", f"deviceId={device_id}")
+    else:
+        _fail("Not paired", "research_config.json missing or incomplete")
+        manual_actions.append("Run `python research.py --pair`")
+
+    if init_firebase():
+        _ok("Firebase Admin SDK", f"project=super-research-492814")
+    else:
+        _fail("Firebase Admin SDK init failed", "check firebase-service-account.json + network")
+        manual_actions.append("Email Sammy for a fresh firebase-service-account.json")
+    print()
+
+    # ── [2] Browser dependencies (Playwright + Chromium) ──
+    print(f"  {_c(_BOLD, 'Browser dependencies')}")
+    print(f"  {_c(_DIM, '─' * 58)}")
+    try:
+        import patchright  # noqa: F401
+        _ok("patchright package", "installed in active venv")
+    except ImportError:
+        _fail("patchright not importable", "pip install -r requirements.txt")
+        manual_actions.append("pip install -r requirements.txt")
+    try:
+        # All-semicolons probe so `python -c` parses on every platform
+        # (compound try/except blocks with embedded \n break -c). If
+        # chromium can't launch, the launch() raises and the subprocess
+        # exits non-zero — we read that return code + stderr instead of
+        # relying on a try/except inside -c. 60s timeout because cold
+        # Chromium boot on slow hardware (Crostini, low-power) can take
+        # a while; this probe runs once per `--doctor`, not per request.
+        _probe = (
+            "from patchright.sync_api import sync_playwright; "
+            "pp=sync_playwright().start(); "
+            "b=pp.chromium.launch(headless=True); "
+            "b.close(); pp.stop(); "
+            "print('OK')"
+        )
+        _chromium_check = _sp.run(
+            [sys.executable, "-c", _probe],
+            capture_output=True, text=True, timeout=60,
+        )
+        _stdout = (_chromium_check.stdout or "").strip()
+        _stderr = (_chromium_check.stderr or "").strip()
+        _combined = (_stdout + " " + _stderr).lower()
+        if _chromium_check.returncode == 0 and "OK" in _stdout:
+            _ok("Chromium binary", "patchright launches headless cleanly")
+        elif "executable doesn't exist" in _combined or "browsertype.launch" in _combined or "playwright install" in _combined:
+            _fail("Chromium binary missing", "run patchright install chromium")
+            manual_actions.append("patchright install chromium")
+        elif "modulenotfounderror" in _combined or "no module named" in _combined:
+            _fail("patchright module not importable in subprocess", "venv mismatch?")
+            manual_actions.append("source .venv/bin/activate && pip install -r requirements.txt")
+        else:
+            _warn("Chromium launch test inconclusive",
+                  (_stderr[:80] or _stdout[:80] or f"exit={_chromium_check.returncode}"))
+    except _sp.TimeoutExpired:
+        _warn("Chromium launch probe timed out (>60s)", "machine under heavy load?")
+    except Exception as e:
+        _warn("Chromium launch probe errored", str(e)[:80])
+    print()
+
+    # ── [3] Supervisor unit / task ──
+    print(f"  {_c(_BOLD, 'Supervisor')}")
+    print(f"  {_c(_DIM, '─' * 58)}")
+    if plat == "Linux":
+        if _SUPERVISOR_UNIT_PATH.exists():
+            _ok("Unit file present", str(_SUPERVISOR_UNIT_PATH))
+            _unit_content = _SUPERVISOR_UNIT_PATH.read_text(encoding="utf-8", errors="replace")
+            if "Environment=" in _unit_content and "DISPLAY=" in _unit_content:
+                _ok("Unit has DISPLAY embedded", "reboot-safe")
+            else:
+                _warn("Unit missing Environment=DISPLAY=...",
+                      "browser may fail post-reboot — re-run --resurrect")
+                manual_actions.append("python research.py --resurrect  (from a graphical-session terminal)")
+        else:
+            _warn("Unit file not installed", "supervisor disabled")
+            manual_actions.append("python research.py --resurrect")
+        try:
+            r = _sp.run(["systemctl", "--user", "is-active", _SUPERVISOR_UNIT_NAME],
+                        capture_output=True, text=True, timeout=5)
+            state = (r.stdout or "").strip()
+            if state == "active":
+                _ok(f"systemctl is-active", state)
+            else:
+                _warn(f"systemctl is-active", state or "unknown")
+                try:
+                    _sp.run(["systemctl", "--user", "restart", _SUPERVISOR_UNIT_NAME],
+                            capture_output=True, text=True, timeout=15)
+                    _fix("Restarted dgresearch-supervisor")
+                except Exception as _re:
+                    manual_actions.append(f"systemctl --user restart dgresearch-supervisor  (was: {_re})")
+        except Exception as e:
+            _warn("systemctl probe failed", str(e)[:80])
+        linger = _check_linger_status()
+        if linger == "yes":
+            _ok("loginctl Linger", "yes — survives logout")
+        elif linger == "no":
+            _warn("loginctl Linger=no", "daemon-loop dies at logout")
+            manual_actions.append("sudo loginctl enable-linger $USER")
+        else:
+            _warn("loginctl Linger unknown")
+    elif plat == "Darwin":
+        if _SUPERVISOR_PLIST_PATH.exists():
+            _ok("LaunchAgent plist present", str(_SUPERVISOR_PLIST_PATH))
+            if _detect_supervised_macos():
+                _ok("launchctl bootstrapped", _SUPERVISOR_PLIST_LABEL)
+            else:
+                _warn("launchctl not bootstrapped", "plist exists but agent not loaded")
+                # Auto-fix attempt: re-bootstrap into the gui session.
+                try:
+                    uid = os.getuid()
+                    _sp.run(["launchctl", "bootstrap", f"gui/{uid}", str(_SUPERVISOR_PLIST_PATH)],
+                            capture_output=True, text=True, timeout=10)
+                    _fix("Re-bootstrapped LaunchAgent into gui session")
+                except Exception as _le:
+                    manual_actions.append(f"launchctl bootstrap gui/$(id -u) {_SUPERVISOR_PLIST_PATH}  (was: {_le})")
+        else:
+            _warn("LaunchAgent plist not installed")
+            manual_actions.append("python research.py --resurrect")
+    else:  # Windows
+        if _detect_supervised_windows():
+            _ok("Scheduled Task installed", _SUPERVISOR_TASK_NAME)
+            # Confirm the task is currently scheduled to run (not just registered).
+            try:
+                r = _sp.run(["schtasks", "/Query", "/TN", _SUPERVISOR_TASK_NAME, "/FO", "LIST"],
+                            capture_output=True, text=True, timeout=5,
+                            creationflags=_PS_NO_WINDOW)
+                _qout = (r.stdout or "").lower()
+                if "ready" in _qout or "running" in _qout:
+                    _ok("Scheduled Task state", "ready/running")
+                elif "disabled" in _qout:
+                    _warn("Scheduled Task state", "disabled")
+                    try:
+                        _sp.run(["schtasks", "/Change", "/TN", _SUPERVISOR_TASK_NAME, "/ENABLE"],
+                                capture_output=True, text=True, timeout=5,
+                                creationflags=_PS_NO_WINDOW)
+                        _fix("Re-enabled SuperResearchBackend Scheduled Task")
+                    except Exception as _se:
+                        manual_actions.append(f"schtasks /Change /TN {_SUPERVISOR_TASK_NAME} /ENABLE  (was: {_se})")
+            except Exception:
+                pass
+        else:
+            _warn("Scheduled Task not installed")
+            manual_actions.append("python research.py --resurrect")
+    print()
+
+    # ── [4] Process tree + port ──
+    print(f"  {_c(_BOLD, 'Process tree')}")
+    print(f"  {_c(_DIM, '─' * 58)}")
+    procs = _enumerate_research_py_procs()
+    daemon_pids = [pid for pid, _c2, role in procs if role == "daemon-loop"]
+    serve_pids  = [pid for pid, _c2, role in procs if role == "serve"]
+    if daemon_pids:
+        _ok(f"daemon-loop running", f"PID {daemon_pids[0]}")
+    else:
+        _warn("daemon-loop not running",
+              "supervisor inactive — see Supervisor section above")
+    if serve_pids:
+        _ok(f"--serve running", f"PID {serve_pids[0]}")
+    else:
+        _fail("--serve not running", "no API server → FE will show offline")
+    # Port 8000 ownership
+    if plat in ("Linux", "Darwin"):
+        try:
+            r = _sp.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=5)
+            if ":8000" in (r.stdout or ""):
+                if serve_pids and f"pid={serve_pids[0]}" in r.stdout:
+                    _ok("Port 8000", f"bound by our --serve (PID {serve_pids[0]})")
+                else:
+                    _warn("Port 8000", "bound by a non-Super-Research process")
+                    manual_actions.append("Identify with `ss -ltnp | grep :8000` and kill the stale binding")
+            else:
+                _warn("Port 8000 not bound", "API unreachable")
+        except Exception:
+            pass
+    print()
+
+    # ── [5] Linux-specific: DISPLAY propagation ──
+    if plat == "Linux":
+        print(f"  {_c(_BOLD, 'Graphical-session env (Linux)')}")
+        print(f"  {_c(_DIM, '─' * 58)}")
+        shell_disp = os.environ.get("DISPLAY", "")
+        if shell_disp:
+            _ok("Shell DISPLAY", shell_disp)
+        else:
+            _warn("Shell DISPLAY empty", "you're in a non-graphical session (SSH? cron?)")
+        # Manager env
+        try:
+            r = _sp.run(["systemctl", "--user", "show-environment"],
+                        capture_output=True, text=True, timeout=5)
+            mgr_env = r.stdout or ""
+            if "DISPLAY=" in mgr_env:
+                _ok("user-systemd manager DISPLAY", "present")
+            else:
+                _warn("user-systemd manager DISPLAY missing",
+                      "supervisor children won't see it")
+                if shell_disp:
+                    try:
+                        _sp.run(["systemctl", "--user", "import-environment",
+                                 "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"],
+                                capture_output=True, text=True, timeout=10)
+                        _fix("Imported DISPLAY/WAYLAND_DISPLAY/XAUTHORITY into user-systemd manager")
+                        # Restart so children pick it up
+                        try:
+                            _sp.run(["systemctl", "--user", "restart", _SUPERVISOR_UNIT_NAME],
+                                    capture_output=True, text=True, timeout=15)
+                            _fix("Restarted dgresearch-supervisor to inherit new env")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        manual_actions.append(f"systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY  (was: {e})")
+        except Exception as e:
+            _warn("systemctl show-environment failed", str(e)[:80])
+        # --serve actual env
+        if serve_pids:
+            try:
+                env_blob = Path(f"/proc/{serve_pids[0]}/environ").read_bytes().decode("utf-8", errors="replace")
+                if "DISPLAY=" in env_blob:
+                    _ok("--serve DISPLAY env", "present")
+                else:
+                    _warn("--serve DISPLAY missing",
+                          "running browser will fail — restart supervisor after the import-environment above")
+            except Exception:
+                pass
+        print()
+
+    # ── Summary ──
+    print(f"  {_c(_DIM, '─' * 58)}")
+    if issues_found == 0:
+        print(f"  {_c(_OK + _BOLD, '✓  Healthy.')}  {_c(_DIM, 'All checks passed.')}")
+    else:
+        print(f"  {_c(_BOLD, f'Found {issues_found} issue(s); applied {fixes_applied} auto-fix(es).')}")
+        if manual_actions:
+            print()
+            print(f"  {_c(_BOLD, 'Manual steps still required:')}")
+            for i, a in enumerate(manual_actions, 1):
+                print(f"    {_c(_ACCENT, f'{i}.')} {a}")
     print()
 
 
@@ -28553,6 +28908,10 @@ def main():
     parser.add_argument("--commands", action="store_true",
         help="Print a branded reference card of every Super Research CLI command, grouped by use-case. "
              "Lighter-weight than --help; designed for at-a-glance recall.")
+    parser.add_argument("--doctor", action="store_true",
+        help="Diagnose + auto-repair common Super Research issues (pair state / Firebase / "
+             "Chromium binary / supervisor unit / port 8000 / Linux DISPLAY propagation). "
+             "First thing to run when something feels wrong. Non-destructive — never unpairs or deletes user data.")
     args = parser.parse_args()
 
     # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand
@@ -28569,6 +28928,10 @@ def main():
 
     if args.commands:
         run_commands_help()
+        return
+
+    if args.doctor:
+        run_doctor()
         return
 
     if args.resurrect:
