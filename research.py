@@ -13745,6 +13745,121 @@ async def _spotlight_latest_response(page, agent_name: str):
         pass
 
 
+# ── Claude clarification-question detector (2026-05-18) ──────────────────────
+# When the user submits a vague / template brief, Claude responds with a chat
+# message asking clarifying questions INSTEAD of starting Deep Research.
+# Without the auto-reply below, the BE waits for an artifact that never
+# appears and surfaces a generic "Hit a snag" alert at the wall-clock cap,
+# requiring the operator to manually type a defer message into the Claude tab.
+#
+# Sign-off pattern: Claude's clarification responses consistently end with a
+# variant of "Once you {clarify|confirm|...}, I'll {launch|start|...} the
+# research" — that exact structure is the gating signal here (5th condition
+# alongside elapsed window, not-generating, no-artifact, short-text-with-?s).
+# Mid-research statements like "I'll start with the analysis of X" don't
+# match because they lack the "once you" / "let me know" / "with those"
+# clarification-pending opener.
+_CLAUDE_CLARIFICATION_SIGNOFF_RE = re.compile(
+    r"(?:once\s+(?:you\s+)?(?:clarify|confirm|share|provide|specify|tell\s+me|answer)|"
+    r"let\s+me\s+know|"
+    r"with\s+(?:those|that|these)\s+(?:answers|details|specifics|clarifications))"
+    r"[^.!?]{0,180}"
+    r"(?:I[''’]?ll|I\s+will)\s+(?:launch|start|begin|dive|jump|kick\s+off|get\s+started)"
+    r"[^.!?]{0,80}"
+    r"research",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+async def _claude_asking_clarification(page):
+    """Lightweight DOM read of the last assistant message + sign-off regex
+    match. Does NOT touch clipboard or open artifact panels (cheaper than
+    extract_claude_response — safe to call every round-robin tick).
+
+    Returns (matched: bool, last_text: str, q_count: int)."""
+    try:
+        last_text = await page.evaluate("""() => {
+            const candidates = [
+                '.font-claude-message',
+                '[data-message-author-role="assistant"]',
+                '.contents .prose',
+            ];
+            for (const sel of candidates) {
+                const all = document.querySelectorAll(sel);
+                if (all.length > 0) {
+                    const last = all[all.length - 1];
+                    const t = (last.innerText || last.textContent || "").trim();
+                    if (t.length > 30) return t;
+                }
+            }
+            return "";
+        }""")
+    except Exception:
+        return False, "", 0
+    if not last_text:
+        return False, "", 0
+    q_count = last_text.count("?")
+    # Sign-off lives in the tail — match on last 600 chars so a mid-message
+    # "I'll start with..." aside doesn't false-positive.
+    tail = last_text[-600:] if len(last_text) > 600 else last_text
+    matched = bool(_CLAUDE_CLARIFICATION_SIGNOFF_RE.search(tail))
+    return matched, last_text, q_count
+
+
+async def _claude_send_clarification_reply(page, label):
+    """Type the defer-to-Claude reply into the chat input, then submit.
+
+    Submit strategy: try the Send button first (matches paste_followup at
+    research.py:5170), fall back to Enter if no enabled button is found.
+    Send-button-first protects against future Claude composer A/B tests
+    that might bind Enter to newline (Shift+Enter→Enter swap pattern).
+
+    Returns True on send, False if no composer was reachable."""
+    reply = "Up to Claude to decide for the best output."
+    typed_into = None
+    for sel in ('div[contenteditable="true"]', '.ProseMirror', 'textarea', '[role="textbox"]'):
+        try:
+            inp = await page.query_selector(sel)
+            if not inp:
+                continue
+            await inp.click()
+            await asyncio.sleep(0.3)
+            await page.keyboard.type(reply, delay=10)
+            await asyncio.sleep(0.4)
+            typed_into = sel
+            break
+        except Exception as _te:
+            log(f"[{label}] Clarification type attempt on {sel} failed: {_te}", "DEBUG")
+            continue
+    if typed_into is None:
+        log(f"[{label}] No composer found for clarification reply", "WARN")
+        return False
+    # Send-button-first (mirror paste_followup pattern at research.py:5170).
+    for sel in (
+        'button[data-testid="send-button"]',
+        'button[aria-label="Send prompt"]',
+        'button[aria-label="Send"]',
+        'button[aria-label="Send message"]',
+        'button[aria-label="Submit"]',
+    ):
+        try:
+            btn = await page.query_selector(sel)
+            if btn and await btn.is_enabled():
+                await btn.click()
+                log(f"[{label}] Sent clarification-defer reply via {sel}: {reply!r}", "INFO")
+                return True
+        except Exception:
+            continue
+    # Enter fallback.
+    try:
+        await page.keyboard.press("Enter")
+        log(f"[{label}] Sent clarification-defer reply via Enter: {reply!r}", "INFO")
+        return True
+    except Exception as _ee:
+        log(f"[{label}] Clarification reply Enter-fallback failed: {_ee}", "WARN")
+        return False
+
+
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -13803,6 +13918,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "claude_artifact_dom_misses": 0,
             "claude_artifact_cua_attempts": 0,
             "observer_text_len": 0,              # MutationObserver sets this (see B2)
+            "claude_clarification_replied": False,  # one-shot flag for clarification-defer reply
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -13951,7 +14067,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "chatgpt_panel_cua_attempts": 0,
                                              "claude_artifact_dom_misses": 0,
                                              "claude_artifact_cua_attempts": 0,
-                                             "observer_text_len": 0}
+                                             "observer_text_len": 0,
+                                             "claude_clarification_replied": False}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
                         else:
@@ -14047,6 +14164,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "observer_text_len": 0,
                     "empty_retries": 0,
                     "hard_retry_count": 0,
+                    "claude_clarification_replied": False,
                 }
             p = pending[_agent_name]
             _hard_count = int(p.get("hard_retry_count", 0)) + 1
@@ -14151,6 +14269,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "observer_text_len": 0,
                 "empty_retries": 0,
                 "hard_retry_count": _hard_count,
+                "claude_clarification_replied": False,
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
@@ -14218,6 +14337,121 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     await _spotlight_latest_response(p["page"], name)
                 except Exception:
                     pass
+
+            # ── Claude clarification auto-reply (2026-05-18) ──
+            # When the brief is vague/template, Claude responds with chat
+            # text asking clarifying questions INSTEAD of starting Deep
+            # Research. Without this block the BE would wait for an
+            # artifact that never appears and eventually surface a generic
+            # "Hit a snag" alert at the wall-clock cap.
+            #
+            # 5 conjoint conditions (all must hold) — tight enough that a
+            # real research-in-progress response can't false-fire:
+            #   (1) name == "Claude" and not already replied for this agent
+            #   (2) 180s ≤ elapsed ≤ 900s (clarifications come fast; if
+            #       research already started by 15min we shouldn't intervene)
+            #   (3) verify_claude_generating == False (Claude finished its
+            #       chat reply and is idle, not mid-stream)
+            #   (4) No artifact / side-panel visible in DOM (research
+            #       artifact has NOT appeared yet)
+            #   (5) Last assistant message contains ≥2 '?' chars AND its
+            #       tail matches _CLAUDE_CLARIFICATION_SIGNOFF_RE (the
+            #       "Once you ... I'll launch the research" signature)
+            # On match: type "Up to Claude to decide for the best output."
+            # + Enter, reset start_time + last_heartbeat so the wall-clock
+            # doesn't fire mid-recompose, set one-shot flag, skip rest of
+            # tick.
+            if (
+                name == "Claude"
+                and not p.get("claude_clarification_replied")
+                and 180 <= elapsed <= 900
+            ):
+                try:
+                    if not await verify_claude_generating(p["page"]):
+                        # Cheap artifact-panel probe — if a right-side
+                        # artifact panel is already open, this isn't a
+                        # clarification scenario.
+                        #
+                        # Bare-aside REMOVED 2026-05-18: Claude.ai's LEFT
+                        # navigation ("New chat / Recents / Projects") is
+                        # rendered as <aside> and exceeds any reasonable
+                        # bbox lower bound, so a bare-aside check would
+                        # always match and the no-panel gate would never
+                        # be true. Tightened gate ports _PANEL_GATE_JS at
+                        # research.py:10639 — must be right-half-of-
+                        # viewport, ≥400px wide, and innerText must not
+                        # read like nav chrome (≥2 nav markers).
+                        try:
+                            _has_panel = await p["page"].evaluate(r"""() => {
+                                const NAV_MARKERS = /\b(new chat|recents?|projects|search|topic generator|starred|home|chats?\b)\b/i;
+                                const _vw = window.innerWidth || document.documentElement.clientWidth;
+                                const sels = [
+                                    '[class*="artifact-panel" i]',
+                                    '[data-testid*="artifact-panel"]',
+                                    '[role="complementary"][class*="artifact" i]',
+                                    '[class*="right-panel"][class*="artifact" i]',
+                                    '[class*="side-panel"][class*="artifact" i]',
+                                    'div[class*="artifact"][class*="open" i]'
+                                ];
+                                const seen = new Set();
+                                const candidates = [];
+                                for (const s of sels) {
+                                    for (const el of document.querySelectorAll(s)) {
+                                        if (seen.has(el)) continue;
+                                        seen.add(el);
+                                        candidates.push(el);
+                                    }
+                                }
+                                for (const el of candidates) {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width < 400) continue;
+                                    if (r.right < _vw * 0.5) continue;
+                                    const head = (el.innerText || '').slice(0, 500);
+                                    if (NAV_MARKERS.test(head)) {
+                                        let n = 0;
+                                        const re = new RegExp(NAV_MARKERS.source, 'gi');
+                                        while (re.exec(head) !== null) n++;
+                                        if (n >= 2) continue;
+                                    }
+                                    return true;
+                                }
+                                return false;
+                            }""")
+                        except Exception:
+                            _has_panel = False
+                        if not _has_panel:
+                            matched, last_text, q_count = await _claude_asking_clarification(p["page"])
+                            if matched and q_count >= 2 and 0 < len(last_text) < 3000:
+                                log(f"[{name}] Clarification scenario detected — "
+                                    f"sign-off matched, {q_count} '?'s, {len(last_text)} chars. "
+                                    f"Auto-sending defer reply.", "INFO")
+                                emit_event(
+                                    "agent_progress", phase=2, agent="claude",
+                                    status="generating",
+                                    progress="Claude was asking for clarification — auto-replied to continue research.",
+                                )
+                                sent = await _claude_send_clarification_reply(p["page"], name)
+                                p["claude_clarification_replied"] = True
+                                if sent:
+                                    # Reset all wall-clock / growth baselines
+                                    # so neither the wall-clock nor the no-
+                                    # growth watchdog (research.py:~14987,
+                                    # requires elapsed>1200 AND no_growth>1200)
+                                    # fires a false-positive snag while Claude
+                                    # composes the new response. Without
+                                    # last_growth_time reset, no_growth_secs
+                                    # would carry the clarification-window's
+                                    # ~200-900s into the new run and trigger
+                                    # the watchdog ~1000s sooner than designed.
+                                    _now = time.time()
+                                    p["start_time"] = _now
+                                    p["last_heartbeat"] = _now
+                                    p["last_growth_time"] = _now
+                                    p["stuck_warned_at"] = 0
+                                    p["last_artifact_scrape"] = 0  # let next tick re-probe
+                                    continue
+                except Exception as _cer:
+                    log(f"[{name}] Clarification-check failed (non-fatal): {_cer}", "DEBUG")
 
             # 2026-05-04: per-agent wall-clock timeout REMOVED entirely.
             # Phase-level soft warn from _await_phase_with_active_deadline
