@@ -75,6 +75,8 @@ python research.py --unpair
 
 That's it. Four commands to a hands-off always-on backend — plus `--retire` to disable On Startup or `--unpair` to fully disconnect this PC.
 
+> Run `python research.py --commands` anytime for a branded, use-case-grouped reference card of every CLI verb (Daily / Lifecycle / Advanced / Internal-Debug). Lighter-weight than `--help`.
+
 > **Just want to smoke-test from the terminal first?** Skip pairing entirely and run `python research.py "your topic"` — see [§ CLI Mode](#cli-mode). No QR, no Firebase round-trip, output lands in `queues/`.
 
 > **Order of ops — what you can do in parallel:**
