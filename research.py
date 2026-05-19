@@ -28389,6 +28389,82 @@ def run_unpair(deep: bool = False):
     ])
 
 
+def run_commands_help():
+    """Branded CLI command reference. Listed by use-case (daily / lifecycle /
+    advanced / debugging) rather than alphabetically, since users learn the
+    workflow not the argparse layout. Use --help for the full argparse dump."""
+    _branded_header("manuale", _BOLD + _ACCENT, "command reference")
+    print()
+
+    def _section(title, rows):
+        print(f"  {_c(_BOLD, title)}")
+        print(f"  {_c(_DIM, '─' * 64)}")
+        # Align command column; longest command wins the padding budget.
+        pad = max(len(cmd) for cmd, _desc in rows)
+        for cmd, desc in rows:
+            print(f"  {_c(_BOLD, cmd.ljust(pad))}   {_c(_DIM, desc)}")
+        print()
+
+    _section("Daily", [
+        ("python research.py --pair",
+         "Pair this PC to your Super Research account (5-stage guided setup)"),
+        ("python research.py --serve",
+         "Run the backend in the foreground (Ctrl+C to stop)"),
+        ("python research.py \"<topic>\"",
+         "One-shot CLI research run (no web app)"),
+    ])
+
+    _section("Lifecycle (supervised auto-restart)", [
+        ("python research.py --resurrect",
+         "Install OS-native supervisor — auto-start at login + restart on crash"),
+        ("python research.py --retire",
+         "Disable On Startup — removes the supervisor; foreground --serve unchanged"),
+        ("python research.py --unpair",
+         "Fully disconnect this PC (deletes token + device doc + local config)"),
+        ("python research.py --unpair --deep",
+         "Same as --unpair, but ALSO wipes ~/.super-research/browser-profile/"),
+    ])
+
+    _section("Advanced", [
+        ("python research.py --brief-file <path>",
+         "Skip Phase 1 — start from an existing brief.md"),
+        ("python research.py --pdf <file> [--pdf <file>...]",
+         "Attach PDF(s) to Phase 1 (repeatable)"),
+        ("python research.py --resume <queue-name|path>",
+         "Resume a previous run from its queue/ directory"),
+        ("python research.py --port <N>",
+         "Override the default port 8000 for --serve"),
+        ("python research.py --env-file <path>",
+         "Load env vars from a custom file (default: .dg-supervisor.env)"),
+        ("python research.py --api-key <key>",
+         "One-shot Anthropic key override (bypasses Firestore / env resolve)"),
+    ])
+
+    _section("Internal / Debug", [
+        ("python research.py --daemon-loop",
+         "Wrapper that keeps --serve alive; spawned by the supervisor"),
+        ("python research.py --verbose",
+         "Tee extra logs to stdout (combine with any other command)"),
+        ("python research.py --help",
+         "Full argparse dump — all flags + types"),
+        ("python research.py --commands",
+         "This screen"),
+    ])
+
+    # Platform-specific hint surfaced at the bottom so users don't miss it.
+    _plat = _supervisor_platform()
+    if _plat == "Darwin":
+        print(f"  {_c(_DIM, '• macOS supervisor: ~/Library/LaunchAgents/com.dgresearch.supervisor.plist')}")
+    elif _plat == "Linux":
+        print(f"  {_c(_DIM, '• Linux supervisor: ~/.config/systemd/user/dgresearch-supervisor.service')}")
+        print(f"  {_c(_DIM, '  (Mac/Linux gated behind DG_ALLOW_CROSS_PLATFORM=1 pending Track C smoke)')}")
+    else:
+        print(f"  {_c(_DIM, '• Windows supervisor: Scheduled Task `SuperResearchBackend`')}")
+    print(f"  {_c(_DIM, '• Config file: .dg-supervisor.env  (template at scripts/dg-supervisor.env.example)')}")
+    print(f"  {_c(_DIM, '• Full docs: README.md   ·   ARCHITECTURE.md')}")
+    print()
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -28417,6 +28493,9 @@ def main():
         help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the On Startup scheduled task.")
     parser.add_argument("--env-file", default=None,
         help=f"Path to KEY=value env file. Default: <script_dir>/.dg-supervisor.env (silently skipped if missing).")
+    parser.add_argument("--commands", action="store_true",
+        help="Print a branded reference card of every Super Research CLI command, grouped by use-case. "
+             "Lighter-weight than --help; designed for at-a-glance recall.")
     args = parser.parse_args()
 
     # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand
@@ -28430,6 +28509,10 @@ def main():
         # where the user hasn't created it yet (the path-exists check here
         # sidesteps `_load_env_file`'s missing-file WARN).
         _load_env_file(_SUPERVISOR_ENV_FILE_DEFAULT_PATH)
+
+    if args.commands:
+        run_commands_help()
+        return
 
     if args.resurrect:
         run_resurrect()
