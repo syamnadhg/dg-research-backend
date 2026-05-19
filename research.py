@@ -26374,7 +26374,9 @@ _SUPERVISOR_TASK_NAME = "SuperResearchBackend"
 # dispatchers at the original names route via `_supervisor_platform()`.
 # All three platforms are first-class supported as of the 2026-05-18 gate
 # drop. Windows uses a Scheduled Task; macOS uses launchd; Linux uses a
-# systemd-user unit. Detailed wire-in spec in PersistenceRecipe.md.
+# systemd-user unit. Implementations live in `_arm_supervisor_macos`,
+# `_arm_supervisor_linux`, `_arm_supervisor_quiet_windows` + their
+# disarm + detect siblings; see README.md § Step 5a / 5b / 5c.
 
 _SUPERVISOR_PLIST_LABEL = "com.dgresearch.supervisor"
 _SUPERVISOR_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_SUPERVISOR_PLIST_LABEL}.plist"
@@ -26382,7 +26384,7 @@ _SUPERVISOR_UNIT_NAME = "dgresearch-supervisor.service"
 _SUPERVISOR_UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / _SUPERVISOR_UNIT_NAME
 
 # Per-machine env file consumed by the supervisor at startup. See PR-Env in
-# PersistenceRecipe.md §3.6. Values applied via `os.environ.setdefault()` —
+# scripts/dg-supervisor.env.example. Values applied via `os.environ.setdefault()` —
 # existing process env (Windows user-scope from "Account → API Config") wins
 # for `resolve_api_key` callers (research.py:204-218). Missing file is fail-
 # soft (Vision defaults to off per research.py:66, CUA fallthrough is safe).

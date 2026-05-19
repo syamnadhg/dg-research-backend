@@ -2,8 +2,8 @@
 REM Manual debug helper. NOT wired into the Scheduled Task.
 REM
 REM The supervisor (installed via `python research.py --resurrect`)
-REM invokes pythonw directly with --env-file; see PersistenceRecipe.md
-REM §3.1 "Windows Scheduled Task action".
+REM invokes pythonw directly with --env-file; see `_arm_supervisor_quiet_windows`
+REM in research.py for the Scheduled Task action that gets installed.
 REM
 REM Env vars (Vision tier, CUA config, Anthropic key) live in
 REM <script_dir>\.dg-supervisor.env. To change them, edit that file —
