@@ -27220,7 +27220,20 @@ def run_daemon_loop(port: int = 8000):
     # window. CREATE_NO_WINDOW suppresses that allocation, and redirecting
     # stdio to the log files keeps uvicorn's output tailable without a
     # window ever appearing.
-    _NO_WINDOW = getattr(_subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    #
+    # 2026-05-18 (Track C smoke caught this) — `creationflags` is Windows-
+    # only at the subprocess level. Passing any non-zero value to Popen on
+    # POSIX raises `ValueError: creationflags is only supported on Windows
+    # platforms`. The pre-fix `getattr(...CREATE_NO_WINDOW, 0x08000000)`
+    # fallback fired on Linux + macOS (CREATE_NO_WINDOW doesn't exist there
+    # → 0x08000000 default), making every `--serve` respawn explode in the
+    # daemon-loop. Match the module-level `_PS_NO_WINDOW` pattern at
+    # research.py:128 — 0 on non-Windows is the only safe value.
+    _NO_WINDOW = (
+        getattr(_subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        if sys.platform == "win32"
+        else 0
+    )
 
     # Pre-flight orphan sweep — runs once at wrapper startup. Catches:
     #   (a) other daemon-loop PIDs (only one wrapper at a time; PT5M task
@@ -27538,8 +27551,20 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
     if plain_serve_pids:
         killed_serve_count = _kill_pids(plain_serve_pids)
 
-    _DETACHED = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
-    _NEWGROUP = getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    # Belt-and-suspenders: gate creationflags on win32 to mirror
+    # `run_daemon_loop`'s pattern (research.py:27223-27240) — function is
+    # already Windows-only by name + caller chain, but a future refactor
+    # that bypasses the dispatcher could otherwise re-introduce the same
+    # POSIX ValueError class. 2026-05-18: caught after Linux Track C smoke
+    # hit the same anti-pattern in `run_daemon_loop`.
+    _DETACHED = (
+        getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
+        if sys.platform == "win32" else 0
+    )
+    _NEWGROUP = (
+        getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        if sys.platform == "win32" else 0
+    )
     try:
         _subprocess.Popen(
             [python_exe, script_path, "--daemon-loop"],
@@ -27844,8 +27869,19 @@ def run_resurrect():
             killed = _kill_pids(plain_serve_pids)
             plural = "es" if killed != 1 else ""
             print(f"  {_c(_DIM, f'     Stopped {killed} running --serve process{plural} to free port 8000.')}")
-        _DETACHED = getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
-        _NEWGROUP = getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        # Belt-and-suspenders: gate on win32 (mirrors `run_daemon_loop`'s
+        # _NO_WINDOW pattern at research.py:27223-27240). This branch is
+        # already only reachable on Windows after the Darwin/Linux early-
+        # returns above, but the constants now self-defend against future
+        # refactors that bypass the dispatcher. 2026-05-18.
+        _DETACHED = (
+            getattr(_subprocess, "DETACHED_PROCESS", 0x00000008)
+            if sys.platform == "win32" else 0
+        )
+        _NEWGROUP = (
+            getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            if sys.platform == "win32" else 0
+        )
         try:
             _subprocess.Popen(
                 [python_exe, script_path, "--daemon-loop"],
