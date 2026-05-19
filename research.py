@@ -3576,9 +3576,20 @@ def _start_command_listener(uid, research_id, loop):
                     except Exception:
                         pass
                     log(f"Command received: CONFIG update (written to disk + ack emitted)")
+            # ── Human-intervention contract (DGOPS-2026-05-18) ──────────
+            # Any action that acknowledges a paused alert MUST call
+            # request_resume() in addition to setting its action-specific
+            # flag. Without resume, the pipeline stays paused even after
+            # the user clicked the action button — symptom from user E2E:
+            # "I hit Retry on Hit-a-snag but pipeline stayed paused".
+            # The flag tells the waiting coroutine WHAT to do; resume
+            # tells it that ANY new state is ready to be consumed.
+            # request_resume is idempotent (no-op when not paused), so
+            # adding it everywhere is safe even for non-paused actions.
             elif action == "skip_init_verify":
                 # User bailed on Phase 0 login verification from the dropdown.
                 loop.call_soon_threadsafe(_controls.request_skip_init_verify)
+                loop.call_soon_threadsafe(_controls.request_resume)
                 log("Command received: SKIP_INIT_VERIFY — Phase 0 will proceed without full verify")
             elif action == "retry_init_verify":
                 # User tapped Retry on the login_required banner. Same as
@@ -3586,6 +3597,7 @@ def _start_command_listener(uid, research_id, loop):
                 # Phase 0 tile — backend will re-emit phase_start so a fresh
                 # tile renders below the retry banner.
                 loop.call_soon_threadsafe(_controls.request_retry_init_verify)
+                loop.call_soon_threadsafe(_controls.request_resume)
                 log("Command received: RETRY_INIT_VERIFY — re-running Phase 0 with a fresh tile")
             elif action == "skip_agent":
                 # Skip a stuck Phase 2 agent without stopping the rest of the
@@ -3599,6 +3611,7 @@ def _start_command_listener(uid, research_id, loop):
                 _ag = (data.get("agent", "") or "").strip().lower()
                 if _ag in ("chatgpt", "gemini", "claude", "notebooklm", "youtube"):
                     loop.call_soon_threadsafe(_controls.request_skip_agent, _ag)
+                    loop.call_soon_threadsafe(_controls.request_resume)
                     log(f"Command received: SKIP_AGENT agent={_ag}")
                 else:
                     log(f"Command received: SKIP_AGENT rejected — unknown agent '{_ag}'", "WARN")
@@ -3631,6 +3644,7 @@ def _start_command_listener(uid, research_id, loop):
                 # told us to proceed without retry. Flag is one-shot — the
                 # caller that emitted the warning consumes it on next check.
                 loop.call_soon_threadsafe(_controls.set_continue_anyway)
+                loop.call_soon_threadsafe(_controls.request_resume)
                 log("Command received: CONTINUE_ANYWAY — resuming past warning")
             elif action == "retry_phase":
                 # User clicked "Retry Phase N" on a pipeline_warning. The
@@ -3683,6 +3697,7 @@ def _start_command_listener(uid, research_id, loop):
                     # retry_phase analog above; phase_complete may overwrite.
                     _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent_hard, _ag)
+                    loop.call_soon_threadsafe(_controls.request_resume)
                     if _agent_pre_failed:
                         # Drop the pre-fail skip marker so the hard-retry path
                         # doesn't see Gemini as still-skipped.
@@ -3698,6 +3713,7 @@ def _start_command_listener(uid, research_id, loop):
                     # "errored" before soft-retry dispatch so the badge flips.
                     _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent, _ag)
+                    loop.call_soon_threadsafe(_controls.request_resume)
                     log(f"Command received: RETRY_AGENT agent={_ag} mode=soft")
                 else:
                     log("Command received: RETRY_AGENT rejected — no agent", "WARN")
@@ -3707,6 +3723,7 @@ def _start_command_listener(uid, research_id, loop):
                 _ag = (data.get("agent") or "").strip()
                 if _ag:
                     loop.call_soon_threadsafe(_controls.request_continue_partial, _ag)
+                    loop.call_soon_threadsafe(_controls.request_resume)
                     log(f"Command received: CONTINUE_PARTIAL_AGENT agent={_ag}")
                 else:
                     log("Command received: CONTINUE_PARTIAL_AGENT rejected — no agent", "WARN")
@@ -3716,6 +3733,7 @@ def _start_command_listener(uid, research_id, loop):
                 _ag = (data.get("agent") or "").strip()
                 if _ag:
                     loop.call_soon_threadsafe(_controls.request_poke_agent, _ag)
+                    loop.call_soon_threadsafe(_controls.request_resume)
                     log(f"Command received: POKE_AGENT agent={_ag}")
                 else:
                     log("Command received: POKE_AGENT rejected — no agent", "WARN")
@@ -3725,6 +3743,7 @@ def _start_command_listener(uid, research_id, loop):
                 _ag = (data.get("agent") or "").strip()
                 if _ag:
                     loop.call_soon_threadsafe(_controls.request_wait_longer_agent, _ag)
+                    loop.call_soon_threadsafe(_controls.request_resume)
                     log(f"Command received: WAIT_LONGER_AGENT agent={_ag}")
                 else:
                     log("Command received: WAIT_LONGER_AGENT rejected — no agent", "WARN")
