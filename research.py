@@ -27779,24 +27779,24 @@ def run_daemon_loop(port: int = 8000):
 
 
 def _write_supervised_flag(enabled: bool):
-    """Push the Supervised flag to the device doc so the frontend can
-    branch watchdog copy. Best-effort — if Firebase isn't reachable we still
-    succeed because the scheduled task is the actual source of truth."""
-    if not _firebase_db:
-        return
-    paired_uid = load_paired_uid()
+    """Push the Supervised flag to the top-level `devices/{deviceId}` doc
+    so the FE Account-page On Startup toggle reflects the supervisor
+    state. Uses Firestore REST PATCH via _pair_patch_device — no gRPC
+    client init needed, so callers (--resurrect / --retire / --pair
+    Stage 5) don't pay the ~10-30s init_firebase wall-clock on Windows.
+
+    Best-effort: if no deviceId on disk or the PATCH fails, returns
+    silently (the Scheduled Task / launchd / systemd unit is the actual
+    source of truth for supervisor state, and the heartbeat will re-
+    write supervised on next --serve boot)."""
     device_id = load_device_id()
-    if not (paired_uid and device_id):
+    if not device_id:
         log("Device not paired — skipping Firestore flag update.", "WARN")
         return
-    try:
-        _firebase_db.collection("users").document(paired_uid) \
-            .collection("devices").document(device_id).update({
-                "supervised": bool(enabled),
-            })
+    if _pair_patch_device(device_id, {"supervised": bool(enabled)}):
         log(f"Supervised flag = {enabled} written to device doc.")
-    except Exception as e:
-        log(f"Could not update supervised flag: {e}", "WARN")
+    else:
+        log(f"Could not update supervised flag (REST patch failed)", "WARN")
 
 
 def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
@@ -28062,10 +28062,12 @@ def run_resurrect():
         # them. Platform-specific install lives in `_arm_supervisor_<plat>`
         # which spawns the daemon-loop inline (vs Windows which spawns it in
         # Step 4 — that asymmetry is intentional, see Step 4 below).
-        init_firebase()
+        # NOTE: init_firebase() + _fetch_paired_email() deliberately skipped
+        # — see the matching comment in the Windows path below. supervised
+        # flag goes through _pair_patch_device (REST), no gRPC dep.
         paired_uid = load_paired_uid()
         device_id = load_device_id()
-        paired_email = _fetch_paired_email(paired_uid)
+        paired_email = ""  # cosmetic — banner falls back to uid[:8]
         currently_supervised = _detect_supervised()
         _ctx_rows = [
             ("Device",    _c(_BOLD, device_id or "(not paired)")),
@@ -28247,12 +28249,8 @@ def run_resurrect():
 
     # ── [3/4] Firestore sync ──
     _setup_step(3, 4, "Firestore sync")
-    # Use the REST PATCH path (no gRPC client init needed) — same primitive
-    # the pair flow uses to mirror Stage 2's On Startup choice.
-    if device_id and _pair_patch_device(device_id, {"supervised": True}):
-        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
-    else:
-        print(f"  {_c(_WARN, '⚠')}  Could not sync supervised flag — the FE toggle may stay off until the heartbeat asserts it.")
+    _write_supervised_flag(True)  # uses _pair_patch_device internally — fast
+    print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
 
     # ── [4/4] Handoff — activate the supervisor NOW, not at next logon ──
     # Without this, --resurrect only schedules the task and leaves the
@@ -28397,10 +28395,11 @@ def run_retire():
         # scaffolding (Context strip → [1/3] Unbinding → [2/3] Stopping →
         # [3/3] Firestore sync → flourish + next-actions). Closes the
         # "Polish deferred" gap so --retire reads the same on every OS.
-        init_firebase()
+        # NOTE: init_firebase + _fetch_paired_email skipped — supervised
+        # flag goes via _write_supervised_flag → _pair_patch_device REST.
         paired_uid = load_paired_uid()
         device_id = load_device_id()
-        paired_email = _fetch_paired_email(paired_uid)
+        paired_email = ""  # cosmetic — banner falls back to uid[:8]
         currently_supervised = _detect_supervised()
 
         _ctx_rows = [
@@ -28474,12 +28473,12 @@ def run_retire():
         ])
         return
 
-    init_firebase()
-
-    # Context strip — what's about to get torn down.
+    # Context strip — what's about to get torn down. Skip init_firebase
+    # + email fetch; supervised flag goes via _write_supervised_flag →
+    # _pair_patch_device REST.
     paired_uid = load_paired_uid()
     device_id = load_device_id()
-    paired_email = _fetch_paired_email(paired_uid)
+    paired_email = ""  # cosmetic — banner falls back to uid[:8]
     currently_supervised = _detect_supervised()
     _ctx_rows_r = [
         ("Device",     _c(_BOLD, device_id or "(not paired)")),
