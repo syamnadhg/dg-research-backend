@@ -1074,16 +1074,45 @@ def _render_context_strip(items: list[tuple[str, str]]):
 def _fetch_paired_email(paired_uid: str | None) -> str:
     """Best-effort lookup of the user's email for display. Returns empty
     string if Firestore is unreachable or the uid is unknown — callers
-    fall back to showing '(not paired)' or the truncated uid."""
-    if not paired_uid or not _firebase_db:
+    fall back to showing '(not paired)' or the truncated uid.
+
+    Post-Track-D: reads from the device doc's `ownerEmail` field (set
+    by the claim Cloud Function from claimerRecord.email), NOT the
+    legacy `users/{uid}.email` path which the synth user can't read
+    per the user-tree rule."""
+    if not _firebase_db:
+        return ""
+    device_id = load_device_id()
+    if not device_id:
         return ""
     try:
-        snap = _firebase_db.collection("users").document(paired_uid).get()
+        snap = _firebase_db.collection("devices").document(device_id).get()
         if snap.exists:
-            return (snap.to_dict() or {}).get("email", "") or ""
+            return (snap.to_dict() or {}).get("ownerEmail", "") or ""
     except Exception:
         pass
     return ""
+
+
+def _fetch_device_meta() -> dict:
+    """Read the BE's own `devices/{deviceId}` doc for banner display.
+    Returns {} on any failure; the synth user can read its own device
+    doc per the rule. Surfaces owner identity (name + email) +
+    device-side metadata (user-editable name + OS string) so the
+    --serve banner can show the same identity surface as the FE
+    Account-page tile."""
+    if not _firebase_db:
+        return {}
+    device_id = load_device_id()
+    if not device_id:
+        return {}
+    try:
+        snap = _firebase_db.collection("devices").document(device_id).get()
+        if snap.exists:
+            return snap.to_dict() or {}
+    except Exception:
+        pass
+    return {}
 
 
 def _render_next_actions(items: list[tuple[str, str]]):
@@ -25427,17 +25456,50 @@ async def run_server(port=8000):
     # tagline) so the three commands feel like a matched set.
     _branded_header("aegis", _BOLD + _ACCENT, "standing watch")
     _paired_uid_now = load_paired_uid()
-    _paired_email = _fetch_paired_email(_paired_uid_now)
     _device_id_now = load_device_id() or ""
-    _device_short = f"{_device_id_now[:8]}…" if _device_id_now else "(none)"
-    _device_val = (f"{_c(_BOLD, _device_short)}  {_c(_OK, '(active)')}"
-                   if _device_id_now else _c(_DIM, "(none)"))
-    _render_context_strip([
-        ("Paired to", _c(_BOLD, _paired_email or "(not paired)")),
+    # Pull owner identity + device metadata from the device doc, not
+    # the (synth-user-inaccessible) users/{uid}/ path. ownerEmail +
+    # ownerDisplayName are written by the claim Cloud Function;
+    # name + os are written by initiate-pair and user-editable from
+    # the FE Account-page tile.
+    _meta = _fetch_device_meta()
+    _paired_email = _meta.get("ownerEmail", "") or ""
+    _paired_name = _meta.get("ownerDisplayName", "") or ""
+    if _paired_name and _paired_email:
+        _paired_val = f"{_c(_BOLD, _paired_name)}  {_c(_DIM, '(' + _paired_email + ')')}"
+    elif _paired_email:
+        _paired_val = _c(_BOLD, _paired_email)
+    elif _paired_uid_now:
+        _paired_val = f"{_c(_DIM, _paired_uid_now[:8] + '…')}"
+    else:
+        _paired_val = _c(_DIM, "(not paired)")
+    _device_name = (
+        _meta.get("name", "")
+        or _meta.get("machineName", "")
+        or _meta.get("hostname", "")
+        or (f"{_device_id_now[:8]}…" if _device_id_now else "(none)")
+    )
+    _device_os = _meta.get("os", "") or ""
+    if _device_id_now:
+        if _device_os:
+            _device_val = (
+                f"{_c(_BOLD, _device_name)}  {_c(_DIM, '(' + _device_os + ')')}  "
+                f"{_c(_OK, '(active)')}"
+            )
+        else:
+            _device_val = f"{_c(_BOLD, _device_name)}  {_c(_OK, '(active)')}"
+    else:
+        _device_val = _c(_DIM, "(none)")
+    _ctx_rows_serve = [
+        ("Paired to", _paired_val),
         ("Device",    _device_val),
         ("Local API", _c(_BOLD, f"http://localhost:{port}")),
         ("Heartbeat", _c(_BOLD, f"{HEARTBEAT_INTERVAL_SEC}s cadence")),
-    ])
+    ]
+    _bat_serve = _battery_state()
+    if _bat_serve:
+        _ctx_rows_serve.append(("Power", _c(_DIM, _bat_serve)))
+    _render_context_strip(_ctx_rows_serve)
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
     print()
