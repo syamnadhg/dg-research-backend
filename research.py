@@ -1903,7 +1903,16 @@ def write_device_doc(uid: str, token: str, device_name: str | None = None):
     from any prior doc and auto-detects `supervised` from the real
     scheduled task (so unlink+relink doesn't lose the toggle). Call once
     from --pair after pairing succeeds, and again from --serve startup to
-    refresh token + heartbeat if the token changed."""
+    refresh token + heartbeat if the token changed.
+
+    User-mode short-circuit: the legacy `users/{uid}/devices/{deviceId}`
+    path is owner-only in the new rules; a synth-device-user write would
+    permission-deny. In practice every existing caller is also gated on
+    `_research_token` (None in user-mode) so this is defense in depth —
+    if any future caller forgets the gate, we fail closed with a log
+    instead of spamming Firestore with deny errors."""
+    if load_auth_mode() == "user":
+        return
     if not _firebase_db or not uid or not token:
         return
     import socket as _socket
@@ -1976,7 +1985,36 @@ async def _heartbeat_loop():
     global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db
     while True:
         try:
-            if _firebase_db and _research_token:
+            mode = load_auth_mode()
+            if mode == "user" and _firebase_db:
+                # Track D user-mode: BE is signed in as the synth device
+                # user. The top-level `devices/{deviceId}` rule lets us
+                # update lastHeartbeat + status (path identifies us; no
+                # deviceId field in the payload — would push it into
+                # affectedKeys() and break the hasOnly check). Legacy
+                # research_tokens + users/{uid}/devices paths are
+                # owner-only in the new rules and would permission-deny.
+                # The FE's listenToDevices fanout-read merges top-level
+                # `devices/` with legacy `users/{uid}/devices/` by max
+                # lastHeartbeat — the new doc always wins because the
+                # legacy mirror stops getting updates in user-mode.
+                device_id = load_device_id()
+                if device_id:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            lambda: _firebase_db.collection("devices")
+                                .document(device_id).update({
+                                    "lastHeartbeat": int(time.time() * 1000),
+                                    "status": "active",
+                                })),
+                        timeout=10.0,
+                    )
+                    _last_heartbeat_at_ms = int(time.time() * 1000)
+                    if _heartbeat_failures > 0:
+                        log(f"[heartbeat] recovered after {_heartbeat_failures} consecutive failures", "INFO")
+                        _heartbeat_failures = 0
+            elif _firebase_db and _research_token:
+                # Legacy mode — unchanged behavior.
                 # Wrap Firestore .update() in to_thread + 10s ceiling. Sync
                 # firebase_admin calls run on the event-loop thread by default;
                 # if the gRPC channel stalls (auth-token refresh under load,
@@ -2621,16 +2659,29 @@ async def save_document_to_firestore_with_retry(
 
 
 def start_firestore_start_listener(job_queue, loop):
-    """Listen for pipeline start requests via this backend's ResearchToken queue.
-    Frontend writes to: research_tokens/{token}/queue/{auto-id}
-    Backend picks it up, queues the job, writes run_id back.
-    Falls back to global pipeline_requests/ if no ResearchToken is set (legacy)."""
+    """Listen for pipeline start requests via this backend's queue.
+
+    Routing is mode-aware:
+    - User-mode → subscribe to top-level `devices/{deviceId}/queue/`.
+      That's the D4 canonical FIFO; rule `isDeviceItself()` lets the
+      synth device user read + delete entries. cmd_pair_v2 doesn't
+      mint a researchToken, so `_research_token` is None here anyway.
+    - Legacy mode → subscribe to `research_tokens/{token}/queue/` as
+      before. Falls back to global `pipeline_requests/` when no
+      researchToken (pre-pair installs).
+    Backend picks up the request, queues the job, writes run_id back."""
     global _start_listener
     if not _firebase_db:
         return
 
-    # Token-scoped queue (preferred) vs legacy global collection
-    if _research_token:
+    if load_auth_mode() == "user":
+        did = load_device_id()
+        if not did:
+            log("user-mode active but deviceId missing — start listener not initialized", "WARN")
+            return
+        col_ref = _firebase_db.collection("devices").document(did).collection("queue")
+        listener_label = f"devices/{did[:8]}…/queue/"
+    elif _research_token:
         col_ref = _firebase_db.collection("research_tokens").document(_research_token).collection("queue")
         listener_label = f"research_tokens/{_research_token[:8]}…/queue/"
     else:
