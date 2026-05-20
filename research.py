@@ -28181,15 +28181,14 @@ def run_resurrect():
     # _arm_supervisor_quiet install path).
     task_run = f'"{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"'
 
-    # Initialize Firebase so the flag write later succeeds. Cheap no-op if
-    # the sa file is missing — we just skip the flag.
-    init_firebase()
-
-    # Context strip — show device / pairing / current supervisor state before
-    # the user watches us rearrange any of them.
+    # NOTE: deliberately skip `init_firebase()` + `_fetch_paired_email()` here.
+    # The only Firestore-side action --resurrect needs is the supervised:true
+    # flag write in step 3, which goes through _pair_patch_device (Firestore
+    # REST + bootstrapped idToken — no gRPC client init). Skipping the cold
+    # gRPC channel construction shaves ~30-60s off resurrect on Windows.
     paired_uid = load_paired_uid()
     device_id = load_device_id()
-    paired_email = _fetch_paired_email(paired_uid)
+    paired_email = ""  # cosmetic only — banner falls back to uid[:8]
     currently_supervised = _detect_supervised()
     _ctx_rows = [
         ("Device",    _c(_BOLD, device_id or "(not paired)")),
@@ -28248,8 +28247,12 @@ def run_resurrect():
 
     # ── [3/4] Firestore sync ──
     _setup_step(3, 4, "Firestore sync")
-    _write_supervised_flag(True)
-    print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+    # Use the REST PATCH path (no gRPC client init needed) — same primitive
+    # the pair flow uses to mirror Stage 2's On Startup choice.
+    if device_id and _pair_patch_device(device_id, {"supervised": True}):
+        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+    else:
+        print(f"  {_c(_WARN, '⚠')}  Could not sync supervised flag — the FE toggle may stay off until the heartbeat asserts it.")
 
     # ── [4/4] Handoff — activate the supervisor NOW, not at next logon ──
     # Without this, --resurrect only schedules the task and leaves the
