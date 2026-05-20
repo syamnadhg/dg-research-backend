@@ -25199,6 +25199,13 @@ async def run_server(port=8000):
             # memory queue; mid-run jobs can't safely resume (browser/CUA state
             # is gone) so they're marked stopped with a clear reason. Without
             # this, the frontend shows "queued" forever after a backend crash.
+            #
+            # Per-query 15s wall-clock cap via asyncio.wait_for + to_thread.
+            # The sync .get() can hang indefinitely if the gRPC channel got
+            # into a bad state (observed once during E2E with the wrong
+            # paired_uid synth-vs-owner mismatch). A hung query here blocks
+            # the event loop and prevents uvicorn from binding port 8000 ->
+            # `--resurrect` handoff fails its API health check.
             try:
                 rehydrated = 0
                 orphaned = 0
@@ -25206,7 +25213,17 @@ async def run_server(port=8000):
                     .collection("researches")
                 for status_val in ("queued", "ongoing"):
                     try:
-                        snaps = list(researches_col.where("status", "==", status_val).get())
+                        snaps = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                lambda sv=status_val: list(
+                                    researches_col.where("status", "==", sv).get()
+                                )
+                            ),
+                            timeout=15.0,
+                        )
+                    except asyncio.TimeoutError:
+                        log(f"Rehydrate query ({status_val}) timed out after 15s — skipping", "WARN")
+                        continue
                     except Exception as e:
                         log(f"Rehydrate query ({status_val}) failed: {e}", "WARN")
                         continue
@@ -25996,6 +26013,13 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         print()  # Clear the polling line.
         _pt(f"exchange OK — deviceId={result['device_id'][:12]}… uid={result['uid'][:14]}…")
 
+        # Initial save — uses the synth uid as paired_uid until the
+        # owner-lookup below resolves the real owner. Without this
+        # write-then-rewrite split, a Ctrl+C between save + owner-
+        # lookup would leave research_config.json without the real
+        # ownerUid, breaking queue rehydration on the next --serve.
+        # The post-lookup save below replaces paired_uid with the
+        # genuine owner uid.
         save_user_mode_state(
             device_id=result["device_id"],
             paired_uid=result["uid"],
@@ -26057,6 +26081,22 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
                 _pt(f"owner read HTTP {_resp.status_code} — falling back", "DEBUG")
         except Exception as e:
             _pt(f"owner lookup failed: {e} (falling back)", "DEBUG")
+
+        # Re-write research_config.json with the REAL owner uid in
+        # paired_uid. The earlier save (right after exchange) used the
+        # synth uid as a placeholder — pointing user-tree queries on
+        # the next --serve at `users/device-d754.../researches/`
+        # instead of the actual owner's collection, which made queue
+        # rehydration look at an empty path. Now that we have the real
+        # ownerUid from the device doc, overwrite. Atomic-write helper
+        # in save_user_mode_state handles partial-file safety.
+        if owner_uid and owner_uid != result["uid"]:
+            save_user_mode_state(
+                device_id=result["device_id"],
+                paired_uid=owner_uid,
+                poll_secret=poll_secret,
+            )
+            _pt(f"paired_uid updated: synth → {owner_uid[:14]}…")
 
         print()
         print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
@@ -27516,6 +27556,65 @@ def _kill_pids(pids: list[int]) -> int:
     return 0
 
 
+def _free_port_8000() -> "list[int]":
+    """Find and force-kill any process listening on port 8000 so a fresh
+    --serve can bind. Used by --resurrect (and any future arming path)
+    to clear stale squatters — both crashed-but-port-leaked --serves and
+    accidentally-running third-party apps.
+
+    Returns the list of PIDs that were killed. Returns [] when port is
+    already free or no killable owner could be identified (best-effort).
+    Cross-platform — Windows uses netstat, POSIX uses lsof.
+    """
+    import subprocess as _sp
+    plat = _supervisor_platform()
+    pids_to_kill: "set[int]" = set()
+    try:
+        if plat == "Windows":
+            r = _sp.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True, text=True, timeout=8,
+                creationflags=_PS_NO_WINDOW,
+            )
+            for line in (r.stdout or "").splitlines():
+                # Format: "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    1234"
+                if "LISTENING" not in line:
+                    continue
+                if ":8000 " not in line and not line.endswith(":8000"):
+                    if " :8000\t" not in line and "0.0.0.0:8000" not in line and "[::]:8000" not in line:
+                        continue
+                parts = line.split()
+                if not parts:
+                    continue
+                try:
+                    pid = int(parts[-1])
+                except ValueError:
+                    continue
+                if pid > 0 and pid != os.getpid():
+                    pids_to_kill.add(pid)
+        elif plat in ("Darwin", "Linux"):
+            r = _sp.run(
+                ["lsof", "-ti", ":8000"],
+                capture_output=True, text=True, timeout=8,
+            )
+            for line in (r.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pid = int(line)
+                except ValueError:
+                    continue
+                if pid > 0 and pid != os.getpid():
+                    pids_to_kill.add(pid)
+    except Exception:
+        return []
+    if not pids_to_kill:
+        return []
+    _kill_pids(list(pids_to_kill))
+    return sorted(pids_to_kill)
+
+
 def _kill_pids_windows(pids: list[int]) -> int:
     """taskkill /F each PID. Returns count that successfully terminated.
     Silent on individual failures — caller can re-enumerate to confirm."""
@@ -28295,6 +28394,17 @@ def run_resurrect():
             killed = _kill_pids(plain_serve_pids)
             plural = "es" if killed != 1 else ""
             print(f"  {_c(_DIM, f'     Stopped {killed} running --serve process{plural} to free port 8000.')}")
+        # Belt-and-suspenders: even after killing known research.py --serve
+        # processes, port 8000 can still be held by:
+        #   - a stale --serve that crashed without releasing (rare)
+        #   - a different app the user happened to bind there
+        #   - a TIME_WAIT socket from a recent --serve exit
+        # Without this, daemon-loop will spawn --serve which hits "address
+        # already in use" on the first uvicorn bind and crash-loops every
+        # 5s. _free_port_8000 catches it once at install time.
+        port_squatters = _free_port_8000()
+        if port_squatters:
+            print(f"  {_c(_DIM, f'     Cleared port 8000 (killed PID(s): {port_squatters})')}")
         # Belt-and-suspenders: gate on win32 (mirrors `run_daemon_loop`'s
         # _NO_WINDOW pattern at research.py:27223-27240). This branch is
         # already only reachable on Windows after the Darwin/Linux early-
