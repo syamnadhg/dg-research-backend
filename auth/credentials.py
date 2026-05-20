@@ -86,7 +86,14 @@ class RefreshTokenCredentials(google.auth.credentials.Credentials):
         keystore.promote_pending(install_uuid)
         creds = cls(install_uuid, web_api_key)
         creds.token = id_token  # google.auth attribute
-        creds.expiry = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+        # google.auth.credentials.Credentials.expiry MUST be timezone-NAIVE
+        # UTC. The library compares it against `datetime.utcnow()` (also
+        # naive) inside `Credentials.expired` and `before_request`. Setting
+        # an aware datetime here raises `can't compare offset-naive and
+        # offset-aware datetimes` deep inside gRPC's auth-refresh path,
+        # which surfaces as a 503 with empty exception message at the
+        # client (observed during E2E heartbeat + rehydration).
+        creds.expiry = dt.datetime.utcnow() + dt.timedelta(
             seconds=max(0, expires_in - _REFRESH_MARGIN_SECONDS)
         )
         creds._uid = uid
@@ -129,6 +136,11 @@ class RefreshTokenCredentials(google.auth.credentials.Credentials):
         keystore.promote_pending(self._install_uuid)
 
         self.token = new_id
-        self.expiry = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+        # NAIVE UTC — see comment in bootstrap() above. Without this,
+        # google-auth's expired/before_request comparison against
+        # datetime.utcnow() (naive) raises mid-refresh, gRPC sees a
+        # 503 from the metadata plugin, and Firestore writes start
+        # failing with empty exception messages.
+        self.expiry = dt.datetime.utcnow() + dt.timedelta(
             seconds=max(0, expires_in - _REFRESH_MARGIN_SECONDS)
         )
