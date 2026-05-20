@@ -776,6 +776,38 @@ def _rule(char: str = "─", color: str = _DIM, max_width: int = 62) -> str:
     return _c(color, char * width)
 
 
+def _clear_status_line() -> None:
+    """`\r` + width-spaces + `\r` — clears the current line for spinner
+    cleanup. F7 of the CLI audit: pre-fix used a hardcoded 78-char wipe
+    that wrapped on Crostini's default 67-72 col terminal, leaving ghost
+    characters in column 73+ of a second physical line."""
+    import shutil as _shutil
+    cols = _shutil.get_terminal_size(fallback=(80, 24)).columns
+    width = max(20, cols - 2)
+    sys.stdout.write("\r" + " " * width + "\r")
+    sys.stdout.flush()
+
+
+def _is_wsl() -> bool:
+    """Detect Windows Subsystem for Linux — F15 of the CLI audit.
+
+    WSL2 reports `_supervisor_platform()` as "Linux" but the systemd-user
+    install path requires `systemd=true` in /etc/wsl.conf [boot] (not the
+    default). Callers in --resurrect / --doctor surface a clear "WSL
+    detected — see docs/WSL.md" warning instead of silently installing a
+    unit that won't survive the next WSL session."""
+    if sys.platform != "linux":
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        with open("/proc/sys/kernel/osrelease", "r") as fh:
+            release = fh.read().lower()
+        return "microsoft" in release or "wsl" in release
+    except Exception:
+        return False
+
+
 # Signature glyph — appears before every command's Latin tagline. Subtle
 # enough not to read as decoration, specific enough to make any `serve` /
 # `pair` / `resurrect` / `retire` / `unpair` terminal output instantly
@@ -835,65 +867,133 @@ def _setup_step(n: int, total: int, title: str):
     phases without requiring each caller to track its own state."""
     print()
     print(f"  {_c(_ACCENT + _BOLD, f'[{n}/{total}]')} {_c(_BOLD, title)}")
-    print(f"  {_c(_DIM, '─' * 58)}")
+    print(f"  {_rule(max_width=58)}")
+
+
+def _bat_glyph(pct_int: int) -> str:
+    """Quarter-phase moon glyph by remaining charge — shared across
+    Windows/macOS/Linux battery-state branches."""
+    if pct_int <= 25:  return "◓"
+    if pct_int <= 50:  return "◒"
+    if pct_int <= 75:  return "◑"
+    return "◐"
 
 
 def _battery_state() -> str:
     """Return a short display string for the machine's power state.
     "On AC" / "On battery (N%)" / "Plugged in (no battery)" / ""
-    Empty string = caller should skip the row (non-Windows or PS error).
-    Result cached for ~10s so multiple context-strip renders in the same
-    command don't re-spawn PowerShell."""
+    Empty string = caller should skip the row (unsupported platform or
+    probe failure). Cached for ~10s so multiple context-strip renders
+    in the same command don't re-probe.
+
+    Cross-platform via per-OS probes:
+      Windows  — PowerShell + Get-CimInstance Win32_Battery
+      macOS    — `pmset -g batt` text parse
+      Linux    — /sys/class/power_supply/BAT*/{capacity,status} sysfs
+    Returns "" on any unsupported OS or probe error so callers can
+    silently skip the context-strip row (F6 of the CLI audit)."""
     import platform as _platform
     import time as _time
-    if _platform.system() != "Windows":
-        return ""
     cache_key = "_battery_state_cache"
     g = globals()
     cached = g.get(cache_key)
     if cached and (_time.time() - cached[0]) < 10:
         return cached[1]
-    try:
-        ps = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             "$b = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1; "
-             "if ($b -eq $null) { 'NONE' } else { \"$($b.BatteryStatus):$($b.EstimatedChargeRemaining)\" }"],
-            capture_output=True, text=True, timeout=8,
-            creationflags=_PS_NO_WINDOW,
-        )
-        out = (ps.stdout or "").strip()
-    except Exception:
-        out = ""
-    def _bat_glyph(pct_int: int) -> str:
-        # Quarter-phase moon glyphs by remaining charge.
-        if pct_int <= 25:  return "◓"
-        if pct_int <= 50:  return "◒"
-        if pct_int <= 75:  return "◑"
-        return "◐"
 
-    if out == "NONE":
-        result = "▰ Plugged in (no battery)"
-    elif ":" in out:
-        status, _, pct = out.partition(":")
+    sys_name = _platform.system()
+    result = ""
+
+    if sys_name == "Windows":
         try:
-            status_i = int(status)
-            pct_i = int(pct) if pct.isdigit() else 100
-            pct_s = f" ({pct}%)" if pct.isdigit() else ""
-            # Win32_Battery.BatteryStatus: 1=Discharging, 2=AC, 3=Fully charged,
-            # 4=Low, 5=Critical, 6=Charging, 7=Charging+High, 8=Charging+Low,
-            # 9=Charging+Critical, 10=Undefined, 11=Partially charged
-            if status_i == 1:
-                result = f"{_bat_glyph(pct_i)} On battery{pct_s}"
-            elif status_i in (2, 3, 11):
-                result = f"⚡ On AC{pct_s}"
-            elif status_i in (6, 7, 8, 9):
-                result = f"⚡ Charging{pct_s}"
-            else:
-                result = f"⚡ AC/battery state {status_i}{pct_s}"
-        except ValueError:
+            ps = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "$b = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1; "
+                 "if ($b -eq $null) { 'NONE' } else { \"$($b.BatteryStatus):$($b.EstimatedChargeRemaining)\" }"],
+                capture_output=True, text=True, timeout=8,
+                creationflags=_PS_NO_WINDOW,
+            )
+            out = (ps.stdout or "").strip()
+        except Exception:
+            out = ""
+        if out == "NONE":
+            result = "▰ Plugged in (no battery)"
+        elif ":" in out:
+            status, _, pct = out.partition(":")
+            try:
+                status_i = int(status)
+                pct_i = int(pct) if pct.isdigit() else 100
+                pct_s = f" ({pct}%)" if pct.isdigit() else ""
+                # Win32_Battery.BatteryStatus: 1=Discharging, 2=AC, 3=Fully charged,
+                # 4=Low, 5=Critical, 6=Charging, 7=Charging+High, 8=Charging+Low,
+                # 9=Charging+Critical, 10=Undefined, 11=Partially charged
+                if status_i == 1:
+                    result = f"{_bat_glyph(pct_i)} On battery{pct_s}"
+                elif status_i in (2, 3, 11):
+                    result = f"⚡ On AC{pct_s}"
+                elif status_i in (6, 7, 8, 9):
+                    result = f"⚡ Charging{pct_s}"
+                else:
+                    result = f"⚡ AC/battery state {status_i}{pct_s}"
+            except ValueError:
+                result = ""
+
+    elif sys_name == "Darwin":
+        # `pmset -g batt` first line is the AC adapter state; second line
+        # has the per-cell battery state in a human-parseable shape like
+        # "  -InternalBattery-0 (id=0)  82%; discharging; 4:12 remaining"
+        try:
+            r = subprocess.run(["pmset", "-g", "batt"], capture_output=True,
+                               text=True, timeout=5)
+            lines = (r.stdout or "").splitlines()
+        except Exception:
+            lines = []
+        if not lines:
             result = ""
-    else:
-        result = ""
+        else:
+            ac_line = (lines[0] or "").lower()
+            batt_line = lines[1] if len(lines) > 1 else ""
+            import re as _re
+            pct_m = _re.search(r"(\d+)%", batt_line)
+            pct_i = int(pct_m.group(1)) if pct_m else 100
+            pct_s = f" ({pct_i}%)" if pct_m else ""
+            if "no batteries" in ac_line or "no battery" in ac_line:
+                result = "▰ Plugged in (no battery)"
+            elif "discharging" in batt_line.lower():
+                result = f"{_bat_glyph(pct_i)} On battery{pct_s}"
+            elif "charging" in batt_line.lower():
+                result = f"⚡ Charging{pct_s}"
+            elif "charged" in batt_line.lower() or "ac power" in ac_line:
+                result = f"⚡ On AC{pct_s}"
+            else:
+                result = ""
+
+    elif sys_name == "Linux":
+        # sysfs is universal on Linux desktops + Crostini. Find the first
+        # BAT* entry; if there's none assume desktop (no battery row).
+        try:
+            from pathlib import Path as _Path
+            ps_root = _Path("/sys/class/power_supply")
+            bats = sorted(ps_root.glob("BAT*")) if ps_root.exists() else []
+        except Exception:
+            bats = []
+        if not bats:
+            result = ""
+        else:
+            bat = bats[0]
+            try:
+                cap = (bat / "capacity").read_text().strip()
+                stat = (bat / "status").read_text().strip().lower()
+                pct_i = int(cap) if cap.isdigit() else 100
+                pct_s = f" ({pct_i}%)" if cap.isdigit() else ""
+            except Exception:
+                pct_i, pct_s, stat = 100, "", ""
+            if stat == "discharging":
+                result = f"{_bat_glyph(pct_i)} On battery{pct_s}"
+            elif stat == "charging":
+                result = f"⚡ Charging{pct_s}"
+            elif stat in ("full", "not charging"):
+                result = f"⚡ On AC{pct_s}"
+
     g[cache_key] = (_time.time(), result)
     return result
 
@@ -902,25 +1002,32 @@ def _local_api_health(port: int = 8000, timeout_s: float = 3.0) -> "tuple[bool, 
     """Probe http://localhost:<port>/api/health. Returns (ok, detail).
     detail is a short status string for printing (e.g. "200 OK" / "no
     connection" / "timeout"). Used by --resurrect Step 4 to confirm the
-    backend is actually responding before declaring success."""
+    backend is actually responding before declaring success.
+
+    Cross-platform via urllib (stdlib) — pre-2026-05-20 this used
+    PowerShell's Invoke-WebRequest which made the POSIX --resurrect Step 4
+    health probe a silent no-op. Now works the same everywhere.
+    """
+    import urllib.request as _urlreq
+    import urllib.error as _urlerr
     try:
-        ps = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             f"try {{ $r = Invoke-WebRequest -Uri http://localhost:{port}/api/health "
-             f"-UseBasicParsing -TimeoutSec {int(timeout_s)}; "
-             "Write-Output $r.StatusCode } "
-             "catch { Write-Output \"ERR:$($_.Exception.Message)\" }"],
-            capture_output=True, text=True, timeout=timeout_s + 5,
-            creationflags=_PS_NO_WINDOW,
+        req = _urlreq.Request(
+            f"http://localhost:{port}/api/health",
+            headers={"User-Agent": "research.py/_local_api_health"},
         )
-        out = (ps.stdout or "").strip()
-        if out.startswith("ERR:"):
-            return False, out[4:120]
-        if out == "200":
-            return True, "200 OK"
-        return False, f"HTTP {out or '<no output>'}"
+        with _urlreq.urlopen(req, timeout=timeout_s) as r:
+            if r.status == 200:
+                return True, "200 OK"
+            return False, f"HTTP {r.status}"
+    except _urlerr.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except _urlerr.URLError as e:
+        # ConnectionRefusedError, DNS failure, timeout — all wrapped here.
+        reason = getattr(e, "reason", e)
+        msg = str(reason)
+        return False, msg[:120] if msg else "connection failed"
     except Exception as e:
-        return False, f"probe error: {e}"
+        return False, f"probe error: {e}"[:120]
 
 
 def _print_with_flourish(line: str, fade_to_color: str | None = None,
@@ -1042,8 +1149,7 @@ class _SyncSpinnerCtx:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.5)
-        sys.stdout.write("\r" + " " * 78 + "\r")
-        sys.stdout.flush()
+        _clear_status_line()
         return False
 
 
@@ -25975,7 +26081,11 @@ async def run_pair(profile_dir, wait_minutes=10):
                            error_correction=qrcode.constants.ERROR_CORRECT_L)
         qr.add_data(token)
         qr.make(fit=True)
-        qr.print_ascii(tty=True, invert=True)
+        # F12 of the CLI audit — invert=True uses ANSI reverse-video,
+        # which renders as `?` runs on terminals where _USE_COLOR is False
+        # (dumb terms, certain TERM=linux consoles, CI). Honor color
+        # detection so the QR stays scannable everywhere.
+        qr.print_ascii(tty=True, invert=bool(_USE_COLOR))
     except ImportError:
         log("    qrcode lib missing — run `pip install -r requirements.txt` first.", "WARN")
     except Exception as e:
@@ -26087,8 +26197,7 @@ async def run_pair(profile_dir, wait_minutes=10):
         aborted_by_user = True
 
     # Clear the spinner line so the next print starts clean
-    sys.stdout.write("\r" + " " * 78 + "\r")
-    sys.stdout.flush()
+    _clear_status_line()
 
     if linked_uid is None:
         _rollback_unclaimed_token()
@@ -28070,6 +28179,14 @@ def run_resurrect():
 
         # ── [2/4] Installing supervisor + auto-spawn ──
         _setup_step(2, 4, f"Installing {_supervisor_artifact_label()}")
+        if plat == "Linux" and _is_wsl():
+            # F15 of the CLI audit — WSL2's systemd-user requires
+            # `systemd=true` in /etc/wsl.conf [boot] (not the default).
+            # If that's missing, the unit installs but won't survive
+            # `wsl --shutdown`. Warn but don't bail — users with systemd
+            # already enabled get exactly what they want.
+            print(f"  {_c(_WARN, '⚠')}  WSL detected — systemd-user units need `systemd=true` in /etc/wsl.conf [boot].")
+            print(f"  {_c(_DIM, '     If unset: add it, run `wsl --shutdown` from PowerShell, then re-run --resurrect.')}")
         if plat == "Linux" and _check_linger_status() == "no":
             _linger_user = os.environ.get("USER") or os.environ.get("LOGNAME") or "$USER"
             print(f"  {_c(_WARN, '⚠')}  loginctl Linger=no — daemon-loop will die at logout.")
@@ -28873,7 +28990,7 @@ def run_commands_help():
 
     def _section(title, rows):
         print(f"  {_c(_BOLD, title)}")
-        print(f"  {_c(_DIM, '─' * 64)}")
+        print(f"  {_rule(max_width=64)}")
         # Align command column; longest command wins the padding budget.
         pad = max(len(cmd) for cmd, _desc in rows)
         for cmd, desc in rows:
@@ -28994,7 +29111,7 @@ def run_doctor():
 
     # ── [1] Platform + pair state ──
     print(f"  {_c(_BOLD, 'Platform + pair state')}")
-    print(f"  {_c(_DIM, '─' * 58)}")
+    print(f"  {_rule(max_width=58)}")
     if plat == "Unsupported":
         _fail(f"Platform unsupported ({sys.platform})", "Only Windows / macOS / Linux desktop.")
         print()
@@ -29020,7 +29137,7 @@ def run_doctor():
 
     # ── [2] Browser dependencies (Playwright + Chromium) ──
     print(f"  {_c(_BOLD, 'Browser dependencies')}")
-    print(f"  {_c(_DIM, '─' * 58)}")
+    print(f"  {_rule(max_width=58)}")
     try:
         import patchright  # noqa: F401
         _ok("patchright package", "installed in active venv")
@@ -29068,7 +29185,7 @@ def run_doctor():
 
     # ── [3] Supervisor unit / task ──
     print(f"  {_c(_BOLD, 'Supervisor')}")
-    print(f"  {_c(_DIM, '─' * 58)}")
+    print(f"  {_rule(max_width=58)}")
     if plat == "Linux":
         if _SUPERVISOR_UNIT_PATH.exists():
             _ok("Unit file present", str(_SUPERVISOR_UNIT_PATH))
@@ -29153,7 +29270,7 @@ def run_doctor():
 
     # ── [4] Process tree + port ──
     print(f"  {_c(_BOLD, 'Process tree')}")
-    print(f"  {_c(_DIM, '─' * 58)}")
+    print(f"  {_rule(max_width=58)}")
     procs = _enumerate_research_py_procs()
     daemon_pids = [pid for pid, _c2, role in procs if role == "daemon-loop"]
     serve_pids  = [pid for pid, _c2, role in procs if role == "serve"]
@@ -29185,7 +29302,7 @@ def run_doctor():
     # ── [5] Linux-specific: DISPLAY propagation ──
     if plat == "Linux":
         print(f"  {_c(_BOLD, 'Graphical-session env (Linux)')}")
-        print(f"  {_c(_DIM, '─' * 58)}")
+        print(f"  {_rule(max_width=58)}")
         shell_disp = os.environ.get("DISPLAY", "")
         if shell_disp:
             _ok("Shell DISPLAY", shell_disp)
@@ -29232,7 +29349,7 @@ def run_doctor():
         print()
 
     # ── Summary ──
-    print(f"  {_c(_DIM, '─' * 58)}")
+    print(f"  {_rule(max_width=58)}")
     if issues_found == 0:
         print(f"  {_c(_OK + _BOLD, '✓  Healthy.')}  {_c(_DIM, 'All checks passed.')}")
     else:
@@ -29368,4 +29485,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # F11 of the CLI audit — wrap the dispatcher in a single clean
+    # KeyboardInterrupt catch so Ctrl+C anywhere in any subcommand
+    # (--pair, --unpair, --retire, --resurrect, --doctor, --serve) exits
+    # with a calm message + Unix convention exit code 130 instead of a
+    # noisy traceback. Subcommands that need to do their own cleanup
+    # before bailing can still catch KeyboardInterrupt locally; if they
+    # re-raise it lands here.
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        print(f"  {_c(_DIM, 'Cancelled.')}  {_c(_DIM, 'Re-run when ready.')}")
+        sys.exit(130)
