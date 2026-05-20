@@ -1443,7 +1443,8 @@ def init_firebase():
         log(
             "Firestore init: refresh token rejected (revoked or expired). "
             "If you triggered Reset Pair Code, check your email for the new "
-            "code and run `python research.py --pair`.",
+            "code and enter it in Account → Add Device — the recovery "
+            "watcher will pick it up and respawn the backend automatically.",
             "ERROR",
         )
         return False
@@ -1753,6 +1754,91 @@ async def _heartbeat_loop():
                 except Exception as reinit_err:
                     log(f"[heartbeat] reinit raised: {reinit_err}", "ERROR")
         await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+
+
+async def _revoked_recovery_loop():
+    """Auto-relink after the owner triggers Reset Pair Code from the FE.
+
+    Reset revokes the synth device user's refresh tokens; the next
+    securetoken refresh on this BE raises RevokedError → the keystore
+    is wiped → `_firebase_db` goes None. The owner gets emailed the
+    fresh 8-char code and enters it in Account → Add Device within 15
+    minutes. The claim Cloud Function writes a new customToken to the
+    same `devices/{deviceId}/pending/{hash(pollSecret)}` subdoc that
+    initial pair used (pollSecret survives Reset in research_config.json),
+    so we can pick it up here without any new handshake.
+
+    On success we exit cleanly. Under the daemon-loop supervisor (Win
+    Scheduled Task / mac launchd / linux systemd-user) the BE respawns
+    within ~5s with the new keystore + fresh Firestore client + fresh
+    listener subscriptions. Unsupervised installs need a manual
+    `python research.py --serve`; we log the instruction.
+
+    Loop is quiet during normal operation — sleeps until `_firebase_db`
+    goes None. Backs off 5 min after a PollTimeout (code window
+    expired) so a stuck recovery doesn't spin."""
+    log("[relink] watcher armed (idle until Firestore drops)", "DEBUG")
+    while True:
+        try:
+            if _firebase_db is not None:
+                await asyncio.sleep(15)
+                continue
+            poll_secret = load_poll_secret()
+            device_id = load_device_id()
+            if not (poll_secret and device_id):
+                # No way to auto-relink (legacy install never paired,
+                # or fresh install pre --pair). Caller must run --pair.
+                await asyncio.sleep(30)
+                continue
+            try:
+                from auth import v2_flow as _v2
+            except ImportError as e:
+                log(f"[relink] auth.v2_flow import failed: {e}", "ERROR")
+                await asyncio.sleep(60)
+                continue
+            log(
+                "[relink] Firestore client down — polling pending subdoc for "
+                "fresh pair code (15 min window). "
+                "Owner enters the emailed code in Account → Add Device.",
+                "INFO",
+            )
+            poll_hash = _v2.compute_poll_secret_hash(poll_secret)
+            try:
+                await _v2.do_redeem_reset(
+                    device_id=device_id,
+                    poll_secret_hash=poll_hash,
+                    poll_timeout_seconds=15 * 60,
+                )
+                log("[relink] new refresh token bootstrapped to keystore", "INFO")
+                # Exit so the supervisor respawns with a fresh Firestore
+                # client + fresh listener subscriptions. In-process swap
+                # would leave the old listeners pointing at the revoked
+                # gRPC channel, which silently stops delivering snapshots.
+                log(
+                    "[relink] exiting --serve so subscriptions reload "
+                    "(supervisor will respawn within ~5s; "
+                    "unsupervised installs need `python research.py --serve`).",
+                    "INFO",
+                )
+                # Give the log line a beat to flush before we go.
+                await asyncio.sleep(0.5)
+                import os as _os
+                _os._exit(0)
+            except _v2.PollTimeout:
+                log(
+                    "[relink] 15-min code window expired — owner can re-Reset "
+                    "from Settings → Manage devices, or run --pair on this PC.",
+                    "WARN",
+                )
+                await asyncio.sleep(5 * 60)
+            except Exception as e:
+                log(f"[relink] recovery attempt failed: {e}", "WARN")
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log(f"[relink] watcher loop error: {e}", "WARN")
+            await asyncio.sleep(30)
 
 
 _device_cmd_watch = None  # Firestore Watch handle; kept for lifetime cleanup
@@ -25047,9 +25133,14 @@ async def run_server(port=8000):
     # the queue race where #2 killed #1's browser mid-run. Single-start here.
     if _firebase_db:
         start_firestore_start_listener(_job_queue, asyncio.get_event_loop())
+    # Reset-recovery watcher. Armed unconditionally so a post-Reset
+    # boot (keystore wiped → init_firebase returned False above) can
+    # still auto-relink the moment the owner enters the new code at
+    # Account → Add Device. Loop is idle while _firebase_db is set.
+    asyncio.create_task(_revoked_recovery_loop())
     # Start heartbeat so frontend can show Online/Offline status
     heartbeat_task = None
-    if token and _firebase_db:
+    if _firebase_db:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
         log(f"Heartbeat started ({HEARTBEAT_INTERVAL_SEC}s interval)")
 

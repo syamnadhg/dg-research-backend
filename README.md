@@ -5,8 +5,10 @@ Automates multi-agent deep research across 6 platforms. Tiered automation: Playw
 > **Jira:** [DGOPS-6933](https://distributedglobal.atlassian.net/browse/DGOPS-6933)
 > **Repo (this one):** github.com/dg-eng/super-research-backend
 >
-> The Firebase Admin SDK key (`firebase-service-account.json`) is **gitignored**
-> and emailed separately by the dev — see ["Firebase Admin Key" below](#firebase-admin-key-required--firebase-service-accountjson).
+> No admin keys, no JSON files to copy around. `--pair` mints an 8-char
+> code in the terminal; you paste it into the web app once. Per-device
+> Firebase refresh tokens live in your OS keystore — Windows DPAPI,
+> macOS Keychain, Linux libsecret.
 
 ## Google accounts: use personal accounts, not workspace ones
 
@@ -30,8 +32,7 @@ The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all
 - **Python 3.11+** (`python --version`).
 - **Real Google Chrome** installed (not just Chromium — patchright launches with `channel="chrome"`).
 - **Anthropic API key** with browser-automation access (`CUA_API_KEY` or `ANTHROPIC_API_KEY` — either works; see Step 2).
-- **Firebase Admin SDK key** (`firebase-service-account.json`) — emailed to you by the dev. See [Firebase Admin Key](#firebase-admin-key-required--firebase-service-accountjson).
-- **Super Research web app account** — sign in at the deployment URL the dev shares with you (Google sign-in). You'll link the backend's ResearchToken from this account during `--pair` Stage 2.
+- **Super Research web app account** — sign in at the deployment URL the dev shares with you (Google sign-in). You'll paste the 8-char pair code into Account → Add Device during `--pair` Stage 1.
 - **Paid Pro tiers on ChatGPT, Claude, and Gemini** — required for the depth Phases 1–2 were tuned against:
   - **ChatGPT Pro** ($200/mo per seat) — Phase 1 brief uses Pro + Extended Thinking.
   - **Claude Pro** ($20/mo per seat) — Phase 2 Claude agent uses Opus 4.7 + Research mode (Free tiers don't expose Opus or Research).
@@ -48,118 +49,82 @@ cd super-research-backend
 pip install -r requirements.txt
 python -m patchright install chrome    # downloads patchright's stealth Chrome wrapper
 
-# 2. Drop in the Firebase Admin key (emailed to you by the dev).
-#    The email attachment will have an auto-generated name like
-#    "super-research-492814-firebase-adminsdk-fbsvc-XXXXX.json".
-#    Save it into THIS directory and RENAME it exactly:
-#       firebase-service-account.json
-#    Step-by-step + verify command in "Firebase Admin Key" below.
-
-# 3. Pair (one-time: mints ResearchToken, renders QR, waits for logins)
+# 2. Pair (one-time: mints an 8-char pair code, prompts API keys, runs browser logins)
 python research.py --pair
 
-# 4. Start the server (keep it running)
+# 3. Start the server (keep it running)
 python research.py --serve
 
-# 4a. (Optional, recommended) Survive reboots + crashes (Windows only today).
+# 3a. (Optional, recommended) Survive reboots + crashes (cross-platform).
 python research.py --resurrect
 
-# 4b. (Undo 4a) Disable On Startup — kills supervisor + serve, removes
-#     the Scheduled Task, syncs the Firestore flag. Pairing stays.
+# 3b. (Undo 3a) Disable On Startup — kills supervisor + serve, removes
+#     the scheduled-task / launchd / systemd unit, syncs the Firestore flag.
+#     Pairing stays.
 python research.py --retire
 
-# 4c. (Full disconnect) Clean teardown — also wipes pairing/device
-#     registry. Use this when you're done with this PC entirely.
+# 3c. (Full disconnect) Clean teardown — deletes the device server-side
+#     via /api/devices/unpair-self, wipes pairing + the OS keystore entry.
+#     Tile disappears across every browser within a second.
 python research.py --unpair
 ```
 
-That's it. Four commands to a hands-off always-on backend — plus `--retire` to disable On Startup or `--unpair` to fully disconnect this PC.
+That's it. Three commands to a hands-off always-on backend — plus `--retire` to disable On Startup or `--unpair` to fully disconnect this PC.
 
 > Run `python research.py --commands` anytime for a branded, use-case-grouped reference card of every CLI verb (Daily / Lifecycle / Advanced / Internal-Debug). Lighter-weight than `--help`.
 
-> **Just want to smoke-test from the terminal first?** Skip pairing entirely and run `python research.py "your topic"` — see [§ CLI Mode](#cli-mode). No QR, no Firebase round-trip, output lands in `queues/`.
+> **Just want to smoke-test from the terminal first?** Skip pairing entirely and run `python research.py "your topic"` — see [§ CLI Mode](#cli-mode). No code, no Firebase round-trip, output lands in `queues/`.
 
-> **Order of ops — what you can do in parallel:**
-> - Steps 1 (install) and 2 (env vars) can run alongside waiting for the Firebase Admin email.
-> - You're **blocked** on the Firebase email before you can run Step 3 (`--pair`).
-> - You're **blocked** on the web app account before Stage 2 of `--pair` (link the token).
+> **Order of ops:**
+> - Steps 1 (install) and 2's API-key prep can run in parallel.
+> - You're **blocked** on a web-app account before `--pair` Stage 1 finishes (paste the 8-char code into Account → Add Device).
 
-## Firebase Admin Key (required) — `firebase-service-account.json`
+## Pairing model (no JSON keys to copy around)
 
-The backend needs a Firebase Admin SDK key to read the queue, write heartbeats, and stream events. **This file is NOT committed to git and never will be.**
+The backend authenticates as a per-device **synthetic Firebase user**
+whose long-lived refresh token lives in your OS keystore — Windows
+DPAPI / macOS Keychain / Linux libsecret (with a `chmod 0600` file
+fallback). No service-account JSON. No god-mode credentials shared
+across devices.
 
-### How to get it
+The handshake at `--pair`:
 
-The dev will email you the JSON file directly. One file per person. The attachment will have an auto-generated name from the Firebase Console — typically:
+1. BE mints a 256-bit `pollSecret` locally and POSTs `sha256(pollSecret)`
+   to the FE Cloud Function `/api/devices/initiate-pair`. The function
+   creates a synthetic Firebase Auth user and returns
+   `{ deviceId, pairCode }` — an 8-char code from a confusion-resistant
+   alphabet (digits 2-9 + uppercase A-Z minus I/L/O).
+2. The terminal prints the code + a scannable QR. You open the web app
+   → **Account → Add Device** → paste the code. The FE claim Cloud
+   Function mints a customToken scoped to this device + you (with
+   custom claims `ownerUid` + `deviceId`) and writes it to a subdoc
+   keyed by `sha256(pollSecret)`. Sharers know the deviceId but not
+   the secret hash, so the customToken is unreadable to them.
+3. BE polls that subdoc (anonymous Firestore REST — `allow get: if true`
+   on the keyed path), exchanges the customToken for a refresh+ID
+   token pair via Firebase REST, saves the refresh token to the OS
+   keystore.
 
-```
-super-research-492814-firebase-adminsdk-fbsvc-XXXXX.json
-```
+From then on, every BE Firestore write goes through that refresh token
++ google-cloud-firestore. The refresh token rotates each refresh cycle
+(~1h) and the keystore rotation slot guarantees a clean swap under
+parallel-process contention.
 
-You **must rename it** to exactly `firebase-service-account.json` (the BE looks for that exact filename — no auto-detect) and place it in the **repo root** (the directory that contains `research.py`).
+**Shared devices.** Same 8-char code drives sharing — a second account
+pastes the same code into Account → Add Device and the claim function
+appends their uid to `sharedWith[]`. They can submit research that
+runs on your PC but can't read your other data; per-device Firestore
+rules enforce the boundary via the BE's custom claim.
 
-### Where it goes (exact path)
-
-The repo root is whatever directory you `cd` into after `git clone`. For the org repo it's:
-
-```
-super-research-backend/firebase-service-account.json
-```
-
-Same directory as `research.py`. If you ever forked or renamed the directory, the file simply needs to be next to `research.py` — nothing else matters.
-
-### Step-by-step (after `git clone` + `cd super-research-backend`)
-
-**macOS / Linux:**
-```bash
-mv ~/Downloads/super-research-492814-firebase-adminsdk-fbsvc-*.json \
-   ./firebase-service-account.json
-ls -lh firebase-service-account.json   # should show ~2 KB
-```
-
-**Windows (PowerShell):**
-```powershell
-Move-Item "$HOME\Downloads\super-research-492814-firebase-adminsdk-fbsvc-*.json" `
-          ".\firebase-service-account.json"
-Get-Item .\firebase-service-account.json | Format-List Name,Length
-```
-
-**Windows (Git Bash / WSL):**
-```bash
-mv "/c/Users/$USER/Downloads/super-research-492814-firebase-adminsdk-fbsvc-"*.json \
-   ./firebase-service-account.json
-ls -lh firebase-service-account.json
-```
-
-If you have multiple matching files in Downloads (you may have re-downloaded), the wildcard might match >1 — copy the most recent one explicitly instead.
-
-### Verify it landed correctly
-
-```bash
-# From the repo root:
-ls firebase-service-account.json
-# OR on Windows PowerShell:
-Test-Path .\firebase-service-account.json
-```
-
-Open the file in any editor — it should be valid JSON starting with `{ "type": "service_account", ...`. If the file is HTML or empty, the email attachment didn't save correctly.
-
-### Safety
-
-- The `.gitignore` is pre-configured: this filename can never accidentally land in a commit, even with `git add -A`.
-- Don't email the file onward, don't commit it, don't paste it into Slack. One file per person.
-- If you suspect the key is compromised, email the dev — keys can be rotated in the Firebase Console.
-
-### What happens if it's missing or wrong
-
-Both `--pair` and `--serve` fail loudly on startup with the path they tried to load:
-
-```
-[FATAL] firebase-service-account.json not found at /path/to/super-research-backend/firebase-service-account.json
-        Email the dev for the file. See README → "Firebase Admin Key".
-```
-
-> **Coming in the next update:** a proper pairing-time token exchange so new users self-onboard without the admin key at all. Until then, email flow stays.
+**Reset Pair Code.** Settings → Manage devices → Reset rotates the
+code, revokes the BE's refresh token, clears `sharedWith=[]`, and
+emails you the new code with a 15-min TTL. The BE's recovery watcher
+notices the revoke, polls the same pending subdoc, picks up the new
+customToken once you enter the new code in the FE, and exits cleanly
+so the supervisor respawns with a fresh keystore + listener
+subscriptions. **No `--pair` on the PC needed** — the device is back
+online within ~5s of you entering the new code. Miss the 15-min
+window and you'll need to re-run `--pair` for a fresh device record.
 
 ## Setup Details
 
@@ -211,14 +176,31 @@ python research.py --pair
 
 The flow has **five** gated stages — each waits for the previous to confirm before advancing. (The terminal renumbered from 4 to 5 stages with the 2026-05-18 pair-prompt addition.)
 
-**`[1/5] Token setup` — mint + render QR + wait for app to link**
-Mints a new ResearchToken (UUID) or reuses the one in `research_config.json`. The token registers in Firestore (`research_tokens/{token}`) with `status: active`, `machineName`, `createdAt`, `lastHeartbeat`. The token is printed and an ASCII QR renders immediately below it; the flow then polls Firestore every 3s waiting for your app to link the token to an authenticated user. Two equally-good ways to link:
-- **Scan** — in the Super Research app: chat → *Connect* bubble → *Scan QR* button, OR Account → Pipeline Connection → small QR icon beside the paste field. Point the phone camera at the terminal QR.
-- **Paste** — copy the token line printed above the QR and paste it into Account → Pipeline Connection → *Paste your ResearchToken* → *Link*.
+**`[1/5] Pair code` — mint + render code+QR + wait for app to claim**
+Mints (or reuses) a 256-bit `pollSecret` and POSTs `sha256(pollSecret)`
+to the FE Cloud Function `/api/devices/initiate-pair`. The function
+creates a synthetic Firebase Auth user, allocates a unique 8-char pair
+code, and returns `{ deviceId, pairCode }`. The terminal prints the
+code in big mono digits with a dash at position 4 (`K7XQ-9B2M`) and an
+ASCII QR right below; the BE then polls
+`devices/{deviceId}/pending/{sha256(pollSecret)}` (anonymous Firestore
+REST) every ~2s for a customToken. Two ways to claim:
+- **Type** — Super Research app → **Account → Add Device** → paste
+  the 8-char code → submit. Works on any device with the app open.
+- **Scan** — phone camera on the QR; the encoded payload deep-links
+  to Account → Add Device with the code pre-filled.
 
-> **Don't have a web app account yet?** The Super Research app lives at the deployment URL the dev shares with you (Google sign-in only). If you weren't invited yet, ping the dev. The app is required for this stage — `--pair` will sit on its polling loop until you link.
+> **Don't have a web app account yet?** The Super Research app lives
+> at the deployment URL the dev shares with you (Google sign-in only).
+> The app is required for this stage — `--pair` sits on its polling
+> loop until you claim the code. Default window is 15 minutes.
 
-Once the app writes the token to your `users/{uid}/settings.researchToken` field, the flow resolves your email via Firebase Auth and prints `[ok] Linked — you@example.com`. Default link timeout is 10 minutes. Delete `research_config.json` if you want to mint a fresh token on the next run.
+Once the claim function writes the customToken, the BE exchanges it
+via Firebase REST for `{refreshToken, idToken, uid}`, saves the
+refresh token to the OS keystore, and prints
+`[ok] Paired — you@example.com`. The `pollSecret` survives in
+`research_config.json` so a future Reset Pair Code can rebind to the
+same `deviceId` without a fresh handshake.
 
 **`[2/5] On Startup` — supervised auto-restart prompt**
 After the link lands, `--pair` prompts:
@@ -251,7 +233,7 @@ Opens 4 browser tabs in a persistent Playwright profile and auto-verifies login 
 
 > Phases 4 + 5 run in the frontend now (YouTube via Data API, Doc + email via Docs API + Resend), so YouTube Studio, Gmail, and Google Docs are no longer in the BE login checklist.
 
-The checklist re-renders only when a platform flips — `[ok]` for logged in, `[  ]` for not yet. It also mirrors the live state to Firestore (`research_tokens/{token}.logins`, `setupState`) so the app can show your progress. Default timeout is 10 minutes; Ctrl+C cancels.
+The checklist re-renders only when a platform flips — `[ok]` for logged in, `[  ]` for not yet. It also mirrors the live state to the BE-owned `devices/{deviceId}.logins` map so the app can show your progress. Default timeout is 10 minutes; Ctrl+C cancels.
 
 > **Markers only tick after real auth.** `verify_login()` checks only auth-specific DOM (profile menus, account chips, chat-history lists). Generic chat-input elements are excluded because they show up on logged-out landing pages too.
 
@@ -265,8 +247,8 @@ If you said `Y` to On Startup back in Stage 2, the supervisor is armed now — W
 When all 4 platform logins clear, the flow:
 
 1. Closes the browser
-2. Writes `research_config.json` locally (if not already present)
-3. Keeps the token registered in Firestore
+2. Persists `pollSecret`, `deviceId`, `pairedUid` in `research_config.json`
+3. Keeps the refresh token in the OS keystore (DPAPI / Keychain / libsecret)
 4. Arms the supervisor inline if you said `Y` to On Startup back in Stage 2 (Windows Scheduled Task / macOS LaunchAgent / Linux systemd-user unit), or tears down any leftover scheduled task if you said `n`
 5. **Exits the Python process — pair does not stay running.**
 
@@ -292,9 +274,9 @@ python research.py --serve
 ```
 
 The server runs on port 8000 with:
-- A **30s heartbeat** → updates `research_tokens/{token}.lastHeartbeat` AND the paired `users/{uid}/devices/{deviceId}.lastHeartbeat` so the app's Account page and sidebar device switcher both show the right online/offline dot.
-- A **token-doc watcher** for sub-second relink: if you unlink this device from the app and paste the token back, the device tile reappears in well under a second instead of waiting up to 30s for the next heartbeat to self-heal it.
-- A **Firestore queue listener** — picks up jobs from `research_tokens/{token}/queue/`. Single-worker per backend: if you fire a second topic on the same PC while the first is running, the second lands in an explicit `queued` state (with a chat banner + Cancel button in the app) until the first finishes.
+- A **5s heartbeat** → writes `devices/{deviceId}.lastHeartbeat` + `status` so the app's Account page and sidebar device switcher both show the right online/offline dot. (FE offline threshold is 15s, so two missed heartbeats flip the tile.)
+- A **Reset-recovery watcher** — idle while the Firestore client is healthy; when the owner triggers Reset Pair Code, the BE's refresh-token revokes and this watcher polls `devices/{deviceId}/pending/{sha256(pollSecret)}` for the new customToken. On pickup it bootstraps a fresh keystore entry and exits cleanly so the supervisor respawns with new subscriptions. Net effect: Reset is hands-off on the PC under supervised mode.
+- A **Firestore queue listener** — picks up jobs from `devices/{deviceId}/queue/`. Single-worker per backend: if you fire a second topic on the same PC while the first is running, the second lands in an explicit `queued` state (with a chat banner + Cancel button in the app) until the first finishes. Sharers can submit too — the BE picks up their queue items as long as their uid is in `sharedWith[]`.
 - A **command listener** for `stop` / `pause` / `resume` / `config` / `add_context` / `agent_decision` / `continue_anyway` / `retry_phase` / `skip_phase` / `skip_init_verify` / `retry_init_verify` / `skip_agent` / `retry_agent` / `continue_partial_agent` / `poke_agent` / `wait_longer_agent` / `dismiss_alert` / `discard_run` / `ping`. **Dispatcher resume-contract (2026-05-18):** every action that acknowledges a paused alert calls `_controls.request_resume()` so the pipeline doesn't stay paused after the user clicks the action button. A static-analysis test (`tests/test_dispatcher_resume_contract.py`) asserts the rule on every required-resume action and rejects accidental `request_resume` on non-pause actions (`pause`, `stop`, `discard_run`, `ping`, `add_context`, `config`, `dismiss_alert`).
 
 - **CLI dispatcher pause-reason routing** (DGOPS-7710 / F6 + 3 follow-up fixes) — when an alert pauses the BE with a `pause_reason` (`agent_link_failed`, `human_verification_required`, `cua_unavailable`, `claude_chat_mode`, `login_required`, `pro_required`), the CLI `r` / `s` keystrokes route to the correct alert-specific helpers (`set_agent_decision`, `set_continue_anyway`, `request_skip_agent`, `request_skip_init_verify`) **plus** `request_resume`, so manual operator intervention always releases the pause. The same routing pattern is mirrored on the Firestore command bus.
@@ -385,18 +367,19 @@ python research.py --unpair          # default: preserves the Playwright browser
 python research.py --unpair --deep   # also wipes ~/.super-research/browser-profile/ for a fresh-browser re-pair
 ```
 
-The "I'm done with this PC" command — wipes everything `--retire` wipes, AND removes the device from the registry. After `--unpair`, this PC appears NOWHERE in the Super Research app's device list.
+The "I'm done with this PC" command — wipes everything `--retire` wipes, AND deletes the device server-side so it disappears from every browser instantly. After `--unpair`, this PC appears NOWHERE in the Super Research app's device list.
 
-Four-step:
+Five-step:
 
-1. **Process kill + Scheduled Task removal** (always runs Step 1 regardless of pairing state, so partial-pairing scenarios clean up correctly).
-2. **Removes the device doc** from `users/{uid}/devices/{deviceId}`.
-3. **Wipes `research_config.json` + `device_config.json`** locally.
-4. **Final-state verification** — if anything survived, prints the surviving PIDs so you can taskkill manually.
+1. **Process kill + scheduled-task/launchd/systemd-unit removal** (always runs regardless of pairing state, so partial-pairing scenarios clean up correctly).
+2. **Server-side delete** — mints a fresh ID token against the current refresh token, calls `/api/devices/unpair-self` so the Cloud Function revokes the synthetic Firebase Auth user, deletes the device doc, and drops the admin-only pollSecretHash entry. Owner + sharer tiles vanish across every browser within a second.
+3. **Keystore clear** — wipes the OS keystore entry (DPAPI / Keychain / libsecret slot or the `chmod 0600` file fallback).
+4. **Wipes `research_config.json` + `device_config.json`** locally so a future `--pair` starts fresh.
+5. **Final-state verification** — if anything survived, prints the surviving PIDs so you can taskkill manually.
 
 **With `--deep`**, an additional step removes the Playwright profile directory (`~/.super-research/browser-profile/`) via `shutil.rmtree(..., ignore_errors=True)`. Use this when re-pairing to a different account or when the F4 cookie check refused pair due to stale Google auth. The default preserves the profile so a re-pair on the same account doesn't force you back through ChatGPT/Gemini/Claude/NotebookLM logins.
 
-To bring this PC back: re-run `--pair` to mint a fresh ResearchToken and re-pair with your account.
+To bring this PC back: re-run `--pair` to mint a fresh deviceId + pair code and claim it from the app.
 
 ### Step 6: Fire a research topic in the app
 
@@ -404,11 +387,13 @@ Open Super Research (the web app) → type a topic → backend picks it up from 
 
 ## Multiple Devices (same user)
 
-One account can pair multiple PCs. Each `--pair` on a new machine registers its own `users/{uid}/devices/{deviceId}` doc. The app's sidebar gets a device switcher (with online/offline dots) and every research is stamped with the device it ran on — so jobs you fire from the app route back to the specific PC that was **active** when you hit Start. If you fire two jobs on the same device while one is running, the second queues; if you fire one on a different device, both run in parallel.
+One account can pair multiple PCs. Each `--pair` on a new machine mints its own synthetic device user + top-level `devices/{deviceId}` doc. The app's sidebar gets a device switcher (with online/offline dots) and every research is stamped with the device it ran on — so jobs you fire from the app route back to the specific PC that was **active** when you hit Start. If you fire two jobs on the same device while one is running, the second queues; if you fire one on a different device, both run in parallel.
 
-## Multiple Users (same backend)
+## Multiple Users (same backend) — sharing via pair code
 
-Multiple people can also share one backend. Share your ResearchToken — they paste it in their own Account settings. Per-user scoping happens via Firestore security rules; the backend just drains the shared queue.
+The same 8-char pair code drives sharing. Show the code in Account → Manage devices (or copy it from the email after Reset), share it with a teammate, and they paste it into their own Account → Add Device. The FE claim function notices the device is already owned and appends their uid to `sharedWith[]` — they get a tile labeled "Shared by {your name}" and can submit research that runs on your PC.
+
+Per-user scoping is enforced by Firestore rules + the BE's custom claim. Sharers can submit research and read their own runs; they can't read the owner's other data, can't read the owner's research history, and can't see the pair code (it's gated by the owner's Pair Code Lock if enabled). Reset clears `sharedWith=[]` in one step — handy for revoking access to a stolen / overshared device without taking the BE down.
 
 ## Pipeline Phases
 
@@ -524,7 +509,6 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 |----------|---------|-------------|
 | `CUA_API_KEY` | (required) | Anthropic API key for browser automation. `ANTHROPIC_API_KEY` is also accepted as a fallback (research.py:203). |
 | `ANTHROPIC_API_KEY` | (fallback for `CUA_API_KEY`) | Standard Anthropic env var; auto-detected if `CUA_API_KEY` isn't set. Also drives the narrator's Haiku 4.5 primary brain. |
-| `RESEARCH_TOKEN` | (from pair) | Override ResearchToken (for Docker/CI) |
 | `CUA_MODEL` | `claude-opus-4-7` | Claude model for CUA |
 | `CUA_SCREEN_WIDTH` | `1280` | Browser viewport width |
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |
@@ -548,8 +532,7 @@ research-automate/
 ├── narrate.py           # Vision-tier panel narrator (PHASE_BUDGET=0 by default; retired 2026-04-30 — re-enable via DG_VISION_NARRATE=1)
 ├── vision_test.py              # Fixture replay tool: --capture saves PNG+JSON, --fixtures replays + asserts action-class agreement + bbox containment
 ├── requirements.txt            # Python dependencies (now includes patchright>=1.59)
-├── firebase-service-account.json  # Firebase connection (not committed)
-├── research_config.json        # Your ResearchToken (generated by --pair)
+├── research_config.json        # deviceId + pollSecret + pairedUid (generated by --pair; keep gitignored)
 ├── run_analytics.json          # Historical phase durations (auto-updated)
 ├── ARCHITECTURE.md             # Backend architecture + Frontend ↔ Backend API contract
 ├── .dg-supervisor.env          # Per-machine env config (gitignored; seeded from scripts/dg-supervisor.env.example on first --resurrect)
