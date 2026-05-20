@@ -1496,16 +1496,16 @@ _LEGACY_PIPE_CONFIG_PATH = Path(__file__).parent / "pipe_config.json"
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    """Atomic JSON dump: write to a sibling temp file, os.replace onto the
-    target. Guarantees readers in another process/thread never see a
-    partial or truncated file — os.replace is atomic on Windows + POSIX
-    when source and destination are on the same volume (which they are,
-    same directory). Prevents the "concurrent --pair + serve heartbeat +
-    daemon-loop respawn" race where a reader would catch mid-write garbage,
-    json.loads would throw, the reader's subsequent save_device_config
-    would write back with a default-{} config, wiping deviceId, and the
-    next write_device_doc call would mint a new deviceId → duplicate
-    device doc in Firestore."""
+    """Atomic JSON dump: write to a sibling temp file, then os.replace
+    onto the target. Guarantees readers in another process/thread never
+    see a partial or truncated file — os.replace is atomic on Windows
+    and POSIX when source + destination are on the same volume (which
+    they are; we use the same directory). Prevents the concurrent
+    --pair + serve heartbeat + daemon-loop respawn race where a reader
+    catches mid-write garbage, json.loads throws, and the reader's
+    save_device_config writes back a default-{} config that wipes
+    deviceId — which would mint a fresh deviceId on the next pair
+    and orphan the Firestore device doc."""
     import tempfile
     parent = str(path.parent)
     fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=path.name + ".", suffix=".tmp")
@@ -2116,10 +2116,10 @@ def _wait_for_uploads_to_settle(max_wait_s: float = 5.0, poll_s: float = 0.1) ->
 
 
 def _resolve_storage_bucket() -> str:
-    """Same bucket name resolver legacy `_init_firebase_legacy` uses, lifted
-    out so the Storage REST path can reuse it without importing
-    firebase_admin. Honors the env override; falls back to the new
-    `<project>.firebasestorage.app` convention."""
+    """Resolve the Firebase Storage bucket name. Honors the
+    `FIREBASE_STORAGE_BUCKET` env override; falls back to the
+    `<project>.firebasestorage.app` convention used by Firebase
+    projects created Oct 2024+."""
     explicit = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
     if explicit:
         return explicit
@@ -25084,24 +25084,12 @@ async def run_server(port=8000):
         # rehydration raised partway through.
         _rehydrated_rids: "set[str]" = set()
         if paired_uid:
-            # Hard 15s ceiling on the device-doc write so a stalled
-            # Firestore gRPC channel (auth-token refresh / Watch back-
-            # pressure on a busy account) can't park startup forever
-            # before `await server.serve()` binds port 8000. Pre-fix
-            # symptom: BE log reaches "[orphan-sweep] started" then
-            # never emits "Device doc updated", uvicorn never binds,
-            # FE renders BE as offline indefinitely. Heartbeat retries
-            # the device write every 5s anyway, so a timeout here is
-            # purely a recovery latency cost (next tick fixes it).
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(write_device_doc, paired_uid, token),
-                    timeout=15.0,
-                )
-            except asyncio.TimeoutError:
-                log("[startup] write_device_doc timed out — heartbeat will retry on next tick", "WARN")
-            except Exception as _wd_e:
-                log(f"[startup] write_device_doc failed: {_wd_e} — heartbeat will retry", "WARN")
+            # The heartbeat loop writes lastHeartbeat + status to
+            # devices/{deviceId} every 5s, so a startup-side eager write
+            # is no longer necessary — the first heartbeat tick (within
+            # ~5s of --serve binding the port) brings the Account-page
+            # tile online.
+
             # Queue rehydration: recover runs that were queued or mid-run when
             # the previous daemon process died. Queued jobs re-enter the in-
             # memory queue; mid-run jobs can't safely resume (browser/CUA state
@@ -27311,26 +27299,23 @@ def run_daemon_loop(port: int = 8000):
         log(f"[daemon-loop] Pre-flight sweep: killed {killed}/{len(sweep_pids)} stale research.py procs ({sweep_pids})")
 
     # Pre-flight dependency probe — runs once before the respawn loop.
-    # Catches the silent-crash trap: when --serve fails its import chain
-    # (e.g. fastapi missing, or firebase_admin importable but its
-    # google.auth transitive dep absent), the supervisor would otherwise
-    # retry forever at 5s/cycle with no loud signal. 2026-05-03: a Python
-    # 3.13→3.14 interpreter swap orphaned 17 packages and produced a
-    # 295-restart silent crash-loop that looked healthy from the outside
-    # (daemon-loop alive, /api/health 200 once finally working but
-    # Firestore disabled). One loud abort is much better than infinite
-    # quiet retries — the Scheduled Task's PT5M re-fire still gives a
-    # second chance after the user fixes deps.
+    # Catches the silent-crash trap: when --serve fails its import
+    # chain (e.g. fastapi missing, or google.auth transitive dep absent),
+    # the supervisor would otherwise retry forever at 5s/cycle with no
+    # loud signal. One loud abort is much better than infinite quiet
+    # retries — the supervisor's re-fire still gives a second chance
+    # after the user reinstalls deps.
     try:
         import importlib
-        # Use full dotted module paths — importlib.import_module handles
+        # Full dotted module paths — importlib.import_module handles
         # submodules (PIL.Image, google.auth, google.cloud.firestore) but
-        # `import PIL; getattr(PIL, "Image")` raises AttributeError because
-        # PIL.Image is a submodule, not an attribute of the PIL package.
+        # `import PIL; getattr(PIL, "Image")` raises AttributeError
+        # because PIL.Image is a submodule, not an attribute of the
+        # PIL package.
         _critical = [
             "fastapi", "uvicorn", "websockets", "pydantic",
             "typing_extensions", "anthropic", "playwright", "patchright",
-            "firebase_admin", "google.auth", "google.cloud.firestore",
+            "google.auth", "google.cloud.firestore", "keyring",
             "PIL.Image", "markdownify", "requests", "qrcode",
         ]
         _missing: list[str] = []
@@ -28273,40 +28258,37 @@ def run_retire():
 def run_unpair(deep: bool = False):
     """Fully disconnect this machine from Super Research — opposite of --pair.
 
-    Semantics: after --unpair, this PC appears NOWHERE in the Super Research
-    app. The device doc under the user account is deleted, the research_token
-    doc is revoked project-wide, local pairing config (token + deviceId +
-    pairedUid) is wiped. A subsequent --pair mints a fresh token and
-    registers a new device from scratch — there's no quiet "rejoin" path
+    Semantics: after --unpair, this PC appears nowhere in the Super
+    Research app. The device doc is deleted via the unpair-self Cloud
+    Function call, local pairing config + OS-keystore refresh token
+    are wiped, the scheduled-task supervisor (if any) is removed, and
+    every daemon-loop / --serve process owned by this user is killed.
+    A subsequent --pair starts fresh — there's no quiet "rejoin" path
     that resurrects the old identity.
 
     Preserved by default (delete manually for a truly clean machine):
       • Chrome profile at ~/.super-research/browser-profile/ (your logins)
       • Pipeline history in queues/
-      • firebase-service-account.json (needed to re-pair)
 
-    With `deep=True` (CLI: `--unpair --deep`), ALSO wipes the Chrome profile
-    directory so the next `--pair` starts with a fresh browser. Use this when
-    re-pairing to a different account or when the F4 cookie check refuses
-    pair due to stale Google auth.
+    With `deep=True` (CLI: `--unpair --deep`), ALSO wipes the Chrome
+    profile directory so the next `--pair` starts with a fresh browser.
+    Use this when re-pairing to a different account or when the
+    multi-account safety check refuses pair due to stale Google auth.
 
-    This is the destructive counterpart to the app's "unlink" action, which
-    only clears linkedUid on the token doc and leaves the device/token
-    themselves live. --unpair is what the user runs when they're done with
-    Super Research on this PC entirely.
-
-    Five-step reset (order matters — config wipe FIRST to stop a
-    daemon-loop-respawned --serve from recreating the device doc moments
-    after step 3 deletes it):
-      1. Wipe local research_config.json (+ legacy pipe_config.json) and
-         zero in-memory caches. A respawned --serve now reads empty config
-         and bails in write_device_doc's `not uid or not token` guard.
-      2. Remove the scheduled task; kill every daemon-loop + serve process.
-         With config already wiped, lingering processes are harmless.
-      3. Delete users/{uid}/devices/{deviceId} so the device vanishes from
-         the Account page device list.
-      4. Delete research_tokens/{token} so the token is gone project-wide.
-      5. Verify nothing survived."""
+    Five-step reset (order matters):
+      0. Pre-step: while keystore is still alive, mint an ID token and
+         POST /api/devices/unpair-self so the FE drops the device tile
+         instantly across every browser.
+      1. Wipe local research_config.json + OS-keystore refresh token
+         + zero in-memory caches. A respawned --serve now reads empty
+         state and the heartbeat loop bails on its missing-deviceId
+         guard.
+      2. Remove the supervisor artifact; kill every daemon-loop +
+         --serve process.
+      3. Confirm the server-side retire (or fall back to FE Unlink for
+         pre-cutover devices the BE can't reach).
+      4. Local artifacts summary.
+      5. Verify no related process survived."""
     import subprocess as _subprocess
     import platform as _platform
     import time as _time
@@ -28370,16 +28352,13 @@ def run_unpair(deep: bool = False):
     total = 5
 
     # ── [1/5] Wipe local config FIRST ──
-    # Critical ordering: research_config.json must disappear BEFORE we kill
-    # + delete Firestore docs. A daemon-loop respawns --serve on a 5s loop
-    # (research.py:14495); if we killed processes first there's a window
-    # where a freshly-spawned --serve reads still-valid config, calls
-    # write_device_doc (which uses set({...}, merge=True) → CREATES), and
-    # resurrects the device doc moments after we deleted it. The user saw
-    # the tile "remove and readd" because of exactly this race. With the
-    # config wiped first, any respawned serve's load_paired_uid / token
-    # return None, so write_device_doc early-returns on the
-    # `not uid or not token` guard (research.py:792).
+    # Ordering: research_config.json + keystore disappear BEFORE we
+    # kill processes. A daemon-loop respawns --serve on a 5s loop; if
+    # processes were killed first, a freshly-spawned --serve could
+    # read still-valid config and re-attach to Firestore. Wiping config
+    # first means any respawned --serve reads empty state and the
+    # heartbeat loop bails on its missing-deviceId guard before any
+    # external writes happen.
     _setup_step(1, total, "Wiping local pairing config")
     wiped = []
     try:
