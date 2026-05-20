@@ -1424,7 +1424,32 @@ BE_PHASES_TIMEOUT_SEC = 4200
 
 
 def init_firebase():
-    """Initialize Firebase Admin SDK from service-account JSON. Call once at server start.
+    """Initialize the Firestore client for this BE process. Routes based on
+    `load_auth_mode()` — every call site (`run_pair`, `run_doctor`,
+    `_heartbeat_loop` self-heal, `cmd_pair_v2`, etc.) goes through this
+    single entry point so the auth-mode switch is centralized.
+
+    legacy mode → Firebase Admin SDK from `firebase-service-account.json`.
+                  Existing behavior, default for every install before
+                  PR-D5c flips the default to user-mode.
+    user mode   → `google.cloud.firestore.Client` backed by the OS
+                  keystore's refresh token (PR-D3 cmd_pair_v2 deposited
+                  it). No service-account.json on disk; per-user blast
+                  radius. PR-D5a-core.
+
+    Returns True on success, False on any error (caller falls back per
+    its own policy)."""
+    global _firebase_db
+    if _firebase_db:
+        return True
+    mode = load_auth_mode()
+    if mode == "user":
+        return _init_firebase_user_mode()
+    return _init_firebase_legacy()
+
+
+def _init_firebase_legacy() -> bool:
+    """Admin-SDK init from firebase-service-account.json. Pre-Track-D path.
 
     Also configures the Storage bucket so Phase 3 can upload NotebookLM audio
     to Firebase Storage (which then streams to the Vercel Podcasts page). The
@@ -1434,8 +1459,6 @@ def init_firebase():
     `<project>.appspot.com`, set the env var explicitly.
     """
     global _firebase_db
-    if _firebase_db:
-        return True
     try:
         import firebase_admin
         from firebase_admin import credentials, firestore as _fs
@@ -1468,6 +1491,73 @@ def init_firebase():
     except Exception as e:
         log(f"Firebase init error: {e}", "WARN")
         return False
+
+
+def _init_firebase_user_mode() -> bool:
+    """Track D user-mode Firestore init — refresh-token credentials from the
+    OS keystore, no Admin SDK, no firebase-service-account.json. Returns
+    False if the keystore is empty (caller prompts re-pair) or if the
+    refresh token has been revoked (owner triggered Reset; caller wipes
+    keystore + prompts re-pair). Errors are logged at ERROR severity
+    because user-mode without auth = BE can't function."""
+    global _firebase_db
+    try:
+        from auth import v2_flow, keystore as _ks
+    except ImportError as e:
+        log(f"Firebase user-mode: auth/ package import failed: {e}", "ERROR")
+        return False
+    install_uuid = _ks.install_uuid()
+    if _ks.try_recover(install_uuid) is None:
+        log(
+            "Firebase user-mode: keystore empty — run "
+            "`python research.py --pair --auth-mode=user` to establish a refresh token.",
+            "ERROR",
+        )
+        return False
+    client = v2_flow.init_firestore_user_scoped(install_uuid)
+    if client is None:
+        log(
+            "Firebase user-mode: refresh token rejected (revoked or expired). "
+            "If you triggered Reset Pair Code, check your email for the new code "
+            "and run `python research.py --pair --auth-mode=user`.",
+            "ERROR",
+        )
+        return False
+    _firebase_db = client
+    log(f"Firestore user-mode client initialized ✓ (install={install_uuid[:8]}…)")
+    return True
+
+
+def _be_payload(data: dict) -> dict:
+    """Inject `deviceId` into a write payload when running in user-mode.
+
+    The Firestore `deviceWritingTo` / `deviceUpdatingFor` rules introduced
+    in PR-D2a require BE writes to user trees to declare which device is
+    doing the write. The deviceId in the payload MUST equal the BE's
+    `auth.token.deviceId` claim (set at custom-token mint time by the
+    claim Cloud Function). `load_device_id()` reads from research_config
+    .json — the same id that was used to bootstrap the claim.
+
+    In legacy mode this helper is a no-op: the doc is written as-is and
+    the Admin SDK bypasses all rules.
+
+    Every centralized write helper that targets `users/{ownerUid}/...`
+    paths must call `_be_payload(data)` immediately before the
+    Firestore call. Pre-D5a-pre this was 17 inline writes; post-D5a-pre
+    it's the 6 centralized helpers (`_update_research_doc`,
+    `_set_research_doc`, `emit_event`, `save_audio_to_firestore`,
+    `save_document_to_firestore`, `update_link_in_firestore`)."""
+    if load_auth_mode() != "user":
+        return data
+    did = load_device_id()
+    if not did:
+        # No deviceId persisted — user-mode pair never completed. Caller's
+        # Firestore write will permission-deny; rather than silently
+        # corrupting state, surface a warn here so the failure mode is
+        # obvious.
+        log("_be_payload: user-mode active but deviceId missing from research_config.json", "WARN")
+        return data
+    return {**data, "deviceId": did}
 
 
 _start_listener = None  # Global start-command listener
@@ -2437,14 +2527,14 @@ def save_audio_to_firestore(audio_id: str, name: str, duration_sec: int, audio_u
         _firebase_db.collection("users").document(_fb_uid) \
             .collection("researches").document(_fb_research_id) \
             .collection("audios").document(audio_id) \
-            .set({
+            .set(_be_payload({
                 "id": audio_id,
                 "name": name,
                 "duration": f"{mins}:{secs:02d}" if duration_sec else "",
                 "durationSec": int(duration_sec or 0),
                 "createdAt": int(time.time() * 1000),
                 **({"audioUrl": audio_url} if audio_url else {}),
-            })
+            }))
     except Exception as e:
         log(f"Failed to sync audio to Firestore: {e}", "WARN")
 
@@ -2473,14 +2563,14 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
         _firebase_db.collection("users").document(_fb_uid) \
             .collection("researches").document(_fb_research_id) \
             .collection("documents").document(doc_type) \
-            .set({
+            .set(_be_payload({
                 "id": doc_type,
                 "name": name or f"{doc_type}.md",
                 "type": doc_type,
                 "content": content,
                 "size": f"{len(content) / 1024:.0f} KB",
                 "createdAt": int(time.time() * 1000),
-            })
+            }))
         return True
     except Exception as e:
         # F5 (2026-05-13): include exception class + gRPC/HTTP status code
@@ -3173,7 +3263,7 @@ def _emit_to_firestore(event):
     try:
         _firebase_db.collection("users").document(_fb_uid) \
             .collection("researches").document(_fb_research_id) \
-            .collection("pipeline_events").add(doc_data)
+            .collection("pipeline_events").add(_be_payload(doc_data))
     except Exception as e:
         log(f"Firestore emit failed: {e}", "WARN")
 
@@ -3212,7 +3302,7 @@ def update_link_in_firestore(kind: str, url: str, **fields):
     try:
         _firebase_db.collection("users").document(_fb_uid) \
             .collection("researches").document(_fb_research_id) \
-            .set({"links": {kind: payload}}, merge=True)
+            .set(_be_payload({"links": {kind: payload}}), merge=True)
     except Exception as e:
         log(f"Firestore link update failed ({kind}): {e}", "WARN")
 
@@ -3272,10 +3362,8 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
     (required by the `deviceUpdatingFor` Firestore rule) in ONE place
     instead of patching 17 scattered call sites.
 
-    Pre-PR-D5a-pre, these writes were inlined across cancel / watchdog /
-    queue-position / backendRunId paths. The shotgun-pellet rewrite for
-    user-mode would have missed one with high probability — see the
-    advisor's plan review for the rationale.
+    In user-mode `_be_payload` injects `deviceId` so the
+    `deviceUpdatingFor` rule passes; in legacy mode it's a no-op.
 
     Returns True on success, False on failure (logged WARN; never raises).
     Sync — async callers wrap with `asyncio.to_thread`."""
@@ -3284,7 +3372,7 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
     try:
         _firebase_db.collection("users").document(uid) \
             .collection("researches").document(research_id) \
-            .update(updates)
+            .update(_be_payload(updates))
         return True
     except Exception as e:
         log(
@@ -3306,7 +3394,7 @@ def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = T
     try:
         _firebase_db.collection("users").document(uid) \
             .collection("researches").document(research_id) \
-            .set(data, merge=merge)
+            .set(_be_payload(data), merge=merge)
         return True
     except Exception as e:
         log(
