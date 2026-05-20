@@ -1377,7 +1377,6 @@ _fb_uid = None          # Per-run: user ID for Firestore path
 _fb_research_id = None  # Per-run: research ID for Firestore path
 _fb_seq = 0             # Per-run: last-emitted seq (monotonic guard; ms-based)
 _fb_listener = None     # Per-run: command listener unsubscribe handle
-_research_token = None  # ResearchToken: this backend instance's unique ID
 
 # Shared queue state: mutated by the job worker in run_server, read by the
 # Firestore start listener (module-level function) so queued research docs
@@ -1528,93 +1527,6 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
-def load_research_token():
-    """Load ResearchToken from local research_config.json (or RESEARCH_TOKEN env var).
-    Returns the token string or None if not set up yet.
-
-    Auto-migrates old pipe_config.json → research_config.json if found (one-time).
-    """
-    global _research_token
-    # Env var takes precedence (for Docker/CI deployments)
-    env_token = os.environ.get("RESEARCH_TOKEN", "").strip() or os.environ.get("PIPE_TOKEN", "").strip()
-    if env_token:
-        _research_token = env_token
-        return _research_token
-
-    # One-time migration: pipe_config.json → research_config.json
-    if _LEGACY_PIPE_CONFIG_PATH.exists() and not RESEARCH_CONFIG_PATH.exists():
-        try:
-            legacy = json.loads(_LEGACY_PIPE_CONFIG_PATH.read_text(encoding="utf-8"))
-            migrated = {
-                "researchToken": legacy.get("pipeToken", "").strip(),
-                "machineName": legacy.get("machineName", ""),
-            }
-            if migrated["researchToken"]:
-                _atomic_write_json(RESEARCH_CONFIG_PATH, migrated)
-                log(f"Migrated pipe_config.json → research_config.json")
-        except Exception as e:
-            log(f"Migration of pipe_config.json failed: {e}", "WARN")
-
-    if RESEARCH_CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
-            _research_token = (cfg.get("researchToken") or cfg.get("pipeToken") or "").strip() or None
-            return _research_token
-        except Exception:
-            pass
-    return None
-
-
-def generate_research_token():
-    """Mint a new ResearchToken and register it in Firestore. Does NOT
-    persist it to research_config.json — the caller is expected to call
-    _persist_research_token_locally() only AFTER the pairing link is
-    confirmed, so a mid-pair Ctrl+C or timeout leaves no trace on disk.
-    The Firestore side is torn down by run_pair's abort cleanup if the
-    link never completes. Called during --pair; returns the token string.
-    """
-    import uuid
-    import socket
-    global _research_token
-    token = str(uuid.uuid4())
-    machine_name = socket.gethostname()
-
-    if _firebase_db:
-        try:
-            from google.cloud.firestore import SERVER_TIMESTAMP
-            _firebase_db.collection("research_tokens").document(token).set({
-                "status": "active",
-                "machineName": machine_name,
-                "createdAt": SERVER_TIMESTAMP,
-                "lastHeartbeat": SERVER_TIMESTAMP,
-            })
-            log(f"ResearchToken registered in Firestore: {token[:8]}...")
-        except Exception as e:
-            log(f"Failed to register ResearchToken in Firestore: {e}", "WARN")
-
-    _research_token = token
-    return token
-
-
-def _persist_research_token_locally(token: str):
-    """Merge researchToken + machineName into research_config.json. Called
-    by --pair only after the app-side link is confirmed, so an aborted
-    setup never leaves a token on disk that re-runs would blindly reuse.
-    Safe to call on a reused token too (idempotent merge write)."""
-    import socket
-    machine_name = socket.gethostname()
-    local_cfg = {}
-    if RESEARCH_CONFIG_PATH.exists():
-        try:
-            local_cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    local_cfg["researchToken"] = token
-    local_cfg["machineName"] = machine_name
-    _atomic_write_json(RESEARCH_CONFIG_PATH, local_cfg)
-    log(f"ResearchToken saved to {RESEARCH_CONFIG_PATH.name}")
-
-
 # ── Device registry (multi-device support) ─────────────────────────────────
 # A "device" is a paired backend PC. One doc per device lives at
 # users/{uid}/devices/{deviceId}. Multiple devices let a user run concurrent
@@ -1639,14 +1551,6 @@ def load_device_id():
         except Exception:
             pass
     return None
-
-
-def load_auth_mode() -> str:
-    """DEPRECATED — kept for backward-compat with any third-party scripts
-    that import it. The Track D cutover removed legacy mode; this always
-    returns "user". To be deleted in a follow-up after callers are
-    audited."""
-    return "user"
 
 
 def load_poll_secret() -> str | None:
@@ -1793,76 +1697,6 @@ def _detect_supervised_windows() -> bool:
         return False
 
 
-def write_device_doc(uid: str, token: str, device_name: str | None = None):
-    """Upsert users/{uid}/devices/{deviceId}. Preserves user-editable `name`
-    from any prior doc and auto-detects `supervised` from the real
-    scheduled task (so unlink+relink doesn't lose the toggle). Call once
-    from --pair after pairing succeeds, and again from --serve startup to
-    refresh token + heartbeat if the token changed.
-
-    User-mode short-circuit: the legacy `users/{uid}/devices/{deviceId}`
-    path is owner-only in the new rules; a synth-device-user write would
-    permission-deny. In practice every existing caller is also gated on
-    `_research_token` (None in user-mode) so this is defense in depth —
-    if any future caller forgets the gate, we fail closed with a log
-    instead of spamming Firestore with deny errors."""
-    if load_auth_mode() == "user":
-        return
-    if not _firebase_db or not uid or not token:
-        return
-    import socket as _socket
-    import platform as _platform
-    device_id = load_device_id() or generate_device_id()
-    hostname = _socket.gethostname()
-    try:
-        os_str = f"{_platform.system()} {_platform.release()}"
-    except Exception:
-        os_str = _platform.system() or ""
-    doc_ref = _firebase_db.collection("users").document(uid) \
-        .collection("devices").document(device_id)
-    existing = {}
-    try:
-        snap = doc_ref.get()
-        if snap.exists:
-            existing = snap.to_dict() or {}
-    except Exception:
-        pass
-    payload = {
-        "id": device_id,
-        "hostname": hostname,
-        "os": os_str,
-        "token": token,
-        # Millis-as-int (NOT SERVER_TIMESTAMP). Frontend reads it as a number
-        # and compares `Date.now() - lastHeartbeat`; a Firestore Timestamp
-        # object would coerce to NaN and the device would look permanently
-        # offline even while the backend is heartbeating normally.
-        "lastHeartbeat": int(time.time() * 1000),
-        # Auto-detect supervised from the scheduled task so the toggle
-        # survives unlink+relink (task isn't uninstalled by unlink). If
-        # schtasks says "installed", we overwrite whatever was in the doc;
-        # the task is the truth.
-        "supervised": _detect_supervised(),
-    }
-    # Name field rules:
-    #  - If --pair passed an explicit device_name, honor it (user typed
-    #    it at the device-name prompt — overrides any prior value).
-    #  - Else on first write, default to hostname.
-    #  - Else preserve the existing (user may have renamed via Account
-    #    page or a previous setup; heartbeat/relink writers must not
-    #    clobber it).
-    if device_name:
-        payload["name"] = device_name
-    elif "name" not in existing:
-        payload["name"] = hostname
-    if "registeredAt" not in existing:
-        payload["registeredAt"] = int(time.time() * 1000)
-    try:
-        doc_ref.set(payload, merge=True)
-        log(f"Device doc updated: users/{uid}/devices/{device_id}")
-    except Exception as e:
-        log(f"Failed to write device doc: {e}", "WARN")
-
-
 async def _heartbeat_loop():
     """Write lastHeartbeat to research_tokens/{token} AND the paired device
     doc every 5s (HEARTBEAT_INTERVAL_SEC) so the frontend can show
@@ -1919,58 +1753,6 @@ async def _heartbeat_loop():
                 except Exception as reinit_err:
                     log(f"[heartbeat] reinit raised: {reinit_err}", "ERROR")
         await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
-
-
-_token_relink_watch = None  # Firestore Watch handle; kept for lifetime cleanup
-
-
-def _start_token_relink_watcher(token: str):
-    """Subscribe to research_tokens/{token} and react to linkedUid flips in
-    real time, so a user pasting the token into the Account page gets their
-    device tile back in well under a second instead of waiting up to ~30s
-    for the next heartbeat. The heartbeat self-heal at _heartbeat_loop() is
-    kept as a safety net in case the watcher drops.
-
-    The Firestore Admin SDK fires the snapshot callback in a background
-    thread — we do sync work only (write_device_doc + save_device_config).
-    Idempotent against repeated snapshots for the same uid. """
-    global _token_relink_watch
-    if not _firebase_db or not token:
-        return
-    doc_ref = _firebase_db.collection("research_tokens").document(token)
-
-    def _on_snap(snapshots, changes, _read_time):
-        try:
-            for snap in snapshots:
-                data = snap.to_dict() or {}
-                new_uid = (data.get("linkedUid") or "").strip()
-                current_uid = load_paired_uid() or ""
-                # Unlink event: linkedUid was cleared. Forget the old owner
-                # locally so the heartbeat stops mirroring to their device
-                # path (otherwise the Account tile reappears within 30s).
-                # Token + deviceId stay intact — a relink from any user with
-                # the same token restores pairing without re-setup.
-                if not new_uid:
-                    if current_uid:
-                        log(f"Token unlinked (linkedUid cleared for paired uid {current_uid[:8]}…) — clearing local pairedUid; heartbeat will stop mirroring until relink.")
-                        clear_paired_uid()
-                    continue
-                if new_uid == current_uid:
-                    continue
-                log(f"Token relinked → {new_uid[:8]}… — refreshing device doc now.")
-                try:
-                    save_device_config(paired_uid=new_uid)
-                    write_device_doc(new_uid, token)
-                except Exception as e:
-                    log(f"Relink refresh failed: {e}", "WARN")
-        except Exception as e:
-            log(f"Relink watcher callback error: {e}", "WARN")
-
-    try:
-        _token_relink_watch = doc_ref.on_snapshot(_on_snap)
-        log("Token relink watcher started")
-    except Exception as e:
-        log(f"Could not start relink watcher (falling back to 30s heartbeat): {e}", "WARN")
 
 
 _device_cmd_watch = None  # Firestore Watch handle; kept for lifetime cleanup
@@ -3356,41 +3138,13 @@ def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = T
 
 
 # ════════════════════════════════════════════════════════════════════
-# Autonomous P4/P5 — BE→Cloud Run trigger (2026-05-12)
+# Autonomous P4/P5 trigger
 #
-# After BE finishes P3 + writes beDone, fire-and-forget a POST to the
-# FE's /api/uploadYouTube. Cloud Run runs the full YouTube upload +
-# Doc + Email + status="completed" flip server-side — so the queue
-# advances and per-run state lands regardless of whether the user's
-# phone/tab is open.
-#
-# Auth: Admin SDK mints a custom token for the paired uid, exchanged
-# for a Firebase ID token via Identity Toolkit. The ID token rides in
-# the Authorization: Bearer header so the route's verifyRequest passes
-# with the correct uid (matching the Firestore path being written).
-#
-# DG_FE_BASE_URL — set the env var to your App Hosting URL (e.g.
-# `https://<backend>--super-research-492814.us-central1.hosted.app`).
-# If unset, the trigger writes a `needsFeTrigger` marker to Firestore
-# so the FE catch-up hook on next chat-open can re-fire the chain.
-#
-# DG_FE_WEB_API_KEY — Firebase Web API key for the project (NOT a
-# secret; it's also in the FE bundle). Defaults to the super-research
-# project key.
+# After BE finishes P3 + writes beDone, write a `needsFeTrigger: true`
+# marker on the research doc. The FE catch-up hook reads that marker
+# on next chat-open and re-fires the YouTube upload + Doc + Email +
+# status="completed" chain via FE-side credentials.
 # ════════════════════════════════════════════════════════════════════
-
-_DG_FE_BASE_URL = os.environ.get("DG_FE_BASE_URL", "").strip()
-_DG_FE_WEB_API_KEY = os.environ.get(
-    "DG_FE_WEB_API_KEY", "AIzaSyDTjXwU_uOwGrsuf7nuJTfQAZg4dTjSAMk"
-).strip()
-# Cloud Tasks queue path for the autonomous P4/P5 trigger. Format:
-#   projects/{project}/locations/{region}/queues/{queue}
-# Default targets the queue created on 2026-05-12 for the super-research
-# project. Override via env if you deploy to a different project or queue.
-_DG_FE_CLOUD_TASKS_QUEUE = os.environ.get(
-    "DG_FE_CLOUD_TASKS_QUEUE",
-    "projects/super-research-492814/locations/us-central1/queues/super-research-p4-trigger",
-).strip()
 
 
 def _mint_fe_id_token(uid):
@@ -3406,108 +3160,27 @@ def _mint_fe_id_token(uid):
 
 
 def _fire_fe_p4_trigger(uid, research_id):
-    """Enqueue a Cloud Task that POSTs to /api/uploadYouTube to kick off
-    the autonomous P4 + P5 chain. Cloud Tasks owns delivery + retries +
-    timeouts — this function makes one fast API call (~50ms typical)
-    and returns; the BE worker loop never blocks on the network.
+    """Write a `needsFeTrigger` marker on the research doc so the FE
+    catch-up hook re-fires the autonomous P4 + P5 chain on next
+    chat-open. Without an Admin SDK service account, the BE can no
+    longer mint user ID tokens or enqueue Cloud Tasks directly — the
+    FE-side catch-up is the canonical trigger.
 
-    The task body carries `research_id` only; the route reads the rest
-    (audio_url, title, links, etc.) from Firestore via Admin SDK on
-    receipt. The task carries a freshly-minted user ID token in the
-    Authorization header so the route's `verifyRequest` resolves to the
-    right uid for Firestore path scoping.
-
-    Falls back to the `needsFeTrigger` marker path on any failure so
-    the FE catch-up hook can re-fire on next chat-open.
-
-    Returns True on successful enqueue, False otherwise. Sync (no
-    daemon thread needed — Cloud Tasks enqueue is a fast unary call)."""
+    Returns False (no successful enqueue ever happens from this BE).
+    The caller doesn't actually distinguish True/False besides log
+    formatting; the FE catch-up always handles it."""
     if not uid or not research_id:
         log(f"FE trigger: skip (uid={bool(uid)} rid={bool(research_id)})", "WARN")
         return False
-    if not _DG_FE_BASE_URL:
-        log("FE trigger: DG_FE_BASE_URL not configured — writing needsFeTrigger marker", "WARN")
-        try:
-            _update_firestore_research({
-                "needsFeTrigger": True,
-                "needsFeTriggerAt": int(time.time() * 1000),
-            })
-        except Exception:
-            pass
-        return False
-    if not _DG_FE_CLOUD_TASKS_QUEUE:
-        log("FE trigger: DG_FE_CLOUD_TASKS_QUEUE not configured — writing needsFeTrigger marker", "WARN")
-        try:
-            _update_firestore_research({
-                "needsFeTrigger": True,
-                "needsFeTriggerAt": int(time.time() * 1000),
-            })
-        except Exception:
-            pass
-        return False
-    id_token = _mint_fe_id_token(uid)
-    if not id_token:
-        log("FE trigger: mint ID token failed — writing needsFeTrigger marker", "WARN")
-        try:
-            _update_firestore_research({
-                "needsFeTrigger": True,
-                "needsFeTriggerAt": int(time.time() * 1000),
-            })
-        except Exception:
-            pass
-        return False
     try:
-        from google.cloud import tasks_v2
-        from google.oauth2 import service_account
-        import json as _json
-        # Use the same service-account JSON Firebase Admin reads. ADC
-        # would also work on GCP-hosted environments, but here the BE
-        # runs on the user's PC so explicit credentials are required.
-        sa_path = Path(__file__).parent / "firebase-service-account.json"
-        if not sa_path.exists():
-            log("FE trigger: firebase-service-account.json missing — writing marker", "WARN")
-            try:
-                _update_firestore_research({
-                    "needsFeTrigger": True,
-                    "needsFeTriggerAt": int(time.time() * 1000),
-                })
-            except Exception:
-                pass
-            return False
-        _creds = service_account.Credentials.from_service_account_file(str(sa_path))
-        client = tasks_v2.CloudTasksClient(credentials=_creds)
-        url = _DG_FE_BASE_URL.rstrip("/") + "/api/uploadYouTube"
-        body = _json.dumps({"research_id": research_id}).encode("utf-8")
-        task = {
-            "http_request": {
-                "http_method": tasks_v2.HttpMethod.POST,
-                "url": url,
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {id_token}",
-                },
-                "body": body,
-            },
-            # 30-min per-task deadline. Route's typical happy-path is
-            # ~3-5 min (ffmpeg + YouTube + Doc + Email); the deadline
-            # is sized for slow encodes / Resend retries / unverified
-            # channel pre-flight failures. Per-task setting overrides
-            # the default 10-min dispatch deadline.
-            "dispatch_deadline": {"seconds": 1800},
-        }
-        response = client.create_task(parent=_DG_FE_CLOUD_TASKS_QUEUE, task=task)
-        log(f"FE trigger: Cloud Task enqueued name={response.name.rsplit('/', 1)[-1][:16]} rid={research_id[:8]}…")
-        return True
+        _update_firestore_research({
+            "needsFeTrigger": True,
+            "needsFeTriggerAt": int(time.time() * 1000),
+        })
+        log(f"FE trigger: needsFeTrigger marker written rid={research_id[:8]}…")
     except Exception as e:
-        log(f"FE trigger: Cloud Tasks enqueue failed: {e}", "WARN")
-        try:
-            _update_firestore_research({
-                "needsFeTrigger": True,
-                "needsFeTriggerAt": int(time.time() * 1000),
-            })
-        except Exception:
-            pass
-        return False
+        log(f"FE trigger: marker write failed: {e}", "WARN")
+    return False
 
 
 def _do_agent_terminal_status_write(agent_key: str, status: str):

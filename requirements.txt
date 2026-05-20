@@ -21,27 +21,18 @@ uvicorn[standard]>=0.34
 websockets>=13.0
 pydantic>=2.0
 
-# Firebase bridge (backend → Firestore → frontend)
-firebase-admin>=6.5
-# google-cloud-firestore is normally pulled in transitively by firebase-admin,
-# but research.py imports it directly (`from google.cloud import firestore`)
-# in 6+ places — pin it explicitly so the dep doesn't disappear if firebase-admin
-# ever drops it. Bumped to >=2.20 for the Track D refresh-token credential path
-# (`google.cloud.firestore.Client(credentials=...)` is stable from 2.20+).
+# Firestore client — BE authenticates as a per-user synthetic device
+# user via refresh-token credentials from the OS keystore (no Admin
+# SDK, no service-account JSON). `Client(credentials=...)` is stable
+# from 2.20+.
 google-cloud-firestore>=2.20
-# google-auth carries the Credentials base class that RefreshTokenCredentials
-# (auth/credentials.py) subclasses. Already a transitive of firebase-admin,
-# but pinned direct so it survives the Track D D8 firebase-admin removal.
+# Carries the `Credentials` base class that auth/credentials.py's
+# RefreshTokenCredentials subclasses.
 google-auth>=2.30
 # Cross-platform OS keystore for the refresh-token slot rotation in
-# auth/keystore.py. Falls back to a chmod-0600 file under ~/.super-research/
-# on headless Linux without secret-service. Track D PR-D1.
+# auth/keystore.py. Falls back to a chmod-0600 file under
+# ~/.super-research/ on headless Linux without secret-service.
 keyring>=25
-# Cloud Tasks — used to enqueue the autonomous P4/P5 trigger after BE-P3.
-# Replaced the held-HTTP-connection pattern (which Cloud Run aborted ~5s
-# after BE disconnected) on 2026-05-12. BE fires a one-shot task; Cloud
-# Tasks owns delivery + retries; route runs the same P4+P5 chain.
-google-cloud-tasks>=2.16
 
 # Setup QR code rendering
 qrcode>=7.4
