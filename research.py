@@ -2617,20 +2617,15 @@ def start_firestore_start_listener(job_queue, loop):
                     log(f"Cancel: target {target_rid[:8]}… is in gate wait — requesting stop + flipping status", "INFO")
                     loop.call_soon_threadsafe(_controls.request_stop)
                     if _firebase_db:
-                        try:
-                            from google.cloud.firestore import DELETE_FIELD as _DF
-                            _firebase_db.collection("users").document(target_uid) \
-                                .collection("researches").document(target_rid) \
-                                .update({
-                                    "status": "stopped",
-                                    "summary": "Cancelled while queued",
-                                    "cancelled": True,
-                                    "queuePosition": _DF,
-                                    "queuedBehindRunId": _DF,
-                                    "queuedBehindTitle": _DF,
-                                })
-                        except Exception as ex:
-                            log(f"Cancel(gate-pending): failed to mark stopped: {ex}", "WARN")
+                        from google.cloud.firestore import DELETE_FIELD as _DF
+                        _update_research_doc(target_uid, target_rid, {
+                            "status": "stopped",
+                            "summary": "Cancelled while queued",
+                            "cancelled": True,
+                            "queuePosition": _DF,
+                            "queuedBehindRunId": _DF,
+                            "queuedBehindTitle": _DF,
+                        })
                     try:
                         doc.reference.delete()
                     except Exception:
@@ -2646,25 +2641,19 @@ def start_firestore_start_listener(job_queue, loop):
                         except Exception:
                             pass
                     if _firebase_db:
-                        try:
-                            from google.cloud.firestore import DELETE_FIELD as _DF
-                            _firebase_db.collection("users").document(target_uid) \
-                                .collection("researches").document(target_rid) \
-                                .update({
-                                    "status": "stopped",
-                                    "summary": "Cancelled",
-                                    # Q6: distinguishes user-cancel from
-                                    # worker-stop. FE consumes for the red
-                                    # dialog and the auto-delete-on-close.
-                                    "cancelled": True,
-                                    # Drop stale queue fields — banner reads
-                                    # them as still-queued otherwise.
-                                    "queuePosition": _DF,
-                                    "queuedBehindRunId": _DF,
-                                    "queuedBehindTitle": _DF,
-                                })
-                        except Exception:
-                            pass
+                        from google.cloud.firestore import DELETE_FIELD as _DF
+                        # Q6: distinguishes user-cancel from worker-stop. FE
+                        # consumes for the red dialog and the auto-delete-on-
+                        # close. queuePosition/queuedBehind* dropped — banner
+                        # reads them as still-queued otherwise.
+                        _update_research_doc(target_uid, target_rid, {
+                            "status": "stopped",
+                            "summary": "Cancelled",
+                            "cancelled": True,
+                            "queuePosition": _DF,
+                            "queuedBehindRunId": _DF,
+                            "queuedBehindTitle": _DF,
+                        })
                     try:
                         doc.reference.delete()
                     except Exception:
@@ -2682,20 +2671,15 @@ def start_firestore_start_listener(job_queue, loop):
                             log(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop", "INFO")
                             _controls.request_stop()
                             if _firebase_db:
-                                try:
-                                    from google.cloud.firestore import DELETE_FIELD as _DF
-                                    _firebase_db.collection("users").document(u) \
-                                        .collection("researches").document(rid) \
-                                        .update({
-                                            "status": "stopped",
-                                            "summary": "Cancelled while queued",
-                                            "cancelled": True,
-                                            "queuePosition": _DF,
-                                            "queuedBehindRunId": _DF,
-                                            "queuedBehindTitle": _DF,
-                                        })
-                                except Exception as ex:
-                                    log(f"Cancel(gate-pending-late): failed to mark stopped: {ex}", "WARN")
+                                from google.cloud.firestore import DELETE_FIELD as _DF
+                                _update_research_doc(u, rid, {
+                                    "status": "stopped",
+                                    "summary": "Cancelled while queued",
+                                    "cancelled": True,
+                                    "queuePosition": _DF,
+                                    "queuedBehindRunId": _DF,
+                                    "queuedBehindTitle": _DF,
+                                })
                             try:
                                 dref.delete()
                             except Exception:
@@ -2720,20 +2704,15 @@ def start_firestore_start_listener(job_queue, loop):
                                 except Exception:
                                     pass
                             if _firebase_db:
-                                try:
-                                    from google.cloud.firestore import DELETE_FIELD as _DF
-                                    _firebase_db.collection("users").document(u) \
-                                        .collection("researches").document(rid) \
-                                        .update({
-                                            "status": "stopped",
-                                            "summary": "Cancelled",
-                                            "cancelled": True,
-                                            "queuePosition": _DF,
-                                            "queuedBehindRunId": _DF,
-                                            "queuedBehindTitle": _DF,
-                                        })
-                                except Exception:
-                                    pass
+                                from google.cloud.firestore import DELETE_FIELD as _DF
+                                _update_research_doc(u, rid, {
+                                    "status": "stopped",
+                                    "summary": "Cancelled",
+                                    "cancelled": True,
+                                    "queuePosition": _DF,
+                                    "queuedBehindRunId": _DF,
+                                    "queuedBehindTitle": _DF,
+                                })
                             try:
                                 dref.delete()
                             except Exception:
@@ -2747,26 +2726,20 @@ def start_firestore_start_listener(job_queue, loop):
                         for j in kept:
                             dq.append(j)
                         if removed and _firebase_db:
-                            try:
-                                from google.cloud.firestore import DELETE_FIELD as _DF
-                                _firebase_db.collection("users").document(u) \
-                                    .collection("researches").document(rid) \
-                                    .update({
-                                        "status": "stopped",
-                                        "phase": 0,
-                                        "summary": "Cancelled before starting",
-                                        "cancelled": True,
-                                        # Drop stale queue fields so the
-                                        # banner unmounts; otherwise
-                                        # reopening the cancelled chat
-                                        # shows a wedged "Queued — Cancel"
-                                        # banner backed by no live job.
-                                        "queuePosition": _DF,
-                                        "queuedBehindRunId": _DF,
-                                        "queuedBehindTitle": _DF,
-                                    })
-                            except Exception as ex:
-                                log(f"Cancel: failed to mark stopped: {ex}", "WARN")
+                            from google.cloud.firestore import DELETE_FIELD as _DF
+                            # Drop stale queue fields so the banner unmounts;
+                            # otherwise reopening the cancelled chat shows a
+                            # wedged "Queued — Cancel" banner backed by no
+                            # live job.
+                            _update_research_doc(u, rid, {
+                                "status": "stopped",
+                                "phase": 0,
+                                "summary": "Cancelled before starting",
+                                "cancelled": True,
+                                "queuePosition": _DF,
+                                "queuedBehindRunId": _DF,
+                                "queuedBehindTitle": _DF,
+                            })
                             fn = _QUEUE_STATE.get("recompute_fn")
                             if fn:
                                 fn()
@@ -2867,12 +2840,7 @@ def start_firestore_start_listener(job_queue, loop):
                 # Flip Firestore status to "ongoing" so the FE drops the alert
                 # banner immediately (the listener race below is harmless —
                 # _safe_enqueue's whitelist accepts ongoing).
-                try:
-                    _firebase_db.collection("users").document(target_uid) \
-                        .collection("researches").document(target_rid) \
-                        .update({"status": "ongoing"})
-                except Exception:
-                    pass
+                _update_research_doc(target_uid, target_rid, {"status": "ongoing"})
                 # Delete the queue doc — Firestore's onSnapshot replays it
                 # otherwise, double-enqueueing on every BE restart.
                 try: doc.reference.delete()
@@ -3036,19 +3004,12 @@ def start_firestore_start_listener(job_queue, loop):
                 }
             else:
                 status_payload = {"backendRunId": run_id, "status": "ongoing"}
-            # Write run_id + initial status back to the research doc
-            try:
-                _firebase_db.collection("users").document(uid) \
-                    .collection("researches").document(research_id) \
-                    .update(status_payload)
-            except Exception as e:
-                log(f"Failed to write backendRunId: {e}", "WARN")
-                try:
-                    _firebase_db.collection("users").document(uid) \
-                        .collection("researches").document(research_id) \
-                        .set(status_payload, merge=True)
-                except Exception:
-                    pass
+            # Write run_id + initial status back to the research doc.
+            # `_update_research_doc` returns False on failure (logs WARN);
+            # we then attempt a set(merge=True) as a fallback for the
+            # "doc doesn't exist yet" race (FE hasn't created it).
+            if not _update_research_doc(uid, research_id, status_payload):
+                _set_research_doc(uid, research_id, status_payload, merge=True)
             # Delete the queue doc (was: mark processed). Queue subcollection
             # accumulated forever before this — every start request a permanent
             # entry. The success path doesn't need to surface run_id back via
@@ -3291,15 +3252,69 @@ def append_user_source_in_firestore(kind: str, url: str, label: str = "", phase:
 
 
 def _update_firestore_research(updates):
-    """Update the research document in Firestore (status, phase, links, agents, etc.)."""
-    if not _firebase_db or not _fb_uid or not _fb_research_id:
+    """Update the research document in Firestore (status, phase, links, agents, etc.).
+
+    Convenience wrapper around `_update_research_doc` that pulls uid +
+    research_id from the active-pipeline globals (`_fb_uid`, `_fb_research_id`).
+    Use this from inside `run_pipeline` / phase handlers where the current
+    research is unambiguous. Use `_update_research_doc(uid, rid, ...)`
+    directly from cancel-watcher / queue-handler paths where the target
+    is some OTHER research than the one currently running."""
+    if not _fb_uid or not _fb_research_id:
         return
+    _update_research_doc(_fb_uid, _fb_research_id, updates)
+
+
+def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
+    """Centralized update of `users/{uid}/researches/{rid}`. The single
+    seam through which every BE-side research-doc write flows — so the
+    Track D PR-D5a-core user-mode adapter can inject the `deviceId` field
+    (required by the `deviceUpdatingFor` Firestore rule) in ONE place
+    instead of patching 17 scattered call sites.
+
+    Pre-PR-D5a-pre, these writes were inlined across cancel / watchdog /
+    queue-position / backendRunId paths. The shotgun-pellet rewrite for
+    user-mode would have missed one with high probability — see the
+    advisor's plan review for the rationale.
+
+    Returns True on success, False on failure (logged WARN; never raises).
+    Sync — async callers wrap with `asyncio.to_thread`."""
+    if not _firebase_db or not uid or not research_id:
+        return False
     try:
-        _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id) \
+        _firebase_db.collection("users").document(uid) \
+            .collection("researches").document(research_id) \
             .update(updates)
+        return True
     except Exception as e:
-        log(f"Firestore research update failed: {e}", "WARN")
+        log(
+            f"research doc update failed "
+            f"(uid={uid[:8]}.., rid={research_id[:8]}..): {e}",
+            "WARN",
+        )
+        return False
+
+
+def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = True) -> bool:
+    """Centralized `set(..., merge=True)` of `users/{uid}/researches/{rid}`
+    — the "doc may not exist yet" sibling of `_update_research_doc`. Used
+    when writing `backendRunId` on first arrival (before the FE has
+    created the doc) and on error-rescue paths where the doc state is
+    uncertain. Same Track D PR-D5a seam as `_update_research_doc`."""
+    if not _firebase_db or not uid or not research_id:
+        return False
+    try:
+        _firebase_db.collection("users").document(uid) \
+            .collection("researches").document(research_id) \
+            .set(data, merge=merge)
+        return True
+    except Exception as e:
+        log(
+            f"research doc set failed "
+            f"(uid={uid[:8]}.., rid={research_id[:8]}..): {e}",
+            "WARN",
+        )
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -24818,22 +24833,17 @@ async def run_server(port=8000):
                 uid = current_job.get("uid")
                 rid = current_job.get("research_id")
                 if uid and rid:
-                    try:
-                        _firebase_db.collection("users").document(uid)\
-                            .collection("researches").document(rid)\
-                            .update({
-                                "status": "paused_backend_restart_failed",
-                                "lastError": (
-                                    "Pipeline state could not be saved before "
-                                    f"backend restart ({str(e)[:120]}). Tap "
-                                    "Resume to attempt manual recovery from "
-                                    "the last checkpoint, or Discard to abandon."
-                                ),
-                            })
+                    if _update_research_doc(uid, rid, {
+                        "status": "paused_backend_restart_failed",
+                        "lastError": (
+                            "Pipeline state could not be saved before "
+                            f"backend restart ({str(e)[:120]}). Tap "
+                            "Resume to attempt manual recovery from "
+                            "the last checkpoint, or Discard to abandon."
+                        ),
+                    }):
                         log(f"[pending_queue] Surfaced persist failure for "
                             f"{rid[:24]} — FE will show recovery banner", "WARN")
-                    except Exception as _fe:
-                        log(f"[pending_queue] Firestore alert emit failed: {_fe}", "WARN")
             return False
 
     # 2026-05-15: expose the persist closure to the module-scope device-cmd
@@ -25052,15 +25062,10 @@ async def run_server(port=8000):
                 except Exception:
                     pass
                 if _firebase_db and job.get("uid") and job.get("research_id"):
-                    try:
-                        _firebase_db.collection("users").document(job["uid"]) \
-                            .collection("researches").document(job["research_id"]) \
-                            .update({
-                                "status": "stopped_by_watchdog",
-                                "summary": f"Stopped — pipeline exceeded {hours}h ceiling",
-                            })
-                    except Exception as e:
-                        log(f"[worker-watchdog] doc update failed: {e}", "WARN")
+                    _update_research_doc(job["uid"], job["research_id"], {
+                        "status": "stopped_by_watchdog",
+                        "summary": f"Stopped — pipeline exceeded {hours}h ceiling",
+                    })
                 # 2026-05-11: error path — daemon-restart will reset
                 # _QUEUE_STATE anyway, but flag for completeness.
                 _QUEUE_STATE["_errored"] = True
@@ -25121,17 +25126,12 @@ async def run_server(port=8000):
                 # them as still-queued. Idempotent on already-cleared docs.
                 _cuid, _crid = completed.get("uid"), completed.get("research_id")
                 if _firebase_db and _cuid and _crid:
-                    try:
-                        from google.cloud.firestore import DELETE_FIELD as _DF
-                        _firebase_db.collection("users").document(_cuid) \
-                            .collection("researches").document(_crid) \
-                            .update({
-                                "queuePosition": _DF,
-                                "queuedBehindRunId": _DF,
-                                "queuedBehindTitle": _DF,
-                            })
-                    except Exception as e:
-                        log(f"[worker-finally] queue field clear failed for {_crid[:8]}…: {e}", "WARN")
+                    from google.cloud.firestore import DELETE_FIELD as _DF
+                    _update_research_doc(_cuid, _crid, {
+                        "queuePosition": _DF,
+                        "queuedBehindRunId": _DF,
+                        "queuedBehindTitle": _DF,
+                    })
                 # Shift remaining queued jobs up one position.
                 _recompute_queue_positions()
                 # Re-snapshot post-completion (current cleared, pending may
