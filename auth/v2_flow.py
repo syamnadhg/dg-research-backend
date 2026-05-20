@@ -28,7 +28,9 @@ local development or staging.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import json
 import logging
 import os
 import secrets as _secrets
@@ -37,6 +39,36 @@ from typing import Any
 import requests
 
 from . import credentials, keystore, pairing
+
+
+def _uid_from_id_token(id_token: str) -> str | None:
+    """Pull the Firebase uid out of an ID token's `user_id` / `sub` claim.
+
+    Firebase's `signInWithCustomToken` REST response used to include
+    `localId` at the top level. Newer responses (observed 2026-05) drop
+    it and only return idToken/refreshToken/expiresIn/isNewUser/kind.
+    The uid is still in the JWT itself — the `user_id` claim (Firebase
+    convention) or `sub` (standard JWT subject). This helper does a
+    no-verify base64 decode of the payload segment to read it back.
+
+    Returns None if the token is malformed or claimless. Caller is
+    expected to treat None as a hard pair failure.
+    """
+    try:
+        parts = id_token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        padding = 4 - (len(payload_b64) % 4)
+        if padding != 4:
+            payload_b64 += "=" * padding
+        payload = json.loads(
+            base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+        )
+        uid = payload.get("user_id") or payload.get("sub")
+        return uid if isinstance(uid, str) and uid else None
+    except Exception:
+        return None
 
 log = logging.getLogger(__name__)
 
@@ -251,24 +283,24 @@ async def do_pair_v2(
     exchange = await asyncio.to_thread(
         pairing.exchange_custom_token, custom_token, WEB_API_KEY
     )
-    # Defensive parse — `signInWithCustomToken` is documented to return
-    # idToken + refreshToken + localId + expiresIn, but a bracket-access
-    # KeyError on any of them buries the actual response shape, which is
-    # what we need to debug field-mismatch / version-skew cases.
     refresh_token = exchange.get("refreshToken")
     id_token = exchange.get("idToken")
-    uid = exchange.get("localId")
+    # `localId` was a top-level field in older `signInWithCustomToken`
+    # responses; the current API (observed 2026-05) returns only
+    # idToken/refreshToken/expiresIn/isNewUser/kind. Pull the uid from
+    # the JWT's user_id claim as a fallback.
+    uid = exchange.get("localId") or (
+        _uid_from_id_token(id_token) if id_token else None
+    )
     if not (refresh_token and id_token and uid):
         keys = sorted(exchange.keys()) if isinstance(exchange, dict) else type(exchange).__name__
-        # `error` is what Firebase returns on a 200-with-body-error edge case;
-        # the rest of the body shape lands in `keys` for diagnostics.
         err = ""
         if isinstance(exchange, dict) and isinstance(exchange.get("error"), dict):
             err = f" error={exchange['error'].get('message') or exchange['error']!r}"
         raise pairing.CustomTokenExchangeError(
             f"signInWithCustomToken 200 but missing fields "
             f"(have refreshToken={bool(refresh_token)} idToken={bool(id_token)} "
-            f"localId={bool(uid)}). keys={keys}{err}"
+            f"uid={bool(uid)}). keys={keys}{err}"
         )
     expires_in = int(exchange.get("expiresIn") or "3600")
 
@@ -322,7 +354,9 @@ async def do_redeem_reset(
     )
     refresh_token = exchange.get("refreshToken")
     id_token = exchange.get("idToken")
-    uid = exchange.get("localId")
+    uid = exchange.get("localId") or (
+        _uid_from_id_token(id_token) if id_token else None
+    )
     if not (refresh_token and id_token and uid):
         keys = sorted(exchange.keys()) if isinstance(exchange, dict) else type(exchange).__name__
         err = ""
@@ -331,7 +365,7 @@ async def do_redeem_reset(
         raise pairing.CustomTokenExchangeError(
             f"signInWithCustomToken 200 but missing fields "
             f"(have refreshToken={bool(refresh_token)} idToken={bool(id_token)} "
-            f"localId={bool(uid)}). keys={keys}{err}"
+            f"uid={bool(uid)}). keys={keys}{err}"
         )
     creds = credentials.RefreshTokenCredentials.bootstrap(
         install_uuid=keystore.install_uuid(),
