@@ -25516,6 +25516,73 @@ def _fresh_user_mode_id_token() -> "str | None":
         return None
 
 
+def _pair_patch_device(
+    device_id: str,
+    set_fields: "dict[str, object]",
+    delete_fields: "list[str] | None" = None,
+) -> bool:
+    """PATCH the top-level `devices/{deviceId}` doc directly via Firestore
+    REST, authenticated with the synth user's fresh idToken from the
+    keystore. Used during pair to mirror state (pairConfirmedAt,
+    supervised intent) to Firestore in real time without depending on a
+    constructed gRPC client — the keystore is bootstrapped within
+    `cmd_pair_v2` but `_firebase_db` (Track-D-user-scoped client) isn't
+    initialized until `--serve`.
+
+    `set_fields` accepts bool / str / int values and converts to the
+    Firestore REST primitive shape. `delete_fields` are added to the
+    updateMask but omitted from the body so the server clears them.
+    Best-effort: returns False on any failure, never raises.
+    """
+    id_token = _fresh_user_mode_id_token()
+    if not id_token:
+        log("[pair-patch] no id_token — keystore not yet bootstrapped", "WARN")
+        return False
+    try:
+        from auth.v2_flow import PROJECT_ID as _PID
+        import requests as _requests
+    except ImportError as e:
+        log(f"[pair-patch] import failed: {e}", "WARN")
+        return False
+    update_mask_fields = list(set_fields.keys()) + list(delete_fields or [])
+    params = [("updateMask.fieldPaths", f) for f in update_mask_fields]
+    fields_body: "dict[str, dict]" = {}
+    for k, v in set_fields.items():
+        if isinstance(v, bool):
+            fields_body[k] = {"booleanValue": v}
+        elif isinstance(v, int):
+            fields_body[k] = {"integerValue": str(v)}
+        elif isinstance(v, str):
+            fields_body[k] = {"stringValue": v}
+        else:
+            fields_body[k] = {"stringValue": str(v)}
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{_PID}"
+        f"/databases/(default)/documents/devices/{device_id}"
+    )
+    try:
+        resp = _requests.patch(
+            url,
+            params=params,
+            headers={
+                "Authorization": f"Bearer {id_token}",
+                "Content-Type": "application/json",
+            },
+            json={"fields": fields_body},
+            timeout=10,
+        )
+    except _requests.RequestException as e:
+        log(f"[pair-patch] network error: {e}", "WARN")
+        return False
+    if resp.status_code == 200:
+        return True
+    log(
+        f"[pair-patch] HTTP {resp.status_code}: {resp.text[:200]}",
+        "WARN",
+    )
+    return False
+
+
 def _save_api_key_via_fe_bridge(key_name: str, value: str) -> bool:
     """POST to `/api/devices/save-api-key` so the FE writes the API key to
     `users/{ownerUid}/settings/prefs.apiKeys.{key_name}` via Admin SDK on
@@ -25831,14 +25898,32 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     _pt("refresh token saved to OS keystore")
     print(f"  {_c(_OK, '✓')} Refresh token saved to OS keystore.")
 
+    # Real-time atomic-pair confirmation. With the keystore bootstrapped
+    # the BE is genuinely paired — Firestore should reflect that right
+    # now so the FE Account-page tile appears at Stage 1, not after the
+    # supervisor-started --serve eventually heartbeats. Mirrors the
+    # contract heartbeat would write: pairConfirmedAt:true + delete
+    # expireAt (cancels the 5-min "must confirm" TTL set by the claim
+    # Cloud Function). Best-effort — if this fails the heartbeat at
+    # Stage 5 still writes both via the same path.
+    if _pair_patch_device(
+        result["device_id"],
+        {"pairConfirmedAt": True},
+        delete_fields=["expireAt"],
+    ):
+        _pt("device confirmed in Firestore — FE tile should appear")
+    else:
+        _pt("device-confirm patch failed (heartbeat will retry)", "WARN")
+
     # Owner-lookup via Firestore REST GET, authed with the freshly-
     # minted idToken. Sidesteps the cold gRPC client init (~10-15s on
     # Windows the first time) that init_firestore_user_scoped does, so
-    # the "Linked to {email}" banner shows the real owner instead of
-    # falling back to the synth uid. Bounded by a 10s HTTP timeout +
-    # graceful fallback — pair never blocks here.
+    # the "Linked to {name} ({email})" banner shows the real owner
+    # instead of falling back to the synth uid. Bounded by a 10s HTTP
+    # timeout + graceful fallback — pair never blocks here.
     owner_uid = result["uid"]
     owner_label = ""
+    owner_email = ""
     try:
         from auth.v2_flow import PROJECT_ID as _PID
         import requests as _requests
@@ -25856,14 +25941,12 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         if _resp.status_code == 200:
             _fields = (_resp.json() or {}).get("fields", {}) or {}
             _owner_field = (_fields.get("ownerUid") or {}).get("stringValue") or ""
-            _label = (
-                (_fields.get("ownerDisplayName") or {}).get("stringValue")
-                or (_fields.get("ownerEmail") or {}).get("stringValue")
-                or ""
-            )
+            _label = (_fields.get("ownerDisplayName") or {}).get("stringValue") or ""
+            _email = (_fields.get("ownerEmail") or {}).get("stringValue") or ""
             owner_uid = _owner_field or owner_uid
-            owner_label = _label
-            _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r}")
+            owner_label = _label or (_email.split("@")[0] if _email else "")
+            owner_email = _email
+            _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r} email={owner_email!r}")
         else:
             _pt(f"owner read HTTP {_resp.status_code} — falling back", "DEBUG")
     except Exception as e:
@@ -25872,7 +25955,17 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     print()
     print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
     print()
-    print(f"  {_c(_OK, '✓')}  Linked to {_c(_BOLD, owner_label or 'your account')}")
+    # Banner: "✓ Linked to Rocky (rocky@gmail.com)" when we have both;
+    # falls back to label-only, then email-only, then "your account".
+    if owner_label and owner_email:
+        _linked_to = f"{_c(_BOLD, owner_label)} {_c(_DIM, '(' + owner_email + ')')}"
+    elif owner_label:
+        _linked_to = _c(_BOLD, owner_label)
+    elif owner_email:
+        _linked_to = _c(_BOLD, owner_email)
+    else:
+        _linked_to = _c(_BOLD, "your account")
+    print(f"  {_c(_OK, '✓')}  Linked to {_linked_to}")
     print()
 
     _pt("entering stages 2-5 (On Startup → API keys → Logins → Ready)")
@@ -25948,6 +26041,12 @@ async def _continue_pair_stages_2_to_5(
     else:
         print(f"  {_c(_DIM, '     Skipped. You will run --serve manually in step 5.')}")
         print(f"  {_c(_DIM, '     Enable later with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
+    # Mirror the Stage 2 intent to the device doc so the FE Account-page
+    # On Startup toggle flips in real time. The actual supervisor arm
+    # still happens in Stage 5; if it fails the user can fix via
+    # --resurrect later. Best-effort.
+    if device_id_for_progress:
+        _pair_patch_device(device_id_for_progress, {"supervised": bool(enable_on_startup)})
     print()
 
     # ══════════════════════════════════════════════════════════════════════
