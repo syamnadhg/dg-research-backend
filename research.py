@@ -28314,12 +28314,44 @@ def run_unpair(deep: bool = False):
     _branded_header("absolvo", _BOLD + _ACCENT, "the bond dissolves")
 
     # Load context BEFORE we nuke local state — the load_* helpers read
-    # research_config.json, which step 4 deletes. init_firebase must run
-    # before any Firestore delete so _firebase_db is live.
+    # research_config.json, which step 4 deletes.
     init_firebase()
     paired_uid = load_paired_uid()
     device_id = load_device_id()
     paired_email = _fetch_paired_email(paired_uid)
+
+    # Best-effort server-side retire BEFORE we wipe the keystore. The
+    # endpoint deletes the top-level devices/{deviceId} doc + revokes
+    # the synth-device-user's refresh tokens, so the FE listenToDevices
+    # subscription drops the tile across every browser instantly. Once
+    # we wipe the keystore in step 1 we lose the ability to mint an ID
+    # token, so this MUST run first. Non-fatal if it fails — the local
+    # wipe still happens and the FE Unlink button is the fallback.
+    _retire_action = None
+    if device_id:
+        try:
+            import requests as _requests
+            from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+            _id_token = _fresh_user_mode_id_token()
+            if _id_token:
+                _resp = _requests.post(
+                    f"{_FE_BASE_URL}/api/devices/unpair-self",
+                    headers={"Authorization": f"Bearer {_id_token}"},
+                    json={"deviceId": device_id},
+                    timeout=15,
+                )
+                if _resp.status_code == 200:
+                    try:
+                        _retire_action = (_resp.json() or {}).get("action")
+                    except Exception:
+                        _retire_action = "retired"
+                else:
+                    log(
+                        f"[unpair] retire endpoint HTTP {_resp.status_code}: {_resp.text[:200]}",
+                        "WARN",
+                    )
+        except Exception as _re:
+            log(f"[unpair] retire endpoint failed (continuing): {_re}", "WARN")
 
     # NOTE: no "nothing to do" short-circuit here even when local config is
     # missing. A prior --unpair (or manual config wipe) can leave orphan
@@ -28471,25 +28503,24 @@ def run_unpair(deep: bool = False):
     else:
         print(f"  {_c(_DIM, '     No backend processes were running.')}")
 
-    # ── [3/5] Account-side device entry ──
-    # The BE can't directly delete the user's device record from
-    # Firestore — the synth device user has no write permission on the
-    # owner's user tree, and the top-level `devices/{deviceId}` doc
-    # disallows direct deletes (rule `allow create, delete: if false`).
-    # The owner-side cleanup paths are:
-    #   - Account page → tap Unlink on the device tile (deletes the
-    #     legacy users-tree entry; pre-cutover devices use this).
-    #   - Settings → Manage devices → Reset (rotates pair code +
-    #     revokes the synth user's refresh tokens; modern devices use
-    #     this to fully retire from this machine).
-    # --unpair just wipes the local config + keystore (step 1) so this
-    # BE process can't re-authenticate. The Firestore doc remains until
-    # the owner does one of the above; the FE Account page surfaces
-    # both buttons.
-    _setup_step(3, total, "Account-side cleanup")
-    print(f"  {_c(_DIM, '     This step is owner-driven from the web app:')}")
-    print(f"        {_c(_BOLD, '·')} Pre-cutover devices  {_c(_DIM, '→')}  tap {_c(_BOLD, 'Unlink')} on the device tile in Account.")
-    print(f"        {_c(_BOLD, '·')} Modern devices       {_c(_DIM, '→')}  Settings → Manage devices → {_c(_BOLD, 'Reset')}.")
+    # ── [3/5] Confirm the server-side retire that ran before step 1 ──
+    _setup_step(3, total, "Removing device from your account")
+    if _retire_action == "retired":
+        print(f"  {_c(_OK, '✓')}  Deleted devices/{device_id} on the server.")
+        print(f"  {_c(_DIM, '     The device tile will disappear from all browsers immediately.')}")
+    elif _retire_action == "left-shared":
+        print(f"  {_c(_OK, '✓')}  Removed your account from the device's shared list.")
+    elif device_id:
+        print(f"  {_c(_WARN, '⚠')}  Server-side retire didn't complete — the device tile may stick around.")
+        print(f"  {_c(_DIM, '     If it does, tap Unlink on the tile in your Account page.')}")
+    else:
+        print(f"  {_c(_DIM, '     No paired modern device on this machine — nothing to remove server-side.')}")
+    # Pre-cutover devices live at users/{uid}/devices/{deviceId} — the
+    # synth-device-user BE can't delete them, and the unpair-self
+    # endpoint only handles top-level devices. The FE Account page
+    # surfaces an Unlink button on those legacy tiles for owner-side
+    # cleanup; mention it so the user knows.
+    print(f"  {_c(_DIM, '     Pre-cutover devices: tap Unlink on the tile in your Account page.')}")
 
     # ── [4/5] Local pairing artifacts ──
     _setup_step(4, total, "Local pairing artifacts")
