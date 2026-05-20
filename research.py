@@ -1880,83 +1880,22 @@ async def _heartbeat_loop():
     global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db
     while True:
         try:
-            mode = load_auth_mode()
-            if mode == "user" and _firebase_db:
-                # Track D user-mode: BE is signed in as the synth device
-                # user. The top-level `devices/{deviceId}` rule lets us
-                # update lastHeartbeat + status (path identifies us; no
-                # deviceId field in the payload — would push it into
-                # affectedKeys() and break the hasOnly check). Legacy
-                # research_tokens + users/{uid}/devices paths are
-                # owner-only in the new rules and would permission-deny.
-                # The FE's listenToDevices fanout-read merges top-level
-                # `devices/` with legacy `users/{uid}/devices/` by max
-                # lastHeartbeat — the new doc always wins because the
-                # legacy mirror stops getting updates in user-mode.
-                device_id = load_device_id()
-                if device_id:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(
-                            lambda: _firebase_db.collection("devices")
-                                .document(device_id).update({
-                                    "lastHeartbeat": int(time.time() * 1000),
-                                    "status": "active",
-                                })),
-                        timeout=10.0,
-                    )
-                    _last_heartbeat_at_ms = int(time.time() * 1000)
-                    if _heartbeat_failures > 0:
-                        log(f"[heartbeat] recovered after {_heartbeat_failures} consecutive failures", "INFO")
-                        _heartbeat_failures = 0
-            elif _firebase_db and _research_token:
-                # Legacy mode — unchanged behavior.
-                # Wrap Firestore .update() in to_thread + 10s ceiling. Sync
-                # firebase_admin calls run on the event-loop thread by default;
-                # if the gRPC channel stalls (auth-token refresh under load,
-                # busy account), the loop wedges and uvicorn.serve() never
-                # binds. Treat each tick as best-effort — a missed heartbeat
-                # ages the device tile to "offline" gracefully; the next
-                # successful tick recovers. Without this, one stalled tick
-                # parks --serve forever.
+            # Update top-level `devices/{deviceId}` — BE is signed in as
+            # the synth device user; the device doc's update rule lets us
+            # set lastHeartbeat + status (path identifies the writer; no
+            # deviceId field in the payload, which would push it into
+            # affectedKeys() and break the rule's hasOnly check).
+            device_id = load_device_id()
+            if _firebase_db and device_id:
                 await asyncio.wait_for(
                     asyncio.to_thread(
-                        lambda: _firebase_db.collection("research_tokens")
-                            .document(_research_token).update({
-                                "lastHeartbeat": SERVER_TIMESTAMP,
+                        lambda: _firebase_db.collection("devices")
+                            .document(device_id).update({
+                                "lastHeartbeat": int(time.time() * 1000),
                                 "status": "active",
                             })),
                     timeout=10.0,
                 )
-                # Mirror to device doc for the per-device status indicator.
-                # Skip silently when no paired uid is pinned — either setup
-                # hasn't run yet, or the user just unlinked and the relink
-                # watcher cleared pairedUid. The token heartbeat above keeps
-                # firing so the relink watcher (which sits on the token doc)
-                # stays responsive; we just stop writing under the old
-                # owner's account. A relink restores pairedUid and the next
-                # tick recreates the device doc under the new owner.
-                paired_uid = load_paired_uid()
-                device_id = load_device_id()
-                if paired_uid and device_id:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.to_thread(
-                                lambda: _firebase_db.collection("users")
-                                    .document(paired_uid)
-                                    .collection("devices").document(device_id).update({
-                                        "lastHeartbeat": int(time.time() * 1000),
-                                    })),
-                            timeout=10.0,
-                        )
-                    except Exception:
-                        # Doc missing but pairedUid still set — either a
-                        # transient Firestore blip or the relink watcher
-                        # hasn't yet seen the unlink event. Leave it alone;
-                        # if the unlink is real, the relink watcher will
-                        # call clear_paired_uid() shortly and subsequent
-                        # ticks skip the mirror block entirely.
-                        pass
-                # Q8 observability — record success.
                 _last_heartbeat_at_ms = int(time.time() * 1000)
                 if _heartbeat_failures > 0:
                     log(f"[heartbeat] recovered after {_heartbeat_failures} consecutive failures", "INFO")
@@ -1964,36 +1903,19 @@ async def _heartbeat_loop():
         except Exception as e:
             _heartbeat_failures += 1
             log(f"[heartbeat] write failed (consecutive={_heartbeat_failures}): {e}", "WARN")
-            # Q8 self-heal — after the threshold, attempt to reinitialize
-            # the Firestore client. Covers the case where _firebase_db's
-            # underlying gRPC channel has died but the SDK doesn't surface
-            # it through retries (the FE reads lastHeartbeat from
-            # Firestore; without recovery it perpetually shows "offline"
-            # despite localhost being responsive).
-            #
-            # firebase_admin.initialize_app() raises if the default app
-            # already exists — must delete_app() first to clear it. And
-            # init_firebase() has a fast-path return if _firebase_db is
-            # truthy, so reset that to None too. Counter resets ONLY on
-            # successful reinit so a flaky reinit doesn't ping-pong.
+            # Self-heal: drop the cached Firestore client + reinit. The
+            # underlying gRPC channel may have died silently (server-side
+            # token revoke, network flap). Without recovery, the FE
+            # perpetually shows "offline" despite localhost being live.
             if _heartbeat_failures >= HEARTBEAT_REINIT_THRESHOLD:
-                log(f"[heartbeat] {_heartbeat_failures} consecutive failures — attempting Firebase Admin SDK reinit", "WARN")
+                log(f"[heartbeat] {_heartbeat_failures} consecutive failures — attempting Firestore reinit", "WARN")
                 try:
-                    import firebase_admin as _fa
-                    try:
-                        _fa.delete_app(_fa.get_app())
-                    except (ValueError, Exception):
-                        # No default app to delete — first reinit attempt
-                        # after a fresh process, or the app was somehow
-                        # already cleaned up. Either way, proceed to
-                        # initialize_app via init_firebase().
-                        pass
-                    _firebase_db = None  # Force init_firebase()'s fast-path to fall through
+                    _firebase_db = None  # Force init_firebase()'s fast-path to fall through.
                     if init_firebase():
                         _heartbeat_failures = 0
                         log("[heartbeat] reinit succeeded — next tick will retry", "INFO")
                     else:
-                        log("[heartbeat] reinit returned False (service-account.json missing?)", "ERROR")
+                        log("[heartbeat] reinit returned False (keystore empty? run --pair)", "ERROR")
                 except Exception as reinit_err:
                     log(f"[heartbeat] reinit raised: {reinit_err}", "ERROR")
         await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
@@ -2545,56 +2467,18 @@ def _download_user_source_via_storage_rest(storage_path: str, dest_path: "Path")
 
 
 def upload_audio_to_storage(local_path: "Path") -> str | None:
-    """Upload the NotebookLM audio file to Firebase Storage and return a
-    publicly-fetchable URL. Path is scoped under the submitter's uid +
-    researchId so users can only access their own files (see storage.rules).
-    Returns None if upload fails or Firebase Storage isn't configured.
-
-    Two paths:
-    - Legacy mode → Admin SDK via firebase_admin.storage.bucket() +
-      blob.make_public() + blob.public_url. Returns a storage.googleapis
-      .com URL.
-    - User mode → Storage REST POST as the synth device user
-      (Authorization: Firebase {id_token}). Returns a download-token URL
-      that's public-by-URL.
-    """
-    if load_auth_mode() == "user":
-        if not (_fb_uid and _fb_research_id):
-            return None
-        if not local_path or not local_path.exists():
-            return None
-        _begin_storage_upload()
-        try:
-            return _upload_audio_via_storage_rest(local_path, _fb_uid, _fb_research_id)
-        finally:
-            _end_storage_upload()
-    if not _firebase_db or not _fb_uid or not _fb_research_id:
+    """Upload the NotebookLM audio file to Firebase Storage via the REST
+    API as the synth device user, and return a download-token URL that
+    the FE Podcasts page can play via plain `<audio src>`. Path is
+    scoped under the submitter's uid + researchId so users can only see
+    their own files (see storage.rules)."""
+    if not (_fb_uid and _fb_research_id):
         return None
     if not local_path or not local_path.exists():
         return None
     _begin_storage_upload()
     try:
-        from firebase_admin import storage as _fb_storage
-        # Object path mirrors the Firestore layout for easy reasoning.
-        blob_name = f"audio/{_fb_uid}/{_fb_research_id}/{local_path.name}"
-        bucket = _fb_storage.bucket()
-        blob = bucket.blob(blob_name)
-        # Content-Type matters so the browser's <audio> tag plays it inline.
-        content_type = "audio/mpeg" if local_path.suffix.lower() == ".mp3" else (
-            "audio/mp4" if local_path.suffix.lower() in (".m4a", ".mp4") else "audio/*"
-        )
-        blob.upload_from_filename(str(local_path), content_type=content_type)
-        # Make the object publicly readable by URL. Auth is enforced at the
-        # Firestore documents level — a user can only see the `audioUrl`
-        # field if they read their own audios subcollection. Making the
-        # blob itself public-with-unguessable-URL avoids needing signed URL
-        # refresh for long-playing sessions.
-        blob.make_public()
-        log(f"Audio uploaded to Storage: gs://{bucket.name}/{blob_name}")
-        return blob.public_url
-    except Exception as e:
-        log(f"Audio upload to Firebase Storage failed: {e}", "WARN")
-        return None
+        return _upload_audio_via_storage_rest(local_path, _fb_uid, _fb_research_id)
     finally:
         _end_storage_upload()
 
@@ -2720,19 +2604,12 @@ def start_firestore_start_listener(job_queue, loop):
     if not _firebase_db:
         return
 
-    if load_auth_mode() == "user":
-        did = load_device_id()
-        if not did:
-            log("user-mode active but deviceId missing — start listener not initialized", "WARN")
-            return
-        col_ref = _firebase_db.collection("devices").document(did).collection("queue")
-        listener_label = f"devices/{did[:8]}…/queue/"
-    elif _research_token:
-        col_ref = _firebase_db.collection("research_tokens").document(_research_token).collection("queue")
-        listener_label = f"research_tokens/{_research_token[:8]}…/queue/"
-    else:
-        col_ref = _firebase_db.collection("pipeline_requests")
-        listener_label = "pipeline_requests/ (legacy — run --pair to get a ResearchToken)"
+    did = load_device_id()
+    if not did:
+        log("deviceId missing — start listener not initialized; run --pair", "WARN")
+        return
+    col_ref = _firebase_db.collection("devices").document(did).collection("queue")
+    listener_label = f"devices/{did[:8]}…/queue/"
 
     def on_snapshot(_col_snapshot, changes, _read_time):
         for change in changes:
@@ -3071,34 +2948,10 @@ def start_firestore_start_listener(job_queue, loop):
                 except Exception:
                     pass
                 continue
-            # Token-unlink guard: a device that was unpaired from Account
-            # settings clears linkedUid on the token doc. The queue listener
-            # itself stays alive (we may relink later), but we must reject
-            # any start requests that arrive between unlink and relink —
-            # otherwise the backend happily processes work for a device the
-            # user revoked. Also enforces uid match so a stolen token can't
-            # trigger runs against someone else's account.
-            if _research_token:
-                try:
-                    tdoc = _firebase_db.collection("research_tokens").document(_research_token).get()
-                    tdata = tdoc.to_dict() or {}
-                    linked_uid = (tdata.get("linkedUid") or "").strip()
-                    if not linked_uid:
-                        log(f"Rejecting start: token unlinked (linkedUid empty). uid={uid[:8]} topic={topic[:40]}", "WARN")
-                        try:
-                            doc.reference.delete()
-                        except Exception:
-                            pass
-                        continue
-                    if uid != linked_uid:
-                        log(f"Rejecting start: uid mismatch (linked={linked_uid[:8]} req={uid[:8]})", "WARN")
-                        try:
-                            doc.reference.delete()
-                        except Exception:
-                            pass
-                        continue
-                except Exception as e:
-                    log(f"Token validation failed (allowing request through): {e}", "WARN")
+            # uid validation is enforced server-side by the Firestore queue
+            # rule (`submittedBy == request.auth.uid`) and the device-doc
+            # `sharedWith[]` check via `deviceWritingTo`. No additional
+            # BE-side gate needed here.
             # Research-doc existence check — user may have deleted the chat
             # from the app between firing the research and us picking up the
             # queue doc. Without this, we'd run a full pipeline and try to
@@ -3541,49 +3394,15 @@ _DG_FE_CLOUD_TASKS_QUEUE = os.environ.get(
 
 
 def _mint_fe_id_token(uid):
-    """Mint a Firebase ID token for `uid` via Admin custom-token +
-    Identity Toolkit signInWithCustomToken exchange. Returns the
-    idToken string on success, None on failure. Non-fatal: caller
-    falls back to the needsFeTrigger marker path.
-
-    Track D user-mode skip: `firebase_admin.auth.create_custom_token`
-    requires the Admin SDK to be initialized with a service-account
-    credential, which `_init_firebase_user_mode()` does NOT do. The
-    BE has no path to mint an arbitrary user's ID token in user-mode
-    (its own refresh-token credentials only authorize the synthetic
-    device user). Returning None triggers `_fire_fe_p4_trigger`'s
-    existing needsFeTrigger fallback — the FE catch-up hook re-fires
-    P4/P5 on next chat-open. No-op crash."""
-    if load_auth_mode() == "user":
-        log("FE trigger: ID token mint skipped in user-mode — fallback to needsFeTrigger marker", "INFO")
-        return None
-    if not uid:
-        return None
-    if not _DG_FE_WEB_API_KEY:
-        log("FE trigger: DG_FE_WEB_API_KEY not configured", "WARN")
-        return None
-    try:
-        from firebase_admin import auth as _fb_auth
-        import requests as _req
-        ct = _fb_auth.create_custom_token(uid)
-        if isinstance(ct, bytes):
-            ct = ct.decode("utf-8")
-        url = (
-            "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken"
-            f"?key={_DG_FE_WEB_API_KEY}"
-        )
-        resp = _req.post(
-            url,
-            json={"token": ct, "returnSecureToken": True},
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            log(f"FE trigger: ID token exchange failed {resp.status_code}: {resp.text[:200]}", "WARN")
-            return None
-        return resp.json().get("idToken")
-    except Exception as e:
-        log(f"FE trigger: mint ID token failed: {e}", "WARN")
-        return None
+    """Always returns None — the BE has no path to mint a Firebase ID
+    token for an arbitrary uid (the synth-device-user's refresh-token
+    credentials only authorize itself, and Admin custom-token mint
+    requires the service account that's no longer on disk). Returning
+    None triggers `_fire_fe_p4_trigger`'s `needsFeTrigger` fallback;
+    the FE catch-up hook re-fires P4/P5 on next chat-open."""
+    del uid  # unused — kept for caller signature compatibility
+    log("FE trigger: ID token mint unavailable — fallback to needsFeTrigger marker", "INFO")
+    return None
 
 
 def _fire_fe_p4_trigger(uid, research_id):
@@ -21885,19 +21704,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # other agent-generated artifact. Failures are logged but the
         # pipeline continues with whatever sources DID download.
         if user_sources:
-            _user_mode = load_auth_mode() == "user"
             try:
-                if _user_mode:
-                    # User-mode: Storage REST per attached source. The synth
-                    # device user has read access to users/{owner}/.../sources/...
-                    # when the device is authorized for that owner (rule
-                    # `deviceAuthorizedFor` in storage.rules).
-                    _bucket = _resolve_storage_bucket()
-                    _bucket_label = _bucket or "(unresolved)"
-                else:
-                    from firebase_admin import storage as _fb_storage
-                    _bucket_obj = _fb_storage.bucket()
-                    _bucket_label = _bucket_obj.name
+                # The synth device user has read access to
+                # `users/{owner}/.../sources/...` when the device is
+                # authorized for that owner (storage.rules helper
+                # `deviceAuthorizedFor`). Stream each attached source
+                # into queue_dir/documents/ before P3 hands them to
+                # NotebookLM.
+                _bucket_label = _resolve_storage_bucket() or "(unresolved)"
                 _ok, _fail = 0, 0
                 for _src in user_sources:
                     _name = (_src.get("name") or "source").strip() or "source"
@@ -21920,13 +21734,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         _dest = queue_dir / "documents" / f"{_stem}-{_i}{_ext}"
                         _i += 1
                     try:
-                        if _user_mode:
-                            _success = _download_user_source_via_storage_rest(_path, _dest)
-                            if not _success:
-                                raise RuntimeError("Storage REST download failed")
-                        else:
-                            _blob = _bucket_obj.blob(_path)  # noqa: F821 - set in else above
-                            _blob.download_to_filename(str(_dest))
+                        if not _download_user_source_via_storage_rest(_path, _dest):
+                            raise RuntimeError("Storage REST download failed")
                         log(f"Flow B source: gs://{_bucket_label}/{_path} → {_dest.name} ({_dest.stat().st_size} bytes)")
                         _ok += 1
                     except Exception as _e:
@@ -25531,13 +25340,9 @@ async def run_server(port=8000):
     init_firebase()
     # Load run analytics for realistic ETAs
     load_analytics()
-    # Load ResearchToken (required for token-scoped queue + heartbeat)
-    token = load_research_token()
-    if token:
-        log(f"ResearchToken loaded: {token[:8]}...")
-    else:
-        log("No ResearchToken found — run `python research.py --pair` to generate one", "WARN")
-        log("Falling back to legacy pipeline_requests/ listener", "WARN")
+    # Track D: device identity loads via load_device_id() / the OS
+    # keystore. No legacy researchToken to fetch here — if init_firebase
+    # already failed, the user needs to run --pair first.
     # 2026-05-11: hoist queue-gate state rehydration above worker
     # creation. The full disk-restore block at the bottom of serve
     # (rehydrates pending + current_job) runs much later, after the
@@ -25596,18 +25401,8 @@ async def run_server(port=8000):
         asyncio.create_task(_orphan_sweep_loop())
         log(f"[orphan-sweep] started ({ORPHAN_SWEEP_INTERVAL_SEC}s interval)")
         # Refresh the paired device doc so the Account page sees this PC
-        # online immediately on server start. If pairedUid isn't pinned yet
-        # (pre-multi-device config), resolve it from the token's linkedUid.
+        # online immediately on server start.
         paired_uid = load_paired_uid()
-        if not paired_uid:
-            try:
-                snap = _firebase_db.collection("research_tokens").document(token).get()
-                if snap.exists:
-                    paired_uid = (snap.to_dict() or {}).get("linkedUid") or ""
-                    if paired_uid:
-                        save_device_config(paired_uid=paired_uid)
-            except Exception as e:
-                log(f"Could not resolve paired uid from token doc: {e}", "WARN")
         # Track every Firestore research_id touched by rehydration — used by
         # the disk-restore block below so an ongoing run that got marked
         # paused_backend_restart isn't falsely re-enqueued from
@@ -25829,12 +25624,6 @@ async def run_server(port=8000):
         except Exception as e:
             log(f"[pending_queue] restore failed: {e}", "WARN")
 
-        # Sub-second relink: watch the token doc so a paste-token flow
-        # (which only writes linkedUid, never touches the device doc) gets
-        # reflected in the Account page tile almost immediately, instead of
-        # waiting up to 30s for the heartbeat-based self-heal.
-        _start_token_relink_watcher(token)
-
         # Device-scoped command channel — receives hard_reset and any
         # future device-level controls (vs research-scoped commands which
         # ride users/{uid}/researches/{rid}/commands). Listener lives for
@@ -25857,12 +25646,13 @@ async def run_server(port=8000):
     _branded_header("aegis", _BOLD + _ACCENT, "standing watch")
     _paired_uid_now = load_paired_uid()
     _paired_email = _fetch_paired_email(_paired_uid_now)
-    token_short = f"{_research_token[:8]}…" if _research_token else "(none)"
-    token_val = (f"{_c(_BOLD, token_short)}  {_c(_OK, '(active)')}"
-                 if _research_token else _c(_DIM, "(none)"))
+    _device_id_now = load_device_id() or ""
+    _device_short = f"{_device_id_now[:8]}…" if _device_id_now else "(none)"
+    _device_val = (f"{_c(_BOLD, _device_short)}  {_c(_OK, '(active)')}"
+                   if _device_id_now else _c(_DIM, "(none)"))
     _render_context_strip([
         ("Paired to", _c(_BOLD, _paired_email or "(not paired)")),
-        ("Token",     token_val),
+        ("Device",    _device_val),
         ("Local API", _c(_BOLD, f"http://localhost:{port}")),
         ("Heartbeat", _c(_BOLD, f"{HEARTBEAT_INTERVAL_SEC}s cadence")),
     ])
@@ -25886,7 +25676,7 @@ async def run_server(port=8000):
         )
     except (asyncio.TimeoutError, Exception):
         _currently_supervised = False
-    if not (_research_token and _paired_uid_now):
+    if not (_device_id_now and _paired_uid_now):
         print()
         print(f"  {_c(_WARN, '⚠')}  Not paired yet — jobs will be ignored until this machine is paired.")
         _render_next_actions([
@@ -25924,19 +25714,11 @@ async def run_server(port=8000):
             except Exception:
                 pass
             _device_cmd_watch = None
-        # Mark the token offline on shutdown as a hint — the authoritative
-        # online/offline signal is heartbeat age on the device doc, which
-        # ages past the 60s threshold naturally when the serve stops. We do
-        # NOT stamp a stale heartbeat on the device doc here: under
-        # daemon-loop supervision this finally block fires on every respawn
-        # cycle (e.g. port-bind crashloop), and the oscillation between
-        # fresh-heartbeat-on-start and stale-on-finally causes green↔red
-        # flicker in the UI.
-        if _firebase_db and _research_token:
-            try:
-                _firebase_db.collection("research_tokens").document(_research_token).update({"status": "offline"})
-            except Exception:
-                pass
+        # No explicit "offline" stamp on shutdown — the FE derives
+        # online/offline from heartbeat age (60s threshold), which the
+        # device doc ages into naturally once heartbeats stop. Under
+        # daemon-loop supervision, stamping on shutdown would oscillate
+        # green↔red on every respawn cycle.
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -28862,7 +28644,6 @@ def run_unpair(deep: bool = False):
     # research_config.json, which step 4 deletes. init_firebase must run
     # before any Firestore delete so _firebase_db is live.
     init_firebase()
-    token = load_research_token()
     paired_uid = load_paired_uid()
     device_id = load_device_id()
     paired_email = _fetch_paired_email(paired_uid)
@@ -28879,7 +28660,6 @@ def run_unpair(deep: bool = False):
     _render_context_strip([
         ("Device",    _c(_BOLD, device_id or "(unknown)")),
         ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
-        ("Token",     _c(_BOLD, (token[:8] + "…") if token else "(none)")),
     ])
 
     total = 5
@@ -28909,10 +28689,16 @@ def run_unpair(deep: bool = False):
             wiped.append(_LEGACY_PIPE_CONFIG_PATH.name)
     except Exception:
         pass
+    # Clear the OS keystore so the refresh token can't re-auth this BE.
+    try:
+        from auth import keystore as _ks
+        _ks.clear_all(_ks.install_uuid())
+        wiped.append("OS keystore")
+    except Exception as _ke:
+        print(f"  {_c(_WARN, '⚠')}  Keystore clear failed: {_ke}")
     # Zero in-memory state too, so anything still running in this process
     # can't re-read pre-wipe values from the global caches.
-    global _research_token, _device_id, _device_paired_uid
-    _research_token = None
+    global _device_id, _device_paired_uid
     _device_id = None
     _device_paired_uid = None
     if wiped:
@@ -29027,19 +28813,16 @@ def run_unpair(deep: bool = False):
     else:
         print(f"  {_c(_DIM, '     No paired account on this machine — nothing to remove.')}")
 
-    # ── [4/5] Delete token doc ──
-    _setup_step(4, total, "Revoking token from project")
-    if _firebase_db and token:
-        try:
-            _firebase_db.collection("research_tokens").document(token).delete()
-            print(f"  {_c(_OK, '✓')}  Deleted research_tokens/{token[:8]}…")
-        except Exception as e:
-            print(f"  {_c(_WARN, '⚠')}  Token doc delete failed: {e}")
-    elif not _firebase_db:
-        print(f"  {_c(_WARN, '⚠')}  Firebase unreachable — token doc left in place.")
-        print(f"  {_c(_DIM, '        Re-run --unpair with network to finish.')}")
-    else:
-        print(f"  {_c(_DIM, '     No token on this machine — nothing to revoke.')}")
+    # ── [4/5] Clear local pairing artifacts ──
+    # Track D devices live at top-level `devices/{deviceId}` and are
+    # owned by the synth device user, not directly deletable from here.
+    # The owner's path to fully retire a device is Reset Pair Code from
+    # Settings → Manage devices (revokes the synth user's refresh tokens
+    # so the BE can't re-authenticate). --unpair locally is enough for
+    # the BE side; the device doc remains until Reset is triggered.
+    _setup_step(4, total, "Local pairing artifacts")
+    print(f"  {_c(_OK, '✓')}  Local config wiped (step 1) + keystore cleared.")
+    print(f"  {_c(_DIM, '     Trigger Reset Pair Code from Settings → Manage devices to fully retire this device server-side.')}")
 
     # ── [5/5] Verify ──
     _setup_step(5, total, "Confirming silence")
@@ -29231,19 +29014,18 @@ def run_doctor():
     _ok(f"Platform: {plat}")
 
     paired_uid = load_paired_uid()
-    token = load_research_token()
     device_id = load_device_id()
-    if paired_uid and token and device_id:
+    if paired_uid and device_id:
         _ok("Pair state", f"deviceId={device_id}")
     else:
-        _fail("Not paired", "research_config.json missing or incomplete")
+        _fail("Not paired", "research_config.json missing or incomplete — run --pair")
         manual_actions.append("Run `python research.py --pair`")
 
     if init_firebase():
-        _ok("Firebase Admin SDK", f"project=super-research-492814")
+        _ok("Firestore client", "user-mode (refresh-token credentials)")
     else:
-        _fail("Firebase Admin SDK init failed", "check firebase-service-account.json + network")
-        manual_actions.append("Email Sammy for a fresh firebase-service-account.json")
+        _fail("Firestore init failed", "OS keystore empty or refresh token revoked")
+        manual_actions.append("Run `python research.py --pair`")
     print()
 
     # ── [2] Browser dependencies (Playwright + Chromium) ──
