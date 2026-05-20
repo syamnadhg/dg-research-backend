@@ -28471,31 +28471,29 @@ def run_unpair(deep: bool = False):
     else:
         print(f"  {_c(_DIM, '     No backend processes were running.')}")
 
-    # ── [3/5] Delete device doc ──
-    _setup_step(3, total, "Removing device from your account")
-    if _firebase_db and paired_uid and device_id:
-        try:
-            _firebase_db.collection("users").document(paired_uid) \
-                .collection("devices").document(device_id).delete()
-            print(f"  {_c(_OK, '✓')}  Deleted users/{paired_uid[:8]}…/devices/{device_id}")
-        except Exception as e:
-            print(f"  {_c(_WARN, '⚠')}  Device doc delete failed: {e}")
-    elif not _firebase_db:
-        print(f"  {_c(_WARN, '⚠')}  Firebase unreachable — skipped.")
-        print(f"  {_c(_DIM, '        Remove the device via the Account page when you can.')}")
-    else:
-        print(f"  {_c(_DIM, '     No paired account on this machine — nothing to remove.')}")
+    # ── [3/5] Account-side device entry ──
+    # The BE can't directly delete the user's device record from
+    # Firestore — the synth device user has no write permission on the
+    # owner's user tree, and the top-level `devices/{deviceId}` doc
+    # disallows direct deletes (rule `allow create, delete: if false`).
+    # The owner-side cleanup paths are:
+    #   - Account page → tap Unlink on the device tile (deletes the
+    #     legacy users-tree entry; pre-cutover devices use this).
+    #   - Settings → Manage devices → Reset (rotates pair code +
+    #     revokes the synth user's refresh tokens; modern devices use
+    #     this to fully retire from this machine).
+    # --unpair just wipes the local config + keystore (step 1) so this
+    # BE process can't re-authenticate. The Firestore doc remains until
+    # the owner does one of the above; the FE Account page surfaces
+    # both buttons.
+    _setup_step(3, total, "Account-side cleanup")
+    print(f"  {_c(_DIM, '     This step is owner-driven from the web app:')}")
+    print(f"        {_c(_BOLD, '·')} Pre-cutover devices  {_c(_DIM, '→')}  tap {_c(_BOLD, 'Unlink')} on the device tile in Account.")
+    print(f"        {_c(_BOLD, '·')} Modern devices       {_c(_DIM, '→')}  Settings → Manage devices → {_c(_BOLD, 'Reset')}.")
 
-    # ── [4/5] Clear local pairing artifacts ──
-    # Track D devices live at top-level `devices/{deviceId}` and are
-    # owned by the synth device user, not directly deletable from here.
-    # The owner's path to fully retire a device is Reset Pair Code from
-    # Settings → Manage devices (revokes the synth user's refresh tokens
-    # so the BE can't re-authenticate). --unpair locally is enough for
-    # the BE side; the device doc remains until Reset is triggered.
+    # ── [4/5] Local pairing artifacts ──
     _setup_step(4, total, "Local pairing artifacts")
     print(f"  {_c(_OK, '✓')}  Local config wiped (step 1) + keystore cleared.")
-    print(f"  {_c(_DIM, '     Trigger Reset Pair Code from Settings → Manage devices to fully retire this device server-side.')}")
 
     # ── [5/5] Verify ──
     _setup_step(5, total, "Confirming silence")
