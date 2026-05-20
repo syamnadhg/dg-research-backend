@@ -128,32 +128,25 @@ class TestSaveApiKeyViaFeBridge:
 # ─── _save_api_key_to_firestore mode-branch ───────────────────────────
 
 
-class TestSaveApiKeyModeBranch:
-    def test_legacy_falls_through_to_firestore_path(self, monkeypatch):
-        monkeypatch.setattr(research, "load_auth_mode", lambda: "legacy")
-        # No _firebase_db → the legacy branch returns False at the second
-        # guard, which is enough to prove the bridge wasn't taken.
-        monkeypatch.setattr(research, "_firebase_db", None)
-        bridge_called = {"called": False}
-        def fake_bridge(*_args, **_kwargs):
-            bridge_called["called"] = True
-            return True
-        monkeypatch.setattr(research, "_save_api_key_via_fe_bridge", fake_bridge)
-        result = research._save_api_key_to_firestore("uid-abc", "anthropic", "sk-ant-xxxxxxxxxxxxxxxxxxxxxxx")
-        assert result is False
-        assert bridge_called["called"] is False  # didn't take user-mode path
+class TestSaveApiKeyAlwaysUsesBridge:
+    """Post-D7: `_save_api_key_to_firestore` always delegates to the FE
+    bridge — there's no legacy branch. The `uid` parameter is ignored;
+    the bridge resolves the target ownerUid from the BE's custom-token
+    claim server-side."""
 
-    def test_user_mode_takes_bridge(self, monkeypatch):
-        monkeypatch.setattr(research, "load_auth_mode", lambda: "user")
+    def test_bridge_always_called(self, monkeypatch):
         bridge_called = {"key_name": None, "value": None}
         def fake_bridge(key_name, value):
             bridge_called["key_name"] = key_name
             bridge_called["value"] = value
             return True
         monkeypatch.setattr(research, "_save_api_key_via_fe_bridge", fake_bridge)
-        # uid is ignored in user-mode (the bridge resolves ownerUid from
-        # the token's custom claim).
         result = research._save_api_key_to_firestore("uid-ignored", "gemini", "AIza-xxxx-yyyy-zzzz-aaaa")
         assert result is True
         assert bridge_called["key_name"] == "gemini"
         assert bridge_called["value"].startswith("AIza")
+
+    def test_bridge_failure_returns_false(self, monkeypatch):
+        monkeypatch.setattr(research, "_save_api_key_via_fe_bridge", lambda k, v: False)
+        result = research._save_api_key_to_firestore("uid", "anthropic", "sk-ant-zzz")
+        assert result is False

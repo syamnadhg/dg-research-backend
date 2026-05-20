@@ -37,65 +37,41 @@ def silent_log(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────
 
 class TestSaveApiKeyToFirestore:
-    """The Firestore writer used by Stage 4/5. Targets the same path the
-    FE Account page writes to (users/{uid}/settings/prefs.apiKeys.{name})
-    with merge=True so the prompt and the web app stay one source of truth."""
+    """Post-D7: `_save_api_key_to_firestore` always goes through the FE
+    bridge (`_save_api_key_via_fe_bridge`) — the synth device user can't
+    write `users/{uid}/settings/prefs` directly per Firestore rules. The
+    `uid` parameter is now ignored; the bridge resolves the target
+    ownerUid from the BE's custom-token claim."""
 
-    def test_no_firestore_client_returns_false(self, monkeypatch, silent_log):
-        """Unpaired backends or pre-init_firebase calls hit None._firebase_db
-        — must bail cleanly without raising."""
+    def test_delegates_to_fe_bridge(self, monkeypatch, silent_log):
+        """The function is a thin wrapper around `_save_api_key_via_fe_bridge`
+        — just forwards (key_name, value) and ignores uid."""
         from research import _save_api_key_to_firestore
-        monkeypatch.setattr("research._firebase_db", None)
-        assert _save_api_key_to_firestore("uid-abc", "anthropic", "sk-ant-xyz") is False
+        captured = {}
+        def fake_bridge(key_name, value):
+            captured["key_name"] = key_name
+            captured["value"] = value
+            return True
+        monkeypatch.setattr("research._save_api_key_via_fe_bridge", fake_bridge)
+        assert _save_api_key_to_firestore("uid-abc", "anthropic", "sk-ant-xyz") is True
+        assert captured == {"key_name": "anthropic", "value": "sk-ant-xyz"}
 
-    def test_empty_uid_returns_false(self, monkeypatch, silent_log):
-        """uid="" should bail before touching Firestore — calling the chain
-        on the real client with empty doc id would 400."""
+    def test_gemini_forwards_key_name(self, monkeypatch, silent_log):
         from research import _save_api_key_to_firestore
-        mock_db = mock.MagicMock()
-        monkeypatch.setattr("research._firebase_db", mock_db)
-        assert _save_api_key_to_firestore("", "anthropic", "sk-ant-xyz") is False
-        # Critical: never call .collection() with an empty uid
-        mock_db.collection.assert_not_called()
-
-    def test_happy_path_writes_merge_apiKeys_dict(self, monkeypatch, silent_log):
-        """Verify the exact write shape — collection/doc path + merge=True +
-        {apiKeys: {key_name: value}} payload. This is the contract with
-        _read_firestore_api_keys() AND the FE Account page."""
-        from research import _save_api_key_to_firestore
-        mock_db = mock.MagicMock()
-        monkeypatch.setattr("research._firebase_db", mock_db)
-        result = _save_api_key_to_firestore("uid-abc", "anthropic", "sk-ant-xyz")
-        assert result is True
-        # Verify the chain: users/{uid}/settings/prefs.set({apiKeys: {...}}, merge=True)
-        mock_db.collection.assert_called_with("users")
-        mock_db.collection().document.assert_called_with("uid-abc")
-        mock_db.collection().document().collection.assert_called_with("settings")
-        mock_db.collection().document().collection().document.assert_called_with("prefs")
-        set_call = mock_db.collection().document().collection().document().set
-        set_call.assert_called_with({"apiKeys": {"anthropic": "sk-ant-xyz"}}, merge=True)
-
-    def test_gemini_uses_gemini_key_in_payload(self, monkeypatch, silent_log):
-        """Same writer reused for Gemini — only the key_name field name
-        changes. apiKeys.gemini must be the FE Account page contract."""
-        from research import _save_api_key_to_firestore
-        mock_db = mock.MagicMock()
-        monkeypatch.setattr("research._firebase_db", mock_db)
+        captured = {}
+        def fake_bridge(key_name, value):
+            captured["key_name"] = key_name
+            return True
+        monkeypatch.setattr("research._save_api_key_via_fe_bridge", fake_bridge)
         _save_api_key_to_firestore("uid-abc", "gemini", "AIzaSyXYZ")
-        set_call = mock_db.collection().document().collection().document().set
-        set_call.assert_called_with({"apiKeys": {"gemini": "AIzaSyXYZ"}}, merge=True)
+        assert captured["key_name"] == "gemini"
 
-    def test_firestore_exception_returns_false_not_raises(self, monkeypatch, silent_log):
-        """Network blip or permission denial must NOT crash pair — the
-        caller falls back to os.environ-only and tells the user to retry
-        from the Account page."""
+    def test_bridge_failure_propagates_as_false(self, monkeypatch, silent_log):
+        """Bridge returns False on token-mint failure, network error, or
+        non-200 from the FE Cloud Function. The wrapper must propagate."""
         from research import _save_api_key_to_firestore
-        mock_db = mock.MagicMock()
-        mock_db.collection().document().collection().document().set.side_effect = Exception("FAILED_PRECONDITION")
-        monkeypatch.setattr("research._firebase_db", mock_db)
-        # Must return False, not raise
-        result = _save_api_key_to_firestore("uid-abc", "anthropic", "sk-ant-xyz")
-        assert result is False
+        monkeypatch.setattr("research._save_api_key_via_fe_bridge", lambda k, v: False)
+        assert _save_api_key_to_firestore("uid-abc", "anthropic", "sk-ant-xyz") is False
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -125,16 +125,6 @@ PHASE_2_MAX_MIN = int(os.environ.get("PHASE_2_MAX_MIN", "120"))  # advisory cap 
 PHASE_3_UPLOAD_MAX_MIN = int(os.environ.get("PHASE_3_UPLOAD_MAX_MIN", "15"))  # NLM upload — bounded utility op
 PHASE_3_AUDIO_MAX_MIN = int(os.environ.get("PHASE_3_AUDIO_MAX_MIN", "90"))    # advisory cap (soft-warn) — podcast gen 30-60min on long sources
 
-# Track D auth mode — `legacy` (default, Admin SDK from firebase-service-
-# account.json) or `user` (refresh-token credentials per user; ships PR-D3
-# as opt-in and becomes default in PR-D5 cutover). Override via env var
-# OR `--auth-mode=user` on `--pair` to enter the new flow. Persists into
-# research_config.json after a successful user-mode pair so subsequent
-# commands (--serve, --doctor, etc.) read the same mode without an env var.
-RESEARCH_AUTH_MODE_ENV = os.environ.get("RESEARCH_AUTH_MODE", "").strip().lower()
-_VALID_AUTH_MODES = ("legacy", "user")
-
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 # CREATE_NO_WINDOW (0x08000000) — passed to every subprocess.run that spawns
@@ -1424,138 +1414,61 @@ BE_PHASES_TIMEOUT_SEC = 4200
 
 
 def init_firebase():
-    """Initialize the Firestore client for this BE process. Routes based on
-    `load_auth_mode()` — every call site (`run_pair`, `run_doctor`,
-    `_heartbeat_loop` self-heal, `cmd_pair_v2`, etc.) goes through this
-    single entry point so the auth-mode switch is centralized.
+    """Initialize the Firestore client for this BE process. Backed by the
+    OS-keystore refresh token (deposited by `cmd_pair_v2`'s Stage 1
+    handshake) via a per-user `google.cloud.firestore.Client`. No Admin
+    SDK; no firebase-service-account.json on disk.
 
-    legacy mode → Firebase Admin SDK from `firebase-service-account.json`.
-                  Existing behavior, default for every install before
-                  PR-D5c flips the default to user-mode.
-    user mode   → `google.cloud.firestore.Client` backed by the OS
-                  keystore's refresh token (PR-D3 cmd_pair_v2 deposited
-                  it). No service-account.json on disk; per-user blast
-                  radius. PR-D5a-core.
-
-    Returns True on success, False on any error (caller falls back per
-    its own policy)."""
+    Returns True on success, False if the keystore is empty (user hasn't
+    paired) or the refresh token has been revoked (owner triggered
+    Reset). Caller's typical recovery is to log the user-facing message
+    and prompt re-pair."""
     global _firebase_db
     if _firebase_db:
         return True
-    mode = load_auth_mode()
-    if mode == "user":
-        return _init_firebase_user_mode()
-    return _init_firebase_legacy()
-
-
-def _init_firebase_legacy() -> bool:
-    """Admin-SDK init from firebase-service-account.json. Pre-Track-D path.
-
-    Also configures the Storage bucket so Phase 3 can upload NotebookLM audio
-    to Firebase Storage (which then streams to the Vercel Podcasts page). The
-    bucket name comes from env var `FIREBASE_STORAGE_BUCKET` if set,
-    otherwise defaults to the new `<project>.firebasestorage.app` convention
-    (used for projects created Oct 2024+). If your project is older and uses
-    `<project>.appspot.com`, set the env var explicitly.
-    """
-    global _firebase_db
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore as _fs
-        sa_path = Path(__file__).parent / "firebase-service-account.json"
-        if not sa_path.exists():
-            log("Firebase: service-account.json not found — Firestore bridge disabled", "WARN")
-            return False
-        cred = credentials.Certificate(str(sa_path))
-        # Derive project id from service account for the default bucket name.
-        import json as _json
-        try:
-            _sa = _json.loads(sa_path.read_text(encoding="utf-8"))
-            _project_id = _sa.get("project_id", "")
-        except Exception:
-            _project_id = ""
-        bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET") or (
-            f"{_project_id}.firebasestorage.app" if _project_id else None
-        )
-        init_opts = {"storageBucket": bucket_name} if bucket_name else None
-        firebase_admin.initialize_app(cred, init_opts)
-        _firebase_db = _fs.client()
-        if bucket_name:
-            log(f"Firebase Admin SDK initialized ✓ (storage bucket: {bucket_name})")
-        else:
-            log("Firebase Admin SDK initialized ✓ (no storage bucket configured)")
-        return True
-    except ImportError:
-        log("Firebase: firebase-admin not installed — Firestore bridge disabled", "WARN")
-        return False
-    except Exception as e:
-        log(f"Firebase init error: {e}", "WARN")
-        return False
-
-
-def _init_firebase_user_mode() -> bool:
-    """Track D user-mode Firestore init — refresh-token credentials from the
-    OS keystore, no Admin SDK, no firebase-service-account.json. Returns
-    False if the keystore is empty (caller prompts re-pair) or if the
-    refresh token has been revoked (owner triggered Reset; caller wipes
-    keystore + prompts re-pair). Errors are logged at ERROR severity
-    because user-mode without auth = BE can't function."""
-    global _firebase_db
     try:
         from auth import v2_flow, keystore as _ks
     except ImportError as e:
-        log(f"Firebase user-mode: auth/ package import failed: {e}", "ERROR")
+        log(f"Firestore init: auth/ package import failed: {e}", "ERROR")
         return False
     install_uuid = _ks.install_uuid()
     if _ks.try_recover(install_uuid) is None:
         log(
-            "Firebase user-mode: keystore empty — run "
-            "`python research.py --pair --auth-mode=user` to establish a refresh token.",
+            "Firestore init: keystore empty — run `python research.py --pair` "
+            "to establish a refresh token.",
             "ERROR",
         )
         return False
     client = v2_flow.init_firestore_user_scoped(install_uuid)
     if client is None:
         log(
-            "Firebase user-mode: refresh token rejected (revoked or expired). "
-            "If you triggered Reset Pair Code, check your email for the new code "
-            "and run `python research.py --pair --auth-mode=user`.",
+            "Firestore init: refresh token rejected (revoked or expired). "
+            "If you triggered Reset Pair Code, check your email for the new "
+            "code and run `python research.py --pair`.",
             "ERROR",
         )
         return False
     _firebase_db = client
-    log(f"Firestore user-mode client initialized ✓ (install={install_uuid[:8]}…)")
+    log(f"Firestore client initialized ✓ (install={install_uuid[:8]}…)")
     return True
 
 
 def _be_payload(data: dict) -> dict:
-    """Inject `deviceId` into a write payload when running in user-mode.
+    """Inject `deviceId` into a Firestore write payload.
 
-    The Firestore `deviceWritingTo` / `deviceUpdatingFor` rules introduced
-    in PR-D2a require BE writes to user trees to declare which device is
-    doing the write. The deviceId in the payload MUST equal the BE's
+    The `deviceWritingTo` / `deviceUpdatingFor` rules on user-tree
+    sub-collections require the BE write to declare which device is
+    making it; the deviceId in the payload MUST equal the BE's
     `auth.token.deviceId` claim (set at custom-token mint time by the
-    claim Cloud Function). `load_device_id()` reads from research_config
-    .json — the same id that was used to bootstrap the claim.
-
-    In legacy mode this helper is a no-op: the doc is written as-is and
-    the Admin SDK bypasses all rules.
-
-    Every centralized write helper that targets `users/{ownerUid}/...`
-    paths must call `_be_payload(data)` immediately before the
-    Firestore call. Pre-D5a-pre this was 17 inline writes; post-D5a-pre
-    it's the 6 centralized helpers (`_update_research_doc`,
-    `_set_research_doc`, `emit_event`, `save_audio_to_firestore`,
-    `save_document_to_firestore`, `update_link_in_firestore`)."""
-    if load_auth_mode() != "user":
-        return data
+    claim Cloud Function). Every centralized write helper that targets
+    a `users/{ownerUid}/...` path calls this immediately before the
+    Firestore put."""
     did = load_device_id()
     if not did:
-        # No deviceId persisted — user-mode pair never completed. Caller's
-        # Firestore write will permission-deny; rather than silently
-        # corrupting state, surface a warn here so the failure mode is
-        # obvious.
-        log("_be_payload: user-mode active but deviceId missing from research_config.json", "WARN")
+        # No deviceId persisted — pair never completed. Caller's write
+        # will permission-deny; surface the misconfig here so the
+        # failure mode is obvious.
+        log("_be_payload: deviceId missing from research_config.json — re-pair required", "WARN")
         return data
     return {**data, "deviceId": did}
 
@@ -1729,47 +1642,10 @@ def load_device_id():
 
 
 def load_auth_mode() -> str:
-    """Track D — resolve effective auth mode (env > config > inferred default).
-
-    `legacy`  Admin SDK from firebase-service-account.json. The Track-D-
-              earliest installs are here; existing devices with a
-              `researchToken` in config keep this until they re-pair.
-    `user`    Refresh-token credentials in the OS keystore (PR-D3 opt-in,
-              PR-D5c cutover default). No service-account JSON needed on
-              the user's machine; per-user blast radius if the keystore is
-              compromised.
-
-    Default-inference rules (in order):
-        1. Env `RESEARCH_AUTH_MODE` if valid.
-        2. Explicit `authMode` field in research_config.json.
-        3. Presence of `researchToken` field in research_config.json →
-           "legacy" (don't silently flip pre-cutover installs into
-           user-mode; their next `--serve` would fail because the
-           keystore is empty).
-        4. Fresh install (no config or empty config) → "user" — Track D
-           is the post-D5c default.
-
-    Override at the CLI:
-        export RESEARCH_AUTH_MODE=user    # env wins everything
-        python research.py --pair --auth-mode=legacy    # CLI flag wins config
-    """
-    if RESEARCH_AUTH_MODE_ENV in _VALID_AUTH_MODES:
-        return RESEARCH_AUTH_MODE_ENV
-    if RESEARCH_CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
-            mode = (cfg.get("authMode") or "").strip().lower()
-            if mode in _VALID_AUTH_MODES:
-                return mode
-            # Pre-D5c install — `authMode` was never written. If a
-            # researchToken exists, the user paired the legacy way; don't
-            # silently flip them. Returning "user" here would break their
-            # next `--serve` because the keystore is empty.
-            if (cfg.get("researchToken") or cfg.get("pipeToken") or "").strip():
-                return "legacy"
-        except Exception:
-            pass
-    # Fresh install — Track D is the new default.
+    """DEPRECATED — kept for backward-compat with any third-party scripts
+    that import it. The Track D cutover removed legacy mode; this always
+    returns "user". To be deleted in a follow-up after callers are
+    audited."""
     return "user"
 
 
@@ -26149,25 +26025,16 @@ def _save_api_key_to_firestore(uid: str, key_name: str, value: str) -> bool:
     session still has the key; the user can re-save from the Account page
     later for cross-device durability.
 
-    Track D user-mode: a direct write would permission-deny (synth device
-    user can't write `users/{userId}/settings/prefs`). Instead we POST to
-    the FE bridge `/api/devices/save-api-key`, which verifies the BE's
+    Post-D7: a direct write would permission-deny (synth device user
+    can't write `users/{userId}/settings/prefs`). All writes POST to the
+    FE bridge `/api/devices/save-api-key`, which verifies the BE's
     ID token, reads the `ownerUid` custom claim, and writes via Admin SDK
-    on our behalf. See `web/src/app/api/devices/save-api-key/route.ts`."""
-    if load_auth_mode() == "user":
-        return _save_api_key_via_fe_bridge(key_name, value)
-    if not (_firebase_db and uid):
-        return False
-    try:
-        _firebase_db.collection("users").document(uid) \
-            .collection("settings").document("prefs").set(
-                {"apiKeys": {key_name: value}}, merge=True,
-            )
-        log(f"[pair] saved apiKeys.{key_name} to Firestore for uid={uid[:8]}…", "INFO")
-        return True
-    except Exception as e:
-        log(f"[pair] Firestore write of apiKeys.{key_name} failed: {e}", "WARN")
-        return False
+    on our behalf. The `uid` parameter is ignored (the bridge resolves
+    the target owner from the token); kept in the signature so call
+    sites don't need updating. See
+    `web/src/app/api/devices/save-api-key/route.ts`."""
+    del uid  # ignored — bridge resolves target ownerUid from the BE's token claim
+    return _save_api_key_via_fe_bridge(key_name, value)
 
 
 async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
@@ -26993,262 +26860,6 @@ async def _continue_pair_stages_2_to_5(
         print(f"  {_c(_DIM, 'Your token is saved. Re-run when ready:')}")
         print(f"        {_c(_BOLD, 'python research.py --pair')}")
         print("")
-
-
-async def run_pair(profile_dir, wait_minutes=10):
-    """Guided setup: generate/reuse ResearchToken, render ASCII QR, open
-    login tabs, auto-verify per-platform login every 30s, exit cleanly when
-    all green (or on user Ctrl+C / timeout).
-
-    Markers only tick after a real authenticated signal in the DOM — generic
-    chat-input elements are deliberately excluded from LOGIN_PLATFORMS.
-
-    QR payload is the bare token string so the in-app scanner just extracts
-    + saves to the user's Firebase profile — no URL round-trips needed.
-    """
-    _setup_logo()
-
-    # Snapshot pre-pair state for the F4 / DGOPS-7451 relaxation downstream.
-    # The F4 cookie check refuses pair when prior Google auth is present —
-    # but only the "switching accounts mid-life" case is the actual DGOPS-7451
-    # risk. First-pair on a fresh device (no _initial_paired_uid) OR re-pair
-    # to the same account (uid matches) are both safe; cookies are presumably
-    # from the user about to claim the link. Captured here before Stage 1
-    # writes new state to research_config.json / device_config.json.
-    _initial_paired_uid = load_paired_uid()
-
-    # ══════════════════════════════════════════════════════════════════════
-    # [1/5] TOKEN SETUP — mint, register in Firestore, render QR, wait for
-    #       the app to claim the link. All token-side work lives here.
-    # ══════════════════════════════════════════════════════════════════════
-    _setup_step(1, 5, "Token setup")
-
-    firebase_ok = init_firebase()
-    if not firebase_ok:
-        log("    Firebase unavailable — the app will NOT be able to validate this token.", "ERROR")
-        log("    Check firebase-service-account.json and your network. Exiting.", "ERROR")
-        return
-
-    # ── Device display name ────────────────────────────────────────────────
-    # Auto-named from the OS hostname (e.g. "SYAM-PC") and written to
-    # users/{uid}/devices/{deviceId}.name at the end of setup. The user
-    # renames it from the Account page if they want something else, so
-    # prompting for it in the terminal is redundant friction.
-    import socket as _socket
-    chosen_device_name = _socket.gethostname()
-
-    existing = load_research_token()
-    # Track whether we minted the token this run. If the user Ctrl+Cs or
-    # the wait loop times out below, we tear down a freshly-minted Firestore
-    # token doc so aborted setups leave no orphan behind. Reused tokens
-    # (from a prior successful --pair's local config) are preserved — the
-    # user is likely just retrying.
-    new_token_minted = False
-    if existing:
-        token = existing
-        print(f"  {_c(_DIM, 'Reusing existing token')}  {_c(_DIM, '·')}  delete {RESEARCH_CONFIG_PATH.name} for a fresh one.")
-    else:
-        token = generate_research_token()
-        new_token_minted = True
-        print(f"  {_c(_OK, 'Minted new token.')}")
-
-    # Upsert in Firestore on every --pair run so a reused local token can't
-    # drift out of sync with what the app reads.
-    try:
-        import socket
-        from google.cloud.firestore import SERVER_TIMESTAMP
-        _firebase_db.collection("research_tokens").document(token).set({
-            "status": "active",
-            "machineName": socket.gethostname(),
-            "lastHeartbeat": SERVER_TIMESTAMP,
-            "createdAt": SERVER_TIMESTAMP,
-        }, merge=True)
-        print(f"  {_c(_OK, '✓')} Registered with {_c(_BOLD, _firebase_db.project)}")
-    except Exception as e:
-        log("    FIRESTORE REGISTRATION FAILED — the app will reject this token.", "ERROR")
-        log(f"        {e}", "ERROR")
-        return
-
-    print()
-    print(f"  {_c(_DIM, 'Token')}")
-    print(f"  {_c(_BOLD + _ACCENT, token)}")
-    print()
-    try:
-        import qrcode
-        qr = qrcode.QRCode(border=1, box_size=1,
-                           error_correction=qrcode.constants.ERROR_CORRECT_L)
-        qr.add_data(token)
-        qr.make(fit=True)
-        # F12 of the CLI audit — invert=True uses ANSI reverse-video,
-        # which renders as `?` runs on terminals where _USE_COLOR is False
-        # (dumb terms, certain TERM=linux consoles, CI). Honor color
-        # detection so the QR stays scannable everywhere.
-        qr.print_ascii(tty=True, invert=bool(_USE_COLOR))
-    except ImportError:
-        log("    qrcode lib missing — run `pip install -r requirements.txt` first.", "WARN")
-    except Exception as e:
-        log(f"    QR render failed: {e}", "WARN")
-    print()
-    print(f"  {_c(_DIM, 'Pair this token in the Super Research app:')}")
-    print(f"       {_c(_ACCENT, '•')} Scan QR  {_c(_DIM, '→')}  chat → Connect → Scan QR")
-    print(f"       {_c(_ACCENT, '•')} or Paste {_c(_DIM, '→')}  Account → Pipeline Connection")
-    print()
-    # Capture the start timestamp BEFORE clearing so that an app-side claim
-    # racing with our clear (claim writes `linkedAt: serverTimestamp()`) still
-    # falls within the freshness window below. Clock-skew tolerance of 30s
-    # further absorbs server/client drift.
-    setup_started_ms = int(time.time() * 1000)
-
-    # Critical: clear any stale link fields from a previous --pair run BEFORE
-    # we start watching. If the user unlinked via the app but the release write
-    # silently failed, `linkedUid` might still be present — we'd read it here
-    # and auto-advance as if paired. Resetting the fields on every --pair
-    # guarantees the email NEVER appears until the user does a live pair.
-    try:
-        _firebase_db.collection("research_tokens").document(token).update({
-            "linkedUid": "",
-            "linkedEmail": "",
-            "linkedAt": None,
-        })
-        log("Cleared any stale link on this token — waiting for a fresh pair from the app.", "INFO")
-    except Exception as e:
-        log(f"    Could not reset stale link fields: {e}", "WARN")
-
-    # Watch the token doc — the app calls claimResearchToken after validating
-    # + saving, which writes {linkedUid, linkedEmail, linkedAt} here. We
-    # require ALL THREE to be present, plus linkedAt newer than this --pair
-    # started (with 30s skew tolerance), so a stale pre-run claim can never
-    # slip through.
-    linked_uid: str | None = None
-    linked_email: str | None = None
-    link_deadline = time.time() + wait_minutes * 60
-    tick = 0
-    first_err_logged = False
-    # Spinner-driven wait: poll Firestore once per 3-second window while a
-    # Braille-dot frame ticks every 100ms on the same line so the terminal
-    # reads as alive. Elapsed counter + Ctrl+C hint ride alongside the
-    # spinner. Single \r-overwritten line — no scrolling wall of
-    # "...still waiting" noise.
-    wait_start_ts = time.time()
-    frame_idx = 0
-    POLL_EVERY_FRAMES = 30  # 30 × 100ms ≈ 3s (matches previous poll cadence)
-    aborted_by_user = False
-
-    def _rollback_unclaimed_token():
-        """Delete the Firestore token doc we minted this run. Only called
-        from the abort/timeout paths when no link has been confirmed, so
-        there's no device doc or paired UID to worry about — the token
-        doc is the only Firestore state --pair has written so far."""
-        if not (new_token_minted and _firebase_db):
-            return
-        try:
-            _firebase_db.collection("research_tokens").document(token).delete()
-            log(f"Rolled back unclaimed token doc in Firestore: {token[:8]}…", "INFO")
-        except Exception as e:
-            log(f"Cleanup of unclaimed token doc failed (non-fatal): {e}", "WARN")
-
-    try:
-        while time.time() < link_deadline and linked_uid is None:
-            # Poll Firestore on frame 0 of each window
-            if frame_idx % POLL_EVERY_FRAMES == 0:
-                try:
-                    doc = _firebase_db.collection("research_tokens").document(token).get()
-                    if doc.exists:
-                        data = doc.to_dict() or {}
-                        _uid = data.get("linkedUid") or ""
-                        _email = data.get("linkedEmail") or ""
-                        _at = data.get("linkedAt")
-                        # linkedAt is a Firestore Timestamp — convert to ms-since-epoch.
-                        _at_ms = 0
-                        if _at is not None:
-                            try:
-                                _at_ms = int(_at.timestamp() * 1000)
-                            except Exception:
-                                _at_ms = 0
-                        # Accept the link only when all three fields are present AND
-                        # the claim is newer than this --pair started (prevents a
-                        # cached pre-run claim from auto-advancing). 30s skew tolerance
-                        # for server/client clock drift.
-                        if _uid and _email and _at_ms >= setup_started_ms - 30_000:
-                            linked_uid = _uid
-                            linked_email = _email
-                            break
-                except Exception as e:
-                    if not first_err_logged:
-                        log(f"    Link poll error (continuing): {e}", "WARN")
-                        first_err_logged = True
-            # Advance spinner
-            frame = _SPINNER_FRAMES[frame_idx % len(_SPINNER_FRAMES)]
-            elapsed = int(time.time() - wait_start_ts)
-            mm, ss = divmod(elapsed, 60)
-            sys.stdout.write(
-                f"\r  {_c(_ACCENT, frame)}  {_c(_DIM, 'waiting for the app to pair…')}   "
-                f"{_c(_DIM, f'{mm:d}:{ss:02d}')}   {_c(_DIM, '(Ctrl+C to cancel)')}    "
-            )
-            sys.stdout.flush()
-            frame_idx += 1
-            await asyncio.sleep(0.1)
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        # User Ctrl+C'd mid-wait. Swallow so we can run cleanup, then
-        # exit cleanly with a "cancelled" message instead of a noisy
-        # traceback. linked_uid is still None → rollback below handles it.
-        aborted_by_user = True
-
-    # Clear the spinner line so the next print starts clean
-    _clear_status_line()
-
-    if linked_uid is None:
-        _rollback_unclaimed_token()
-        print()
-        if aborted_by_user:
-            print(f"  {_c(_WARN, 'Pair cancelled.')}")
-        else:
-            print(f"  {_c(_WARN, 'Timed out waiting for app pairing.')}")
-        if new_token_minted:
-            print(f"  {_c(_DIM, '     No token saved locally. Re-run to start fresh.')}")
-        else:
-            print(f"  {_c(_DIM, '     Your existing token is kept — re-run to try again.')}")
-        print(f"  {_c(_DIM, 'Re-run when ready:')}  {_c(_BOLD, 'python research.py --pair')}")
-        return
-
-    # Prefer the email written by the scanner; fall back to Firebase Auth.
-    if not linked_email:
-        try:
-            from firebase_admin import auth as fb_auth
-            user_obj = fb_auth.get_user(linked_uid)
-            linked_email = user_obj.email or linked_uid[:8]
-        except Exception:
-            linked_email = linked_uid[:8]
-
-    # Link confirmed — now safe to persist the token to research_config.json.
-    # Held off until this point so a mid-pair Ctrl+C / timeout leaves no
-    # researchToken on disk (the Firestore token doc is torn down by the
-    # abort path above when newly minted).
-    _persist_research_token_locally(token)
-    # Pin the paired uid locally so --serve's heartbeat can mirror into the
-    # device doc without re-reading Firestore. Also upsert the device doc so
-    # the app's Account page + sidebar see this PC immediately.
-    save_device_config(paired_uid=linked_uid)
-    write_device_doc(linked_uid, token, device_name=chosen_device_name)
-
-    print()
-    print(f"  {_c(_OK, '✓')}  Linked to {_c(_BOLD, linked_email or '—')}")
-    print()
-
-    # Stages 2-5 are shared with cmd_pair_v2 (user-mode). Legacy mode
-    # writes per-platform login progress into research_tokens/{token};
-    # user-mode writes into devices/{deviceId}.logins. Pass token here;
-    # device_id_for_progress=None so the helper takes the legacy branch.
-    await _continue_pair_stages_2_to_5(
-        profile_dir,
-        linked_uid=linked_uid,
-        linked_email=linked_email or "",
-        initial_paired_uid=_initial_paired_uid,
-        token=token,
-        device_id_for_progress=None,
-    )
-    return  # The helper handles the Ready/cancelled tail messages.
-
 
 
 # ── Supervised mode (--resurrect / --retire) ───────────────────────────
@@ -29873,12 +29484,6 @@ def main():
     parser.add_argument("--api-key", "-k", help="CUA API key")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--pair", action="store_true", help="First-time login setup")
-    parser.add_argument("--auth-mode", choices=["legacy", "user"], default=None,
-        help="Track D opt-in: with --pair, use the new refresh-token credentials path "
-             "(no firebase-service-account.json needed). Currently alpha (PR-D3): only "
-             "Stage 1 is wired into user-mode; Stages 2-5 still need legacy --pair. "
-             "Default: respect RESEARCH_AUTH_MODE env var, fall back to research_config.json, "
-             "fall back to legacy.")
     parser.add_argument("--resume", "-r", help="Resume from a previous queue directory (name or full path)")
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
     parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
@@ -29942,16 +29547,7 @@ def main():
         return
 
     if args.pair:
-        # Resolve effective auth mode: CLI flag > env var > config > inferred default.
-        # Post-D5c, plain `--pair` defaults to user-mode for fresh installs
-        # (load_auth_mode() returns "user"); pre-existing legacy installs
-        # with a researchToken in config stay on "legacy" until they
-        # explicitly opt in.
-        effective_mode = args.auth_mode or load_auth_mode()
-        if effective_mode == "user":
-            asyncio.run(cmd_pair_v2(str(PROFILE_DIR)))
-        else:
-            asyncio.run(run_pair(str(PROFILE_DIR)))
+        asyncio.run(cmd_pair_v2(str(PROFILE_DIR)))
         return
 
     if args.serve:
