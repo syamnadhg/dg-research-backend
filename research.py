@@ -1759,29 +1759,29 @@ _device_cmd_watch = None  # Firestore Watch handle; kept for lifetime cleanup
 
 
 def _start_device_command_listener(uid: str, device_id: str):
-    """Subscribe to users/{uid}/devices/{deviceId}/commands so the FE can
-    issue device-level commands that aren't scoped to a particular
-    research run. The first such command will be `hard_reset` (C2 wires
-    that handler in) — this commit just establishes the plumbing.
+    """Subscribe to devices/{deviceId}/commands so the FE can issue
+    device-level commands that aren't scoped to a particular research
+    run (e.g. `hard_reset` from the Account-page Online pill, or
+    `clear_local_storage` broadcast from Settings → Manage Data).
 
-    Mirrors _start_command_listener's pattern: a startup sweep that
-    deletes any `processed:true` docs left over from a prior session
-    that crashed before its tail-delete flushed, plus a 30s stale-age
-    gate so commands written before the previous serve died don't
-    replay on the new attach.
+    Owner + sharers write to the subcollection (rule `isDeviceMember`
+    + `submittedBy == auth.uid`); the BE-as-synth-device reads + deletes
+    after processing (rule `isDeviceItself`). The synth user can listen
+    here because the parent device doc's read rule permits self-reads.
 
-    Unlike the research-scoped listener, this one runs for the full
-    lifetime of `--serve` (until os._exit/SIGINT) because it's
-    device-scoped, not run-scoped. The Firestore Admin SDK fires the
-    snapshot callback in a background thread — we do sync work only
-    (log + delete). Idempotent against repeated snapshots: handled
-    docs are deleted in the same callback iteration."""
+    Startup sweep + 30s stale-age gate match the research-scoped
+    listener's pattern — handled docs are tail-deleted in the same
+    callback so a crash-before-delete doesn't double-fire on the next
+    --serve. Lifetime is `--serve`-long (no per-run teardown).
+
+    The `uid` param is now informational only (kept for logging /
+    backward-compat); routing uses the top-level device path."""
     global _device_cmd_watch
-    if not _firebase_db or not uid or not device_id:
-        log("[device-cmds] not starting — missing uid/device_id/firebase", "DEBUG")
+    if not _firebase_db or not device_id:
+        log("[device-cmds] not starting — missing device_id/firebase", "DEBUG")
         return
-    col_ref = _firebase_db.collection("users").document(uid) \
-        .collection("devices").document(device_id) \
+    del uid  # routed via deviceId only post-D8
+    col_ref = _firebase_db.collection("devices").document(device_id) \
         .collection("commands")
 
     # Startup sweep — same rationale as _start_command_listener (line ~2127).
