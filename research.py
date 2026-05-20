@@ -2535,23 +2535,163 @@ def _wait_for_uploads_to_settle(max_wait_s: float = 5.0, poll_s: float = 0.1) ->
         return _inflight_uploads
 
 
+def _resolve_storage_bucket() -> str:
+    """Same bucket name resolver legacy `_init_firebase_legacy` uses, lifted
+    out so the Storage REST path can reuse it without importing
+    firebase_admin. Honors the env override; falls back to the new
+    `<project>.firebasestorage.app` convention."""
+    explicit = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+    if explicit:
+        return explicit
+    try:
+        from auth.v2_flow import PROJECT_ID
+        return f"{PROJECT_ID}.firebasestorage.app"
+    except Exception:
+        return ""
+
+
+def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_id: str) -> "str | None":
+    """Track D user-mode audio upload — Firebase Storage REST API using
+    the synth-device-user's ID token. The Storage rule for
+    `audio/{userId}/{...}` permits create+update when the token's
+    `deviceId` claim resolves to a device authorized for `userId`.
+
+    Returns a download-token URL on success — publicly fetchable by URL,
+    so the FE Podcasts page can stream it via `<audio src>` without an
+    Authorization header. Returns None on token-mint failure, upload
+    failure, or missing bucket.
+
+    Object path mirrors legacy: audio/{ownerUid}/{researchId}/{filename}.
+    """
+    import requests as _requests
+    from urllib.parse import quote as _quote
+
+    bucket = _resolve_storage_bucket()
+    if not bucket:
+        log("[storage REST] FIREBASE_STORAGE_BUCKET unresolved — skip audio upload", "WARN")
+        return None
+    id_token = _fresh_user_mode_id_token()
+    if not id_token:
+        log("[storage REST] no usable ID token — re-pair required", "WARN")
+        return None
+
+    filename = local_path.name
+    object_path = f"audio/{owner_uid}/{research_id}/{filename}"
+    ct = "audio/mpeg" if filename.lower().endswith(".mp3") else (
+        "audio/mp4" if filename.lower().endswith((".m4a", ".mp4")) else "audio/*"
+    )
+    upload_url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o"
+        f"?uploadType=media&name={_quote(object_path, safe='')}"
+    )
+    try:
+        with open(local_path, "rb") as f:
+            resp = _requests.post(
+                upload_url,
+                headers={
+                    "Authorization": f"Firebase {id_token}",
+                    "Content-Type": ct,
+                },
+                data=f,
+                timeout=120,
+            )
+    except _requests.RequestException as e:
+        log(f"[storage REST] audio upload network error: {e}", "WARN")
+        return None
+    if resp.status_code != 200:
+        log(f"[storage REST] audio upload HTTP {resp.status_code}: {resp.text[:200]}", "WARN")
+        return None
+    try:
+        meta = resp.json()
+    except Exception:
+        log("[storage REST] audio upload returned non-JSON response", "WARN")
+        return None
+    # Firebase returns a comma-separated downloadTokens list; first entry
+    # is the active one. The URL with `?alt=media&token=...` is public-
+    # by-URL — anyone with the URL can fetch the bytes.
+    tokens = (meta.get("downloadTokens") or "").split(",")
+    token = tokens[0].strip() if tokens else ""
+    if not token:
+        log("[storage REST] audio upload returned no downloadTokens", "WARN")
+        return None
+    public_url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o/"
+        f"{_quote(object_path, safe='')}?alt=media&token={token}"
+    )
+    log(f"Audio uploaded via Storage REST: gs://{bucket}/{object_path}")
+    return public_url
+
+
+def _download_user_source_via_storage_rest(storage_path: str, dest_path: "Path") -> bool:
+    """Track D user-mode source download — Firebase Storage REST GET using
+    the synth-device-user's ID token. The Storage rule for
+    `users/{userId}/researches/{rid}/sources/{filename}` permits read
+    when the token's `deviceId` claim resolves to a device authorized
+    for `userId`. Streams to disk; returns True on success."""
+    import requests as _requests
+    from urllib.parse import quote as _quote
+
+    bucket = _resolve_storage_bucket()
+    if not bucket:
+        log("[storage REST] FIREBASE_STORAGE_BUCKET unresolved — skip source download", "WARN")
+        return False
+    id_token = _fresh_user_mode_id_token()
+    if not id_token:
+        log("[storage REST] no usable ID token — re-pair required", "WARN")
+        return False
+
+    url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o/"
+        f"{_quote(storage_path, safe='')}?alt=media"
+    )
+    try:
+        resp = _requests.get(
+            url,
+            headers={"Authorization": f"Firebase {id_token}"},
+            stream=True,
+            timeout=60,
+        )
+    except _requests.RequestException as e:
+        log(f"[storage REST] source download network error ({storage_path}): {e}", "WARN")
+        return False
+    if resp.status_code != 200:
+        log(f"[storage REST] source download HTTP {resp.status_code} ({storage_path}): {resp.text[:200]}", "WARN")
+        return False
+    try:
+        with open(dest_path, "wb") as out:
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    out.write(chunk)
+    except Exception as e:
+        log(f"[storage REST] source write failed ({storage_path} → {dest_path}): {e}", "WARN")
+        return False
+    return True
+
+
 def upload_audio_to_storage(local_path: "Path") -> str | None:
     """Upload the NotebookLM audio file to Firebase Storage and return a
-    public download URL. Path is scoped under the user's uid + researchId so
-    users can only access their own files (see storage.rules).
+    publicly-fetchable URL. Path is scoped under the submitter's uid +
+    researchId so users can only access their own files (see storage.rules).
     Returns None if upload fails or Firebase Storage isn't configured.
 
-    Track D user-mode skip: `firebase_admin.storage.bucket()` requires the
-    Admin SDK to be initialized with a service-account credential, which
-    `_init_firebase_user_mode()` deliberately does NOT do. Storage REST
-    via refresh-token credentials is a future-D5b option; for now, audio
-    upload is skipped in user-mode and the audios doc gets no
-    `audioUrl` field. The Podcasts page reads audioUrl — missing = no
-    play button surfaced, no crash.
+    Two paths:
+    - Legacy mode → Admin SDK via firebase_admin.storage.bucket() +
+      blob.make_public() + blob.public_url. Returns a storage.googleapis
+      .com URL.
+    - User mode → Storage REST POST as the synth device user
+      (Authorization: Firebase {id_token}). Returns a download-token URL
+      that's public-by-URL.
     """
     if load_auth_mode() == "user":
-        log("[storage] audio upload skipped in user-mode (Admin SDK unavailable) — Podcasts playback will be absent for this research", "INFO")
-        return None
+        if not (_fb_uid and _fb_research_id):
+            return None
+        if not local_path or not local_path.exists():
+            return None
+        _begin_storage_upload()
+        try:
+            return _upload_audio_via_storage_rest(local_path, _fb_uid, _fb_research_id)
+        finally:
+            _end_storage_upload()
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return None
     if not local_path or not local_path.exists():
@@ -21869,71 +22009,74 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # other agent-generated artifact. Failures are logged but the
         # pipeline continues with whatever sources DID download.
         if user_sources:
-            if load_auth_mode() == "user":
-                # Track D user-mode skip — same reason as upload_audio_to_storage:
-                # Admin SDK isn't initialized in user-mode, so the Storage
-                # download path is unavailable. P3 ingests only what the agents
-                # generated; user-attached files are silently absent. Surface
-                # via FE chat banner is D5b territory.
-                log(
-                    f"[flow-b] {len(user_sources)} user-attached source(s) skipped — "
-                    f"Storage download unavailable in user-mode (rid={queue_dir.name})",
-                    "WARN",
-                )
-            else:
-                try:
+            _user_mode = load_auth_mode() == "user"
+            try:
+                if _user_mode:
+                    # User-mode: Storage REST per attached source. The synth
+                    # device user has read access to users/{owner}/.../sources/...
+                    # when the device is authorized for that owner (rule
+                    # `deviceAuthorizedFor` in storage.rules).
+                    _bucket = _resolve_storage_bucket()
+                    _bucket_label = _bucket or "(unresolved)"
+                else:
                     from firebase_admin import storage as _fb_storage
-                    _bucket = _fb_storage.bucket()
-                    _ok, _fail = 0, 0
-                    for _src in user_sources:
-                        _name = (_src.get("name") or "source").strip() or "source"
-                        _path = (_src.get("storagePath") or "").strip()
-                        if not _path:
-                            _fail += 1
-                            continue
-                        # Sanitize: keep alnum + . _ - and cap length so a
-                        # malicious name can't escape queue_dir.
-                        _safe = re.sub(r"[^A-Za-z0-9._-]", "-", _name)[:80] or "source"
-                        # Avoid clobbering brief.md or another source with the
-                        # same sanitized name — append a numeric suffix.
-                        _dest = queue_dir / "documents" / _safe
-                        if _dest.stem == "brief":
-                            _dest = queue_dir / "documents" / f"src-{_safe}"
-                        _i = 2
-                        while _dest.exists():
-                            _stem = _dest.stem
-                            _ext = _dest.suffix
-                            _dest = queue_dir / "documents" / f"{_stem}-{_i}{_ext}"
-                            _i += 1
-                        try:
-                            _blob = _bucket.blob(_path)
+                    _bucket_obj = _fb_storage.bucket()
+                    _bucket_label = _bucket_obj.name
+                _ok, _fail = 0, 0
+                for _src in user_sources:
+                    _name = (_src.get("name") or "source").strip() or "source"
+                    _path = (_src.get("storagePath") or "").strip()
+                    if not _path:
+                        _fail += 1
+                        continue
+                    # Sanitize: keep alnum + . _ - and cap length so a
+                    # malicious name can't escape queue_dir.
+                    _safe = re.sub(r"[^A-Za-z0-9._-]", "-", _name)[:80] or "source"
+                    # Avoid clobbering brief.md or another source with the
+                    # same sanitized name — append a numeric suffix.
+                    _dest = queue_dir / "documents" / _safe
+                    if _dest.stem == "brief":
+                        _dest = queue_dir / "documents" / f"src-{_safe}"
+                    _i = 2
+                    while _dest.exists():
+                        _stem = _dest.stem
+                        _ext = _dest.suffix
+                        _dest = queue_dir / "documents" / f"{_stem}-{_i}{_ext}"
+                        _i += 1
+                    try:
+                        if _user_mode:
+                            _success = _download_user_source_via_storage_rest(_path, _dest)
+                            if not _success:
+                                raise RuntimeError("Storage REST download failed")
+                        else:
+                            _blob = _bucket_obj.blob(_path)  # noqa: F821 - set in else above
                             _blob.download_to_filename(str(_dest))
-                            log(f"Flow B source: gs://{_bucket.name}/{_path} → {_dest.name} ({_dest.stat().st_size} bytes)")
-                            _ok += 1
-                        except Exception as _e:
-                            log(f"Flow B source download FAILED ({_path}): {_e}", "WARN")
-                            _fail += 1
-                    log(f"Flow B sources: {_ok} downloaded, {_fail} failed")
-                    # If every download failed, the run is doomed — P3 will trip
-                    # the gate and surface a generic "no documents" alert. Better
-                    # to fail fast with the actual reason so the user can retry
-                    # the upload or fix Storage permissions.
-                    if _ok == 0 and _fail > 0:
-                        log(f"Flow B: ALL {_fail} source downloads failed — aborting", "ERROR")
-                        fail_phase(
-                            phase=3,
-                            error=f"Couldn't download {_fail} attached source(s) from Storage",
-                            reason="The pipeline can't continue without the sources you attached. Re-attach and Retry, or Skip Phase 3 to run with no NotebookLM/podcast.",
-                            actions=[
-                                {"id": "retry", "label": "Retry", "style": "primary",
-                                 "command": {"action": "retry_phase", "phase": 3}},
-                                {"id": "skip", "label": "Skip Phase 3", "style": "default",
-                                 "command": {"action": "skip_phase", "phase": 3}},
-                            ],
-                        )
-                        return
-                except Exception as _outer:
-                    log(f"Flow B handler failed (non-fatal): {_outer}", "WARN")
+                        log(f"Flow B source: gs://{_bucket_label}/{_path} → {_dest.name} ({_dest.stat().st_size} bytes)")
+                        _ok += 1
+                    except Exception as _e:
+                        log(f"Flow B source download FAILED ({_path}): {_e}", "WARN")
+                        _fail += 1
+                log(f"Flow B sources: {_ok} downloaded, {_fail} failed")
+                # If every download failed, the run is doomed — P3 will trip
+                # the gate and surface a generic "no documents" alert. Better
+                # to fail fast with the actual reason so the user can retry
+                # the upload or fix Storage permissions.
+                if _ok == 0 and _fail > 0:
+                    log(f"Flow B: ALL {_fail} source downloads failed — aborting", "ERROR")
+                    fail_phase(
+                        phase=3,
+                        error=f"Couldn't download {_fail} attached source(s) from Storage",
+                        reason="The pipeline can't continue without the sources you attached. Re-attach and Retry, or Skip Phase 3 to run with no NotebookLM/podcast.",
+                        actions=[
+                            {"id": "retry", "label": "Retry", "style": "primary",
+                             "command": {"action": "retry_phase", "phase": 3}},
+                            {"id": "skip", "label": "Skip Phase 3", "style": "default",
+                             "command": {"action": "skip_phase", "phase": 3}},
+                        ],
+                    )
+                    return
+            except Exception as _outer:
+                log(f"Flow B handler failed (non-fatal): {_outer}", "WARN")
 
         # Bridge user_sources → P1/P2 attachments. After the Flow B block
         # downloaded everything into documents/, walk that dir and:
