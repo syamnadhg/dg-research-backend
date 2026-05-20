@@ -125,6 +125,15 @@ PHASE_2_MAX_MIN = int(os.environ.get("PHASE_2_MAX_MIN", "120"))  # advisory cap 
 PHASE_3_UPLOAD_MAX_MIN = int(os.environ.get("PHASE_3_UPLOAD_MAX_MIN", "15"))  # NLM upload — bounded utility op
 PHASE_3_AUDIO_MAX_MIN = int(os.environ.get("PHASE_3_AUDIO_MAX_MIN", "90"))    # advisory cap (soft-warn) — podcast gen 30-60min on long sources
 
+# Track D auth mode — `legacy` (default, Admin SDK from firebase-service-
+# account.json) or `user` (refresh-token credentials per user; ships PR-D3
+# as opt-in and becomes default in PR-D5 cutover). Override via env var
+# OR `--auth-mode=user` on `--pair` to enter the new flow. Persists into
+# research_config.json after a successful user-mode pair so subsequent
+# commands (--serve, --doctor, etc.) read the same mode without an env var.
+RESEARCH_AUTH_MODE_ENV = os.environ.get("RESEARCH_AUTH_MODE", "").strip().lower()
+_VALID_AUTH_MODES = ("legacy", "user")
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1470,6 +1479,71 @@ def load_device_id():
         except Exception:
             pass
     return None
+
+
+def load_auth_mode() -> str:
+    """Track D — resolve effective auth mode (env > config > default).
+
+    `legacy`  Admin SDK from firebase-service-account.json. Current default;
+              every existing install is in this mode.
+    `user`    Refresh-token credentials in the OS keystore (PR-D3 opt-in,
+              PR-D5 cutover). No service-account JSON needed on the user's
+              machine; per-user blast radius if the keystore is compromised.
+
+    Defaults to `legacy` if neither source pins it. Override:
+        export RESEARCH_AUTH_MODE=user    # env wins
+        python research.py --pair --auth-mode=user    # CLI flag wins
+    """
+    if RESEARCH_AUTH_MODE_ENV in _VALID_AUTH_MODES:
+        return RESEARCH_AUTH_MODE_ENV
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+            mode = (cfg.get("authMode") or "").strip().lower()
+            if mode in _VALID_AUTH_MODES:
+                return mode
+        except Exception:
+            pass
+    return "legacy"
+
+
+def load_poll_secret() -> str | None:
+    """Track D — the 256-bit pollSecret for the BE-only path-key under which
+    the FE claim Cloud Function writes the customToken. Lives in
+    research_config.json (NOT the keystore — it must survive Reset Pair
+    Code, which wipes the keystore but reuses the same secret hash on
+    re-pair). Returns None if not yet minted (legacy install, fresh pre-
+    pair state)."""
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+            val = (cfg.get("pollSecret") or "").strip()
+            if val:
+                return val
+        except Exception:
+            pass
+    return None
+
+
+def save_user_mode_state(*, device_id: str, paired_uid: str, poll_secret: str) -> None:
+    """Persist Track D user-mode state after a successful cmd_pair_v2.
+    Flips authMode to "user" so subsequent commands route to the new
+    Firestore client + heartbeat target. Reuses the atomic-write path that
+    save_device_config uses."""
+    global _device_id, _device_paired_uid
+    local_cfg = {}
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            local_cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    local_cfg["authMode"] = "user"
+    local_cfg["deviceId"] = device_id
+    local_cfg["pairedUid"] = paired_uid
+    local_cfg["pollSecret"] = poll_secret
+    _atomic_write_json(RESEARCH_CONFIG_PATH, local_cfg)
+    _device_id = device_id
+    _device_paired_uid = paired_uid
 
 
 def load_paired_uid():
@@ -25620,6 +25694,134 @@ async def _pair_prompt_api_keys(uid: str):
             print(f"  {_c(_DIM, '─')}  Skipped Gemini — set later from the web app (Account → API Config).")
 
 
+async def cmd_pair_v2():
+    """Track D Stage-1 user-mode pair (PR-D3 alpha — opt-in via
+    `--pair --auth-mode=user` or `RESEARCH_AUTH_MODE=user`).
+
+    Mints a 256-bit pollSecret locally, calls the FE Cloud Function
+    /api/devices/initiate-pair, displays the 8-char code (and QR), polls
+    the pending-customToken subdoc, exchanges the JWT for a refresh
+    token, persists it to the OS keystore via RefreshTokenCredentials.
+    bootstrap. No Admin SDK, no firebase-service-account.json.
+
+    Scope: Stage 1 ONLY. Stages 2-5 (API keys, browser logins,
+    supervisor) still require the legacy `--pair` flow until PR-D5
+    unifies them. This command is for users who want to test the
+    Track D infrastructure end-to-end before the cutover lands.
+    """
+    from auth import v2_flow
+    import socket as _socket
+    import platform as _platform
+
+    _setup_logo()
+    _setup_step(1, 5, "Token setup  ·  Track D user-mode (PR-D3 alpha)")
+
+    existing_secret = load_poll_secret()
+    if existing_secret:
+        poll_secret = existing_secret
+        print(f"  {_c(_DIM, 'Reusing pollSecret from config — same hash → same Firestore subdoc path.')}")
+    else:
+        poll_secret = v2_flow.generate_poll_secret()
+        print(f"  {_c(_OK, '✓')} Minted new 256-bit pollSecret.")
+
+    poll_secret_hash = v2_flow.compute_poll_secret_hash(poll_secret)
+
+    hostname = _socket.gethostname()
+    os_string = f"{_platform.system()} {_platform.release()}"
+
+    captured = {"device_id": None, "pair_code": None}
+
+    def _on_code(device_id: str, pair_code: str) -> None:
+        captured["device_id"] = device_id
+        captured["pair_code"] = pair_code
+        formatted = (
+            f"{pair_code[:4]}-{pair_code[4:]}" if len(pair_code) == 8 else pair_code
+        )
+        print()
+        print(f"  {_c(_DIM, 'Pair code')}")
+        print(f"  {_c(_BOLD + _ACCENT, formatted)}")
+        print()
+        try:
+            import qrcode
+            qr = qrcode.QRCode(
+                border=1, box_size=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+            )
+            qr.add_data(pair_code)
+            qr.make(fit=True)
+            # invert=True uses ANSI reverse-video — only safe when we know
+            # the terminal honors color (matches F12 of the CLI audit).
+            qr.print_ascii(tty=True, invert=bool(_USE_COLOR))
+        except ImportError:
+            log("    qrcode lib missing — pip install -r requirements.txt", "WARN")
+        except Exception as e:
+            log(f"    QR render failed: {e}", "WARN")
+        print()
+        print(f"  {_c(_DIM, 'Enter this code in the Super Research app:')}")
+        print(f"       {_c(_ACCENT, '•')} Account → Pipeline Connection → Add Device")
+        print()
+
+    last_tick = {"sec": -1}
+
+    def _on_waiting(elapsed: float) -> None:
+        sec = int(elapsed)
+        # Print every 5s — printing every poll spams the terminal.
+        if sec - last_tick["sec"] >= 5:
+            last_tick["sec"] = sec
+            # \r keeps the line in-place; trailing spaces wipe the previous
+            # counter so single-digit→double-digit transitions don't leave
+            # stale chars. F7 width clamp would be cleaner but the message
+            # is short.
+            sys.stdout.write(
+                f"  {_c(_DIM, f'Waiting for FE claim... {sec}s')}                 \r"
+            )
+            sys.stdout.flush()
+
+    try:
+        result = await v2_flow.do_pair_v2(
+            poll_secret_hash=poll_secret_hash,
+            machine_name=hostname,
+            hostname=hostname,
+            os_string=os_string,
+            on_code=_on_code,
+            on_waiting=_on_waiting,
+        )
+    except v2_flow.PollTimeout:
+        print()
+        log("Pair window expired — re-run --pair --auth-mode=user to start fresh.", "ERROR")
+        return
+    except v2_flow.InitiatePairError as e:
+        print()
+        log(f"Could not contact the Super Research backend: {e}", "ERROR")
+        log("  Check internet + that superresearch.io is reachable.", "ERROR")
+        return
+    except Exception as e:
+        print()
+        log(f"Unexpected error during user-mode pair: {e}", "ERROR")
+        return
+
+    print()  # Clear the polling line.
+
+    save_user_mode_state(
+        device_id=result["device_id"],
+        paired_uid=result["uid"],
+        poll_secret=poll_secret,
+    )
+
+    print()
+    print(f"  {_c(_OK, '✓')} Refresh token saved to OS keystore.")
+    print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
+    print(f"  {_c(_DIM, 'Synth uid  ·')}  {_c(_BOLD, result['uid'])}")
+    print(f"  {_c(_DIM, 'Owner uid  ·')}  {_c(_BOLD, result['uid'])}")
+    print()
+    print(f"  {_c(_BOLD + _ACCENT, '  The Track D foundation is laid.')}")
+    print()
+    print(f"  {_c(_WARN, 'PR-D3 alpha:')} Stages 2-5 (API keys, browser logins, supervisor)")
+    print(f"     are not yet wired into user-mode. To finish setup:")
+    print(f"       {_c(_BOLD, 'python research.py --pair')}  {_c(_DIM, '(legacy admin SDK, runs Stages 2-5)')}")
+    print(f"     Or wait for PR-D5 which unifies the flow.")
+
+
 async def run_pair(profile_dir, wait_minutes=10):
     """Guided setup: generate/reuse ResearchToken, render ASCII QR, open
     login tabs, auto-verify per-platform login every 30s, exit cleanly when
@@ -28909,6 +29111,12 @@ def main():
     parser.add_argument("--api-key", "-k", help="CUA API key")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--pair", action="store_true", help="First-time login setup")
+    parser.add_argument("--auth-mode", choices=["legacy", "user"], default=None,
+        help="Track D opt-in: with --pair, use the new refresh-token credentials path "
+             "(no firebase-service-account.json needed). Currently alpha (PR-D3): only "
+             "Stage 1 is wired into user-mode; Stages 2-5 still need legacy --pair. "
+             "Default: respect RESEARCH_AUTH_MODE env var, fall back to research_config.json, "
+             "fall back to legacy.")
     parser.add_argument("--resume", "-r", help="Resume from a previous queue directory (name or full path)")
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
     parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
@@ -28972,7 +29180,12 @@ def main():
         return
 
     if args.pair:
-        asyncio.run(run_pair(str(PROFILE_DIR)))
+        # Resolve effective auth mode: CLI flag > env var > config > default.
+        effective_mode = args.auth_mode or load_auth_mode()
+        if effective_mode == "user":
+            asyncio.run(cmd_pair_v2())
+        else:
+            asyncio.run(run_pair(str(PROFILE_DIR)))
         return
 
     if args.serve:
