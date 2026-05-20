@@ -724,6 +724,41 @@ _RESET    = "\033[0m"
 def _c(color: str, text: str) -> str:
     return f"{color}{text}{_RESET}" if _USE_COLOR else text
 
+
+# ─── Cross-platform CLI nomenclature ──────────────────────────────────
+# Centralized here so a single edit propagates to every user-facing
+# string in --retire / --unpair / --pair / --doctor. Pre-2026-05-20 these
+# strings hardcoded Windows commands ("taskkill", "Task Manager",
+# "Scheduled Task") which surfaced literally on Linux/macOS as a constant
+# reminder that the tool was built for Windows first.
+
+def _kill_pid_hint(pid: "int | str" = "<pid>") -> str:
+    """Platform-appropriate one-liner for stopping a runaway PID."""
+    if sys.platform == "win32":
+        return f"taskkill /F /PID {pid}"
+    # macOS + Linux + any other POSIX
+    return f"kill -9 {pid}"
+
+
+def _process_manager_label() -> str:
+    """How to refer to the OS's process-management UI in copy."""
+    if sys.platform == "win32":
+        return "Task Manager"
+    if sys.platform == "darwin":
+        return "Activity Monitor"
+    # Linux desktops vary too much to name one app; the shell is universal.
+    return "your shell (e.g. `ps aux | grep research.py`)"
+
+
+def _supervisor_artifact_label() -> str:
+    """How to refer to the per-platform "starts on login" installation."""
+    if sys.platform == "win32":
+        return "Scheduled Task"
+    if sys.platform == "darwin":
+        return "LaunchAgent"
+    return "systemd-user unit"
+
+
 # Signature glyph — appears before every command's Latin tagline. Subtle
 # enough not to read as decoration, specific enough to make any `serve` /
 # `pair` / `resurrect` / `retire` / `unpair` terminal output instantly
@@ -25603,17 +25638,34 @@ async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
     Returns the trimmed key string on paste, or "" on skip / Ctrl+C / EOF.
     Skip is first-class — pair completes regardless; missing keys surface
     at first-job via the cua_unavailable / narrator-disabled paths (both
-    already user-recoverable from the FE alert)."""
+    already user-recoverable from the FE alert).
+
+    Uses `getpass.getpass` so the key DOES NOT echo to the terminal or
+    scrollback — important on shared Linux/macOS machines and when
+    screen-sharing during setup. Falls back to `input` only on platforms
+    where getpass can't suppress echo (rare).
+    """
+    import getpass as _getpass
     print(f"  {_c(_BOLD, label)}  {_c(_DIM, f'— get one at {help_url}')}")
+    prompt = (
+        f"  {_c(_ACCENT, '>')}  Paste {label} key ({example})  "
+        f"{_c(_DIM, 'or [S]kip — input hidden:')} "
+    )
     while True:
         try:
-            raw = await asyncio.to_thread(
-                input,
-                f"  {_c(_ACCENT, '>')}  Paste {label} key ({example})  {_c(_DIM, 'or [S]kip:')} ",
-            )
+            raw = await asyncio.to_thread(_getpass.getpass, prompt)
         except (EOFError, KeyboardInterrupt):
             print()
             return ""
+        except _getpass.GetPassWarning:
+            # No-echo support unavailable on this terminal — fall back to
+            # echoed input rather than crashing. User loses the privacy
+            # benefit but the prompt still works.
+            try:
+                raw = await asyncio.to_thread(input, prompt)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return ""
         s = (raw or "").strip()
         # Strip surrounding quotes — users often copy from .env-style snippets
         if len(s) >= 2 and s[0] in ('"', "'") and s[-1] == s[0]:
@@ -26518,12 +26570,7 @@ async def run_pair(profile_dir, wait_minutes=10):
                 task_info, killed_procs = await asyncio.to_thread(_disarm_supervisor_quiet)
             _write_supervised_flag(False)
             if task_info == "removed":
-                _supervisor_kind = (
-                    "Scheduled Task" if sys.platform == "win32"
-                    else "LaunchAgent" if sys.platform == "darwin"
-                    else "systemd-user unit"
-                )
-                print(f"  {_c(_OK, '✓')}  Removed leftover {_supervisor_kind} ({_SUPERVISOR_TASK_NAME})")
+                print(f"  {_c(_OK, '✓')}  Removed leftover {_supervisor_artifact_label()} ({_SUPERVISOR_TASK_NAME})")
             elif task_info in ("missing", "no-task"):
                 # macOS/Linux disarm helpers return "no-task" rather than
                 # "missing"; both mean the same thing — nothing to remove.
@@ -28005,8 +28052,11 @@ def run_resurrect():
         print(f"  {_c(_OK, '✓')}  Pairing complete")
         _seed_env_file_if_missing()
         if _check_linger_status() == "no":
+            # Expand $USER server-side so the user can paste-and-go even from
+            # a shell where the env var isn't set the way they expect.
+            _linger_user = os.environ.get("USER") or os.environ.get("LOGNAME") or "$USER"
             print(f"  {_c(_WARN, '⚠')}  loginctl Linger=no — daemon-loop will die at logout.")
-            print(f"  {_c(_DIM, '     Run:')} {_c(_BOLD, 'sudo loginctl enable-linger $USER')}")
+            print(f"  {_c(_DIM, '     Run:')} {_c(_BOLD, f'sudo loginctl enable-linger {_linger_user}')}")
             print(f"  {_c(_DIM, '     (continuing anyway — supervisor still works while logged in)')}")
         ok, daemon_pid, info, killed_serve = _arm_supervisor_linux()
         if not ok:
@@ -28418,7 +28468,7 @@ def run_retire():
             print(f"       {_c(_DIM, f'PID {pid}  age {age_s}  research.py{cmd_short}')}")
         if len(other_procs) > 3:
             print(f"       {_c(_DIM, f'... and {len(other_procs) - 3} more')}")
-        print(f"       {_c(_DIM, 'Stop manually with: taskkill /F /PID <pid>')}")
+        print(f"       {_c(_DIM, f'Stop manually with: {_kill_pid_hint()}')}")
 
     # ── [3/3] Firestore sync + verification ──
     _setup_step(3, 3, "Firestore sync")
@@ -28431,7 +28481,7 @@ def run_retire():
         print(f"  {_c(_WARN, '⚠')}  {len(stragglers)} related process(es) would not terminate:")
         for pid, role in stragglers:
             print(f"       {_c(_BOLD, f'PID {pid}')}  ({role})")
-        print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --retire.')}")
+        print(f"  {_c(_DIM, f'       Kill them from {_process_manager_label()} or re-run --retire.')}")
     else:
         _print_with_flourish(
             f"  {_c(_BOLD + _RED, '  Silence.')}  "
@@ -28678,7 +28728,7 @@ def run_unpair(deep: bool = False):
         print(f"  {_c(_WARN, '⚠')}  {len(stragglers)} related process(es) would not terminate:")
         for pid, _cmd, role in stragglers:
             print(f"       {_c(_BOLD, f'PID {pid}')}  ({role})")
-        print(f"  {_c(_DIM, '       Kill them from Task Manager or re-run --unpair.')}")
+        print(f"  {_c(_DIM, f'       Kill them from {_process_manager_label()} or re-run --unpair.')}")
     else:
         print(f"  {_c(_OK, '✓')}  No research.py process remains")
 
