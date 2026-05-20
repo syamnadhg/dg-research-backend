@@ -74,13 +74,24 @@ except Exception as _ve:
     if sys.stdout is not None:
         print(f"[vision] import failed (shadow disabled): {_ve}", flush=True)
 
-# Windows UTF-8 fix — guarded for pythonw.exe (sys.stdout/stderr are None
-# under the no-console interpreter, so .reconfigure would crash at import).
-if sys.platform == "win32":
-    if sys.stdout is not None:
+# UTF-8 + errors="replace" reconfigure for stdout/stderr on every platform.
+# Windows needs it for the cp1252 default; Linux/macOS need it when LANG=C
+# or POSIX is in effect (Crostini's penguin shell pre-`dpkg-reconfigure
+# locales`, slim Docker images, CI runners). Without this, any Unicode
+# sigil (◆, spinner frames ⠋⠙, box-drawing chars) raises UnicodeEncodeError
+# and crashes the whole subcommand before the user sees the banner.
+# Guarded for pythonw.exe (sys.stdout/stderr are None under the no-console
+# interpreter, so .reconfigure would crash at import).
+if sys.stdout is not None:
+    try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
-    if sys.stderr is not None:
+    except Exception:
+        pass  # Older Python or wrapped stream; ignore silently.
+if sys.stderr is not None:
+    try:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -697,6 +708,7 @@ _OK       = "\033[38;5;108m"  # muted green
 _WARN     = "\033[38;5;214m"  # amber
 _BRIGHT   = "\033[38;5;231m"  # glowing white — for 'resurgam' rising-from-rest vibe
 _RED      = "\033[38;5;160m"  # dignified deep red — for 'requiescat' resting vibe
+_ERR      = _RED              # alias used by --doctor's `✗` failure marks
 _BOLD     = "\033[1m"
 _RESET    = "\033[0m"
 
@@ -25061,7 +25073,9 @@ async def run_server(port=8000):
         media_type = mime_map.get(path.suffix.lower(), "application/octet-stream")
         return _FileResponse(str(path), media_type=media_type, filename=safe)
 
-    log(f"Starting API server on http://0.0.0.0:{port}")
+    # Banner shows localhost so users can copy-click; uvicorn still binds
+    # to 0.0.0.0 below so the FE web app can reach this BE.
+    log(f"Starting API server on http://localhost:{port}")
     log(f"  GET  /api/runs                     — List all runs")
     log(f"  POST /api/runs                     — Start new run {{topic, email}}")
     log(f"  GET  /api/runs/{{id}}                — Run details + meta")
@@ -25406,7 +25420,7 @@ async def run_server(port=8000):
     _render_context_strip([
         ("Paired to", _c(_BOLD, _paired_email or "(not paired)")),
         ("Token",     token_val),
-        ("Local API", _c(_BOLD, f"http://0.0.0.0:{port}")),
+        ("Local API", _c(_BOLD, f"http://localhost:{port}")),
         ("Heartbeat", _c(_BOLD, f"{HEARTBEAT_INTERVAL_SEC}s cadence")),
     ])
     print()
@@ -26302,13 +26316,20 @@ async def run_pair(profile_dir, wait_minutes=10):
                 task_info, killed_procs = await asyncio.to_thread(_disarm_supervisor_quiet)
             _write_supervised_flag(False)
             if task_info == "removed":
-                print(f"  {_c(_OK, '✓')}  Removed leftover Scheduled Task ({_SUPERVISOR_TASK_NAME})")
-            elif task_info == "missing":
-                print(f"  {_c(_DIM, '     No scheduled task was installed.')}")
+                _supervisor_kind = (
+                    "Scheduled Task" if sys.platform == "win32"
+                    else "LaunchAgent" if sys.platform == "darwin"
+                    else "systemd-user unit"
+                )
+                print(f"  {_c(_OK, '✓')}  Removed leftover {_supervisor_kind} ({_SUPERVISOR_TASK_NAME})")
+            elif task_info in ("missing", "no-task"):
+                # macOS/Linux disarm helpers return "no-task" rather than
+                # "missing"; both mean the same thing — nothing to remove.
+                print(f"  {_c(_DIM, '     No supervisor was installed.')}")
             elif task_info in ("non-Windows", "unsupported"):
                 pass  # silent — no supervisor artifact to remove on this platform
             else:
-                print(f"  {_c(_WARN, '⚠')}  schtasks teardown: {task_info}")
+                print(f"  {_c(_WARN, '⚠')}  Supervisor teardown: {task_info}")
             if killed_procs:
                 plural = "es" if killed_procs != 1 else ""
                 print(f"  {_c(_OK, '✓')}  Stopped {killed_procs} leftover backend process{plural}")
