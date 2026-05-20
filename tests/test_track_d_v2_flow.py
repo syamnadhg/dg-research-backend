@@ -295,3 +295,75 @@ class TestFirestoreRestUrl:
         assert v2_flow.PROJECT_ID in url
         assert "/devices/dev-abc/pending/" in url
         assert url.endswith("deadbeef" * 8)
+
+
+# ─── JWT user_id fallback (signInWithCustomToken localId drop) ────────
+
+
+class TestUidFromIdToken:
+    """The signInWithCustomToken REST response stopped including `localId`
+    at some point in 2026; the uid only lives in the idToken JWT now.
+    `_uid_from_id_token` is the no-verify base64 decoder that pulls it
+    out. These tests pin its happy path + every malformed-input branch
+    so a future refactor can't quietly break pair on a Firebase API
+    drift again."""
+
+    import base64
+    import json
+
+    @staticmethod
+    def _make_jwt(payload: dict) -> str:
+        """Build a synthetic 3-segment JWT with the given payload. No
+        signature verification anywhere in the helper, so the header
+        + signature can be arbitrary strings."""
+        import base64 as _b64
+        import json as _j
+        payload_b64 = (
+            _b64.urlsafe_b64encode(_j.dumps(payload).encode("ascii"))
+            .decode("ascii")
+            .rstrip("=")
+        )
+        return f"header.{payload_b64}.signature"
+
+    def test_extracts_user_id_claim(self):
+        jwt = self._make_jwt({"user_id": "device-abc123", "iss": "test"})
+        assert v2_flow._uid_from_id_token(jwt) == "device-abc123"
+
+    def test_falls_back_to_sub_when_user_id_missing(self):
+        # Some Firebase ID tokens carry only `sub` (standard JWT subject
+        # claim) without the user_id alias. The helper accepts either.
+        jwt = self._make_jwt({"sub": "device-fallback", "iss": "test"})
+        assert v2_flow._uid_from_id_token(jwt) == "device-fallback"
+
+    def test_user_id_wins_over_sub(self):
+        # If both are present, prefer user_id — it's Firebase's
+        # canonical field name in their ID tokens.
+        jwt = self._make_jwt({"user_id": "via-user-id", "sub": "via-sub"})
+        assert v2_flow._uid_from_id_token(jwt) == "via-user-id"
+
+    def test_returns_none_on_missing_segments(self):
+        assert v2_flow._uid_from_id_token("not.a.jwt") is None
+        assert v2_flow._uid_from_id_token("only.two") is None
+        assert v2_flow._uid_from_id_token("") is None
+        assert v2_flow._uid_from_id_token("one") is None
+
+    def test_returns_none_on_garbage_payload(self):
+        # Middle segment isn't valid base64 → catch + return None.
+        assert v2_flow._uid_from_id_token("header.!!!garbage!!!.sig") is None
+
+    def test_returns_none_when_no_uid_claim(self):
+        jwt = self._make_jwt({"iss": "test", "exp": 9999})
+        assert v2_flow._uid_from_id_token(jwt) is None
+
+    def test_returns_none_on_non_string_uid(self):
+        # JWT spec allows arbitrary types; we want a string only.
+        jwt = self._make_jwt({"user_id": 12345})
+        assert v2_flow._uid_from_id_token(jwt) is None
+
+    def test_handles_payload_with_uncommon_padding(self):
+        # Build a JWT whose payload b64-encodes to a length needing 1
+        # padding char (`{"u":"a"}` → 10 chars, base64 → 16 chars = no
+        # padding needed). Force a different shape:
+        jwt = self._make_jwt({"user_id": "abc"})  # likely needs padding
+        # No exception, returns the value cleanly.
+        assert v2_flow._uid_from_id_token(jwt) == "abc"

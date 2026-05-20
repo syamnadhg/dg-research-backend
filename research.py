@@ -25719,6 +25719,15 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     import socket as _socket
     import platform as _platform
 
+    # Per-step timing instrumentation. `_pair_t0` is set on entry; each
+    # diagnostic print gets a `[+1.23s]` prefix relative to the pair
+    # start. Surfaces exactly where a "stuck" pair is spending its time
+    # without requiring gcloud log inspection.
+    _pair_t0 = time.monotonic()
+    def _pt(msg: str, kind: str = "INFO") -> None:
+        elapsed = time.monotonic() - _pair_t0
+        log(f"[pair +{elapsed:5.2f}s] {msg}", kind)
+
     _setup_logo()
     _setup_step(1, 5, "Token setup  ·  Track D user-mode (PR-D3 alpha)")
 
@@ -25783,6 +25792,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             )
             sys.stdout.flush()
 
+    _pt("calling /api/devices/initiate-pair...")
     try:
         result = await v2_flow.do_pair_v2(
             poll_secret_hash=poll_secret_hash,
@@ -25794,25 +25804,27 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         )
     except v2_flow.PollTimeout:
         print()
-        log("Pair window expired — re-run --pair --auth-mode=user to start fresh.", "ERROR")
+        _pt("polling timed out — re-run --pair to start fresh", "ERROR")
         return
     except v2_flow.InitiatePairError as e:
         print()
-        log(f"Could not contact the Super Research backend: {e}", "ERROR")
+        _pt(f"could not contact backend: {e}", "ERROR")
         log("  Check internet + that superresearch.io is reachable.", "ERROR")
         return
     except Exception as e:
         print()
-        log(f"Unexpected error during user-mode pair: {e}", "ERROR")
+        _pt(f"unexpected error: {e}", "ERROR")
         return
 
     print()  # Clear the polling line.
+    _pt(f"exchange OK — deviceId={result['device_id'][:12]}… uid={result['uid'][:14]}…")
 
     save_user_mode_state(
         device_id=result["device_id"],
         paired_uid=result["uid"],
         poll_secret=poll_secret,
     )
+    _pt("refresh token saved to OS keystore")
     print(f"  {_c(_OK, '✓')} Refresh token saved to OS keystore.")
 
     # Resolve the owner identity for Stages 2-5. The device doc carries
@@ -25846,12 +25858,14 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         )
         return _uid, _label
 
+    _pt("resolving owner identity from Firestore...")
     try:
         owner_uid, owner_label = await asyncio.wait_for(_resolve_owner(), timeout=15.0)
+        _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r}")
     except asyncio.TimeoutError:
-        log("[pair-v2] owner lookup timed out — continuing with synth uid", "WARN")
+        _pt("owner lookup timed out (15s) — continuing with synth uid", "WARN")
     except Exception as e:
-        log(f"[pair-v2] owner lookup failed (continuing with synth uid): {e}", "WARN")
+        _pt(f"owner lookup failed: {e} (continuing with synth uid)", "WARN")
 
     print()
     print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
@@ -25860,6 +25874,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     print(f"  {_c(_OK, '✓')}  Linked to {_c(_BOLD, owner_label or owner_uid[:8])}")
     print()
 
+    _pt("entering stages 2-5 (On Startup → API keys → Logins → Ready)")
     # Stages 2-5 — On Startup, API keys (via FE bridge in user-mode),
     # browser logins, Ready/supervisor. The helper writes per-platform
     # login progress to devices/{deviceId}.logins via the user-scoped
