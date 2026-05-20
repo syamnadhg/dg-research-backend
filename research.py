@@ -1195,8 +1195,7 @@ class _AsyncSpinnerCtx:
                 await self._task
             except Exception:
                 pass
-        sys.stdout.write("\r" + " " * 78 + "\r")
-        sys.stdout.flush()
+        _clear_status_line()
         return False
 
 
