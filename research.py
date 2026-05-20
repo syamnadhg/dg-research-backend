@@ -28012,74 +28012,107 @@ def run_resurrect():
     _branded_header("resurgam", _BOLD + _BRIGHT, "the backend rises")
 
     plat = _supervisor_platform()
-    if plat == "Darwin":
-        # PR1: macOS install via _arm_supervisor_macos. Minimal UX (no context
-        # strip / step numbers — parity-of-mechanism, not parity-of-UX).
-        # Polish deferred to a follow-up once smoke tests pass on real hardware.
-        init_firebase()
-        paired_uid = load_paired_uid()
-        if not paired_uid:
-            print(f"  {_c(_WARN, '⚠')} Device not paired. Run --pair first.")
-            return
-        print(f"  {_c(_OK, '✓')}  Pairing complete")
-        _seed_env_file_if_missing()
-        ok, daemon_pid, info, killed_serve = _arm_supervisor_macos()
-        if not ok:
-            print(f"  {_c(_WARN, '⚠')}  launchd install failed: {info}")
-            return
-        print(f"  {_c(_OK, '✓')}  LaunchAgent installed ({_SUPERVISOR_PLIST_LABEL})")
-        if killed_serve:
-            print(f"  {_c(_DIM, f'     Stopped {killed_serve} stale --serve process(es).')}")
-        if daemon_pid is not None:
-            print(f"  {_c(_OK, '✓')}  Backend started (PID {daemon_pid}, supervised by launchd)")
-        else:
-            print(f"  {_c(_WARN, '⚠')}  {info or 'daemon-loop did not appear within 5s'} — launchd will retry (KeepAlive=true).")
-        _write_supervised_flag(True)
-        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+    if plat not in ("Windows", "Darwin", "Linux"):
+        # Truly unsupported platform (FreeBSD, headless WSL without GUI, etc.).
         print()
-        print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  {_c(_DIM, '--serve respawns on any exit.')}")
+        print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
         return
 
-    if plat == "Linux":
-        # PR2: systemd-user install via _arm_supervisor_linux. Minimal UX.
-        # Linger probe surfaces a WARN if Linger=no (user must enable
-        # separately; we don't sudo-escalate).
+    if plat in ("Darwin", "Linux"):
+        # POSIX path — refactored 2026-05-20 from a bare-bones flow into the
+        # same 4-step scaffolding as Windows. Removes the "parity-of-mechanism,
+        # not parity-of-UX" gap the user flagged during Linux testing. Helpers
+        # (`_render_context_strip`, `_setup_step`, `_print_with_flourish`,
+        # `_render_next_actions`) were already platform-agnostic; we just call
+        # them. Platform-specific install lives in `_arm_supervisor_<plat>`
+        # which spawns the daemon-loop inline (vs Windows which spawns it in
+        # Step 4 — that asymmetry is intentional, see Step 4 below).
         init_firebase()
         paired_uid = load_paired_uid()
+        device_id = load_device_id()
+        paired_email = _fetch_paired_email(paired_uid)
+        currently_supervised = _detect_supervised()
+        _ctx_rows = [
+            ("Device",    _c(_BOLD, device_id or "(not paired)")),
+            ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+            ("On Startup", _aegis_rune(currently_supervised, transition_to="on")),
+        ]
+        _bat = _battery_state()
+        if _bat:
+            _ctx_rows.append(("Power", _c(_DIM, _bat)))
+        _render_context_strip(_ctx_rows)
+
+        # ── [1/4] Pre-flight ──
+        _setup_step(1, 4, "Pre-flight")
         if not paired_uid:
-            print(f"  {_c(_WARN, '⚠')} Device not paired. Run --pair first.")
+            print(f"  {_c(_WARN, '⚠')} Device not paired yet.")
+            print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, 'python research.py --pair')} {_c(_DIM, 'first, then retry --resurrect.')}")
             return
-        print(f"  {_c(_OK, '✓')}  Pairing complete")
+        print(f"  {_c(_OK, '✓')}  Pairing complete on this machine")
         _seed_env_file_if_missing()
-        if _check_linger_status() == "no":
-            # Expand $USER server-side so the user can paste-and-go even from
-            # a shell where the env var isn't set the way they expect.
+
+        # ── [2/4] Installing supervisor + auto-spawn ──
+        _setup_step(2, 4, f"Installing {_supervisor_artifact_label()}")
+        if plat == "Linux" and _check_linger_status() == "no":
             _linger_user = os.environ.get("USER") or os.environ.get("LOGNAME") or "$USER"
             print(f"  {_c(_WARN, '⚠')}  loginctl Linger=no — daemon-loop will die at logout.")
             print(f"  {_c(_DIM, '     Run:')} {_c(_BOLD, f'sudo loginctl enable-linger {_linger_user}')}")
-            print(f"  {_c(_DIM, '     (continuing anyway — supervisor still works while logged in)')}")
-        ok, daemon_pid, info, killed_serve = _arm_supervisor_linux()
-        if not ok:
-            print(f"  {_c(_WARN, '⚠')}  systemctl install failed: {info}")
-            return
-        print(f"  {_c(_OK, '✓')}  systemd user unit installed ({_SUPERVISOR_UNIT_NAME})")
-        if killed_serve:
-            print(f"  {_c(_DIM, f'     Stopped {killed_serve} stale --serve process(es).')}")
-        if daemon_pid is not None:
-            print(f"  {_c(_OK, '✓')}  Backend started (PID {daemon_pid}, supervised by systemd)")
+            print(f"  {_c(_DIM, '     (continuing — supervisor still works while logged in)')}")
+        if plat == "Darwin":
+            ok, daemon_pid, info, killed_serve = _arm_supervisor_macos()
+            if not ok:
+                print(f"  {_c(_WARN, '⚠')}  launchd install failed: {info}")
+                return
+            print(f"  {_c(_OK, '✓')}  LaunchAgent installed ({_SUPERVISOR_PLIST_LABEL})")
         else:
-            print(f"  {_c(_WARN, '⚠')}  {info or 'daemon-loop did not appear within 5s'} — systemd will retry (Restart=always).")
+            ok, daemon_pid, info, killed_serve = _arm_supervisor_linux()
+            if not ok:
+                print(f"  {_c(_WARN, '⚠')}  systemctl install failed: {info}")
+                return
+            print(f"  {_c(_OK, '✓')}  systemd user unit installed ({_SUPERVISOR_UNIT_NAME})")
+        if killed_serve:
+            _plural_s = "es" if killed_serve != 1 else ""
+            print(f"  {_c(_DIM, f'     Stopped {killed_serve} stale --serve process{_plural_s}.')}")
+
+        # ── [3/4] Firestore sync ──
+        _setup_step(3, 4, "Firestore sync")
         _write_supervised_flag(True)
         print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
-        print()
-        print(f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  {_c(_DIM, '--serve respawns on any exit.')}")
-        return
 
-    if plat != "Windows":
-        # Truly unsupported platform (FreeBSD, headless WSL without GUI, etc.)
-        # macOS / Linux are handled by the Darwin / Linux branches above.
+        # ── [4/4] Handoff — verify daemon-loop is live + API responds ──
+        # Asymmetric with Windows: `_arm_supervisor_<plat>` already spawned
+        # daemon-loop in Step 2 (launchd/systemd handle the spawn at install
+        # time). Here we just confirm the spawn succeeded and that uvicorn
+        # bound port 8000. Matches the Windows handoff's "did the daemon
+        # actually come up?" verification.
+        _setup_step(4, 4, "Handoff")
+        _kind = "launchd" if plat == "Darwin" else "systemd"
+        _retry_hint = "KeepAlive=true" if plat == "Darwin" else "Restart=always"
+        if daemon_pid is not None:
+            print(f"  {_c(_OK, '✓')}  Backend started (PID {daemon_pid}, supervised by {_kind})")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  {info or 'daemon-loop did not appear within 5s'} — {_kind} will retry ({_retry_hint}).")
+        # API health probe (matches Windows handoff's _local_api_health call).
+        import time as _time_pos
+        _time_pos.sleep(2)  # let uvicorn finish startup
+        _api_ok, _api_detail = _local_api_health()
+        if _api_ok:
+            print(f"  {_c(_OK, '✓')}  API responding ({_api_detail})")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  API not responding yet: {_api_detail}")
+            print(f"  {_c(_DIM, '     daemon-loop may still be initializing — curl localhost:8000/api/health in ~30s.')}")
+
+        # ── Final flourish + next actions (matches Windows path) ──
         print()
-        print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
+        _print_with_flourish(
+            f"  {_c(_BOLD + _BRIGHT, '  The supervisor holds watch.')}  "
+            f"{_c(_DIM, '--serve respawns on any exit.')}",
+            fade_to_color=_BOLD + _ACCENT,
+            hold_s=0.3,
+        )
+        _render_next_actions([
+            ("python research.py --retire", "disable On Startup"),
+        ])
         return
 
     # Seed `.dg-supervisor.env` from scripts/dg-supervisor.env.example so the
@@ -28307,49 +28340,92 @@ def run_retire():
     _branded_header("requiescat", _BOLD + _RED, "let the loop rest")
 
     plat = _supervisor_platform()
-    if plat == "Darwin":
-        # PR1: macOS teardown via _disarm_supervisor_macos. Minimal UX.
-        init_firebase()
-        status, killed_total = _disarm_supervisor_macos()
-        if status == "removed":
-            print(f"  {_c(_OK, '✓')}  LaunchAgent removed ({_SUPERVISOR_PLIST_LABEL})")
-        elif status == "no-task":
-            print(f"  {_c(_DIM, '     No LaunchAgent was installed.')}")
-        else:
-            print(f"  {_c(_WARN, '⚠')}  bootout returned: {status}")
-        if killed_total:
-            plural = "es" if killed_total != 1 else ""
-            print(f"  {_c(_OK, '✓')}  Stopped {killed_total} process{plural}")
-        else:
-            print(f"  {_c(_DIM, '     No daemon-loop / --serve processes were running.')}")
-        _write_supervised_flag(False)
-        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
-        return
-
-    if plat == "Linux":
-        # PR2: systemd-user teardown via _disarm_supervisor_linux. Minimal UX.
-        init_firebase()
-        status, killed_total = _disarm_supervisor_linux()
-        if status == "removed":
-            print(f"  {_c(_OK, '✓')}  systemd user unit removed ({_SUPERVISOR_UNIT_NAME})")
-        elif status == "no-task":
-            print(f"  {_c(_DIM, '     No systemd unit was installed.')}")
-        else:
-            print(f"  {_c(_WARN, '⚠')}  systemctl disable returned: {status}")
-        if killed_total:
-            plural = "es" if killed_total != 1 else ""
-            print(f"  {_c(_OK, '✓')}  Stopped {killed_total} process{plural}")
-        else:
-            print(f"  {_c(_DIM, '     No daemon-loop / --serve processes were running.')}")
-        _write_supervised_flag(False)
-        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
-        return
-
-    if plat != "Windows":
-        # Truly unsupported platform (FreeBSD, headless WSL without GUI, etc.)
-        # macOS / Linux are handled by the Darwin / Linux branches above.
+    if plat not in ("Windows", "Darwin", "Linux"):
+        # Truly unsupported platform (FreeBSD, headless WSL without GUI, etc.).
         print()
         print(f"  {_c(_WARN, '⚠')} Only Windows / macOS / Linux desktop is supported.")
+        return
+
+    if plat in ("Darwin", "Linux"):
+        # POSIX path — refactored 2026-05-20 to match the Windows 3-step
+        # scaffolding (Context strip → [1/3] Unbinding → [2/3] Stopping →
+        # [3/3] Firestore sync → flourish + next-actions). Closes the
+        # "Polish deferred" gap so --retire reads the same on every OS.
+        init_firebase()
+        paired_uid = load_paired_uid()
+        device_id = load_device_id()
+        paired_email = _fetch_paired_email(paired_uid)
+        currently_supervised = _detect_supervised()
+
+        _ctx_rows = [
+            ("Device",     _c(_BOLD, device_id or "(not paired)")),
+            ("Paired to",  _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+            ("On Startup", _aegis_rune(currently_supervised, transition_to="nothing-to-undo")),
+        ]
+        _bat = _battery_state()
+        if _bat:
+            _ctx_rows.append(("Power", _c(_DIM, _bat)))
+        _render_context_strip(_ctx_rows)
+
+        # Short-circuit: nothing armed AND nothing running → no-op (mirrors
+        # the Windows branch). Avoids three separate "nothing to do" lines.
+        self_pid = os.getpid()
+        running_now = any(
+            role in ("daemon-loop", "serve")
+            for pid, _cmd, role in _enumerate_research_py_procs()
+            if pid != self_pid
+        )
+        if not currently_supervised and not running_now:
+            print()
+            print(f"  {_c(_DIM, 'Nothing to retire — On Startup is already off and no backend is running.')}")
+            _render_next_actions([
+                ("python research.py --resurrect", "enable On Startup"),
+            ])
+            return
+
+        # ── [1/3] Unbinding schedule ──
+        _setup_step(1, 3, "Unbinding schedule")
+        if plat == "Darwin":
+            status, killed_during_disarm = _disarm_supervisor_macos()
+            if status == "removed":
+                print(f"  {_c(_OK, '✓')}  LaunchAgent removed ({_SUPERVISOR_PLIST_LABEL})")
+            elif status == "no-task":
+                print(f"  {_c(_DIM, '     Nothing bound — LaunchAgent was not installed.')}")
+            else:
+                print(f"  {_c(_WARN, '⚠')}  bootout returned: {status}")
+        else:
+            status, killed_during_disarm = _disarm_supervisor_linux()
+            if status == "removed":
+                print(f"  {_c(_OK, '✓')}  systemd user unit removed ({_SUPERVISOR_UNIT_NAME})")
+            elif status == "no-task":
+                print(f"  {_c(_DIM, '     Nothing bound — systemd unit was not installed.')}")
+            else:
+                print(f"  {_c(_WARN, '⚠')}  systemctl disable returned: {status}")
+
+        # ── [2/3] Stopping backend ──
+        _setup_step(2, 3, "Stopping backend")
+        if killed_during_disarm:
+            _plural = "es" if killed_during_disarm != 1 else ""
+            print(f"  {_c(_OK, '✓')}  Stopped {killed_during_disarm} process{_plural}")
+        else:
+            print(f"  {_c(_DIM, '     No daemon-loop / --serve processes were running.')}")
+
+        # ── [3/3] Firestore sync ──
+        _setup_step(3, 3, "Firestore sync")
+        _write_supervised_flag(False)
+        print(f"  {_c(_OK, '✓')}  Synced to the Super Research app")
+
+        # ── Final flourish + next actions (matches Windows path) ──
+        print()
+        _print_with_flourish(
+            f"  {_c(_BOLD + _RED, '  Silence.')}  "
+            f"{_c(_DIM, 'No research.py process remains.')}",
+            fade_to_color=_DIM + _RED,
+            hold_s=0.5,
+        )
+        _render_next_actions([
+            ("python research.py --resurrect", "re-enable On Startup"),
+        ])
         return
 
     init_firebase()
