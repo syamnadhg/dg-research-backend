@@ -25903,6 +25903,78 @@ async def run_server(port=8000):
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
+def _fresh_user_mode_id_token() -> "str | None":
+    """Return a fresh Firebase ID token for the synth device user, or None
+    if the keystore is empty / refresh token revoked. Used by user-mode
+    code paths that need to authenticate against an FE Cloud Function
+    (e.g. /api/devices/save-api-key). Forces a refresh on every call so
+    the token can't be expired by the time the HTTP request lands."""
+    try:
+        from auth import credentials, keystore
+        from auth.v2_flow import WEB_API_KEY
+    except ImportError as e:
+        log(f"user-mode id-token: auth/ import failed: {e}", "WARN")
+        return None
+    iuid = keystore.install_uuid()
+    if keystore.try_recover(iuid) is None:
+        return None
+    try:
+        creds = credentials.RefreshTokenCredentials(iuid, WEB_API_KEY)
+        creds.refresh(None)  # type: ignore[arg-type]
+        return creds.token  # type: ignore[no-any-return]
+    except credentials.RevokedError:
+        log("user-mode id-token: refresh token revoked — wiping keystore", "WARN")
+        keystore.clear_all(iuid)
+        return None
+    except Exception as e:
+        log(f"user-mode id-token: refresh failed: {e}", "WARN")
+        return None
+
+
+def _save_api_key_via_fe_bridge(key_name: str, value: str) -> bool:
+    """POST to `/api/devices/save-api-key` so the FE writes the API key to
+    `users/{ownerUid}/settings/prefs.apiKeys.{key_name}` via Admin SDK on
+    our behalf. Used by user-mode cmd_pair_v2 Stages 3/5 because the BE's
+    synth device user can't write to the owner's settings tree directly.
+
+    Returns True iff the FE responded 200. False on token-mint failure,
+    network error, or non-2xx response."""
+    import requests as _requests
+    try:
+        from auth.v2_flow import FE_BASE_URL
+    except ImportError:
+        log("save-api-key bridge: auth.v2_flow import failed", "WARN")
+        return False
+    id_token = _fresh_user_mode_id_token()
+    if not id_token:
+        log("save-api-key bridge: no usable ID token — re-pair required", "WARN")
+        return False
+    url = f"{FE_BASE_URL}/api/devices/save-api-key"
+    try:
+        resp = _requests.post(
+            url,
+            headers={"Authorization": f"Bearer {id_token}"},
+            json={"keyName": key_name, "value": value},
+            timeout=15,
+        )
+    except _requests.RequestException as e:
+        log(f"save-api-key bridge: network error: {e}", "WARN")
+        return False
+    if resp.status_code == 200:
+        log(f"[pair] saved apiKeys.{key_name} via FE bridge (user-mode)", "INFO")
+        return True
+    try:
+        body = resp.json()
+        err = body.get("error", "")
+    except Exception:
+        err = resp.text[:200]
+    log(
+        f"save-api-key bridge: HTTP {resp.status_code} ({err}) — key applied to this session only",
+        "WARN",
+    )
+    return False
+
+
 def _save_api_key_to_firestore(uid: str, key_name: str, value: str) -> bool:
     """Merge-write users/{uid}/settings/prefs.apiKeys.{key_name} = value.
 
@@ -25915,17 +25987,13 @@ def _save_api_key_to_firestore(uid: str, key_name: str, value: str) -> bool:
     session still has the key; the user can re-save from the Account page
     later for cross-device durability.
 
-    Track D user-mode skip: the synth device user (auth.uid =
-    `device-{uuid}`) does NOT match the rule `request.auth.uid == userId`
-    on `users/{userId}/settings/prefs`, so a direct write would always
-    permission-deny. In user-mode, API keys belong on the FE Account →
-    API Config page (or are scheduled to route through a future Cloud
-    Function in D5c). Returning False here lets the existing caller fall
-    through to the "applied to this session only — save permanently from
-    the web app" message, which is exactly the right user-facing prompt."""
+    Track D user-mode: a direct write would permission-deny (synth device
+    user can't write `users/{userId}/settings/prefs`). Instead we POST to
+    the FE bridge `/api/devices/save-api-key`, which verifies the BE's
+    ID token, reads the `ownerUid` custom claim, and writes via Admin SDK
+    on our behalf. See `web/src/app/api/devices/save-api-key/route.ts`."""
     if load_auth_mode() == "user":
-        log("[pair] API key save to Firestore skipped in user-mode — keys belong on FE Account → API Config", "INFO")
-        return False
+        return _save_api_key_via_fe_bridge(key_name, value)
     if not (_firebase_db and uid):
         return False
     try:
