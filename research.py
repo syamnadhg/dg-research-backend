@@ -759,6 +759,23 @@ def _supervisor_artifact_label() -> str:
     return "systemd-user unit"
 
 
+def _rule(char: str = "─", color: str = _DIM, max_width: int = 62) -> str:
+    """Width-aware horizontal rule — F8 of the CLI audit.
+
+    Pre-fix, banner / section / step rules hardcoded a 62-char width that
+    wrapped to multi-line zigzag on narrow terminals (Crostini default,
+    tmux panes, SSH at 80 cols with sidebar). This helper sizes to the
+    terminal but caps at `max_width` so wide terminals don't render a
+    200-char monster bar.
+
+    Falls back to (80, 24) when shutil can't read the size (CI, dumb
+    terminals)."""
+    import shutil as _shutil
+    cols = _shutil.get_terminal_size(fallback=(80, 24)).columns
+    width = max(10, min(max_width, cols - 4))
+    return _c(color, char * width)
+
+
 # Signature glyph — appears before every command's Latin tagline. Subtle
 # enough not to read as decoration, specific enough to make any `serve` /
 # `pair` / `resurrect` / `retire` / `unpair` terminal output instantly
@@ -781,7 +798,7 @@ def _branded_header(tagline_text: str, tagline_color: str, tagline_gloss: str):
 
     tagline_color is a foreground escape; BOLD is added by the caller inside
     the _c(...) call so different commands can pick different weights."""
-    bar = _c(_DIM, "━" * 62)
+    bar = _rule("━")
     print()
     print(f"  {bar}")
     print()
@@ -979,7 +996,7 @@ def _render_next_actions(items: list[tuple[str, str]]):
     adjacent tooling so they're not hunting through --help or memory."""
     if not items:
         return
-    bar = _c(_DIM, "┈" * 62)
+    bar = _rule("┈")
     cmd_width = min(max(len(c) for c, _ in items), 40)
     print()
     print(f"  {bar}")
@@ -26609,9 +26626,9 @@ async def run_pair(profile_dir, wait_minutes=10):
             ])
     else:
         print()
-        print(f"  {_c(_WARN, '━' * 62)}")
+        print(f"  {_rule('━', _WARN)}")
         print(f"  {_c(_WARN, 'Setup cancelled — not all platforms logged in yet.')}")
-        print(f"  {_c(_WARN, '━' * 62)}")
+        print(f"  {_rule('━', _WARN)}")
         print("")
         if last_results:
             print(f"  {_c(_DIM, 'Last check:')}")
@@ -28920,9 +28937,11 @@ def run_commands_help():
         print(f"  {_c(_DIM, '• macOS supervisor: ~/Library/LaunchAgents/com.dgresearch.supervisor.plist')}")
     elif _plat == "Linux":
         print(f"  {_c(_DIM, '• Linux supervisor: ~/.config/systemd/user/dgresearch-supervisor.service')}")
-        print(f"  {_c(_DIM, '  (Cross-platform supervisor: Windows Scheduled Task / macOS LaunchAgent / Linux systemd-user)')}")
     else:
         print(f"  {_c(_DIM, '• Windows supervisor: Scheduled Task `SuperResearchBackend`')}")
+    # Cross-platform descriptor — F13 of the CLI audit. Pre-fix it only printed
+    # under the Linux branch; Windows + macOS users never saw the full set.
+    print(f"  {_c(_DIM, '  (Cross-platform: Windows Scheduled Task / macOS LaunchAgent / Linux systemd-user)')}")
     print(f"  {_c(_DIM, '• Config file: .dg-supervisor.env  (template at scripts/dg-supervisor.env.example)')}")
     print(f"  {_c(_DIM, '• Pipeline broken? Run')}  {_c(_BOLD, 'python research.py --doctor')}  {_c(_DIM, 'to diagnose + auto-fix.')}")
     print(f"  {_c(_DIM, '• Full docs: README.md   ·   ARCHITECTURE.md')}")
