@@ -1699,17 +1699,26 @@ def _detect_supervised_windows() -> bool:
 
 
 async def _heartbeat_loop():
-    """Write lastHeartbeat to research_tokens/{token} AND the paired device
-    doc every 5s (HEARTBEAT_INTERVAL_SEC) so the frontend can show
-    Online/Offline status per device. Pairs with the FE 15s offline
-    threshold (DEVICE_OFFLINE_THRESHOLD_MS) — missing two consecutive
-    ticks plus a small slack flips the UI to offline.
+    """Write lastHeartbeat to the top-level `devices/{deviceId}` doc every
+    HEARTBEAT_INTERVAL_SEC so the frontend can show Online/Offline status
+    per device. Pairs with the FE 15s offline threshold
+    (DEVICE_OFFLINE_THRESHOLD_MS) — missing two consecutive ticks plus
+    a small slack flips the UI to offline.
 
-    Token doc uses SERVER_TIMESTAMP (frontend reads `.seconds` off the
-    Timestamp). Device doc uses millis-as-int — the frontend compares
+    Device doc uses millis-as-int — the frontend compares
     `Date.now() - lastHeartbeat` directly, so a Timestamp object would
-    become NaN and the tile would look perpetually offline. """
-    from google.cloud.firestore import SERVER_TIMESTAMP
+    become NaN and the tile would look perpetually offline.
+
+    First-tick confirms the atomic-pair contract: writes
+    pairConfirmedAt:true + FieldValue.delete() on expireAt. The claim
+    Cloud Function sets expireAt:now+5min when granting ownership, and
+    if the BE never reaches this heartbeat (custom-token exchange fails,
+    keystore write fails, anything else downstream), Firestore TTL
+    auto-deletes the doc and the FE tile never appears. Once
+    pairConfirmedAt is set, every subsequent heartbeat keeps it true
+    (idempotent — `update` overwrites cleanly).
+    """
+    from google.cloud.firestore import DELETE_FIELD
     # All globals must be declared at the top of the function — Python
     # rejects `global X` if X has already been read in this scope.
     global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db
@@ -1717,7 +1726,7 @@ async def _heartbeat_loop():
         try:
             # Update top-level `devices/{deviceId}` — BE is signed in as
             # the synth device user; the device doc's update rule lets us
-            # set lastHeartbeat + status (path identifies the writer; no
+            # set the allow-listed fields (path identifies the writer; no
             # deviceId field in the payload, which would push it into
             # affectedKeys() and break the rule's hasOnly check).
             device_id = load_device_id()
@@ -1728,6 +1737,10 @@ async def _heartbeat_loop():
                             .document(device_id).update({
                                 "lastHeartbeat": int(time.time() * 1000),
                                 "status": "active",
+                                # Atomic-pair contract: confirm this BE
+                                # is alive + cancel the post-claim TTL.
+                                "pairConfirmedAt": True,
+                                "expireAt": DELETE_FIELD,
                             })),
                     timeout=10.0,
                 )
@@ -25800,32 +25813,47 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         paired_uid=result["uid"],
         poll_secret=poll_secret,
     )
+    print(f"  {_c(_OK, '✓')} Refresh token saved to OS keystore.")
 
     # Resolve the owner identity for Stages 2-5. The device doc carries
     # ownerUid (set by the claim Cloud Function) and optionally
     # ownerDisplayName / owner email. Use the user-scoped Firestore client
     # we just bootstrapped — the synth user can read its own device doc
-    # per Firestore rules.
+    # per Firestore rules. Wrapped in a 15s wall-clock cap so a slow
+    # Firestore round-trip can't make pair look hung; we fall back to
+    # the synth uid silently and Stage 2 continues either way.
+    print(f"  {_c(_DIM, 'Resolving owner identity from Firestore...')}")
     owner_uid = result["uid"]  # default fallback: synth uid (rare misroute)
     owner_label = ""
-    try:
+
+    async def _resolve_owner() -> "tuple[str, str]":
         from auth import v2_flow as _v2
-        _user_db = _v2.init_firestore_user_scoped()
-        if _user_db is not None:
-            _snap = _user_db.collection("devices").document(result["device_id"]).get()
-            if _snap.exists:
-                _data = _snap.to_dict() or {}
-                owner_uid = _data.get("ownerUid") or owner_uid
-                owner_label = (
-                    _data.get("ownerDisplayName")
-                    or _data.get("ownerEmail")
-                    or ""
-                )
+        _user_db = await asyncio.to_thread(_v2.init_firestore_user_scoped)
+        if _user_db is None:
+            return owner_uid, owner_label
+        _snap = await asyncio.to_thread(
+            lambda: _user_db.collection("devices")
+                .document(result["device_id"]).get()
+        )
+        if not _snap.exists:
+            return owner_uid, owner_label
+        _data = _snap.to_dict() or {}
+        _uid = _data.get("ownerUid") or owner_uid
+        _label = (
+            _data.get("ownerDisplayName")
+            or _data.get("ownerEmail")
+            or ""
+        )
+        return _uid, _label
+
+    try:
+        owner_uid, owner_label = await asyncio.wait_for(_resolve_owner(), timeout=15.0)
+    except asyncio.TimeoutError:
+        log("[pair-v2] owner lookup timed out — continuing with synth uid", "WARN")
     except Exception as e:
         log(f"[pair-v2] owner lookup failed (continuing with synth uid): {e}", "WARN")
 
     print()
-    print(f"  {_c(_OK, '✓')} Refresh token saved to OS keystore.")
     print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
     print(f"  {_c(_DIM, 'Owner uid  ·')}  {_c(_BOLD, owner_uid)}")
     print()

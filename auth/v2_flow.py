@@ -222,6 +222,12 @@ async def poll_pending_token(
             except ValueError:
                 ct = None
             if ct:
+                # One-time visible signal — the caller's on_tick handler
+                # uses a \r-overwritten counter line; without this print
+                # the terminal goes silent from "Waiting..." until the
+                # next post-exchange log line, which can read as "stuck"
+                # if the keystore/owner-lookup phase happens to be slow.
+                print("\n  customToken received — exchanging for refresh token...")
                 return ct
         # 404 = subdoc doesn't exist yet (FE hasn't claimed). 403 = rule
         # mismatch (deploy lag). 5xx = transient. Keep polling; the
