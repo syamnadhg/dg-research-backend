@@ -25719,17 +25719,21 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     import socket as _socket
     import platform as _platform
 
-    # Per-step timing instrumentation. `_pair_t0` is set on entry; each
-    # diagnostic print gets a `[+1.23s]` prefix relative to the pair
-    # start. Surfaces exactly where a "stuck" pair is spending its time
-    # without requiring gcloud log inspection.
+    # Per-step timing instrumentation, kept at DEBUG so the user-facing
+    # terminal stays clean. Set `DG_PAIR_TRACE=1` in the env to re-enable
+    # the `[pair +X.XXs]` step prefix on stderr for diagnosis. The
+    # actual user-facing progress lines (✓ Refresh token saved, etc.)
+    # are plain `print()` calls below so they always show.
     _pair_t0 = time.monotonic()
-    def _pt(msg: str, kind: str = "INFO") -> None:
+    _pair_trace = os.environ.get("DG_PAIR_TRACE") == "1"
+    def _pt(msg: str, kind: str = "DEBUG") -> None:
+        if not _pair_trace and kind == "DEBUG":
+            return
         elapsed = time.monotonic() - _pair_t0
         log(f"[pair +{elapsed:5.2f}s] {msg}", kind)
 
     _setup_logo()
-    _setup_step(1, 5, "Token setup  ·  Track D user-mode (PR-D3 alpha)")
+    _setup_step(1, 5, "Token setup")
 
     existing_secret = load_poll_secret()
     if existing_secret:
@@ -25827,51 +25831,48 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     _pt("refresh token saved to OS keystore")
     print(f"  {_c(_OK, '✓')} Refresh token saved to OS keystore.")
 
-    # Resolve the owner identity for Stages 2-5. The device doc carries
-    # ownerUid (set by the claim Cloud Function) and optionally
-    # ownerDisplayName / owner email. Use the user-scoped Firestore client
-    # we just bootstrapped — the synth user can read its own device doc
-    # per Firestore rules. Wrapped in a 15s wall-clock cap so a slow
-    # Firestore round-trip can't make pair look hung; we fall back to
-    # the synth uid silently and Stage 2 continues either way.
-    print(f"  {_c(_DIM, 'Resolving owner identity from Firestore...')}")
-    owner_uid = result["uid"]  # default fallback: synth uid (rare misroute)
+    # Owner-lookup via Firestore REST GET, authed with the freshly-
+    # minted idToken. Sidesteps the cold gRPC client init (~10-15s on
+    # Windows the first time) that init_firestore_user_scoped does, so
+    # the "Linked to {email}" banner shows the real owner instead of
+    # falling back to the synth uid. Bounded by a 10s HTTP timeout +
+    # graceful fallback — pair never blocks here.
+    owner_uid = result["uid"]
     owner_label = ""
-
-    async def _resolve_owner() -> "tuple[str, str]":
-        from auth import v2_flow as _v2
-        _user_db = await asyncio.to_thread(_v2.init_firestore_user_scoped)
-        if _user_db is None:
-            return owner_uid, owner_label
-        _snap = await asyncio.to_thread(
-            lambda: _user_db.collection("devices")
-                .document(result["device_id"]).get()
-        )
-        if not _snap.exists:
-            return owner_uid, owner_label
-        _data = _snap.to_dict() or {}
-        _uid = _data.get("ownerUid") or owner_uid
-        _label = (
-            _data.get("ownerDisplayName")
-            or _data.get("ownerEmail")
-            or ""
-        )
-        return _uid, _label
-
-    _pt("resolving owner identity from Firestore...")
     try:
-        owner_uid, owner_label = await asyncio.wait_for(_resolve_owner(), timeout=15.0)
-        _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r}")
-    except asyncio.TimeoutError:
-        _pt("owner lookup timed out (15s) — continuing with synth uid", "WARN")
+        from auth.v2_flow import PROJECT_ID as _PID
+        import requests as _requests
+        _id_token = result["credentials"].token  # set by RefreshTokenCredentials.bootstrap
+        _url = (
+            f"https://firestore.googleapis.com/v1/projects/{_PID}"
+            f"/databases/(default)/documents/devices/{result['device_id']}"
+        )
+        _resp = await asyncio.to_thread(
+            _requests.get,
+            _url,
+            headers={"Authorization": f"Bearer {_id_token}"},
+            timeout=10,
+        )
+        if _resp.status_code == 200:
+            _fields = (_resp.json() or {}).get("fields", {}) or {}
+            _owner_field = (_fields.get("ownerUid") or {}).get("stringValue") or ""
+            _label = (
+                (_fields.get("ownerDisplayName") or {}).get("stringValue")
+                or (_fields.get("ownerEmail") or {}).get("stringValue")
+                or ""
+            )
+            owner_uid = _owner_field or owner_uid
+            owner_label = _label
+            _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r}")
+        else:
+            _pt(f"owner read HTTP {_resp.status_code} — falling back", "DEBUG")
     except Exception as e:
-        _pt(f"owner lookup failed: {e} (continuing with synth uid)", "WARN")
+        _pt(f"owner lookup failed: {e} (falling back)", "DEBUG")
 
     print()
     print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
-    print(f"  {_c(_DIM, 'Owner uid  ·')}  {_c(_BOLD, owner_uid)}")
     print()
-    print(f"  {_c(_OK, '✓')}  Linked to {_c(_BOLD, owner_label or owner_uid[:8])}")
+    print(f"  {_c(_OK, '✓')}  Linked to {_c(_BOLD, owner_label or 'your account')}")
     print()
 
     _pt("entering stages 2-5 (On Startup → API keys → Logins → Ready)")
@@ -28430,11 +28431,16 @@ def run_unpair(deep: bool = False):
     _branded_header("absolvo", _BOLD + _ACCENT, "the bond dissolves")
 
     # Load context BEFORE we nuke local state — the load_* helpers read
-    # research_config.json, which step 4 deletes.
-    init_firebase()
+    # research_config.json, which step 4 deletes. NOTE: we deliberately
+    # skip `init_firebase()` here — the only Firestore operation unpair
+    # needs is the retire POST below, which authenticates with an
+    # idToken minted via `_fresh_user_mode_id_token()` (its own
+    # creds.refresh, no Firestore client init required). Skipping the
+    # cold gRPC channel construction shaves ~10-15s off the user-facing
+    # unpair wall-clock on Windows.
     paired_uid = load_paired_uid()
     device_id = load_device_id()
-    paired_email = _fetch_paired_email(paired_uid)
+    paired_email = ""  # cosmetic only — banner falls back to uid[:8]
 
     # Best-effort server-side retire BEFORE we wipe the keystore. The
     # endpoint deletes the top-level devices/{deviceId} doc + revokes
