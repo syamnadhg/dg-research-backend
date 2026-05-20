@@ -2521,7 +2521,18 @@ def upload_audio_to_storage(local_path: "Path") -> str | None:
     public download URL. Path is scoped under the user's uid + researchId so
     users can only access their own files (see storage.rules).
     Returns None if upload fails or Firebase Storage isn't configured.
+
+    Track D user-mode skip: `firebase_admin.storage.bucket()` requires the
+    Admin SDK to be initialized with a service-account credential, which
+    `_init_firebase_user_mode()` deliberately does NOT do. Storage REST
+    via refresh-token credentials is a future-D5b option; for now, audio
+    upload is skipped in user-mode and the audios doc gets no
+    `audioUrl` field. The Podcasts page reads audioUrl — missing = no
+    play button surfaced, no crash.
     """
+    if load_auth_mode() == "user":
+        log("[storage] audio upload skipped in user-mode (Admin SDK unavailable) — Podcasts playback will be absent for this research", "INFO")
+        return None
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return None
     if not local_path or not local_path.exists():
@@ -3498,7 +3509,19 @@ def _mint_fe_id_token(uid):
     """Mint a Firebase ID token for `uid` via Admin custom-token +
     Identity Toolkit signInWithCustomToken exchange. Returns the
     idToken string on success, None on failure. Non-fatal: caller
-    falls back to the needsFeTrigger marker path."""
+    falls back to the needsFeTrigger marker path.
+
+    Track D user-mode skip: `firebase_admin.auth.create_custom_token`
+    requires the Admin SDK to be initialized with a service-account
+    credential, which `_init_firebase_user_mode()` does NOT do. The
+    BE has no path to mint an arbitrary user's ID token in user-mode
+    (its own refresh-token credentials only authorize the synthetic
+    device user). Returning None triggers `_fire_fe_p4_trigger`'s
+    existing needsFeTrigger fallback — the FE catch-up hook re-fires
+    P4/P5 on next chat-open. No-op crash."""
+    if load_auth_mode() == "user":
+        log("FE trigger: ID token mint skipped in user-mode — fallback to needsFeTrigger marker", "INFO")
+        return None
     if not uid:
         return None
     if not _DG_FE_WEB_API_KEY:
@@ -21827,59 +21850,71 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # other agent-generated artifact. Failures are logged but the
         # pipeline continues with whatever sources DID download.
         if user_sources:
-            try:
-                from firebase_admin import storage as _fb_storage
-                _bucket = _fb_storage.bucket()
-                _ok, _fail = 0, 0
-                for _src in user_sources:
-                    _name = (_src.get("name") or "source").strip() or "source"
-                    _path = (_src.get("storagePath") or "").strip()
-                    if not _path:
-                        _fail += 1
-                        continue
-                    # Sanitize: keep alnum + . _ - and cap length so a
-                    # malicious name can't escape queue_dir.
-                    _safe = re.sub(r"[^A-Za-z0-9._-]", "-", _name)[:80] or "source"
-                    # Avoid clobbering brief.md or another source with the
-                    # same sanitized name — append a numeric suffix.
-                    _dest = queue_dir / "documents" / _safe
-                    if _dest.stem == "brief":
-                        _dest = queue_dir / "documents" / f"src-{_safe}"
-                    _i = 2
-                    while _dest.exists():
-                        _stem = _dest.stem
-                        _ext = _dest.suffix
-                        _dest = queue_dir / "documents" / f"{_stem}-{_i}{_ext}"
-                        _i += 1
-                    try:
-                        _blob = _bucket.blob(_path)
-                        _blob.download_to_filename(str(_dest))
-                        log(f"Flow B source: gs://{_bucket.name}/{_path} → {_dest.name} ({_dest.stat().st_size} bytes)")
-                        _ok += 1
-                    except Exception as _e:
-                        log(f"Flow B source download FAILED ({_path}): {_e}", "WARN")
-                        _fail += 1
-                log(f"Flow B sources: {_ok} downloaded, {_fail} failed")
-                # If every download failed, the run is doomed — P3 will trip
-                # the gate and surface a generic "no documents" alert. Better
-                # to fail fast with the actual reason so the user can retry
-                # the upload or fix Storage permissions.
-                if _ok == 0 and _fail > 0:
-                    log(f"Flow B: ALL {_fail} source downloads failed — aborting", "ERROR")
-                    fail_phase(
-                        phase=3,
-                        error=f"Couldn't download {_fail} attached source(s) from Storage",
-                        reason="The pipeline can't continue without the sources you attached. Re-attach and Retry, or Skip Phase 3 to run with no NotebookLM/podcast.",
-                        actions=[
-                            {"id": "retry", "label": "Retry", "style": "primary",
-                             "command": {"action": "retry_phase", "phase": 3}},
-                            {"id": "skip", "label": "Skip Phase 3", "style": "default",
-                             "command": {"action": "skip_phase", "phase": 3}},
-                        ],
-                    )
-                    return
-            except Exception as _outer:
-                log(f"Flow B handler failed (non-fatal): {_outer}", "WARN")
+            if load_auth_mode() == "user":
+                # Track D user-mode skip — same reason as upload_audio_to_storage:
+                # Admin SDK isn't initialized in user-mode, so the Storage
+                # download path is unavailable. P3 ingests only what the agents
+                # generated; user-attached files are silently absent. Surface
+                # via FE chat banner is D5b territory.
+                log(
+                    f"[flow-b] {len(user_sources)} user-attached source(s) skipped — "
+                    f"Storage download unavailable in user-mode (rid={queue_dir.name})",
+                    "WARN",
+                )
+            else:
+                try:
+                    from firebase_admin import storage as _fb_storage
+                    _bucket = _fb_storage.bucket()
+                    _ok, _fail = 0, 0
+                    for _src in user_sources:
+                        _name = (_src.get("name") or "source").strip() or "source"
+                        _path = (_src.get("storagePath") or "").strip()
+                        if not _path:
+                            _fail += 1
+                            continue
+                        # Sanitize: keep alnum + . _ - and cap length so a
+                        # malicious name can't escape queue_dir.
+                        _safe = re.sub(r"[^A-Za-z0-9._-]", "-", _name)[:80] or "source"
+                        # Avoid clobbering brief.md or another source with the
+                        # same sanitized name — append a numeric suffix.
+                        _dest = queue_dir / "documents" / _safe
+                        if _dest.stem == "brief":
+                            _dest = queue_dir / "documents" / f"src-{_safe}"
+                        _i = 2
+                        while _dest.exists():
+                            _stem = _dest.stem
+                            _ext = _dest.suffix
+                            _dest = queue_dir / "documents" / f"{_stem}-{_i}{_ext}"
+                            _i += 1
+                        try:
+                            _blob = _bucket.blob(_path)
+                            _blob.download_to_filename(str(_dest))
+                            log(f"Flow B source: gs://{_bucket.name}/{_path} → {_dest.name} ({_dest.stat().st_size} bytes)")
+                            _ok += 1
+                        except Exception as _e:
+                            log(f"Flow B source download FAILED ({_path}): {_e}", "WARN")
+                            _fail += 1
+                    log(f"Flow B sources: {_ok} downloaded, {_fail} failed")
+                    # If every download failed, the run is doomed — P3 will trip
+                    # the gate and surface a generic "no documents" alert. Better
+                    # to fail fast with the actual reason so the user can retry
+                    # the upload or fix Storage permissions.
+                    if _ok == 0 and _fail > 0:
+                        log(f"Flow B: ALL {_fail} source downloads failed — aborting", "ERROR")
+                        fail_phase(
+                            phase=3,
+                            error=f"Couldn't download {_fail} attached source(s) from Storage",
+                            reason="The pipeline can't continue without the sources you attached. Re-attach and Retry, or Skip Phase 3 to run with no NotebookLM/podcast.",
+                            actions=[
+                                {"id": "retry", "label": "Retry", "style": "primary",
+                                 "command": {"action": "retry_phase", "phase": 3}},
+                                {"id": "skip", "label": "Skip Phase 3", "style": "default",
+                                 "command": {"action": "skip_phase", "phase": 3}},
+                            ],
+                        )
+                        return
+                except Exception as _outer:
+                    log(f"Flow B handler failed (non-fatal): {_outer}", "WARN")
 
         # Bridge user_sources → P1/P2 attachments. After the Flow B block
         # downloaded everything into documents/, walk that dir and:
@@ -25878,7 +25913,19 @@ def _save_api_key_to_firestore(uid: str, key_name: str, value: str) -> bool:
     Returns True on success, False on any failure. On failure the caller
     keeps the in-memory os.environ assignment so the current pair / serve
     session still has the key; the user can re-save from the Account page
-    later for cross-device durability."""
+    later for cross-device durability.
+
+    Track D user-mode skip: the synth device user (auth.uid =
+    `device-{uuid}`) does NOT match the rule `request.auth.uid == userId`
+    on `users/{userId}/settings/prefs`, so a direct write would always
+    permission-deny. In user-mode, API keys belong on the FE Account →
+    API Config page (or are scheduled to route through a future Cloud
+    Function in D5c). Returning False here lets the existing caller fall
+    through to the "applied to this session only — save permanently from
+    the web app" message, which is exactly the right user-facing prompt."""
+    if load_auth_mode() == "user":
+        log("[pair] API key save to Firestore skipped in user-mode — keys belong on FE Account → API Config", "INFO")
+        return False
     if not (_firebase_db and uid):
         return False
     try:
