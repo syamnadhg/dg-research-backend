@@ -25583,6 +25583,97 @@ def _pair_patch_device(
     return False
 
 
+def _cleanup_partial_pair(device_id: str) -> None:
+    """Reverse a partially-completed pair when the user Ctrl+Cs (or the
+    flow errors out) between Stage 1 exchange and Stage 5 completion.
+
+    Track D writes pairConfirmedAt:true to the device doc the moment
+    exchange succeeds so the FE Account tile appears at Stage 1 — but
+    that means a mid-flow cancellation would leave a "confirmed" tile
+    with no working backend behind it. This helper:
+      1) POSTs /api/devices/unpair-self with the just-minted idToken
+         (full server-side retire — deletes device doc + revokes synth
+         Firebase user, drops the pollSecretHash entry).
+      2) Wipes the OS keystore.
+      3) Removes research_config.json.
+      4) Best-effort supervisor disarm (schtasks /Delete on Windows /
+         launchctl bootout on mac / systemctl --user disable on linux)
+         in case the cancellation happened during Stage 5 arming.
+
+    Best-effort throughout — never raises, prints WARN on each failed
+    step so the user can run `--unpair` manually if anything sticks."""
+    import requests as _requests
+    import subprocess as _sp
+    # Server-side: delete the device doc + revoke synth user. Requires
+    # an idToken which is still mintable from the just-bootstrapped
+    # keystore at this point (we haven't wiped it yet).
+    try:
+        from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+        _id_token = _fresh_user_mode_id_token()
+        if _id_token:
+            try:
+                _resp = _requests.post(
+                    f"{_FE_BASE_URL}/api/devices/unpair-self",
+                    headers={"Authorization": f"Bearer {_id_token}"},
+                    json={"deviceId": device_id},
+                    timeout=10,
+                )
+                if _resp.status_code == 200:
+                    log("[cleanup] device retired server-side ✓", "INFO")
+                else:
+                    log(
+                        f"[cleanup] /unpair-self HTTP {_resp.status_code} — "
+                        f"run --unpair to clean up manually",
+                        "WARN",
+                    )
+            except Exception as e:
+                log(f"[cleanup] server-side retire failed: {e}", "WARN")
+        else:
+            log("[cleanup] no idToken — skipping server-side retire", "WARN")
+    except Exception as e:
+        log(f"[cleanup] auth import failed: {e}", "WARN")
+    # Local: wipe keystore + research_config.json so the next --pair
+    # starts from a clean slate.
+    try:
+        from auth import keystore as _ks
+        _ks.clear_all(_ks.install_uuid())
+        log("[cleanup] OS keystore cleared", "INFO")
+    except Exception as e:
+        log(f"[cleanup] keystore wipe failed: {e}", "WARN")
+    try:
+        if RESEARCH_CONFIG_PATH.exists():
+            RESEARCH_CONFIG_PATH.unlink()
+            log("[cleanup] research_config.json removed", "INFO")
+    except Exception as e:
+        log(f"[cleanup] config wipe failed: {e}", "WARN")
+    # In-memory caches — anything still running in this process can't
+    # re-read pre-wipe values.
+    global _device_id, _device_paired_uid
+    _device_id = None
+    _device_paired_uid = None
+    # Supervisor: best-effort disarm in case Ctrl+C landed during Stage
+    # 5 arming. Failures are silent — `--retire` is the user's fallback.
+    try:
+        _plat = _supervisor_platform()
+        if _plat == "Windows":
+            _sp.run(
+                ["schtasks", "/Delete", "/TN", _SUPERVISOR_TASK_NAME, "/F"],
+                capture_output=True, timeout=10, creationflags=_PS_NO_WINDOW,
+            )
+        elif _plat == "Darwin":
+            _sp.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}/{_SUPERVISOR_PLIST_LABEL}"],
+                capture_output=True, timeout=10,
+            )
+        elif _plat == "Linux":
+            _sp.run(
+                ["systemctl", "--user", "disable", "--now", _SUPERVISOR_UNIT_NAME],
+                capture_output=True, timeout=10,
+            )
+    except Exception:
+        pass
+
+
 def _save_api_key_via_fe_bridge(key_name: str, value: str) -> bool:
     """POST to `/api/devices/save-api-key` so the FE writes the API key to
     `users/{ownerUid}/settings/prefs.apiKeys.{key_name}` via Admin SDK on
@@ -25864,123 +25955,156 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             sys.stdout.flush()
 
     _pt("calling /api/devices/initiate-pair...")
+    # captured_device_id is set immediately after a successful exchange
+    # so the try/finally cleanup at the bottom of this function can
+    # reverse a partial pair if the user Ctrl+Cs between Stage 1 and
+    # Stage 5. Stays None when we never got past polling — the device
+    # doc's 24h initiate-pair TTL handles that case server-side.
+    captured_device_id: "str | None" = None
+    pair_completed = False
     try:
-        result = await v2_flow.do_pair_v2(
-            poll_secret_hash=poll_secret_hash,
-            machine_name=hostname,
-            hostname=hostname,
-            os_string=os_string,
-            on_code=_on_code,
-            on_waiting=_on_waiting,
+        try:
+            result = await v2_flow.do_pair_v2(
+                poll_secret_hash=poll_secret_hash,
+                machine_name=hostname,
+                hostname=hostname,
+                os_string=os_string,
+                on_code=_on_code,
+                on_waiting=_on_waiting,
+            )
+        except v2_flow.PollTimeout:
+            print()
+            _pt("polling timed out — re-run --pair to start fresh", "ERROR")
+            return
+        except v2_flow.InitiatePairError as e:
+            print()
+            _pt(f"could not contact backend: {e}", "ERROR")
+            log("  Check internet + that superresearch.io is reachable.", "ERROR")
+            return
+        except KeyboardInterrupt:
+            print()
+            log("Cancelled before exchange — nothing to clean up server-side.", "WARN")
+            return
+        except Exception as e:
+            print()
+            _pt(f"unexpected error: {e}", "ERROR")
+            return
+        # Past this point we have a live device entry in Firestore that
+        # cleanup needs to revert if the flow doesn't finish.
+        captured_device_id = result["device_id"]
+
+        print()  # Clear the polling line.
+        _pt(f"exchange OK — deviceId={result['device_id'][:12]}… uid={result['uid'][:14]}…")
+
+        save_user_mode_state(
+            device_id=result["device_id"],
+            paired_uid=result["uid"],
+            poll_secret=poll_secret,
         )
-    except v2_flow.PollTimeout:
-        print()
-        _pt("polling timed out — re-run --pair to start fresh", "ERROR")
-        return
-    except v2_flow.InitiatePairError as e:
-        print()
-        _pt(f"could not contact backend: {e}", "ERROR")
-        log("  Check internet + that superresearch.io is reachable.", "ERROR")
-        return
-    except Exception as e:
-        print()
-        _pt(f"unexpected error: {e}", "ERROR")
-        return
+        _pt("refresh token saved to OS keystore")
+        print(f"  {_c(_OK, '✓')} Refresh token saved to OS keystore.")
 
-    print()  # Clear the polling line.
-    _pt(f"exchange OK — deviceId={result['device_id'][:12]}… uid={result['uid'][:14]}…")
-
-    save_user_mode_state(
-        device_id=result["device_id"],
-        paired_uid=result["uid"],
-        poll_secret=poll_secret,
-    )
-    _pt("refresh token saved to OS keystore")
-    print(f"  {_c(_OK, '✓')} Refresh token saved to OS keystore.")
-
-    # Real-time atomic-pair confirmation. With the keystore bootstrapped
-    # the BE is genuinely paired — Firestore should reflect that right
-    # now so the FE Account-page tile appears at Stage 1, not after the
-    # supervisor-started --serve eventually heartbeats. Mirrors the
-    # contract heartbeat would write: pairConfirmedAt:true + delete
-    # expireAt (cancels the 5-min "must confirm" TTL set by the claim
-    # Cloud Function). Best-effort — if this fails the heartbeat at
-    # Stage 5 still writes both via the same path.
-    if _pair_patch_device(
-        result["device_id"],
-        {"pairConfirmedAt": True},
-        delete_fields=["expireAt"],
-    ):
-        _pt("device confirmed in Firestore — FE tile should appear")
-    else:
-        _pt("device-confirm patch failed (heartbeat will retry)", "WARN")
-
-    # Owner-lookup via Firestore REST GET, authed with the freshly-
-    # minted idToken. Sidesteps the cold gRPC client init (~10-15s on
-    # Windows the first time) that init_firestore_user_scoped does, so
-    # the "Linked to {name} ({email})" banner shows the real owner
-    # instead of falling back to the synth uid. Bounded by a 10s HTTP
-    # timeout + graceful fallback — pair never blocks here.
-    owner_uid = result["uid"]
-    owner_label = ""
-    owner_email = ""
-    try:
-        from auth.v2_flow import PROJECT_ID as _PID
-        import requests as _requests
-        _id_token = result["credentials"].token  # set by RefreshTokenCredentials.bootstrap
-        _url = (
-            f"https://firestore.googleapis.com/v1/projects/{_PID}"
-            f"/databases/(default)/documents/devices/{result['device_id']}"
-        )
-        _resp = await asyncio.to_thread(
-            _requests.get,
-            _url,
-            headers={"Authorization": f"Bearer {_id_token}"},
-            timeout=10,
-        )
-        if _resp.status_code == 200:
-            _fields = (_resp.json() or {}).get("fields", {}) or {}
-            _owner_field = (_fields.get("ownerUid") or {}).get("stringValue") or ""
-            _label = (_fields.get("ownerDisplayName") or {}).get("stringValue") or ""
-            _email = (_fields.get("ownerEmail") or {}).get("stringValue") or ""
-            owner_uid = _owner_field or owner_uid
-            owner_label = _label or (_email.split("@")[0] if _email else "")
-            owner_email = _email
-            _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r} email={owner_email!r}")
+        # Real-time atomic-pair confirmation. With the keystore bootstrapped
+        # the BE is genuinely paired — Firestore should reflect that right
+        # now so the FE Account-page tile appears at Stage 1, not after the
+        # supervisor-started --serve eventually heartbeats. Mirrors the
+        # contract heartbeat would write: pairConfirmedAt:true + delete
+        # expireAt (cancels the 5-min "must confirm" TTL set by the claim
+        # Cloud Function). Best-effort — if this fails the heartbeat at
+        # Stage 5 still writes both via the same path.
+        if _pair_patch_device(
+            result["device_id"],
+            {"pairConfirmedAt": True},
+            delete_fields=["expireAt"],
+        ):
+            _pt("device confirmed in Firestore — FE tile should appear")
         else:
-            _pt(f"owner read HTTP {_resp.status_code} — falling back", "DEBUG")
-    except Exception as e:
-        _pt(f"owner lookup failed: {e} (falling back)", "DEBUG")
+            _pt("device-confirm patch failed (heartbeat will retry)", "WARN")
 
-    print()
-    print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
-    print()
-    # Banner: "✓ Linked to Rocky (rocky@gmail.com)" when we have both;
-    # falls back to label-only, then email-only, then "your account".
-    if owner_label and owner_email:
-        _linked_to = f"{_c(_BOLD, owner_label)} {_c(_DIM, '(' + owner_email + ')')}"
-    elif owner_label:
-        _linked_to = _c(_BOLD, owner_label)
-    elif owner_email:
-        _linked_to = _c(_BOLD, owner_email)
-    else:
-        _linked_to = _c(_BOLD, "your account")
-    print(f"  {_c(_OK, '✓')}  Linked to {_linked_to}")
-    print()
+        # Owner-lookup via Firestore REST GET, authed with the freshly-
+        # minted idToken. Sidesteps the cold gRPC client init (~10-15s on
+        # Windows the first time) that init_firestore_user_scoped does, so
+        # the "Linked to {name} ({email})" banner shows the real owner
+        # instead of falling back to the synth uid. Bounded by a 10s HTTP
+        # timeout + graceful fallback — pair never blocks here.
+        owner_uid = result["uid"]
+        owner_label = ""
+        owner_email = ""
+        try:
+            from auth.v2_flow import PROJECT_ID as _PID
+            import requests as _requests
+            _id_token = result["credentials"].token  # set by RefreshTokenCredentials.bootstrap
+            _url = (
+                f"https://firestore.googleapis.com/v1/projects/{_PID}"
+                f"/databases/(default)/documents/devices/{result['device_id']}"
+            )
+            _resp = await asyncio.to_thread(
+                _requests.get,
+                _url,
+                headers={"Authorization": f"Bearer {_id_token}"},
+                timeout=10,
+            )
+            if _resp.status_code == 200:
+                _fields = (_resp.json() or {}).get("fields", {}) or {}
+                _owner_field = (_fields.get("ownerUid") or {}).get("stringValue") or ""
+                _label = (_fields.get("ownerDisplayName") or {}).get("stringValue") or ""
+                _email = (_fields.get("ownerEmail") or {}).get("stringValue") or ""
+                owner_uid = _owner_field or owner_uid
+                owner_label = _label or (_email.split("@")[0] if _email else "")
+                owner_email = _email
+                _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r} email={owner_email!r}")
+            else:
+                _pt(f"owner read HTTP {_resp.status_code} — falling back", "DEBUG")
+        except Exception as e:
+            _pt(f"owner lookup failed: {e} (falling back)", "DEBUG")
 
-    _pt("entering stages 2-5 (On Startup → API keys → Logins → Ready)")
-    # Stages 2-5 — On Startup, API keys (via FE bridge in user-mode),
-    # browser logins, Ready/supervisor. The helper writes per-platform
-    # login progress to devices/{deviceId}.logins via the user-scoped
-    # Firestore client (rule permits synth user updates of `logins`).
-    await _continue_pair_stages_2_to_5(
-        profile_dir or str(PROFILE_DIR),
-        linked_uid=owner_uid,
-        linked_email=owner_label or owner_uid[:8],
-        initial_paired_uid=None,
-        token="",
-        device_id_for_progress=result["device_id"],
-    )
+        print()
+        print(f"  {_c(_DIM, 'Device id  ·')}  {_c(_BOLD, result['device_id'])}")
+        print()
+        # Banner: "✓ Linked to Rocky (rocky@gmail.com)" when we have both;
+        # falls back to label-only, then email-only, then "your account".
+        if owner_label and owner_email:
+            _linked_to = f"{_c(_BOLD, owner_label)} {_c(_DIM, '(' + owner_email + ')')}"
+        elif owner_label:
+            _linked_to = _c(_BOLD, owner_label)
+        elif owner_email:
+            _linked_to = _c(_BOLD, owner_email)
+        else:
+            _linked_to = _c(_BOLD, "your account")
+        print(f"  {_c(_OK, '✓')}  Linked to {_linked_to}")
+        print()
+
+        _pt("entering stages 2-5 (On Startup → API keys → Logins → Ready)")
+        # Stages 2-5 — On Startup, API keys (via FE bridge in user-mode),
+        # browser logins, Ready/supervisor. The helper writes per-platform
+        # login progress to devices/{deviceId}.logins via the user-scoped
+        # Firestore client (rule permits synth user updates of `logins`).
+        await _continue_pair_stages_2_to_5(
+            profile_dir or str(PROFILE_DIR),
+            linked_uid=owner_uid,
+            linked_email=owner_email or owner_label or owner_uid[:8],
+            initial_paired_uid=None,
+            token="",
+            device_id_for_progress=result["device_id"],
+        )
+        # Reached only if Stages 2-5 returned cleanly (no Ctrl+C, no
+        # exception). The finally below uses this sentinel to decide
+        # whether to run server-side cleanup.
+        pair_completed = True
+    finally:
+        if captured_device_id and not pair_completed:
+            print()
+            log(
+                "Pair interrupted — reverting partial state so your FE "
+                "Account doesn't show a half-paired device tile.",
+                "WARN",
+            )
+            _cleanup_partial_pair(captured_device_id)
+            log(
+                "Cleanup done. Re-run `python research.py --pair` to try "
+                "again from a clean slate.",
+                "INFO",
+            )
 
 
 async def _continue_pair_stages_2_to_5(
