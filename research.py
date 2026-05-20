@@ -1729,17 +1729,29 @@ def load_device_id():
 
 
 def load_auth_mode() -> str:
-    """Track D — resolve effective auth mode (env > config > default).
+    """Track D — resolve effective auth mode (env > config > inferred default).
 
-    `legacy`  Admin SDK from firebase-service-account.json. Current default;
-              every existing install is in this mode.
+    `legacy`  Admin SDK from firebase-service-account.json. The Track-D-
+              earliest installs are here; existing devices with a
+              `researchToken` in config keep this until they re-pair.
     `user`    Refresh-token credentials in the OS keystore (PR-D3 opt-in,
-              PR-D5 cutover). No service-account JSON needed on the user's
-              machine; per-user blast radius if the keystore is compromised.
+              PR-D5c cutover default). No service-account JSON needed on
+              the user's machine; per-user blast radius if the keystore is
+              compromised.
 
-    Defaults to `legacy` if neither source pins it. Override:
-        export RESEARCH_AUTH_MODE=user    # env wins
-        python research.py --pair --auth-mode=user    # CLI flag wins
+    Default-inference rules (in order):
+        1. Env `RESEARCH_AUTH_MODE` if valid.
+        2. Explicit `authMode` field in research_config.json.
+        3. Presence of `researchToken` field in research_config.json →
+           "legacy" (don't silently flip pre-cutover installs into
+           user-mode; their next `--serve` would fail because the
+           keystore is empty).
+        4. Fresh install (no config or empty config) → "user" — Track D
+           is the post-D5c default.
+
+    Override at the CLI:
+        export RESEARCH_AUTH_MODE=user    # env wins everything
+        python research.py --pair --auth-mode=legacy    # CLI flag wins config
     """
     if RESEARCH_AUTH_MODE_ENV in _VALID_AUTH_MODES:
         return RESEARCH_AUTH_MODE_ENV
@@ -1749,9 +1761,16 @@ def load_auth_mode() -> str:
             mode = (cfg.get("authMode") or "").strip().lower()
             if mode in _VALID_AUTH_MODES:
                 return mode
+            # Pre-D5c install — `authMode` was never written. If a
+            # researchToken exists, the user paired the legacy way; don't
+            # silently flip them. Returning "user" here would break their
+            # next `--serve` because the keystore is empty.
+            if (cfg.get("researchToken") or cfg.get("pipeToken") or "").strip():
+                return "legacy"
         except Exception:
             pass
-    return "legacy"
+    # Fresh install — Track D is the new default.
+    return "user"
 
 
 def load_poll_secret() -> str | None:
@@ -26122,9 +26141,9 @@ async def _pair_prompt_api_keys(uid: str):
             print(f"  {_c(_DIM, '─')}  Skipped Gemini — set later from the web app (Account → API Config).")
 
 
-async def cmd_pair_v2():
-    """Track D Stage-1 user-mode pair (PR-D3 alpha — opt-in via
-    `--pair --auth-mode=user` or `RESEARCH_AUTH_MODE=user`).
+async def cmd_pair_v2(profile_dir: "str | None" = None):
+    """Track D user-mode pair (PR-D5c default-flipped — plain `--pair`
+    routes here on fresh installs).
 
     Mints a 256-bit pollSecret locally, calls the FE Cloud Function
     /api/devices/initiate-pair, displays the 8-char code (and QR), polls
@@ -26132,11 +26151,16 @@ async def cmd_pair_v2():
     token, persists it to the OS keystore via RefreshTokenCredentials.
     bootstrap. No Admin SDK, no firebase-service-account.json.
 
-    Scope: Stage 1 ONLY. Stages 2-5 (API keys, browser logins,
-    supervisor) still require the legacy `--pair` flow until PR-D5
-    unifies them. This command is for users who want to test the
-    Track D infrastructure end-to-end before the cutover lands.
+    Scope (as of D5c-2): Stage 1 (the user-mode handshake). Stages 2-5
+    (API keys, browser logins, supervisor) are NOT yet unified into the
+    user-mode flow — for now, run `python research.py --pair
+    --auth-mode=legacy` afterward to complete them. Full unification
+    lands in the follow-up D5c-3 commit.
+
+    `profile_dir` will be threaded into the browser-login Stage 4 once
+    D5c-3 lands; accepted now to keep the dispatcher signature stable.
     """
+    del profile_dir  # reserved for D5c-3
     from auth import v2_flow
     import socket as _socket
     import platform as _platform
@@ -26242,12 +26266,15 @@ async def cmd_pair_v2():
     print(f"  {_c(_DIM, 'Synth uid  ·')}  {_c(_BOLD, result['uid'])}")
     print(f"  {_c(_DIM, 'Owner uid  ·')}  {_c(_BOLD, result['uid'])}")
     print()
-    print(f"  {_c(_BOLD + _ACCENT, '  The Track D foundation is laid.')}")
+    print(f"  {_c(_BOLD + _ACCENT, '  Track D pair complete.')}")
     print()
-    print(f"  {_c(_WARN, 'PR-D3 alpha:')} Stages 2-5 (API keys, browser logins, supervisor)")
-    print(f"     are not yet wired into user-mode. To finish setup:")
-    print(f"       {_c(_BOLD, 'python research.py --pair')}  {_c(_DIM, '(legacy admin SDK, runs Stages 2-5)')}")
-    print(f"     Or wait for PR-D5 which unifies the flow.")
+    print(f"  {_c(_DIM, 'Stages 2-5 (API keys, browser logins, supervisor) are not yet')}")
+    print(f"  {_c(_DIM, 'wired into user-mode pairing — that lands in PR-D5c-3. To set up')}")
+    print(f"  {_c(_DIM, 'API keys + browser logins + supervisor for this device now, run:')}")
+    print()
+    print(f"       {_c(_BOLD, 'python research.py --pair --auth-mode=legacy')}")
+    print()
+    print(f"  {_c(_DIM, 'Or set the API keys directly from the web app: Account → API Config.')}")
 
 
 async def run_pair(profile_dir, wait_minutes=10):
@@ -29695,10 +29722,14 @@ def main():
         return
 
     if args.pair:
-        # Resolve effective auth mode: CLI flag > env var > config > default.
+        # Resolve effective auth mode: CLI flag > env var > config > inferred default.
+        # Post-D5c, plain `--pair` defaults to user-mode for fresh installs
+        # (load_auth_mode() returns "user"); pre-existing legacy installs
+        # with a researchToken in config stay on "legacy" until they
+        # explicitly opt in.
         effective_mode = args.auth_mode or load_auth_mode()
         if effective_mode == "user":
-            asyncio.run(cmd_pair_v2())
+            asyncio.run(cmd_pair_v2(str(PROFILE_DIR)))
         else:
             asyncio.run(run_pair(str(PROFILE_DIR)))
         return
