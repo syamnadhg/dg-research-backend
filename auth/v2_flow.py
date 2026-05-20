@@ -251,9 +251,25 @@ async def do_pair_v2(
     exchange = await asyncio.to_thread(
         pairing.exchange_custom_token, custom_token, WEB_API_KEY
     )
-    refresh_token = exchange["refreshToken"]
-    id_token = exchange["idToken"]
-    uid = exchange["localId"]
+    # Defensive parse — `signInWithCustomToken` is documented to return
+    # idToken + refreshToken + localId + expiresIn, but a bracket-access
+    # KeyError on any of them buries the actual response shape, which is
+    # what we need to debug field-mismatch / version-skew cases.
+    refresh_token = exchange.get("refreshToken")
+    id_token = exchange.get("idToken")
+    uid = exchange.get("localId")
+    if not (refresh_token and id_token and uid):
+        keys = sorted(exchange.keys()) if isinstance(exchange, dict) else type(exchange).__name__
+        # `error` is what Firebase returns on a 200-with-body-error edge case;
+        # the rest of the body shape lands in `keys` for diagnostics.
+        err = ""
+        if isinstance(exchange, dict) and isinstance(exchange.get("error"), dict):
+            err = f" error={exchange['error'].get('message') or exchange['error']!r}"
+        raise pairing.CustomTokenExchangeError(
+            f"signInWithCustomToken 200 but missing fields "
+            f"(have refreshToken={bool(refresh_token)} idToken={bool(id_token)} "
+            f"localId={bool(uid)}). keys={keys}{err}"
+        )
     expires_in = int(exchange.get("expiresIn") or "3600")
 
     creds = credentials.RefreshTokenCredentials.bootstrap(
@@ -304,17 +320,30 @@ async def do_redeem_reset(
     exchange = await asyncio.to_thread(
         pairing.exchange_custom_token, custom_token, WEB_API_KEY
     )
+    refresh_token = exchange.get("refreshToken")
+    id_token = exchange.get("idToken")
+    uid = exchange.get("localId")
+    if not (refresh_token and id_token and uid):
+        keys = sorted(exchange.keys()) if isinstance(exchange, dict) else type(exchange).__name__
+        err = ""
+        if isinstance(exchange, dict) and isinstance(exchange.get("error"), dict):
+            err = f" error={exchange['error'].get('message') or exchange['error']!r}"
+        raise pairing.CustomTokenExchangeError(
+            f"signInWithCustomToken 200 but missing fields "
+            f"(have refreshToken={bool(refresh_token)} idToken={bool(id_token)} "
+            f"localId={bool(uid)}). keys={keys}{err}"
+        )
     creds = credentials.RefreshTokenCredentials.bootstrap(
         install_uuid=keystore.install_uuid(),
         web_api_key=WEB_API_KEY,
-        refresh_token=exchange["refreshToken"],
-        id_token=exchange["idToken"],
-        uid=exchange["localId"],
+        refresh_token=refresh_token,
+        id_token=id_token,
+        uid=uid,
         expires_in=int(exchange.get("expiresIn") or "3600"),
     )
     return {
         "device_id": device_id,
-        "uid": exchange["localId"],
+        "uid": uid,
         "credentials": creds,
     }
 
