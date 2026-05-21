@@ -30518,7 +30518,7 @@ def run_unpair(deep: bool = False):
     that resurrects the old identity.
 
     Preserved by default (delete manually for a truly clean machine):
-      • Chrome profile at ~/.super-research/browser-profile/ (your logins)
+      • Chrome profile(s) at ~/.super-research/browser-profile*/ (your logins)
       • Pipeline history in queues/
 
     With `deep=True` (CLI: `--unpair --deep`), ALSO wipes the Chrome
@@ -30773,40 +30773,82 @@ def run_unpair(deep: bool = False):
     else:
         print(f"  {_c(_OK, '✓')}  No research.py process remains")
 
-    # Deep cleanup: also wipe the Playwright browser profile if --unpair
-    # --deep was passed. Default --unpair preserves the profile so a
+    # Deep cleanup: also wipe ALL Playwright browser profiles if --unpair
+    # --deep was passed. Default --unpair preserves the profiles so a
     # re-pair on the same account doesn't force the user back through
     # ChatGPT/Gemini/Claude/NotebookLM logins. --deep is for the explicit
     # "I want a fresh browser, e.g. switching accounts" case + the F4
     # cookie-refusal recovery path.
-    browser_wiped = False
+    #
+    # 2026-05-21: multi-profile aware. Globs ~/.super-research/browser-profile*
+    # so profile-1 (legacy `browser-profile/`) AND any profile-N dirs
+    # (`browser-profile-2/`, `browser-profile-3/`, …) all get wiped in one
+    # pass. Without this, a re-pair after --unpair --deep would see stale
+    # cookies in profile-2+ and the new pair's Stage 4 multi-profile loop
+    # would inherit them. workerCount is also reset to 1 so the post-deep
+    # state matches a fresh-install baseline.
+    browser_wiped_count = 0
     if deep:
         try:
             import shutil as _shutil
-            if PROFILE_DIR.exists():
-                _shutil.rmtree(str(PROFILE_DIR), ignore_errors=True)
-                browser_wiped = not PROFILE_DIR.exists()
-                if browser_wiped:
-                    log(f"Browser profile wiped: {PROFILE_DIR}", "INFO")
-                else:
-                    log(f"Browser profile wipe partial — some files survived at {PROFILE_DIR}", "WARN")
+            profile_root = PROFILE_DIR.parent  # ~/.super-research
+            wiped_names: list[str] = []
+            survived_names: list[str] = []
+            if profile_root.exists():
+                for sub in profile_root.iterdir():
+                    # Match exactly `browser-profile` and `browser-profile-{N}`,
+                    # not arbitrary `browser-profile_backup` or similar.
+                    if not sub.is_dir():
+                        continue
+                    name = sub.name
+                    if name != "browser-profile" and not (
+                        name.startswith("browser-profile-")
+                        and name[len("browser-profile-"):].isdigit()
+                    ):
+                        continue
+                    try:
+                        _shutil.rmtree(str(sub), ignore_errors=True)
+                    except Exception as _sub_err:
+                        log(f"Browser profile wipe failed for {name}: {_sub_err}", "WARN")
+                        survived_names.append(name)
+                        continue
+                    if sub.exists():
+                        survived_names.append(name)
+                        log(f"Browser profile wipe partial — some files survived at {sub}", "WARN")
+                    else:
+                        wiped_names.append(name)
+                        log(f"Browser profile wiped: {sub}", "INFO")
+            browser_wiped_count = len(wiped_names)
+            if browser_wiped_count:
+                # Reset worker capacity to fresh-install baseline. Next pair's
+                # Stage 4 multi-profile loop will re-establish whatever count
+                # the user wants.
+                try:
+                    save_worker_count(1)
+                    log("workerCount reset to 1 after --unpair --deep", "INFO")
+                except Exception as _wc_err:
+                    log(f"workerCount reset failed (non-fatal): {_wc_err}", "WARN")
         except Exception as _de:
             log(f"Browser profile wipe failed: {_de}", "WARN")
+    browser_wiped = browser_wiped_count > 0
 
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  The bond dissolves.')}  {_c(_DIM, 'This machine is no longer paired.')}")
     print()
     if browser_wiped:
-        print(f"  {_c(_OK, '✓')}  Chrome profile wiped (`--deep`) — fresh browser on next --pair.")
+        if browser_wiped_count == 1:
+            print(f"  {_c(_OK, '✓')}  Chrome profile wiped (`--deep`) — fresh browser on next --pair.")
+        else:
+            print(f"  {_c(_OK, '✓')}  {browser_wiped_count} Chrome profiles wiped (`--deep`) — fresh browsers on next --pair.")
         print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
         print(f"       {_c(_DIM, '• Research history in queues/')}")
         print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
     else:
         print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
-        print(f"       {_c(_DIM, '• Chrome profile at ~/.super-research/browser-profile/  (your logins)')}")
+        print(f"       {_c(_DIM, '• Chrome profile(s) at ~/.super-research/browser-profile*/  (your logins)')}")
         print(f"       {_c(_DIM, '• Research history in queues/')}")
         print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
-        print(f"       {_c(_DIM, '  Add --deep to also wipe the Chrome profile next time.')}")
+        print(f"       {_c(_DIM, '  Add --deep to also wipe the Chrome profile(s) next time.')}")
     _render_next_actions([
         ("python research.py --pair", "reconnect this machine (mints a fresh token)"),
     ])
@@ -30845,7 +30887,7 @@ def run_commands_help():
         ("python research.py --unpair",
          "Fully disconnect this PC (deletes token + device doc + local config)"),
         ("python research.py --unpair --deep",
-         "Same as --unpair, but ALSO wipes ~/.super-research/browser-profile/"),
+         "Same as --unpair, but ALSO wipes all ~/.super-research/browser-profile*/ dirs + resets workerCount"),
     ])
 
     _section("Advanced", [
@@ -31213,9 +31255,10 @@ def main():
     parser.add_argument("--unpair", action="store_true",
         help="Fully disconnect this machine from Super Research (inverse of --pair): deletes token + device doc + local config")
     parser.add_argument("--deep", action="store_true",
-        help="With --unpair: also wipe the Playwright browser profile at ~/.super-research/browser-profile/ "
-             "(clears ChatGPT/Gemini/Claude/NotebookLM logins). Useful when re-pairing to a different account "
-             "or when the F4 cookie check refuses pair due to stale Google auth. Default: preserve the profile.")
+        help="With --unpair: also wipe ALL Playwright browser profiles under ~/.super-research/browser-profile*/ "
+             "(clears ChatGPT/Gemini/Claude/NotebookLM logins across profile-1 and any profile-N set up via pair "
+             "Stage 4 multi-profile loop). Also resets workerCount to 1. Useful when re-pairing to a different "
+             "account or when the F4 cookie check refuses pair due to stale Google auth. Default: preserve profiles.")
     parser.add_argument("--daemon-loop", action="store_true",
         help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the On Startup scheduled task.")
     parser.add_argument("--env-file", default=None,
