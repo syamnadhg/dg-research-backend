@@ -1734,6 +1734,43 @@ def save_device_config(device_id: str | None = None, paired_uid: str | None = No
     _atomic_write_json(RESEARCH_CONFIG_PATH, local_cfg)
 
 
+def load_worker_count() -> int:
+    """Number of concurrent-run slots this device has logins for.
+
+    1 = single-worker (legacy default). 2+ = multi-profile, set up during
+    pair Stage 4's "Add another browser profile?" loop. PR 2 wires this
+    into daemon-loop so N worker subprocesses spawn, each pinned to its
+    own browser profile.
+
+    Defaults to 1 if the field is missing, the file is malformed, or any
+    read raises — never returns <1.
+    """
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+            raw = cfg.get("workerCount", 1)
+            n = int(raw) if raw is not None else 1
+            return max(1, n)
+        except Exception:
+            pass
+    return 1
+
+
+def save_worker_count(n: int) -> None:
+    """Merge-write workerCount into research_config.json. Clamped to >=1
+    so a bad caller can't disable the only worker. Atomic write via
+    _atomic_write_json — partial-write safe."""
+    n = max(1, int(n))
+    local_cfg = {}
+    if RESEARCH_CONFIG_PATH.exists():
+        try:
+            local_cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            local_cfg = {}
+    local_cfg["workerCount"] = n
+    _atomic_write_json(RESEARCH_CONFIG_PATH, local_cfg)
+
+
 def clear_paired_uid():
     """Wipe pairedUid from memory + research_config.json without touching
     deviceId or researchToken. Used when the relink watcher sees linkedUid
