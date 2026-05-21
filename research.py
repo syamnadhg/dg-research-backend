@@ -2824,6 +2824,67 @@ def _download_user_source_via_storage_rest(storage_path: str, dest_path: "Path")
         return False
     if resp.status_code != 200:
         log(f"[storage REST] source download HTTP {resp.status_code} ({storage_path}): {resp.text[:200]}", "WARN")
+        # 2026-05-21: 403 diagnostic. The Track D synth-user storage read
+        # depends on a deviceId claim resolving to a device authorized for
+        # the path's `userId`. When it fails, dump the actionable state:
+        # (a) synth uid + deviceId claim from the live token, (b) device
+        # doc's ownerUid + sharedWith so the user can see the mismatch.
+        # Without this, the 403 above is opaque — same string regardless
+        # of whether the synth-user claims are stale, the device doc
+        # owner is wrong, or the path's owner just isn't in scope.
+        if resp.status_code == 403:
+            try:
+                import base64 as _b64, json as _j
+                # Decode the ID-token middle segment (no signature verify
+                # — we're just reading claims for diagnostic purposes).
+                _claims = {}
+                try:
+                    _seg = id_token.split(".")[1] + "=="
+                    _claims = _j.loads(_b64.urlsafe_b64decode(_seg).decode("utf-8"))
+                except Exception:
+                    pass
+                _synth_uid = _claims.get("user_id") or _claims.get("sub") or "?"
+                _claim_did = _claims.get("deviceId") or "?"
+                _claim_owner = _claims.get("ownerUid") or "?"
+                # Path's userId is the first segment after "users/".
+                _path_owner = "?"
+                if storage_path.startswith("users/"):
+                    _path_owner = storage_path.split("/", 2)[1]
+                # Look up the device doc — sharedWith / ownerUid current
+                # state. Best-effort: skip if Firestore client not ready.
+                _dev_owner = "?"
+                _dev_shared: list[str] = []
+                try:
+                    if _firebase_db and _claim_did and _claim_did != "?":
+                        _snap = _firebase_db.collection("devices").document(_claim_did).get()
+                        if _snap.exists:
+                            _dd = _snap.to_dict() or {}
+                            _dev_owner = _dd.get("ownerUid") or "?"
+                            _dev_shared = list(_dd.get("sharedWith") or [])
+                except Exception as _de:
+                    _dev_owner = f"(lookup failed: {_de})"
+                log(
+                    f"[storage REST] 403 diagnostic: "
+                    f"synth_uid={_synth_uid[:24]}… "
+                    f"claim_deviceId={_claim_did[:16] if _claim_did else '?'}… "
+                    f"claim_ownerUid={_claim_owner[:16] if _claim_owner else '?'}… "
+                    f"path_owner={_path_owner[:16] if _path_owner else '?'}… "
+                    f"device_doc_owner={_dev_owner[:16] if _dev_owner else '?'}… "
+                    f"device_doc_sharedWith={[s[:16] for s in _dev_shared]}",
+                    "ERROR",
+                )
+                # Specifically call out the mismatch class so the user
+                # knows whether it's a stale-claim issue (re-pair fixes)
+                # vs a sharing issue (owner needs to share with sharer).
+                if _path_owner != "?" and _dev_owner != "?":
+                    if _path_owner == _dev_owner:
+                        log("[storage REST] 403 root: path is for THIS device's owner — claim/token freshness issue. Try Reset Pair Code → re-pair.", "ERROR")
+                    elif _path_owner in _dev_shared:
+                        log("[storage REST] 403 root: path is for a sharer who IS in sharedWith — device-doc state OK, suspect synth-token claim staleness (re-pair to refresh)", "ERROR")
+                    else:
+                        log(f"[storage REST] 403 root: path owner {_path_owner[:24]}… is NOT in device's owner/sharedWith. Owner must share with this user via Manage devices → Add sharer.", "ERROR")
+            except Exception as _diag_err:
+                log(f"[storage REST] 403 diagnostic raised: {_diag_err}", "WARN")
         return False
     try:
         with open(dest_path, "wb") as out:
