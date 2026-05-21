@@ -27564,6 +27564,228 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             )
 
 
+async def _walk_platform_logins(
+    browser,
+    services: "list[tuple[str, str, str]]",
+    cua_client,
+    *,
+    results: "dict[str, bool]",
+    emit_row,
+    push_progress=None,
+    initial_pro_acknowledged: bool = False,
+) -> "tuple[bool, bool]":
+    """Sequentially walk per-platform login during pair Stage 4.
+
+    Extracted from `_continue_pair_stages_2_to_5` so the multi-profile
+    Stage 4 outer loop (2026-05-21) can reuse the exact same flow on
+    additional browser profiles without duplicating ~180 lines. Behavior
+    is byte-identical to the pre-extraction inline loop — same pacing
+    jitter, same URL/CUA gates, same Pro-tier branches.
+
+    SETUP-2026-04-19 design rationale (still applies): one platform at a
+    time, never bulk-open. Two problems with the earlier batch flow:
+    (1) opening many tabs within seconds reads as a robotic burst to
+    Cloudflare scoring, and (2) asking the user to juggle N simultaneous
+    login flows is overwhelming. This walk opens → settles → URL check
+    → CUA verify → closes, one platform at a time.
+
+    `results` is mutated in-place (not returned) so the caller's
+    `push_progress` closure sees fresh state without re-passing the dict
+    on every callback invocation.
+    """
+    cancelled = False
+    pair_pro_acknowledged = initial_pro_acknowledged
+
+    for idx, (name, url, key) in enumerate(services):
+        # 2026-04-30: cookie fast-path REMOVED. Was raising false positives —
+        # cookies persist past server-side session invalidation, so
+        # cookie_login_hit returned "logged in" when the session was actually
+        # dead. Mirrors the same removal init/Phase 0 made on 2026-04-24
+        # (research.py:16894-16902). Always open tab → settle → URL check →
+        # CUA. Slower but it looks at what's actually on screen.
+
+        # Stagger tab opens just like the probe paths — a user clicking
+        # through bookmarks takes a beat between each one.
+        if idx > 0:
+            await asyncio.sleep(random.uniform(2.5, 4.5))
+
+        try:
+            tab = await browser.new_tab(url)
+        except Exception as e:
+            log(f"    Failed to open {name}: {e}", "WARN")
+            results[key] = False
+            emit_row(name, False, f"could not open ({e})")
+            if push_progress:
+                push_progress()
+            continue
+
+        # SPA hydration — matches Phase 0 / probe timing. CUA misreads
+        # the neutral loading shell as a login wall if we peek too early.
+        await asyncio.sleep(4.0)
+
+        print("")
+        print(f"  {_c(_BOLD, name)}  {_c(_DIM, '— log in on the tab that just opened.')}")
+
+        platform_ok = False
+        while True:
+            try:
+                await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Press Enter when done ")
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                log("Setup cancelled by user", "INFO")
+                cancelled = True
+                try:
+                    await tab.close()
+                except Exception:
+                    pass
+                break
+
+            # 2026-04-30: cookie + Playwright DOM shortcuts REMOVED. Both
+            # raised false positives — cookies survive server-side session
+            # invalidation, and strict DOM selectors match cached sidebar
+            # fragments on logged-out landings. Mirror init's gate
+            # (research.py:16934-16947): URL host negative signal first,
+            # then CUA as the single source of truth.
+
+            # Cheap negative signal first: URL on a known login host →
+            # definitely not logged in. Skip the CUA call to save budget.
+            try:
+                current_url = (tab.url or "").lower()
+            except Exception:
+                current_url = ""
+            if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
+                print(f"  {_c(_WARN, 'Not logged in yet — finish the flow and press Enter again.')}")
+                continue
+
+            # Vision verification is the gate. URL already cleared the
+            # cheap "obvious login wall" case; everything else is a CUA
+            # decision. If no CUA client (Anthropic key missing/disabled),
+            # accept on URL pass — that mirrors init's behavior in the
+            # CuaUnavailableError fallback path.
+            if not cua_client:
+                platform_ok = True
+                break
+            try:
+                cua_ok = await verify_login_cua(tab, key, cua_client)
+            except Exception as e:
+                log(f"    CUA verify error for {key}: {e}", "WARN")
+                cua_ok = False
+            if cua_ok:
+                # Pro-tier verify (DGOPS-7357 re-open). Login-OK is no longer
+                # the final gate for ChatGPT/Claude/Gemini — the OAuth-side-
+                # effect cookie can hydrate Gemini as the WORK account when
+                # the user wanted the personal one, and CUA only answers
+                # "logged in?", not "as whom?". Trust the user to fix the
+                # account in-tab; the Pro check at least catches the most
+                # common silent miscompare (work=Free, personal=Pro).
+                #
+                # Control-flow contract (refactored 2026-05-07 to address
+                # PR review C4 — original was correct but reviewers misread
+                # the break-then-fall-through pattern as a skip-bug).
+                # Each branch below now sets platform_ok + break EXPLICITLY,
+                # eliminating the dangling unconditional `platform_ok = True`
+                # at the end of the if cua_ok body that previously read as
+                # "always set True after any cua_ok=True". No behavior change.
+                if (key in _PRO_TIER_PLATFORMS
+                        and not pair_pro_acknowledged):
+                    print(f"  {_c(_DIM, 'Verifying subscription tier…')}")
+                    try:
+                        tier = await _cua_pro_tier_call(tab, key, cua_client)
+                    except CuaUnavailableError as cua_err:
+                        # Pre-pipeline: Phase 0 will re-check with the same
+                        # client and surface its own canonical alert. Don't
+                        # block setup on a transient billing/cap blip.
+                        log(f"    Setup pro_tier: CUA unavailable for {key} ({cua_err}) — skipping tier check", "WARN")
+                        tier = "unsure"
+                    except Exception as e:
+                        log(f"    Setup pro_tier: unexpected error for {key} ({e}) — assuming Pro (fail-open)", "WARN")
+                        tier = "unsure"
+                    if tier == "free":
+                        # 3-option terminal prompt. Free-tier was caught;
+                        # the user picks how to handle it.
+                        title, _details = _PRO_TIER_DETAILS_BY_KEY.get(
+                            key, (f"{name} Pro required", ""))
+                        print("")
+                        print(f"  {_c(_WARN, title)}")
+                        print(f"  {_c(_DIM, 'This account is on Free — Phase 1/2 quality will be degraded.')}")
+                        print(f"  {_c(_DIM, '  [c] continue with Free   [r] retry (sign in with Pro)   [s] skip this platform')}")
+                        choice = ""
+                        while True:
+                            try:
+                                choice = (await asyncio.to_thread(
+                                    input, f"  {_c(_ACCENT, '>')}  Choose [c/r/s] ")
+                                ).strip().lower()
+                            except (EOFError, KeyboardInterrupt):
+                                print("")
+                                log("Setup cancelled by user during Pro alert", "INFO")
+                                cancelled = True
+                                try:
+                                    await tab.close()
+                                except Exception:
+                                    pass
+                                break
+                            if choice in ("c", "continue", ""):
+                                pair_pro_acknowledged = True
+                                log(f"    Setup: user chose Continue with Free for {name}", "INFO")
+                                platform_ok = True
+                                break
+                            if choice in ("r", "retry"):
+                                log(f"    Setup: user chose Retry on {name} Free-tier alert — re-running login walk", "INFO")
+                                # Stay on this platform: same tab, user signs
+                                # out / signs back in with Pro, presses Enter
+                                # again. Fall through to the outer press-Enter
+                                # loop below via `continue`.
+                                platform_ok = False
+                                break
+                            if choice in ("s", "skip"):
+                                log(f"    Setup: user chose Skip for {name} (Free-tier)", "INFO")
+                                platform_ok = False
+                                break
+                            print(f"  {_c(_WARN, 'Pick c, r, or s.')}")
+                        if cancelled:
+                            break
+                        if choice in ("r", "retry"):
+                            # Don't break the press-Enter loop — `continue`
+                            # so the user gets the Press Enter prompt again
+                            # on the same tab after switching accounts.
+                            continue
+                        # c or s: leave the press-Enter loop with platform_ok
+                        # already set (True for c, False for s).
+                        break
+                    elif tier == "pro":
+                        log(f"    Setup: {name} Pro detected", "INFO")
+                        platform_ok = True
+                        break
+                    else:  # unsure → fail open
+                        log(f"    Setup: {name} tier UNSURE — assuming Pro (fail-open)", "INFO")
+                        platform_ok = True
+                        break
+                else:
+                    # Either pair_pro_acknowledged is True (user already
+                    # chose Continue-with-Free on a prior platform), or
+                    # this platform isn't in _PRO_TIER_PLATFORMS (e.g.,
+                    # NotebookLM, where the pro-tier prompt doesn't apply).
+                    # CUA confirmed login — that's enough.
+                    platform_ok = True
+                    break
+            print(f"  {_c(_WARN, 'CUA could not confirm login — try again and press Enter.')}")
+
+        if cancelled:
+            break
+
+        try:
+            await tab.close()
+        except Exception:
+            pass
+
+        results[key] = platform_ok
+        emit_row(name, platform_ok)
+        if push_progress:
+            push_progress()
+
+    return cancelled, pair_pro_acknowledged
+
+
 async def _continue_pair_stages_2_to_5(
     profile_dir: str,
     *,
@@ -27765,14 +27987,8 @@ async def _continue_pair_stages_2_to_5(
         # via OAuth refresh token), BE no longer uploads. Gmail + Google
         # Docs dropped 2026-04-30 — P5 is FE-owned.
     ]
-    # ── Sequential per-platform login (open → Enter → URL+CUA verify → Pro-tier gate) ──
-    # SETUP-2026-04-19: replaces the earlier bulk-open-then-batch-verify
-    # flow. Two problems with the old approach: (1) opening 7 tabs within
-    # a few seconds reads as a robotic burst to Cloudflare scoring, and
-    # (2) asking the user to juggle 7 simultaneous login flows is
-    # overwhelming. New flow walks the list in order — one platform at a
-    # time, cookie-check first, tab-open only on miss, close after verify
-    # so the browser shows just the current target.
+    # Per-platform login walk runs in _walk_platform_logins (above) —
+    # design rationale + sequencing notes live in that helper's docstring.
     pad = max(len(n) for n, _u, _k in services)
     results: dict[str, bool] = {}
     cancelled = False
@@ -27812,190 +28028,15 @@ async def _continue_pair_stages_2_to_5(
         except Exception:
             pass
 
-    for idx, (name, url, key) in enumerate(services):
-        # 2026-04-30: cookie fast-path REMOVED. Was raising false positives —
-        # cookies persist past server-side session invalidation, so
-        # cookie_login_hit returned "logged in" when the session was actually
-        # dead. Mirrors the same removal init/Phase 0 made on 2026-04-24
-        # (research.py:16894-16902). Always open tab → settle → URL check →
-        # CUA. Slower but it looks at what's actually on screen.
-
-        # Stagger tab opens just like the probe paths — a user clicking
-        # through bookmarks takes a beat between each one.
-        if idx > 0:
-            await asyncio.sleep(random.uniform(2.5, 4.5))
-
-        try:
-            tab = await browser.new_tab(url)
-        except Exception as e:
-            log(f"    Failed to open {name}: {e}", "WARN")
-            results[key] = False
-            _emit_row(name, False, f"could not open ({e})")
-            _push_firestore_progress()
-            continue
-
-        # SPA hydration — matches Phase 0 / probe timing. CUA misreads
-        # the neutral loading shell as a login wall if we peek too early.
-        await asyncio.sleep(4.0)
-
-        print("")
-        print(f"  {_c(_BOLD, name)}  {_c(_DIM, '— log in on the tab that just opened.')}")
-
-        platform_ok = False
-        while True:
-            try:
-                await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Press Enter when done ")
-            except (EOFError, KeyboardInterrupt):
-                print("")
-                log("Setup cancelled by user", "INFO")
-                cancelled = True
-                try:
-                    await tab.close()
-                except Exception:
-                    pass
-                break
-
-            # 2026-04-30: cookie + Playwright DOM shortcuts REMOVED. Both
-            # raised false positives — cookies survive server-side session
-            # invalidation, and strict DOM selectors match cached sidebar
-            # fragments on logged-out landings. Mirror init's gate
-            # (research.py:16934-16947): URL host negative signal first,
-            # then CUA as the single source of truth.
-
-            # Cheap negative signal first: URL on a known login host →
-            # definitely not logged in. Skip the CUA call to save budget.
-            try:
-                current_url = (tab.url or "").lower()
-            except Exception:
-                current_url = ""
-            if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
-                print(f"  {_c(_WARN, 'Not logged in yet — finish the flow and press Enter again.')}")
-                continue
-
-            # Vision verification is the gate. URL already cleared the
-            # cheap "obvious login wall" case; everything else is a CUA
-            # decision. If no CUA client (Anthropic key missing/disabled),
-            # accept on URL pass — that mirrors init's behavior in the
-            # CuaUnavailableError fallback path.
-            if not _setup_cua_client:
-                platform_ok = True
-                break
-            try:
-                cua_ok = await verify_login_cua(tab, key, _setup_cua_client)
-            except Exception as e:
-                log(f"    CUA verify error for {key}: {e}", "WARN")
-                cua_ok = False
-            if cua_ok:
-                # Pro-tier verify (DGOPS-7357 re-open). Login-OK is no longer
-                # the final gate for ChatGPT/Claude/Gemini — the OAuth-side-
-                # effect cookie can hydrate Gemini as the WORK account when
-                # the user wanted the personal one, and CUA only answers
-                # "logged in?", not "as whom?". Trust the user to fix the
-                # account in-tab; the Pro check at least catches the most
-                # common silent miscompare (work=Free, personal=Pro).
-                #
-                # Control-flow contract (refactored 2026-05-07 to address
-                # PR review C4 — original was correct but reviewers misread
-                # the break-then-fall-through pattern as a skip-bug).
-                # Each branch below now sets platform_ok + break EXPLICITLY,
-                # eliminating the dangling unconditional `platform_ok = True`
-                # at the end of the if cua_ok body that previously read as
-                # "always set True after any cua_ok=True". No behavior change.
-                if (key in _PRO_TIER_PLATFORMS
-                        and not pair_pro_acknowledged):
-                    print(f"  {_c(_DIM, 'Verifying subscription tier…')}")
-                    try:
-                        tier = await _cua_pro_tier_call(tab, key, _setup_cua_client)
-                    except CuaUnavailableError as cua_err:
-                        # Pre-pipeline: Phase 0 will re-check with the same
-                        # client and surface its own canonical alert. Don't
-                        # block setup on a transient billing/cap blip.
-                        log(f"    Setup pro_tier: CUA unavailable for {key} ({cua_err}) — skipping tier check", "WARN")
-                        tier = "unsure"
-                    except Exception as e:
-                        log(f"    Setup pro_tier: unexpected error for {key} ({e}) — assuming Pro (fail-open)", "WARN")
-                        tier = "unsure"
-                    if tier == "free":
-                        # 3-option terminal prompt. Free-tier was caught;
-                        # the user picks how to handle it.
-                        title, _details = _PRO_TIER_DETAILS_BY_KEY.get(
-                            key, (f"{name} Pro required", ""))
-                        print("")
-                        print(f"  {_c(_WARN, title)}")
-                        print(f"  {_c(_DIM, 'This account is on Free — Phase 1/2 quality will be degraded.')}")
-                        print(f"  {_c(_DIM, '  [c] continue with Free   [r] retry (sign in with Pro)   [s] skip this platform')}")
-                        choice = ""
-                        while True:
-                            try:
-                                choice = (await asyncio.to_thread(
-                                    input, f"  {_c(_ACCENT, '>')}  Choose [c/r/s] ")
-                                ).strip().lower()
-                            except (EOFError, KeyboardInterrupt):
-                                print("")
-                                log("Setup cancelled by user during Pro alert", "INFO")
-                                cancelled = True
-                                try:
-                                    await tab.close()
-                                except Exception:
-                                    pass
-                                break
-                            if choice in ("c", "continue", ""):
-                                pair_pro_acknowledged = True
-                                log(f"    Setup: user chose Continue with Free for {name}", "INFO")
-                                platform_ok = True
-                                break
-                            if choice in ("r", "retry"):
-                                log(f"    Setup: user chose Retry on {name} Free-tier alert — re-running login walk", "INFO")
-                                # Stay on this platform: same tab, user signs
-                                # out / signs back in with Pro, presses Enter
-                                # again. Fall through to the outer press-Enter
-                                # loop below via `continue`.
-                                platform_ok = False
-                                break
-                            if choice in ("s", "skip"):
-                                log(f"    Setup: user chose Skip for {name} (Free-tier)", "INFO")
-                                platform_ok = False
-                                break
-                            print(f"  {_c(_WARN, 'Pick c, r, or s.')}")
-                        if cancelled:
-                            break
-                        if choice in ("r", "retry"):
-                            # Don't break the press-Enter loop — `continue`
-                            # so the user gets the Press Enter prompt again
-                            # on the same tab after switching accounts.
-                            continue
-                        # c or s: leave the press-Enter loop with platform_ok
-                        # already set (True for c, False for s).
-                        break
-                    elif tier == "pro":
-                        log(f"    Setup: {name} Pro detected", "INFO")
-                        platform_ok = True
-                        break
-                    else:  # unsure → fail open
-                        log(f"    Setup: {name} tier UNSURE — assuming Pro (fail-open)", "INFO")
-                        platform_ok = True
-                        break
-                else:
-                    # Either pair_pro_acknowledged is True (user already
-                    # chose Continue-with-Free on a prior platform), or
-                    # this platform isn't in _PRO_TIER_PLATFORMS (e.g.,
-                    # NotebookLM, where the pro-tier prompt doesn't apply).
-                    # CUA confirmed login — that's enough.
-                    platform_ok = True
-                    break
-            print(f"  {_c(_WARN, 'CUA could not confirm login — try again and press Enter.')}")
-
-        if cancelled:
-            break
-
-        try:
-            await tab.close()
-        except Exception:
-            pass
-
-        results[key] = platform_ok
-        _emit_row(name, platform_ok)
-        _push_firestore_progress()
+    cancelled, pair_pro_acknowledged = await _walk_platform_logins(
+        browser,
+        services,
+        _setup_cua_client,
+        results=results,
+        emit_row=_emit_row,
+        push_progress=_push_firestore_progress,
+        initial_pro_acknowledged=pair_pro_acknowledged,
+    )
 
     if not cancelled:
         all_ok = all(results.get(k, False) for _n, _u, k in services)
