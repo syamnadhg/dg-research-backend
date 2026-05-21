@@ -1115,6 +1115,65 @@ def _fetch_device_meta() -> dict:
     return {}
 
 
+def _fetch_device_meta_rest() -> dict:
+    """REST-based variant of `_fetch_device_meta` for subcommands that
+    deliberately skip `init_firebase()` to stay fast (--retire,
+    --resurrect, --unpair). Uses the keystore-cached id token + Firestore
+    REST GET — no gRPC client init.
+
+    The synth user's read rule allows `auth.uid == syntheticDeviceUid`
+    on its own device doc, so this works without owner credentials.
+    Returns {} on any failure (missing token, network, decode).
+    """
+    device_id = load_device_id()
+    if not device_id:
+        return {}
+    id_token = _fresh_user_mode_id_token()
+    if not id_token:
+        return {}
+    try:
+        from auth.v2_flow import PROJECT_ID as _PID
+        import requests as _requests
+    except ImportError:
+        return {}
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{_PID}"
+        f"/databases/(default)/documents/devices/{device_id}"
+    )
+    try:
+        resp = _requests.get(
+            url,
+            headers={"Authorization": f"Bearer {id_token}"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return {}
+        body = resp.json() or {}
+        fields = body.get("fields") or {}
+    except Exception:
+        return {}
+    # Unwrap Firestore REST primitive shape → plain Python dict.
+    out: dict = {}
+    for k, v in fields.items():
+        if not isinstance(v, dict):
+            continue
+        if "stringValue" in v:
+            out[k] = v["stringValue"]
+        elif "booleanValue" in v:
+            out[k] = bool(v["booleanValue"])
+        elif "integerValue" in v:
+            try:
+                out[k] = int(v["integerValue"])
+            except Exception:
+                pass
+        elif "arrayValue" in v:
+            arr = (v["arrayValue"] or {}).get("values") or []
+            out[k] = [
+                _x.get("stringValue") for _x in arr if isinstance(_x, dict)
+            ]
+    return out
+
+
 def _render_next_actions(items: list[tuple[str, str]]):
     """Print a compact 'Next' block at the tail of every subcommand: 2-3
     likely follow-up commands with one-liner purposes. items = [(command,
@@ -24837,14 +24896,21 @@ async def run_server(port=8000):
                     or "Missing or insufficient permissions" in _e_str
                 ):
                     # Track D: synth user denied on prior run's research
-                    # doc. Without a structural rule fix, we can't poll
-                    # the prior run's terminal status — fall through to
-                    # the deadline timeout, which force-dequeues at
-                    # BE_PHASES_TIMEOUT_SEC. Logged DEBUG to avoid WARN
-                    # spam every 2s.
-                    log("[queue-gate] read denied (synth user) — falling back to deadline timeout", "DEBUG")
-                else:
-                    log(f"[queue-gate] Firestore read failed: {e}", "WARN")
+                    # doc. We can't poll its terminal status — but we
+                    # also can't sit in a 2-second poll loop spamming
+                    # 403s and wedging the queue for BE_PHASES_TIMEOUT_SEC
+                    # (4200s by default). The on-disk gate-state and
+                    # _safe_enqueue's whitelist already de-dupe restart
+                    # races, so release the gate immediately and let
+                    # the worker proceed. Under-Track-D this is the
+                    # right behavior: every research is owned by some
+                    # device, the BE only sees its own device-queue
+                    # entries, and two queued runs on the same device
+                    # arrive in order via the start listener.
+                    log("[queue-gate] read denied (synth user) — releasing gate (Track D)", "DEBUG")
+                    _QUEUE_STATE.pop("gate_pending_job", None)
+                    return
+                log(f"[queue-gate] Firestore read failed: {e}", "WARN")
             await asyncio.sleep(2)
 
     async def _job_worker():
@@ -28400,11 +28466,31 @@ def run_resurrect():
         # flag goes through _pair_patch_device (REST), no gRPC dep.
         paired_uid = load_paired_uid()
         device_id = load_device_id()
-        paired_email = ""  # cosmetic — banner falls back to uid[:8]
+        # Pull friendly name + owner email from the device doc via REST so
+        # the banner shows "VivobookPro" / "Rocky (alice@example.com)"
+        # instead of the raw deviceId UUID / uid[:8] prefix. Best-effort —
+        # drops back to the raw values on any failure.
+        _meta_b = _fetch_device_meta_rest()
+        device_name = (
+            (_meta_b.get("name") if isinstance(_meta_b.get("name"), str) else "")
+            or (_meta_b.get("hostname") if isinstance(_meta_b.get("hostname"), str) else "")
+            or device_id
+            or "(not paired)"
+        )
+        owner_display = _meta_b.get("ownerDisplayName") if isinstance(_meta_b.get("ownerDisplayName"), str) else ""
+        owner_email = _meta_b.get("ownerEmail") if isinstance(_meta_b.get("ownerEmail"), str) else ""
+        if owner_display and owner_email:
+            paired_email = f"{owner_display}  ({owner_email})"
+        elif owner_email:
+            paired_email = owner_email
+        elif paired_uid:
+            paired_email = paired_uid[:8] + "…"
+        else:
+            paired_email = "(not paired)"
         currently_supervised = _detect_supervised()
         _ctx_rows = [
-            ("Device",    _c(_BOLD, device_id or "(not paired)")),
-            ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+            ("Device",    _c(_BOLD, device_name)),
+            ("Paired to", _c(_BOLD, paired_email)),
             ("On Startup", _aegis_rune(currently_supervised, transition_to="on")),
         ]
         _bat = _battery_state()
@@ -28523,11 +28609,31 @@ def run_resurrect():
     # gRPC channel construction shaves ~30-60s off resurrect on Windows.
     paired_uid = load_paired_uid()
     device_id = load_device_id()
-    paired_email = ""  # cosmetic only — banner falls back to uid[:8]
+    # Pull friendly name + owner email from the device doc via REST so the
+    # banner shows "VivobookPro" / "Rocky (alice@example.com)" instead of
+    # the raw deviceId UUID / uid[:8] prefix. Best-effort — drops back to
+    # the raw values on any failure.
+    _meta_b = _fetch_device_meta_rest()
+    device_name = (
+        (_meta_b.get("name") if isinstance(_meta_b.get("name"), str) else "")
+        or (_meta_b.get("hostname") if isinstance(_meta_b.get("hostname"), str) else "")
+        or device_id
+        or "(not paired)"
+    )
+    owner_display = _meta_b.get("ownerDisplayName") if isinstance(_meta_b.get("ownerDisplayName"), str) else ""
+    owner_email = _meta_b.get("ownerEmail") if isinstance(_meta_b.get("ownerEmail"), str) else ""
+    if owner_display and owner_email:
+        paired_email = f"{owner_display}  ({owner_email})"
+    elif owner_email:
+        paired_email = owner_email
+    elif paired_uid:
+        paired_email = paired_uid[:8] + "…"
+    else:
+        paired_email = "(not paired)"
     currently_supervised = _detect_supervised()
     _ctx_rows = [
-        ("Device",    _c(_BOLD, device_id or "(not paired)")),
-        ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+        ("Device",    _c(_BOLD, device_name)),
+        ("Paired to", _c(_BOLD, paired_email)),
         ("On Startup", _aegis_rune(currently_supervised, transition_to="on")),
     ]
     _bat = _battery_state()
@@ -28678,12 +28784,20 @@ def run_resurrect():
                         break
             if spawned_pid is not None:
                 print(f"  {_c(_OK, '✓')}  Backend started (PID {spawned_pid}, running in background)")
-                # Health probe — confirm the API is actually responding before
-                # declaring success. Catches the case where daemon-loop is
-                # alive but --serve crashed on bind (e.g., port 8000 squatter)
-                # and is restart-looping.
-                _time.sleep(2)  # let uvicorn finish startup
-                _api_ok, _api_detail = _local_api_health()
+                # Health probe — confirm the API is actually responding
+                # before declaring success. Daemon-loop has to (1) start
+                # --serve, (2) Firestore client init (~3-5s on Windows
+                # cold), (3) uvicorn bind. Retry up to ~12s with a
+                # spinner so the user doesn't see a false-alarm WARN
+                # for the common "uvicorn just hasn't bound yet" case.
+                _api_ok = False
+                _api_detail = ""
+                with _SyncSpinnerCtx("Waiting for API"):
+                    for _hb_attempt in range(8):  # 8 × 1.5s = 12s
+                        _time.sleep(1.5)
+                        _api_ok, _api_detail = _local_api_health()
+                        if _api_ok:
+                            break
                 if _api_ok:
                     print(f"  {_c(_OK, '✓')}  API responding ({_api_detail})")
                 else:
@@ -28743,12 +28857,32 @@ def run_retire():
         # flag goes via _write_supervised_flag → _pair_patch_device REST.
         paired_uid = load_paired_uid()
         device_id = load_device_id()
-        paired_email = ""  # cosmetic — banner falls back to uid[:8]
+        # Pull friendly name + owner email from the device doc via REST so
+        # the banner shows "VivobookPro" / "Rocky (alice@example.com)"
+        # instead of the raw deviceId UUID / uid[:8] prefix. Best-effort —
+        # drops back to the raw values on any failure.
+        _meta_b = _fetch_device_meta_rest()
+        device_name = (
+            (_meta_b.get("name") if isinstance(_meta_b.get("name"), str) else "")
+            or (_meta_b.get("hostname") if isinstance(_meta_b.get("hostname"), str) else "")
+            or device_id
+            or "(not paired)"
+        )
+        owner_display = _meta_b.get("ownerDisplayName") if isinstance(_meta_b.get("ownerDisplayName"), str) else ""
+        owner_email = _meta_b.get("ownerEmail") if isinstance(_meta_b.get("ownerEmail"), str) else ""
+        if owner_display and owner_email:
+            paired_email = f"{owner_display}  ({owner_email})"
+        elif owner_email:
+            paired_email = owner_email
+        elif paired_uid:
+            paired_email = paired_uid[:8] + "…"
+        else:
+            paired_email = "(not paired)"
         currently_supervised = _detect_supervised()
 
         _ctx_rows = [
-            ("Device",     _c(_BOLD, device_id or "(not paired)")),
-            ("Paired to",  _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+            ("Device",     _c(_BOLD, device_name)),
+            ("Paired to",  _c(_BOLD, paired_email)),
             ("On Startup", _aegis_rune(currently_supervised, transition_to="nothing-to-undo")),
         ]
         _bat = _battery_state()
@@ -28822,11 +28956,31 @@ def run_retire():
     # _pair_patch_device REST.
     paired_uid = load_paired_uid()
     device_id = load_device_id()
-    paired_email = ""  # cosmetic — banner falls back to uid[:8]
+    # Pull friendly name + owner email from the device doc via REST so the
+    # banner shows "VivobookPro" / "Rocky (alice@example.com)" instead of
+    # the raw deviceId UUID / uid[:8] prefix. Best-effort — drops back to
+    # the raw values on any failure.
+    _meta_b = _fetch_device_meta_rest()
+    device_name = (
+        (_meta_b.get("name") if isinstance(_meta_b.get("name"), str) else "")
+        or (_meta_b.get("hostname") if isinstance(_meta_b.get("hostname"), str) else "")
+        or device_id
+        or "(not paired)"
+    )
+    owner_display = _meta_b.get("ownerDisplayName") if isinstance(_meta_b.get("ownerDisplayName"), str) else ""
+    owner_email = _meta_b.get("ownerEmail") if isinstance(_meta_b.get("ownerEmail"), str) else ""
+    if owner_display and owner_email:
+        paired_email = f"{owner_display}  ({owner_email})"
+    elif owner_email:
+        paired_email = owner_email
+    elif paired_uid:
+        paired_email = paired_uid[:8] + "…"
+    else:
+        paired_email = "(not paired)"
     currently_supervised = _detect_supervised()
     _ctx_rows_r = [
-        ("Device",     _c(_BOLD, device_id or "(not paired)")),
-        ("Paired to",  _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+        ("Device",     _c(_BOLD, device_name)),
+        ("Paired to",  _c(_BOLD, paired_email)),
         ("On Startup", _aegis_rune(currently_supervised, transition_to="nothing-to-undo")),
     ]
     _bat_r = _battery_state()
@@ -29055,7 +29209,7 @@ def run_unpair(deep: bool = False):
     # Context strip — what's about to vanish.
     _render_context_strip([
         ("Device",    _c(_BOLD, device_id or "(unknown)")),
-        ("Paired to", _c(_BOLD, paired_email or (paired_uid[:8] + "…") if paired_uid else "(not paired)")),
+        ("Paired to", _c(_BOLD, paired_email)),
     ])
 
     total = 5
