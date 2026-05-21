@@ -18259,64 +18259,148 @@ async def setup_chatgpt_dr(page) -> bool:
 
 
 async def setup_gemini_dr(page) -> bool:
-    """Enable Gemini Deep Research via the Tools menu. Returns True on success.
+    """Enable Gemini Deep Research. Returns True only when DR is verified
+    ACTIVE (pill visible + pressed/selected). Returns False otherwise so
+    the caller's CUA fallback kicks in instead of letting the run proceed
+    silently in chat mode.
 
-    Gemini routes Deep Research through Tools → Deep Research (user
-    confirmed 2026-04-28). The previous direct-pill / model-dropdown
-    paths never matched the actual UI — they only worked during brief
-    A/B windows where Google exposed DR as a composer pill. Today the
-    Tools menu is the only reliable path, so we try it first and keep
-    the legacy paths only as last-resort fallbacks.
+    UI history:
+      • 2026-05: + (attach) → "More tools" → "Deep Research" (current).
+      • 2026-04: "Tools" → "Deep Research".
+      • Older: direct DR pill in composer / DR in model dropdown.
+
+    Tries the current path first, falls through each legacy path on miss,
+    then strictly verifies the resulting pill state. Pre-fix, a missing
+    active-state attribute downgraded to a WARN-and-return-True — that
+    silently shipped chat-mode briefs as Deep Research output. Strict
+    verification is the cost of avoiding that class of bug.
     """
     try:
         await asyncio.sleep(2)
-
-        # ── Step 1: open the Tools menu and click "Deep Research" ─────
-        # The Tools button lives next to the composer's attach (+) control
-        # and is exposed via text "Tools" or an aria-label containing
-        # "tools" / a title="Tools" tooltip.
         direct_clicked = False
-        tools_opened = await page.evaluate("""() => {
-            const candidates = document.querySelectorAll('button, [role="button"]');
-            for (const b of candidates) {
-                if (!b.offsetParent) continue;
-                const t = (b.textContent || '').trim().toLowerCase();
+
+        # ── Step 1 (current UI 2026-05): + → More tools → Deep Research ──
+        # The + button sits in the composer toolbar (left of the textarea).
+        # Gemini exposes it via aria-label "Add", "Add files", "Attach",
+        # "Attachments", "More", "More options"; sometimes a literal "+"
+        # text node; sometimes only via a Material icon span with name="add".
+        # Restrict by viewport position (bottom half) to avoid the top-bar
+        # "+" found in some account-switcher panels.
+        plus_opened = await page.evaluate("""() => {
+            const inComposer = (b) => {
+                const r = b.getBoundingClientRect();
+                return r.top > window.innerHeight * 0.4 && r.width > 0;
+            };
+            const matchesPlus = (b) => {
+                if (!b.offsetParent) return false;
+                const text = (b.textContent || '').trim();
                 const a = (b.getAttribute('aria-label') || '').toLowerCase();
                 const tt = (b.getAttribute('title') || '').toLowerCase();
-                if (t === 'tools' || a === 'tools' ||
-                    a.includes('tools') || tt.includes('tools') ||
-                    t.startsWith('tools')) {
-                    b.click();
-                    return true;
+                return (a === 'add' || a === 'add files' || a.includes('add files') ||
+                        a === 'attach' || a === 'attachments' ||
+                        a === 'more options' || a === 'more' ||
+                        tt === 'add' || tt === 'more' || tt.includes('attach') ||
+                        text === '+');
+            };
+            for (const b of document.querySelectorAll('button, [role="button"]')) {
+                if (matchesPlus(b) && inComposer(b)) { b.click(); return true; }
+            }
+            // Last resort — find Material "add" icon inside a button.
+            for (const ic of document.querySelectorAll(
+                    'mat-icon, .material-symbols-outlined, .material-icons')) {
+                const name = (ic.textContent || '').trim().toLowerCase();
+                if (name !== 'add' && name !== 'add_circle') continue;
+                const btn = ic.closest('button, [role="button"]');
+                if (btn && btn.offsetParent && inComposer(btn)) {
+                    btn.click(); return true;
                 }
             }
             return false;
         }""")
-        if tools_opened:
+        if plus_opened:
             await asyncio.sleep(0.8)
-            log("[setup_gemini_dr] Step 1 OK: opened Tools menu")
-            direct_clicked = await page.evaluate("""() => {
-                const items = document.querySelectorAll('[role="menuitem"], [role="option"], button, a, li');
+            log("[setup_gemini_dr] Step 1 (current UI): opened + menu")
+            more_tools_opened = await page.evaluate("""() => {
+                const items = document.querySelectorAll(
+                    '[role="menuitem"], [role="option"], button, a, li');
                 for (const el of items) {
                     if (!el.offsetParent) continue;
                     const t = (el.textContent || '').trim().toLowerCase();
                     const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                    if (t === 'deep research' || a === 'deep research' ||
-                        t.startsWith('deep research') || a.startsWith('deep research')) {
+                    if (t === 'more tools' || t.startsWith('more tools') ||
+                        a === 'more tools' || a.startsWith('more tools')) {
                         el.click();
                         return true;
                     }
                 }
                 return false;
             }""")
-            if direct_clicked:
-                log("[setup_gemini_dr] Step 1 OK: clicked Deep Research inside Tools menu")
+            if more_tools_opened:
+                await asyncio.sleep(0.8)
+                log("[setup_gemini_dr] Step 1 (current UI): opened More tools submenu")
+                direct_clicked = await page.evaluate("""() => {
+                    const items = document.querySelectorAll(
+                        '[role="menuitem"], [role="option"], button, a, li');
+                    for (const el of items) {
+                        if (!el.offsetParent) continue;
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                        if (t === 'deep research' || a === 'deep research' ||
+                            t.startsWith('deep research') || a.startsWith('deep research')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if direct_clicked:
+                    log("[setup_gemini_dr] Step 1 OK (current UI): + → More tools → Deep Research")
+                else:
+                    log("[setup_gemini_dr] Step 1 (current UI): More tools submenu missing Deep Research — falling back", "WARN")
             else:
-                log("[setup_gemini_dr] Step 1: Tools menu opened but Deep Research item missing — falling back", "WARN")
+                log("[setup_gemini_dr] Step 1 (current UI): + menu opened but no More tools item — falling back", "INFO")
         else:
-            log("[setup_gemini_dr] Step 1: Tools button not visible — trying legacy paths", "INFO")
+            log("[setup_gemini_dr] Step 1 (current UI): + button not in composer — trying legacy paths", "INFO")
 
-        # ── Step 2 (legacy fallback): direct DR pill in the composer ──
+        # ── Step 2 (legacy 2026-04): Tools button → Deep Research ────
+        if not direct_clicked:
+            tools_opened = await page.evaluate("""() => {
+                const candidates = document.querySelectorAll('button, [role="button"]');
+                for (const b of candidates) {
+                    if (!b.offsetParent) continue;
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const tt = (b.getAttribute('title') || '').toLowerCase();
+                    if (t === 'tools' || a === 'tools' ||
+                        a.includes('tools') || tt.includes('tools') ||
+                        t.startsWith('tools')) {
+                        b.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if tools_opened:
+                await asyncio.sleep(0.8)
+                log("[setup_gemini_dr] Step 2 (legacy): opened Tools menu")
+                direct_clicked = await page.evaluate("""() => {
+                    const items = document.querySelectorAll('[role="menuitem"], [role="option"], button, a, li');
+                    for (const el of items) {
+                        if (!el.offsetParent) continue;
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                        if (t === 'deep research' || a === 'deep research' ||
+                            t.startsWith('deep research') || a.startsWith('deep research')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if direct_clicked:
+                    log("[setup_gemini_dr] Step 2 OK (legacy): Tools → Deep Research")
+
+        # ── Step 3 (legacy): direct DR pill in the composer ────────────
         if not direct_clicked:
             direct_clicked = await page.evaluate("""() => {
                 const candidates = document.querySelectorAll('button, [role="button"], [role="menuitem"]');
@@ -18332,9 +18416,9 @@ async def setup_gemini_dr(page) -> bool:
                 return false;
             }""")
             if direct_clicked:
-                log("[setup_gemini_dr] Step 2 OK (legacy): clicked DR pill directly in composer")
+                log("[setup_gemini_dr] Step 3 OK (legacy): clicked DR pill directly in composer")
 
-        # ── Step 3 (legacy fallback): DR inside the model dropdown ────
+        # ── Step 4 (legacy): DR inside the model dropdown ──────────────
         if not direct_clicked:
             for sel in ['button[aria-label*="model"]', 'button[data-test-id*="model"]']:
                 try:
@@ -18342,7 +18426,7 @@ async def setup_gemini_dr(page) -> bool:
                     if btn:
                         await btn.click()
                         await asyncio.sleep(0.8)
-                        log(f"[setup_gemini_dr] Step 3 (legacy): opened {sel}")
+                        log(f"[setup_gemini_dr] Step 4 (legacy): opened {sel}")
                         direct_clicked = await page.evaluate("""() => {
                             const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
                             for (const el of items) {
@@ -18352,44 +18436,53 @@ async def setup_gemini_dr(page) -> bool:
                             return false;
                         }""")
                         if direct_clicked:
-                            log(f"[setup_gemini_dr] Step 3 OK (legacy): DR selected via {sel} dropdown")
+                            log(f"[setup_gemini_dr] Step 4 OK (legacy): DR selected via {sel} dropdown")
                             break
                         else:
-                            log(f"[setup_gemini_dr] Step 3 {sel}: dropdown opened but DR option absent", "WARN")
+                            log(f"[setup_gemini_dr] Step 4 {sel}: dropdown opened but DR option absent", "WARN")
                 except Exception as e:
-                    log(f"[setup_gemini_dr] Step 3 {sel} errored: {e}", "WARN")
+                    log(f"[setup_gemini_dr] Step 4 {sel} errored: {e}", "WARN")
                     continue
 
         if not direct_clicked:
-            log("[setup_gemini_dr] FAIL: Tools menu, direct pill, and model-dropdown fallback all missed DR — selectors likely rotated", "WARN")
+            log("[setup_gemini_dr] FAIL: + menu, Tools menu, direct pill, and model-dropdown fallbacks all missed DR — selectors rotated", "WARN")
             return False
 
         await asyncio.sleep(1.5)
 
-        # Step 3: verify the pill is visible AND reads as active (not just
-        # a hover tooltip or inactive label). Gemini exposes the active
-        # state via aria-pressed / aria-selected on its chip buttons.
+        # ── Verification: STRICT. DR must be visibly active before we
+        # return True. If the pill is visible but no active-state signal
+        # fires, we return False so the caller's CUA fallback can re-try
+        # — this is the fix for the 2026-05-21 silent-chat-mode regression
+        # (UI changed; Step 2 happened to click the wrong control, pill
+        # appeared without being pressed, function returned True anyway,
+        # pipeline shipped a chat-mode brief as DR output).
         active = await page.evaluate("""() => {
             const pills = document.querySelectorAll('button, [role="button"]');
             for (const p of pills) {
                 if (!p.offsetParent) continue;
                 const t = (p.textContent || '').trim().toLowerCase();
                 if (t !== 'deep research') continue;
+                const cls = (p.className || '').toLowerCase();
+                // Material chips mark active via mat-mdc-chip-selected / .mdc-evolution-chip--selected,
+                // generic ARIA via aria-pressed / aria-selected, sometimes a data-active attr.
                 const pressed = p.getAttribute('aria-pressed') === 'true' ||
                                  p.getAttribute('aria-selected') === 'true' ||
-                                 (p.className || '').toLowerCase().includes('active') ||
-                                 (p.className || '').toLowerCase().includes('selected');
-                return { ok: true, pressed, text: p.textContent.trim().slice(0, 40) };
+                                 p.getAttribute('data-active') === 'true' ||
+                                 cls.includes('active') ||
+                                 cls.includes('selected') ||
+                                 cls.includes('--filled');
+                return { ok: true, pressed, text: p.textContent.trim().slice(0, 40), cls: cls.slice(0, 80) };
             }
             return { ok: false };
         }""")
         if not active or not active.get("ok"):
-            log("[setup_gemini_dr] Step 3 FAIL: DR pill not visible after click — UI may not have reflected the selection", "WARN")
+            log("[setup_gemini_dr] Verify FAIL: DR pill not visible after click — UI did not reflect the selection", "WARN")
             return False
         if not active.get("pressed"):
-            log(f"[setup_gemini_dr] Step 3 WARN: DR pill visible but no active-state attribute ({active.get('text')}) — proceeding but may be in off state")
-        else:
-            log(f"[setup_gemini_dr] Step 3 OK: DR pill active → {active.get('text')}")
+            log(f"[setup_gemini_dr] Verify FAIL: DR pill visible but NOT marked active (text={active.get('text')!r} cls={active.get('cls')!r}) — returning False so CUA fallback retries", "WARN")
+            return False
+        log(f"[setup_gemini_dr] Verify OK: DR pill active → {active.get('text')}")
         return True
     except Exception as e:
         log(f"[setup_gemini_dr] exception: {e}", "WARN")
@@ -22829,6 +22922,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                    durationSec=int(time.time() - _p0_start),
                    summary=_p0_summary)
 
+        # Pre-emit phase_start(1) BEFORE the verify gate runs so the FE
+        # renders the P1 chip immediately instead of a blank gap during
+        # the gate's 4s SPA hydration + verify_login_cua + Pro tier check
+        # (skip_init_verify=true path). If the gate / dispatch below skips
+        # P1, phase_skipped follows and the FE flips the chip running →
+        # skipped — same lifecycle as a mid-phase skip click.
+        _p1_start_emitted = False
+        if (start_phase <= 1 and 1 not in skip_phases
+                and 1 not in _controls.skipped_phases
+                and not _controls.is_stop()):
+            emit_event("phase_start", phase=1,
+                       description="Generating research brief with ChatGPT Pro + Extended Thinking",
+                       agents=["chatgpt"])
+            _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
+            _p1_start_emitted = True
+
         # ══════════════════════ PHASE 1 verify gate (BE-2) ══════════════════════
         # When init was skipped (skip_init_verify=True), re-verify ChatGPT
         # login + Pro before P1 touches it. Skip routes into manual_brief
@@ -22925,8 +23034,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             else:
                 log("Phase 1 skip: no brief source — Phase 2 will fail unless one appears", "WARN")
         elif start_phase <= 1:
-            emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
-            _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
+            if not _p1_start_emitted:
+                # Edge case: pre-emit was gated out above (e.g. stop pressed
+                # mid-verify-gate, then cleared). Emit now so the dispatch
+                # has a corresponding start event.
+                emit_event("phase_start", phase=1, description="Generating research brief with ChatGPT Pro + Extended Thinking", agents=["chatgpt"])
+                _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
             _p1_start = time.time()
             # Active-time ceiling for Phase 1 — paused seconds don't count.
             # If the user pauses for lunch, the budget is preserved.

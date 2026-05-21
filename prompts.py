@@ -145,11 +145,25 @@ PROMPT_GEMINI_DEEP_RESEARCH = SYSTEM_BASE + """
 
 Your task: Enable Deep Research mode in Gemini. Nothing else.
 
-Steps:
-1. Look at the Gemini page (gemini.google.com).
-2. In the composer (bottom input area), click the "Deep research" chip/pill to activate it.
-3. If Deep research chip is not visible directly, click "Sources" or the tools menu to find it.
-4. Ensure the Deep research pill shows as ACTIVE (highlighted/selected) before stopping.
+UI navigation (current as of 2026-05): the Deep Research control is
+nested behind a "More tools" submenu. Try these paths in order:
+
+PRIMARY path (current UI):
+1. In the composer (bottom input area), find the "+" button on the left
+   side of the textarea (often labelled "Add", "Add files", or shown as
+   a plus icon). Click it.
+2. In the menu that opens, click "More tools".
+3. In the More tools submenu, click "Deep Research".
+
+FALLBACK paths (if the + button or More tools is not visible):
+- Older UI: click a "Tools" button next to the composer, then click
+  "Deep Research" in the menu that opens.
+- Even older: a "Deep research" chip/pill may be visible directly in
+  the composer — click it.
+
+After clicking:
+4. Ensure the Deep Research pill/chip shows as ACTIVE (highlighted,
+   filled, or otherwise visually selected) before stopping.
 5. Click the message input area to focus it.
 6. Say "ready for paste" and STOP.
 
@@ -160,9 +174,11 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 - DO NOT send anything.
 - DO NOT click Send / Submit.
 - If Deep Research is already on: say "ready for paste" immediately and STOP.
-- If you cannot find Deep Research: say "deep research unavailable" and STOP.
+- If you cannot find Deep Research after trying the + → More tools path
+  AND the legacy Tools path: say "deep research unavailable" and STOP.
 
-Once Deep Research pill is active and input is focused, your job is DONE."""
+Once Deep Research pill is ACTIVE (visibly selected) and input is focused,
+your job is DONE."""
 
 PROMPT_CLAUDE_DEEP_RESEARCH = SYSTEM_BASE + """
 
