@@ -2310,6 +2310,139 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 except Exception as _dr_err:
                     log(f"[device-cmds] HARD_RESET: queue drain failed: {_dr_err}", "WARN")
 
+                # 2026-05-21: bulk-sweep ANY stale ongoing/paused/running
+                # research docs for the paired owner. The drain above only
+                # closes jobs that are CURRENTLY queued or running in BE
+                # memory — it misses runs that were wedged in a prior
+                # session and never finished writing a terminal status
+                # (process crash, kill -9, BE-restart-without-finally, etc).
+                # Pre-fix, those zombie docs kept the FE chat tile showing
+                # "Ongoing" forever and the queue gate (which keys on the
+                # most recent beDone marker) would refuse to advance into
+                # the NEXT user's queued run until the user manually went
+                # tile-by-tile in Account → Manage devices to delete them.
+                #
+                # Filter: by deviceId so other devices' in-flight work
+                # isn't accidentally killed. The research doc's deviceId
+                # field is stamped by `_be_payload` on every BE write, so
+                # this filter matches anything THIS device ever started.
+                # Owner-other-device runs are left alone.
+                #
+                # Best-effort: a Firestore client failure here doesn't
+                # block the exit — gate state is already cleared above.
+                try:
+                    if _firebase_db:
+                        _swept_n = 0
+                        _swept_fail = 0
+                        _stuck_set = {"ongoing", "running", "paused"}
+                        _now_ms = int(time.time() * 1000)
+                        try:
+                            from google.cloud.firestore import DELETE_FIELD as _SWEEP_DF
+                        except Exception:
+                            _SWEEP_DF = None  # type: ignore
+                        # We need the paired owner's uid + this device's
+                        # id. Both already live in research_config.json
+                        # (loaded into the BE context via the auth.v2_flow
+                        # init path). Recover from module-level helpers
+                        # rather than re-reading config — load_paired_uid
+                        # + load_device_id are the canonical readers.
+                        try:
+                            _sweep_uid = load_paired_uid()
+                        except Exception:
+                            _sweep_uid = ""
+                        try:
+                            _sweep_did = load_device_id()
+                        except Exception:
+                            _sweep_did = ""
+                        if _sweep_uid and _sweep_did:
+                            try:
+                                _res_col = _firebase_db.collection("users") \
+                                    .document(_sweep_uid).collection("researches")
+                                # No compound where because the deviceId
+                                # field may be missing on legacy docs;
+                                # filter in Python instead. Cheap — the
+                                # researches collection is small (<200
+                                # docs per user typically).
+                                for _snap in _res_col.where("deviceId", "==", _sweep_did).stream():
+                                    _sd = _snap.to_dict() or {}
+                                    _status = (_sd.get("status") or "").lower()
+                                    if _status not in _stuck_set:
+                                        continue
+                                    _swp: dict = {
+                                        "status": "stopped",
+                                        "cancelled": True,
+                                        "updatedAt": _now_ms,
+                                        "stoppedAt": _now_ms,
+                                        "stoppedBy": "hard_reset_sweep",
+                                        "summary": "Cancelled by Reset Backend",
+                                    }
+                                    if _SWEEP_DF is not None:
+                                        _swp["queuePosition"] = _SWEEP_DF
+                                        _swp["queuedBehindRunId"] = _SWEEP_DF
+                                        _swp["queuedBehindTitle"] = _SWEEP_DF
+                                    try:
+                                        _snap.reference.update(_swp)
+                                        _swept_n += 1
+                                    except Exception as _sw_err:
+                                        _swept_fail += 1
+                                        log(f"[device-cmds] HARD_RESET: sweep update failed for {_snap.id[:24]}…: {_sw_err}", "DEBUG")
+                                if _swept_n or _swept_fail:
+                                    log(f"[device-cmds] HARD_RESET: Firestore sweep marked {_swept_n} stale run(s) as stopped ({_swept_fail} failed)")
+                                else:
+                                    log("[device-cmds] HARD_RESET: Firestore sweep — no stale ongoing/paused runs found")
+                            except Exception as _q_err:
+                                log(f"[device-cmds] HARD_RESET: Firestore sweep query failed: {_q_err}", "WARN")
+                        else:
+                            log("[device-cmds] HARD_RESET: skipping Firestore sweep — paired uid or device id missing", "WARN")
+                    else:
+                        log("[device-cmds] HARD_RESET: skipping Firestore sweep — no _firebase_db", "WARN")
+                except Exception as _bs_err:
+                    log(f"[device-cmds] HARD_RESET: Firestore sweep wrapper failed: {_bs_err}", "WARN")
+
+                # Local-disk meta.json sweep — stamp every queues/<dir>/meta.json
+                # whose status is still "ongoing"/"paused"/"running" as
+                # "stopped". Without this, the local `/api/runs` listing
+                # (read by the BE's HTTP layer; surfaces in the Account-page
+                # device debug view) keeps showing zombie entries from
+                # crashed prior runs even after the Firestore docs are
+                # cleaned. Each crashed run typically leaves a meta.json
+                # frozen at the phase where it died.
+                try:
+                    queues_root_local = Path(__file__).parent / "queues"
+                    if queues_root_local.exists():
+                        _m_swept = 0
+                        _m_active = None
+                        try:
+                            if _tracks_dir is not None:
+                                _m_active = _tracks_dir.name
+                        except NameError:
+                            _m_active = None
+                        for _qd in queues_root_local.iterdir():
+                            if not _qd.is_dir():
+                                continue
+                            if _m_active and _qd.name == _m_active:
+                                continue  # leave the active run's meta alone — its finally will write
+                            _mp = _qd / "meta.json"
+                            if not _mp.exists():
+                                continue
+                            try:
+                                _md = json.loads(_mp.read_text(encoding="utf-8"))
+                                _ms = (_md.get("status") or "").lower()
+                                if _ms in ("ongoing", "running", "paused"):
+                                    _md["status"] = "stopped"
+                                    _md["stoppedAt"] = int(time.time() * 1000)
+                                    _md["stoppedBy"] = "hard_reset_sweep"
+                                    _mp.write_text(json.dumps(_md, indent=2), encoding="utf-8")
+                                    _m_swept += 1
+                            except Exception:
+                                # Best-effort; corrupted meta files are
+                                # left for the user's local-storage clear.
+                                continue
+                        if _m_swept:
+                            log(f"[device-cmds] HARD_RESET: local meta.json sweep marked {_m_swept} stale dir(s) as stopped")
+                except Exception as _ms_err:
+                    log(f"[device-cmds] HARD_RESET: local meta.json sweep failed: {_ms_err}", "WARN")
+
                 # Supervisor detection. If a daemon-loop process is alive,
                 # os._exit lets it respawn us cleanly. If not (foreground
                 # --serve run), os._exit kills the BE permanently — the
