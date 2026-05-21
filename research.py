@@ -2404,8 +2404,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 #
                 # Best-effort: a Firestore client failure here doesn't
                 # block the exit — gate state is already cleared above.
+                #
+                # Multi-worker (2026-05-21): only WORKER_ID==1 runs the
+                # sweep. The collection is device-scoped (shared across
+                # all workers on this device), and the sweep's writes
+                # are idempotent — running it N times only wastes
+                # Firestore RPC and opens a tiny race where two updates
+                # could contend on the same doc.
                 try:
-                    if _firebase_db:
+                    if _firebase_db and WORKER_ID == 1:
                         _swept_n = 0
                         _swept_fail = 0
                         _stuck_set = {"ongoing", "running", "paused"}
@@ -2481,9 +2488,18 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # crashed prior runs even after the Firestore docs are
                 # cleaned. Each crashed run typically leaves a meta.json
                 # frozen at the phase where it died.
+                #
+                # Multi-worker (2026-05-21): only WORKER_ID==1 sweeps.
+                # The queues/ tree is shared across workers; two workers
+                # rmtree-ing the same dirs would race. The "active dir"
+                # exclusion below uses the CALLING worker's _tracks_dir
+                # (process-local), so w1's sweep already skips w1's
+                # active run; w2+'s active dirs would NOT be excluded
+                # if w2's hard_reset also fired the sweep — which is
+                # exactly the bug worker-1-only avoids.
                 try:
                     queues_root_local = Path(__file__).parent / "queues"
-                    if queues_root_local.exists():
+                    if WORKER_ID == 1 and queues_root_local.exists():
                         _m_swept = 0
                         _m_active = None
                         try:
