@@ -118,9 +118,29 @@ class RefreshTokenCredentials(google.auth.credentials.Credentials):
 
         if resp.status_code == 400:
             body = resp.json() if resp.content else {}
-            err = body.get("error", "")
-            if "INVALID_REFRESH_TOKEN" in err or "TOKEN_EXPIRED" in err:
-                raise RevokedError(f"refresh token rejected: {err}")
+            # Firebase REST returns 400 with a JSON body shaped:
+            #   {"error": {"code": 400, "message": "TOKEN_EXPIRED",
+            #              "status": "INVALID_ARGUMENT", ...}}
+            # body.get("error", "") returns the inner DICT (not a string),
+            # so the prior `"TOKEN_EXPIRED" in err` was a dict-key check
+            # that always missed -> the BE swallowed RevokedError into a
+            # generic RuntimeError, crash-looped --serve under the daemon-
+            # loop supervisor, and the `_revoked_recovery_loop` never fired
+            # (it gates on `_firebase_db is None` from RevokedError path).
+            # Extract the message field explicitly.
+            err_obj = body.get("error")
+            err_msg = (
+                err_obj.get("message", "")
+                if isinstance(err_obj, dict)
+                else str(err_obj or "")
+            )
+            if (
+                "INVALID_REFRESH_TOKEN" in err_msg
+                or "TOKEN_EXPIRED" in err_msg
+                or "USER_DISABLED" in err_msg
+                or "USER_NOT_FOUND" in err_msg
+            ):
+                raise RevokedError(f"refresh token rejected: {err_msg}")
         if not resp.ok:
             raise RuntimeError(f"refresh HTTP {resp.status_code}: {resp.text}")
 
