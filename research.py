@@ -21968,9 +21968,33 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         if 1 not in sp and 2 not in sp and not any(ac.values()):
             log("Config: brief on with 0 agents (not explicit skip) — auto-enabling ChatGPT", "WARN")
             ac["chatgpt"] = True
-        return sp, ac, ve, ee, pl
+        # 2026-05-20 (queued-run init-skip parity): also honor
+        # skipInitVerify from disk config. Pre-fix this was only set via
+        # the per-run skip_init_verify action command at runtime — which
+        # the queued run can't fire because the per-research command
+        # listener isn't attached until after Phase 0 starts. Result:
+        # the Settings → Pipeline "Skip verification" toggle worked for
+        # immediate runs (whose Phase 0 was already running when the
+        # listener attached and the command landed) but was silently
+        # ignored for queued runs. Now reload_config returns the
+        # disk-config value, and the Phase 0 entry block primes
+        # _controls.skip_init_verify from it before the verify loop
+        # starts.
+        siv = bool(pipeline_config.get("skipInitVerify", False))
+        return sp, ac, ve, ee, pl, siv
 
-    skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length = reload_config()
+    skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length, skip_init_verify_cfg = reload_config()
+    # Prime the per-run controls. The FE Settings toggle and per-run
+    # command both write to _controls.skip_init_verify; honoring the
+    # disk config at Phase 0 entry ensures queued runs respect the
+    # global Settings preference without depending on the per-research
+    # command listener attaching first.
+    if skip_init_verify_cfg:
+        try:
+            _controls.skip_init_verify = True
+            log("[config] skipInitVerify=true from disk config — Phase 0 will skip login verification", "INFO")
+        except Exception:
+            pass
 
     # ── Preload data from previous phases (for resume) ──
     brief_text, brief_url = "", cp.get("brief_url", "")
@@ -23187,7 +23211,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             if _controls.is_stop():
                 return
 
-        skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length = reload_config()
+        skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length, _ = reload_config()
         # ══════════════════════ PHASE 2: Deep Research ══════════════════════
         results = {}
         _user_skip_p2 = _controls.consume_phase_skip(2)
@@ -23777,7 +23801,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Dropping {len(dropped)} chars of residual extra_context post-P2 "
                 f"(add_context disabled for Phase 3+)", "WARN")
 
-        skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length = reload_config()
+        skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length, _ = reload_config()
         # ── 2026-05-10: Eager phase_start:3 BEFORE the verify gate ──
         # Pre-fix, the verify gate (when skip_init_verify=True) ran a 5-15s
         # CUA call BEFORE phase_start:3 was emitted — FE saw P2 done + blank
@@ -25150,6 +25174,27 @@ async def run_server(port=8000):
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
             log(f"Starting queued job: {job['topic'][:60]}")
+            # Publish currentRunId on the device doc so sharers / sibling
+            # tabs can see "device is busy with run X" and render the
+            # QueuedBanner correctly when they submit a NEW research.
+            # Pre-fix, sharers' FE only had their OWN cachedResearches to
+            # check, so the owner's in-flight run was invisible and the
+            # sharer's submission rendered the Phase 0 INIT tile instead
+            # of "queued behind X". The synth-user write is gated by the
+            # devices-doc allow-list rule (62530fb + 2026-05-20 expansion
+            # to include currentRunId fields).
+            try:
+                _did = load_device_id()
+                if _firebase_db and _did:
+                    _crun_patch: dict = {
+                        "currentRunId": job.get("research_id") or "",
+                        "currentRunOwnerUid": job.get("uid") or "",
+                        "currentRunTitle": (job.get("topic") or "")[:60],
+                        "currentRunStartedAt": int(time.time() * 1000),
+                    }
+                    _firebase_db.collection("devices").document(_did).update(_crun_patch)
+            except Exception as _crun_err:
+                log(f"[device] currentRunId publish failed (non-fatal): {_crun_err}", "DEBUG")
             # Snapshot AFTER popping so an exit during run_pipeline can
             # restore both the running job AND remaining queue. Without the
             # current_job param a Phoenix restart would lose this in-flight
@@ -25242,6 +25287,22 @@ async def run_server(port=8000):
                 completed = _QUEUE_STATE.get("current_job") or {}
                 _QUEUE_STATE["running"] = False
                 _QUEUE_STATE["current_job"] = None
+                # Clear currentRunId on device doc — release the "device
+                # is busy" signal so the next submitter's FE doesn't think
+                # we're still mid-run. Best-effort; the next worker tick
+                # will overwrite anyway if we missed this.
+                try:
+                    from google.cloud.firestore import DELETE_FIELD as _CR_DF
+                    _did = load_device_id()
+                    if _firebase_db and _did:
+                        _firebase_db.collection("devices").document(_did).update({
+                            "currentRunId": _CR_DF,
+                            "currentRunOwnerUid": _CR_DF,
+                            "currentRunTitle": _CR_DF,
+                            "currentRunStartedAt": _CR_DF,
+                        })
+                except Exception as _crun_clear_err:
+                    log(f"[device] currentRunId clear failed (non-fatal): {_crun_clear_err}", "DEBUG")
                 # 2026-05-11: record what the next dequeue's gate needs.
                 # last_be_done_at=0 on error/watchdog paths short-circuits
                 # the gate (since FE-P5 will never write "completed").
