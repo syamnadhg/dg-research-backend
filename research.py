@@ -5656,6 +5656,13 @@ def validate_email(email):
     return True, ""
 
 
+class _SkipRehydration(Exception):
+    """Sentinel raised by worker N≥2 to short-circuit the Firestore queue
+    rehydration in run_server (research.py:~26882). Multi-worker: only
+    worker 1 rehydrates; others rely on the listener claim + idle-rescan
+    paths. Catch is non-warning so the log doesn't read as an error."""
+
+
 class SessionExpiredError(Exception):
     """Raised when a platform's chat URL redirects to login after resume."""
     pass
@@ -26877,9 +26884,25 @@ async def run_server(port=8000):
             # paired_uid synth-vs-owner mismatch). A hung query here blocks
             # the event loop and prevents uvicorn from binding port 8000 ->
             # `--resurrect` handoff fails its API health check.
+            #
+            # Multi-worker (2026-05-21): only worker 1 runs the
+            # Firestore rehydration. Pre-fix, every worker would scan
+            # the same users/{uid}/researches collection, re-enqueue
+            # every queued doc into its own local job_queue, and both
+            # would race the same Browser(_profile_dir(K)) for the same
+            # backendRunId — double-running the pipeline. Disk-restore
+            # (the pending_queue_*.json snapshot) is per-worker file
+            # (commit 4) so it's already safe; only the Firestore-side
+            # rehydration needs gating. Workers 2+ rely on the listener
+            # claim path + idle-rescan to pick up unclaimed Firestore
+            # queue docs on next dequeue.
+            rehydrated = 0
+            orphaned = 0
+            if WORKER_ID != 1:
+                log(f"[rehydration] worker {WORKER_ID}: skipping Firestore rehydration (worker-1-only)", "INFO")
             try:
-                rehydrated = 0
-                orphaned = 0
+                if WORKER_ID != 1:
+                    raise _SkipRehydration()  # local sentinel, caught below
                 researches_col = _firebase_db.collection("users").document(paired_uid) \
                     .collection("researches")
                 for status_val in ("queued", "ongoing"):
@@ -27050,6 +27073,10 @@ async def run_server(port=8000):
                                 rehydrated += 1
                 if rehydrated or orphaned:
                     log(f"Queue rehydration: re-enqueued {rehydrated} queued, marked {orphaned} orphaned runs stopped")
+            except _SkipRehydration:
+                # Worker N≥2 — intentional skip, not an error. Already
+                # logged above; no-op here.
+                pass
             except Exception as e:
                 log(f"Queue rehydration failed: {e}", "WARN")
 
@@ -29872,8 +29899,25 @@ def run_daemon_loop(port: int = 8000):
                     except Exception:
                         pass
             return
-        # Multi-worker branch exits the function. Single-worker code below
-        # is unreachable when n_workers > 1.
+        except Exception as _mw_err:
+            # Any other exception in the multi-worker loop (rare:
+            # resource exhaustion in _time.sleep, corrupted Popen state,
+            # etc.) MUST NOT fall through to the single-worker code
+            # below — that path would spawn an additional --serve on
+            # port 8000 racing the existing worker-1. Terminate all
+            # known children, log loudly, and exit the wrapper so the
+            # supervisor's scheduled-task respawn can give us a fresh
+            # event loop. Without this `return`, the multi-worker loop's
+            # spawned children remain alive AND the single-worker loop
+            # spins up its own --serve, leaving 2× the worker count.
+            log(f"[daemon-loop] Multi-worker loop crashed: {_mw_err} — terminating workers + exiting wrapper for clean respawn", "ERROR")
+            for k, state in workers.items():
+                if state and not state.get("_dead"):
+                    try:
+                        state["process"].terminate()
+                    except Exception:
+                        pass
+            return
 
     # ──── Single-worker branch (legacy, workerCount==1) ────────────────
     # Crash-loop safety net. If --serve exits non-zero CRASH_THRESHOLD
