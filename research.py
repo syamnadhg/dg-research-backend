@@ -3057,8 +3057,27 @@ def _safe_enqueue(job_queue, job, source: str) -> bool:
             log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not enqueueable)", "INFO")
             return False
     except Exception as e:
-        log(f"[safe_enqueue:{source}] skipped — Firestore check failed for {rid[:24]}…: {e}", "WARN")
-        return False
+        # Track D synth-device-user can't read `users/{ownerUid}/
+        # researches/{rid}` — the rule's `allow read` requires
+        # auth.uid==userId and the synth uid never matches the owner.
+        # Treat 403 as "trust the FE", since the queue-listener entry
+        # we're acting on was authenticated FE-side (the FE rule for
+        # devices/{id}/queue gates create on submittedBy==auth.uid).
+        # Any OTHER exception still bails defensively.
+        err_str = str(e)
+        if (
+            "403" in err_str
+            or "PERMISSION_DENIED" in err_str
+            or "Missing or insufficient permissions" in err_str
+        ):
+            log(
+                f"[safe_enqueue:{source}] existence check denied (user-mode read "
+                f"rule blocks synth user) — trusting FE-side queue write",
+                "DEBUG",
+            )
+        else:
+            log(f"[safe_enqueue:{source}] skipped — Firestore check failed for {rid[:24]}…: {e}", "WARN")
+            return False
     try:
         job_queue.put_nowait(job)
         return True
