@@ -25292,11 +25292,47 @@ async def run_server(port=8000):
         if _pending_queue_path.exists():
             _snap = json.loads(_pending_queue_path.read_text(encoding="utf-8"))
             _gate = _snap.get("gate") or {}
-            if _gate.get("last_completed_uid"):
-                _QUEUE_STATE["last_completed_uid"] = _gate.get("last_completed_uid")
-                _QUEUE_STATE["last_completed_rid"] = _gate.get("last_completed_rid")
-                _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
-                log(f"[queue-gate] pre-worker rehydrate: prior-run {(_gate.get('last_completed_rid') or '')[:8]}…")
+            _gate_uid = _gate.get("last_completed_uid")
+            _gate_rid = _gate.get("last_completed_rid")
+            if _gate_uid and _gate_rid:
+                # Orphan check: if the prior run's current Firestore status
+                # is non-terminal ("queued" / "ongoing"), the BE crashed
+                # mid-run and the prior is now orphaned. Don't carry the
+                # gate state forward — otherwise every subsequent
+                # submission waits 70 min for an "ongoing" status that
+                # will never become terminal. Mark the orphan stopped so
+                # the FE clears its chat banner.
+                _is_orphan = False
+                if _firebase_db:
+                    try:
+                        _prior_snap = _firebase_db.collection("users") \
+                            .document(_gate_uid).collection("researches") \
+                            .document(_gate_rid).get()
+                        if _prior_snap.exists:
+                            _prior_status = (_prior_snap.to_dict() or {}).get("status", "")
+                            if _prior_status in ("queued", "ongoing"):
+                                _is_orphan = True
+                    except Exception as _orphan_check_err:
+                        log(f"[queue-gate] orphan-check read failed (continuing): {_orphan_check_err}", "DEBUG")
+                if _is_orphan:
+                    log(f"[queue-gate] prior-run {_gate_rid[:8]}… orphaned (BE crashed mid-run) — clearing gate state")
+                    try:
+                        _update_research_doc(_gate_uid, _gate_rid, {
+                            "status": "stopped",
+                            "lastError": "Backend restarted before this run reached completion. Resubmit to retry.",
+                        })
+                    except Exception:
+                        pass
+                    # Drop gate state so the next submission proceeds
+                    # immediately instead of waiting on a zombie prior.
+                    _QUEUE_STATE["last_completed_uid"] = None
+                    _QUEUE_STATE["last_completed_rid"] = None
+                    _QUEUE_STATE["last_be_done_at"] = 0
+                else:
+                    _QUEUE_STATE["last_completed_uid"] = _gate_uid
+                    _QUEUE_STATE["last_completed_rid"] = _gate_rid
+                    _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
+                    log(f"[queue-gate] pre-worker rehydrate: prior-run {_gate_rid[:8]}…")
     except Exception as _e:
         log(f"[queue-gate] pre-worker rehydrate failed (non-fatal): {_e}", "WARN")
 
