@@ -2182,14 +2182,28 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # loop using get_nowait — works on asyncio.Queue from the
                 # listener thread because _queue is the underlying deque.
                 try:
+                    # Drain via the underlying deque directly rather than
+                    # asyncio.Queue.get_nowait() — get_nowait pops AND
+                    # touches the unfinished_tasks counter (Queue.join
+                    # internals), and calling task_done out-of-band from
+                    # the listener thread can ValueError "called too many
+                    # times". The deque popleft is thread-safe in CPython
+                    # (single C-level operation), matches how the queue-
+                    # position recompute at research.py:24700 already
+                    # snapshots `_job_queue._queue`, and bypasses the
+                    # counter entirely. The drained jobs are about to be
+                    # cancelled anyway, so the counter mismatch doesn't
+                    # matter — the process will exit + respawn fresh.
                     _drained_jobs: list[dict] = []
                     try:
                         while True:
-                            _drained_jobs.append(_job_queue.get_nowait())
-                            _job_queue.task_done()
-                    except Exception:
-                        # asyncio.QueueEmpty — done draining
+                            _drained_jobs.append(_job_queue._queue.popleft())
+                    except IndexError:
+                        # deque empty — done draining
                         pass
+                    except Exception as _drain_pop_err:
+                        log(f"[device-cmds] HARD_RESET: deque pop failed mid-drain: {_drain_pop_err}", "WARN")
+                    log(f"[device-cmds] HARD_RESET: drain found {len(_drained_jobs)} queued job(s)")
                     if _drained_jobs and _firebase_db:
                         try:
                             from google.cloud.firestore import DELETE_FIELD as _DRAIN_DF
@@ -2234,6 +2248,26 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                                 log(f"[device-cmds] HARD_RESET: queue-doc delete failed for {_qr[:24]}…: {_drain_q_err}", "DEBUG")
                     elif _drained_jobs:
                         log(f"[device-cmds] HARD_RESET: drained {len(_drained_jobs)} job(s) from memory (no Firestore client — research docs left as-is)", "WARN")
+                    # CRITICAL: re-persist after drain so the disk snapshot
+                    # reflects the now-empty queue. Without this second
+                    # persist, the pending list written by the gate-clear's
+                    # _persist_fn call above still contained the jobs we
+                    # just drained — on BE respawn, the rehydrate block
+                    # would re-enqueue them and the user's "cleared queue"
+                    # silently came back. Same _hr_lock semantics — write
+                    # the post-drain snapshot atomically w.r.t. any
+                    # racing worker `finally` block. Skip if persist_fn
+                    # isn't available (boot-time race; gate-clear branch
+                    # already logged about it).
+                    try:
+                        _hr_lock2 = _QUEUE_STATE.get("_hard_reset_lock")
+                        _persist_fn2 = _QUEUE_STATE.get("persist_fn")
+                        if _hr_lock2 is not None and _persist_fn2 is not None:
+                            with _hr_lock2:
+                                _persist_fn2(current_job=None)
+                            log("[device-cmds] HARD_RESET: re-persisted clean snapshot post-drain")
+                    except Exception as _rp_err:
+                        log(f"[device-cmds] HARD_RESET: post-drain re-persist failed: {_rp_err}", "WARN")
                 except Exception as _dr_err:
                     log(f"[device-cmds] HARD_RESET: queue drain failed: {_dr_err}", "WARN")
 
