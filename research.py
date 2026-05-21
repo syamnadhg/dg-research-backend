@@ -2076,6 +2076,47 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                             log(f"[device-cmds] HARD_RESET: marked .stop on active run {_tracks_dir.name}")
                         except Exception as _se:
                             log(f"[device-cmds] HARD_RESET: .stop touch failed: {_se}", "WARN")
+                        # Flip the active run's research doc to cancelled so
+                        # the FE chat shows the red Cancelled dialog and
+                        # the auto-delete-on-close cascade kicks in —
+                        # parity with the queued-jobs drain below + with
+                        # how a user-triggered Cancel from the chat input
+                        # behaves today. Reads the run's uid/rid from
+                        # _QUEUE_STATE["current_job"]; falls back to a
+                        # meta.json lookup on the active queue dir if
+                        # current_job hasn't been written yet (rare race
+                        # between worker assignment and Stop).
+                        try:
+                            _cur = _QUEUE_STATE.get("current_job") or {}
+                            _au = _cur.get("uid") or ""
+                            _ar = _cur.get("research_id") or ""
+                            if (not _au or not _ar) and _tracks_dir is not None:
+                                _meta_p = _tracks_dir / "meta.json"
+                                if _meta_p.exists():
+                                    try:
+                                        _meta = json.loads(_meta_p.read_text(encoding="utf-8"))
+                                        _au = _au or (_meta.get("uid") or "")
+                                        _ar = _ar or (_meta.get("researchId") or "")
+                                    except Exception:
+                                        pass
+                            if _au and _ar and _firebase_db:
+                                try:
+                                    from google.cloud.firestore import DELETE_FIELD as _ACT_DF
+                                except Exception:
+                                    _ACT_DF = None  # type: ignore
+                                _act_patch: dict = {
+                                    "status": "stopped",
+                                    "summary": "Cancelled by Reset Backend",
+                                    "cancelled": True,
+                                }
+                                if _ACT_DF is not None:
+                                    _act_patch["queuePosition"] = _ACT_DF
+                                    _act_patch["queuedBehindRunId"] = _ACT_DF
+                                    _act_patch["queuedBehindTitle"] = _ACT_DF
+                                _update_research_doc(_au, _ar, _act_patch)
+                                log(f"[device-cmds] HARD_RESET: flipped active run {_ar[:24]}… to cancelled")
+                        except Exception as _act_err:
+                            log(f"[device-cmds] HARD_RESET: active-run cancel-flip failed: {_act_err}", "WARN")
                 except NameError:
                     # _tracks_dir might not be defined yet on this serve
                     # (boot-time hard_reset before any run has started).
@@ -2122,6 +2163,79 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                         log("[device-cmds] HARD_RESET: cleared queue-gate state and persisted clean snapshot")
                 except Exception as _ge:
                     log(f"[device-cmds] HARD_RESET: gate clear/persist failed: {_ge}", "WARN")
+
+                # Drain queued jobs — Reset Backend means "stop everything
+                # on this device, not just the active run". Without this,
+                # pending jobs in _job_queue survive the reset and start
+                # executing the moment the worker is back, surprising the
+                # user who thought they cleared the slate. Each queued
+                # research gets:
+                #   1. status="stopped" + cancelled=true on its research
+                #      doc → the FE chat shows the Cancelled red dialog
+                #      and the auto-delete-on-close cascade kicks in
+                #      (mirroring how a user-triggered Cancel behaves
+                #      from the chat input).
+                #   2. The devices/{id}/queue/{auto} doc deleted so the
+                #      Firestore start listener doesn't re-enqueue it on
+                #      next BE startup.
+                # The in-memory _job_queue is drained to "" via a tight
+                # loop using get_nowait — works on asyncio.Queue from the
+                # listener thread because _queue is the underlying deque.
+                try:
+                    _drained_jobs: list[dict] = []
+                    try:
+                        while True:
+                            _drained_jobs.append(_job_queue.get_nowait())
+                            _job_queue.task_done()
+                    except Exception:
+                        # asyncio.QueueEmpty — done draining
+                        pass
+                    if _drained_jobs and _firebase_db:
+                        try:
+                            from google.cloud.firestore import DELETE_FIELD as _DRAIN_DF
+                        except Exception:
+                            _DRAIN_DF = None  # type: ignore
+                        log(
+                            f"[device-cmds] HARD_RESET: draining {len(_drained_jobs)} queued job(s) — flipping research status to stopped + cancelled"
+                        )
+                        for _qjob in _drained_jobs:
+                            _qu = _qjob.get("uid") or ""
+                            _qr = _qjob.get("research_id") or ""
+                            if not _qu or not _qr:
+                                continue
+                            _patch: dict = {
+                                "status": "stopped",
+                                "summary": "Cancelled by Reset Backend",
+                                "cancelled": True,
+                            }
+                            if _DRAIN_DF is not None:
+                                _patch["queuePosition"] = _DRAIN_DF
+                                _patch["queuedBehindRunId"] = _DRAIN_DF
+                                _patch["queuedBehindTitle"] = _DRAIN_DF
+                            try:
+                                _update_research_doc(_qu, _qr, _patch)
+                            except Exception as _drain_doc_err:
+                                log(f"[device-cmds] HARD_RESET: queued-research update failed for {_qr[:24]}…: {_drain_doc_err}", "WARN")
+                            # Also delete the device-queue entry so the
+                            # start-listener doesn't replay it. The
+                            # queue-collection iteration is best-effort.
+                            try:
+                                _did = load_device_id()
+                                if _did:
+                                    _q_col = _firebase_db.collection("devices") \
+                                        .document(_did).collection("queue") \
+                                        .where("researchId", "==", _qr).stream()
+                                    for _qsnap in _q_col:
+                                        try:
+                                            _qsnap.reference.delete()
+                                        except Exception:
+                                            pass
+                            except Exception as _drain_q_err:
+                                log(f"[device-cmds] HARD_RESET: queue-doc delete failed for {_qr[:24]}…: {_drain_q_err}", "DEBUG")
+                    elif _drained_jobs:
+                        log(f"[device-cmds] HARD_RESET: drained {len(_drained_jobs)} job(s) from memory (no Firestore client — research docs left as-is)", "WARN")
+                except Exception as _dr_err:
+                    log(f"[device-cmds] HARD_RESET: queue drain failed: {_dr_err}", "WARN")
 
                 # Supervisor detection. If a daemon-loop process is alive,
                 # os._exit lets it respawn us cleanly. If not (foreground
