@@ -7552,7 +7552,7 @@ async def _shadow_observed_cua(
 def fail_phase(phase: int, title: str = "", details: str = "",
                agent: str | None = None, can_retry: bool = True,
                error: str | None = None, reason: str | None = None,
-               actions=None, **extra):
+               actions=None, mark_phase_errored: bool = True, **extra):
     """Template A: phase-level error alert with [Retry, Skip, Dismiss]
     (Retry omitted when can_retry=False). NO Stop — Stop lives only in
     the chat input.
@@ -7563,7 +7563,19 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     title/details directly.
 
     Every alert carries `dismissible: True` + a unique `alert_id` so the
-    FE store can short-circuit re-render after dismiss."""
+    FE store can short-circuit re-render after dismiss.
+
+    `mark_phase_errored=False` suppresses the persistent
+    `phases[N].status = "errored"` write. Use this for PREFLIGHT
+    aborts (where the pipeline never actually reached the phase) so
+    the FE icon row doesn't paint that phase's agent icon red
+    prematurely. Example: Flow B source-download fails BEFORE P3
+    NotebookLM starts — pre-fix, the FE rendered NLM with a red
+    error badge while the pipeline was still at Phase 0 Init, which
+    falsely implied NLM itself had failed. With this flag, the
+    pipeline_error banner + Retry/Skip actions still fire, and the
+    queue-gate "_errored" flag is still set; only the icon-state
+    write is skipped."""
     if title == "" and error:
         title = error
     if details == "" and reason:
@@ -7591,7 +7603,9 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     # Tile/Icon Consistency (2026-05-01): persist errored status to root
     # doc so the listing-page tile + chat phase icons stay red post-
     # reload. If a later Retry succeeds, phase_complete overwrites this.
-    _write_phase_terminal_status(phase, "errored")
+    # Skipped for preflight aborts — see docstring.
+    if mark_phase_errored:
+        _write_phase_terminal_status(phase, "errored")
     # 2026-05-12: flag the queue gate so the next dequeue short-circuits.
     # Without this, run_pipeline returning cleanly after fail_phase leaves
     # the worker's `finally` block setting `last_be_done_at = now` (the
@@ -22112,6 +22126,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # the upload or fix Storage permissions.
                 if _ok == 0 and _fail > 0:
                     log(f"Flow B: ALL {_fail} source downloads failed — aborting", "ERROR")
+                    # mark_phase_errored=False: this is a PREFLIGHT abort
+                    # — the pipeline never reached Phase 3 (NLM never ran),
+                    # so persisting `phases[3].status="errored"` would
+                    # paint the NLM icon red while the chat still shows
+                    # Phase 0 Init (the misleading state user flagged).
+                    # FE banner with Retry/Skip still fires via the
+                    # pipeline_error event; queue-gate _errored flag is
+                    # still set; only the icon-row taint is suppressed.
                     fail_phase(
                         phase=3,
                         error=f"Couldn't download {_fail} attached source(s) from Storage",
@@ -22122,6 +22144,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             {"id": "skip", "label": "Skip Phase 3", "style": "default",
                              "command": {"action": "skip_phase", "phase": 3}},
                         ],
+                        mark_phase_errored=False,
                     )
                     return
             except Exception as _outer:
