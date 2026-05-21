@@ -97,6 +97,15 @@ if sys.stderr is not None:
 
 PROFILE_DIR = Path.home() / ".super-research" / "browser-profile"
 
+# Stamped by argparse dispatch in __main__ (research.py:~31320). Worker 1 is
+# the primary serve (FE-facing port 8000, heartbeats, currentRunId writes,
+# orphan-sweeps, hard_reset orchestration). Workers ≥2 are silent siblings
+# that share the same deviceId but run pipelines from their own profile dirs.
+# Module-global rather than threaded because the listener / worker / pipeline
+# / pending-queue layers all need it and threading it through ~30 call sites
+# is more noise than signal.
+WORKER_ID: int = 1
+
 
 def _profile_dir(n: int) -> Path:
     """Browser profile dir for worker `n`. Worker 1 returns the legacy
@@ -31247,7 +31256,14 @@ def main():
     parser.add_argument("--pair", action="store_true", help="First-time login setup")
     parser.add_argument("--resume", "-r", help="Resume from a previous queue directory (name or full path)")
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
-    parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
+    parser.add_argument("--port", type=int, default=None,
+        help="Server port. Default: 8000 for worker 1, 8000+(worker_id-1) for worker N. "
+             "Pass explicitly only for non-default port mappings (testing / port collision recovery).")
+    parser.add_argument("--worker-id", type=int, default=1, dest="worker_id",
+        help="Worker slot index (1-based). Worker N uses _profile_dir(N) for its browser "
+             "and binds port 8000+N-1 (unless --port overrides). Workers ≥2 are spawned by "
+             "daemon-loop when research_config.json's workerCount > 1; set up via pair Stage 4's "
+             "multi-profile loop. Default: 1 (single-worker, backward compat).")
     parser.add_argument("--resurrect", action="store_true",
         help="Enable On Startup: auto-start the backend at login and keep it running in the background")
     parser.add_argument("--retire", action="store_true",
@@ -31304,8 +31320,17 @@ def main():
         run_unpair(deep=bool(args.deep))
         return
 
+    # Resolve worker_id + port. Port defaults to 8000+(worker_id-1) so the
+    # daemon-loop's N children each bind a distinct port without each spawn
+    # needing to know the global mapping. Stamp WORKER_ID module-global so
+    # downstream code (pipeline launcher, pending-queue path, listener
+    # claim, w1-only gates) can read it without plumbing.
+    global WORKER_ID
+    WORKER_ID = max(1, int(args.worker_id or 1))
+    _resolved_port = args.port if args.port is not None else (8000 + WORKER_ID - 1)
+
     if args.daemon_loop:
-        run_daemon_loop(args.port)
+        run_daemon_loop(_resolved_port)
         return
 
     if args.pair:
@@ -31313,7 +31338,7 @@ def main():
         return
 
     if args.serve:
-        asyncio.run(run_server(args.port))
+        asyncio.run(run_server(_resolved_port))
         return
 
     if args.resume:
