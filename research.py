@@ -7814,6 +7814,19 @@ def fail_phase(phase: int, title: str = "", details: str = "",
                "alert_id": f"phase{phase}_error"}
     if agent:
         payload["agent"] = agent
+    # 2026-05-21: when mark_phase_errored=False (preflight aborts), also
+    # flag the event payload as quiet=True so the FE listing-page tile
+    # doesn't paint the target phase's node red via the volatile
+    # pipeline.phaseAlerts fallback (researches/page.tsx:786-792 unions
+    # alerts into erroredPhases only when !quiet). Pre-fix, the persistent
+    # write was suppressed but the tile still went red on the Flow B
+    # preflight abort because the alert side-channel was unconditional.
+    # The Retry/Skip banner still fires (PhaseAlertPanel reads the same
+    # alert via a different path that doesn't gate on quiet), so the
+    # user-facing recovery affordance is unchanged — only the per-node
+    # red tile badge is suppressed for "never-reached" phases.
+    if not mark_phase_errored:
+        payload["quiet"] = True
     payload.update(extra)
     emit_event("pipeline_error", phase=phase, **payload)
     # Tile/Icon Consistency (2026-05-01): persist errored status to root
