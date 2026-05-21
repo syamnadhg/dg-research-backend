@@ -2562,7 +2562,40 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
         log(f"[storage REST] audio upload network error: {e}", "WARN")
         return None
     if resp.status_code != 200:
-        log(f"[storage REST] audio upload HTTP {resp.status_code}: {resp.text[:200]}", "WARN")
+        # Surface enough diagnostic to debug the common Track D regression:
+        # synth-user upload getting 403 because the device doc's `ownerUid`
+        # was cleared (FE owner-Unlink without token revoke pre-fix) or
+        # `sharedWith[]` doesn't include this user. Decoding the JWT claims
+        # lets us see the actual deviceId/ownerUid the BE is sending vs
+        # what the rule expected.
+        _claim_dump = ""
+        try:
+            import base64 as _b64
+            import json as _json
+            _payload_b64 = id_token.split(".")[1]
+            _payload_b64 += "=" * (-len(_payload_b64) % 4)
+            _claims = _json.loads(_b64.urlsafe_b64decode(_payload_b64))
+            _claim_dump = (
+                f" claims={{deviceId={_claims.get('deviceId')!r}, "
+                f"ownerUid={_claims.get('ownerUid')!r}, "
+                f"sub={_claims.get('sub')!r}}}"
+            )
+        except Exception:
+            pass
+        log(
+            f"[storage REST] audio upload HTTP {resp.status_code} "
+            f"path=audio/{owner_uid}/{research_id}/{filename}{_claim_dump} "
+            f"body={resp.text[:300]}",
+            "WARN",
+        )
+        if resp.status_code == 403:
+            log(
+                "[storage REST] 403 hint: device doc may have lost ownerUid "
+                "(check FE Unlink without token revoke) — re-pair via FE "
+                "Account → Add Device to restore device.ownerUid + bootstrap "
+                "fresh synth-user claims.",
+                "WARN",
+            )
         return None
     try:
         meta = resp.json()
