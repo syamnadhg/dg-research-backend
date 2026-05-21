@@ -3390,6 +3390,19 @@ def teardown_firestore_run():
 
 _exit_scheduled = False
 
+# 2026-05-21: handle on the live pipeline Browser instance. The stop /
+# discard / hard-reset paths reach this from the Firestore command
+# listener thread (sync context) and schedule a graceful `browser.close()`
+# via `loop.create_task` so the patchright session tears down
+# IMMEDIATELY instead of waiting for the pipeline coroutine to notice
+# `_controls.is_stop()` at the next phase boundary (mid-Phase-2 stops
+# would otherwise leave Chromium open for the full 30-60min remainder
+# of the run, since the deep-research polling loop has no inline
+# is_stop check). Set in run_pipeline after each successful
+# `browser.start()`, cleared in the pipeline's finally. Pause+resume
+# re-creates a Browser instance so the ref is re-assigned each time.
+_active_browser_ref = None  # type: Optional["Browser"]
+
 
 def _safe_enqueue(job_queue, job, source: str) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
@@ -3457,6 +3470,14 @@ def _schedule_server_exit(source: str, delay_sec: float = 3.0):
     browser cleanly. Idempotent: if the same run is stopped via BOTH the
     Firestore command listener AND the HTTP endpoint, we only spawn one
     exit thread. Called from whichever stop transport fires first.
+
+    2026-05-21: reap child PIDs (patchright node driver + chromium)
+    BEFORE os._exit. Pre-fix, `os._exit(0)` left the patchright node
+    driver as an orphan with chromium hanging off it — the user saw
+    Stop fail to close the browser after pressing it mid-Phase-2.
+    The psutil sweep walks our own pid's children recursively and
+    kills them before the parent exits, so the daemon-loop respawn
+    starts with a clean process tree.
     """
     global _exit_scheduled
     if _exit_scheduled:
@@ -3466,7 +3487,37 @@ def _schedule_server_exit(source: str, delay_sec: float = 3.0):
     import threading as _threading
     def _runner():
         import time as _t, os as _os
-        _t.sleep(delay_sec)
+        # Brief grace for the async cleanup path (pipeline finally:
+        # browser.close + dispatcher_task.cancel + teardown_firestore_run)
+        # to complete on its own. The `_active_browser_ref` close that the
+        # stop handler scheduled in parallel typically lands in <1s on a
+        # healthy patchright session.
+        _t.sleep(min(delay_sec, 2.0))
+        # Hard-reap any remaining child processes before os._exit. Without
+        # this, the patchright node-driver + chromium subprocesses persist
+        # past os._exit and orphan into the user's process list (memory
+        # entry `project_queue_bug_investigation.md` documents this exact
+        # failure mode from 2026-04-29).
+        try:
+            import psutil as _ps
+            me = _ps.Process(_os.getpid())
+            killed_n = 0
+            for child in me.children(recursive=True):
+                try:
+                    child.kill()
+                    killed_n += 1
+                except (_ps.NoSuchProcess, _ps.AccessDenied):
+                    pass
+            if killed_n:
+                log(f"[{source}] Reaped {killed_n} child process(es) before exit", "INFO")
+        except Exception as _ps_err:
+            try:
+                log(f"[{source}] Child-process sweep failed (non-fatal): {_ps_err}", "WARN")
+            except Exception:
+                pass
+        # Any remaining delay budget after the grace + sweep (typically 0
+        # since 2s grace + sub-second sweep already consumed delay_sec=3).
+        _t.sleep(max(0, delay_sec - 2.0))
         log(f"Exiting server after Stop ({source})", "WARN")
         _os._exit(0)
     _threading.Thread(target=_runner, daemon=True).start()
@@ -3952,6 +4003,26 @@ def _start_command_listener(uid, research_id, loop):
                 except Exception:
                     pass
                 loop.call_soon_threadsafe(_controls.request_stop)
+                # 2026-05-21: schedule a graceful browser teardown NOW so
+                # the patchright session closes inline instead of waiting
+                # for the pipeline coroutine to notice `_controls.is_stop()`
+                # at the next phase boundary. Mid-Phase-2 stops would
+                # otherwise leave the browser open for the full deep-
+                # research remainder (30-60min) since the polling loop
+                # has no inline is_stop check. browser.close() raises
+                # CancelledError into the awaits chained on the context,
+                # unblocking the pipeline coroutine so its finally fires
+                # and the queue can drain to the next item. Idempotent —
+                # the pipeline's finally re-calls close() which the
+                # Browser.close() handler treats as a no-op via try/except.
+                _b = _active_browser_ref
+                if _b is not None:
+                    def _close_now():
+                        try:
+                            asyncio.get_event_loop().create_task(_b.close())
+                        except Exception as _ce:
+                            log(f"[stop] inline browser.close schedule failed: {_ce}", "WARN")
+                    loop.call_soon_threadsafe(_close_now)
                 # Bridge: also create file sentinel for old phase-boundary checks
                 if _tracks_dir:
                     try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
@@ -4014,6 +4085,18 @@ def _start_command_listener(uid, research_id, loop):
                 except Exception:
                     pass
                 loop.call_soon_threadsafe(_controls.request_stop)
+                # 2026-05-21: schedule graceful browser teardown on discard
+                # too — same rationale as the stop branch above. Discard
+                # is user-facing (Watchdog T3 alert), so the same Chromium-
+                # orphan symptom would surface here without this hook.
+                _b = _active_browser_ref
+                if _b is not None:
+                    def _close_now_discard():
+                        try:
+                            asyncio.get_event_loop().create_task(_b.close())
+                        except Exception as _ce:
+                            log(f"[discard] inline browser.close schedule failed: {_ce}", "WARN")
+                    loop.call_soon_threadsafe(_close_now_discard)
                 if _tracks_dir:
                     try: (Path(__file__).parent / "queues" / _tracks_dir.name / ".stop").touch()
                     except Exception: pass
@@ -22722,6 +22805,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         update_delivery()
 
     browser = Browser(PROFILE_DIR, headless=False)
+    # Expose the live Browser instance to the stop / discard / hard-reset
+    # paths so they can schedule a graceful close without waiting for
+    # the pipeline to reach its next is_stop() phase boundary. Pause+resume
+    # paths below re-create the Browser and re-assign this ref.
+    global _active_browser_ref
+    _active_browser_ref = browser
     try:
         # ══════════════════════ PHASE 0: Preflight ══════════════════════
         # Phase 0 does real work now: launch browser, verify each platform's
@@ -23640,6 +23729,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # Relaunch browser on resume
                 browser = Browser(PROFILE_DIR, headless=False)
                 await browser.start()
+                _active_browser_ref = browser  # re-point stop handler at fresh session
                 emit_event("pipeline_resumed", phase=1)
                 _update_firestore_research({"status": "ongoing"})
                 # Pause+resume+input semantics: rerun the paused phase with the
@@ -24124,6 +24214,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # Relaunch — agents in Phase 2 are already complete at this boundary
                 browser = Browser(PROFILE_DIR, headless=False)
                 await browser.start()
+                _active_browser_ref = browser  # re-point stop handler at fresh session
                 emit_event("pipeline_resumed", phase=2)
                 _update_firestore_research({"status": "ongoing"})
                 # Restart-phase logic: if user supplied input while paused, re-run Phase 2 with combined input
@@ -24741,6 +24832,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     return
                 browser = Browser(PROFILE_DIR, headless=False)
                 await browser.start()
+                _active_browser_ref = browser  # re-point stop handler at fresh session
                 emit_event("pipeline_resumed", phase=3)
                 _update_firestore_research({"status": "ongoing"})
                 # Post-P2 input is disabled. Drop any residual buffer silently.
@@ -24839,6 +24931,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 await browser.close()
         except Exception as e:
             log(f"Browser final close error: {e}", "WARN")
+        # Clear the active-browser ref AFTER close() runs. _schedule_server_
+        # exit's child-PID sweep is the safety net for any chromium that
+        # outlived close() (e.g. patchright node-driver hang), but the
+        # ref-clear here matters for non-exit shutdowns (clean completes,
+        # crashes that recover via auto-retry) where the next pipeline
+        # creates a fresh Browser instance.
+        _active_browser_ref = None
         _runtime.reset()
         teardown_firestore_run()
         # Clear the active-run global so subsequent device commands
@@ -25131,6 +25230,17 @@ async def run_server(port=8000):
         # exit via the shared helper. Idempotent if the Firestore-command path
         # already fired — we won't spawn duplicate exit threads.
         _controls.request_stop()
+        # 2026-05-21: schedule graceful browser teardown inline before the
+        # exit timer fires — without this, mid-Phase awaits keep the
+        # patchright session open until os._exit reaps the process tree.
+        # We're already in an async handler so asyncio.create_task works
+        # directly (no call_soon_threadsafe needed).
+        _b = _active_browser_ref
+        if _b is not None:
+            try:
+                asyncio.create_task(_b.close())
+            except Exception as _ce:
+                log(f"[http-stop] inline browser.close schedule failed: {_ce}", "WARN")
         _schedule_server_exit("http-endpoint")
         return {"status": "stop_requested", "id": run_id}
 
