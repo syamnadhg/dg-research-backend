@@ -24871,6 +24871,15 @@ async def run_server(port=8000):
                 _doc_ref = _firebase_db.collection("users").document(_puid) \
                     .collection("researches").document(_prid)
                 snap = await asyncio.to_thread(_doc_ref.get)
+                if not snap.exists:
+                    # Prior research doc was deleted (user purged from
+                    # /researches). Treat as terminal — there's nothing
+                    # left to wait on. Without this branch the gate
+                    # would spin silently until the deadline fires
+                    # (worst case BE_PHASES_TIMEOUT_SEC = 70 min).
+                    log(f"[queue-gate] prior run {_prid[:8]}… doc missing — dequeueing")
+                    _QUEUE_STATE.pop("gate_pending_job", None)
+                    return
                 if snap.exists:
                     data = snap.to_dict() or {}
                     status = data.get("status", "")
@@ -25295,27 +25304,43 @@ async def run_server(port=8000):
             _gate_uid = _gate.get("last_completed_uid")
             _gate_rid = _gate.get("last_completed_rid")
             if _gate_uid and _gate_rid:
-                # Orphan check: if the prior run's current Firestore status
-                # is non-terminal ("queued" / "ongoing"), the BE crashed
-                # mid-run and the prior is now orphaned. Don't carry the
-                # gate state forward — otherwise every subsequent
-                # submission waits 70 min for an "ongoing" status that
-                # will never become terminal. Mark the orphan stopped so
-                # the FE clears its chat banner.
+                # Orphan detection — three cases get treated as terminal so
+                # the gate doesn't wedge the next submission:
+                #   (a) Prior research doc DELETED (user purged it from
+                #       /researches → snap.exists False).
+                #   (b) Prior status is non-terminal ("queued"/"ongoing")
+                #       → BE crashed mid-run; without a worker to
+                #       advance it, the status never becomes terminal.
+                #   (c) Read failed entirely (network, transient denial)
+                #       → safer to release than wedge for 70 min.
+                # In every case we drop the gate-state IN-MEMORY *and* on
+                # disk; otherwise the next BE restart's rehydrate re-loads
+                # the same zombie pointer and the wedge re-engages.
                 _is_orphan = False
+                _orphan_reason = ""
                 if _firebase_db:
                     try:
                         _prior_snap = _firebase_db.collection("users") \
                             .document(_gate_uid).collection("researches") \
                             .document(_gate_rid).get()
-                        if _prior_snap.exists:
+                        if not _prior_snap.exists:
+                            _is_orphan = True
+                            _orphan_reason = "doc deleted"
+                        else:
                             _prior_status = (_prior_snap.to_dict() or {}).get("status", "")
                             if _prior_status in ("queued", "ongoing"):
                                 _is_orphan = True
+                                _orphan_reason = f"status={_prior_status}"
                     except Exception as _orphan_check_err:
-                        log(f"[queue-gate] orphan-check read failed (continuing): {_orphan_check_err}", "DEBUG")
+                        log(f"[queue-gate] orphan-check read failed — treating as orphan: {_orphan_check_err}", "DEBUG")
+                        _is_orphan = True
+                        _orphan_reason = "read failed"
                 if _is_orphan:
-                    log(f"[queue-gate] prior-run {_gate_rid[:8]}… orphaned (BE crashed mid-run) — clearing gate state")
+                    log(f"[queue-gate] prior-run {_gate_rid[:8]}… orphaned ({_orphan_reason}) — clearing gate state")
+                    # Best-effort status flip (will silently 403 for legacy
+                    # research docs without a deviceId field, since
+                    # deviceUpdatingFor requires resource.data.deviceId match;
+                    # don't depend on it).
                     try:
                         _update_research_doc(_gate_uid, _gate_rid, {
                             "status": "stopped",
@@ -25323,11 +25348,22 @@ async def run_server(port=8000):
                         })
                     except Exception:
                         pass
-                    # Drop gate state so the next submission proceeds
-                    # immediately instead of waiting on a zombie prior.
+                    # Drop gate state both in memory AND on disk so next
+                    # restart doesn't re-engage the wedge.
                     _QUEUE_STATE["last_completed_uid"] = None
                     _QUEUE_STATE["last_completed_rid"] = None
                     _QUEUE_STATE["last_be_done_at"] = 0
+                    try:
+                        _clean = {**_snap, "gate": {
+                            "last_completed_uid": None,
+                            "last_completed_rid": None,
+                            "last_be_done_at": 0,
+                        }}
+                        _tmp = _pending_queue_path.with_suffix(".json.tmp")
+                        _tmp.write_text(json.dumps(_clean, indent=2), encoding="utf-8")
+                        os.replace(str(_tmp), str(_pending_queue_path))
+                    except Exception as _persist_err:
+                        log(f"[queue-gate] orphan-clear persist failed (continuing): {_persist_err}", "WARN")
                 else:
                     _QUEUE_STATE["last_completed_uid"] = _gate_uid
                     _QUEUE_STATE["last_completed_rid"] = _gate_rid
