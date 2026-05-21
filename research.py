@@ -1884,6 +1884,14 @@ async def _heartbeat_loop():
             # affectedKeys() and break the rule's hasOnly check).
             device_id = load_device_id()
             if _firebase_db and device_id:
+                # Multi-worker (2026-05-21): publish workerCount so the FE
+                # can gate its "queue vs ongoing" decision on actual slot
+                # capacity. Without this, FE treats ANY active run on the
+                # device as "device busy" — a second submit shows as
+                # queued even when worker 2 is idle and ready to take it.
+                # Heartbeat is the natural carrier (already running on
+                # worker 1 only, already updating allow-listed fields).
+                _wc_payload = load_worker_count()
                 await asyncio.wait_for(
                     asyncio.to_thread(
                         lambda: _firebase_db.collection("devices")
@@ -1894,6 +1902,7 @@ async def _heartbeat_loop():
                                 # is alive + cancel the post-claim TTL.
                                 "pairConfirmedAt": True,
                                 "expireAt": DELETE_FIELD,
+                                "workerCount": _wc_payload,
                             })),
                     timeout=10.0,
                 )
@@ -26276,18 +26285,31 @@ async def run_server(port=8000):
             # of "queued behind X". The synth-user write is gated by the
             # devices-doc allow-list rule (62530fb + 2026-05-20 expansion
             # to include currentRunId fields).
-            try:
-                _did = load_device_id()
-                if _firebase_db and _did:
-                    _crun_patch: dict = {
-                        "currentRunId": job.get("research_id") or "",
-                        "currentRunOwnerUid": job.get("uid") or "",
-                        "currentRunTitle": (job.get("topic") or "")[:60],
-                        "currentRunStartedAt": int(time.time() * 1000),
-                    }
-                    _firebase_db.collection("devices").document(_did).update(_crun_patch)
-            except Exception as _crun_err:
-                log(f"[device] currentRunId publish failed (non-fatal): {_crun_err}", "DEBUG")
+            # Multi-worker (2026-05-21): only worker 1 publishes
+            # currentRunId. The device doc has a single currentRunId
+            # field; if both workers wrote, the value would flip-flop
+            # to whichever flipped last. FE QueuedBanner reads this to
+            # show "device busy with X" — with worker-1-only writes,
+            # the banner reflects w1's current run while w2's runs
+            # complete invisibly to the banner. Sibling tabs / sharers
+            # firing a 3rd run still see "queued" status because both
+            # worker queues are busy; the specific title may be w1's
+            # rather than w2's. Acceptable compromise — FE display
+            # quirk does not affect actual execution. PR 3 may expand
+            # this to a currentRunIds.{workerId} map field.
+            if WORKER_ID == 1:
+                try:
+                    _did = load_device_id()
+                    if _firebase_db and _did:
+                        _crun_patch: dict = {
+                            "currentRunId": job.get("research_id") or "",
+                            "currentRunOwnerUid": job.get("uid") or "",
+                            "currentRunTitle": (job.get("topic") or "")[:60],
+                            "currentRunStartedAt": int(time.time() * 1000),
+                        }
+                        _firebase_db.collection("devices").document(_did).update(_crun_patch)
+                except Exception as _crun_err:
+                    log(f"[device] currentRunId publish failed (non-fatal): {_crun_err}", "DEBUG")
             # Snapshot AFTER popping so an exit during run_pipeline can
             # restore both the running job AND remaining queue. Without the
             # current_job param a Phoenix restart would lose this in-flight
@@ -26384,18 +26406,25 @@ async def run_server(port=8000):
                 # is busy" signal so the next submitter's FE doesn't think
                 # we're still mid-run. Best-effort; the next worker tick
                 # will overwrite anyway if we missed this.
-                try:
-                    from google.cloud.firestore import DELETE_FIELD as _CR_DF
-                    _did = load_device_id()
-                    if _firebase_db and _did:
-                        _firebase_db.collection("devices").document(_did).update({
-                            "currentRunId": _CR_DF,
-                            "currentRunOwnerUid": _CR_DF,
-                            "currentRunTitle": _CR_DF,
-                            "currentRunStartedAt": _CR_DF,
-                        })
-                except Exception as _crun_clear_err:
-                    log(f"[device] currentRunId clear failed (non-fatal): {_crun_clear_err}", "DEBUG")
+                #
+                # Multi-worker (2026-05-21): only worker 1 clears, mirror
+                # of the publish gate above. A worker-2 finish leaves
+                # currentRunId pointing at w1's still-active run — which
+                # is correct from the banner's perspective (the device
+                # IS still busy with w1's run).
+                if WORKER_ID == 1:
+                    try:
+                        from google.cloud.firestore import DELETE_FIELD as _CR_DF
+                        _did = load_device_id()
+                        if _firebase_db and _did:
+                            _firebase_db.collection("devices").document(_did).update({
+                                "currentRunId": _CR_DF,
+                                "currentRunOwnerUid": _CR_DF,
+                                "currentRunTitle": _CR_DF,
+                                "currentRunStartedAt": _CR_DF,
+                            })
+                    except Exception as _crun_clear_err:
+                        log(f"[device] currentRunId clear failed (non-fatal): {_crun_clear_err}", "DEBUG")
                 # 2026-05-11: record what the next dequeue's gate needs.
                 # last_be_done_at=0 on error/watchdog paths short-circuits
                 # the gate (since FE-P5 will never write "completed").
@@ -26760,16 +26789,26 @@ async def run_server(port=8000):
     # still auto-relink the moment the owner enters the new code at
     # Account → Add Device. Loop is idle while _firebase_db is set.
     asyncio.create_task(_revoked_recovery_loop())
-    # Start heartbeat so frontend can show Online/Offline status
+    # Start heartbeat so frontend can show Online/Offline status.
+    # Multi-worker (2026-05-21): only worker 1 heartbeats. FE only needs
+    # a single "device alive" signal and devices/{deviceId}.lastHeartbeat
+    # is a single field — both workers writing it would double the
+    # Firestore RPC rate for no FE benefit. If worker 1 dies but worker
+    # 2 survives, the heartbeat goes stale and FE flips Offline; that's
+    # accurate from the FE's perspective because there's no longer a
+    # primary serve binding port 8000.
     heartbeat_task = None
-    if _firebase_db:
+    if _firebase_db and WORKER_ID == 1:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
         log(f"Heartbeat started ({HEARTBEAT_INTERVAL_SEC}s interval)")
 
+    if _firebase_db:
         # Aegis pulse — slow standing-watch heartbeat in the log every 60s
         # while the queue is idle. Alternates ◆/◇ glyph so a tail of the
         # log shows a faint pulse instead of flat repetition. Suppressed
         # during active pipeline runs (the job worker is already chatty).
+        # Per-worker (each worker logs its own pulse, prefixed with its
+        # ID) so a tail of any worker's log shows liveness.
         async def _aegis_pulse_loop():
             glyphs = ("◆", "◇")
             i = 0
@@ -26777,15 +26816,20 @@ async def run_server(port=8000):
                 while True:
                     await asyncio.sleep(60)
                     if not _QUEUE_STATE.get("running"):
-                        log(f"[aegis] {glyphs[i % 2]} standing watch")
+                        log(f"[aegis] worker {WORKER_ID}: {glyphs[i % 2]} standing watch")
                         i += 1
             except asyncio.CancelledError:
                 return
         asyncio.create_task(_aegis_pulse_loop())
         # Periodic orphan sweep: existence-based cleanup of local queues/
-        # dirs whose Firestore research doc has been deleted.
-        asyncio.create_task(_orphan_sweep_loop())
-        log(f"[orphan-sweep] started ({ORPHAN_SWEEP_INTERVAL_SEC}s interval)")
+        # dirs whose Firestore research doc has been deleted. Worker-1
+        # only — the queues/ tree is shared across workers and sweep is
+        # idempotent; running it N times wastes Firestore RPC budget and
+        # opens a small race window where two sweeps could each see the
+        # same dir and contend on rmtree.
+        if WORKER_ID == 1:
+            asyncio.create_task(_orphan_sweep_loop())
+            log(f"[orphan-sweep] started ({ORPHAN_SWEEP_INTERVAL_SEC}s interval)")
         # Refresh the paired device doc so the Account page sees this PC
         # online immediately on server start.
         paired_uid = load_paired_uid()
