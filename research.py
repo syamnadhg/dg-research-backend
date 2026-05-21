@@ -3280,14 +3280,32 @@ def start_firestore_start_listener(job_queue, loop):
             # existence + status check on the asyncio loop right before
             # put_nowait, catching any delete/cancel that landed between
             # this listener's pre-checks above and the actual enqueue.
+            # On successful enqueue, also fire _recompute_queue_positions
+            # so the freshly-enqueued job's `queuedBehindTitle` is
+            # corrected from the FE's submit-time guess (which always
+            # uses the currently-running pipeline — correct for
+            # position #1 but wrong for position #2+ where "behind"
+            # should be the previously-queued run, not the running one).
+            # Recompute is reached via _QUEUE_STATE because the function
+            # lives inside run_server's closure scope.
             # Default-arg capture avoids the lambda-in-loop closure bug.
-            loop.call_soon_threadsafe(
-                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text, us=user_sources, ul=user_links:
-                    _safe_enqueue(job_queue,
+            def _enqueue_with_position_refresh(
+                t, e, c, r, u, ri, bt, us, ul,
+            ):
+                if _safe_enqueue(job_queue,
                         {"topic": t, "email": e, "config": c, "run_id": r,
                          "uid": u, "research_id": ri, "brief_text": bt,
                          "user_sources": us, "user_links": ul},
-                        source="start-listener")
+                        source="start-listener"):
+                    _recompute = _QUEUE_STATE.get("recompute_fn")
+                    if _recompute is not None:
+                        try:
+                            _recompute()
+                        except Exception as _re:
+                            log(f"[start-listener] post-enqueue recompute failed: {_re}", "WARN")
+            loop.call_soon_threadsafe(
+                lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text, us=user_sources, ul=user_links:
+                    _enqueue_with_position_refresh(t, e, c, r, u, ri, bt, us, ul)
             )
 
     _start_listener = col_ref.on_snapshot(on_snapshot)
@@ -25101,10 +25119,35 @@ async def run_server(port=8000):
                 continue
             new_pos = idx + 1
             if idx == 0:
-                patch = {"queuePosition": new_pos}
-                if DELETE_FIELD is not None:
-                    patch["queuedBehindRunId"] = DELETE_FIELD
-                    patch["queuedBehindTitle"] = DELETE_FIELD
+                # Position #1's "behind" is the currently-running pipeline
+                # when there is one. Two callers reach this branch with
+                # different semantics:
+                #   • Completion flow (after task_done at :25549) —
+                #     `_QUEUE_STATE["running"]` was just flipped False and
+                #     `current_job` set to None. The else-branch clears
+                #     behind fields (no run ahead — position #1 is next up).
+                #   • Enqueue flow (called from the start-listener lambda
+                #     after _safe_enqueue) — `running` is True and
+                #     `current_job` is the live pipeline. Set behind to
+                #     the running job's title so QueuedBanner reads
+                #     "Will play after <running>" instead of either no
+                #     reference or (pre-fix) the wrong one the FE wrote
+                #     at submit time based on its own activeOnDevice
+                #     guess.
+                running_job = _QUEUE_STATE.get("current_job")
+                if (running_job
+                        and _QUEUE_STATE.get("running")
+                        and running_job.get("research_id") != rid_v):
+                    patch = {
+                        "queuePosition": new_pos,
+                        "queuedBehindRunId": running_job.get("research_id") or "",
+                        "queuedBehindTitle": (running_job.get("topic") or "")[:60],
+                    }
+                else:
+                    patch = {"queuePosition": new_pos}
+                    if DELETE_FIELD is not None:
+                        patch["queuedBehindRunId"] = DELETE_FIELD
+                        patch["queuedBehindTitle"] = DELETE_FIELD
             else:
                 prev = pending[idx - 1]
                 patch = {
