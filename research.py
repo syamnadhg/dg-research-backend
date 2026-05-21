@@ -27866,6 +27866,27 @@ def run_daemon_loop(port: int = 8000):
     except Exception as _pe:
         log(f"[daemon-loop] Pre-flight import probe crashed (continuing anyway): {_pe}", "WARN")
 
+    # Crash-loop safety net. If --serve exits non-zero CRASH_THRESHOLD
+    # times within CRASH_WINDOW_SEC, the daemon-loop wipes the OS
+    # keystore so the recovery loop inside the next --serve can take
+    # over from a clean slate. Without this, a stuck refresh token
+    # (e.g. an edge-case Firebase error the parser at credentials.py
+    # doesn't recognize as revoked) traps the BE in an infinite
+    # respawn — the FE "Reset backend" button can't help because the
+    # device-commands listener lives inside --serve, which never
+    # finishes starting up. Auto-recovery: keystore goes empty -> next
+    # --serve's init_firebase returns False -> _firebase_db = None ->
+    # _revoked_recovery_loop polls the pending subdoc for a fresh
+    # customToken from a Reset+Approve cycle. User-visible action: tap
+    # Reset on the device tile in the FE Account page; the email's
+    # Approve link deposits the customToken the recovery loop is
+    # waiting for. `keystore_wiped_by_crashloop` gates against repeated
+    # wipes if --serve keeps crashing for a different reason after the
+    # wipe — wiping again would do nothing.
+    CRASH_WINDOW_SEC = 30
+    CRASH_THRESHOLD = 3
+    crash_window: list[float] = []
+    keystore_wiped_by_crashloop = False
     restarts = 0
     while True:
         try:
@@ -27879,6 +27900,48 @@ def run_daemon_loop(port: int = 8000):
                     creationflags=_NO_WINDOW,
                 )
             log(f"[daemon-loop] --serve exited with code {result.returncode}")
+            # Track crash-loop pattern. Code 0 = clean exit (Ctrl+C from
+            # outside, or `_revoked_recovery_loop` calling os._exit(0)
+            # after picking up a fresh customToken). Clean exits reset
+            # the window so a healthy restart doesn't get falsely
+            # flagged later.
+            if result.returncode == 0:
+                crash_window = []
+                keystore_wiped_by_crashloop = False
+            else:
+                _now = _time.time()
+                crash_window.append(_now)
+                crash_window = [t for t in crash_window if t > _now - CRASH_WINDOW_SEC]
+                if (
+                    len(crash_window) >= CRASH_THRESHOLD
+                    and not keystore_wiped_by_crashloop
+                ):
+                    log(
+                        f"[daemon-loop] Crash loop detected: {len(crash_window)} "
+                        f"non-zero exits in <{CRASH_WINDOW_SEC}s. Wiping the OS "
+                        f"keystore so the recovery loop in the next --serve can "
+                        f"poll for a fresh customToken.",
+                        "WARN",
+                    )
+                    try:
+                        from auth import keystore as _ks_recovery
+                        _ks_recovery.clear_all(_ks_recovery.install_uuid())
+                        keystore_wiped_by_crashloop = True
+                        crash_window = []
+                        log(
+                            "[daemon-loop] Keystore wiped. The next --serve will "
+                            "boot into recovery mode and wait for a Reset+Approve "
+                            "from the FE Account page (Settings → Manage devices "
+                            "→ Reset, then click Approve in the email).",
+                            "INFO",
+                        )
+                    except Exception as _ke:
+                        log(
+                            f"[daemon-loop] Keystore wipe failed: {_ke}. The user "
+                            f"may need to run `python research.py --unpair && "
+                            f"python research.py --pair` to recover manually.",
+                            "ERROR",
+                        )
         except KeyboardInterrupt:
             log("[daemon-loop] Interrupted — exiting wrapper")
             return
