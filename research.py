@@ -3489,6 +3489,62 @@ def start_firestore_start_listener(job_queue, loop):
             except Exception as e:
                 log(f"Queue: research-doc existence check failed (allowing through): {e}", "WARN")
 
+            # ── Multi-worker claim (2026-05-21) ─────────────────────────────
+            # With workerCount>1, every worker's listener fires for this same
+            # queue doc. Workers cooperate via a Firestore transactional
+            # claim on the queue doc itself — first to set `assignedWorker`
+            # wins, losers exit this loop iteration cleanly. Without the
+            # claim, every worker would process the doc end-to-end:
+            # duplicate research-doc writes, duplicate queue-doc deletes,
+            # and N copies of the SAME pipeline running on N profiles.
+            #
+            # Gate-on-busy is layered with the claim, BUT only in
+            # multi-worker mode. Single-worker (workerCount=1) keeps the
+            # pre-PR behavior — listener always processes and enqueues,
+            # local job_queue handles serial ordering. Pre-PR, busy meant
+            # status="queued" with position; the user saw "queued behind X"
+            # in the chat. We preserve that by NOT gating in single-worker.
+            #
+            # Multi-worker gate logic:
+            #   - If MY worker is busy → don't claim. An idle sibling
+            #     picks it up. If ALL workers are busy, the doc sits with
+            #     no assignedWorker until the idle-rescan loop (PR 2,
+            #     follow-up commit) catches it on the next worker idle.
+            #   - Else → try claim. On win, fall through to existing
+            #     status-decision + side-effect path. On loss, skip.
+            _multi_worker_mode = load_worker_count() > 1
+            if _multi_worker_mode and (
+                _QUEUE_STATE.get("running") or job_queue.qsize() > 0
+            ):
+                continue
+            if _firebase_db is not None:
+                from google.cloud import firestore as _firestore_claim
+                _claim_ref = doc.reference
+
+                @_firestore_claim.transactional
+                def _try_claim(t, _ref=_claim_ref, _wid=WORKER_ID):
+                    snap = _ref.get(transaction=t)
+                    if not snap.exists:
+                        return False  # already deleted by the winning worker
+                    d = snap.to_dict() or {}
+                    if d.get("assignedWorker") or d.get("processed"):
+                        return False  # already claimed/processed by sibling
+                    t.update(_ref, {
+                        "assignedWorker": _wid,
+                        "claimedAt": int(time.time() * 1000),
+                    })
+                    return True
+
+                try:
+                    if not _try_claim(_firebase_db.transaction()):
+                        log(f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}…", "DEBUG")
+                        continue
+                except Exception as _ce:
+                    log(f"[start-listener] worker {WORKER_ID}: claim TX exception (skipping): {_ce}", "WARN")
+                    continue
+                if _multi_worker_mode:
+                    log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}…", "INFO")
+
             # Generate run_id
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             log(f"Firestore start: uid={uid[:8]}... topic={topic[:40]} run_id={run_id}")
@@ -26039,6 +26095,132 @@ async def run_server(port=8000):
                 log(f"[queue-gate] Firestore read failed: {e}", "WARN")
             await asyncio.sleep(2)
 
+    async def _rescan_queue_for_unclaimed():
+        """Multi-worker orphan recovery (2026-05-21).
+
+        Scenario: N workers all busy when doc D arrives → every worker's
+        on_snapshot fires but each gates on busy → D sits in
+        `devices/{deviceId}/queue/` with no `assignedWorker`. Firestore
+        won't re-fire ADDED for D when a worker becomes idle (it's not
+        a new doc anymore), so without this rescan D would orphan.
+
+        Called from the worker's finally block (after every job ends).
+        On entry, the worker is idle. Scan the queue collection for
+        unclaimed start-action docs, attempt Firestore transactional
+        claim on the first match, and enqueue locally. Single attempt
+        per call — if the claim races and loses, the next worker idle
+        triggers another rescan.
+
+        No-op in single-worker mode (workerCount=1): the on_snapshot
+        listener doesn't gate on busy there, so all docs are enqueued
+        as they arrive; orphan path never reached.
+        """
+        if not _firebase_db:
+            return
+        if load_worker_count() <= 1:
+            return  # single-worker mode — listener never gates on busy
+        if _QUEUE_STATE.get("running") or _job_queue.qsize() > 0:
+            return  # not actually idle
+        did = load_device_id()
+        if not did:
+            return
+        try:
+            col = _firebase_db.collection("devices").document(did).collection("queue")
+            candidates = await asyncio.to_thread(lambda: list(col.limit(10).stream()))
+        except Exception as e:
+            log(f"[idle-rescan] worker {WORKER_ID}: scan failed: {e}", "WARN")
+            return
+
+        from google.cloud import firestore as _firestore_claim
+
+        for snap in candidates:
+            d = snap.to_dict() or {}
+            if d.get("processed") or d.get("assignedWorker"):
+                continue
+            if (d.get("action") or "start") != "start":
+                continue  # cancel/resume handled by their own paths
+            # Re-check busy before each claim attempt (could have flipped
+            # mid-scan if a sibling beat us to a different doc).
+            if _QUEUE_STATE.get("running") or _job_queue.qsize() > 0:
+                return
+
+            @_firestore_claim.transactional
+            def _try_claim_rescan(t, _ref=snap.reference, _wid=WORKER_ID):
+                s = _ref.get(transaction=t)
+                if not s.exists:
+                    return False
+                dd = s.to_dict() or {}
+                if dd.get("assignedWorker") or dd.get("processed"):
+                    return False
+                t.update(_ref, {
+                    "assignedWorker": _wid,
+                    "claimedAt": int(time.time() * 1000),
+                })
+                return True
+
+            try:
+                won = await asyncio.to_thread(
+                    _try_claim_rescan, _firebase_db.transaction()
+                )
+            except Exception as _ce:
+                log(f"[idle-rescan] worker {WORKER_ID}: claim TX exception: {_ce}", "WARN")
+                continue
+            if not won:
+                continue
+
+            # Won — replicate the listener's minimal start-action side
+            # effects: validate fields, flip research doc to ongoing,
+            # delete the queue doc, enqueue locally. We DON'T replicate
+            # the full listener (stale-skip, cancel handling, etc.) —
+            # those are only relevant for newly-arrived docs the
+            # listener already gated.
+            uid = (d.get("uid") or "").strip()
+            research_id = (d.get("researchId") or "").strip()
+            topic = (d.get("topic") or "").strip()
+            if not uid or not research_id or not topic:
+                log(f"[idle-rescan] claimed doc missing required fields — deleting", "WARN")
+                try:
+                    await asyncio.to_thread(snap.reference.delete)
+                except Exception:
+                    pass
+                continue
+
+            run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan {research_id[:8]}… ({topic[:40]})")
+
+            # Flip research-doc status to ongoing (the listener path
+            # writes this when the worker is idle on first dequeue;
+            # mirror that here for the rescanned doc).
+            try:
+                _update_research_doc(uid, research_id, {
+                    "backendRunId": run_id,
+                    "status": "ongoing",
+                })
+            except Exception as _ue:
+                log(f"[idle-rescan] research-doc update failed: {_ue}", "WARN")
+
+            # Delete the queue doc — we've claimed and are about to run.
+            try:
+                await asyncio.to_thread(snap.reference.delete)
+            except Exception:
+                pass
+
+            # Enqueue locally. Use _safe_enqueue mirror of the listener
+            # path so cancellations between claim and enqueue still
+            # reach the right place.
+            _safe_enqueue(_job_queue, {
+                "topic": topic,
+                "email": d.get("email", ""),
+                "config": d.get("config", {}),
+                "run_id": run_id,
+                "uid": uid,
+                "research_id": research_id,
+                "brief_text": (d.get("briefText") or "").strip(),
+                "user_sources": d.get("userSources") or [],
+                "user_links": d.get("userLinks") or [],
+            }, source="idle-rescan")
+            return  # one at a time — let the worker process this before next rescan
+
     async def _job_worker():
         """Process pipeline jobs one at a time from the queue."""
         while True:
@@ -26267,6 +26449,18 @@ async def run_server(port=8000):
                             _persist_pending_queue(current_job=None)
                 else:
                     _persist_pending_queue(current_job=None)
+                # Multi-worker idle rescan (2026-05-21). If a sibling
+                # worker was busy when a queue doc arrived AND so was I,
+                # the on_snapshot listener gated both of us → doc orphaned
+                # in devices/{deviceId}/queue/ with no assignedWorker.
+                # Now that I'm idle, check for unclaimed docs and pick
+                # one up. No-op in single-worker mode. Fire-and-forget —
+                # the worker's next loop iteration awaits _job_queue.get()
+                # which the rescan's _safe_enqueue feeds.
+                try:
+                    asyncio.create_task(_rescan_queue_for_unclaimed())
+                except Exception as _re:
+                    log(f"[idle-rescan] launch failed (non-fatal): {_re}", "WARN")
 
     # Worker + Firestore start listener are launched below in the direct
     # startup path (before `await server.serve()`). We used to ALSO register
