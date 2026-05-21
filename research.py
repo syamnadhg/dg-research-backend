@@ -1911,6 +1911,45 @@ async def _revoked_recovery_loop():
                     poll_timeout_seconds=15 * 60,
                 )
                 log("[relink] new refresh token bootstrapped to keystore", "INFO")
+                # CRITICAL: cancel the 5-min `expireAt` TTL on the device
+                # doc BEFORE exiting. The claim Cloud Function (Branch 1
+                # re-pair / Branch 2 initial-pair) wrote `expireAt: now+5min`
+                # as the "BE-must-confirm" deadline. Without this patch:
+                #   t=0   user re-pairs → device doc has expireAt: now+5min
+                #   t=0.5s BE picks up customToken, bootstraps fresh keystore
+                #   t=1s  BE _os._exit(0) → daemon-loop respawns
+                #   t=6-30s new --serve completes init (DPAPI + gRPC + port)
+                #   t=30s+ heartbeat fires → tries to clear expireAt
+                #   IF respawn takes >5min (rare but not impossible on cold
+                #   start with antivirus / heavy load) OR if heartbeat's
+                #   first tick lands after the TTL fired → Firestore TTL
+                #   DELETES the entire devices/{deviceId} doc. Once gone:
+                #   deviceAuthorizedFor returns false (no ownerUid lookup
+                #   target) → every Storage/Firestore cross-tree call 403s
+                #   → audio upload broken, source download broken, queue
+                #   writes rejected by the FE-side `isDeviceMember` rule.
+                # cmd_pair_v2 Stage 1 (research.py:~26931) does this eager
+                # patch already; the recovery path was missed when Track D
+                # shipped. _pair_patch_device uses REST PATCH so it works
+                # with just the freshly-minted ID token (no gRPC client
+                # required).
+                try:
+                    if _pair_patch_device(
+                        device_id,
+                        {"pairConfirmedAt": True},
+                        delete_fields=["expireAt"],
+                    ):
+                        log(
+                            "[relink] device-doc TTL canceled — pairConfirmedAt set + expireAt cleared; doc survives supervisor respawn",
+                            "INFO",
+                        )
+                    else:
+                        log(
+                            "[relink] device-confirm patch failed (heartbeat will retry post-respawn — race window with the 5-min TTL)",
+                            "WARN",
+                        )
+                except Exception as _confirm_err:
+                    log(f"[relink] device-confirm patch raised: {_confirm_err}", "WARN")
                 # Exit so the supervisor respawns with a fresh Firestore
                 # client + fresh listener subscriptions. In-process swap
                 # would leave the old listeners pointing at the revoked
