@@ -7715,7 +7715,13 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
 
         tab = None
         try:
-            tab = await browser.new_tab(root)
+            # open_isolated_tab (NOT new_tab) — verify is a throwaway: we
+            # open the tab, check login/tier, close it in finally. Using
+            # new_tab here clobbers self.page; tab.close() then leaves
+            # self.page pointing at a dead page and run_phase1's first
+            # navigate dies with TargetClosedError. open_isolated_tab
+            # preserves self.page across the verify call.
+            tab = await browser.open_isolated_tab(root)
             # Settle for SPA hydration — same delay Phase 0 uses (line ~19894)
             # to dodge the "loading shell" false-positive on Claude/Gemini.
             await asyncio.sleep(4.0)
@@ -11989,7 +11995,47 @@ class Browser:
 
     async def navigate(self, url):
         log(f"Navigating: {url}")
-        await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        # Self-heal if self.page was closed out from under us. Common
+        # trigger: a throwaway tab opened via new_tab() (which reassigns
+        # self.page) and then close()'d by the caller — e.g. the verify-
+        # at-phase-time flow at :7718 / :7851. Pre-fix, run_phase1's
+        # first navigate hit TargetClosedError on the stale self.page
+        # because nothing restored it post-verify. context.new_page()
+        # gives us a live page on the same persistent profile (logins
+        # survive) so the goto below lands somewhere alive.
+        if self.page is None or self.page.is_closed():
+            log("navigate: self.page closed — opening fresh page", "WARN")
+            self.page = await self.context.new_page()
+            self._known_pages.add(self.page)
+            try:
+                self.page.on("close", lambda p: self._known_pages.discard(p))
+            except Exception:
+                pass
+            self._attach_file_handler(self.page)
+        try:
+            await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            # One retry on page-death-class failures (TargetClosedError
+            # surfaces as "Target page, context or browser has been closed").
+            # Bounded to one retry so context-level death (driver EPIPE,
+            # network) still surfaces to the caller's snag handler instead
+            # of looping forever.
+            msg = str(e).lower()
+            if ("target page" in msg or "browser has been closed" in msg
+                    or "page, context" in msg):
+                log(f"navigate: page died mid-goto ({type(e).__name__}) — recreating + retry once", "WARN")
+                try: await self.page.close()
+                except Exception: pass
+                self.page = await self.context.new_page()
+                self._known_pages.add(self.page)
+                try:
+                    self.page.on("close", lambda p: self._known_pages.discard(p))
+                except Exception:
+                    pass
+                self._attach_file_handler(self.page)
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            else:
+                raise
 
     async def new_tab(self, url=None):
         """Open new tab. Sets self.page to the new tab."""
@@ -12009,6 +12055,27 @@ class Browser:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
         self._attach_file_handler(self.page)
         return self.page
+
+    async def open_isolated_tab(self, url=None):
+        """Open a throwaway tab WITHOUT touching self.page. Use for
+        verify/probe tabs the caller will close in a finally. Critical
+        because new_tab() reassigns self.page — closing the returned
+        page would leave self.page pointing at a dead page and break
+        the next Browser-level navigate. See verify_at_phase_time
+        (:7718) — pre-fix, that flow used new_tab + tab.close() and
+        crashed P1's first navigate with TargetClosedError every time
+        skipInitVerify was on."""
+        page = await self.context.new_page()
+        self._known_pages.add(page)
+        try:
+            page.on("close", lambda p: self._known_pages.discard(p))
+        except Exception:
+            pass
+        if url:
+            log(f"New tab: {url}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        self._attach_file_handler(page)
+        return page
 
     async def switch_to_page(self, page):
         self.page = page
