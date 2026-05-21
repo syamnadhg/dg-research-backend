@@ -18381,6 +18381,106 @@ async def setup_chatgpt_dr(page) -> bool:
         return False
 
 
+async def _gemini_select_pro_model(page) -> bool:
+    """Pre-DR step: open the model dropdown and select 2.5 Pro.
+
+    Why this matters: Gemini Advanced accounts default to "2.5 Flash" in
+    the composer; enabling Deep Research without first picking 2.5 Pro
+    leaves the DR job running on whatever the dropdown happens to show
+    (Flash / Flash-Lite). The shallower model produces a far weaker
+    report — same class of regression as ChatGPT Free vs Pro. The README
+    contract says Phase 2 Gemini = "2.5 Pro / Deep Think + Deep Research".
+
+    Approach: find the model-name button at the top of the chat panel
+    (text starts with "Gemini" / "2.5"), click it, then click the menu
+    item whose label includes "2.5 Pro". Best-effort: if the dropdown
+    structure has rotated, return False — the caller proceeds with DR
+    enablement anyway and the run uses whatever model the dropdown was
+    on. We do NOT fail-hard because (a) the run is still usable on
+    Flash if Pro selection breaks, and (b) the existing Pro-tier alert
+    surfaces tier misconfiguration through a different path.
+
+    Returns True when 2.5 Pro is visibly selected; False on any miss.
+    """
+    try:
+        # Step 1: find the model dropdown button. Gemini's current UI uses
+        # a button at the top of the chat header whose text is the current
+        # model name ("2.5 Flash", "2.5 Pro", "Gemini 2.5 Pro", etc.). The
+        # button usually has aria-haspopup="menu" or a chevron icon.
+        # Common selectors across UI versions:
+        #   - bard-mode-menu-button (legacy data-test-id)
+        #   - button[aria-label*="model" i]
+        #   - button[aria-haspopup="menu"] near the top of the page whose
+        #     text contains "Gemini" / "2.5" / "Flash" / "Pro"
+        opened = await page.evaluate("""() => {
+            const isTopOfPage = (b) => {
+                const r = b.getBoundingClientRect();
+                return r.top < window.innerHeight * 0.25 && r.width > 0;
+            };
+            // Try precise selectors first.
+            const precise = document.querySelectorAll(
+                'bard-mode-menu-button button, ' +
+                'button[data-test-id="bard-mode-menu-button"], ' +
+                'button[aria-label*="model" i], ' +
+                'button[aria-label*="Switch model" i]'
+            );
+            for (const b of precise) {
+                if (b.offsetParent && isTopOfPage(b)) { b.click(); return true; }
+            }
+            // Fall back to text-pattern match across visible menu buttons.
+            const buttons = document.querySelectorAll('button[aria-haspopup="menu"], button[aria-expanded]');
+            for (const b of buttons) {
+                if (!b.offsetParent || !isTopOfPage(b)) continue;
+                const t = (b.textContent || '').trim();
+                if (/\\b(2\\.5|Gemini|Flash|Pro|Deep Think)\\b/i.test(t)) {
+                    b.click(); return true;
+                }
+            }
+            return false;
+        }""")
+        if not opened:
+            log("[setup_gemini_dr] model-pick: dropdown button not found — skipping Pro selection", "INFO")
+            return False
+        await asyncio.sleep(0.8)
+
+        # Step 2: click the "2.5 Pro" menu item. Match defensively against
+        # the variants Gemini has used: "2.5 Pro", "Gemini 2.5 Pro", and
+        # "Gemini 2.5 Pro (Preview)". Reject Flash / Flash-Lite / Deep
+        # Think items to avoid clicking the wrong sibling.
+        picked = await page.evaluate("""() => {
+            const items = document.querySelectorAll(
+                '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li');
+            for (const el of items) {
+                if (!el.offsetParent) continue;
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (!t) continue;
+                // Hard-reject sibling items so we don't accidentally click them.
+                if (t.includes('flash') || t.includes('deep think')) continue;
+                // Accept any item whose first line names 2.5 Pro.
+                if (/\\b2\\.5\\s*pro\\b/i.test(t) || /gemini\\s*2\\.5\\s*pro/i.test(t)) {
+                    el.click();
+                    return t.slice(0, 40);
+                }
+            }
+            return '';
+        }""")
+        if not picked:
+            log("[setup_gemini_dr] model-pick: 2.5 Pro item not found in dropdown — closing menu", "WARN")
+            # Best-effort: close the open dropdown so the next step's + button
+            # isn't sitting under an overlay.
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
+        await asyncio.sleep(0.8)
+        log(f"[setup_gemini_dr] model-pick OK: clicked '{picked}'")
+        return True
+    except Exception as e:
+        log(f"[setup_gemini_dr] model-pick exception: {e}", "WARN")
+        return False
+
+
 async def setup_gemini_dr(page) -> bool:
     """Enable Gemini Deep Research. Returns True only when DR is verified
     ACTIVE (pill visible + pressed/selected). Returns False otherwise so
@@ -18397,9 +18497,18 @@ async def setup_gemini_dr(page) -> bool:
     active-state attribute downgraded to a WARN-and-return-True — that
     silently shipped chat-mode briefs as Deep Research output. Strict
     verification is the cost of avoiding that class of bug.
+
+    2026-05-21: also pre-selects "2.5 Pro" via _gemini_select_pro_model
+    before enabling DR — without that, the dropdown's default of 2.5
+    Flash / Flash-Lite carried into the DR run (regression: user-
+    reported P2 Gemini brief shipped on Flash-Lite).
     """
     try:
         await asyncio.sleep(2)
+        # Best-effort: pick 2.5 Pro before opening + menu. Non-fatal if it
+        # misses (run proceeds on whatever model the dropdown was on).
+        await _gemini_select_pro_model(page)
+        await asyncio.sleep(0.5)
         direct_clicked = False
 
         # ── Step 1 (current UI 2026-05): + → More tools → Deep Research ──
@@ -23601,6 +23710,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             enabled_agents = [a for a, on in agents_cfg.items() if on]
             disabled_agents = [a for a, on in agents_cfg.items() if not on]
             log(f"[phase2] enabled_agents={enabled_agents} disabled_agents={disabled_agents}")
+            # Pre-emit phase_start(2) BEFORE the verify gate. Mirrors the
+            # P0→P1 eager-start pattern: without this, P1 ticked complete
+            # and the FE sat on a blank gap while the per-agent verify gate
+            # ran 4-15s of CUA verify_login calls (skip_init_verify path).
+            # _p2_initial_enabled remembers the pre-gate roster so the
+            # canonical re-emit below can detect whether the gate trimmed
+            # the list and re-fire with the corrected agents= field. Also
+            # writes "phase: 2, currentPhase: 2, status: ongoing" to root
+            # doc so the listing tile + queue gate flip immediately.
+            _p2_start_emitted = False
+            _p2_initial_enabled = list(enabled_agents)
+            if not _controls.is_stop():
+                emit_event("phase_start", phase=2, agents=enabled_agents,
+                           description="Parallel deep research across AI platforms")
+                _update_firestore_research({"phase": 2, "currentPhase": 2, "status": "ongoing"})
+                _p2_start_emitted = True
+
             # ── P2 verify gate (BE-2) ──
             # When init was skipped, re-verify each enabled agent's login +
             # Pro before P2 runs. Skip drops just that agent from
@@ -23629,8 +23755,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     emit_event("pipeline_stopped", phase=2,
                                reason="all_agents_skipped_at_verify_gate")
                     return
-            emit_event("phase_start", phase=2, agents=enabled_agents, description="Parallel deep research across AI platforms")
-            _update_firestore_research({"phase": 2, "currentPhase": 2, "status": "ongoing"})
+            # Canonical phase_start(2) re-emit — refreshes the agents= list
+            # post-verify-gate (gate may have dropped agents into the
+            # _p2_dropped_at_gate set). When the eager pre-emit above already
+            # fired with the un-trimmed list, this second emit overwrites the
+            # agents field cleanly via deterministic phaseId; if the eager
+            # emit was gated out (stop pressed mid-config-reload then cleared),
+            # this acts as the primary start.
+            if not _p2_start_emitted:
+                emit_event("phase_start", phase=2, agents=enabled_agents, description="Parallel deep research across AI platforms")
+                _update_firestore_research({"phase": 2, "currentPhase": 2, "status": "ongoing"})
+            elif enabled_agents != _p2_initial_enabled:
+                # Verify gate dropped one or more agents — re-emit so the FE
+                # tile reflects the trimmed enabled set.
+                emit_event("phase_start", phase=2, agents=enabled_agents, description="Parallel deep research across AI platforms")
             for da in disabled_agents:
                 # F2 (2026-05-06): emit with `reason` so the emit_event hook
                 # at :5818-5833 persists agents[<da>].status="skipped" to the
