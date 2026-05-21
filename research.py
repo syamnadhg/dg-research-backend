@@ -2747,21 +2747,41 @@ def start_firestore_start_listener(job_queue, loop):
                     try: doc.reference.delete()
                     except Exception: pass
                     continue
-                try:
-                    rs = _firebase_db.collection("users").document(target_uid) \
-                        .collection("researches").document(target_rid).get()
-                except Exception as ex:
-                    log(f"Resume: failed to read research doc: {ex}", "WARN")
-                    try: doc.reference.delete()
-                    except Exception: pass
-                    continue
-                if not rs.exists:
-                    log(f"Resume: research {target_rid[:8]}... not found", "WARN")
-                    try: doc.reference.delete()
-                    except Exception: pass
-                    continue
-                rd = rs.to_dict() or {}
-                backend_run_id = rd.get("backendRunId") or ""
+                # Track D: synth user can't read users/{ownerUid}/researches.
+                # FE now carries backendRunId in the queue payload, so the
+                # research-doc read is a fallback only (legacy Admin-SDK BEs
+                # or installs where the FE somehow forgot to include it).
+                # Initialize `rd` so the topic fallback at line ~2829 is
+                # safe even when we skip the doc-read branch entirely.
+                rd: dict = {}
+                backend_run_id = (data.get("backendRunId") or "").strip()
+                if not backend_run_id:
+                    try:
+                        rs = _firebase_db.collection("users").document(target_uid) \
+                            .collection("researches").document(target_rid).get()
+                    except Exception as ex:
+                        err_str = str(ex)
+                        if (
+                            "403" in err_str
+                            or "PERMISSION_DENIED" in err_str
+                            or "Missing or insufficient permissions" in err_str
+                        ):
+                            log(
+                                f"Resume: read denied on research doc + no backendRunId in payload — drop queue entry",
+                                "WARN",
+                            )
+                        else:
+                            log(f"Resume: failed to read research doc: {ex}", "WARN")
+                        try: doc.reference.delete()
+                        except Exception: pass
+                        continue
+                    if not rs.exists:
+                        log(f"Resume: research {target_rid[:8]}... not found", "WARN")
+                        try: doc.reference.delete()
+                        except Exception: pass
+                        continue
+                    rd = rs.to_dict() or {}
+                    backend_run_id = rd.get("backendRunId") or ""
                 if not backend_run_id:
                     log(f"Resume: research {target_rid[:8]}... has no backendRunId", "WARN")
                     try: doc.reference.delete()
@@ -21682,7 +21702,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             log(f"[config-overlay] FS podcastLength={_fs_pl} overrides disk={pipeline_config.get('podcastLength')}", "WARN")
                             pipeline_config["podcastLength"] = _fs_pl
         except Exception as _overlay_err:
-            log(f"[config-overlay] Firestore re-read failed (non-fatal): {_overlay_err}", "WARN")
+            _o_err = str(_overlay_err)
+            if (
+                "403" in _o_err
+                or "PERMISSION_DENIED" in _o_err
+                or "Missing or insufficient permissions" in _o_err
+            ):
+                # Track D: synth user denied on user-tree research-doc
+                # read. The disk-side pipelineConfig already merged
+                # ctrl_updates; FE-side queued-state toggles still need
+                # this overlay (see cleanup #552 for structural rule
+                # fix that lets synth user read research docs scoped
+                # to its deviceId).
+                log("[config-overlay] re-read denied (synth user) — using disk pipelineConfig", "DEBUG")
+            else:
+                log(f"[config-overlay] Firestore re-read failed (non-fatal): {_overlay_err}", "WARN")
         sp = set(pipeline_config.get("skipPhases", []))
         ac = pipeline_config.get("agents", {"chatgpt": True, "gemini": True, "claude": True})
         ve = pipeline_config.get("videoEnabled", True)
@@ -24524,12 +24558,12 @@ async def run_server(port=8000):
                 cur = (snap.to_dict() or {}).get("status")
                 if cur != "queued":
                     return f"skipped({cur})"
-                tx.update(doc_ref, {
+                tx.update(doc_ref, _be_payload({
                     "status": "ongoing",
                     "queuePosition": _firestore.DELETE_FIELD,
                     "queuedBehindRunId": _firestore.DELETE_FIELD,
                     "queuedBehindTitle": _firestore.DELETE_FIELD,
-                })
+                }))
                 return "flipped"
 
             outcome = _flip_txn(_firebase_db.transaction())
@@ -24593,7 +24627,7 @@ async def run_server(port=8000):
             for uid_v, rid_v, patch in patches[i:i + CHUNK]:
                 ref = _firebase_db.collection("users").document(uid_v) \
                     .collection("researches").document(rid_v)
-                batch.update(ref, patch)
+                batch.update(ref, _be_payload(patch))
             try:
                 batch.commit()
             except Exception as e:
@@ -24796,7 +24830,21 @@ async def run_server(port=8000):
                         _QUEUE_STATE.pop("gate_pending_job", None)
                         return
             except Exception as e:
-                log(f"[queue-gate] Firestore read failed: {e}", "WARN")
+                _e_str = str(e)
+                if (
+                    "403" in _e_str
+                    or "PERMISSION_DENIED" in _e_str
+                    or "Missing or insufficient permissions" in _e_str
+                ):
+                    # Track D: synth user denied on prior run's research
+                    # doc. Without a structural rule fix, we can't poll
+                    # the prior run's terminal status — fall through to
+                    # the deadline timeout, which force-dequeues at
+                    # BE_PHASES_TIMEOUT_SEC. Logged DEBUG to avoid WARN
+                    # spam every 2s.
+                    log("[queue-gate] read denied (synth user) — falling back to deadline timeout", "DEBUG")
+                else:
+                    log(f"[queue-gate] Firestore read failed: {e}", "WARN")
             await asyncio.sleep(2)
 
     async def _job_worker():
@@ -25273,7 +25321,31 @@ async def run_server(port=8000):
                         log(f"Rehydrate query ({status_val}) timed out after 15s — skipping", "WARN")
                         continue
                     except Exception as e:
-                        log(f"Rehydrate query ({status_val}) failed: {e}", "WARN")
+                        err_str = str(e)
+                        if (
+                            "403" in err_str
+                            or "PERMISSION_DENIED" in err_str
+                            or "Missing or insufficient permissions" in err_str
+                        ):
+                            # Track D: synth-device-user can't read
+                            # users/{ownerUid}/researches/* under the
+                            # current rules (allow read: if request.auth.uid
+                            # == userId). The device-side queue at
+                            # devices/{deviceId}/queue/* is the source of
+                            # truth for new submissions; on-disk queues/
+                            # checkpoints handle mid-run resume. Skip
+                            # Firestore-side rehydration silently.
+                            #
+                            # Structural fix (cleanup #552): add a
+                            # `deviceMemberOf` Firestore rule analogous to
+                            # `deviceWritingTo` so the synth user can read
+                            # research docs routed to its device.
+                            log(
+                                f"[rehydrate:{status_val}] read denied (synth user can't read user-tree research docs) — relying on device-queue + on-disk state",
+                                "DEBUG",
+                            )
+                        else:
+                            log(f"Rehydrate query ({status_val}) failed: {e}", "WARN")
                         continue
                     for snap in snaps:
                         data = snap.to_dict() or {}
@@ -25297,17 +25369,35 @@ async def run_server(port=8000):
                             device_id = data.get("deviceId") or ""
                             is_supervised = False
                             if device_id:
+                                # Track D: top-level devices/{deviceId} is the
+                                # canonical home; synth user CAN read its own
+                                # doc (rule: auth.uid == syntheticDeviceUid).
+                                # Legacy users/{ownerUid}/devices/{deviceId}
+                                # read 403s under synth auth, so try modern
+                                # first and only fall back on miss.
                                 try:
-                                    dev_snap = _firebase_db.collection("users") \
-                                        .document(paired_uid) \
-                                        .collection("devices") \
+                                    dev_snap = _firebase_db.collection("devices") \
                                         .document(device_id).get()
                                     if dev_snap.exists:
                                         is_supervised = bool(
                                             (dev_snap.to_dict() or {})
                                             .get("supervised", False))
                                 except Exception as _de:
-                                    log(f"Rehydrate: device read failed for {research_id[:24]}…: {_de}", "WARN")
+                                    log(f"Rehydrate: top-level device read failed for {research_id[:24]}…: {_de}", "WARN")
+                                if not is_supervised:
+                                    try:
+                                        dev_snap = _firebase_db.collection("users") \
+                                            .document(paired_uid) \
+                                            .collection("devices") \
+                                            .document(device_id).get()
+                                        if dev_snap.exists:
+                                            is_supervised = bool(
+                                                (dev_snap.to_dict() or {})
+                                                .get("supervised", False))
+                                    except Exception:
+                                        # Synth user is denied on user-tree
+                                        # devices subcollection — expected.
+                                        pass
 
                             auto_resumed = False
                             if is_supervised:
