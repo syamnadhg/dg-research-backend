@@ -22529,25 +22529,29 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # the upload or fix Storage permissions.
                 if _ok == 0 and _fail > 0:
                     log(f"Flow B: ALL {_fail} source downloads failed — aborting", "ERROR")
-                    # mark_phase_errored=False: this is a PREFLIGHT abort
-                    # — the pipeline never reached Phase 3 (NLM never ran),
-                    # so persisting `phases[3].status="errored"` would
-                    # paint the NLM icon red while the chat still shows
-                    # Phase 0 Init (the misleading state user flagged).
-                    # FE banner with Retry/Skip still fires via the
-                    # pipeline_error event; queue-gate _errored flag is
-                    # still set; only the icon-row taint is suppressed.
+                    # 2026-05-21: emit at whatever phase the pipeline is
+                    # currently at (preflight always runs early so this is
+                    # P0 in practice, but we read _runtime.phase dynamically
+                    # so the alert always lands on the user's visible tile,
+                    # not on the original Flow-B-target P3 NLM dropdown
+                    # that the user can't see while the chat is at P0).
+                    # Pre-fix: phase=3 hard-coded → alert vanished into the
+                    # P3 dropdown the user never opens, manifesting as
+                    # "stuck at init with no actionable button anywhere".
+                    # Skip action still routes to skip_phase(3) so user can
+                    # elect to run without NLM ingestion, but Retry restarts
+                    # the current phase since most 403s are token/auth races.
+                    _alert_phase = getattr(_runtime, "phase", 0) or 0
                     fail_phase(
-                        phase=3,
+                        phase=_alert_phase,
                         error=f"Couldn't download {_fail} attached source(s) from Storage",
-                        reason="The pipeline can't continue without the sources you attached. Re-attach and Retry, or Skip Phase 3 to run with no NotebookLM/podcast.",
+                        reason="The pipeline couldn't fetch the file(s) you attached. Most often this is a Storage rules / auth-token race — Retry first. If it keeps failing, Skip drops the attachments and continues with no NotebookLM ingestion.",
                         actions=[
                             {"id": "retry", "label": "Retry", "style": "primary",
-                             "command": {"action": "retry_phase", "phase": 3}},
-                            {"id": "skip", "label": "Skip Phase 3", "style": "default",
+                             "command": {"action": "retry_phase", "phase": _alert_phase}},
+                            {"id": "skip", "label": "Skip attachments", "style": "default",
                              "command": {"action": "skip_phase", "phase": 3}},
                         ],
-                        mark_phase_errored=False,
                     )
                     return
             except Exception as _outer:
