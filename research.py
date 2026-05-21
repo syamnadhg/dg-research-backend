@@ -11966,7 +11966,26 @@ class Browser:
         path = self._upload_queue.pop(chosen_idx)
         if Path(path).exists():
             log(f"File dialog intercepted — uploading: {Path(path).name} (accept={accept[:60] or 'unset'})")
-            await file_chooser.set_files(path)
+            # Wrap in try/except — pyee's AsyncIOEventEmitter turns any
+            # unhandled exception in this `page.on("filechooser", ...)`
+            # callback into a process-killing `raise error` (pyee/base.py
+            # _emit_handle_potential_error). Pre-fix, a TargetClosedError
+            # raised here when the page closed mid-upload (popup-guard
+            # racing the dialog, EPIPE from the Patchright Node driver
+            # during HV recovery, etc.) escalated the whole BE process
+            # to exit code 0xFFFFFFFF and the daemon-loop respawned —
+            # losing the in-flight pipeline and leaving the queue-gate
+            # wedged on a stale prior-run pointer. The page is gone; we
+            # have nothing useful to do with the file. Drop a WARN and
+            # let the caller's own retry / timeout path handle it.
+            try:
+                await file_chooser.set_files(path)
+            except Exception as _set_err:
+                log(
+                    f"File dialog set_files failed ({type(_set_err).__name__}): {_set_err} "
+                    f"— page may have closed mid-upload; swallowing to keep BE alive",
+                    "WARN",
+                )
         else:
             log(f"File dialog — queued file not found: {path}", "WARN")
 
@@ -25873,7 +25892,22 @@ async def run_server(port=8000):
                             _orphan_reason = "doc deleted"
                         else:
                             _prior_status = (_prior_snap.to_dict() or {}).get("status", "")
-                            if _prior_status in ("queued", "ongoing"):
+                            # Terminal-non-success statuses also qualify as
+                            # orphan: a prior run that errored / stopped /
+                            # was watchdog-killed never reaches FE-P5
+                            # (Phase 4 + 5 only run on a clean BE finish),
+                            # so the queue-gate's wait-for-prior-FE-P5
+                            # would block forever (BE_PHASES_TIMEOUT_SEC =
+                            # 4200s fallback). Treat them like queued/
+                            # ongoing — clear the gate so the next run
+                            # can dequeue. Pre-fix the gate wedged every
+                            # new submission with "waiting for prior run
+                            # … FE-P5 completion" for 70 minutes whenever
+                            # the prior run hit any failure path.
+                            if _prior_status in (
+                                "queued", "ongoing",
+                                "error", "errored", "stopped",
+                            ):
                                 _is_orphan = True
                                 _orphan_reason = f"status={_prior_status}"
                     except Exception as _orphan_check_err:
