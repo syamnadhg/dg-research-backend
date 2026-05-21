@@ -28102,6 +28102,122 @@ async def _continue_pair_stages_2_to_5(
     await browser.close()
 
     print("")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Multi-profile login loop (2026-05-21). Each successful profile = 1
+    # concurrent run slot. Gated on profile-1 success — no point chaining
+    # profiles when the primary failed. workerCount is persisted
+    # incrementally so a Ctrl+C mid-loop preserves the profiles that
+    # DID complete (e.g. user adds profile 2 ok, bails on profile 3 →
+    # workerCount stays at 2). PR 2 (daemon-loop) reads workerCount to
+    # spawn N --serve workers, each pinned to _profile_dir(k).
+    #
+    # Reuses _walk_platform_logins (above) so the per-platform UX is
+    # byte-identical to profile-1's walk. push_progress is None for
+    # profile-2+ — Firestore's devices/{deviceId}.logins map stays as
+    # the canonical profile-1 set (FE-visible login status); per-profile
+    # logins are tracked locally only.
+    # ══════════════════════════════════════════════════════════════════════
+    if all_ok and not cancelled:
+        # Anchor profile-1 as the baseline (covers the downgrade path: a
+        # prior pair may have set workerCount=3, and the user now wants 1.
+        # This write resets the floor before the loop bumps it back up.)
+        try:
+            save_worker_count(1)
+        except Exception as _wc_err:
+            log(f"save_worker_count(1) failed (continuing): {_wc_err}", "WARN")
+
+        print(f"  {_c(_OK, '✓')}  Profile 1 logins complete.")
+        print("")
+        print(f"  {_c(_DIM, 'Each browser profile = 1 concurrent run slot. Recommended: 2 profiles total.')}")
+        print(f"  {_c(_DIM, 'Past your slot count, fired runs go into the queue.')}")
+        print("")
+
+        next_profile_n = 2
+        while True:
+            try:
+                ans = (await asyncio.to_thread(
+                    input,
+                    f"  {_c(_ACCENT, '>')}  Add another browser profile (profile {next_profile_n})? {_c(_DIM, '[y/N]')}: ",
+                )).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                log(f"Multi-profile loop: Ctrl+C at profile {next_profile_n} prompt — keeping workerCount={next_profile_n - 1}", "INFO")
+                break
+            if ans not in ("y", "yes"):
+                break
+
+            prof_path = _profile_dir(next_profile_n)
+            print(f"  {_c(_DIM, f'Opening browser profile {next_profile_n} at {prof_path}…')}")
+            try:
+                browser_n = Browser(str(prof_path), headless=False)
+                await browser_n.start()
+            except Exception as e:
+                log(f"Setup: failed to open browser for profile {next_profile_n}: {e}", "ERROR")
+                print(f"  {_c(_WARN, f'Could not launch browser for profile {next_profile_n}: {e}')}")
+                print(f"  {_c(_DIM, 'Stopping multi-profile loop. Pair continues with the profiles already set up.')}")
+                break
+
+            # F4 / DGOPS-7451 awareness — profile-N is fresh on first setup,
+            # but a re-pair may find leftover cookies. We surface a passive
+            # notice; the device is already paired to linked_uid, so prior
+            # cookies likely belong to the same account. A stricter "refuse
+            # if account_mismatch" gate would need to read the cookie's
+            # account_id which Stage 4 doesn't do either — keep symmetric.
+            try:
+                prior_n = await _detect_persisted_google_auth(browser_n.context)
+            except Exception as _de:
+                log(f"[security] profile {next_profile_n} preflight detection failed (continuing): {_de}", "WARN")
+                prior_n = None
+            if prior_n:
+                _n_cookies = prior_n.get("cookieMatches", 0) if isinstance(prior_n, dict) else 0
+                _msg = f"Profile {next_profile_n}: {_n_cookies} prior Google auth cookie(s) detected — continuing (presumed same account)."
+                print(f"  {_c(_DIM, _msg)}")
+
+            # Fresh results dict per profile — push_progress=None so the
+            # canonical Firestore logins map stays bound to profile-1.
+            profile_n_results: "dict[str, bool]" = {}
+            n_cancelled, pair_pro_acknowledged = await _walk_platform_logins(
+                browser_n,
+                services,
+                _setup_cua_client,
+                results=profile_n_results,
+                emit_row=_emit_row,
+                push_progress=None,
+                initial_pro_acknowledged=pair_pro_acknowledged,
+            )
+
+            n_all_ok = (not n_cancelled) and all(
+                profile_n_results.get(k, False) for _n, _u, k in services
+            )
+
+            try:
+                await browser_n.close()
+            except Exception:
+                pass
+
+            print("")
+            if n_all_ok:
+                try:
+                    save_worker_count(next_profile_n)
+                except Exception as _wc_err:
+                    log(f"save_worker_count({next_profile_n}) failed (continuing): {_wc_err}", "WARN")
+                print(f"  {_c(_OK, '✓')}  Profile {next_profile_n} logins complete — concurrent capacity is now {next_profile_n}.")
+                next_profile_n += 1
+            else:
+                if n_cancelled:
+                    print(f"  {_c(_WARN, '⚠')}  Profile {next_profile_n} logins cancelled — keeping workerCount={next_profile_n - 1}.")
+                else:
+                    _missing = [_name for _name, _u, _key in services if not profile_n_results.get(_key, False)]
+                    print(f"  {_c(_WARN, '⚠')}  Profile {next_profile_n} logins incomplete — keeping workerCount={next_profile_n - 1}.")
+                    if _missing:
+                        print(f"       {_c(_DIM, 'Did not verify: ' + ', '.join(_missing))}")
+                # Don't increment — the dir at _profile_dir(next_profile_n)
+                # may have stale partial cookies. User can wipe via
+                # --unpair --deep and re-pair to retry that slot.
+                break
+        print("")
+
     if all_ok:
         # ══════════════════════════════════════════════════════════════════════
         # [5/5] READY — pair is complete. If the user opted into On Startup
