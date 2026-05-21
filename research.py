@@ -96,6 +96,25 @@ if sys.stderr is not None:
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 PROFILE_DIR = Path.home() / ".super-research" / "browser-profile"
+
+
+def _profile_dir(n: int) -> Path:
+    """Browser profile dir for worker `n`. Worker 1 returns the legacy
+    PROFILE_DIR path (`~/.super-research/browser-profile/`) so existing
+    installs keep their cookies on the same disk location — no migration.
+    Workers ≥2 return `~/.super-research/browser-profile-{n}/`, created
+    on first use by the Patchright launcher when pair Stage 4 opens its
+    Browser instance for that profile.
+
+    Each profile = 1 concurrent run slot. The total profile count for
+    this device lives in `research_config.json.workerCount` (see
+    load_worker_count / save_worker_count).
+    """
+    if n <= 1:
+        return PROFILE_DIR
+    return Path.home() / ".super-research" / f"browser-profile-{n}"
+
+
 BETA_FLAG = "computer-use-2025-11-24"
 # All configurable via env vars (defaults are production-tuned)
 CUA_MODEL = os.environ.get("CUA_MODEL", "claude-opus-4-7")
