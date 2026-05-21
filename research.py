@@ -25852,7 +25852,19 @@ async def run_server(port=8000):
     # Snapshot to disk on every worker boundary so a Phoenix restart can
     # restore. Firestore-driven rehydration (line ~17850) takes precedence;
     # this is a belt-and-suspenders fallback for racing/network-blocked cases.
-    _pending_queue_path = queues_root / "_pending_queue.json"
+    # Per-worker pending-queue file (2026-05-21). Pre-multi-worker, all
+    # writers raced on `_pending_queue.json` (+ its `.tmp` sibling). With
+    # N workers, the tmp-then-replace dance still races: two workers
+    # writing different snapshots both name the tmp the same, the second
+    # write clobbers the first mid-buffer. Per-worker file isolates each
+    # snapshot. Restore (research.py:~26649, 26991) reads MY worker's
+    # file only — siblings restore their own. Single-worker installs
+    # keep the legacy filename (worker 1 = no suffix) so a pre-PR install
+    # that never re-pairs into multi-worker still finds its snapshot.
+    if WORKER_ID == 1:
+        _pending_queue_path = queues_root / "_pending_queue.json"
+    else:
+        _pending_queue_path = queues_root / f"_pending_queue_worker_{WORKER_ID}.json"
 
     # Forward declaration so the module-scope device-cmd listener at
     # research.py:1766 can call this closure via _QUEUE_STATE["persist_fn"].
