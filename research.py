@@ -18382,36 +18382,37 @@ async def setup_chatgpt_dr(page) -> bool:
 
 
 async def _gemini_select_pro_model(page) -> bool:
-    """Pre-DR step: open the model dropdown and select 2.5 Pro.
+    """Pre-DR step: open the model dropdown and select 3.1 Pro.
 
-    Why this matters: Gemini Advanced accounts default to "2.5 Flash" in
-    the composer; enabling Deep Research without first picking 2.5 Pro
-    leaves the DR job running on whatever the dropdown happens to show
-    (Flash / Flash-Lite). The shallower model produces a far weaker
-    report — same class of regression as ChatGPT Free vs Pro. The README
-    contract says Phase 2 Gemini = "2.5 Pro / Deep Think + Deep Research".
+    Why this matters: Gemini Advanced accounts default to "3.1 Flash" /
+    "Flash-Lite" in the composer; enabling Deep Research without first
+    picking 3.1 Pro leaves the DR job running on whatever the dropdown
+    happens to show. The shallower model produces a far weaker report —
+    same class of regression as ChatGPT Free vs Pro.
 
     Approach: find the model-name button at the top of the chat panel
-    (text starts with "Gemini" / "2.5"), click it, then click the menu
-    item whose label includes "2.5 Pro". Best-effort: if the dropdown
-    structure has rotated, return False — the caller proceeds with DR
-    enablement anyway and the run uses whatever model the dropdown was
-    on. We do NOT fail-hard because (a) the run is still usable on
-    Flash if Pro selection breaks, and (b) the existing Pro-tier alert
-    surfaces tier misconfiguration through a different path.
+    (text shows current model — "Gemini", "3.1", "Flash", "Pro", etc.),
+    click it, then click the menu item whose label includes "3.1 Pro".
+    Best-effort: if the dropdown structure has rotated or 3.1 Pro is
+    not available on this account, return False — the caller proceeds
+    with DR enablement anyway and the run uses whatever model the
+    dropdown was on. We do NOT fail-hard because (a) the run is still
+    usable on Flash if Pro selection breaks, and (b) the existing
+    Pro-tier alert surfaces tier misconfiguration through a different
+    path.
 
-    Returns True when 2.5 Pro is visibly selected; False on any miss.
+    Returns True when 3.1 Pro is visibly selected; False on any miss.
     """
     try:
         # Step 1: find the model dropdown button. Gemini's current UI uses
         # a button at the top of the chat header whose text is the current
-        # model name ("2.5 Flash", "2.5 Pro", "Gemini 2.5 Pro", etc.). The
+        # model name ("3.1 Flash", "3.1 Pro", "Gemini 3.1 Pro", etc.). The
         # button usually has aria-haspopup="menu" or a chevron icon.
         # Common selectors across UI versions:
         #   - bard-mode-menu-button (legacy data-test-id)
         #   - button[aria-label*="model" i]
         #   - button[aria-haspopup="menu"] near the top of the page whose
-        #     text contains "Gemini" / "2.5" / "Flash" / "Pro"
+        #     text contains "Gemini" / "3.1" / "Flash" / "Pro"
         opened = await page.evaluate("""() => {
             const isTopOfPage = (b) => {
                 const r = b.getBoundingClientRect();
@@ -18428,11 +18429,14 @@ async def _gemini_select_pro_model(page) -> bool:
                 if (b.offsetParent && isTopOfPage(b)) { b.click(); return true; }
             }
             // Fall back to text-pattern match across visible menu buttons.
+            // Accept any version-number prefix (3.1 / 3.0 / 2.5) so the
+            // probe still finds the dropdown if Google rotates the
+            // model-name label between versions.
             const buttons = document.querySelectorAll('button[aria-haspopup="menu"], button[aria-expanded]');
             for (const b of buttons) {
                 if (!b.offsetParent || !isTopOfPage(b)) continue;
                 const t = (b.textContent || '').trim();
-                if (/\\b(2\\.5|Gemini|Flash|Pro|Deep Think)\\b/i.test(t)) {
+                if (/\\b(\\d\\.\\d|Gemini|Flash|Pro|Deep Think)\\b/i.test(t)) {
                     b.click(); return true;
                 }
             }
@@ -18443,9 +18447,9 @@ async def _gemini_select_pro_model(page) -> bool:
             return False
         await asyncio.sleep(0.8)
 
-        # Step 2: click the "2.5 Pro" menu item. Match defensively against
-        # the variants Gemini has used: "2.5 Pro", "Gemini 2.5 Pro", and
-        # "Gemini 2.5 Pro (Preview)". Reject Flash / Flash-Lite / Deep
+        # Step 2: click the "3.1 Pro" menu item. Match defensively against
+        # the variants Gemini uses: "3.1 Pro", "Gemini 3.1 Pro", and
+        # "Gemini 3.1 Pro (Preview)". Reject Flash / Flash-Lite / Deep
         # Think items to avoid clicking the wrong sibling.
         picked = await page.evaluate("""() => {
             const items = document.querySelectorAll(
@@ -18456,8 +18460,8 @@ async def _gemini_select_pro_model(page) -> bool:
                 if (!t) continue;
                 // Hard-reject sibling items so we don't accidentally click them.
                 if (t.includes('flash') || t.includes('deep think')) continue;
-                // Accept any item whose first line names 2.5 Pro.
-                if (/\\b2\\.5\\s*pro\\b/i.test(t) || /gemini\\s*2\\.5\\s*pro/i.test(t)) {
+                // Accept any item whose first line names 3.1 Pro.
+                if (/\\b3\\.1\\s*pro\\b/i.test(t) || /gemini\\s*3\\.1\\s*pro/i.test(t)) {
                     el.click();
                     return t.slice(0, 40);
                 }
@@ -18465,7 +18469,7 @@ async def _gemini_select_pro_model(page) -> bool:
             return '';
         }""")
         if not picked:
-            log("[setup_gemini_dr] model-pick: 2.5 Pro item not found in dropdown — closing menu", "WARN")
+            log("[setup_gemini_dr] model-pick: 3.1 Pro item not found in dropdown — closing menu", "WARN")
             # Best-effort: close the open dropdown so the next step's + button
             # isn't sitting under an overlay.
             try:
@@ -18498,8 +18502,8 @@ async def setup_gemini_dr(page) -> bool:
     silently shipped chat-mode briefs as Deep Research output. Strict
     verification is the cost of avoiding that class of bug.
 
-    2026-05-21: also pre-selects "2.5 Pro" via _gemini_select_pro_model
-    before enabling DR — without that, the dropdown's default of 2.5
+    2026-05-21: also pre-selects "3.1 Pro" via _gemini_select_pro_model
+    before enabling DR — without that, the dropdown's default of 3.1
     Flash / Flash-Lite carried into the DR run (regression: user-
     reported P2 Gemini brief shipped on Flash-Lite).
     """
