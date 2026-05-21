@@ -1945,7 +1945,7 @@ async def _revoked_recovery_loop():
 _device_cmd_watch = None  # Firestore Watch handle; kept for lifetime cleanup
 
 
-def _start_device_command_listener(uid: str, device_id: str):
+def _start_device_command_listener(uid: str, device_id: str, loop=None):
     """Subscribe to devices/{deviceId}/commands so the FE can issue
     device-level commands that aren't scoped to a particular research
     run (e.g. `hard_reset` from the Account-page Online pill, or
@@ -2112,12 +2112,60 @@ def _start_device_command_listener(uid: str, device_id: str):
                             _QUEUE_STATE["last_completed_uid"] = None
                             _QUEUE_STATE["last_completed_rid"] = None
                             _QUEUE_STATE["last_be_done_at"] = 0
+                            # Also clear gate_pending_job so any worker
+                            # currently sitting in _wait_for_prior_fe_
+                            # completion immediately falls through on
+                            # its next is_stop() check (we set request
+                            # _stop below in the foreground branch).
+                            _QUEUE_STATE.pop("gate_pending_job", None)
                             _persist_fn(current_job=None)
                         log("[device-cmds] HARD_RESET: cleared queue-gate state and persisted clean snapshot")
                 except Exception as _ge:
                     log(f"[device-cmds] HARD_RESET: gate clear/persist failed: {_ge}", "WARN")
-                log("[device-cmds] HARD_RESET: scheduling exit in 1.5s — daemon-loop will respawn")
-                _schedule_server_exit("device-hard-reset", delay_sec=1.5)
+
+                # Supervisor detection. If a daemon-loop process is alive,
+                # os._exit lets it respawn us cleanly. If not (foreground
+                # --serve run), os._exit kills the BE permanently — the
+                # user wouldn't see Online come back. Detect via process
+                # enumeration: any python(.exe) with --daemon-loop in its
+                # command line is the supervisor.
+                _supervisor_alive = False
+                try:
+                    self_pid = os.getpid()
+                    for pid, _cmd, role in _enumerate_research_py_procs():
+                        if pid != self_pid and role == "daemon-loop":
+                            _supervisor_alive = True
+                            break
+                except Exception as _enum_err:
+                    log(f"[device-cmds] HARD_RESET: supervisor detect failed (assuming foreground): {_enum_err}", "DEBUG")
+
+                if _supervisor_alive:
+                    log("[device-cmds] HARD_RESET: scheduling exit in 1.5s — daemon-loop will respawn")
+                    _schedule_server_exit("device-hard-reset", delay_sec=1.5)
+                else:
+                    # Foreground --serve. Don't os._exit — the user is
+                    # watching their terminal and a silent process death
+                    # leaves the FE tile offline with no auto-recovery.
+                    # Instead: request_stop on any active run (so the
+                    # worker's finally drains cleanly), keep the
+                    # heartbeat + listeners alive, and let the FE's next
+                    # tile poll see us still online with a freshly-
+                    # cleared gate state.
+                    log("[device-cmds] HARD_RESET: foreground mode — clearing in-place (no daemon-loop detected)")
+                    if loop is not None:
+                        try:
+                            loop.call_soon_threadsafe(_controls.request_stop)
+                            log("[device-cmds] HARD_RESET: complete — active run signalled to stop, gate cleared, BE staying up")
+                        except Exception as _rs_err:
+                            log(f"[device-cmds] HARD_RESET: request_stop dispatch failed: {_rs_err}", "WARN")
+                    else:
+                        # Pre-run_server-init hard_reset (boot-time race)
+                        # or call site that didn't pass the loop. Gate is
+                        # already cleared; just log and continue. Any
+                        # active run on this BE will keep running, which
+                        # is fine — gate state is the thing that matters
+                        # for unstucking the next pipeline.
+                        log("[device-cmds] HARD_RESET: no event loop ref — gate cleared, no active-run stop signal sent", "WARN")
                 continue
 
             if action == "clear_local_storage":
@@ -24836,6 +24884,18 @@ async def run_server(port=8000):
             log("[queue-gate] prior run errored — skipping FE-completion wait")
             return
         deadline = _pdone + BE_PHASES_TIMEOUT_SEC * 1000
+        # Mid-session stuck-status self-heal — if the prior FE-P5 just
+        # legitimately ghosted (user closed the tab, FE-P5 errored without
+        # flipping status, browser was force-quit), the gate previously
+        # waited the full 70-min deadline before giving up. Now: take a
+        # snapshot of (status, feP5State) on entry and force-release if
+        # both stay unchanged for STUCK_STATUS_RELEASE_MS (5 min). The
+        # deadline still backstops the slow-FE-P5 case (large YouTube
+        # uploads), but the common-case stuck-prior gets unstuck in 5 min
+        # without needing a BE restart or Reset Backend tap.
+        STUCK_STATUS_RELEASE_MS = 5 * 60 * 1000
+        _stuck_first_seen_ms: int = 0
+        _stuck_status_signature: str = ""  # f"{status}|{feP5State}"
         log(f"[queue-gate] waiting for prior run {_prid[:8]}… FE-P5 completion (fallback in {BE_PHASES_TIMEOUT_SEC}s)")
         # 2026-05-12: register the gate-pending job so cancel handlers can
         # see it. Without this, a cancel that arrives while the worker is
@@ -24895,6 +24955,26 @@ async def run_server(port=8000):
                     # Release the gate on this fast-fail marker too.
                     if fe_p5_state == "failed":
                         log("[queue-gate] prior run's FE-P5 failed — dequeueing")
+                        _QUEUE_STATE.pop("gate_pending_job", None)
+                        return
+                    # Stuck-status self-heal: if (status, feP5State) hasn't
+                    # changed in STUCK_STATUS_RELEASE_MS, the prior FE has
+                    # ghosted and is never coming back. Force-release. The
+                    # first-seen marker resets on any signature change so
+                    # a slow-but-progressing FE-P5 (e.g., long YouTube
+                    # upload that flips feP5State queued→running→completed
+                    # over several minutes) doesn't trip the heal.
+                    _sig = f"{status}|{fe_p5_state}"
+                    if _sig != _stuck_status_signature:
+                        _stuck_status_signature = _sig
+                        _stuck_first_seen_ms = now_ms
+                    elif (now_ms - _stuck_first_seen_ms) >= STUCK_STATUS_RELEASE_MS:
+                        log(
+                            f"[queue-gate] prior run {_prid[:8]}… stuck at "
+                            f"({status},{fe_p5_state}) for "
+                            f"{int((now_ms - _stuck_first_seen_ms) / 1000)}s — "
+                            f"FE-P5 ghosted, force-dequeueing"
+                        )
                         _QUEUE_STATE.pop("gate_pending_job", None)
                         return
             except Exception as e:
@@ -25692,7 +25772,11 @@ async def run_server(port=8000):
             _paired_uid_for_cmds = load_paired_uid() or ""
             _device_id_for_cmds = load_device_id() or ""
             if _paired_uid_for_cmds and _device_id_for_cmds:
-                _start_device_command_listener(_paired_uid_for_cmds, _device_id_for_cmds)
+                _start_device_command_listener(
+                    _paired_uid_for_cmds,
+                    _device_id_for_cmds,
+                    loop=asyncio.get_event_loop(),
+                )
         except Exception as _dce:
             log(f"[device-cmds] listener attach failed: {_dce}", "WARN")
 
