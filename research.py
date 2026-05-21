@@ -23080,7 +23080,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     if not (queue_dir / "delivery.json").exists():
         update_delivery()
 
-    browser = Browser(PROFILE_DIR, headless=False)
+    browser = Browser(_profile_dir(WORKER_ID), headless=False)
     # Expose the live Browser instance to the stop / discard / hard-reset
     # paths so they can schedule a graceful close without waiting for
     # the pipeline to reach its next is_stop() phase boundary. Pause+resume
@@ -24003,7 +24003,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _update_firestore_research({"status": "stopped", "phase": 1})
                     return
                 # Relaunch browser on resume
-                browser = Browser(PROFILE_DIR, headless=False)
+                browser = Browser(_profile_dir(WORKER_ID), headless=False)
                 await browser.start()
                 _active_browser_ref = browser  # re-point stop handler at fresh session
                 emit_event("pipeline_resumed", phase=1)
@@ -24488,7 +24488,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _update_firestore_research({"status": "stopped", "phase": 2})
                     return
                 # Relaunch — agents in Phase 2 are already complete at this boundary
-                browser = Browser(PROFILE_DIR, headless=False)
+                browser = Browser(_profile_dir(WORKER_ID), headless=False)
                 await browser.start()
                 _active_browser_ref = browser  # re-point stop handler at fresh session
                 emit_event("pipeline_resumed", phase=2)
@@ -25106,7 +25106,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     emit_event("pipeline_stopped", phase=3, reason="stop_after_pause")
                     _update_firestore_research({"status": "stopped", "phase": 3})
                     return
-                browser = Browser(PROFILE_DIR, headless=False)
+                browser = Browser(_profile_dir(WORKER_ID), headless=False)
                 await browser.start()
                 _active_browser_ref = browser  # re-point stop handler at fresh session
                 emit_event("pipeline_resumed", phase=3)
