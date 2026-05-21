@@ -29709,6 +29709,171 @@ def run_daemon_loop(port: int = 8000):
     except Exception as _pe:
         log(f"[daemon-loop] Pre-flight import probe crashed (continuing anyway): {_pe}", "WARN")
 
+    # ──── Multi-worker branch (2026-05-21) ────────────────────────────
+    # workerCount > 1 means pair Stage 4 set up N>=2 browser profiles —
+    # spawn N --serve subprocesses (one per profile slot) in parallel via
+    # Popen + a poll loop. Each worker K binds port (port + K - 1) and
+    # is pinned to its own profile dir via --worker-id=K. Single-worker
+    # mode (workerCount=1) falls through to the existing subprocess.run
+    # blocking loop below — same behavior as pre-PR.
+    CRASH_WINDOW_SEC = 30
+    CRASH_THRESHOLD = 3
+    n_workers = load_worker_count()
+    if n_workers > 1:
+        log(f"[daemon-loop] Multi-worker mode: spawning {n_workers} workers")
+        # Per-worker state: process handle, log file handles, crash window,
+        # keystore-wiped flag, restart count. None = dead (won't respawn —
+        # for workers that hit crash-loop threshold; worker-1 always retries
+        # via the keystore-wipe recovery path).
+        workers: dict[int, dict] = {}
+
+        def _open_logs(k: int):
+            # Worker 1 keeps the legacy log filenames so existing tooling
+            # (tail backend.log) keeps working. Workers 2+ get -{k} suffix
+            # so the streams don't interleave.
+            if k == 1:
+                return (_log_dir / "backend.log", _log_dir / "backend.err.log")
+            return (_log_dir / f"backend-{k}.log", _log_dir / f"backend-{k}.err.log")
+
+        def _spawn_worker(k: int):
+            w_port = port + (k - 1)
+            log_out_path, log_err_path = _open_logs(k)
+            # Port probe — if the port is wedged from a prior session,
+            # log it and try anyway (uvicorn will surface EADDRINUSE).
+            if not _wait_for_port_free(w_port, max_wait_s=10.0):
+                log(f"[daemon-loop] worker {k}: port {w_port} still in use after 10s — spawning anyway", "WARN")
+            try:
+                _out_fh = open(log_out_path, "ab")
+                _err_fh = open(log_err_path, "ab")
+            except Exception as _oe:
+                log(f"[daemon-loop] worker {k}: log file open failed: {_oe}", "ERROR")
+                return None
+            try:
+                proc = _subprocess.Popen(
+                    [python_exe, script_path, "--serve",
+                     "--port", str(w_port), "--worker-id", str(k)],
+                    stdin=_subprocess.DEVNULL,
+                    stdout=_out_fh,
+                    stderr=_err_fh,
+                    creationflags=_NO_WINDOW,
+                )
+            except Exception as _se:
+                log(f"[daemon-loop] worker {k}: Popen failed: {_se}", "ERROR")
+                try:
+                    _out_fh.close()
+                    _err_fh.close()
+                except Exception:
+                    pass
+                return None
+            log(f"[daemon-loop] worker {k}: started PID={proc.pid} port={w_port}")
+            return {
+                "process": proc,
+                "out_fh": _out_fh,
+                "err_fh": _err_fh,
+                "port": w_port,
+                "crash_window": [],
+                "keystore_wiped": False,
+                "restarts": 0,
+            }
+
+        # Initial spawn of all workers.
+        for k in range(1, n_workers + 1):
+            workers[k] = _spawn_worker(k) or {"_dead": True}
+
+        try:
+            while True:
+                _time.sleep(2)
+                for k in range(1, n_workers + 1):
+                    state = workers.get(k)
+                    if state is None or state.get("_dead"):
+                        # Spawn-failed-permanently slots can be retried on
+                        # the next iteration in case the underlying issue
+                        # (port held, disk full, etc.) cleared.
+                        new_state = _spawn_worker(k)
+                        if new_state is not None:
+                            workers[k] = new_state
+                        continue
+                    rc = state["process"].poll()
+                    if rc is None:
+                        continue  # still running
+                    # Worker exited — close logs, track crash, decide.
+                    log(f"[daemon-loop] worker {k}: exited with code {rc}")
+                    try:
+                        state["out_fh"].close()
+                        state["err_fh"].close()
+                    except Exception:
+                        pass
+                    if rc == 0:
+                        state["crash_window"] = []
+                        state["keystore_wiped"] = False
+                    else:
+                        _now = _time.time()
+                        state["crash_window"].append(_now)
+                        state["crash_window"] = [
+                            t for t in state["crash_window"] if t > _now - CRASH_WINDOW_SEC
+                        ]
+                        if (
+                            len(state["crash_window"]) >= CRASH_THRESHOLD
+                            and not state["keystore_wiped"]
+                        ):
+                            if k == 1:
+                                # Worker 1 owns the keystore; on crash loop,
+                                # wipe so the next --serve enters recovery.
+                                log(
+                                    f"[daemon-loop] worker 1: crash loop "
+                                    f"({len(state['crash_window'])} non-zero exits "
+                                    f"in <{CRASH_WINDOW_SEC}s) — wiping keystore",
+                                    "WARN",
+                                )
+                                try:
+                                    from auth import keystore as _ks_recovery
+                                    _ks_recovery.clear_all(_ks_recovery.install_uuid())
+                                    state["keystore_wiped"] = True
+                                    state["crash_window"] = []
+                                except Exception as _ke:
+                                    log(f"[daemon-loop] keystore wipe failed: {_ke}", "ERROR")
+                            else:
+                                # Worker 2+ crash loop: most likely a port
+                                # conflict or missing profile dir. Stop
+                                # respawning to prevent log spam; primary
+                                # (w1) keeps running so the device stays
+                                # functional in degraded mode.
+                                log(
+                                    f"[daemon-loop] worker {k}: crash loop "
+                                    f"({len(state['crash_window'])} non-zero exits "
+                                    f"in <{CRASH_WINDOW_SEC}s) — STOPPING respawn "
+                                    f"for this worker. Check backend-{k}.err.log "
+                                    f"and fix the underlying issue (port "
+                                    f"conflict / profile dir missing / dep mismatch).",
+                                    "ERROR",
+                                )
+                                workers[k] = {"_dead": True}
+                                continue
+                    state["restarts"] += 1
+                    log(f"[daemon-loop] worker {k}: restarting (restart #{state['restarts']}) in 5s…")
+                    _time.sleep(5)
+                    new_state = _spawn_worker(k)
+                    if new_state is not None:
+                        # Carry over crash tracking across the respawn.
+                        new_state["crash_window"] = state["crash_window"]
+                        new_state["keystore_wiped"] = state["keystore_wiped"]
+                        new_state["restarts"] = state["restarts"]
+                        workers[k] = new_state
+                    else:
+                        workers[k] = {"_dead": True}
+        except KeyboardInterrupt:
+            log("[daemon-loop] Interrupted — terminating all workers")
+            for k, state in workers.items():
+                if state and not state.get("_dead"):
+                    try:
+                        state["process"].terminate()
+                    except Exception:
+                        pass
+            return
+        # Multi-worker branch exits the function. Single-worker code below
+        # is unreachable when n_workers > 1.
+
+    # ──── Single-worker branch (legacy, workerCount==1) ────────────────
     # Crash-loop safety net. If --serve exits non-zero CRASH_THRESHOLD
     # times within CRASH_WINDOW_SEC, the daemon-loop wipes the OS
     # keystore so the recovery loop inside the next --serve can take
@@ -29726,8 +29891,6 @@ def run_daemon_loop(port: int = 8000):
     # waiting for. `keystore_wiped_by_crashloop` gates against repeated
     # wipes if --serve keeps crashing for a different reason after the
     # wipe — wiping again would do nothing.
-    CRASH_WINDOW_SEC = 30
-    CRASH_THRESHOLD = 3
     crash_window: list[float] = []
     keystore_wiped_by_crashloop = False
     restarts = 0
