@@ -3538,36 +3538,38 @@ def start_firestore_start_listener(job_queue, loop):
             #   - Else → try claim. On win, fall through to existing
             #     status-decision + side-effect path. On loss, skip.
             _multi_worker_mode = load_worker_count() > 1
-            if _multi_worker_mode and (
-                _QUEUE_STATE.get("running") or job_queue.qsize() > 0
-            ):
-                continue
-            if _firebase_db is not None:
-                from google.cloud import firestore as _firestore_claim
-                _claim_ref = doc.reference
-
-                @_firestore_claim.transactional
-                def _try_claim(t, _ref=_claim_ref, _wid=WORKER_ID):
-                    snap = _ref.get(transaction=t)
-                    if not snap.exists:
-                        return False  # already deleted by the winning worker
-                    d = snap.to_dict() or {}
-                    if d.get("assignedWorker") or d.get("processed"):
-                        return False  # already claimed/processed by sibling
-                    t.update(_ref, {
-                        "assignedWorker": _wid,
-                        "claimedAt": int(time.time() * 1000),
-                    })
-                    return True
-
-                try:
-                    if not _try_claim(_firebase_db.transaction()):
-                        log(f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}…", "DEBUG")
-                        continue
-                except Exception as _ce:
-                    log(f"[start-listener] worker {WORKER_ID}: claim TX exception (skipping): {_ce}", "WARN")
+            if _multi_worker_mode:
+                # Multi-worker only: gate-on-busy + Firestore claim.
+                # Single-worker installs skip both — no contender to
+                # race, and adding a Firestore RTT to every start event
+                # would be a free regression with no upside.
+                if _QUEUE_STATE.get("running") or job_queue.qsize() > 0:
                     continue
-                if _multi_worker_mode:
+                if _firebase_db is not None:
+                    from google.cloud import firestore as _firestore_claim
+                    _claim_ref = doc.reference
+
+                    @_firestore_claim.transactional
+                    def _try_claim(t, _ref=_claim_ref, _wid=WORKER_ID):
+                        snap = _ref.get(transaction=t)
+                        if not snap.exists:
+                            return False  # already deleted by the winner
+                        d = snap.to_dict() or {}
+                        if d.get("assignedWorker") or d.get("processed"):
+                            return False  # already claimed by sibling
+                        t.update(_ref, {
+                            "assignedWorker": _wid,
+                            "claimedAt": int(time.time() * 1000),
+                        })
+                        return True
+
+                    try:
+                        if not _try_claim(_firebase_db.transaction()):
+                            log(f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}…", "DEBUG")
+                            continue
+                    except Exception as _ce:
+                        log(f"[start-listener] worker {WORKER_ID}: claim TX exception (skipping): {_ce}", "WARN")
+                        continue
                     log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}…", "INFO")
 
             # Generate run_id
