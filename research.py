@@ -3461,32 +3461,54 @@ def start_firestore_start_listener(job_queue, loop):
             data = doc.to_dict() or {}
             if data.get("processed"):
                 continue
-            # Stale-queue defense: Firestore's onSnapshot replays every
-            # existing unprocessed doc as ADDED on first attach. If a
-            # previous serve session wrote a start request but crashed /
-            # exited before marking processed, that doc replays on the
-            # NEXT serve startup and silently kicks off a research the
-            # user never asked for. This has killed multiple test
-            # sessions. Mirrors the stale-command defense in
-            # _start_command_listener.
-            # Threshold past the frontend's worst-case command round-trip
-            # so legitimate "just-fired" starts always pass.
-            STALE_QUEUE_AGE_MS = 30_000
+            # Stale-queue defense (2026-05-22 rewrite): Firestore's
+            # onSnapshot replays every unprocessed doc as ADDED on first
+            # attach. Pre-rewrite we deleted EVERY doc > 30s old, which
+            # conflated two distinct cases and caused multi-account FIFO
+            # loss after STOP+respawn:
+            #   (a) Post-crash zombie — prior session claimed the doc
+            #       (assignedWorker + claimedAt set) but the process
+            #       died before processing. Safe to delete (no live
+            #       worker on it; submitter's FE will surface "couldn't
+            #       start — retry" via the watchdog landing in commit 5).
+            #   (b) Legit FIFO wait — doc was deferred by the listener
+            #       because both workers were busy. assignedWorker
+            #       UNSET. The original 30s gate killed these on every
+            #       respawn, deleting deferred-FIFO entries that
+            #       should have been claimed cleanly post-restart.
+            # 3-way decision:
+            #   ZOMBIE        (assignedWorker + claimedAt set,
+            #                  age_since_claim > grace)        → delete
+            #   ZOMBIE-IN-GRACE (claimed within grace)         → skip,
+            #                  don't delete (sibling may still
+            #                  be alive). On next process bounce,
+            #                  age_since_claim will exceed grace and
+            #                  the ZOMBIE branch cleans up.
+            #   ABANDONED     (no assignedWorker, age ≥ 12h)   → delete
+            #   UNCLAIMED-RECENT (no assignedWorker, age < 12h) →
+            #                  fall through to normal claim path
+            # Missing-timestamp legacy docs (no _ts and no _ca) fall
+            # through, preserving the original code's bug-compatible
+            # behavior. The FIFO pre-query at line 3901 already filters
+            # docs with assignedWorker set, so a claimed-doc passing
+            # through the elif chain is harmless either way.
+            ZOMBIE_GRACE_MS = 30_000
+            ABANDONED_MAX_MS = 12 * 60 * 60 * 1000  # 12h — user moved on
             _ts = data.get("timestamp")
+            _age_ms = 0
             if isinstance(_ts, (int, float)) and _ts > 0:
                 _age_ms = int(time.time() * 1000) - int(_ts)
-                if _age_ms > STALE_QUEUE_AGE_MS:
-                    # Diagnostic: log topic + assignedWorker + claimedAt +
-                    # submittedBy so a stale-skip can be distinguished
-                    # between "post-crash zombie" (assignedWorker set,
-                    # half-claimed) and "legit FIFO wait" (no
-                    # assignedWorker, just waited too long for idle
-                    # worker). The next commit will branch behavior on
-                    # this distinction; for now we just surface it.
+            _aw = data.get("assignedWorker")
+            _ca = data.get("claimedAt")
+            if _aw is not None and isinstance(_ca, (int, float)) and _ca > 0:
+                _age_since_claim = int(time.time() * 1000) - int(_ca)
+                if _age_since_claim > ZOMBIE_GRACE_MS:
                     log(
-                        f"Queue: skipped stale doc (age={_age_ms // 1000}s, action={data.get('action', 'start')}) "
-                        f"topic={(data.get('topic') or '')[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
-                        f"assignedWorker={data.get('assignedWorker')} claimedAt={data.get('claimedAt')}",
+                        f"Queue: stale-skip ZOMBIE {(data.get('researchId') or '')[:8]}… "
+                        f"topic={(data.get('topic') or '')[:40]!r} "
+                        f"submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                        f"assignedWorker={_aw} claimedAt={_ca} "
+                        f"age_since_claim={_age_since_claim // 1000}s — deleting",
                         "INFO",
                     )
                     try:
@@ -3494,6 +3516,25 @@ def start_firestore_start_listener(job_queue, loop):
                     except Exception:
                         pass
                     continue
+                # Within grace — sibling may still be alive. Skip this
+                # listener fire but don't delete. Doc gets re-evaluated
+                # on next process bounce (replay → ZOMBIE → delete).
+                continue
+            elif _age_ms > ABANDONED_MAX_MS:
+                log(
+                    f"Queue: stale-skip ABANDONED {(data.get('researchId') or '')[:8]}… "
+                    f"topic={(data.get('topic') or '')[:40]!r} "
+                    f"submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                    f"age={_age_ms // 1000}s — deleting",
+                    "INFO",
+                )
+                try:
+                    doc.reference.delete()
+                except Exception:
+                    pass
+                continue
+            # UNCLAIMED-RECENT or missing-timestamp — fall through to
+            # action handling + normal claim path.
             action = data.get("action", "start")
             # Handle cancel-queued: remove the target research from the job
             # queue before it reaches the worker and mark it stopped. The
