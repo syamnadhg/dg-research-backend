@@ -19025,11 +19025,15 @@ async def _gemini_select_pro_model(page) -> bool:
         #   - button[aria-haspopup="menu"] near the top of the page whose
         #     text contains "Gemini" / "3.1" / "Flash" / "Pro"
         opened = await page.evaluate("""() => {
-            const isTopOfPage = (b) => {
-                const r = b.getBoundingClientRect();
-                return r.top < window.innerHeight * 0.25 && r.width > 0;
-            };
-            // Try precise selectors first.
+            // No top-of-page guard: on the home-screen UI Gemini centers
+            // the composer at ~30-50% of viewport, so the prior < 25%
+            // position gate never matched the model button there (the
+            // gate was right for sticky-header chat view, wrong for the
+            // empty-chat landing). Precise selectors are model-button
+            // specific, so we click them unconditionally; the text-
+            // pattern fallback still uses a wide-but-bounded position
+            // gate so an unrelated menu button (account chip) can't
+            // accidentally match.
             const precise = document.querySelectorAll(
                 'bard-mode-menu-button button, ' +
                 'button[data-test-id="bard-mode-menu-button"], ' +
@@ -19037,15 +19041,23 @@ async def _gemini_select_pro_model(page) -> bool:
                 'button[aria-label*="Switch model" i]'
             );
             for (const b of precise) {
-                if (b.offsetParent && isTopOfPage(b)) { b.click(); return true; }
+                if (b.offsetParent) { b.click(); return true; }
             }
             // Fall back to text-pattern match across visible menu buttons.
             // Accept any version-number prefix (3.1 / 3.0 / 2.5) so the
             // probe still finds the dropdown if Google rotates the
-            // model-name label between versions.
+            // model-name label between versions. Position gate widened
+            // to top 95% so BOTH home-screen-centered composer (~50%
+            // viewport) AND new-UI bottom-anchored composer (~85% on
+            // tall viewports) qualify. The only thing this rules out is
+            // a sub-footer banner.
+            const inViewableArea = (b) => {
+                const r = b.getBoundingClientRect();
+                return r.top >= 0 && r.top < window.innerHeight * 0.95 && r.width > 0;
+            };
             const buttons = document.querySelectorAll('button[aria-haspopup="menu"], button[aria-expanded]');
             for (const b of buttons) {
-                if (!b.offsetParent || !isTopOfPage(b)) continue;
+                if (!b.offsetParent || !inViewableArea(b)) continue;
                 const t = (b.textContent || '').trim();
                 if (/\\b(\\d\\.\\d|Gemini|Flash|Pro|Deep Think)\\b/i.test(t)) {
                     b.click(); return true;
@@ -19120,7 +19132,7 @@ async def setup_gemini_dr(page) -> bool:
     """
     try:
         await asyncio.sleep(2)
-        # Best-effort: pick 2.5 Pro before opening + menu. Non-fatal if it
+        # Best-effort: pick 3.1 Pro before opening + menu. Non-fatal if it
         # misses (run proceeds on whatever model the dropdown was on).
         await _gemini_select_pro_model(page)
         await asyncio.sleep(0.5)
@@ -19167,45 +19179,70 @@ async def setup_gemini_dr(page) -> bool:
         if plus_opened:
             await asyncio.sleep(0.8)
             log("[setup_gemini_dr] Step 1 (current UI): opened + menu")
-            more_tools_opened = await page.evaluate("""() => {
+            # Step 1a: scan the + tray top level for "Deep research" — current
+            # 2026-05 UI places it as a SIBLING of "More tools", not inside
+            # the submenu. Prior code descended into More tools first and
+            # never found DR (More tools submenu now contains: Create music,
+            # Learning, Guided learning, Personal Intelligence).
+            direct_clicked = await page.evaluate("""() => {
                 const items = document.querySelectorAll(
                     '[role="menuitem"], [role="option"], button, a, li');
                 for (const el of items) {
                     if (!el.offsetParent) continue;
                     const t = (el.textContent || '').trim().toLowerCase();
                     const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                    if (t === 'more tools' || t.startsWith('more tools') ||
-                        a === 'more tools' || a.startsWith('more tools')) {
+                    if (t === 'deep research' || a === 'deep research' ||
+                        t.startsWith('deep research') || a.startsWith('deep research')) {
                         el.click();
                         return true;
                     }
                 }
                 return false;
             }""")
-            if more_tools_opened:
-                await asyncio.sleep(0.8)
-                log("[setup_gemini_dr] Step 1 (current UI): opened More tools submenu")
-                direct_clicked = await page.evaluate("""() => {
+            if direct_clicked:
+                log("[setup_gemini_dr] Step 1 OK (current UI): + → Deep Research (top-level)")
+            else:
+                # Step 1b (older UI variant): + → More tools → Deep Research.
+                # Kept as fallback for accounts still on the prior layout.
+                more_tools_opened = await page.evaluate("""() => {
                     const items = document.querySelectorAll(
                         '[role="menuitem"], [role="option"], button, a, li');
                     for (const el of items) {
                         if (!el.offsetParent) continue;
                         const t = (el.textContent || '').trim().toLowerCase();
                         const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                        if (t === 'deep research' || a === 'deep research' ||
-                            t.startsWith('deep research') || a.startsWith('deep research')) {
+                        if (t === 'more tools' || t.startsWith('more tools') ||
+                            a === 'more tools' || a.startsWith('more tools')) {
                             el.click();
                             return true;
                         }
                     }
                     return false;
                 }""")
-                if direct_clicked:
-                    log("[setup_gemini_dr] Step 1 OK (current UI): + → More tools → Deep Research")
+                if more_tools_opened:
+                    await asyncio.sleep(0.8)
+                    log("[setup_gemini_dr] Step 1b (older UI): opened More tools submenu")
+                    direct_clicked = await page.evaluate("""() => {
+                        const items = document.querySelectorAll(
+                            '[role="menuitem"], [role="option"], button, a, li');
+                        for (const el of items) {
+                            if (!el.offsetParent) continue;
+                            const t = (el.textContent || '').trim().toLowerCase();
+                            const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                            if (t === 'deep research' || a === 'deep research' ||
+                                t.startsWith('deep research') || a.startsWith('deep research')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""")
+                    if direct_clicked:
+                        log("[setup_gemini_dr] Step 1b OK (older UI): + → More tools → Deep Research")
+                    else:
+                        log("[setup_gemini_dr] Step 1b (older UI): More tools submenu missing Deep Research — falling back", "WARN")
                 else:
-                    log("[setup_gemini_dr] Step 1 (current UI): More tools submenu missing Deep Research — falling back", "WARN")
-            else:
-                log("[setup_gemini_dr] Step 1 (current UI): + menu opened but no More tools item — falling back", "INFO")
+                    log("[setup_gemini_dr] Step 1 (current UI): no Deep Research top-level AND no More tools — falling back", "INFO")
         else:
             log("[setup_gemini_dr] Step 1 (current UI): + button not in composer — trying legacy paths", "INFO")
 
