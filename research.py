@@ -4443,6 +4443,52 @@ def _safe_enqueue(job_queue, job, source: str) -> bool:
         return False
 
 
+def _clear_current_run_id_best_effort(reason: str) -> None:
+    """Worker-1-only clear of the device-doc `currentRunId` /
+    `currentRunOwnerUid` / `currentRunTitle` / `currentRunStartedAt`
+    fields. Best-effort, swallows errors.
+
+    Why a shared helper: the in-worker `finally` clear (after each
+    job completes) was the only call site, but ANY worker-1 exit
+    that skips the `finally` — STOP, hard_reset, watchdog T3,
+    `_schedule_server_exit` from agent-decision-stop / firestore-
+    command / http-endpoint / token-cancel-current / device-hard-
+    reset — leaves the field pointing at the now-stopped run.
+
+    Stale `currentRunId` is the data-layer root cause of the
+    QueuedBanner-shows-on-fresh-run regression (2026-05-22 repro):
+    owner fires a new run after STOP; FE sees `device.currentRunId`
+    set to the prior (stopped) run, falls through the cross-user
+    banner fallback, and renders "queued behind X" even though
+    nothing's queued. Each exit path that bypasses the finally
+    needs to call this helper.
+
+    Worker-1-only gate mirrors the publish in `_job_worker` —
+    currentRunId tracks worker 1's run; worker N>1 has no signal
+    here to clear.
+    """
+    if WORKER_ID != 1:
+        return
+    if not _firebase_db:
+        return
+    try:
+        from google.cloud.firestore import DELETE_FIELD as _CR_DF
+        _did = load_device_id()
+        if not _did:
+            return
+        _firebase_db.collection("devices").document(_did).update({
+            "currentRunId": _CR_DF,
+            "currentRunOwnerUid": _CR_DF,
+            "currentRunTitle": _CR_DF,
+            "currentRunStartedAt": _CR_DF,
+        })
+    except Exception as _crun_clear_err:
+        log(
+            f"[device] currentRunId clear ({reason}) failed (non-fatal): {_crun_clear_err}",
+            "DEBUG",
+        )
+
+
 def _schedule_server_exit(source: str, delay_sec: float = 3.0):
     """Schedule a one-shot daemon thread that calls os._exit(0) after a short
     delay, giving the pipeline time to emit pipeline_stopped + close the
@@ -4457,12 +4503,23 @@ def _schedule_server_exit(source: str, delay_sec: float = 3.0):
     The psutil sweep walks our own pid's children recursively and
     kills them before the parent exits, so the daemon-loop respawn
     starts with a clean process tree.
+
+    2026-05-22: clear device-doc currentRunId fields before exit.
+    All exit paths (STOP, hard_reset, watchdog, agent-decision-stop,
+    etc.) route through this helper, so patching it once covers them
+    all. Without this, the field persists past os._exit pointing at
+    the now-stopped run, and the next submission's FE renders a
+    spurious QueuedBanner (Bug X).
     """
     global _exit_scheduled
     if _exit_scheduled:
         log(f"[{source}] Exit already scheduled — ignoring duplicate", "INFO")
         return
     _exit_scheduled = True
+    # Clear currentRunId before the os._exit lands. Synchronous + best-
+    # effort; if Firestore is unreachable the worker-1-boot startup
+    # clear (commit 2b) is the fallback.
+    _clear_current_run_id_best_effort(f"exit-{source}")
     import threading as _threading
     def _runner():
         import time as _t, os as _os
@@ -27247,27 +27304,11 @@ async def run_server(port=8000):
                 _delete_worker_lock(WORKER_ID)
                 # Clear currentRunId on device doc — release the "device
                 # is busy" signal so the next submitter's FE doesn't think
-                # we're still mid-run. Best-effort; the next worker tick
-                # will overwrite anyway if we missed this.
-                #
-                # Multi-worker (2026-05-21): only worker 1 clears, mirror
-                # of the publish gate above. A worker-2 finish leaves
-                # currentRunId pointing at w1's still-active run — which
-                # is correct from the banner's perspective (the device
-                # IS still busy with w1's run).
-                if WORKER_ID == 1:
-                    try:
-                        from google.cloud.firestore import DELETE_FIELD as _CR_DF
-                        _did = load_device_id()
-                        if _firebase_db and _did:
-                            _firebase_db.collection("devices").document(_did).update({
-                                "currentRunId": _CR_DF,
-                                "currentRunOwnerUid": _CR_DF,
-                                "currentRunTitle": _CR_DF,
-                                "currentRunStartedAt": _CR_DF,
-                            })
-                    except Exception as _crun_clear_err:
-                        log(f"[device] currentRunId clear failed (non-fatal): {_crun_clear_err}", "DEBUG")
+                # we're still mid-run. Best-effort. Shared helper covers
+                # all exit paths (STOP / hard_reset / watchdog / etc.)
+                # too via _schedule_server_exit at research.py:_schedule_server_exit
+                # 2026-05-22).
+                _clear_current_run_id_best_effort("job-finally")
                 # 2026-05-11: record what the next dequeue's gate needs.
                 # last_be_done_at=0 on error/watchdog paths short-circuits
                 # the gate (since FE-P5 will never write "completed").
