@@ -27488,11 +27488,14 @@ async def run_server(port=8000):
             # ~5s of --serve binding the port) brings the Account-page
             # tile online.
 
-            # Queue rehydration: recover runs that were queued or mid-run when
-            # the previous daemon process died. Queued jobs re-enter the in-
-            # memory queue; mid-run jobs can't safely resume (browser/CUA state
-            # is gone) so they're marked stopped with a clear reason. Without
-            # this, the frontend shows "queued" forever after a backend crash.
+            # Queue rehydration: recover mid-run runs from the previous
+            # daemon session. Browser/CUA state is gone, so we either
+            # mark them paused_backend_restart (FE shows a Resume CTA)
+            # or auto-resume on supervised devices (re-enqueue with
+            # resume_dir from checkpoint). Queued-status docs are NOT
+            # rehydrated here — the on_snapshot listener replays every
+            # queue doc as ADDED on first attach and the FIFO pre-query
+            # handles them across all submitters (owner + sharers).
             #
             # Per-query 15s wall-clock cap via asyncio.wait_for + to_thread.
             # The sync .get() can hang indefinitely if the gRPC channel got
@@ -27521,7 +27524,22 @@ async def run_server(port=8000):
                     raise _SkipRehydration()  # local sentinel, caught below
                 researches_col = _firebase_db.collection("users").document(paired_uid) \
                     .collection("researches")
-                for status_val in ("queued", "ongoing"):
+                # 2026-05-22: dropped "queued" from rehydration. The
+                # Firestore on_snapshot listener replays every existing
+                # queue doc as ADDED on first attach (research.py:3458)
+                # and the FIFO pre-query (3955-3989) handles ordering
+                # across all submitters (owner + sharers). Rehydrating
+                # queued docs from `users/{paired_uid}/researches/` was
+                # owner-tree-only AND created a dual-processing race:
+                # worker 1 ran the rehydrated job locally while
+                # worker 2's idle-rescan claimed the UNTOUCHED Firestore
+                # queue doc and ran a second copy. The on-disk safety
+                # net for "FE wrote research doc but queue write failed"
+                # is covered by the FE-side orphan-queue watchdog
+                # (commit 4 of this batch). "ongoing" status is still
+                # rehydrated for paused_backend_restart marking +
+                # supervised auto-resume — independent code path.
+                for status_val in ("ongoing",):
                     try:
                         snaps = await asyncio.wait_for(
                             asyncio.to_thread(
@@ -27663,32 +27681,11 @@ async def run_server(port=8000):
                                     orphaned += 1
                                 except Exception as e:
                                     log(f"Rehydrate: mark paused_backend_restart failed for {research_id}: {e}", "WARN")
-                        else:  # queued
-                            topic = data.get("topic", "")
-                            if not topic:
-                                continue
-                            # Research doc uses pipelineConfig.skippedPhases; backend
-                            # run_pipeline reads skipPhases. Translate on rehydrate.
-                            cfg = dict(data.get("pipelineConfig") or {})
-                            if "skippedPhases" in cfg and "skipPhases" not in cfg:
-                                cfg["skipPhases"] = cfg.pop("skippedPhases")
-                            # Funnel through _safe_enqueue (Q7) — even
-                            # though the where(status=="queued") query
-                            # filtered above, Firestore is eventually
-                            # consistent on edge cases (deletion racing
-                            # the query) and the helper's final check
-                            # closes that gap.
-                            if _safe_enqueue(_job_queue, {
-                                "topic": topic,
-                                "email": "",  # not persisted on research doc; Phase 5 email will skip
-                                "config": cfg,
-                                "run_id": data.get("backendRunId") or "",
-                                "uid": paired_uid,
-                                "research_id": research_id,
-                            }, source="rehydrate"):
-                                rehydrated += 1
+                        # queued-status branch removed 2026-05-22 — see
+                        # comment at the for-loop above for rationale.
+                        # The on_snapshot listener handles queued docs.
                 if rehydrated or orphaned:
-                    log(f"Queue rehydration: re-enqueued {rehydrated} queued, marked {orphaned} orphaned runs stopped")
+                    log(f"Queue rehydration: auto-resumed {rehydrated} supervised run(s), marked {orphaned} as paused_backend_restart")
             except _SkipRehydration:
                 # Worker N≥2 — intentional skip, not an error. Already
                 # logged above; no-op here.
@@ -27719,8 +27716,9 @@ async def run_server(port=8000):
                     _QUEUE_STATE["last_be_done_at"] = int(_gate.get("last_be_done_at") or 0)
                     log(f"[queue-gate] rehydrated prior-run state for {(_gate.get('last_completed_rid') or '')[:8]}…")
                 # Seed dedupe with anything Firestore-rehydration touched
-                # (queued + ongoing), then add what's currently in the
-                # in-memory queue (the rehydrated queued set).
+                # (ongoing-status only — queued docs are handled by the
+                # listener, not rehydration), then add what's currently
+                # in the in-memory queue (auto-resumed supervised runs).
                 already = set(_rehydrated_rids)
                 try:
                     for q in list(_job_queue._queue):
