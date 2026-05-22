@@ -1728,6 +1728,101 @@ _QUEUE_STATE = {
 BE_PHASES_TIMEOUT_SEC = 4200
 
 
+def _try_claim_queue_doc(doc_ref, worker_id: int, log_prefix: str = "[claim]",
+                          max_attempts: int = 3):
+    """Atomic conditional-claim of a `devices/{id}/queue/{docId}` entry.
+
+    Replaces the prior `@firestore.transactional` approach which masked
+    `BeginTransaction` failures (synth-user JWT refresh blip, gRPC
+    channel hiccup, transient `Unauthenticated`) behind a misleading
+    `ValueError("The transaction has no transaction ID, so it cannot
+    be rolled back.")` — see 2026-05-22 root-cause investigation.
+
+    Mechanism:
+      1. `snap = doc_ref.get()` to read current state + update_time.
+      2. Early-out if doc gone / already-assigned / already-processed.
+      3. `doc_ref.update({assignedWorker, claimedAt}, option=
+         write_option(last_update_time=snap.update_time))` — Firestore
+         single-doc writes are linearized server-side, so a precondition
+         on update_time gives the same atomicity guarantee as a TX.
+      4. `FailedPrecondition` on update = sibling beat us (race-loss).
+         Return False without re-raising — that's the expected path.
+
+    Retry semantics: transient failures (`ServiceUnavailable`,
+    `DeadlineExceeded`, `Unauthenticated`, `InternalServerError`) retry
+    up to `max_attempts` with `250ms * attempt` backoff. Per-failure
+    surfacing of `__context__` so unmasked exceptions show up in logs
+    (the TX decorator buried them; the conditional-update path leaves
+    them on the wire).
+
+    Returns:
+      True   — this worker claimed the doc.
+      False  — race lost (sibling claimed, doc deleted, already-processed).
+      None   — unexpected error after retries; caller logs + skips,
+               the idle-rescan loop picks it up later.
+    """
+    import google.api_core.exceptions as _gax_exc
+
+    for attempt in range(1, max_attempts + 1):
+        # ── Read current state ────────────────────────────────────────
+        try:
+            snap = doc_ref.get()
+        except (_gax_exc.ServiceUnavailable, _gax_exc.DeadlineExceeded,
+                _gax_exc.Unauthenticated, _gax_exc.InternalServerError) as _re:
+            if attempt < max_attempts:
+                time.sleep(0.25 * attempt)
+                continue
+            log(f"{log_prefix} worker {worker_id}: read failed after "
+                f"{attempt} attempts: {type(_re).__name__}: {_re}", "WARN")
+            return None
+        except _gax_exc.NotFound:
+            return False  # doc gone — race lost cleanly
+        except Exception as _ge:
+            _root = _ge.__context__ or _ge
+            log(f"{log_prefix} worker {worker_id}: read unexpected: "
+                f"{type(_ge).__name__}: {_ge} | "
+                f"root: {type(_root).__name__}: {_root}", "WARN")
+            return None
+
+        if not snap.exists:
+            return False
+        d = snap.to_dict() or {}
+        if d.get("assignedWorker") or d.get("processed"):
+            return False  # already claimed / processed by sibling
+
+        # ── Conditional update ────────────────────────────────────────
+        try:
+            doc_ref.update(
+                {"assignedWorker": worker_id,
+                 "claimedAt": int(time.time() * 1000)},
+                option=_firebase_db.write_option(
+                    last_update_time=snap.update_time),
+            )
+            return True
+        except _gax_exc.FailedPrecondition:
+            # Sibling updated the doc between our read and write.
+            # Expected race-loss path — not an error.
+            return False
+        except _gax_exc.NotFound:
+            # Owner deleted the doc between our read and write.
+            return False
+        except (_gax_exc.ServiceUnavailable, _gax_exc.DeadlineExceeded,
+                _gax_exc.Unauthenticated, _gax_exc.InternalServerError) as _re:
+            if attempt < max_attempts:
+                time.sleep(0.25 * attempt)
+                continue
+            log(f"{log_prefix} worker {worker_id}: update failed after "
+                f"{attempt} attempts: {type(_re).__name__}: {_re}", "WARN")
+            return None
+        except Exception as _ue:
+            _root = _ue.__context__ or _ue
+            log(f"{log_prefix} worker {worker_id}: update unexpected: "
+                f"{type(_ue).__name__}: {_ue} | "
+                f"root: {type(_root).__name__}: {_root}", "WARN")
+            return None
+    return None  # Defensive — loop should always return inside
+
+
 def init_firebase():
     """Initialize the Firestore client for this BE process. Backed by the
     OS-keystore refresh token (deposited by `cmd_pair_v2`'s Stage 1
@@ -3772,7 +3867,6 @@ def start_firestore_start_listener(job_queue, loop):
                 if _QUEUE_STATE.get("running") or job_queue.qsize() > 0:
                     continue
                 if _firebase_db is not None:
-                    from google.cloud import firestore as _firestore_claim
                     _claim_ref = doc.reference
 
                     # FIFO pre-query (PR 3, 2026-05-21): before attempting
@@ -3824,26 +3918,22 @@ def start_firestore_start_listener(job_queue, loop):
                             "WARN",
                         )
 
-                    @_firestore_claim.transactional
-                    def _try_claim(t, _ref=_claim_ref, _wid=WORKER_ID):
-                        snap = _ref.get(transaction=t)
-                        if not snap.exists:
-                            return False  # already deleted by the winner
-                        d = snap.to_dict() or {}
-                        if d.get("assignedWorker") or d.get("processed"):
-                            return False  # already claimed by sibling
-                        t.update(_ref, {
-                            "assignedWorker": _wid,
-                            "claimedAt": int(time.time() * 1000),
-                        })
-                        return True
-
-                    try:
-                        if not _try_claim(_firebase_db.transaction()):
-                            log(f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}…", "DEBUG")
-                            continue
-                    except Exception as _ce:
-                        log(f"[start-listener] worker {WORKER_ID}: claim TX exception (skipping): {_ce}", "WARN")
+                    # Conditional-update claim (replaces prior TX-based
+                    # claim that masked BeginTransaction failures behind
+                    # the "no transaction ID" rollback ValueError —
+                    # 2026-05-22 root-cause fix). Same atomicity (single-
+                    # doc writes are linearized server-side), no TX
+                    # lifecycle, no masking, half the RPCs.
+                    _claim_outcome = _try_claim_queue_doc(
+                        _claim_ref, WORKER_ID,
+                        log_prefix="[start-listener]")
+                    if _claim_outcome is None:
+                        # Unexpected failure after retries — the helper
+                        # logged the root cause; skip + let idle-rescan
+                        # retry later.
+                        continue
+                    if _claim_outcome is False:
+                        log(f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}…", "DEBUG")
                         continue
                     log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}…", "INFO")
 
@@ -26580,8 +26670,6 @@ async def run_server(port=8000):
             return (1, 0, _snap.id)
         candidates.sort(key=_fifo_key)
 
-        from google.cloud import firestore as _firestore_claim
-
         for snap in candidates:
             d = snap.to_dict() or {}
             if d.get("processed") or d.get("assignedWorker"):
@@ -26593,28 +26681,15 @@ async def run_server(port=8000):
             if _QUEUE_STATE.get("running") or _job_queue.qsize() > 0:
                 return
 
-            @_firestore_claim.transactional
-            def _try_claim_rescan(t, _ref=snap.reference, _wid=WORKER_ID):
-                s = _ref.get(transaction=t)
-                if not s.exists:
-                    return False
-                dd = s.to_dict() or {}
-                if dd.get("assignedWorker") or dd.get("processed"):
-                    return False
-                t.update(_ref, {
-                    "assignedWorker": _wid,
-                    "claimedAt": int(time.time() * 1000),
-                })
-                return True
-
-            try:
-                won = await asyncio.to_thread(
-                    _try_claim_rescan, _firebase_db.transaction()
-                )
-            except Exception as _ce:
-                log(f"[idle-rescan] worker {WORKER_ID}: claim TX exception: {_ce}", "WARN")
-                continue
-            if not won:
+            # Conditional-update claim (replaces TX-based claim that
+            # masked BeginTransaction failures — 2026-05-22 root-cause
+            # fix). Helper handles retries + race-loss + unexpected
+            # errors with full __context__ surfacing.
+            _outcome = await asyncio.to_thread(
+                _try_claim_queue_doc, snap.reference, WORKER_ID,
+                "[idle-rescan]",
+            )
+            if _outcome is None or _outcome is False:
                 continue
 
             # Won — replicate the listener's minimal start-action side
