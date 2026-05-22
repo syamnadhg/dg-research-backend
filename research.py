@@ -301,6 +301,89 @@ def _save_api_key_local(name: str, value: str) -> bool:
     return _save_api_key_to_env_file(name, value)
 
 
+def _clear_api_key_from_user_scope(name: str) -> bool:
+    """Remove a Windows User-scope env var (HKCU\\Environment).
+
+    PowerShell `SetEnvironmentVariable(name, $null, 'User')` deletes
+    the entry from the registry. Idempotent — calling on an absent
+    name still returns True (returncode 0 == success).
+
+    Mirror of `_save_api_key_to_user_scope`. Used by `--unpair --deep`
+    to fully reset pair-time API keys from this machine."""
+    if sys.platform != "win32":
+        return False
+    if not _LOCAL_KEY_NAME_RE.match(name):
+        log(f"[clear-api-key-local] invalid env var name: {name!r}", "WARN")
+        return False
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"[System.Environment]::SetEnvironmentVariable("
+             f"'{name}', $null, 'User')"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_PS_NO_WINDOW)
+        if r.returncode != 0:
+            log(f"[clear-api-key-local] PS SetEnvironmentVariable($null) returncode={r.returncode}: {r.stderr[:200]}", "WARN")
+            return False
+        return True
+    except Exception as e:
+        log(f"[clear-api-key-local] PS SetEnvironmentVariable($null) failed: {e}", "WARN")
+        return False
+
+
+def _clear_api_key_from_env_file(name: str, path=None) -> bool:
+    """Delete a NAME= line from `.dg-supervisor.env`. Preserves
+    comments and unrelated entries verbatim. Atomic write-then-rename.
+
+    Idempotent: returns True both when the line was removed and when
+    the name was already absent. If the file doesn't exist, also
+    True (the desired state — `name` not persisted — already holds).
+
+    Mirror of `_save_api_key_to_env_file`."""
+    if not _LOCAL_KEY_NAME_RE.match(name):
+        log(f"[clear-api-key-local] invalid env var name: {name!r}", "WARN")
+        return False
+    target = Path(path) if path else _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+    try:
+        if not target.exists():
+            return True
+        lines = target.read_text(encoding="utf-8-sig").splitlines()
+        new_lines = []
+        removed = False
+        for line in lines:
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                new_lines.append(line)
+                continue
+            head = stripped.split("=", 1)[0].strip()
+            if head == name:
+                removed = True
+                continue
+            new_lines.append(line)
+        if not removed:
+            return True
+        out = "\n".join(new_lines)
+        if out and not out.endswith("\n"):
+            out += "\n"
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(out, encoding="utf-8")
+        tmp.replace(target)
+        return True
+    except Exception as e:
+        log(f"[clear-api-key-local] clear {target} failed: {e}", "WARN")
+        return False
+
+
+def _clear_api_key_local(name: str) -> bool:
+    """Per-OS dispatcher — removes a key from BE-local persistence.
+    Mirror of `_save_api_key_local`. Called by `--unpair --deep` so
+    a re-pair starts with a truly clean slate and the verifier
+    actually fires on the next paste."""
+    if sys.platform == "win32":
+        return _clear_api_key_from_user_scope(name)
+    return _clear_api_key_from_env_file(name)
+
+
 def get_env(name):
     """os.environ first, User-scope Windows env as fallback. Keeps the
     legacy contract for callers that just want 'whatever env has this

@@ -156,6 +156,101 @@ class TestSaveApiKeyLocal:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# _clear_api_key_local + per-OS clear helpers (mirror of save)
+# ─────────────────────────────────────────────────────────────────────
+
+class TestClearApiKeyLocal:
+    """`_clear_api_key_local` mirrors `_save_api_key_local`: per-OS
+    dispatch removes a key from BE-local persistence. Used by
+    `--unpair --deep` so the next `--pair` Stage 3 actually re-prompts
+    and re-verifies instead of short-circuiting on the leftover key.
+
+    Windows: SetEnvironmentVariable(name, $null, 'User').
+    POSIX:   line removal from `.dg-supervisor.env`, atomic rewrite."""
+
+    def test_invalid_name_rejected(self, monkeypatch, silent_log):
+        """Same name whitelist as the save path — defense in depth
+        against typos / injection through the PowerShell command."""
+        from research import _clear_api_key_local
+        assert _clear_api_key_local("lowercase") is False
+        assert _clear_api_key_local("1STARTS_WITH_DIGIT") is False
+        assert _clear_api_key_local("HAS SPACE") is False
+        assert _clear_api_key_local("HAS-DASH") is False
+        assert _clear_api_key_local("X'); whoami; ('Y") is False
+
+    def test_env_file_clear_removes_line(self, tmp_path, monkeypatch, silent_log):
+        """Existing KEY=value line is dropped; comments and unrelated
+        entries are preserved verbatim."""
+        from research import _clear_api_key_from_env_file
+        target = tmp_path / ".dg-supervisor.env"
+        target.write_text(
+            "# Header comment\n"
+            "VISION_TIER=2\n"
+            "ANTHROPIC_API_KEY='sk-ant-xyz'\n"
+            "# Trailing comment\n",
+            encoding="utf-8",
+        )
+        assert _clear_api_key_from_env_file(
+            "ANTHROPIC_API_KEY", path=target) is True
+        body = target.read_text(encoding="utf-8-sig")
+        assert "ANTHROPIC_API_KEY" not in body
+        assert "# Header comment" in body
+        assert "VISION_TIER=2" in body
+        assert "# Trailing comment" in body
+
+    def test_env_file_clear_when_absent_is_noop(self, tmp_path, monkeypatch, silent_log):
+        """Calling clear on a key that isn't in the file leaves the
+        file unchanged and returns True (idempotent — desired state
+        already holds)."""
+        from research import _clear_api_key_from_env_file
+        target = tmp_path / ".dg-supervisor.env"
+        original = "VISION_TIER=2\nFOO=bar\n"
+        target.write_text(original, encoding="utf-8")
+        assert _clear_api_key_from_env_file(
+            "ANTHROPIC_API_KEY", path=target) is True
+        # File untouched.
+        assert target.read_text(encoding="utf-8-sig") == original
+
+    def test_env_file_clear_when_file_missing_is_noop(self, tmp_path, monkeypatch, silent_log):
+        """Target file doesn't exist → desired state (key absent) is
+        already met → True with no file created."""
+        from research import _clear_api_key_from_env_file
+        target = tmp_path / ".dg-supervisor.env"
+        assert not target.exists()
+        assert _clear_api_key_from_env_file(
+            "GEMINI_API_KEY", path=target) is True
+        assert not target.exists()
+
+    def test_env_file_clear_only_drops_exact_match(self, tmp_path, monkeypatch, silent_log):
+        """Substring / prefix matches don't get dropped — only the
+        exact env-var name. Prevents accidental removal of similarly-
+        named keys."""
+        from research import _clear_api_key_from_env_file
+        target = tmp_path / ".dg-supervisor.env"
+        target.write_text(
+            "ANTHROPIC_API_KEY='target'\n"
+            "ANTHROPIC_API_KEY_BACKUP='keep-me'\n"
+            "MY_ANTHROPIC_API_KEY='also-keep'\n",
+            encoding="utf-8",
+        )
+        assert _clear_api_key_from_env_file(
+            "ANTHROPIC_API_KEY", path=target) is True
+        body = target.read_text(encoding="utf-8-sig")
+        assert "ANTHROPIC_API_KEY_BACKUP='keep-me'" in body
+        assert "MY_ANTHROPIC_API_KEY='also-keep'" in body
+        # Exact match dropped.
+        assert "ANTHROPIC_API_KEY='target'" not in body
+
+    def test_user_scope_non_windows_returns_false(self, monkeypatch, silent_log):
+        """On non-Windows, the User-scope clearer is a no-op returning
+        False — the dispatcher routes to the env-file path on POSIX,
+        but a direct call must not silently succeed."""
+        from research import _clear_api_key_from_user_scope
+        monkeypatch.setattr("sys.platform", "linux")
+        assert _clear_api_key_from_user_scope("ANTHROPIC_API_KEY") is False
+
+
+# ─────────────────────────────────────────────────────────────────────
 # _pair_prompt_one_key (validation loop)
 # ─────────────────────────────────────────────────────────────────────
 
