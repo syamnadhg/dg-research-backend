@@ -31780,6 +31780,51 @@ def run_unpair(deep: bool = False):
     _setup_step(4, total, "Local pairing artifacts")
     print(f"  {_c(_OK, '✓')}  Local config wiped (step 1) + keystore cleared.")
 
+    # Deep cleanup: also wipe pair-time API keys. Lives in Step 4 because
+    # API keys are conceptually "local pairing artifacts" — they're
+    # persisted by --pair Stage 3 and live in the same axis as the
+    # config + keystore. _save_api_key_local writes to Windows User-
+    # scope env (HKCU) on Windows and to .dg-supervisor.env on POSIX.
+    # Default --unpair leaves these in place so a re-pair on the same
+    # machine skips re-pasting (Stage 3 short-circuits via
+    # resolve_api_key/resolve_gemini_api_key "already configured").
+    # --deep is the "I want a truly fresh slate" path — wipe the
+    # persisted keys too so the next --pair Stage 3 fires the paste-
+    # and-verify loop end-to-end.
+    #
+    # We also pop from os.environ in this process so an immediate
+    # --pair launched in the SAME shell session (rare but happens
+    # during development / E2E testing) doesn't inherit the stale keys
+    # via the shell env fallback (resolver rank 5/6).
+    api_keys_cleared = 0
+    if deep:
+        api_key_names = (
+            "ANTHROPIC_API_KEY",
+            "CUA_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        )
+        for _name in api_key_names:
+            try:
+                if _clear_api_key_local(_name):
+                    api_keys_cleared += 1
+            except Exception as _ke:
+                log(f"API key clear failed for {_name}: {_ke}", "WARN")
+            # Strip from current process too. shell-inherited env on
+            # POSIX or pythonw inheritance on Windows can both stash a
+            # stale value that would re-resolve in a same-shell --pair.
+            os.environ.pop(_name, None)
+        # Bust the hot-path key cache so any in-process resolver
+        # (shouldn't be any, but defense in depth) sees the cleared
+        # state immediately on next call.
+        try:
+            _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
+        except Exception:
+            pass
+    api_keys_wiped = api_keys_cleared > 0
+    if api_keys_wiped:
+        print(f"  {_c(_OK, '✓')}  Pair-time API keys cleared (`--deep`) — Stage 3 will re-prompt and re-verify on next --pair.")
+
     # ── [5/5] Verify ──
     _setup_step(5, total, "Confirming silence")
     stragglers = [p for p in _enumerate_research_py_procs()
@@ -31851,46 +31896,6 @@ def run_unpair(deep: bool = False):
             log(f"Browser profile wipe failed: {_de}", "WARN")
     browser_wiped = browser_wiped_count > 0
 
-    # ── Deep cleanup: also wipe pair-time API keys ──
-    # _save_api_key_local writes to Windows User-scope env (HKCU) on
-    # Windows and to .dg-supervisor.env on POSIX. Default --unpair leaves
-    # these in place so a re-pair on the same machine skips re-pasting
-    # (Stage 3 short-circuits via resolve_api_key/resolve_gemini_api_key
-    # "already configured"). --deep is the "I want a truly fresh slate"
-    # path — wipe the persisted keys too so the next --pair Stage 3 fires
-    # the paste-and-verify loop end-to-end.
-    #
-    # We also pop from os.environ in this process so an immediate
-    # --pair launched in the SAME shell session (rare but happens during
-    # development / E2E testing) doesn't inherit the stale keys via the
-    # shell env fallback (resolver rank 5/6).
-    api_keys_cleared = 0
-    if deep:
-        api_key_names = (
-            "ANTHROPIC_API_KEY",
-            "CUA_API_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-        )
-        for _name in api_key_names:
-            try:
-                if _clear_api_key_local(_name):
-                    api_keys_cleared += 1
-            except Exception as _ke:
-                log(f"API key clear failed for {_name}: {_ke}", "WARN")
-            # Strip from current process too. shell-inherited env on
-            # POSIX or pythonw inheritance on Windows can both stash a
-            # stale value that would re-resolve in a same-shell --pair.
-            os.environ.pop(_name, None)
-        # Bust the hot-path key cache so any in-process resolver
-        # (shouldn't be any, but defense in depth) sees the cleared
-        # state immediately on next call.
-        try:
-            _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
-        except Exception:
-            pass
-    api_keys_wiped = api_keys_cleared > 0
-
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  The bond dissolves.')}  {_c(_DIM, 'This machine is no longer paired.')}")
     print()
@@ -31899,8 +31904,6 @@ def run_unpair(deep: bool = False):
             print(f"  {_c(_OK, '✓')}  Chrome profile wiped (`--deep`) — fresh browser on next --pair.")
         else:
             print(f"  {_c(_OK, '✓')}  {browser_wiped_count} Chrome profiles wiped (`--deep`) — fresh browsers on next --pair.")
-    if api_keys_wiped:
-        print(f"  {_c(_OK, '✓')}  Pair-time API keys cleared (`--deep`) — Stage 3 will re-prompt and re-verify on next --pair.")
     if browser_wiped or api_keys_wiped:
         print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
         print(f"       {_c(_DIM, '• Research history in queues/')}")
