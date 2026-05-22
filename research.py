@@ -27601,6 +27601,95 @@ def _save_api_key_to_firestore(uid: str, key_name: str, value: str) -> bool:
     return _save_api_key_via_fe_bridge(key_name, value)
 
 
+# ── Pair-flow API key verifiers ───────────────────────────────────────
+# Cheap live-API calls invoked during --pair Stage 3 to confirm a pasted
+# key actually authenticates before we persist it. Verification at paste
+# time means the operator catches typos / revoked keys / wrong-account
+# pastes immediately, instead of mid-pipeline. All verifiers return one
+# of three string statuses:
+#   "ok"            — key authenticates
+#   "auth_failed"   — provider rejected the key (401/403/specific error
+#                     code) — re-prompt makes sense
+#   "network_error" — timeout / connection / unrecognized error — the
+#                     caller treats this as "save anyway, the user can
+#                     run a job and see what happens" so offline pairs
+#                     and transient blips don't block setup
+def _verify_anthropic_key(key: str) -> str:
+    """Verify an Anthropic API key against the live API.
+
+    Calls `models.list()` with a 5s timeout and `max_retries=0` so the
+    pair UX feels snappy on flaky connections. `models.list` requires a
+    well-formed, recognized key but does NOT exercise message-API
+    billing — a never-funded key still passes here and fails at first
+    `messages.create`. Good enough for pair-time format-checking; full
+    billing verification belongs in the first job's error surface."""
+    if not key:
+        return "auth_failed"
+    try:
+        import anthropic as _anth
+    except ImportError:
+        # Anthropic SDK missing — can't verify; treat as network so the
+        # caller saves the key anyway and the operator installs the SDK
+        # separately. Unblocks the pair flow.
+        return "network_error"
+    try:
+        _anth.Anthropic(api_key=key, timeout=5.0, max_retries=0).models.list()
+        return "ok"
+    except _anth.AuthenticationError:
+        return "auth_failed"
+    except _anth.PermissionDeniedError:
+        # 403 — workspace cap / org-disabled. Same UX outcome as a bad
+        # key (user needs to paste a different one), so we re-prompt.
+        return "auth_failed"
+    except (_anth.APITimeoutError, _anth.APIConnectionError):
+        return "network_error"
+    except Exception:
+        # Catch-all for unexpected SDK errors. We'd rather save an
+        # unverified key than crash the pair flow.
+        return "network_error"
+
+
+def _verify_gemini_key(key: str) -> str:
+    """Verify a Gemini / Google AI API key against the live API.
+
+    Issues an unauthenticated `GET /v1beta/models?key=...` (5s timeout)
+    and inspects the JSON error body. Google's URL-param auth returns
+    HTTP 400 with `error.status=INVALID_ARGUMENT` and `details[].reason=
+    API_KEY_INVALID` for structurally bad keys, and HTTP 403 with
+    `PERMISSION_DENIED` for revoked / scope-disabled keys. We only
+    re-prompt on those two specific signals — 429 quota and 5xx blips
+    fall through to network_error so the user isn't blocked."""
+    if not key:
+        return "auth_failed"
+    try:
+        import requests as _requests
+    except ImportError:
+        return "network_error"
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    try:
+        resp = _requests.get(url, params={"key": key}, timeout=5.0)
+    except _requests.RequestException:
+        return "network_error"
+    if resp.status_code == 200:
+        return "ok"
+    try:
+        err = (resp.json() or {}).get("error", {}) or {}
+        reasons = {
+            str((d or {}).get("reason", ""))
+            for d in (err.get("details") or [])
+        }
+    except Exception:
+        return "network_error"
+    if "API_KEY_INVALID" in reasons:
+        return "auth_failed"
+    if str(err.get("status", "")) == "PERMISSION_DENIED":
+        return "auth_failed"
+    # 429 quota, 5xx, or unrecognized error shape — save and let the
+    # operator find out at first run. Don't block the pair flow on a
+    # transient provider issue.
+    return "network_error"
+
+
 async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
     """Single-key paste loop for --pair Stage 4/5.
 
@@ -27651,16 +27740,92 @@ async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
         return s
 
 
+async def _pair_prompt_one_key_with_verify(
+    label: str,
+    example: str,
+    help_url: str,
+    verifier,
+    max_attempts: int = 3,
+) -> str:
+    """Paste-and-verify loop for --pair Stage 3.
+
+    Wraps `_pair_prompt_one_key` with an API-call verifier (cheap
+    `models.list`-style probe). On verify result:
+      - "ok": return the key — caller persists it.
+      - "auth_failed": warn + re-prompt up to `max_attempts` times.
+        After the last fail, ask "save anyway? [y/N]" — yes returns
+        the last pasted key with a stern warning, no returns "" (skip).
+      - "network_error": warn + return the key as-is. Offline-tolerant
+        pair — the user can still set up on a flaky connection; jobs
+        fail-loud at first run if the key is actually bad.
+
+    Skip path (`_pair_prompt_one_key` returns "") never invokes the
+    verifier — skip is first-class and free.
+    """
+    attempts = 0
+    last_key = ""
+    while True:
+        key = await _pair_prompt_one_key(label, example, help_url)
+        if not key:
+            return ""  # Skip — no verification needed
+        # Wrap the verifier in to_thread so the 5s network call doesn't
+        # block the event loop (defensive; pair has nothing else running).
+        status = await asyncio.to_thread(verifier, key)
+        if status == "ok":
+            return key
+        if status == "network_error":
+            print(f"  {_c(_WARN, '!')}  Could not reach {label} API to verify "
+                  f"{_c(_DIM, '(network error — saving without check).')}")
+            print(f"  {_c(_DIM, '     Jobs will fail-loud at first run if the key is invalid.')}")
+            return key
+        # status == "auth_failed"
+        attempts += 1
+        last_key = key
+        if attempts < max_attempts:
+            remaining = max_attempts - attempts
+            print(
+                f"  {_c(_WARN, '!')}  {label} rejected this key "
+                f"{_c(_DIM, f'({remaining} attempt' + ('s' if remaining != 1 else '') + ' left — try again or type s to skip).')}"
+            )
+            continue
+        # Last attempt failed — escape hatch in case the verifier endpoint
+        # itself is misbehaving (e.g. enterprise proxy MITM that breaks
+        # TLS). Default to no.
+        print(
+            f"  {_c(_WARN, '!')}  {label} rejected this key on attempt "
+            f"{attempts}/{max_attempts}."
+        )
+        try:
+            ans = await asyncio.to_thread(
+                input,
+                f"  {_c(_ACCENT, '>')}  Save this key anyway "
+                f"{_c(_DIM, '[y/N]:')} ",
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+        if (ans or "").strip().lower() in ("y", "yes"):
+            print(
+                f"  {_c(_WARN, '⚠')}  Saving unverified key. "
+                f"{_c(_DIM, 'Jobs will fail-loud at first run if it remains invalid.')}"
+            )
+            return last_key
+        return ""
+
+
 async def _pair_prompt_api_keys(uid: str):
     """Stage 3/5 of --pair: detect-or-prompt for Anthropic + Gemini.
 
     Per key: if any source already resolves (Firestore / Windows user-scope
     env / shell env / .dg-supervisor.env via _load_env_file), skip the
     prompt and tell the user we're using that. Otherwise prompt with
-    paste-or-skip. On paste: write Firestore (canonical, cross-device) +
-    os.environ (in-memory for this session) + bust _RESOLVED_KEY_CACHE so
-    the change is picked up immediately by Stage 4 browser-login CUA
-    init AND by Stage 5 supervisor arming.
+    paste-or-skip, then VERIFY the pasted key against the provider's API
+    before persisting — typos / revoked keys / wrong-account pastes
+    surface immediately, not mid-pipeline. On verified paste: write
+    Firestore (canonical, cross-device) + os.environ (in-memory for this
+    session) + bust _RESOLVED_KEY_CACHE so the change is picked up
+    immediately by Stage 4 browser-login CUA init AND by Stage 5
+    supervisor arming.
 
     Anthropic and Gemini are independent — skipping one doesn't affect the
     other. Pair always completes; degraded modes (cua_unavailable for
@@ -27670,10 +27835,11 @@ async def _pair_prompt_api_keys(uid: str):
     if resolve_api_key():
         print(f"  {_c(_OK, '✓')}  Anthropic key {_c(_DIM, 'already configured — using existing source.')}")
     else:
-        key = await _pair_prompt_one_key(
+        key = await _pair_prompt_one_key_with_verify(
             label="Anthropic",
             example="sk-ant-...",
             help_url="https://console.anthropic.com/settings/keys",
+            verifier=_verify_anthropic_key,
         )
         if key:
             ok = _save_api_key_to_firestore(uid, "anthropic", key)
@@ -27694,10 +27860,11 @@ async def _pair_prompt_api_keys(uid: str):
     if resolve_gemini_api_key():
         print(f"  {_c(_OK, '✓')}  Gemini key {_c(_DIM, 'already configured — using existing source.')}")
     else:
-        key = await _pair_prompt_one_key(
+        key = await _pair_prompt_one_key_with_verify(
             label="Gemini",
             example="AIza...",
             help_url="https://aistudio.google.com/app/apikey",
+            verifier=_verify_gemini_key,
         )
         if key:
             ok = _save_api_key_to_firestore(uid, "gemini", key)
