@@ -124,6 +124,37 @@ def _profile_dir(n: int) -> Path:
     return Path.home() / ".super-research" / f"browser-profile-{n}"
 
 
+def _profile_matches_cmdline(profile: str, cmdline: str) -> bool:
+    """True iff `cmdline` references `profile` as a complete path segment,
+    NOT a substring. Both args expected to be lowercased + forward-slash
+    normalized by caller.
+
+    Bug history: prior code used `if our_profile in cmdline` which is a
+    bare substring check. Worker 1's profile dir is `…/browser-profile/`
+    (no suffix) and worker 2's is `…/browser-profile-2/`. The substring
+    "browser-profile" IS in "browser-profile-2/…", so worker 1's
+    orphan-Chrome sweep wrongly identified worker 2's live Chrome as its
+    own orphan and killed it — surfacing as "Browser tab closed
+    unexpectedly" on the sibling worker (2026-05-22 multi-worker repro
+    where stopping Golden Retriever killed German Shepherd).
+
+    Boundary rule: profile must be followed by '/' (a path separator,
+    matches the typical Patchright cmdline shape with /Default/...
+    appended) OR by whitespace OR at end of cmdline.
+    """
+    p = profile.rstrip("/")
+    c = cmdline
+    idx = 0
+    while True:
+        i = c.find(p, idx)
+        if i < 0:
+            return False
+        end = i + len(p)
+        if end >= len(c) or c[end] in "/ \t":
+            return True
+        idx = end + 1
+
+
 BETA_FLAG = "computer-use-2025-11-24"
 # All configurable via env vars (defaults are production-tuned)
 CUA_MODEL = os.environ.get("CUA_MODEL", "claude-opus-4-7")
@@ -12659,7 +12690,7 @@ class Browser:
                 try:
                     if proc.info["name"] and "chrome" in proc.info["name"].lower():
                         cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
-                        if our_profile in cmdline:
+                        if _profile_matches_cmdline(our_profile, cmdline):
                             try:
                                 chrome_start_ts = proc.create_time()
                             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -13118,7 +13149,7 @@ class Browser:
                     try:
                         if proc.info["name"] and "chrom" in proc.info["name"].lower():
                             cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
-                            if our_profile in cmdline:
+                            if _profile_matches_cmdline(our_profile, cmdline):
                                 proc.kill()
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
