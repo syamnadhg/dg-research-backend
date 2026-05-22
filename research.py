@@ -3549,6 +3549,55 @@ def start_firestore_start_listener(job_queue, loop):
                     from google.cloud import firestore as _firestore_claim
                     _claim_ref = doc.reference
 
+                    # FIFO pre-query (PR 3, 2026-05-21): before attempting
+                    # claim, verify this doc is the OLDEST unclaimed start
+                    # action on the device queue. Without this gate the
+                    # claim was "first-free-worker-wins" — Firestore
+                    # delivers ADDED changes in doc-id order (random for
+                    # auto-IDs), NOT createdAt order. With 3 docs A,B,C
+                    # arriving fast and 2 workers, W1 could iterate B
+                    # first and claim B while older A sat unclaimed until
+                    # idle-rescan. Pre-query sorts candidates by client-ms
+                    # `timestamp` ASC (universal field, written by FE
+                    # buildQueuePayload) with doc-id tiebreaker; if my doc
+                    # isn't the head, defer — the head's own listener-
+                    # fire (or idle-rescan) will claim it. Missing-
+                    # timestamp legacy docs sort LAST so they don't
+                    # FIFO-block well-formed new docs.
+                    try:
+                        _head_candidates = list(col_ref.limit(20).stream())
+
+                        def _fifo_key(_snap):
+                            _hd = _snap.to_dict() or {}
+                            _ts = _hd.get("timestamp")
+                            if isinstance(_ts, (int, float)) and _ts > 0:
+                                return (0, _ts, _snap.id)
+                            return (1, 0, _snap.id)
+
+                        _head_candidates.sort(key=_fifo_key)
+                        _head_id = None
+                        for _hs in _head_candidates:
+                            _hd = _hs.to_dict() or {}
+                            if _hd.get("processed") or _hd.get("assignedWorker"):
+                                continue
+                            # FIFO only over start actions. Cancel/resume
+                            # have their own dispatch paths upstream.
+                            if (_hd.get("action") or "start") != "start":
+                                continue
+                            _head_id = _hs.id
+                            break
+                        if _head_id is not None and _head_id != doc.id:
+                            log(
+                                f"[start-listener] worker {WORKER_ID}: FIFO defer {research_id[:8]}… (older unclaimed {_head_id[:8]}… is head)",
+                                "DEBUG",
+                            )
+                            continue
+                    except Exception as _fe:
+                        log(
+                            f"[start-listener] worker {WORKER_ID}: FIFO pre-query failed (proceeding): {_fe}",
+                            "WARN",
+                        )
+
                     @_firestore_claim.transactional
                     def _try_claim(t, _ref=_claim_ref, _wid=WORKER_ID):
                         snap = _ref.get(transaction=t)
@@ -26172,10 +26221,26 @@ async def run_server(port=8000):
             return
         try:
             col = _firebase_db.collection("devices").document(did).collection("queue")
-            candidates = await asyncio.to_thread(lambda: list(col.limit(10).stream()))
+            candidates = await asyncio.to_thread(lambda: list(col.limit(20).stream()))
         except Exception as e:
             log(f"[idle-rescan] worker {WORKER_ID}: scan failed: {e}", "WARN")
             return
+
+        # FIFO sort (PR 3, 2026-05-21): pick oldest unclaimed first so an
+        # orphan that's been sitting longer gets picked up before a newer
+        # one. Stream order is by doc-id (random for auto-IDs), so without
+        # sorting the rescan was effectively "first-found-wins" — could
+        # leave the OLDEST orphan sitting under a newer one. Sort by
+        # client-ms `timestamp` ASC, missing-timestamp docs sort LAST
+        # (Firestore `order_by` excludes them entirely, so in-process
+        # sort handles them gracefully without a separate fallback pass).
+        def _fifo_key(_snap):
+            _hd = _snap.to_dict() or {}
+            _ts = _hd.get("timestamp")
+            if isinstance(_ts, (int, float)) and _ts > 0:
+                return (0, _ts, _snap.id)
+            return (1, 0, _snap.id)
+        candidates.sort(key=_fifo_key)
 
         from google.cloud import firestore as _firestore_claim
 
