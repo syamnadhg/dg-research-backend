@@ -28021,8 +28021,12 @@ async def _pair_prompt_one_key_with_verify(
     """Paste-and-verify loop for --pair Stage 3.
 
     Wraps `_pair_prompt_one_key` with an API-call verifier (cheap
-    `models.list`-style probe). On verify result:
-      - "ok": return the key — caller persists it.
+    `models.list`-style probe). A visible `_async_spinner_ctx` runs
+    during the probe so the operator sees verification is happening
+    (the probe itself is up to 5s — silent would feel like a hang).
+    On verify result:
+      - "ok": print `✓ {label} key verified.` + return the key —
+        caller persists it.
       - "auth_failed": warn + re-prompt up to `max_attempts` times.
         After the last fail, ask "save anyway? [y/N]" — yes returns
         the last pasted key with a stern warning, no returns "" (skip).
@@ -28041,8 +28045,13 @@ async def _pair_prompt_one_key_with_verify(
             return ""  # Skip — no verification needed
         # Wrap the verifier in to_thread so the 5s network call doesn't
         # block the event loop (defensive; pair has nothing else running).
-        status = await asyncio.to_thread(verifier, key)
+        # Spinner gives the user visible feedback that the probe is
+        # actually running — silent would feel like a hang on slow
+        # networks.
+        async with _async_spinner_ctx(f"Verifying {label} key"):
+            status = await asyncio.to_thread(verifier, key)
         if status == "ok":
+            print(f"  {_c(_OK, '✓')}  {label} key verified.")
             return key
         if status == "network_error":
             print(f"  {_c(_WARN, '!')}  Could not reach {label} API to verify "

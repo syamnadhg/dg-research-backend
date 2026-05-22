@@ -823,6 +823,26 @@ class TestPairPromptOneKeyWithVerify:
             verifier=lambda k: "ok"))
         assert result == valid_key
 
+    def test_ok_prints_verified_confirmation(self, monkeypatch, silent_log, capsys):
+        """Successful verify must print `✓ {label} key verified.` before
+        returning. Without the visible checkpoint, the operator can't
+        tell the verifier actually ran (the spinner clears + the save
+        line follows immediately — silent verify would look identical
+        to a no-op pre-fix-2026-05-22)."""
+        from research import _pair_prompt_one_key_with_verify
+        valid_key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"
+        monkeypatch.setattr("research.asyncio.to_thread",
+                            _dispatching_to_thread(valid_key, "ok"))
+        result = self._run(_pair_prompt_one_key_with_verify(
+            "Anthropic", "sk-ant-...", "https://x",
+            verifier=lambda k: "ok"))
+        assert result == valid_key
+        out = capsys.readouterr().out
+        # Label string is interpolated into the confirmation line.
+        # ANSI color codes wrap around the ✓ but the literal text
+        # substring is stable.
+        assert "Anthropic key verified" in out
+
     def test_network_error_returns_key_with_warning(self, monkeypatch, silent_log):
         """network_error must not block; key is returned as-is."""
         from research import _pair_prompt_one_key_with_verify
