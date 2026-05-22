@@ -26687,6 +26687,18 @@ async def run_server(port=8000):
             return
         if load_worker_count() <= 1:
             return  # single-worker mode — listener never gates on busy
+        # Shutdown gate (2026-05-22): STOP scheduled exit makes the
+        # worker's `finally` block trigger an idle-rescan even though
+        # the process is about to die. Without this gate, the rescan
+        # would claim a deferred-FIFO doc, log "picking up orphan",
+        # then exit before completing the side effects — leaving the
+        # doc half-claimed in Firestore (`assignedWorker` set, no
+        # actual work happening). The next respawn's stale-skip
+        # would then delete the legit FIFO entry. Skip the whole
+        # rescan when a stop is in flight.
+        if _exit_scheduled:
+            log(f"[idle-rescan] worker {WORKER_ID}: skipping — exit scheduled", "INFO")
+            return
         if _QUEUE_STATE.get("running") or _job_queue.qsize() > 0:
             return  # not actually idle
         did = load_device_id()
@@ -26721,9 +26733,10 @@ async def run_server(port=8000):
                 continue
             if (d.get("action") or "start") != "start":
                 continue  # cancel/resume handled by their own paths
-            # Re-check busy before each claim attempt (could have flipped
-            # mid-scan if a sibling beat us to a different doc).
-            if _QUEUE_STATE.get("running") or _job_queue.qsize() > 0:
+            # Re-check busy + shutdown before each claim attempt (could
+            # have flipped mid-scan: a sibling claimed a different doc
+            # OR a STOP landed between candidates).
+            if _exit_scheduled or _QUEUE_STATE.get("running") or _job_queue.qsize() > 0:
                 return
 
             # Conditional-update claim (replaces TX-based claim that
@@ -26752,6 +26765,29 @@ async def run_server(port=8000):
                     "INFO",
                 )
                 continue
+
+            # Final shutdown gate: even with a successful claim, don't
+            # proceed if a STOP scheduled exit during the claim RPC.
+            # The claim wrote assignedWorker + claimedAt — release them
+            # via DELETE_FIELD so the doc returns to "unclaimed" state
+            # and the next worker (sibling or respawned-self) can pick
+            # it up cleanly. Best-effort: if the release write fails,
+            # commit 3's stale-skip discrimination handles the zombie.
+            if _exit_scheduled:
+                log(
+                    f"[idle-rescan] worker {WORKER_ID}: claimed {(d.get('researchId') or '')[:8]}… "
+                    f"but exit scheduled — releasing claim",
+                    "WARN",
+                )
+                try:
+                    from google.cloud.firestore import DELETE_FIELD as _DF
+                    await asyncio.to_thread(
+                        snap.reference.update,
+                        {"assignedWorker": _DF, "claimedAt": _DF},
+                    )
+                except Exception as _re:
+                    log(f"[idle-rescan] release-claim failed (non-fatal): {_re}", "WARN")
+                return
 
             # Won — replicate the listener's minimal start-action side
             # effects: validate fields, flip research doc to ongoing,
