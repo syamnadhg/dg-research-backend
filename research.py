@@ -31524,8 +31524,15 @@ def run_unpair(deep: bool = False):
       • Chrome profile(s) at ~/.super-research/browser-profile*/ (your logins)
       • Pipeline history in queues/
 
-    With `deep=True` (CLI: `--unpair --deep`), ALSO wipes the Chrome
-    profile directory so the next `--pair` starts with a fresh browser.
+    With `deep=True` (CLI: `--unpair --deep`), ALSO wipes:
+      • All ~/.super-research/browser-profile*/ dirs (fresh browsers
+        on next --pair) + workerCount reset to 1.
+      • Pair-time API keys (ANTHROPIC_API_KEY / CUA_API_KEY /
+        GEMINI_API_KEY / GOOGLE_API_KEY) from Windows User-scope env
+        (HKCU) or `.dg-supervisor.env` on POSIX, plus the current
+        process's os.environ + _RESOLVED_KEY_CACHE — so the next
+        --pair Stage 3 actually re-prompts and re-verifies instead
+        of short-circuiting on a leftover key.
     Use this when re-pairing to a different account or when the
     multi-account safety check refuses pair due to stale Google auth.
 
@@ -31835,6 +31842,46 @@ def run_unpair(deep: bool = False):
             log(f"Browser profile wipe failed: {_de}", "WARN")
     browser_wiped = browser_wiped_count > 0
 
+    # ── Deep cleanup: also wipe pair-time API keys ──
+    # _save_api_key_local writes to Windows User-scope env (HKCU) on
+    # Windows and to .dg-supervisor.env on POSIX. Default --unpair leaves
+    # these in place so a re-pair on the same machine skips re-pasting
+    # (Stage 3 short-circuits via resolve_api_key/resolve_gemini_api_key
+    # "already configured"). --deep is the "I want a truly fresh slate"
+    # path — wipe the persisted keys too so the next --pair Stage 3 fires
+    # the paste-and-verify loop end-to-end.
+    #
+    # We also pop from os.environ in this process so an immediate
+    # --pair launched in the SAME shell session (rare but happens during
+    # development / E2E testing) doesn't inherit the stale keys via the
+    # shell env fallback (resolver rank 5/6).
+    api_keys_cleared = 0
+    if deep:
+        api_key_names = (
+            "ANTHROPIC_API_KEY",
+            "CUA_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        )
+        for _name in api_key_names:
+            try:
+                if _clear_api_key_local(_name):
+                    api_keys_cleared += 1
+            except Exception as _ke:
+                log(f"API key clear failed for {_name}: {_ke}", "WARN")
+            # Strip from current process too. shell-inherited env on
+            # POSIX or pythonw inheritance on Windows can both stash a
+            # stale value that would re-resolve in a same-shell --pair.
+            os.environ.pop(_name, None)
+        # Bust the hot-path key cache so any in-process resolver
+        # (shouldn't be any, but defense in depth) sees the cleared
+        # state immediately on next call.
+        try:
+            _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
+        except Exception:
+            pass
+    api_keys_wiped = api_keys_cleared > 0
+
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  The bond dissolves.')}  {_c(_DIM, 'This machine is no longer paired.')}")
     print()
@@ -31843,6 +31890,9 @@ def run_unpair(deep: bool = False):
             print(f"  {_c(_OK, '✓')}  Chrome profile wiped (`--deep`) — fresh browser on next --pair.")
         else:
             print(f"  {_c(_OK, '✓')}  {browser_wiped_count} Chrome profiles wiped (`--deep`) — fresh browsers on next --pair.")
+    if api_keys_wiped:
+        print(f"  {_c(_OK, '✓')}  Pair-time API keys cleared (`--deep`) — Stage 3 will re-prompt and re-verify on next --pair.")
+    if browser_wiped or api_keys_wiped:
         print(f"  {_c(_DIM, 'Preserved on disk (remove manually for a fully clean slate):')}")
         print(f"       {_c(_DIM, '• Research history in queues/')}")
         print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
@@ -31851,7 +31901,7 @@ def run_unpair(deep: bool = False):
         print(f"       {_c(_DIM, '• Chrome profile(s) at ~/.super-research/browser-profile*/  (your logins)')}")
         print(f"       {_c(_DIM, '• Research history in queues/')}")
         print(f"       {_c(_DIM, '• firebase-service-account.json  (needed to re-pair)')}")
-        print(f"       {_c(_DIM, '  Add --deep to also wipe the Chrome profile(s) next time.')}")
+        print(f"       {_c(_DIM, '  Add --deep to also wipe the Chrome profile(s) + pair-time API keys next time.')}")
     _render_next_actions([
         ("python research.py --pair", "reconnect this machine (mints a fresh token)"),
     ])
@@ -31890,7 +31940,7 @@ def run_commands_help():
         ("python research.py --unpair",
          "Fully disconnect this PC (deletes token + device doc + local config)"),
         ("python research.py --unpair --deep",
-         "Same as --unpair, but ALSO wipes all ~/.super-research/browser-profile*/ dirs + resets workerCount"),
+         "Same as --unpair, but ALSO wipes browser-profile*/ dirs + pair-time API keys + resets workerCount"),
     ])
 
     _section("Advanced", [
@@ -32267,8 +32317,11 @@ def main():
     parser.add_argument("--deep", action="store_true",
         help="With --unpair: also wipe ALL Playwright browser profiles under ~/.super-research/browser-profile*/ "
              "(clears ChatGPT/Gemini/Claude/NotebookLM logins across profile-1 and any profile-N set up via pair "
-             "Stage 4 multi-profile loop). Also resets workerCount to 1. Useful when re-pairing to a different "
-             "account or when the F4 cookie check refuses pair due to stale Google auth. Default: preserve profiles.")
+             "Stage 4 multi-profile loop). Also resets workerCount to 1 and wipes pair-time API keys "
+             "(ANTHROPIC_API_KEY/CUA_API_KEY/GEMINI_API_KEY/GOOGLE_API_KEY) from Windows User-scope env or "
+             ".dg-supervisor.env so the next --pair Stage 3 re-prompts and re-verifies. Useful when re-pairing "
+             "to a different account or when the F4 cookie check refuses pair due to stale Google auth. "
+             "Default: preserve profiles + keys.")
     parser.add_argument("--daemon-loop", action="store_true",
         help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the On Startup scheduled task.")
     parser.add_argument("--env-file", default=None,
