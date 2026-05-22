@@ -20312,6 +20312,44 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         # Settle after clearance — page often reloads to the real content
         await asyncio.sleep(2)
 
+    # LAYER 0.5 (Gemini-only): force fresh chat. `https://gemini.google.com`
+    # natural-redirects to `/app` and Google then auto-routes to the most
+    # recent `/app/<chat-id>` for accounts with history. Pasting the brief
+    # into a past conversation produces the "stuck in past run" symptom
+    # (Gemini answers in the old thread's context, the new run inherits
+    # stale state, and detect_completion can fire on the prior turn's
+    # Share button). Click "New chat" if URL has a chat id; fall back to
+    # a direct nav to /app so we always land on a clean composer.
+    if platform_l == "gemini":
+        try:
+            cur_url = (page.url or "").lower().rstrip("/")
+            if "/app/" in cur_url and not cur_url.endswith("/app"):
+                log(f"[{label}] Detected past-chat URL ({cur_url}) — forcing New chat")
+                clicked = await page.evaluate("""() => {
+                    const sel = 'button[aria-label*="New chat" i], a[aria-label*="New chat" i]';
+                    const btn = document.querySelector(sel);
+                    if (btn && btn.offsetParent !== null) { btn.click(); return true; }
+                    for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        if (t === 'new chat' && el.offsetParent !== null) { el.click(); return true; }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    await asyncio.sleep(2)
+                cur2 = (page.url or "").lower().rstrip("/")
+                if "/app/" in cur2 and not cur2.endswith("/app"):
+                    log(f"[{label}] Still on past chat ({cur2}) — direct nav to /app", "INFO")
+                    try:
+                        await page.goto("https://gemini.google.com/app")
+                        await asyncio.sleep(3)
+                    except Exception as _ne:
+                        log(f"[{label}] Direct /app nav failed: {_ne}", "WARN")
+                else:
+                    log(f"[{label}] Fresh chat confirmed ({cur2 or 'unknown'})")
+        except Exception as _fe:
+            log(f"[{label}] Fresh-chat guard errored (continuing): {_fe}", "WARN")
+
     # LAYER 1: Playwright-direct setup first
     setup_ok = False
     if platform_l == "chatgpt":
