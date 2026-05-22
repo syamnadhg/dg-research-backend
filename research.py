@@ -27717,6 +27717,21 @@ async def run_server(port=8000):
         # Refresh the paired device doc so the Account page sees this PC
         # online immediately on server start.
         paired_uid = load_paired_uid()
+        # Worker-1 boot: clear device-doc `currentRunId` fields proactively.
+        # This is the backstop for any exit path that bypassed
+        # `_schedule_server_exit` (commit 2a) — process SIGKILL, OOM,
+        # daemon-loop crash, `--retire` (externally killed). Without
+        # this, a stale currentRunId from a prior session persists and
+        # the owner's first new submission's FE renders a spurious
+        # QueuedBanner (Bug X).
+        #
+        # If a job is auto-resumed by rehydration below, its dequeue at
+        # research.py:~26948 will re-write the fields. The 1-15s window
+        # between this clear and re-write is invisible to the FE
+        # because the cross-user fallback predicate requires
+        # `currentRunId` set; cleared state ⇒ fallback not engaged ⇒ no
+        # banner.
+        _clear_current_run_id_best_effort("worker-1-boot")
         # Track every Firestore research_id touched by rehydration — used by
         # the disk-restore block below so an ongoing run that got marked
         # paused_backend_restart isn't falsely re-enqueued from
