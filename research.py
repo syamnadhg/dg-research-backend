@@ -155,6 +155,161 @@ def _profile_matches_cmdline(profile: str, cmdline: str) -> bool:
         idx = end + 1
 
 
+# Multi-worker claim sentinel: one flat lock file per worker, identifying
+# the research it currently owns. Used by rehydration on worker reboot to
+# avoid dual-spawn when a sibling worker just claimed a new run while we
+# were restarting (2026-05-22 repro: STOP killed worker 1; worker 2
+# claimed the next submission via the start-listener, deleted the
+# Firestore queue doc, flipped research to ongoing; worker 1 rehydrated
+# and saw the ongoing research with on-disk queue_dir → auto-resumed
+# locally → both workers ran the same pipeline).
+#
+# Why a flat layout (queues/.worker.{N}.lock) rather than per-run
+# (queues/{run_id}/.worker.{N}.lock): the run-specific queue_dir is
+# created by setup_firestore_run AT DEQUEUE, not at claim. Between claim
+# and dequeue (~1-2s when the worker pops the asyncio queue and enters
+# run_pipeline) the per-run dir doesn't exist yet, so a sibling's
+# rehydration check on the per-run path would see nothing and proceed.
+# Flat-at-queues-root means the lock can be written the moment the
+# worker dequeues — same code path as the queue_dir creation — and is
+# discoverable by sibling rehydration without knowing the run_id.
+#
+# Why not a Firestore signal: both claim paths (start-listener at
+# research.py:4138-4141 and idle-rescan at 26895-26899) delete the
+# device-queue doc immediately after a successful claim. By the time a
+# rebooting sibling's rehydration runs (4s later in the repro), no
+# Firestore doc exists to query.
+_WORKER_LOCK_PID_REUSE_MAX_AGE_MS = 8 * 60 * 60 * 1000  # 8h
+
+
+def _worker_lock_path(worker_id: int) -> Path:
+    return Path(__file__).parent / "queues" / f".worker.{worker_id}.lock"
+
+
+def _write_worker_lock(worker_id: int, research_id: str, run_id: str) -> None:
+    """Write claim sentinel for `worker_id`. Records PID + started_at so a
+    crashed-worker stale lock can be distinguished from a live claim
+    (PID-liveness check) AND from a recycled-PID coincidence (started_at
+    age guard, 8h max). Idempotent — overwrites any prior content for
+    this worker. Best-effort; failures logged DEBUG.
+
+    Atomic write via tmp+os.replace — `Path.write_text` on its own opens
+    O_TRUNC then writes, so a concurrent scanner could read zero bytes
+    between truncate and write completion (json.loads("") → ValueError
+    → lock invisible for one scan tick, dual-spawn re-opens). tmp+
+    replace is atomic-from-reader's-perspective on POSIX (rename swaps
+    the inode while the old handle stays valid) and on Windows
+    (ReplaceFile semantics).
+
+    Windows-specific: `os.replace` raises `PermissionError` (WinError 5,
+    ERROR_ACCESS_DENIED) if the destination file is held open by
+    another handle at the instant of replace — including a concurrent
+    scanner's `read_text` call. Retry with a brief backoff; the
+    scanner's open-read-close window is microseconds.
+
+    tmp suffix `.lock.tmp` is excluded from the scanner's
+    `.worker.*.lock` glob, so an interrupted write (process killed
+    between tmp write and replace) leaves an orphan `.lock.tmp` that's
+    invisible to the scanner — safe.
+    """
+    try:
+        lock_dir = Path(__file__).parent / "queues"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        path = _worker_lock_path(worker_id)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps({
+            "pid": os.getpid(),
+            "worker_id": worker_id,
+            "research_id": research_id,
+            "run_id": run_id,
+            "started_at": int(time.time() * 1000),
+        }), encoding="utf-8")
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.01 * (attempt + 1))  # 10ms / 20ms / 30ms / 40ms
+    except Exception as _le:
+        log(f"[worker-lock] write failed for worker {worker_id} (non-fatal): {_le}", "DEBUG")
+
+
+def _delete_worker_lock(worker_id: int) -> None:
+    """Best-effort cleanup on run completion/error. Leftover stale locks
+    from process kills are handled by _scan_sibling_locks_for_research's
+    PID-liveness + started_at-age guards."""
+    try:
+        path = _worker_lock_path(worker_id)
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _scan_sibling_locks_for_research(research_id: str, exclude_worker_id: int) -> "list[dict]":
+    """Return list of live sibling claim records for the given research_id.
+
+    "Live" gating, applied in order:
+      1. lock JSON parses
+      2. worker_id != exclude_worker_id (skip self)
+      3. research_id matches (different runs on different workers don't
+         interfere — we only block when the SAME research is being run
+         on a sibling)
+      4. PID alive (psutil.pid_exists)
+      5. started_at within last 8h (PID-reuse defense: stale lock from a
+         long-dead worker whose PID was recycled by an unrelated
+         process must not be treated as live)
+
+    Empty list ⇒ safe to proceed with auto-resume.
+
+    Note: research_id="" is treated as a match-anything wildcard for the
+    research_id check; pass "" only when you intentionally want every
+    sibling lock back (currently unused — kept for symmetry).
+    """
+    try:
+        import psutil
+    except Exception:
+        # No psutil → can't tell if PID is alive. Conservative: assume
+        # no siblings (proceeds with auto-resume). The much-more-common
+        # bug was dual-spawn; absent-psutil is exceptional.
+        return []
+    out: "list[dict]" = []
+    lock_dir = Path(__file__).parent / "queues"
+    if not lock_dir.exists():
+        return out
+    now_ms = int(time.time() * 1000)
+    for lock_file in lock_dir.glob(".worker.*.lock"):
+        try:
+            data = json.loads(lock_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        wid = data.get("worker_id")
+        if wid is None or wid == exclude_worker_id:
+            continue
+        lrid = data.get("research_id") or ""
+        if research_id and lrid != research_id:
+            continue
+        pid = data.get("pid")
+        try:
+            pid_alive = bool(pid) and psutil.pid_exists(int(pid))
+        except Exception:
+            pid_alive = False
+        if not pid_alive:
+            continue
+        started_at = int(data.get("started_at") or 0)
+        if started_at <= 0 or (now_ms - started_at) > _WORKER_LOCK_PID_REUSE_MAX_AGE_MS:
+            continue
+        out.append({
+            "worker_id": wid,
+            "pid": int(pid),
+            "research_id": lrid,
+            "started_at": started_at,
+        })
+    return out
+
+
 BETA_FLAG = "computer-use-2025-11-24"
 # All configurable via env vars (defaults are production-tuned)
 CUA_MODEL = os.environ.get("CUA_MODEL", "claude-opus-4-7")
@@ -26947,6 +27102,17 @@ async def run_server(port=8000):
                 pass
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
+            # Multi-worker claim sentinel. Written here (at dequeue, the
+            # earliest point we own the job) so a sibling worker booting
+            # up sees our claim before doing rehydration auto-resume.
+            # Cleared in the finally block below. Helper docstring at
+            # research.py:_write_worker_lock explains the flat-layout
+            # choice + crash-leftover defenses.
+            _write_worker_lock(
+                WORKER_ID,
+                job.get("research_id") or "",
+                job.get("run_id") or "",
+            )
             log(f"Starting queued job: {job['topic'][:60]}")
             # Publish currentRunId on the device doc so sharers / sibling
             # tabs can see "device is busy with run X" and render the
@@ -27074,6 +27240,11 @@ async def run_server(port=8000):
                 completed = _QUEUE_STATE.get("current_job") or {}
                 _QUEUE_STATE["running"] = False
                 _QUEUE_STATE["current_job"] = None
+                # Release multi-worker claim sentinel. Best-effort —
+                # stale locks from process kills are caught by
+                # _scan_sibling_locks_for_research's PID-liveness + 8h
+                # started_at-age guards.
+                _delete_worker_lock(WORKER_ID)
                 # Clear currentRunId on device doc — release the "device
                 # is busy" signal so the next submitter's FE doesn't think
                 # we're still mid-run. Best-effort; the next worker tick
@@ -27615,6 +27786,42 @@ async def run_server(port=8000):
                         research_id = snap.id
                         _rehydrated_rids.add(research_id)
                         if status_val == "ongoing":
+                            # Sibling-claim guard (2026-05-22). If a
+                            # sibling worker on this device has the lock
+                            # for this research_id (.worker.N.lock with
+                            # live PID + fresh started_at), the sibling
+                            # is actively running the pipeline.
+                            # Auto-resuming locally would dual-spawn
+                            # (two browsers, two FE phase streams, two
+                            # Doc/Email writes). Skip both the auto-
+                            # resume AND the paused_backend_restart
+                            # marker — the sibling owns this run and
+                            # the FE should keep seeing "ongoing".
+                            #
+                            # Repro context: STOP killed worker 1, the
+                            # user fired a new submission while worker 1
+                            # was restarting, worker 2 claimed it via
+                            # the start-listener (Firestore queue doc
+                            # deleted post-claim — no Firestore signal
+                            # available 4s later when worker 1 booted),
+                            # worker 1 saw research status=ongoing +
+                            # queue_dir on disk and re-enqueued the
+                            # same job. The lock files are the only
+                            # cross-worker signal that survives queue-
+                            # doc deletion.
+                            _sibling_holders = _scan_sibling_locks_for_research(
+                                research_id, WORKER_ID
+                            )
+                            if _sibling_holders:
+                                h = _sibling_holders[0]
+                                _age_s = (int(time.time() * 1000) - h["started_at"]) // 1000
+                                log(
+                                    f"[rehydrate] {research_id[:24]}… already claimed by sibling "
+                                    f"worker {h['worker_id']} (PID {h['pid']}, started {_age_s}s ago) "
+                                    f"— skipping auto-resume + paused mark to avoid dual-spawn",
+                                    "INFO",
+                                )
+                                continue
                             # Mid-run runs need either auto-resume (supervised
                             # device — supervisor just respawned us, take the
                             # natural next step and resume the runs too) or a
