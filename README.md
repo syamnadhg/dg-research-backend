@@ -126,6 +126,58 @@ subscriptions. **No `--pair` on the PC needed** — the device is back
 online within ~5s of you entering the new code. Miss the 15-min
 window and you'll need to re-run `--pair` for a fresh device record.
 
+What Reset does to **in-flight runs** (multi-worker safe): the FE
+route writes a `hard_reset` command to `devices/{id}/commands/`
+**before** revoking refresh tokens. Every worker subscribes to that
+subcollection (research.py:27452) so all N workers process the
+command independently — each touches `.stop` on its own active run
+dir, flips its own active research doc to `cancelled`, and schedules
+`os._exit(0)` so the daemon-loop respawns it clean. **No zombie
+runs.** The route polls up to 5s for the BE to ack (delete the
+command) before proceeding to revoke; if the BE is already wedged
+the 30s stale-gate at research.py:2253 ensures a respawned BE won't
+re-fire it.
+
+What Reset does to **queued runs**: the FE route stamps
+`expireAt: now+15min` + `cancelledReason: "device_pair_expired"` on
+every user-tree research doc that points at this device (owner +
+every sharer + every previously-revoked sharer, in `queued` /
+`ongoing` / `running` / `paused` / `paused_pending_repair` state)
+plus every `devices/{id}/queue/*` subdoc. Firestore TTL (configured
+via `firestore.indexes.json` `fieldOverrides`) auto-deletes them at
+the 15-min mark — sharer's research page clears the orphans
+automatically via the existing real-time listener. The sharer sees
+no Cancelled card to dismiss; rows just disappear.
+
+**If you re-pair within 15 min**: the claim route's
+awaiting-re-pair branch reads the snapshotted `preResetUids` field
+from the device doc, clears the `expireAt` + `cancelledReason`
+fields across every sharer's user-tree, and clears `expireAt` on
+the queue subdocs. Queued sharer + owner runs resume seamlessly on
+the post-respawn BE — sharer never sees a blip beyond the brief
+"device offline" interval during the 15-min window.
+
+**If you don't re-pair within 15 min**: device doc + all sharer
+research docs + all queued runs vanish from every browser at the
+15-min mark. To restore, run `python research.py --pair` on the PC.
+Sharers will not regain access until you explicitly re-share with
+them (post-Reset `sharedWith[]` is empty, even if you re-pair).
+
+Partial-failure semantics: both the cross-tree expireAt set (Reset)
+and the cross-tree clear (re-pair) wrap each user-tree batch in a
+3-attempt retry with 250ms × attempt backoff. Persistent failures
+surface as `[reset-pair-code] expireAt set FAILED after 3 attempts`
+or `[claim] re-pair expireAt clear FAILED after 3 attempts` log
+lines — single-RPC blips are absorbed.
+
+What Reset does NOT touch: `~/.super-research/browser-profile*/`
+directories (your Google/ChatGPT/Gemini/Claude logins survive),
+`workerCount` in `research_config.json`, the supervisor (daemon-loop
+keeps respawning workers on the same ports — `--retire` is the only
+way to stop it), the OS keystore (the recovery watcher needs the
+existing `pollSecret` from `research_config.json` to redeem the new
+customToken).
+
 ## Setup Details
 
 ### Step 1: Install Dependencies
