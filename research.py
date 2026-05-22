@@ -18088,12 +18088,36 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # on every platform.
 
     # ── Tier 1: HTML→MD from Gemini's response containers ──
-    # Has shipped 23k–47k chars consistently across many runs — keep
-    # as primary.
+    # 2026-05-21: side-panel selectors added FIRST. The new Gemini UI
+    # renders the Deep Research report in a side-panel artifact
+    # (Contents | Share & Export | Create toolbar) separate from the
+    # chat history. Prior selector list targeted the chat side only —
+    # would return the 200-char ack ("I've completed your research…")
+    # instead of the 23k-47k report. Panel selectors are best-effort
+    # shotgun (we don't know Gemini's exact class names without DOM
+    # inspection) — first match wins via _extract_html_to_md.
     md = await _extract_html_to_md(page, [
+        # New UI (2026-05+): side-panel artifact
+        'immersive-panel', 'deep-research-panel',
+        '[class*="immersive" i] message-content',
+        '[class*="immersive" i] .markdown',
+        '[class*="artifact" i] .markdown',
+        '[class*="report-panel" i] .markdown',
+        'aside[class*="artifact" i]',
+        'aside[class*="report" i]',
+        'aside[class*="research" i]',
+        '[role="complementary"][aria-label*="research" i]',
+        '[role="region"][aria-label*="research" i]',
+        # Chat-inline (legacy / accounts pre-artifact rollout)
         'message-content', '.model-response-text', '.response-container',
     ], label)
-    if md and len(md) > 100:
+    # 2026-05-21: threshold raised 100 → 2000. The new UI's chat side
+    # carries a ~200-char ack that would pass both _is_sources_not_
+    # document and _looks_like_nav_sidebar — shipping it as the report
+    # is the "stuck post-completion / wrong md" symptom. Real Deep
+    # Research reports are >5000 chars; 2000 is a safe floor that
+    # tolerates partial-render glitches while rejecting the ack shape.
+    if md and len(md) > 2000:
         if _is_sources_not_document(md, platform="generic"):
             log(f"[{label}] HTML→MD wrong-artifact — falling to Tier 2", "WARN")
         elif _looks_like_nav_sidebar(md):
@@ -18101,6 +18125,9 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         else:
             log(f"[{label}] Extracted via HTML→MD: {len(md)} chars")
             return md
+    elif md:
+        log(f"[{label}] HTML→MD returned {len(md)} chars (below 2000-char threshold — "
+            f"likely chat-side ack, not the report panel) — falling to Tier 2", "WARN")
 
     # ── Tier 2: CUA-driven Share & Export → "Copy contents" + hijack ──
     # Gemini's "Copy contents" action lives inside a "Share & Export"
@@ -18144,8 +18171,18 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         # Focus the response area before select-all. Without this, focus
         # may still be in the composer and Ctrl+A selects only the
         # composer's text (the old Tier 3 inherited this failure mode).
+        # 2026-05-21: side-panel selectors added first so the new UI's
+        # artifact panel (where the report renders) gets focus before
+        # the chat-inline response selectors. Playwright returns first
+        # match, so side panel wins if present, else falls back to
+        # legacy message-content.
         try:
-            await page.click('message-content, .model-response-text', timeout=2000)
+            await page.click(
+                '[class*="immersive" i], aside[class*="artifact" i], '
+                'aside[class*="report" i], aside[class*="research" i], '
+                '[role="complementary"][aria-label*="research" i], '
+                'message-content, .model-response-text',
+                timeout=2000)
         except Exception:
             # Best-effort — proceed even if click missed; the response
             # area is typically already focused after a completed turn.
