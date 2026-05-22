@@ -170,12 +170,9 @@ def _read_user_scope_env(name: str) -> str:
     """Read a Windows User-scope env var via PowerShell. Empty string
     on non-Windows or failure. Persistent across shells — settable
     manually via `setx NAME value` or PowerShell
-    `[System.Environment]::SetEnvironmentVariable(name, value, 'User')`.
-
-    NOT set by the FE Account page (that path writes to Firestore —
-    see `_read_firestore_api_keys`). This function exists as a
-    legacy / advanced alternative for operators who prefer Windows
-    user-scope env over Firestore or the .env file."""
+    `[System.Environment]::SetEnvironmentVariable(name, value, 'User')`,
+    and by --pair Stage 3 via `_save_api_key_to_user_scope` (Windows
+    persistence path for paste-time API keys)."""
     if sys.platform != "win32":
         return ""
     try:
@@ -187,6 +184,121 @@ def _read_user_scope_env(name: str) -> str:
         return r.stdout.strip()
     except Exception:
         return ""
+
+
+# Whitelist for env-var names accepted by the local-save helpers. Strict
+# subset of POSIX env-var syntax (uppercase letters, digits, underscore;
+# must start with a letter or underscore). Used to defang injection into
+# the PowerShell SetEnvironmentVariable / .dg-supervisor.env writers
+# below — callers pass literal constants, but defense in depth.
+_LOCAL_KEY_NAME_RE = __import__("re").compile(r"^[A-Z_][A-Z0-9_]*$")
+
+
+def _save_api_key_to_user_scope(name: str, value: str) -> bool:
+    """Persist an env var to Windows User-scope (HKCU\\Environment) so
+    future processes inherit it. The CURRENT process's `os.environ` is
+    NOT touched — User-scope env is read at process spawn from the
+    registry, so the caller must mirror to `os.environ` separately for
+    the in-flight session.
+
+    `value` is passed to PowerShell via the subprocess's `env` dict
+    (`$env:_DG_SCOPE_VALUE`) so quotes / dollar-signs / backticks in
+    the key body cannot break out of the quoted PS command argument.
+
+    Returns True on returncode 0, False on non-Windows / bad name /
+    failure / timeout."""
+    if sys.platform != "win32":
+        return False
+    if not _LOCAL_KEY_NAME_RE.match(name):
+        log(f"[save-api-key-local] invalid env var name: {name!r}", "WARN")
+        return False
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"[System.Environment]::SetEnvironmentVariable("
+             f"'{name}', $env:_DG_SCOPE_VALUE, 'User')"],
+            env={**os.environ, "_DG_SCOPE_VALUE": value},
+            capture_output=True, text=True, timeout=10,
+            creationflags=_PS_NO_WINDOW)
+        if r.returncode != 0:
+            log(f"[save-api-key-local] PS SetEnvironmentVariable returncode={r.returncode}: {r.stderr[:200]}", "WARN")
+            return False
+        return True
+    except Exception as e:
+        log(f"[save-api-key-local] PS SetEnvironmentVariable failed: {e}", "WARN")
+        return False
+
+
+def _save_api_key_to_env_file(name: str, value: str, path=None) -> bool:
+    """Upsert `NAME=value` into `.dg-supervisor.env` so the supervisor's
+    next `--env-file` load picks it up. POSIX persistence path; on
+    Windows, prefer User-scope env (faster, no file I/O for read).
+
+    Value is single-quoted with `'` escaped to `'\\''` (POSIX shell-
+    style escape) so any embedded characters round-trip through
+    `_load_env_file`'s matching-quote strip.
+
+    Returns True on successful write, False on bad name / IO failure.
+    Uses atomic write-then-rename so a crash mid-write doesn't corrupt
+    the file."""
+    if not _LOCAL_KEY_NAME_RE.match(name):
+        log(f"[save-api-key-local] invalid env var name: {name!r}", "WARN")
+        return False
+    target = Path(path) if path else _SUPERVISOR_ENV_FILE_DEFAULT_PATH
+    try:
+        lines = []
+        if target.exists():
+            lines = target.read_text(encoding="utf-8-sig").splitlines()
+        quoted = "'" + value.replace("'", "'\\''") + "'"
+        new_line = f"{name}={quoted}"
+        replaced = False
+        new_lines = []
+        for line in lines:
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                new_lines.append(line)
+                continue
+            head = stripped.split("=", 1)[0].strip()
+            if head == name and not replaced:
+                new_lines.append(new_line)
+                replaced = True
+            else:
+                new_lines.append(line)
+        if not replaced:
+            new_lines.append(new_line)
+        out = "\n".join(new_lines)
+        if not out.endswith("\n"):
+            out += "\n"
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(out, encoding="utf-8")
+        tmp.replace(target)
+        return True
+    except Exception as e:
+        log(f"[save-api-key-local] write {target} failed: {e}", "WARN")
+        return False
+
+
+def _save_api_key_local(name: str, value: str) -> bool:
+    """Persist an API key to the local machine for the supervisor and
+    future processes. Picks the right path per OS:
+      - Windows: HKCU User-scope env via PowerShell.
+      - POSIX (macOS / Linux): upsert into `.dg-supervisor.env` so the
+        supervisor's `--env-file` inherits it.
+
+    The current process's `os.environ` is NOT touched by this helper —
+    callers must mirror to `os.environ` themselves so the in-flight
+    pair session can use the key immediately (User-scope env is read
+    at process spawn from the registry, not live; .env file is read
+    only by --env-file at startup).
+
+    Pair-time keys (Stage 3 of `--pair`) flow through here. They live
+    ONLY on the paired machine — the FE Account page is a SEPARATE
+    surface that writes to Firestore (see `_read_firestore_api_keys`).
+    BE resolution prefers Firestore → User-scope → shell env, so an
+    FE-Account-page key wins over a pair-time key when both are set."""
+    if sys.platform == "win32":
+        return _save_api_key_to_user_scope(name, value)
+    return _save_api_key_to_env_file(name, value)
 
 
 def get_env(name):
@@ -205,10 +317,15 @@ def _read_firestore_api_keys() -> dict:
     Returns dict of {gemini, anthropic, deepgram} strings (any subset),
     or empty dict if unpaired / Firestore unreachable / uid unknown.
 
-    This is the Account page sync: the user sets keys in the web app,
-    they land in Firestore, and the backend picks them up on startup
-    without needing a shell env or PowerShell setup. Read-only and
-    silent on failure — env fallback still works."""
+    This is the FE Account → API Config sync: keys the user pastes
+    on the web app land in Firestore, and the backend picks them up
+    on startup. Pair-time keys (from `_pair_prompt_api_keys`) live in
+    BE-local persistence instead (Win User-scope env / .dg-supervisor.env
+    on POSIX) so the FE Account page only ever shows keys the user
+    typed there — never auto-filled by --pair.
+
+    Read-only and silent on failure — User-scope / env fallback in
+    resolve_*_api_key() still works."""
     try:
         uid = load_paired_uid()
         if not uid:
@@ -27351,8 +27468,9 @@ def _fresh_user_mode_id_token() -> "str | None":
     """Return a fresh Firebase ID token for the synth device user, or None
     if the keystore is empty / refresh token revoked. Used by user-mode
     code paths that need to authenticate against an FE Cloud Function
-    (e.g. /api/devices/save-api-key). Forces a refresh on every call so
-    the token can't be expired by the time the HTTP request lands."""
+    (e.g. /api/devices/unpair-self, oauth-callback hand-offs). Forces a
+    refresh on every call so the token can't be expired by the time the
+    HTTP request lands."""
     try:
         from auth import credentials, keystore
         from auth.v2_flow import WEB_API_KEY
@@ -27531,74 +27649,6 @@ def _cleanup_partial_pair(device_id: str) -> None:
             )
     except Exception:
         pass
-
-
-def _save_api_key_via_fe_bridge(key_name: str, value: str) -> bool:
-    """POST to `/api/devices/save-api-key` so the FE writes the API key to
-    `users/{ownerUid}/settings/prefs.apiKeys.{key_name}` via Admin SDK on
-    our behalf. Used by user-mode cmd_pair_v2 Stages 3/5 because the BE's
-    synth device user can't write to the owner's settings tree directly.
-
-    Returns True iff the FE responded 200. False on token-mint failure,
-    network error, or non-2xx response."""
-    import requests as _requests
-    try:
-        from auth.v2_flow import FE_BASE_URL
-    except ImportError:
-        log("save-api-key bridge: auth.v2_flow import failed", "WARN")
-        return False
-    id_token = _fresh_user_mode_id_token()
-    if not id_token:
-        log("save-api-key bridge: no usable ID token — re-pair required", "WARN")
-        return False
-    url = f"{FE_BASE_URL}/api/devices/save-api-key"
-    try:
-        resp = _requests.post(
-            url,
-            headers={"Authorization": f"Bearer {id_token}"},
-            json={"keyName": key_name, "value": value},
-            timeout=15,
-        )
-    except _requests.RequestException as e:
-        log(f"save-api-key bridge: network error: {e}", "WARN")
-        return False
-    if resp.status_code == 200:
-        log(f"[pair] saved apiKeys.{key_name} via FE bridge (user-mode)", "INFO")
-        return True
-    try:
-        body = resp.json()
-        err = body.get("error", "")
-    except Exception:
-        err = resp.text[:200]
-    log(
-        f"save-api-key bridge: HTTP {resp.status_code} ({err}) — key applied to this session only",
-        "WARN",
-    )
-    return False
-
-
-def _save_api_key_to_firestore(uid: str, key_name: str, value: str) -> bool:
-    """Merge-write users/{uid}/settings/prefs.apiKeys.{key_name} = value.
-
-    Targets the same Firestore path the FE Account page writes to, so the
-    pair-time prompt and the web app stay one source of truth (no .env file
-    write — that would create a third source and drift on rotation).
-
-    Returns True on success, False on any failure. On failure the caller
-    keeps the in-memory os.environ assignment so the current pair / serve
-    session still has the key; the user can re-save from the Account page
-    later for cross-device durability.
-
-    Post-D7: a direct write would permission-deny (synth device user
-    can't write `users/{userId}/settings/prefs`). All writes POST to the
-    FE bridge `/api/devices/save-api-key`, which verifies the BE's
-    ID token, reads the `ownerUid` custom claim, and writes via Admin SDK
-    on our behalf. The `uid` parameter is ignored (the bridge resolves
-    the target owner from the token); kept in the signature so call
-    sites don't need updating. See
-    `web/src/app/api/devices/save-api-key/route.ts`."""
-    del uid  # ignored — bridge resolves target ownerUid from the BE's token claim
-    return _save_api_key_via_fe_bridge(key_name, value)
 
 
 # ── Pair-flow API key verifiers ───────────────────────────────────────
@@ -27816,21 +27866,31 @@ async def _pair_prompt_one_key_with_verify(
 async def _pair_prompt_api_keys(uid: str):
     """Stage 3/5 of --pair: detect-or-prompt for Anthropic + Gemini.
 
-    Per key: if any source already resolves (Firestore / Windows user-scope
-    env / shell env / .dg-supervisor.env via _load_env_file), skip the
-    prompt and tell the user we're using that. Otherwise prompt with
-    paste-or-skip, then VERIFY the pasted key against the provider's API
-    before persisting — typos / revoked keys / wrong-account pastes
-    surface immediately, not mid-pipeline. On verified paste: write
-    Firestore (canonical, cross-device) + os.environ (in-memory for this
-    session) + bust _RESOLVED_KEY_CACHE so the change is picked up
-    immediately by Stage 4 browser-login CUA init AND by Stage 5
+    Per key: if any source already resolves (Firestore Account-page key /
+    Windows User-scope env / shell env / .dg-supervisor.env via
+    _load_env_file), skip the prompt and tell the user we're using that.
+    Otherwise prompt with paste-or-skip, then VERIFY the pasted key
+    against the provider's API before persisting — typos / revoked keys
+    / wrong-account pastes surface immediately, not mid-pipeline. On
+    verified paste: write to BE-local persistence (Win User-scope env
+    on Windows; `.dg-supervisor.env` on POSIX) + os.environ (in-memory
+    for this session) + bust _RESOLVED_KEY_CACHE so the change is picked
+    up immediately by Stage 4 browser-login CUA init AND by Stage 5
     supervisor arming.
 
-    Anthropic and Gemini are independent — skipping one doesn't affect the
-    other. Pair always completes; degraded modes (cua_unavailable for
-    missing Anthropic, narration disabled for missing Gemini) are
+    Pair-time keys live ONLY on the paired machine — they are NOT
+    written to Firestore. The FE Account → API Config page is a
+    SEPARATE surface that does write to Firestore; when a user pastes
+    a key there it takes precedence over the BE-local pair-time key
+    (resolver order: Firestore → User-scope → shell env). Keeping the
+    surfaces disjoint prevents the FE Account page from auto-filling
+    with a pair-time key the user never typed there.
+
+    Anthropic and Gemini are independent — skipping one doesn't affect
+    the other. Pair always completes; degraded modes (cua_unavailable
+    for missing Anthropic, narration disabled for missing Gemini) are
     user-recoverable via FE alert + Account → API Config."""
+    del uid  # No longer used — pair-time persistence is BE-local, not Firestore.
     # ── Anthropic ─────────────────────────────────────────────────────────
     if resolve_api_key():
         print(f"  {_c(_OK, '✓')}  Anthropic key {_c(_DIM, 'already configured — using existing source.')}")
@@ -27842,14 +27902,19 @@ async def _pair_prompt_api_keys(uid: str):
             verifier=_verify_anthropic_key,
         )
         if key:
-            ok = _save_api_key_to_firestore(uid, "anthropic", key)
+            # Persist to BE-local FIRST, then mirror to os.environ for the
+            # in-flight session (User-scope env / .env file are only seen
+            # by *new* processes — the current pair session needs the
+            # os.environ mirror to use the key in Stage 4 / Stage 5).
+            ok_anth = _save_api_key_local("ANTHROPIC_API_KEY", key)
+            ok_cua = _save_api_key_local("CUA_API_KEY", key)
             os.environ["ANTHROPIC_API_KEY"] = key
             os.environ["CUA_API_KEY"] = key
             _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
-            if ok:
-                print(f"  {_c(_OK, '✓')}  Saved to your account {_c(_DIM, '— synced across your devices.')}")
+            if ok_anth and ok_cua:
+                print(f"  {_c(_OK, '✓')}  Saved to this machine {_c(_DIM, '— survives reboots via the supervisor.')}")
             else:
-                print(f"  {_c(_WARN, '⚠')}  Could not sync to your account — applied to this session only.")
+                print(f"  {_c(_WARN, '⚠')}  Could not persist — applied to this session only.")
                 print(f"  {_c(_DIM, '     Save permanently from the web app: Account → API Config.')}")
         else:
             print(f"  {_c(_DIM, '─')}  Skipped Anthropic — set later from the web app (Account → API Config).")
@@ -27867,16 +27932,17 @@ async def _pair_prompt_api_keys(uid: str):
             verifier=_verify_gemini_key,
         )
         if key:
-            ok = _save_api_key_to_firestore(uid, "gemini", key)
+            ok_gem = _save_api_key_local("GEMINI_API_KEY", key)
+            ok_goog = _save_api_key_local("GOOGLE_API_KEY", key)
             os.environ["GEMINI_API_KEY"] = key
             os.environ["GOOGLE_API_KEY"] = key
             # resolve_gemini_api_key() has no cache — nothing to bust. If a
             # Gemini cache is ever added (mirroring _RESOLVED_KEY_CACHE), add
             # the equivalent reset here so this site doesn't silently break.
-            if ok:
-                print(f"  {_c(_OK, '✓')}  Saved to your account {_c(_DIM, '— synced across your devices.')}")
+            if ok_gem and ok_goog:
+                print(f"  {_c(_OK, '✓')}  Saved to this machine {_c(_DIM, '— survives reboots via the supervisor.')}")
             else:
-                print(f"  {_c(_WARN, '⚠')}  Could not sync to your account — applied to this session only.")
+                print(f"  {_c(_WARN, '⚠')}  Could not persist — applied to this session only.")
                 print(f"  {_c(_DIM, '     Save permanently from the web app: Account → API Config.')}")
         else:
             print(f"  {_c(_DIM, '─')}  Skipped Gemini — set later from the web app (Account → API Config).")

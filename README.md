@@ -153,12 +153,12 @@ The supervisor reads env vars from `.dg-supervisor.env` (created automatically o
 
 **API keys** — Anthropic powers the agents (CUA + Vision) and is **required** for browser automation. Gemini powers narration + acts as the Haiku fallback for title refinement, and is **optional** (narrator silently disables without it). Four ways to set either, **all platforms**:
 
-- **(easiest — recommended)** **`--pair` Stage 4/5 auto-prompt.** At the end of pairing, `--pair` checks whether each key is already resolvable from any source; for missing keys it prompts with `[paste / S=skip]`. On paste it writes Firestore + `os.environ` + busts the resolver cache so Stage 5 supervisor arming sees the key immediately. Skip is first-class per key (skip Gemini if you don't have one; skip Anthropic if you'll set it later via the web app).
-- **(equivalent — set later, or rotate)** "Account → API Config" in the web app — same Firestore target (`users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}`). Works on Windows, macOS, Linux — same UI, same flow. No restart required after rotating; backend re-reads on next call (60s cache).
-- **(file-based, all platforms)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` and/or `GEMINI_API_KEY=AIza...` in `.dg-supervisor.env`. Loaded by `--env-file` at supervisor startup; survives reboots via the persistence supervisor. Good for un-paired backends or operators who prefer files.
-- **(advanced / legacy)** Set in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). `resolve_api_key()` accepts `CUA_API_KEY` or `ANTHROPIC_API_KEY`; `resolve_gemini_api_key()` accepts `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
+- **(easiest — recommended)** **`--pair` Stage 3 auto-prompt.** At the end of pairing, `--pair` checks whether each key is already resolvable from any source; for missing keys it prompts with `[paste / S=skip]`, **verifies** the pasted key against the provider's API (5s cheap probe), and on success writes BE-local persistence + `os.environ` + busts the resolver cache. Persistence is per-machine: Windows User-scope env on Windows; `.dg-supervisor.env` upsert on macOS / Linux. Skip is first-class per key.
+- **(equivalent — set later, or rotate, or sync across devices)** "Account → API Config" in the web app — writes `users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}` in Firestore. Distinct surface from pair-time keys: pair never auto-fills these inputs, so anything you see there is something you typed there. Works on Windows, macOS, Linux. No restart required after rotating; backend re-reads on next call (60s cache).
+- **(file-based, all platforms)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` and/or `GEMINI_API_KEY=AIza...` in `.dg-supervisor.env`. Loaded by `--env-file` at supervisor startup; survives reboots via the persistence supervisor. Good for un-paired backends or operators who prefer files. (On POSIX, `--pair` writes here too.)
+- **(advanced / legacy)** Set in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). `resolve_api_key()` accepts `CUA_API_KEY` or `ANTHROPIC_API_KEY`; `resolve_gemini_api_key()` accepts `GEMINI_API_KEY` or `GOOGLE_API_KEY`. (On Windows, `--pair` writes here too.)
 
-**Don't set the same key in multiple places with different values** — pick one. Priority chain: CLI `--api-key` → **Firestore (pair-prompt or Account page — same target)** → Windows user-scope env → `os.environ` (the `.env` file loads here). Firestore wins, so a stale shell/file value won't override a freshly-set Firestore key.
+**Don't set the same key in multiple places with different values** — pick one. Priority chain: CLI `--api-key` → **FE Account-page Firestore key** → Windows user-scope env (where `--pair` persists on Windows) → `os.environ` (the `.dg-supervisor.env` file loads here on POSIX, including pair-time keys). FE-Account-page key wins, so a stale BE-local pair key won't override a freshly-set web-app key.
 
 **Other config** (Vision tier, CUA model overrides, shadow log path) also lives in `.dg-supervisor.env`. See `scripts/dg-supervisor.env.example` for the documented template + key descriptions.
 
@@ -212,15 +212,17 @@ Enable On Startup? [Y/n]:
 - **`Y` (default)** — opts into supervised mode; actual arming is **deferred to Stage 5** so an aborted login can't leave Firestore flagged as supervised while platforms are half-logged-in.
 - **`n`** — skip; you'll run `python research.py --serve` manually after `--pair` finishes (and, on Linux/Mac, set up your own backgrounding via `nohup` / `tmux` / `screen` / your own systemd unit — see [§ Linux/Mac backgrounding](#linuxmac-backgrounding-while-track-c-is-still-pending)).
 
-**`[3/5] API keys` — Anthropic + Gemini detect-or-prompt** *(reordered to position 3 on 2026-05-18 so CUA + Vision are available for Stage 4)*
-`--pair` runs `resolve_api_key()` and `resolve_gemini_api_key()` to check whether each key is already resolvable from any source (Firestore, Windows user-scope, shell env, or `.dg-supervisor.env`). For each missing key, it prompts:
+**`[3/5] API keys` — Anthropic + Gemini detect-prompt-verify** *(reordered to position 3 on 2026-05-18 so CUA + Vision are available for Stage 4)*
+`--pair` runs `resolve_api_key()` and `resolve_gemini_api_key()` to check whether each key is already resolvable from any source (FE Account-page Firestore, Windows user-scope, shell env, or `.dg-supervisor.env`). For each missing key, it prompts:
 
 ```
 Anthropic  — get one at https://console.anthropic.com/settings/keys
 >  Paste Anthropic key (sk-ant-...) or [S]kip:
 ```
 
-On paste it writes Firestore (`users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}` — same path the Account page writes to), sets both env-var names per key in `os.environ` (`ANTHROPIC_API_KEY` + `CUA_API_KEY`, or `GEMINI_API_KEY` + `GOOGLE_API_KEY`), and busts `_RESOLVED_KEY_CACHE` so the very next `resolve_api_key()` call (at the top of Stage 4 browser-login CUA init) sees the new key.
+On paste, the BE makes a cheap **live-API verification call** (`models.list` for Anthropic; `GET /v1beta/models` for Gemini) with a 5s timeout. If the provider rejects the key (auth_failed), the prompt re-asks up to 3 times then offers `Save anyway? [y/N]` defaulting to no. If the verifier itself can't reach the API (network_error — offline pair, transient blip), the key is saved with a fail-loud-at-first-run warning rather than blocking the pair.
+
+On verified paste, the BE writes the key to **BE-local persistence**: Windows User-scope env on Windows, `.dg-supervisor.env` upsert on macOS / Linux. It also mirrors to `os.environ` (both var names per key — `ANTHROPIC_API_KEY` + `CUA_API_KEY`, or `GEMINI_API_KEY` + `GOOGLE_API_KEY`) so the running pair session can use the key immediately, and busts `_RESOLVED_KEY_CACHE` so the very next `resolve_api_key()` call (at the top of Stage 4 browser-login CUA init) sees the new key. Pair-time keys do NOT touch Firestore — the FE Account → API Config page is a separate surface that writes Firestore directly.
 
 Skip is first-class per key — pair finishes regardless. Missing Anthropic falls back to **Playwright-only** verification in Stage 4 (less rigorous; no Pro-tier check) and surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
 
@@ -258,8 +260,8 @@ The final banner branches on whether the supervisor is live:
 ✓  Paired with you@example.com
 ✓  All 4 platforms logged in
 ✓  Browser closed
-✓  Anthropic key saved to your account  (or "Skipped — set later via Account → API Config")
-✓  Gemini key saved to your account     (or "Skipped — set later via Account → API Config")
+✓  Anthropic key saved to this machine  (or "Skipped — set later via Account → API Config")
+✓  Gemini key saved to this machine     (or "Skipped — set later via Account → API Config")
 ...
 The bond is forged.  The backend is live — running in the background.        # if supervisor armed
                                           OR

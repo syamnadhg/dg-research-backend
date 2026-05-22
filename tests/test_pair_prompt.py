@@ -1,7 +1,9 @@
-"""--pair Stage 4/5 API-key detect-or-prompt tests.
+"""--pair Stage 3 API-key detect-or-prompt tests.
 
 Covers the helpers added to research.py for the pair flow:
-  - _save_api_key_to_firestore(uid, key_name, value) -> bool
+  - _save_api_key_to_user_scope(name, value)  -> bool (Windows)
+  - _save_api_key_to_env_file(name, value)    -> bool (POSIX)
+  - _save_api_key_local(name, value)          -> bool (per-OS dispatch)
   - _verify_anthropic_key(key) -> "ok"|"auth_failed"|"network_error"
   - _verify_gemini_key(key)    -> "ok"|"auth_failed"|"network_error"
   - _pair_prompt_one_key(label, example, help_url)          -> str (async)
@@ -11,14 +13,15 @@ Covers the helpers added to research.py for the pair flow:
 Behavior under test:
   1. Detect-first: if a resolver already returns a key, no prompt fires.
   2. Skip is first-class: typing s/skip / Ctrl+C / EOF returns "" cleanly,
-     pair continues, no Firestore write, no os.environ mutation, NO
+     pair continues, no local save, no os.environ mutation, NO
      verifier call.
   3. On paste: trim + quote-strip, validation rejects empty / too short /
-     whitespace-containing input; verified key writes to Firestore +
-     os.environ + busts _RESOLVED_KEY_CACHE.
+     whitespace-containing input; verified key writes to BE-local
+     persistence (Win User-scope / .dg-supervisor.env) + os.environ +
+     busts _RESOLVED_KEY_CACHE.
   4. Verifier "auth_failed" re-prompts up to 3x then asks save-anyway;
      "network_error" saves the key with a warning.
-  5. Firestore write failure falls back to os.environ-only (in-memory).
+  5. Local-save failure falls back to os.environ-only (in-memory).
 
 Run via:
     pytest tests/test_pair_prompt.py -v
@@ -60,45 +63,96 @@ def _dispatching_to_thread(canned_input, verifier_status="ok"):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _save_api_key_to_firestore
+# _save_api_key_local + per-OS persistence helpers
 # ─────────────────────────────────────────────────────────────────────
 
-class TestSaveApiKeyToFirestore:
-    """Post-D7: `_save_api_key_to_firestore` always goes through the FE
-    bridge (`_save_api_key_via_fe_bridge`) — the synth device user can't
-    write `users/{uid}/settings/prefs` directly per Firestore rules. The
-    `uid` parameter is now ignored; the bridge resolves the target
-    ownerUid from the BE's custom-token claim."""
+class TestSaveApiKeyLocal:
+    """`_save_api_key_local` dispatches by platform. Windows takes the
+    User-scope env path via PowerShell SetEnvironmentVariable; POSIX
+    upserts `.dg-supervisor.env` so `--env-file` picks it up on the
+    next supervisor spawn. The CURRENT process's os.environ is NOT
+    touched — callers mirror separately."""
 
-    def test_delegates_to_fe_bridge(self, monkeypatch, silent_log):
-        """The function is a thin wrapper around `_save_api_key_via_fe_bridge`
-        — just forwards (key_name, value) and ignores uid."""
-        from research import _save_api_key_to_firestore
-        captured = {}
-        def fake_bridge(key_name, value):
-            captured["key_name"] = key_name
-            captured["value"] = value
-            return True
-        monkeypatch.setattr("research._save_api_key_via_fe_bridge", fake_bridge)
-        assert _save_api_key_to_firestore("uid-abc", "anthropic", "sk-ant-xyz") is True
-        assert captured == {"key_name": "anthropic", "value": "sk-ant-xyz"}
+    def test_invalid_name_rejected(self, monkeypatch, silent_log):
+        """Defense in depth: only `[A-Z_][A-Z0-9_]*` env-var names
+        accepted. Prevents injection / typos from creating garbage
+        registry entries / env-file lines."""
+        from research import _save_api_key_local
+        # Lowercase, digits-first, and special chars all rejected.
+        assert _save_api_key_local("lowercase", "v") is False
+        assert _save_api_key_local("1STARTS_WITH_DIGIT", "v") is False
+        assert _save_api_key_local("HAS SPACE", "v") is False
+        assert _save_api_key_local("HAS-DASH", "v") is False
+        # Quote-injection attempts on the PowerShell path:
+        assert _save_api_key_local("X'); whoami; ('Y", "v") is False
 
-    def test_gemini_forwards_key_name(self, monkeypatch, silent_log):
-        from research import _save_api_key_to_firestore
-        captured = {}
-        def fake_bridge(key_name, value):
-            captured["key_name"] = key_name
-            return True
-        monkeypatch.setattr("research._save_api_key_via_fe_bridge", fake_bridge)
-        _save_api_key_to_firestore("uid-abc", "gemini", "AIzaSyXYZ")
-        assert captured["key_name"] == "gemini"
+    def test_env_file_upsert_creates_when_absent(self, tmp_path, monkeypatch, silent_log):
+        """First call against an empty target file creates the file
+        with one KEY=value line."""
+        from research import _save_api_key_to_env_file
+        target = tmp_path / ".dg-supervisor.env"
+        assert _save_api_key_to_env_file(
+            "ANTHROPIC_API_KEY", "sk-ant-xyz", path=target) is True
+        body = target.read_text(encoding="utf-8-sig")
+        # Single-quoted to defang special chars; _load_env_file strips
+        # matching outer quotes on read.
+        assert "ANTHROPIC_API_KEY='sk-ant-xyz'" in body
+        assert body.endswith("\n")
 
-    def test_bridge_failure_propagates_as_false(self, monkeypatch, silent_log):
-        """Bridge returns False on token-mint failure, network error, or
-        non-200 from the FE Cloud Function. The wrapper must propagate."""
-        from research import _save_api_key_to_firestore
-        monkeypatch.setattr("research._save_api_key_via_fe_bridge", lambda k, v: False)
-        assert _save_api_key_to_firestore("uid-abc", "anthropic", "sk-ant-xyz") is False
+    def test_env_file_upsert_replaces_existing_line(self, tmp_path, monkeypatch, silent_log):
+        """Existing KEY= line is overwritten in-place; comments and
+        unrelated lines are preserved verbatim."""
+        from research import _save_api_key_to_env_file
+        target = tmp_path / ".dg-supervisor.env"
+        target.write_text(
+            "# Header comment\n"
+            "VISION_TIER=2\n"
+            "ANTHROPIC_API_KEY=old-value\n"
+            "# Trailing comment\n",
+            encoding="utf-8",
+        )
+        assert _save_api_key_to_env_file(
+            "ANTHROPIC_API_KEY", "new-value", path=target) is True
+        body = target.read_text(encoding="utf-8-sig")
+        # Comments + sibling vars preserved
+        assert "# Header comment" in body
+        assert "VISION_TIER=2" in body
+        assert "# Trailing comment" in body
+        # Old value gone, new value present
+        assert "old-value" not in body
+        assert "ANTHROPIC_API_KEY='new-value'" in body
+
+    def test_env_file_upsert_appends_when_key_absent(self, tmp_path, monkeypatch, silent_log):
+        """Key not yet present in an existing file → appended as a new
+        line. Existing entries untouched."""
+        from research import _save_api_key_to_env_file
+        target = tmp_path / ".dg-supervisor.env"
+        target.write_text("VISION_TIER=2\n", encoding="utf-8")
+        assert _save_api_key_to_env_file(
+            "GEMINI_API_KEY", "AIza-xxx", path=target) is True
+        body = target.read_text(encoding="utf-8-sig")
+        assert "VISION_TIER=2" in body
+        assert "GEMINI_API_KEY='AIza-xxx'" in body
+
+    def test_env_file_escapes_single_quotes_in_value(self, tmp_path, monkeypatch, silent_log):
+        """Single quotes in the value get escaped to `'\\''` (POSIX
+        shell-style) so the line round-trips through _load_env_file's
+        matching-quote strip without truncation."""
+        from research import _save_api_key_to_env_file
+        target = tmp_path / ".dg-supervisor.env"
+        # Hypothetical key containing a literal single quote.
+        assert _save_api_key_to_env_file(
+            "WEIRD_KEY", "abc'def", path=target) is True
+        body = target.read_text(encoding="utf-8-sig")
+        assert "WEIRD_KEY='abc'\\''def'" in body
+
+    def test_user_scope_non_windows_returns_false(self, monkeypatch, silent_log):
+        """On non-Windows, the User-scope writer is a no-op returning
+        False — the local-save dispatcher routes to the env-file path
+        on POSIX, but a direct call must not silently succeed."""
+        from research import _save_api_key_to_user_scope
+        monkeypatch.setattr("sys.platform", "linux")
+        assert _save_api_key_to_user_scope("ANTHROPIC_API_KEY", "k") is False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -240,16 +294,29 @@ class TestPairPromptOneKey:
 # ─────────────────────────────────────────────────────────────────────
 
 class TestPairPromptApiKeys:
-    """The orchestrator. Detect-first via resolve_*_api_key(); on paste
-    writes Firestore + os.environ + busts cache. Anthropic and Gemini
-    independent."""
+    """The orchestrator. Detect-first via resolve_*_api_key(); on
+    verified paste writes BE-local persistence (`_save_api_key_local`)
+    + os.environ + busts cache. Anthropic and Gemini independent.
+    Pair-time keys never touch Firestore."""
 
     def _run(self, coro):
         return asyncio.run(coro)
 
+    @pytest.fixture(autouse=True)
+    def _no_real_save(self, monkeypatch):
+        """Default `_save_api_key_local` to a no-op returning True so
+        tests don't accidentally write to the registry / supervisor env
+        file when they trigger a save path. Per-test overrides can flip
+        this to False to exercise the failure path."""
+        self.save_calls = []
+        def _fake_save(name, value):
+            self.save_calls.append((name, value))
+            return True
+        monkeypatch.setattr("research._save_api_key_local", _fake_save)
+
     def test_both_already_set_no_prompt(self, monkeypatch, silent_log):
         """If both resolvers return a key, neither prompt fires —
-        zero asyncio.to_thread input calls."""
+        zero asyncio.to_thread input calls and zero local saves."""
         from research import _pair_prompt_api_keys
         monkeypatch.setattr("research.resolve_api_key", lambda: "sk-ant-existing")
         monkeypatch.setattr("research.resolve_gemini_api_key", lambda: "AIza-existing")
@@ -260,16 +327,17 @@ class TestPairPromptApiKeys:
         monkeypatch.setattr("research.asyncio.to_thread", _no_prompt)
         self._run(_pair_prompt_api_keys("uid-abc"))
         assert prompt_calls == []  # No input prompts fired
+        assert self.save_calls == []  # No local saves either
 
     def test_anthropic_missing_gemini_set_only_one_prompt(self, monkeypatch, silent_log):
         """Anthropic resolver returns "" → prompts for Anthropic. Gemini
-        resolver returns a key → skips Gemini prompt."""
+        resolver returns a key → skips Gemini prompt. Local save fires
+        for both ANTHROPIC_API_KEY + CUA_API_KEY (BE pipeline reads
+        either)."""
         from research import _pair_prompt_api_keys
         valid_key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"
         monkeypatch.setattr("research.resolve_api_key", lambda: "")
         monkeypatch.setattr("research.resolve_gemini_api_key", lambda: "AIza-existing")
-        mock_db = mock.MagicMock()
-        monkeypatch.setattr("research._firebase_db", mock_db)
         # Anthropic: paste key, verifier says ok, loop exits
         monkeypatch.setattr("research.asyncio.to_thread",
                             _dispatching_to_thread(valid_key, "ok"))
@@ -278,11 +346,15 @@ class TestPairPromptApiKeys:
         before_gemini = os.environ.get("GEMINI_API_KEY")
         try:
             self._run(_pair_prompt_api_keys("uid-abc"))
-            # Anthropic was set
+            # os.environ mirror set for both variant names (BE-local
+            # User-scope / env-file persistence handled by save_calls).
             assert os.environ.get("ANTHROPIC_API_KEY") == valid_key
             assert os.environ.get("CUA_API_KEY") == valid_key
             # Gemini was NOT touched (resolver said it's already configured)
             assert os.environ.get("GEMINI_API_KEY") == before_gemini
+            # Both Anthropic-side variants persisted locally; nothing for Gemini.
+            persisted = {name for name, _ in self.save_calls}
+            assert persisted == {"ANTHROPIC_API_KEY", "CUA_API_KEY"}
         finally:
             # Restore env
             if before_anthropic is None:
@@ -294,12 +366,11 @@ class TestPairPromptApiKeys:
 
     def test_paste_busts_anthropic_cache(self, monkeypatch, silent_log):
         """After paste, _RESOLVED_KEY_CACHE.ts is reset to 0.0 so the next
-        resolve_api_key() call re-reads from Firestore / env."""
+        resolve_api_key() call re-reads from sources."""
         from research import _pair_prompt_api_keys, _RESOLVED_KEY_CACHE
         valid_key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"
         monkeypatch.setattr("research.resolve_api_key", lambda: "")
         monkeypatch.setattr("research.resolve_gemini_api_key", lambda: "AIza-existing")
-        monkeypatch.setattr("research._firebase_db", mock.MagicMock())
         monkeypatch.setattr("research.asyncio.to_thread",
                             _dispatching_to_thread(valid_key, "ok"))
         # Seed cache with a stale value
@@ -315,13 +386,11 @@ class TestPairPromptApiKeys:
             _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
 
     def test_skip_both_no_env_change(self, monkeypatch, silent_log):
-        """User skips both — no Firestore write, no env mutation, no
-        verifier call (skip is verifier-free)."""
+        """User skips both — no local save, no env mutation, no verifier
+        call (skip is verifier-free)."""
         from research import _pair_prompt_api_keys
         monkeypatch.setattr("research.resolve_api_key", lambda: "")
         monkeypatch.setattr("research.resolve_gemini_api_key", lambda: "")
-        mock_db = mock.MagicMock()
-        monkeypatch.setattr("research._firebase_db", mock_db)
         # If skip="skip" is returned by the input prompt, the wrapper
         # short-circuits and never invokes the verifier. Booby-trap the
         # verifier mocks to flunk if they're called.
@@ -333,30 +402,30 @@ class TestPairPromptApiKeys:
                             _dispatching_to_thread("skip", "ok"))
         before = dict(os.environ)
         self._run(_pair_prompt_api_keys("uid-abc"))
-        # No Firestore writes
-        set_call = mock_db.collection().document().collection().document().set
-        set_call.assert_not_called()
+        # No local saves either (skip is verifier-free AND save-free).
+        assert self.save_calls == []
         # No env mutations for the four candidate vars
         for var in ("ANTHROPIC_API_KEY", "CUA_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
             assert os.environ.get(var) == before.get(var)
 
-    def test_firestore_write_fails_still_sets_env(self, monkeypatch, silent_log):
-        """If Firestore write throws, os.environ is still mutated so the
-        current --pair / --serve session has the key. The user gets a
-        WARN message + a pointer to the Account page for persistence."""
+    def test_local_save_fails_still_sets_env(self, monkeypatch, silent_log):
+        """If `_save_api_key_local` returns False (e.g. PowerShell
+        SetEnvironmentVariable failure on a locked-down corporate
+        Windows install), os.environ is STILL mutated so the current
+        --pair / --serve session has the key. The user gets a WARN
+        message + a pointer to the Account page for persistence."""
         from research import _pair_prompt_api_keys
         valid_key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"
         monkeypatch.setattr("research.resolve_api_key", lambda: "")
         monkeypatch.setattr("research.resolve_gemini_api_key", lambda: "AIza-existing")
-        mock_db = mock.MagicMock()
-        mock_db.collection().document().collection().document().set.side_effect = Exception("PERMISSION_DENIED")
-        monkeypatch.setattr("research._firebase_db", mock_db)
+        # Override the autouse mock to flunk all save attempts.
+        monkeypatch.setattr("research._save_api_key_local", lambda n, v: False)
         monkeypatch.setattr("research.asyncio.to_thread",
                             _dispatching_to_thread(valid_key, "ok"))
         before_anthropic = os.environ.get("ANTHROPIC_API_KEY")
         try:
             self._run(_pair_prompt_api_keys("uid-abc"))
-            # Despite Firestore write failure, env is still set
+            # Despite local-save failure, env is still set
             assert os.environ.get("ANTHROPIC_API_KEY") == valid_key
             assert os.environ.get("CUA_API_KEY") == valid_key
         finally:
@@ -370,12 +439,11 @@ class TestPairPromptApiKeys:
     def test_gemini_paste_sets_both_env_var_names(self, monkeypatch, silent_log):
         """Both GEMINI_API_KEY and GOOGLE_API_KEY are set on paste — the
         resolver checks both, and downstream consumers (narrate.py) check
-        both too."""
+        both too. Local save fires for both variants."""
         from research import _pair_prompt_api_keys
         valid_key = "AIzaSyABCDEFGHIJKLMNOPQRSTUV-1234567890"
         monkeypatch.setattr("research.resolve_api_key", lambda: "sk-ant-existing")
         monkeypatch.setattr("research.resolve_gemini_api_key", lambda: "")
-        monkeypatch.setattr("research._firebase_db", mock.MagicMock())
         monkeypatch.setattr("research.asyncio.to_thread",
                             _dispatching_to_thread(valid_key, "ok"))
         before_gemini = os.environ.get("GEMINI_API_KEY")
@@ -384,6 +452,8 @@ class TestPairPromptApiKeys:
             self._run(_pair_prompt_api_keys("uid-abc"))
             assert os.environ.get("GEMINI_API_KEY") == valid_key
             assert os.environ.get("GOOGLE_API_KEY") == valid_key
+            persisted = {name for name, _ in self.save_calls}
+            assert persisted == {"GEMINI_API_KEY", "GOOGLE_API_KEY"}
         finally:
             for var, before in (("GEMINI_API_KEY", before_gemini), ("GOOGLE_API_KEY", before_google)):
                 if before is None:
@@ -393,9 +463,9 @@ class TestPairPromptApiKeys:
 
     def test_verifier_auth_failed_then_skip_does_not_save(self, monkeypatch, silent_log):
         """First paste fails verification, second paste is 'skip' →
-        no env mutation, no Firestore write. Confirms the wrapper
-        re-enters the prompt loop on auth_failed instead of saving the
-        rejected key."""
+        no env mutation, no local save. Confirms the wrapper re-enters
+        the prompt loop on auth_failed instead of saving the rejected
+        key."""
         from research import _pair_prompt_api_keys
         bad_key = "sk-ant-api03-rejectednotvalidatallxxxxxxxxxxxxxxxxx"
         # First call returns bad_key (paste), second call returns "skip".
@@ -411,13 +481,13 @@ class TestPairPromptApiKeys:
 
         monkeypatch.setattr("research.resolve_api_key", lambda: "")
         monkeypatch.setattr("research.resolve_gemini_api_key", lambda: "AIza-existing")
-        monkeypatch.setattr("research._firebase_db", mock.MagicMock())
         monkeypatch.setattr("research.asyncio.to_thread", _dispatch)
         before_anthropic = os.environ.get("ANTHROPIC_API_KEY")
         try:
             self._run(_pair_prompt_api_keys("uid-abc"))
             # bad_key was never saved because skip followed auth_failed
             assert os.environ.get("ANTHROPIC_API_KEY") == before_anthropic
+            assert self.save_calls == []
         finally:
             if before_anthropic is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -433,7 +503,6 @@ class TestPairPromptApiKeys:
         valid_key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"
         monkeypatch.setattr("research.resolve_api_key", lambda: "")
         monkeypatch.setattr("research.resolve_gemini_api_key", lambda: "AIza-existing")
-        monkeypatch.setattr("research._firebase_db", mock.MagicMock())
         monkeypatch.setattr("research.asyncio.to_thread",
                             _dispatching_to_thread(valid_key, "network_error"))
         before_anthropic = os.environ.get("ANTHROPIC_API_KEY")
@@ -441,6 +510,8 @@ class TestPairPromptApiKeys:
             self._run(_pair_prompt_api_keys("uid-abc"))
             assert os.environ.get("ANTHROPIC_API_KEY") == valid_key
             assert os.environ.get("CUA_API_KEY") == valid_key
+            persisted = {name for name, _ in self.save_calls}
+            assert persisted == {"ANTHROPIC_API_KEY", "CUA_API_KEY"}
         finally:
             if before_anthropic is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
