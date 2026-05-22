@@ -3476,7 +3476,19 @@ def start_firestore_start_listener(job_queue, loop):
             if isinstance(_ts, (int, float)) and _ts > 0:
                 _age_ms = int(time.time() * 1000) - int(_ts)
                 if _age_ms > STALE_QUEUE_AGE_MS:
-                    log(f"Queue: skipped stale doc (age={_age_ms // 1000}s, action={data.get('action', 'start')})", "INFO")
+                    # Diagnostic: log topic + assignedWorker + claimedAt +
+                    # submittedBy so a stale-skip can be distinguished
+                    # between "post-crash zombie" (assignedWorker set,
+                    # half-claimed) and "legit FIFO wait" (no
+                    # assignedWorker, just waited too long for idle
+                    # worker). The next commit will branch behavior on
+                    # this distinction; for now we just surface it.
+                    log(
+                        f"Queue: skipped stale doc (age={_age_ms // 1000}s, action={data.get('action', 'start')}) "
+                        f"topic={(data.get('topic') or '')[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                        f"assignedWorker={data.get('assignedWorker')} claimedAt={data.get('claimedAt')}",
+                        "INFO",
+                    )
                     try:
                         doc.reference.delete()
                     except Exception:
@@ -3865,6 +3877,21 @@ def start_firestore_start_listener(job_queue, loop):
                 # race, and adding a Firestore RTT to every start event
                 # would be a free regression with no upside.
                 if _QUEUE_STATE.get("running") or job_queue.qsize() > 0:
+                    # Silent defer was the load-bearing observability gap
+                    # for the multi-account FIFO investigation — a
+                    # sharer-submitted doc that arrives while both
+                    # workers are busy has no trace until idle-rescan
+                    # picks it up (or stale-skip wipes it). Log so future
+                    # repros are traceable from BE log alone. Gated on
+                    # multi-worker (this whole block is) so single-worker
+                    # installs stay quiet.
+                    _defer_reason = "busy-running" if _QUEUE_STATE.get("running") else "queue-nonempty"
+                    log(
+                        f"[start-listener] worker {WORKER_ID}: defer {research_id[:8]}… "
+                        f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                        f"reason={_defer_reason}",
+                        "INFO",
+                    )
                     continue
                 if _firebase_db is not None:
                     _claim_ref = doc.reference
@@ -3907,9 +3934,16 @@ def start_firestore_start_listener(job_queue, loop):
                             _head_id = _hs.id
                             break
                         if _head_id is not None and _head_id != doc.id:
+                            # Promoted from DEBUG to INFO (2026-05-22) so
+                            # multi-account FIFO ordering is visible in
+                            # prod logs without needing to lower the
+                            # logger level. Includes topic + submittedBy
+                            # for cross-account triage.
                             log(
-                                f"[start-listener] worker {WORKER_ID}: FIFO defer {research_id[:8]}… (older unclaimed {_head_id[:8]}… is head)",
-                                "DEBUG",
+                                f"[start-listener] worker {WORKER_ID}: FIFO defer {research_id[:8]}… "
+                                f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                                f"(older unclaimed {_head_id[:8]}… is head)",
+                                "INFO",
                             )
                             continue
                     except Exception as _fe:
@@ -3930,12 +3964,23 @@ def start_firestore_start_listener(job_queue, loop):
                     if _claim_outcome is None:
                         # Unexpected failure after retries — the helper
                         # logged the root cause; skip + let idle-rescan
-                        # retry later.
+                        # retry later. Add a topic-bearing marker so the
+                        # silent skip is traceable from log alone.
+                        log(
+                            f"[start-listener] worker {WORKER_ID}: claim error — skipping {research_id[:8]}… "
+                            f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
+                            f"(idle-rescan will retry)",
+                            "WARN",
+                        )
                         continue
                     if _claim_outcome is False:
-                        log(f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}…", "DEBUG")
+                        log(
+                            f"[start-listener] worker {WORKER_ID}: queue doc lost to sibling — skipping {research_id[:8]}… "
+                            f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]}",
+                            "INFO",
+                        )
                         continue
-                    log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}…", "INFO")
+                    log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}… topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]}", "INFO")
 
             # Generate run_id
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -26689,7 +26734,23 @@ async def run_server(port=8000):
                 _try_claim_queue_doc, snap.reference, WORKER_ID,
                 "[idle-rescan]",
             )
-            if _outcome is None or _outcome is False:
+            if _outcome is None:
+                # Claim helper logged the root cause — surface a
+                # topic-bearing marker too so the silent continue isn't
+                # invisible. submittedBy + research_id help cross-
+                # account triage when the orphan is a sharer's doc.
+                log(
+                    f"[idle-rescan] worker {WORKER_ID}: claim error — skipping {(d.get('researchId') or '')[:8]}… "
+                    f"topic={(d.get('topic') or '')[:40]!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
+                    "WARN",
+                )
+                continue
+            if _outcome is False:
+                log(
+                    f"[idle-rescan] worker {WORKER_ID}: lost to sibling — skipping {(d.get('researchId') or '')[:8]}… "
+                    f"topic={(d.get('topic') or '')[:40]!r} submittedBy={(d.get('submittedBy') or '?')[:8]}",
+                    "INFO",
+                )
                 continue
 
             # Won — replicate the listener's minimal start-action side
@@ -26710,7 +26771,7 @@ async def run_server(port=8000):
                 continue
 
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan {research_id[:8]}… ({topic[:40]})")
+            log(f"[idle-rescan] worker {WORKER_ID}: picking up orphan {research_id[:8]}… ({topic[:40]}) submittedBy={(d.get('submittedBy') or '?')[:8]}")
 
             # Flip research-doc status to ongoing (the listener path
             # writes this when the worker is idle on first dequeue;
