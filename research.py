@@ -2068,13 +2068,39 @@ async def _revoked_recovery_loop():
 
     Loop is quiet during normal operation — sleeps until `_firebase_db`
     goes None. Backs off 5 min after a PollTimeout (code window
-    expired) so a stuck recovery doesn't spin."""
+    expired) so a stuck recovery doesn't spin.
+
+    2026-05-22: wall-clock cap at MAX_RECOVERY_WALLCLOCK_SEC (1hr). After
+    the device doc TTL-deletes at 15 min (reset-pair-code/route.ts:269),
+    the pending subdoc path becomes unreachable — polling forever wastes
+    CPU + log volume. At the cap we log + os._exit(0) so the supervisor
+    sees a clean exit code (and stops respawning a worker that will just
+    re-enter the same dead loop)."""
+    MAX_RECOVERY_WALLCLOCK_SEC = 3600  # 1 hour
     log("[relink] watcher armed (idle until Firestore drops)", "DEBUG")
+    first_recovery_attempt_ts: "float | None" = None
     while True:
         try:
             if _firebase_db is not None:
+                # Healthy state — reset the wall-clock anchor so a NEW
+                # revoke later doesn't inherit the old timer.
+                first_recovery_attempt_ts = None
                 await asyncio.sleep(15)
                 continue
+            # Stamp the wall-clock anchor on first entry to recovery mode.
+            if first_recovery_attempt_ts is None:
+                first_recovery_attempt_ts = time.time()
+            elif (time.time() - first_recovery_attempt_ts) > MAX_RECOVERY_WALLCLOCK_SEC:
+                log(
+                    f"[relink] giving up after {MAX_RECOVERY_WALLCLOCK_SEC}s "
+                    "(device doc TTL likely expired) — exiting so supervisor "
+                    "stops respawning into the same dead loop. Owner must "
+                    "run `python research.py --pair` to recover.",
+                    "ERROR",
+                )
+                await asyncio.sleep(0.5)
+                import os as _os
+                _os._exit(0)
             poll_secret = load_poll_secret()
             device_id = load_device_id()
             if not (poll_secret and device_id):
