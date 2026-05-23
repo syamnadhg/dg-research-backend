@@ -4152,24 +4152,77 @@ def start_firestore_start_listener(job_queue, loop):
                         dq.clear()
                         for j in kept:
                             dq.append(j)
-                        if removed and _firebase_db:
+                        # Bug Cancel-Stale (2026-05-22): for deferred jobs
+                        # (still in Firestore queue, no worker has claimed
+                        # them) the local dq scan misses, removed=False,
+                        # and the pre-fix code skipped both the
+                        # Firestore-queue-doc deletion AND the research-
+                        # doc status flip. Result: chat tile stayed
+                        # "queued" forever, only Reset BE could clear it,
+                        # and a BE restart would replay the start doc and
+                        # actually run the "cancelled" job.
+                        #
+                        # Fix: scan + delete the start queue doc + flip
+                        # the research status regardless of dq state.
+                        # Idempotent for cross-worker case (sibling already
+                        # handled it via its own listener — duplicate
+                        # writes of the same payload are no-ops).
+                        if not removed and _firebase_db:
+                            try:
+                                _start_doc_id = None
+                                for _qsnap in col_ref.limit(50).stream():
+                                    _qd = _qsnap.to_dict() or {}
+                                    if (_qd.get("researchId") == rid
+                                            and (_qd.get("action") or "start") == "start"):
+                                        _start_doc_id = _qsnap.id
+                                        break
+                                if _start_doc_id is not None:
+                                    try:
+                                        col_ref.document(_start_doc_id).delete()
+                                        log(
+                                            f"Cancel: deferred start doc {_start_doc_id[:8]}… "
+                                            f"deleted for rid={rid[:8]}…",
+                                            "INFO",
+                                        )
+                                    except Exception as _de:
+                                        log(
+                                            f"Cancel: deferred start doc delete failed "
+                                            f"(non-fatal — sibling may have got it): {_de}",
+                                            "DEBUG",
+                                        )
+                            except Exception as _se:
+                                log(
+                                    f"Cancel: deferred start doc scan failed (non-fatal): {_se}",
+                                    "DEBUG",
+                                )
+                        if _firebase_db:
+                            # Always flip status — the removed=True case
+                            # had this; the removed=False case used to
+                            # skip it. Both paths now converge on the
+                            # same write so the FE banner clears either
+                            # way.
                             from google.cloud.firestore import DELETE_FIELD as _DF
-                            # Drop stale queue fields so the banner unmounts;
-                            # otherwise reopening the cancelled chat shows a
-                            # wedged "Queued — Cancel" banner backed by no
-                            # live job.
                             _update_research_doc(u, rid, {
                                 "status": "stopped",
                                 "phase": 0,
-                                "summary": "Cancelled before starting",
+                                "summary": (
+                                    "Cancelled before starting"
+                                    if removed
+                                    else "Cancelled while queued"
+                                ),
                                 "cancelled": True,
                                 "queuePosition": _DF,
                                 "queuedBehindRunId": _DF,
                                 "queuedBehindTitle": _DF,
                             })
-                            fn = _QUEUE_STATE.get("recompute_fn")
-                            if fn:
-                                fn()
+                            if removed:
+                                # recompute_fn re-numbers everyone behind
+                                # me in my own worker's local queue. Skip
+                                # for the deferred case — nothing was
+                                # popped, nothing to renumber.
+                                fn = _QUEUE_STATE.get("recompute_fn")
+                                if fn:
+                                    fn()
                         # Log the outcome. The `cancelled: True` field on
                         # the research doc (Q6) is the FE signal that
                         # drives the red Cancelled dialog AND the
@@ -4348,6 +4401,32 @@ def start_firestore_start_listener(job_queue, loop):
                     .collection("researches").document(research_id).get()
                 if not research_doc.exists:
                     log(f"Queue: skipped — research doc {research_id} no longer exists (user deleted chat?)", "INFO")
+                    try:
+                        doc.reference.delete()
+                    except Exception:
+                        pass
+                    continue
+                # 2026-05-22 (cancel-stale fix): cross-worker cancel race
+                # mitigation. The cancel handler at research.py:4090 flips
+                # research status="stopped" + cancelled=True, but there's
+                # a window where worker A claimed the queue doc + scheduled
+                # call_soon_threadsafe enqueue BEFORE the cancel arrives —
+                # the cancel handler's dq scan finds nothing on either
+                # worker, and worker A's pending enqueue lands afterward.
+                # Pre-claim status re-check catches this: if the research
+                # doc is already in a terminal state, skip + delete the
+                # queue doc so it doesn't replay on listener attach.
+                _rd_data = research_doc.to_dict() or {}
+                _rd_status = _rd_data.get("status")
+                if _rd_status in (
+                    "stopped", "completed", "archived",
+                    "terminated_by_user_discard", "stopped_by_watchdog",
+                ):
+                    log(
+                        f"Queue: skipped — research {research_id[:24]}… "
+                        f"already status={_rd_status} (cancel landed mid-claim?)",
+                        "INFO",
+                    )
                     try:
                         doc.reference.delete()
                     except Exception:
