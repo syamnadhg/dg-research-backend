@@ -1961,6 +1961,78 @@ def _pending_enq_dec():
             max(0, _QUEUE_STATE.get("_pending_listener_enqueues", 0) - 1)
 
 
+def _sweep_stuck_research_docs_for_device(
+    db, paired_uid: str, device_id: str, *,
+    stopped_by: str, summary: str,
+) -> "tuple[int, int]":
+    """Multi-user wrapper around `_sweep_stuck_research_docs`. Sweeps
+    the paired owner's tree AND every uid in `device.sharedWith[]`.
+
+    Without this wrapper, an owner-only sweep leaves sharer-submitted
+    runs stuck on Reset BE / unpair — the sharer's chat tiles persist
+    as "ongoing" with no live BE behind them. The 2026-05-22 St
+    Bernard repro highlighted this gap (St Bernard was owner-tree so
+    the user-facing fix landed, but the same flow on a sharer's run
+    would be invisible to a Reset).
+
+    Firestore rules path: synth-device-user reads/writes user-tree
+    research docs via `deviceMemberOf(userId)` (firestore.rules:45-49),
+    which checks `deviceOwnership(deviceId, userId)` — true when this
+    device's `ownerUid == userId` OR `userId in sharedWith`. So the
+    sweep can iterate any uid the device's sharedWith[] lists, same
+    as it already does for the paired owner.
+
+    Resolves `sharedWith` from `devices/{deviceId}.sharedWith[]`. Best-
+    effort — if the device-doc read fails (revoked token, etc.), falls
+    back to owner-only sweep. Per-uid sweep failures (PERMISSION_DENIED
+    on an unexpected sharer permissions edge case, etc.) are logged
+    DEBUG + counted; sweeping continues with remaining uids.
+    """
+    if not (db and paired_uid and device_id):
+        return (0, 0)
+    sharers: "list[str]" = []
+    try:
+        ds = db.collection("devices").document(device_id).get()
+        if ds.exists:
+            shared = (ds.to_dict() or {}).get("sharedWith") or []
+            # Deduplicate against paired_uid + filter empties so a
+            # mis-configured device doc with the owner listed twice
+            # doesn't cause a double-sweep.
+            sharers = [u for u in shared if u and u != paired_uid]
+    except Exception as _de:
+        log(
+            f"[sweep:{stopped_by}] sharedWith read failed ({_de}); sweeping owner only",
+            "DEBUG",
+        )
+    total_n = 0
+    total_fail = 0
+    for uid in [paired_uid, *sharers]:
+        try:
+            n, f = _sweep_stuck_research_docs(
+                db, uid, device_id,
+                stopped_by=stopped_by, summary=summary,
+            )
+            total_n += n
+            total_fail += f
+            if n or f:
+                _label = "owner" if uid == paired_uid else f"sharer {uid[:8]}"
+                log(
+                    f"[sweep:{stopped_by}] {_label}: swept={n} failed={f}",
+                    "DEBUG",
+                )
+        except Exception as _ue:
+            # PERMISSION_DENIED, transient network, etc. Sharer-tree
+            # reads should succeed under the deviceMemberOf rule, but
+            # the rule cache or a rules-engine `get()` call limit can
+            # cause sporadic 403s in edge cases. Defensive: continue
+            # with the remaining trees.
+            log(
+                f"[sweep:{stopped_by}] sweep raised for uid={uid[:8]} ({_ue}); continuing",
+                "DEBUG",
+            )
+    return (total_n, total_fail)
+
+
 def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
                                 stopped_by: str, summary: str) -> "tuple[int, int]":
     """Bulk-sweep stale BE-self-set states for one device's runs in the
@@ -3151,15 +3223,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                             _sweep_did = ""
                         if _sweep_uid and _sweep_did:
                             try:
-                                _swept_n, _swept_fail = _sweep_stuck_research_docs(
+                                _swept_n, _swept_fail = _sweep_stuck_research_docs_for_device(
                                     _firebase_db, _sweep_uid, _sweep_did,
                                     stopped_by="hard_reset_sweep",
                                     summary="Cancelled by Reset Backend",
                                 )
                                 if _swept_n or _swept_fail:
-                                    log(f"[device-cmds] HARD_RESET: Firestore sweep marked {_swept_n} stale run(s) as stopped ({_swept_fail} failed)")
+                                    log(f"[device-cmds] HARD_RESET: Firestore sweep marked {_swept_n} stale run(s) as stopped ({_swept_fail} failed) — covers owner + sharer trees")
                                 else:
-                                    log("[device-cmds] HARD_RESET: Firestore sweep — no stale ongoing/queued/paused/paused_backend_restart runs found")
+                                    log("[device-cmds] HARD_RESET: Firestore sweep — no stale ongoing/queued/paused/paused_backend_restart runs found (owner + sharers)")
                             except Exception as _q_err:
                                 log(f"[device-cmds] HARD_RESET: Firestore sweep query failed: {_q_err}", "WARN")
                         else:
@@ -32375,15 +32447,15 @@ def run_unpair(deep: bool = False):
             init_firebase()
             global _firebase_db
             if _firebase_db:
-                _swp_n, _swp_f = _sweep_stuck_research_docs(
+                _swp_n, _swp_f = _sweep_stuck_research_docs_for_device(
                     _firebase_db, paired_uid, device_id,
                     stopped_by="unpair_sweep",
                     summary="Cancelled by Unpair",
                 )
                 if _swp_n or _swp_f:
-                    log(f"[unpair] Firestore sweep marked {_swp_n} stale run(s) as stopped ({_swp_f} failed)", "INFO")
+                    log(f"[unpair] Firestore sweep marked {_swp_n} stale run(s) as stopped ({_swp_f} failed) — owner + sharer trees", "INFO")
                 else:
-                    log("[unpair] Firestore sweep — no stale runs found", "DEBUG")
+                    log("[unpair] Firestore sweep — no stale runs found (owner + sharers)", "DEBUG")
             else:
                 log("[unpair] skipping Firestore sweep — init_firebase did not produce a client", "WARN")
         except Exception as _sw_err:
