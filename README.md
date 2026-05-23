@@ -328,9 +328,9 @@ python research.py --serve
 ```
 
 The server runs on port 8000 with:
-- A **5s heartbeat** → writes `devices/{deviceId}.lastHeartbeat` + `status` so the app's Account page and sidebar device switcher both show the right online/offline dot. (FE offline threshold is 15s, so two missed heartbeats flip the tile.)
+- A **5s heartbeat** → writes `devices/{deviceId}.lastHeartbeat` + `status` + `workerCount` so the app's Account page and sidebar device switcher show the right online/offline dot AND know how many parallel slots this device has. (FE offline threshold = **30s** = `DEVICE_OFFLINE_THRESHOLD_MS`, so six missed heartbeats flip the tile.)
 - A **Reset-recovery watcher** — idle while the Firestore client is healthy; when the owner triggers Reset Pair Code, the BE's refresh-token revokes and this watcher polls `devices/{deviceId}/pending/{sha256(pollSecret)}` for the new customToken. On pickup it bootstraps a fresh keystore entry and exits cleanly so the supervisor respawns with new subscriptions. Net effect: Reset is hands-off on the PC under supervised mode.
-- A **Firestore queue listener** — picks up jobs from `devices/{deviceId}/queue/`. Single-worker per backend: if you fire a second topic on the same PC while the first is running, the second lands in an explicit `queued` state (with a chat banner + Cancel button in the app) until the first finishes. Sharers can submit too — the BE picks up their queue items as long as their uid is in `sharedWith[]`.
+- A **Firestore queue listener** — picks up jobs from `devices/{deviceId}/queue/`. Multi-worker aware: with `workerCount = N` (see § Multi-Worker below), N concurrent slots run in parallel; a new submit lands in explicit `queued` state only when ALL N slots are busy OR there are already-deferred queue docs ahead of it (FIFO fairness). Sharers can submit too — the BE picks up their queue items as long as their uid is in `sharedWith[]`. Cross-account submits sort by Firestore `submittedAt` (server timestamp, clock-skew immune); `_recompute_deferred_queue_positions` renumbers all deferred docs on every claim and cancel so the FE banner reflects #N changes live.
 - A **command listener** for `stop` / `pause` / `resume` / `config` / `add_context` / `agent_decision` / `continue_anyway` / `retry_phase` / `skip_phase` / `skip_init_verify` / `retry_init_verify` / `skip_agent` / `retry_agent` / `continue_partial_agent` / `poke_agent` / `wait_longer_agent` / `dismiss_alert` / `discard_run` / `ping`. **Dispatcher resume-contract (2026-05-18):** every action that acknowledges a paused alert calls `_controls.request_resume()` so the pipeline doesn't stay paused after the user clicks the action button. A static-analysis test (`tests/test_dispatcher_resume_contract.py`) asserts the rule on every required-resume action and rejects accidental `request_resume` on non-pause actions (`pause`, `stop`, `discard_run`, `ping`, `add_context`, `config`, `dismiss_alert`).
 
 - **CLI dispatcher pause-reason routing** (DGOPS-7710 / F6 + 3 follow-up fixes) — when an alert pauses the BE with a `pause_reason` (`agent_link_failed`, `human_verification_required`, `cua_unavailable`, `claude_chat_mode`, `login_required`, `pro_required`), the CLI `r` / `s` keystrokes route to the correct alert-specific helpers (`set_agent_decision`, `set_continue_anyway`, `request_skip_agent`, `request_skip_init_verify`) **plus** `request_resume`, so manual operator intervention always releases the pause. The same routing pattern is mirrored on the Firestore command bus.
@@ -338,7 +338,7 @@ The server runs on port 8000 with:
 - **Phase 2 Claude clarification auto-reply** — when a vague brief makes Claude respond with chat-text clarifying questions instead of starting Deep Research (signature: tail of last message matches "Once you ... I'll launch the research"), the polling loop auto-types `"Up to Claude to decide for the best output."` + Send so the agent proceeds without operator intervention. 5-condition heuristic (one-shot per agent) gates the trigger; see `_claude_asking_clarification` + `_claude_send_clarification_reply` near `poll_all_agents_round_robin`. Without this, the BE used to wait for an artifact that never appeared and eventually surfaced a generic "Hit a snag" alert at the wall-clock cap.
 - A **local HTTP API** on `http://localhost:8000` for the CLI + any direct calls.
 
-Keep `--serve` running while you use the app. If the server stops, the web app's 60s watchdog detects it, marks running tiles as stopped, and prevents a reload from resurrecting the pipeline.
+Keep `--serve` running while you use the app. If the server stops, the FE's heartbeat-based offline detection flips the device dot red at the **30s** threshold, and the per-phase silence watchdog (T1/T2 — see FE README → Watchdog) surfaces actionable dropdown alerts on each in-flight phase. The pipeline does NOT resurrect on reload if the heartbeat is stale.
 
 **Queue persistence across restarts** — on `--serve` startup, the backend re-enqueues any `status:"queued"` researches from Firestore, so the queue survives a `--daemon-loop` respawn. Anything that was `status:"ongoing"` when the previous process died is flipped to `paused_backend_restart` (with a "Resume from checkpoint?" warn alert in the FE), instead of appearing live-but-frozen. If the persist itself fails (Firestore unavailable on respawn), affected researches surface a `paused_backend_restart_failed` red error with the actual error string.
 
@@ -441,7 +441,18 @@ Open Super Research (the web app) → type a topic → backend picks it up from 
 
 ## Multiple Devices (same user)
 
-One account can pair multiple PCs. Each `--pair` on a new machine mints its own synthetic device user + top-level `devices/{deviceId}` doc. The app's sidebar gets a device switcher (with online/offline dots) and every research is stamped with the device it ran on — so jobs you fire from the app route back to the specific PC that was **active** when you hit Start. If you fire two jobs on the same device while one is running, the second queues; if you fire one on a different device, both run in parallel.
+One account can pair multiple PCs. Each `--pair` on a new machine mints its own synthetic device user + top-level `devices/{deviceId}` doc. The app's sidebar gets a device switcher (with online/offline dots) and every research is stamped with the device it ran on — so jobs you fire from the app route back to the specific PC that was **active** when you hit Start. If you fire two jobs on the same device while it's at capacity, the second queues; if you fire one on a different device, both run in parallel.
+
+## Multi-Worker (parallel runs on one PC)
+
+A device can run **multiple pipelines in parallel** when its backend has `workerCount > 1` in `research_config.json`. Default is **1** (single-worker); a typical multi-profile production setup is **2**. Each worker is a separate Python subprocess spawned by the daemon-loop supervisor on adjacent ports (8000, 8001, …); each subscribes independently to the same `devices/{deviceId}/queue/` and `devices/{deviceId}/commands/` subcollections, and each pins to its own browser-profile dir (`~/.super-research/browser-profile-N/`) so they don't race on the same Chrome session.
+
+- **Where it's set:** `research_config.json.workerCount`. Loaded by `load_worker_count()` (research.py:2667) with a >=1 clamp so a bad config can't disable the only worker.
+- **How to raise it:** run `python research.py --pair` and at the "Add another browser profile?" prompt during Stage 4, add a second profile. The BE will spawn the additional worker on next supervisor cycle.
+- **Where the FE learns about it:** every heartbeat publishes `workerCount` on `devices/{deviceId}`. The FE gates a new submit on `ongoing >= workerCount OR queued > 0` to decide ongoing vs queued.
+- **Two researches running at once on one PC — is that a bug?** No. It's the expected behavior under `workerCount=2`. The queue only kicks in when ALL workers are busy.
+- **Cross-cutting safety:** the on-disk worker lock (`safe_enqueue_lock_*`) prevents dual-spawn on supervisor restarts; the listener `_pending_enq` counter prevents back-to-back claims by Firestore listener replay; a pre-claim status re-check drops a claim if the research doc transitioned to a terminal status (cancel, stop) between claim-scan and enqueue (cross-worker cancel race guard).
+- **HARD_RESET safety:** Reset Pair Code writes a single `hard_reset` command to `devices/{deviceId}/commands/`. Every worker subscribes and processes it independently — each touches `.stop` on its own active run dir, flips its own active research doc to `cancelled`, and schedules `os._exit(0)` so the daemon-loop respawns it clean. No zombie runs across N workers.
 
 ## Multiple Users (same backend) — sharing via pair code
 
@@ -611,9 +622,11 @@ research-automate/
 
 **`patchright` launches but Chrome doesn't open** — Patchright launches with `channel="chrome"` (real Chrome, not bundled Chromium). If real Chrome isn't installed on this machine, install it from google.com/chrome (Windows), `brew install --cask google-chrome` (macOS), or your distro's Chrome package (Linux).
 
-**Backend shows "Offline" in the web app** — Make sure `python research.py --serve` is running. The heartbeat updates every 30 seconds.
+**Backend shows "Offline" in the web app** — Make sure `python research.py --serve` is running. The heartbeat updates every **5 seconds**; the FE flips the dot red after **30 seconds** of silence (6 missed ticks).
 
-**"Backend did not respond within 15s"** — The backend may be busy with another research. Check the queue: `GET http://localhost:8000/api/queue`.
+**"Backend did not respond within 15s" / "didn't pick up the job"** — Only fires for immediate-claim submits (workers were free at submit time). Means the BE didn't ack within 15s — usually a transient Firestore RPC blip. Tap Retry. **Queued submits are exempt** as of 2026-05-22 (FE commit `992db14`) — they don't trigger this alarm even if claim takes minutes, which it legitimately can when all workers are busy with cross-account runs.
+
+**Two researches running at once on one PC** — Expected under `workerCount > 1`. See § Multi-Worker above. Not a bug.
 
 **Browser sessions expired** — Re-run `python research.py --pair` to log in again.
 
