@@ -33,7 +33,23 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from research import _compute_global_queue_position  # noqa: E402
+from research import (  # noqa: E402
+    _compute_global_queue_position,
+    _queue_doc_fifo_ms,
+)
+
+
+class _FakeServerTs:
+    """Stand-in for a Firestore Timestamp / DatetimeWithNanoseconds —
+    exposes `.timestamp()` returning unix seconds (float). Real returns
+    a datetime subclass; we only depend on `.timestamp()` so the fake
+    just needs that one method."""
+
+    def __init__(self, epoch_ms: int):
+        self._epoch_ms = epoch_ms
+
+    def timestamp(self) -> float:
+        return self._epoch_ms / 1000.0
 
 
 # ── Fakes ──────────────────────────────────────────────────────────────
@@ -67,8 +83,12 @@ class _FakeColRef:
 
 
 def _q_doc(doc_id, *, timestamp_ms, topic, research_id, submitted_by="user",
-           action="start", assigned_worker=None, processed=False):
-    """Helper to assemble a queue-doc payload."""
+           action="start", assigned_worker=None, processed=False,
+           submitted_at_ms=None):
+    """Helper to assemble a queue-doc payload. `submitted_at_ms` populates
+    the Firestore `serverTimestamp()` field; legacy callers omit it and
+    only carry the client-side `timestamp`. When set, it's the
+    authoritative ordering key (matches production buildQueuePayload)."""
     p = {
         "timestamp": timestamp_ms,
         "topic": topic,
@@ -77,6 +97,8 @@ def _q_doc(doc_id, *, timestamp_ms, topic, research_id, submitted_by="user",
         "action": action,
         "processed": processed,
     }
+    if submitted_at_ms is not None:
+        p["submittedAt"] = _FakeServerTs(submitted_at_ms)
     if assigned_worker is not None:
         p["assignedWorker"] = assigned_worker
     return _FakeSnap(doc_id, p)
@@ -248,3 +270,119 @@ def test_topic_truncated_to_60_chars():
     assert pos == 2
     assert behind_title == "A" * 60
     assert behind_rid == "rid-a"
+
+
+# ── Server-timestamp ordering (clock-skew immunity) ────────────────────
+
+def test_submitted_at_overrides_client_timestamp():
+    """When both submittedAt + timestamp are set, submittedAt wins. The
+    FE writes both via buildQueuePayload (legacy `timestamp` is kept for
+    BE stale-queue defense at research.py:~2658); ordering MUST use the
+    server-side value for clock-skew immunity."""
+    snaps = [
+        # Client says A is older (1_000ms) but server says it landed
+        # LATER (10_000ms). Server-side ordering must put A second.
+        _q_doc("qd-a", timestamp_ms=1_000, submitted_at_ms=10_000,
+               topic="A", research_id="rid-a"),
+        _q_doc("qd-b", timestamp_ms=2_000, submitted_at_ms=2_000,
+               topic="B", research_id="rid-b"),
+    ]
+    pos, behind_rid, behind_title = _compute_global_queue_position(_FakeColRef(snaps), "qd-a")
+    assert pos == 2, (
+        "submittedAt should override the client `timestamp` — "
+        "qd-a's server timestamp (10s) is later than qd-b's (2s)"
+    )
+    assert behind_rid == "rid-b"
+    assert behind_title == "B"
+
+
+def test_clock_skew_repro_owner_vs_sharer():
+    """The 2026-05-22 follow-up scenario: sharer's browser clock is 5s
+    BEHIND the owner's. Without the server-timestamp fix, the helper
+    would have sorted Bull Dog (sharer, client-ts=995_000) ahead of
+    Husky (owner, client-ts=1_000_000) and assigned Bull Dog=1.
+
+    With submittedAt as the authoritative key (server stamps in actual
+    arrival order: Husky at 1_001_500ms, Bull Dog at 1_002_000ms), the
+    correct order is restored: Husky=1, Bull Dog=2."""
+    snaps = [
+        # Owner submits Husky first. Owner's clock = correct (~ms 1_000_000).
+        # Husky reaches Firestore server at server-ms 1_001_500.
+        _q_doc("qd-husky", timestamp_ms=1_000_000, submitted_at_ms=1_001_500,
+               topic="Husky", research_id="rid-husky",
+               submitted_by="owner-uid"),
+        # Sharer submits Bull Dog second. Sharer's clock is 5s behind so
+        # client-ms reads 995_000 — earlier than owner's. Doc still
+        # reaches Firestore AFTER Husky (server-ms 1_002_000).
+        _q_doc("qd-bulldog", timestamp_ms=995_000, submitted_at_ms=1_002_000,
+               topic="Bull Dog", research_id="rid-bulldog",
+               submitted_by="sharer-uid"),
+    ]
+    pos, behind_rid, behind_title = _compute_global_queue_position(_FakeColRef(snaps), "qd-husky")
+    assert pos == 1, "Husky should be head despite owner's later client clock"
+    pos, behind_rid, behind_title = _compute_global_queue_position(_FakeColRef(snaps), "qd-bulldog")
+    assert pos == 2, "Bull Dog should be #2 — sharer's lagging clock must not push it ahead"
+    assert behind_rid == "rid-husky"
+    assert behind_title == "Husky"
+
+
+def test_legacy_doc_without_submitted_at_falls_back_to_timestamp():
+    """A queue doc that pre-dates the server-timestamp rollout has only
+    `timestamp`. The helper must still order it relative to modern docs
+    via the client-ms field (not last-place)."""
+    snaps = [
+        _q_doc("qd-legacy", timestamp_ms=500, topic="Legacy", research_id="rid-l"),
+        _q_doc("qd-modern", timestamp_ms=2_000, submitted_at_ms=2_000,
+               topic="Modern", research_id="rid-m"),
+    ]
+    pos, _, _ = _compute_global_queue_position(_FakeColRef(snaps), "qd-legacy")
+    assert pos == 1  # legacy ts=500 < modern submittedAt=2000
+    pos, behind_rid, behind_title = _compute_global_queue_position(_FakeColRef(snaps), "qd-modern")
+    assert pos == 2
+    assert behind_rid == "rid-l"
+
+
+def test_missing_both_timestamp_fields_sorts_last():
+    """An anomalous doc with neither field set sinks to the bottom —
+    same as the pre-fix behavior. Matches `_fifo_key` returning the
+    (1, 0, id) tier."""
+    snaps = [
+        _q_doc("qd-modern", timestamp_ms=2_000, submitted_at_ms=2_000,
+               topic="Modern", research_id="rid-m"),
+        _FakeSnap("qd-broken", {"topic": "Broken", "researchId": "rid-b",
+                                "action": "start"}),
+    ]
+    pos, _, _ = _compute_global_queue_position(_FakeColRef(snaps), "qd-modern")
+    assert pos == 1
+    pos, behind_rid, _ = _compute_global_queue_position(_FakeColRef(snaps), "qd-broken")
+    assert pos == 2
+    assert behind_rid == "rid-m"
+
+
+# ── _queue_doc_fifo_ms helper (extracted, also used by FIFO pre-query) ─
+
+def test_helper_prefers_submitted_at():
+    assert _queue_doc_fifo_ms({"submittedAt": _FakeServerTs(5_000),
+                               "timestamp": 1_000}) == 5_000
+
+
+def test_helper_falls_back_to_timestamp():
+    assert _queue_doc_fifo_ms({"timestamp": 1_500}) == 1_500
+
+
+def test_helper_returns_none_for_missing_or_invalid():
+    assert _queue_doc_fifo_ms({}) is None
+    assert _queue_doc_fifo_ms({"timestamp": 0}) is None  # invalid
+    assert _queue_doc_fifo_ms({"timestamp": -1}) is None  # invalid
+    assert _queue_doc_fifo_ms({"timestamp": "not-a-number"}) is None
+
+
+def test_helper_handles_submitted_at_without_timestamp_method():
+    """Defensive: if submittedAt is some other type that doesn't expose
+    `.timestamp()`, fall through to the client timestamp without
+    raising."""
+    class _BadServerTs:
+        pass
+
+    d = {"submittedAt": _BadServerTs(), "timestamp": 2_000}
+    assert _queue_doc_fifo_ms(d) == 2_000

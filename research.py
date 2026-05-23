@@ -2109,6 +2109,34 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
     return (swept_n, swept_fail)
 
 
+def _queue_doc_fifo_ms(data: dict) -> "int | None":
+    """Resolve a queue-doc payload's ordering timestamp in epoch ms.
+
+    Prefers `submittedAt` (Firestore `serverTimestamp()` set in
+    `buildQueuePayload` at FE-side — immune to client clock skew between
+    owner / sharer browsers). Falls back to the legacy `timestamp`
+    (client `Date.now()` ms) when the server field is missing — covers
+    pre-server-timestamp docs that may still sit in the queue across a
+    deploy. Returns None when neither field carries a usable value, so
+    the caller can demote the snap to last-place.
+
+    Clock-skew was the 2026-05-22 follow-up to Bug A: sharer's browser
+    clock was behind owner's by a few seconds, so a sharer-submitted
+    Bull Dog doc could land with `timestamp < Husky.timestamp` and sort
+    ahead of an owner-submitted Husky that actually reached Firestore
+    first. The server timestamp removes that variability."""
+    sat = data.get("submittedAt")
+    if sat is not None:
+        try:
+            return int(sat.timestamp() * 1000)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    ts = data.get("timestamp")
+    if isinstance(ts, (int, float)) and ts > 0:
+        return int(ts)
+    return None
+
+
 def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, str]":
     """Compute this queue-doc's authoritative position in the device-
     wide FIFO ordering across all submitters (owner + sharers). The
@@ -2133,10 +2161,10 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
         where my doc carries my own worker id)
       - skip non-start actions (cancel/resume have their own paths)
 
-    Sort key: client `timestamp` ASC with doc-id tiebreaker for
-    legacy docs missing `timestamp`. Identical to the existing FIFO
-    pre-query — must match exactly so callers and pre-query agree on
-    who's head.
+    Sort key: `submittedAt` (Firestore server timestamp) ASC with
+    doc-id tiebreaker, falls back to client `timestamp` (ms) for
+    legacy docs. Identical to the FIFO pre-query — must match exactly
+    so callers and pre-query agree on who's head.
 
     Best-effort: on Firestore error, returns (1, "", "") so callers
     fall back to "head" semantics (safer than reporting a misleading
@@ -2149,9 +2177,9 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
 
     def _fifo_key(snap):
         d = snap.to_dict() or {}
-        ts = d.get("timestamp")
-        if isinstance(ts, (int, float)) and ts > 0:
-            return (0, ts, snap.id)
+        ms = _queue_doc_fifo_ms(d)
+        if ms is not None:
+            return (0, ms, snap.id)
         return (1, 0, snap.id)
 
     sorted_cands = sorted(candidates, key=_fifo_key)
@@ -4426,21 +4454,21 @@ def start_firestore_start_listener(job_queue, loop):
                     # auto-IDs), NOT createdAt order. With 3 docs A,B,C
                     # arriving fast and 2 workers, W1 could iterate B
                     # first and claim B while older A sat unclaimed until
-                    # idle-rescan. Pre-query sorts candidates by client-ms
-                    # `timestamp` ASC (universal field, written by FE
-                    # buildQueuePayload) with doc-id tiebreaker; if my doc
-                    # isn't the head, defer — the head's own listener-
-                    # fire (or idle-rescan) will claim it. Missing-
-                    # timestamp legacy docs sort LAST so they don't
-                    # FIFO-block well-formed new docs.
+                    # idle-rescan. Pre-query sorts candidates by
+                    # `submittedAt` (Firestore server timestamp) ASC —
+                    # immune to FE-clock skew between owner and sharer
+                    # browsers (2026-05-22 follow-up). Falls back to
+                    # legacy client-ms `timestamp` for older docs;
+                    # missing-both legacy docs sort LAST so they don't
+                    # FIFO-block well-formed new docs. Doc-id tiebreaker.
                     try:
                         _head_candidates = list(col_ref.limit(20).stream())
 
                         def _fifo_key(_snap):
                             _hd = _snap.to_dict() or {}
-                            _ts = _hd.get("timestamp")
-                            if isinstance(_ts, (int, float)) and _ts > 0:
-                                return (0, _ts, _snap.id)
+                            _ms = _queue_doc_fifo_ms(_hd)
+                            if _ms is not None:
+                                return (0, _ms, _snap.id)
                             return (1, 0, _snap.id)
 
                         _head_candidates.sort(key=_fifo_key)
