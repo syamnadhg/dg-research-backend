@@ -161,7 +161,7 @@ async def smoke_test() -> int:
 async def fixtures_mode() -> int:
     """Load all fixtures from FIXTURES_DIR, run each through ask(), report."""
     if not _check_real_api_key():
-        print("ERROR: ANTHROPIC_API_KEY (or CUA_API_KEY) not set — fixtures mode "
+        print("ERROR: ANTHROPIC_API_KEY not set — fixtures mode "
               "needs a real key. Use --smoke for an offline sanity check.")
         return 2
 
@@ -320,7 +320,7 @@ async def live_mode(hotspot: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────
 
 def _check_real_api_key() -> bool:
-    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CUA_API_KEY"))
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
 def main() -> int:

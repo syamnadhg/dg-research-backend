@@ -31,7 +31,7 @@ The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all
 
 - **Python 3.11+** (`python --version`).
 - **Real Google Chrome** installed (not just Chromium — patchright launches with `channel="chrome"`).
-- **Anthropic API key** with browser-automation access (`CUA_API_KEY` or `ANTHROPIC_API_KEY` — either works; see Step 2).
+- **Anthropic API key** with browser-automation access (`ANTHROPIC_API_KEY`; see Step 2).
 - **Super Research web app account** — sign in at the deployment URL the dev shares with you (Google sign-in). You'll paste the 8-char pair code into Account → Add Device during `--pair` Stage 1.
 - **Paid Pro tiers on ChatGPT, Claude, and Gemini** — required for the depth Phases 1–2 were tuned against:
   - **ChatGPT Pro** ($200/mo per seat) — Phase 1 brief uses Pro + Extended Thinking.
@@ -208,7 +208,7 @@ The supervisor reads env vars from `.dg-supervisor.env` (created automatically o
 - **(easiest — recommended)** **`--pair` Stage 3 auto-prompt.** At the end of pairing, `--pair` checks whether each key is already resolvable from any source; for missing keys it prompts with `[paste / S=skip]`, **verifies** the pasted key against the provider's API (5s cheap probe), and on success writes BE-local persistence + `os.environ` + busts the resolver cache. Persistence is per-machine: Windows User-scope env on Windows; `.dg-supervisor.env` upsert on macOS / Linux. Skip is first-class per key.
 - **(equivalent — set later, or rotate, or sync across devices)** "Account → API Config" in the web app — writes `users/{uid}/settings/prefs.apiKeys.{anthropic,gemini}` in Firestore. Distinct surface from pair-time keys: pair never auto-fills these inputs, so anything you see there is something you typed there. Works on Windows, macOS, Linux. No restart required after rotating; backend re-reads on next call (60s cache).
 - **(file-based, all platforms)** Uncomment `ANTHROPIC_API_KEY=sk-ant-...` and/or `GEMINI_API_KEY=AIza...` in `.dg-supervisor.env`. Loaded by `--env-file` at supervisor startup; survives reboots via the persistence supervisor. Good for un-paired backends or operators who prefer files. (On POSIX, `--pair` writes here too.)
-- **(advanced / legacy)** Set in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). `resolve_api_key()` accepts `CUA_API_KEY` or `ANTHROPIC_API_KEY`; `resolve_gemini_api_key()` accepts `GEMINI_API_KEY` or `GOOGLE_API_KEY`. (On Windows, `--pair` writes here too.)
+- **(advanced / legacy)** Set in your shell rc (Mac/Linux) or via PowerShell `[System.Environment]::SetEnvironmentVariable(..., 'User')` (Windows user-scope). The canonical env-var names are `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` (matching the Anthropic SDK + Gemini API docs). Legacy aliases `CUA_API_KEY` and `GOOGLE_API_KEY` are auto-migrated on next startup and removed; new BE versions only read the canonical names. (On Windows, `--pair` writes here too.)
 
 **Don't set the same key in multiple places with different values** — pick one. Priority chain: CLI `--api-key` → **FE Account-page Firestore key** → Windows user-scope env (where `--pair` persists on Windows) → `os.environ` (the `.dg-supervisor.env` file loads here on POSIX, including pair-time keys). FE-Account-page key wins, so a stale BE-local pair key won't override a freshly-set web-app key.
 
@@ -274,12 +274,12 @@ Anthropic  — get one at https://console.anthropic.com/settings/keys
 
 On paste, the BE makes a cheap **live-API verification call** (`models.list` for Anthropic; `GET /v1beta/models` for Gemini) with a 5s timeout. If the provider rejects the key (auth_failed), the prompt re-asks up to 3 times then offers `Save anyway? [y/N]` defaulting to no. If the verifier itself can't reach the API (network_error — offline pair, transient blip), the key is saved with a fail-loud-at-first-run warning rather than blocking the pair.
 
-On verified paste, the BE writes the key to **BE-local persistence**: Windows User-scope env on Windows, `.dg-supervisor.env` upsert on macOS / Linux. It also mirrors to `os.environ` (both var names per key — `ANTHROPIC_API_KEY` + `CUA_API_KEY`, or `GEMINI_API_KEY` + `GOOGLE_API_KEY`) so the running pair session can use the key immediately, and busts `_RESOLVED_KEY_CACHE` so the very next `resolve_api_key()` call (at the top of Stage 4 browser-login CUA init) sees the new key. Pair-time keys do NOT touch Firestore — the FE Account → API Config page is a separate surface that writes Firestore directly.
+On verified paste, the BE writes the key to **BE-local persistence**: Windows User-scope env on Windows, `.dg-supervisor.env` upsert on macOS / Linux. It also mirrors to `os.environ` under the canonical name (`ANTHROPIC_API_KEY` for the Anthropic key, `GEMINI_API_KEY` for the Gemini key) so the running pair session can use the key immediately, and busts `_RESOLVED_KEY_CACHE` so the very next `resolve_api_key()` call (at the top of Stage 4 browser-login CUA init) sees the new key. Pair-time keys do NOT touch Firestore — the FE Account → API Config page is a separate surface that writes Firestore directly. (Pre-2026-05-23 devices may still have the legacy aliases `CUA_API_KEY` / `GOOGLE_API_KEY` in their User-scope env; `_migrate_legacy_api_keys()` runs once at startup, copies any surviving value to the canonical name, then retires the legacy entry. Idempotent + sentinel-cached.)
 
 Skip is first-class per key — pair finishes regardless. Missing Anthropic falls back to **Playwright-only** verification in Stage 4 (less rigorous; no Pro-tier check) and surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
 
 **`[4/5] Browser logins`**
-Opens 4 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds. With the Anthropic key set or detected in Stage 3, each platform passes BOTH Playwright DOM checks AND CUA vision before clearing — matches Phase 0 init rigor. Without the key, falls back to Playwright-only (logged in the BE as "Setup Stage 4: No CUA_API_KEY — Playwright-only verification (less rigorous)"):
+Opens 4 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds. With the Anthropic key set or detected in Stage 3, each platform passes BOTH Playwright DOM checks AND CUA vision before clearing — matches Phase 0 init rigor. Without the key, falls back to Playwright-only (logged in the BE as "Setup Stage 4: No ANTHROPIC_API_KEY — Playwright-only verification (less rigorous)"):
 - ChatGPT (chatgpt.com)
 - Gemini (gemini.google.com)
 - Claude (claude.ai)
@@ -572,8 +572,7 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CUA_API_KEY` | (required) | Anthropic API key for browser automation. `ANTHROPIC_API_KEY` is also accepted as a fallback (research.py:203). |
-| `ANTHROPIC_API_KEY` | (fallback for `CUA_API_KEY`) | Standard Anthropic env var; auto-detected if `CUA_API_KEY` isn't set. Also drives the narrator's Haiku 4.5 primary brain. |
+| `ANTHROPIC_API_KEY` | (required) | Anthropic API key for browser automation (CUA) + narrator's Haiku 4.5 primary brain. Industry-standard name (matches the Anthropic SDK's auto-pickup). Legacy `CUA_API_KEY` is auto-migrated to this name on next BE startup. |
 | `CUA_MODEL` | `claude-opus-4-7` | Claude model for CUA |
 | `CUA_SCREEN_WIDTH` | `1280` | Browser viewport width |
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |

@@ -281,7 +281,8 @@ class VisionClient:
         if not key:
             # Last-resort flat read — covers standalone callers (e.g.
             # vision_test.py) where the research module isn't loaded.
-            key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CUA_API_KEY")
+            # Single canonical name only (CUA_API_KEY retired 2026-05-23).
+            key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
             raise RuntimeError(
                 "VisionClient: no API key. Pass api_key= or set ANTHROPIC_API_KEY."

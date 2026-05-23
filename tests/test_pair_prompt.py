@@ -427,8 +427,8 @@ class TestPairPromptApiKeys:
     def test_anthropic_missing_gemini_set_only_one_prompt(self, monkeypatch, silent_log):
         """Anthropic resolver returns "" → prompts for Anthropic. Gemini
         resolver returns a key → skips Gemini prompt. Local save fires
-        for both ANTHROPIC_API_KEY + CUA_API_KEY (BE pipeline reads
-        either)."""
+        for the canonical name ANTHROPIC_API_KEY only — the legacy
+        CUA_API_KEY alias was retired 2026-05-23."""
         from research import _pair_prompt_api_keys
         valid_key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"
         monkeypatch.setattr("research.resolve_api_key", lambda: "")
@@ -438,26 +438,25 @@ class TestPairPromptApiKeys:
                             _dispatching_to_thread(valid_key, "ok"))
         # Snapshot env so we can assert what changed
         before_anthropic = os.environ.get("ANTHROPIC_API_KEY")
+        before_cua = os.environ.get("CUA_API_KEY")
         before_gemini = os.environ.get("GEMINI_API_KEY")
         try:
             self._run(_pair_prompt_api_keys("uid-abc"))
-            # os.environ mirror set for both variant names (BE-local
-            # User-scope / env-file persistence handled by save_calls).
+            # os.environ mirror set for the canonical name only.
             assert os.environ.get("ANTHROPIC_API_KEY") == valid_key
-            assert os.environ.get("CUA_API_KEY") == valid_key
+            # Legacy CUA_API_KEY is NOT touched — pair flow only writes canonical.
+            assert os.environ.get("CUA_API_KEY") == before_cua
             # Gemini was NOT touched (resolver said it's already configured)
             assert os.environ.get("GEMINI_API_KEY") == before_gemini
-            # Both Anthropic-side variants persisted locally; nothing for Gemini.
+            # Only the canonical name persisted locally; no legacy alias write.
             persisted = {name for name, _ in self.save_calls}
-            assert persisted == {"ANTHROPIC_API_KEY", "CUA_API_KEY"}
+            assert persisted == {"ANTHROPIC_API_KEY"}
         finally:
             # Restore env
             if before_anthropic is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
-                os.environ.pop("CUA_API_KEY", None)
             else:
                 os.environ["ANTHROPIC_API_KEY"] = before_anthropic
-                os.environ["CUA_API_KEY"] = before_anthropic
 
     def test_paste_busts_anthropic_cache(self, monkeypatch, silent_log):
         """After paste, _RESOLVED_KEY_CACHE.ts is reset to 0.0 so the next
@@ -477,7 +476,6 @@ class TestPairPromptApiKeys:
             assert _RESOLVED_KEY_CACHE["key"] is None
         finally:
             os.environ.pop("ANTHROPIC_API_KEY", None)
-            os.environ.pop("CUA_API_KEY", None)
             _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
 
     def test_skip_both_no_env_change(self, monkeypatch, silent_log):
@@ -499,8 +497,10 @@ class TestPairPromptApiKeys:
         self._run(_pair_prompt_api_keys("uid-abc"))
         # No local saves either (skip is verifier-free AND save-free).
         assert self.save_calls == []
-        # No env mutations for the four candidate vars
-        for var in ("ANTHROPIC_API_KEY", "CUA_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        # No env mutations for either canonical var. (The legacy aliases
+        # CUA_API_KEY / GOOGLE_API_KEY are not written by the pair flow
+        # anymore — _migrate_legacy_api_keys handles existing values.)
+        for var in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
             assert os.environ.get(var) == before.get(var)
 
     def test_local_save_fails_still_sets_env(self, monkeypatch, silent_log):
@@ -520,21 +520,18 @@ class TestPairPromptApiKeys:
         before_anthropic = os.environ.get("ANTHROPIC_API_KEY")
         try:
             self._run(_pair_prompt_api_keys("uid-abc"))
-            # Despite local-save failure, env is still set
+            # Despite local-save failure, env is still set (canonical name only).
             assert os.environ.get("ANTHROPIC_API_KEY") == valid_key
-            assert os.environ.get("CUA_API_KEY") == valid_key
         finally:
             if before_anthropic is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
-                os.environ.pop("CUA_API_KEY", None)
             else:
                 os.environ["ANTHROPIC_API_KEY"] = before_anthropic
-                os.environ["CUA_API_KEY"] = before_anthropic
 
-    def test_gemini_paste_sets_both_env_var_names(self, monkeypatch, silent_log):
-        """Both GEMINI_API_KEY and GOOGLE_API_KEY are set on paste — the
-        resolver checks both, and downstream consumers (narrate.py) check
-        both too. Local save fires for both variants."""
+    def test_gemini_paste_sets_canonical_env_var(self, monkeypatch, silent_log):
+        """Only GEMINI_API_KEY is set on paste — the legacy GOOGLE_API_KEY
+        alias was retired 2026-05-23. The resolver reads only the canonical
+        name; existing GOOGLE_API_KEY values are auto-migrated on startup."""
         from research import _pair_prompt_api_keys
         valid_key = "AIzaSyABCDEFGHIJKLMNOPQRSTUV-1234567890"
         monkeypatch.setattr("research.resolve_api_key", lambda: "sk-ant-existing")
@@ -546,15 +543,15 @@ class TestPairPromptApiKeys:
         try:
             self._run(_pair_prompt_api_keys("uid-abc"))
             assert os.environ.get("GEMINI_API_KEY") == valid_key
-            assert os.environ.get("GOOGLE_API_KEY") == valid_key
+            # Legacy GOOGLE_API_KEY is NOT touched by the pair flow.
+            assert os.environ.get("GOOGLE_API_KEY") == before_google
             persisted = {name for name, _ in self.save_calls}
-            assert persisted == {"GEMINI_API_KEY", "GOOGLE_API_KEY"}
+            assert persisted == {"GEMINI_API_KEY"}
         finally:
-            for var, before in (("GEMINI_API_KEY", before_gemini), ("GOOGLE_API_KEY", before_google)):
-                if before is None:
-                    os.environ.pop(var, None)
-                else:
-                    os.environ[var] = before
+            if before_gemini is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = before_gemini
 
     def test_verifier_auth_failed_then_skip_does_not_save(self, monkeypatch, silent_log):
         """First paste fails verification, second paste is 'skip' →
@@ -586,10 +583,8 @@ class TestPairPromptApiKeys:
         finally:
             if before_anthropic is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
-                os.environ.pop("CUA_API_KEY", None)
             else:
                 os.environ["ANTHROPIC_API_KEY"] = before_anthropic
-                os.environ["CUA_API_KEY"] = before_anthropic
 
     def test_verifier_network_error_saves_anyway(self, monkeypatch, silent_log):
         """Verifier returns 'network_error' (transient blip, offline pair)
@@ -604,16 +599,13 @@ class TestPairPromptApiKeys:
         try:
             self._run(_pair_prompt_api_keys("uid-abc"))
             assert os.environ.get("ANTHROPIC_API_KEY") == valid_key
-            assert os.environ.get("CUA_API_KEY") == valid_key
             persisted = {name for name, _ in self.save_calls}
-            assert persisted == {"ANTHROPIC_API_KEY", "CUA_API_KEY"}
+            assert persisted == {"ANTHROPIC_API_KEY"}
         finally:
             if before_anthropic is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
-                os.environ.pop("CUA_API_KEY", None)
             else:
                 os.environ["ANTHROPIC_API_KEY"] = before_anthropic
-                os.environ["CUA_API_KEY"] = before_anthropic
 
 
 # ─────────────────────────────────────────────────────────────────────

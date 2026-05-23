@@ -570,6 +570,115 @@ def _clear_api_key_local(name: str) -> bool:
     return _clear_api_key_from_env_file(name)
 
 
+# Sentinel file marking that the legacy-env-name migration has run on
+# this machine. Sits under ~/.super-research/ (the same dir as the
+# browser-profile / refresh-token persistence) so it shares the unpair
+# blast radius — `--unpair --deep` doesn't need to remove it because
+# re-running the migration on a clean machine is a no-op anyway.
+_ENV_MIGRATION_SENTINEL = Path.home() / ".super-research" / "env-migrated-v1"
+
+# Legacy → canonical env-var pairs handled by the one-shot migration.
+# Edit this list when introducing future renames.
+_LEGACY_API_KEY_MIGRATIONS = (
+    ("CUA_API_KEY", "ANTHROPIC_API_KEY"),
+    ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+)
+
+
+def _migrate_legacy_api_keys() -> None:
+    """One-shot migration: copy legacy API-key env var names to the
+    industry-standard canonical names, then retire the legacy entries.
+
+      CUA_API_KEY    → ANTHROPIC_API_KEY   (Anthropic SDK convention)
+      GOOGLE_API_KEY → GEMINI_API_KEY      (Gemini API docs convention)
+
+    Before this migration the pair flow wrote API keys under BOTH the
+    legacy and canonical names so downstream code could resolve via
+    either — which let the two drift (e.g. user rotates one but not
+    the other, or wipes one via PowerShell). The codebase now writes
+    and reads only the canonical name; this helper handles the
+    in-place upgrade for machines that paired before the cutover, with
+    no user action and no re-pair required.
+
+    Behavior (per pair):
+      - Detect legacy value from BE-local persistence (Windows
+        User-scope env or `.dg-supervisor.env` on POSIX) plus
+        `os.environ` (the in-process view, populated by the env file
+        load at main() entry).
+      - If the canonical name is unset AND a legacy value exists,
+        copy legacy → canonical in both persistence + os.environ.
+      - Remove the legacy entry from both persistence + os.environ
+        regardless, so resolvers never see the old name again.
+
+    Cached via a `~/.super-research/env-migrated-v1` sentinel so
+    subsequent process starts skip the (~600ms on Windows) PowerShell
+    calls. Idempotent; failures are logged at WARN and swallowed.
+
+    Called by main() after `_load_env_file()` and before any
+    subcommand dispatch — every entrypoint (--pair, --serve,
+    --daemon-loop, --doctor, etc.) sees a migrated env."""
+    try:
+        if _ENV_MIGRATION_SENTINEL.exists():
+            return
+    except Exception:
+        # Path.exists can raise on weird filesystems / permission
+        # issues. If we can't even check the sentinel, fall through
+        # and run the migration — it's idempotent.
+        pass
+
+    migrated_any = False
+    for legacy, canonical in _LEGACY_API_KEY_MIGRATIONS:
+        try:
+            legacy_persisted = _read_user_scope_env(legacy)
+            legacy_env = os.environ.get(legacy, "").strip()
+            canonical_persisted = _read_user_scope_env(canonical)
+            canonical_env = os.environ.get(canonical, "").strip()
+
+            legacy_value = legacy_persisted or legacy_env
+            canonical_value = canonical_persisted or canonical_env
+
+            if not legacy_value:
+                continue
+
+            # Copy legacy → canonical only when canonical is empty.
+            # If both are set with different values, the canonical
+            # wins (it's already authoritative); we still proceed to
+            # the cleanup step below to retire the legacy entry.
+            if not canonical_value:
+                if _save_api_key_local(canonical, legacy_value):
+                    log(f"[migrate-env] copied {legacy} → {canonical} (legacy name retired)", "INFO")
+                os.environ[canonical] = legacy_value
+
+            # Retire the legacy entry from persistence + os.environ
+            # so downstream resolvers (which now only read canonical)
+            # don't see the old name lingering.
+            try:
+                _clear_api_key_local(legacy)
+            except Exception:
+                pass
+            os.environ.pop(legacy, None)
+            migrated_any = True
+        except Exception as e:
+            log(f"[migrate-env] {legacy} → {canonical} failed (non-fatal): {e}", "WARN")
+
+    # Drop the cache so the first resolve_api_key() call after migration
+    # re-reads from the canonical name instead of returning a stale None
+    # captured before the env was updated.
+    if migrated_any:
+        try:
+            _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
+        except Exception:
+            pass
+
+    # Write sentinel last so a mid-migration crash doesn't suppress
+    # a retry on the next process start.
+    try:
+        _ENV_MIGRATION_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+        _ENV_MIGRATION_SENTINEL.touch()
+    except Exception:
+        pass
+
+
 def get_env(name):
     """os.environ first, User-scope Windows env as fallback. Keeps the
     legacy contract for callers that just want 'whatever env has this
@@ -630,13 +739,11 @@ _RESOLVED_KEY_NONE_TTL = 5.0  # seconds — shorter TTL when no key is found, so
 
 
 def resolve_api_key(cli_key=None):
-    """Resolve the CUA / Anthropic API key. Priority (highest first):
+    """Resolve the Anthropic API key. Priority (highest first):
         1. --api-key CLI argument
         2. Firestore apiKeys.anthropic (from the web app's Account page)
-        3. Windows User-scope CUA_API_KEY
-        4. Windows User-scope ANTHROPIC_API_KEY
-        5. os.environ CUA_API_KEY  (shell / .bashrc)
-        6. os.environ ANTHROPIC_API_KEY
+        3. Windows User-scope ANTHROPIC_API_KEY (or `.dg-supervisor.env` on POSIX)
+        4. os.environ ANTHROPIC_API_KEY (shell-inherited)
 
     Rationale: the user's intentional settings — CLI arg, web app, or
     PowerShell SetEnvironmentVariable 'User' — should always win over a
@@ -644,12 +751,18 @@ def resolve_api_key(cli_key=None):
     the 'I set a new key in PowerShell but the backend keeps using the
     old one from .bashrc' trap.
 
+    The legacy `CUA_API_KEY` env-var name was retired 2026-05-23;
+    `_migrate_legacy_api_keys()` runs at process startup and copies any
+    surviving CUA_API_KEY value to ANTHROPIC_API_KEY before resolvers
+    are touched, so the legacy name doesn't need to appear in the chain
+    here.
+
     Logs which source was chosen so mismatches are debuggable."""
     if cli_key:
         log(f"[resolve_api_key] using --api-key CLI argument", "INFO")
         return cli_key
     # Hot-path cache. Without it: every narrator tick (6s in P1/P2) triggers
-    # a Firestore RPC + 2 PowerShell subprocess spawns + an INFO log line.
+    # a Firestore RPC + a PowerShell subprocess spawn + an INFO log line.
     # Differentiated TTLs (PR review C1):
     #   - 60s when a real key is cached — stable, hot-path absorption.
     #   -  5s when None is cached — operator may have just added a key
@@ -666,38 +779,39 @@ def resolve_api_key(cli_key=None):
         log(f"[resolve_api_key] using apiKeys.anthropic from Firestore (Account page)", "INFO")
         _RESOLVED_KEY_CACHE.update(key=fs_keys["anthropic"], ts=time.time())
         return fs_keys["anthropic"]
-    # 3 + 4. User-scope env (persistent)
-    for var in ("CUA_API_KEY", "ANTHROPIC_API_KEY"):
-        key = _read_user_scope_env(var)
-        if key:
-            shell_val = os.environ.get(var, "")
-            if shell_val and shell_val != key:
-                log(f"[resolve_api_key] {var}: Windows User-scope wins over shell env (shell had a stale value)", "INFO")
-            else:
-                log(f"[resolve_api_key] using {var} from Windows User-scope", "INFO")
-            _RESOLVED_KEY_CACHE.update(key=key, ts=time.time())
-            return key
-    # 5 + 6. os.environ (shell-inherited)
-    for var in ("CUA_API_KEY", "ANTHROPIC_API_KEY"):
-        key = os.environ.get(var, "").strip()
-        if key:
-            log(f"[resolve_api_key] using {var} from shell env (no User-scope / Firestore key)", "INFO")
-            _RESOLVED_KEY_CACHE.update(key=key, ts=time.time())
-            return key
+    # 3. User-scope persistence (Windows User-scope env or POSIX env file)
+    key = _read_user_scope_env("ANTHROPIC_API_KEY")
+    if key:
+        shell_val = os.environ.get("ANTHROPIC_API_KEY", "")
+        if shell_val and shell_val != key:
+            log("[resolve_api_key] ANTHROPIC_API_KEY: Windows User-scope wins over shell env (shell had a stale value)", "INFO")
+        else:
+            log("[resolve_api_key] using ANTHROPIC_API_KEY from Windows User-scope", "INFO")
+        _RESOLVED_KEY_CACHE.update(key=key, ts=time.time())
+        return key
+    # 4. os.environ (shell-inherited)
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        log("[resolve_api_key] using ANTHROPIC_API_KEY from shell env (no User-scope / Firestore key)", "INFO")
+        _RESOLVED_KEY_CACHE.update(key=key, ts=time.time())
+        return key
     _RESOLVED_KEY_CACHE.update(key=None, ts=time.time())
     return None
 
 
 def resolve_gemini_api_key():
-    """Resolve the Gemini / Google AI API key. Same priority shape as
+    """Resolve the Gemini API key. Same priority shape as
     resolve_api_key() — the user's Account-page key wins over any env.
 
     Priority (highest first):
         1. Firestore apiKeys.gemini (from the web app's Account page)
-        2. Windows User-scope GEMINI_API_KEY
-        3. Windows User-scope GOOGLE_API_KEY
-        4. os.environ GEMINI_API_KEY
-        5. os.environ GOOGLE_API_KEY
+        2. Windows User-scope GEMINI_API_KEY (or `.dg-supervisor.env` on POSIX)
+        3. os.environ GEMINI_API_KEY (shell-inherited)
+
+    The legacy `GOOGLE_API_KEY` env-var name was retired 2026-05-23;
+    `_migrate_legacy_api_keys()` runs at startup and copies any surviving
+    GOOGLE_API_KEY value to GEMINI_API_KEY before this resolver is
+    called.
 
     Used by: narrator loop, vision URL extractor, and narrate.narrate_panel.
     Each consumer calls this at use-time (not at module-load) because
@@ -705,15 +819,10 @@ def resolve_gemini_api_key():
     fs_keys = _read_firestore_api_keys()
     if fs_keys.get("gemini"):
         return fs_keys["gemini"]
-    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        key = _read_user_scope_env(var)
-        if key:
-            return key
-    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        key = os.environ.get(var, "").strip()
-        if key:
-            return key
-    return ""
+    key = _read_user_scope_env("GEMINI_API_KEY")
+    if key:
+        return key
+    return os.environ.get("GEMINI_API_KEY", "").strip()
 
 
 # ── 2026-05-10: Research summary helper (writes Research.summary to Firestore) ──
@@ -14088,7 +14197,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 return {"status": "error", "text": str(e)}
             elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
                 log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
-                _bad_key_hint = "Paste a fresh key in Account → API Config (preferred, no restart), or update CUA_API_KEY on the BE machine and restart."
+                _bad_key_hint = "Paste a fresh key in Account → API Config (preferred, no restart), or update ANTHROPIC_API_KEY on the BE machine and restart."
                 if _phase == 2 and _agent:
                     fail_agent(_agent, "Claude API key rejected", _bad_key_hint)
                 else:
@@ -23856,7 +23965,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         topic = re.sub(r'\s+', ' ', topic).strip()
     api_key = resolve_api_key(api_key)
     if not api_key:
-        log("No API key (set CUA_API_KEY)", "ERROR")
+        log("No API key (set ANTHROPIC_API_KEY)", "ERROR")
         return
 
     import anthropic
@@ -24768,8 +24877,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                          "This usually means one of three things:\n"
                          "• Invalid or missing Anthropic key — add or rotate it in "
                          "Account → API Config (preferred, no restart), or set "
-                         "ANTHROPIC_API_KEY (or CUA_API_KEY) on the backend "
-                         "machine and restart.\n"
+                         "ANTHROPIC_API_KEY on the backend machine and restart.\n"
                          "• Workspace usage cap or 400 overage — raise the cap in "
                          "console.anthropic.com → Workspaces, wait for the "
                          "monthly reset, OR paste a key from a different "
@@ -24974,7 +25082,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Account → API Config" instead of a mid-phase vision crash.
         if not resolve_api_key():
             _env_ok = False
-            _env_errors.append("Anthropic API key missing — add it in Account → API Config (preferred), or set ANTHROPIC_API_KEY (or CUA_API_KEY) on the BE machine. Vision/CUA tiers can't run without it.")
+            _env_errors.append("Anthropic API key missing — add it in Account → API Config (preferred), or set ANTHROPIC_API_KEY on the BE machine. Vision/CUA tiers can't run without it.")
         if not _env_ok:
             emit_event("login_required",
                        phase=0,
@@ -29281,12 +29389,16 @@ async def _pair_prompt_api_keys(uid: str):
             # in-flight session (User-scope env / .env file are only seen
             # by *new* processes — the current pair session needs the
             # os.environ mirror to use the key in Stage 4 / Stage 5).
+            #
+            # Single canonical name only — `CUA_API_KEY` was retired
+            # 2026-05-23 in favor of the Anthropic-SDK standard
+            # `ANTHROPIC_API_KEY`. Existing devices with a CUA_API_KEY
+            # set are migrated to ANTHROPIC_API_KEY by
+            # _migrate_legacy_api_keys() at startup.
             ok_anth = _save_api_key_local("ANTHROPIC_API_KEY", key)
-            ok_cua = _save_api_key_local("CUA_API_KEY", key)
             os.environ["ANTHROPIC_API_KEY"] = key
-            os.environ["CUA_API_KEY"] = key
             _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
-            if ok_anth and ok_cua:
+            if ok_anth:
                 print(f"  {_c(_OK, '✓')}  Saved to this machine {_c(_DIM, '— survives reboots via the supervisor.')}")
             else:
                 print(f"  {_c(_WARN, '⚠')}  Could not persist — applied to this session only.")
@@ -29307,14 +29419,16 @@ async def _pair_prompt_api_keys(uid: str):
             verifier=_verify_gemini_key,
         )
         if key:
+            # Single canonical name only — `GOOGLE_API_KEY` was retired
+            # 2026-05-23 in favor of the Gemini-API-docs standard
+            # `GEMINI_API_KEY`. Existing devices with GOOGLE_API_KEY set
+            # are migrated by _migrate_legacy_api_keys() at startup.
             ok_gem = _save_api_key_local("GEMINI_API_KEY", key)
-            ok_goog = _save_api_key_local("GOOGLE_API_KEY", key)
             os.environ["GEMINI_API_KEY"] = key
-            os.environ["GOOGLE_API_KEY"] = key
             # resolve_gemini_api_key() has no cache — nothing to bust. If a
             # Gemini cache is ever added (mirroring _RESOLVED_KEY_CACHE), add
             # the equivalent reset here so this site doesn't silently break.
-            if ok_gem and ok_goog:
+            if ok_gem:
                 print(f"  {_c(_OK, '✓')}  Saved to this machine {_c(_DIM, '— survives reboots via the supervisor.')}")
             else:
                 print(f"  {_c(_WARN, '⚠')}  Could not persist — applied to this session only.")
@@ -30009,7 +30123,7 @@ async def _continue_pair_stages_2_to_5(
         except Exception as e:
             log(f"Setup Stage 4: Could not init CUA client ({e}) — Playwright-only verification.", "WARN")
     else:
-        log("Setup Stage 4: No CUA_API_KEY — Playwright-only verification (less rigorous). Re-run --pair and paste a key at Stage 3 to enable CUA.", "WARN")
+        log("Setup Stage 4: No ANTHROPIC_API_KEY — Playwright-only verification (less rigorous). Re-run --pair and paste a key at Stage 3 to enable CUA.", "WARN")
 
     services = [
         ("ChatGPT",        "https://chatgpt.com",           "chatgpt"),
@@ -32681,9 +32795,10 @@ def run_unpair(deep: bool = False):
     With `deep=True` (CLI: `--unpair --deep`), ALSO wipes:
       • All ~/.super-research/browser-profile*/ dirs (fresh browsers
         on next --pair) + workerCount reset to 1.
-      • Pair-time API keys (ANTHROPIC_API_KEY / CUA_API_KEY /
-        GEMINI_API_KEY / GOOGLE_API_KEY) from Windows User-scope env
-        (HKCU) or `.dg-supervisor.env` on POSIX, plus the current
+      • Pair-time API keys (ANTHROPIC_API_KEY and GEMINI_API_KEY,
+        plus the retired legacy aliases CUA_API_KEY and GOOGLE_API_KEY
+        in case any survived the startup migration) from Windows
+        User-scope env (HKCU) or `.dg-supervisor.env` on POSIX, plus the current
         process's os.environ + _RESOLVED_KEY_CACHE — so the next
         --pair Stage 3 actually re-prompts and re-verifies instead
         of short-circuiting on a leftover key.
@@ -33507,7 +33622,7 @@ def main():
         help="With --unpair: also wipe ALL Playwright browser profiles under ~/.super-research/browser-profile*/ "
              "(clears ChatGPT/Gemini/Claude/NotebookLM logins across profile-1 and any profile-N set up via pair "
              "Stage 4 multi-profile loop). Also resets workerCount to 1 and wipes pair-time API keys "
-             "(ANTHROPIC_API_KEY/CUA_API_KEY/GEMINI_API_KEY/GOOGLE_API_KEY) from Windows User-scope env or "
+             "(ANTHROPIC_API_KEY/GEMINI_API_KEY, plus retired legacy aliases CUA_API_KEY/GOOGLE_API_KEY) from Windows User-scope env or "
              ".dg-supervisor.env so the next --pair Stage 3 re-prompts and re-verifies. Useful when re-pairing "
              "to a different account or when the F4 cookie check refuses pair due to stale Google auth. "
              "Default: preserve profiles + keys.")
@@ -33535,6 +33650,14 @@ def main():
         # where the user hasn't created it yet (the path-exists check here
         # sidesteps `_load_env_file`'s missing-file WARN).
         _load_env_file(_SUPERVISOR_ENV_FILE_DEFAULT_PATH)
+
+    # One-shot upgrade for pre-2026-05-23 machines that paired before the
+    # CUA_API_KEY → ANTHROPIC_API_KEY + GOOGLE_API_KEY → GEMINI_API_KEY
+    # rename. Runs after env-file load (so POSIX picks up env-file legacy
+    # values) and before subcommand dispatch (so resolvers see canonical
+    # names everywhere). Cached via `~/.super-research/env-migrated-v1`
+    # sentinel — subsequent process starts skip the work.
+    _migrate_legacy_api_keys()
 
     if args.commands:
         run_commands_help()

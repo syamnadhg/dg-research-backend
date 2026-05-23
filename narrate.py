@@ -160,9 +160,11 @@ async def narrate_panel(
     except Exception:
         api_key = ""
     if not api_key:
+        # Single canonical name (GOOGLE_API_KEY retired 2026-05-23 —
+        # the BE startup migration in research.py copies any legacy
+        # value to GEMINI_API_KEY before this module runs).
         api_key = (
             os.environ.get("GEMINI_API_KEY")
-            or os.environ.get("GOOGLE_API_KEY")
             or _read_user_scope_env_safe("GEMINI_API_KEY")
         )
     if not api_key:
