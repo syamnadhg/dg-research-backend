@@ -1903,7 +1903,73 @@ _QUEUE_STATE = {
     # short-circuits the gate so a watchdog-stopped run doesn't wedge the
     # queue for 70 min.
     "last_completed_uid": None, "last_completed_rid": None, "last_be_done_at": 0,
+    # 2026-05-22: listener-replay dual-claim gate.
+    # Firestore on_snapshot delivers ADDED changes synchronously in a
+    # callback thread; the actual asyncio.Queue.put happens via
+    # `loop.call_soon_threadsafe(...)`, which is asynchronous. Between
+    # the listener's claim+schedule of doc A and its next iteration
+    # processing doc B, the gate at research.py:4106 reads
+    # `job_queue.qsize()` — but A's put hasn't landed on the event loop
+    # yet, so qsize() is still 0. Gate passes, B is also claimed,
+    # dual-spawn for back-to-back submissions (the 2026-05-22 St Bernard
+    # repro). The counter increments AFTER `_try_claim_queue_doc`
+    # success + BEFORE call_soon_threadsafe, decrements either at the
+    # worker's running-flag flip OR on `_safe_enqueue == False` (rare
+    # race-loss in the call_soon callback). `threading.Lock` because
+    # increment runs on the Firestore listener thread and decrement
+    # runs on the asyncio main thread — true cross-thread access.
+    "_pending_listener_enqueues": 0, "_pending_enq_lock": None,
 }
+
+
+def _pending_enq_inc():
+    """Listener-thread increment. Idempotent on first-call when the
+    `_pending_enq_lock` hasn't been initialised yet (run_server
+    initialises it during startup at research.py:~26686). The pre-init
+    case only matters in tests; in prod the lock is always set before
+    the listener attaches."""
+    lock = _QUEUE_STATE.get("_pending_enq_lock")
+    if lock is None:
+        _QUEUE_STATE["_pending_listener_enqueues"] = \
+            _QUEUE_STATE.get("_pending_listener_enqueues", 0) + 1
+        return
+    with lock:
+        _QUEUE_STATE["_pending_listener_enqueues"] = \
+            _QUEUE_STATE.get("_pending_listener_enqueues", 0) + 1
+
+
+def _pending_enq_dec():
+    """Asyncio-main-thread decrement. Fires from one of three sites:
+    (a) the worker's running-flag flip (normal path, after dequeue +
+    gate wait); (b) the stop-during-gate-wait short-circuit; (c) the
+    `_enqueue_with_position_refresh` `_safe_enqueue == False` branch
+    inside the `call_soon_threadsafe` callback (cancel landed between
+    claim and put). All three run on the asyncio main thread; the
+    increment in `_pending_enq_inc` runs on the Firestore listener
+    thread, so the lock guards cross-thread access. `max(0, ...)`
+    defensively in case a stray decrement (e.g., a worker crash +
+    daemon-loop respawn between increment and decrement) would
+    otherwise drive the counter negative — false-busy gate would
+    block all submissions until next process bounce."""
+    lock = _QUEUE_STATE.get("_pending_enq_lock")
+    if lock is None:
+        _QUEUE_STATE["_pending_listener_enqueues"] = \
+            max(0, _QUEUE_STATE.get("_pending_listener_enqueues", 0) - 1)
+        return
+    with lock:
+        _QUEUE_STATE["_pending_listener_enqueues"] = \
+            max(0, _QUEUE_STATE.get("_pending_listener_enqueues", 0) - 1)
+
+
+def _pending_enq_read() -> int:
+    """Gate-time read. Returns int. Always lock-protected when the lock
+    is initialised so a torn read (mid-increment-by-listener) can't
+    leak through as a false-low value."""
+    lock = _QUEUE_STATE.get("_pending_enq_lock")
+    if lock is None:
+        return int(_QUEUE_STATE.get("_pending_listener_enqueues", 0) or 0)
+    with lock:
+        return int(_QUEUE_STATE.get("_pending_listener_enqueues", 0) or 0)
 
 # 2026-05-11: queue gate fallback — wait at most this many seconds for the
 # prior run's FE-P5 to flip status="completed" before force-dequeueing the
@@ -4103,7 +4169,9 @@ def start_firestore_start_listener(job_queue, loop):
                 # Single-worker installs skip both — no contender to
                 # race, and adding a Firestore RTT to every start event
                 # would be a free regression with no upside.
-                if _QUEUE_STATE.get("running") or job_queue.qsize() > 0:
+                if (_QUEUE_STATE.get("running")
+                        or job_queue.qsize() > 0
+                        or _pending_enq_read() > 0):
                     # Silent defer was the load-bearing observability gap
                     # for the multi-account FIFO investigation — a
                     # sharer-submitted doc that arrives while both
@@ -4112,7 +4180,22 @@ def start_firestore_start_listener(job_queue, loop):
                     # repros are traceable from BE log alone. Gated on
                     # multi-worker (this whole block is) so single-worker
                     # installs stay quiet.
-                    _defer_reason = "busy-running" if _QUEUE_STATE.get("running") else "queue-nonempty"
+                    #
+                    # The `_pending_enq_read() > 0` clause closes the
+                    # listener-replay race: when this listener fired
+                    # ADDED for the previous doc in the same callback
+                    # batch, the call_soon_threadsafe enqueue hasn't
+                    # landed on the event loop yet (qsize() still 0)
+                    # but the counter was bumped synchronously after
+                    # claim. Without this clause, both docs claim and
+                    # the second job goes stale (the 2026-05-22 St
+                    # Bernard symptom).
+                    if _QUEUE_STATE.get("running"):
+                        _defer_reason = "busy-running"
+                    elif job_queue.qsize() > 0:
+                        _defer_reason = "queue-nonempty"
+                    else:
+                        _defer_reason = "claim-in-flight"
                     log(
                         f"[start-listener] worker {WORKER_ID}: defer {research_id[:8]}… "
                         f"topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]} "
@@ -4208,6 +4291,15 @@ def start_firestore_start_listener(job_queue, loop):
                         )
                         continue
                     log(f"[start-listener] worker {WORKER_ID}: claimed {research_id[:8]}… topic={topic[:40]!r} submittedBy={(data.get('submittedBy') or '?')[:8]}", "INFO")
+                    # Synchronously reserve a "pending enqueue" slot
+                    # BEFORE call_soon_threadsafe schedules the actual
+                    # put. This closes the back-to-back-claim race
+                    # exploited by Firestore listener replay (see the
+                    # gate clause at research.py:~4106). Decrement
+                    # lands either at the worker's running-flag flip
+                    # OR via _enqueue_with_position_refresh on
+                    # _safe_enqueue failure (rare cancel-mid-flight).
+                    _pending_enq_inc()
 
             # Generate run_id
             run_id = f"{safe_name(topic)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -4321,6 +4413,13 @@ def start_firestore_start_listener(job_queue, loop):
                             _recompute()
                         except Exception as _re:
                             log(f"[start-listener] post-enqueue recompute failed: {_re}", "WARN")
+                else:
+                    # _safe_enqueue dropped this job (cancel landed
+                    # between claim and call_soon_threadsafe). The
+                    # listener-side _pending_enq_inc() must be undone
+                    # here — the worker's running-flip decrement won't
+                    # fire because no put landed on the queue.
+                    _pending_enq_dec()
             loop.call_soon_threadsafe(
                 lambda t=topic, e=email, c=config, r=run_id, u=uid, ri=research_id, bt=brief_text, us=user_sources, ul=user_links:
                     _enqueue_with_position_refresh(t, e, c, r, u, ri, bt, us, ul)
@@ -26684,6 +26783,7 @@ async def run_server(port=8000):
     # (line 1919) of hard_reset would write stale uid_X back to _QUEUE_STATE,
     # which the persist would then snapshot to disk — defeating the reset.
     _QUEUE_STATE["_hard_reset_lock"] = _threading.Lock()
+    _QUEUE_STATE["_pending_enq_lock"] = _threading.Lock()
 
     # ── pending_queue.json (Phoenix T3 resume) ─────────────────────────────
     # The in-memory _job_queue (asyncio.Queue) is lost when the BE process
@@ -27152,6 +27252,13 @@ async def run_server(port=8000):
                         _controls.reset()
                     except Exception:
                         pass
+                    # The listener bumped the pending counter when it
+                    # claimed this job; we're skipping the running-flag
+                    # flip below where the normal decrement lands. Drain
+                    # the counter here so a stop-during-gate-wait
+                    # doesn't leak a slot (would falsely defer all
+                    # subsequent submissions on this worker).
+                    _pending_enq_dec()
                     _job_queue.task_done()
                     # Keep the queue running but drop this job entirely.
                     continue
@@ -27159,6 +27266,16 @@ async def run_server(port=8000):
                 pass
             _QUEUE_STATE["running"] = True
             _QUEUE_STATE["current_job"] = job
+            # Listener-replay counter decrement (Bug B fix). Tied to
+            # the running-flag flip rather than the earlier
+            # `_job_queue.get()` because `_wait_for_prior_fe_completion`
+            # above can suspend the coroutine for the full
+            # BE_PHASES_TIMEOUT_SEC window; decrementing at get() would
+            # let the gate at research.py:~4106 look idle (counter=0,
+            # qsize=0, running still False) for minutes while this
+            # worker is occupied waiting on FE-P5. Setting running=True
+            # FIRST then dec'ing closes that window.
+            _pending_enq_dec()
             # Multi-worker claim sentinel. Written here (at dequeue, the
             # earliest point we own the job) so a sibling worker booting
             # up sees our claim before doing rehydration auto-resume.
