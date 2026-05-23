@@ -1961,6 +1961,82 @@ def _pending_enq_dec():
             max(0, _QUEUE_STATE.get("_pending_listener_enqueues", 0) - 1)
 
 
+def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
+                                stopped_by: str, summary: str) -> "tuple[int, int]":
+    """Bulk-sweep stale BE-self-set states for one device's runs in the
+    owner's research collection. Returns `(swept_count, fail_count)`.
+
+    Used by:
+      - HARD_RESET (FE Reset Backend / Online button)
+      - run_unpair (CLI `--unpair`)
+
+    Both contexts mean "the BE is leaving / restarting on this device,
+    leave Firestore in a clean state". User-driven terminal states
+    (`stopped`, `completed`, `terminated_by_user_discard`,
+    `stopped_by_watchdog`) are left alone — those are audit-trail.
+
+    Stuck set (extended 2026-05-22 from {ongoing, running, paused}):
+      - `queued`: pre-claim docs the BE will never get to process
+      - `paused_backend_restart`: BE-self-set on reboot when a run
+        was status=ongoing pre-exit (the 2026-05-22 St Bernard
+        symptom — HARD_RESET's prior sweep missed this status, so a
+        "Reset BE" couldn't actually unstick the chat)
+      - `paused_backend_restart_failed`: BE-self-set when the resume
+        attempt also crashed
+
+    Per-doc patch: status=stopped, cancelled=true, stoppedBy=<arg>,
+    summary=<arg>, plus DELETE_FIELD on queuePosition /
+    queuedBehindRunId / queuedBehindTitle so a freshly-paired BE
+    doesn't see leftover position markers.
+
+    Best-effort: any per-doc update failure is counted as `fail`;
+    sweeping continues. A query-level failure raises (caller logs)."""
+    if not (db and paired_uid and device_id):
+        return (0, 0)
+    swept_n = 0
+    swept_fail = 0
+    stuck_set = {
+        "ongoing", "running", "paused", "queued",
+        "paused_backend_restart", "paused_backend_restart_failed",
+    }
+    now_ms = int(time.time() * 1000)
+    try:
+        from google.cloud.firestore import DELETE_FIELD as _DF
+    except Exception:
+        _DF = None  # type: ignore
+    res_col = db.collection("users").document(paired_uid).collection("researches")
+    # No compound where: deviceId may be absent on legacy docs.
+    # Cheap to filter client-side — research collection is small
+    # (<200 docs per user typically).
+    for snap in res_col.where("deviceId", "==", device_id).stream():
+        sd = snap.to_dict() or {}
+        status = (sd.get("status") or "").lower()
+        if status not in stuck_set:
+            continue
+        patch: dict = {
+            "status": "stopped",
+            "cancelled": True,
+            "updatedAt": now_ms,
+            "stoppedAt": now_ms,
+            "stoppedBy": stopped_by,
+            "summary": summary,
+        }
+        if _DF is not None:
+            patch["queuePosition"] = _DF
+            patch["queuedBehindRunId"] = _DF
+            patch["queuedBehindTitle"] = _DF
+        try:
+            snap.reference.update(patch)
+            swept_n += 1
+        except Exception as _sw_err:
+            swept_fail += 1
+            log(
+                f"[sweep:{stopped_by}] update failed for {snap.id[:24]}…: {_sw_err}",
+                "DEBUG",
+            )
+    return (swept_n, swept_fail)
+
+
 def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, str]":
     """Compute this queue-doc's authoritative position in the device-
     wide FIFO ordering across all submitters (owner + sharers). The
@@ -3064,64 +3140,26 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # could contend on the same doc.
                 try:
                     if _firebase_db and WORKER_ID == 1:
-                        _swept_n = 0
-                        _swept_fail = 0
-                        _stuck_set = {"ongoing", "running", "paused"}
-                        _now_ms = int(time.time() * 1000)
+                        # Resolve paired uid + device id from local config.
                         try:
-                            from google.cloud.firestore import DELETE_FIELD as _SWEEP_DF
-                        except Exception:
-                            _SWEEP_DF = None  # type: ignore
-                        # We need the paired owner's uid + this device's
-                        # id. Both already live in research_config.json
-                        # (loaded into the BE context via the auth.v2_flow
-                        # init path). Recover from module-level helpers
-                        # rather than re-reading config — load_paired_uid
-                        # + load_device_id are the canonical readers.
-                        try:
-                            _sweep_uid = load_paired_uid()
+                            _sweep_uid = load_paired_uid() or ""
                         except Exception:
                             _sweep_uid = ""
                         try:
-                            _sweep_did = load_device_id()
+                            _sweep_did = load_device_id() or ""
                         except Exception:
                             _sweep_did = ""
                         if _sweep_uid and _sweep_did:
                             try:
-                                _res_col = _firebase_db.collection("users") \
-                                    .document(_sweep_uid).collection("researches")
-                                # No compound where because the deviceId
-                                # field may be missing on legacy docs;
-                                # filter in Python instead. Cheap — the
-                                # researches collection is small (<200
-                                # docs per user typically).
-                                for _snap in _res_col.where("deviceId", "==", _sweep_did).stream():
-                                    _sd = _snap.to_dict() or {}
-                                    _status = (_sd.get("status") or "").lower()
-                                    if _status not in _stuck_set:
-                                        continue
-                                    _swp: dict = {
-                                        "status": "stopped",
-                                        "cancelled": True,
-                                        "updatedAt": _now_ms,
-                                        "stoppedAt": _now_ms,
-                                        "stoppedBy": "hard_reset_sweep",
-                                        "summary": "Cancelled by Reset Backend",
-                                    }
-                                    if _SWEEP_DF is not None:
-                                        _swp["queuePosition"] = _SWEEP_DF
-                                        _swp["queuedBehindRunId"] = _SWEEP_DF
-                                        _swp["queuedBehindTitle"] = _SWEEP_DF
-                                    try:
-                                        _snap.reference.update(_swp)
-                                        _swept_n += 1
-                                    except Exception as _sw_err:
-                                        _swept_fail += 1
-                                        log(f"[device-cmds] HARD_RESET: sweep update failed for {_snap.id[:24]}…: {_sw_err}", "DEBUG")
+                                _swept_n, _swept_fail = _sweep_stuck_research_docs(
+                                    _firebase_db, _sweep_uid, _sweep_did,
+                                    stopped_by="hard_reset_sweep",
+                                    summary="Cancelled by Reset Backend",
+                                )
                                 if _swept_n or _swept_fail:
                                     log(f"[device-cmds] HARD_RESET: Firestore sweep marked {_swept_n} stale run(s) as stopped ({_swept_fail} failed)")
                                 else:
-                                    log("[device-cmds] HARD_RESET: Firestore sweep — no stale ongoing/paused runs found")
+                                    log("[device-cmds] HARD_RESET: Firestore sweep — no stale ongoing/queued/paused/paused_backend_restart runs found")
                             except Exception as _q_err:
                                 log(f"[device-cmds] HARD_RESET: Firestore sweep query failed: {_q_err}", "WARN")
                         else:
@@ -32318,6 +32356,38 @@ def run_unpair(deep: bool = False):
     paired_uid = load_paired_uid()
     device_id = load_device_id()
     paired_email = ""  # cosmetic only — banner falls back to uid[:8]
+
+    # Bug C extension (2026-05-22): sweep stale research docs before
+    # the device doc gets deleted. Without this, runs that were
+    # ongoing/queued/paused_backend_restart on this device persist
+    # under the owner's tree with no device link (cloud function
+    # deletes the device doc but doesn't cascade-update research
+    # docs), leaving zombie chat tiles the owner can't Resume.
+    # Mirror of the HARD_RESET sweep — same helper, different
+    # stopped_by/summary labels for audit-trail differentiation.
+    #
+    # Cost: ~10-15s wall-clock for init_firebase() on Windows (the
+    # bypass-init optimization is intentionally reverted here for
+    # correctness — a clean-state guarantee outweighs the wall-clock
+    # for a once-per-device-lifetime operation).
+    if paired_uid and device_id:
+        try:
+            init_firebase()
+            global _firebase_db
+            if _firebase_db:
+                _swp_n, _swp_f = _sweep_stuck_research_docs(
+                    _firebase_db, paired_uid, device_id,
+                    stopped_by="unpair_sweep",
+                    summary="Cancelled by Unpair",
+                )
+                if _swp_n or _swp_f:
+                    log(f"[unpair] Firestore sweep marked {_swp_n} stale run(s) as stopped ({_swp_f} failed)", "INFO")
+                else:
+                    log("[unpair] Firestore sweep — no stale runs found", "DEBUG")
+            else:
+                log("[unpair] skipping Firestore sweep — init_firebase did not produce a client", "WARN")
+        except Exception as _sw_err:
+            log(f"[unpair] Firestore sweep failed (continuing): {_sw_err}", "WARN")
 
     # Best-effort server-side retire BEFORE we wipe the keystore. The
     # endpoint deletes the top-level devices/{deviceId} doc + revokes
