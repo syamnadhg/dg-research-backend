@@ -1961,6 +1961,84 @@ def _pending_enq_dec():
             max(0, _QUEUE_STATE.get("_pending_listener_enqueues", 0) - 1)
 
 
+def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, str]":
+    """Compute this queue-doc's authoritative position in the device-
+    wide FIFO ordering across all submitters (owner + sharers). The
+    FE-side `existingQueuedCount` only sees the current user's
+    cachedResearches (Firestore rules block cross-user research reads),
+    so the FE's optimistic position is wrong on multi-user devices —
+    sharer's submission renders as #1 when an owner's deferred run is
+    actually ahead of it (the 2026-05-22 Bull Dog / St Bernard repro).
+
+    Returns `(position, behind_rid, behind_title)`:
+      - position: 1-indexed slot in the global queue. 1 means "head"
+        (next to run when any worker becomes free).
+      - behind_rid / behind_title: research-id + topic of the doc
+        immediately ahead of mine in FIFO order. Empty strings when
+        I'm head (caller can fall back to `device.currentRunTitle`
+        for the user-facing "queued behind X" message).
+
+    Filter rules mirror the existing FIFO pre-query at research.py:4226:
+      - skip `processed: true` (already-claimed-and-finished)
+      - skip `assignedWorker: <not me>` (sibling has it)
+      - include `assignedWorker == self` (post-claim-pre-delete window
+        where my doc carries my own worker id)
+      - skip non-start actions (cancel/resume have their own paths)
+
+    Sort key: client `timestamp` ASC with doc-id tiebreaker for
+    legacy docs missing `timestamp`. Identical to the existing FIFO
+    pre-query — must match exactly so callers and pre-query agree on
+    who's head.
+
+    Best-effort: on Firestore error, returns (1, "", "") so callers
+    fall back to "head" semantics (safer than reporting a misleading
+    larger number)."""
+    try:
+        candidates = list(col_ref.limit(50).stream())
+    except Exception as _qe:
+        log(f"[queue-position] global-scan failed (best-effort): {_qe}", "DEBUG")
+        return (1, "", "")
+
+    def _fifo_key(snap):
+        d = snap.to_dict() or {}
+        ts = d.get("timestamp")
+        if isinstance(ts, (int, float)) and ts > 0:
+            return (0, ts, snap.id)
+        return (1, 0, snap.id)
+
+    sorted_cands = sorted(candidates, key=_fifo_key)
+    queue = []
+    for snap in sorted_cands:
+        d = snap.to_dict() or {}
+        is_me = snap.id == my_doc_id
+        if d.get("processed"):
+            continue
+        aw = d.get("assignedWorker")
+        if aw and not is_me:
+            continue
+        if (d.get("action") or "start") != "start":
+            continue
+        queue.append((snap.id, d, is_me))
+
+    my_idx = -1
+    for i, (_id, _d, is_me) in enumerate(queue):
+        if is_me:
+            my_idx = i
+            break
+    if my_idx < 0:
+        # Doc disappeared between caller's read and our scan
+        # (cancel/delete race). Safe fallback.
+        return (1, "", "")
+    position = my_idx + 1
+    behind_rid = ""
+    behind_title = ""
+    if my_idx > 0:
+        _, prev_data, _ = queue[my_idx - 1]
+        behind_rid = (prev_data.get("researchId") or "")
+        behind_title = (prev_data.get("topic") or "")[:60]
+    return (position, behind_rid, behind_title)
+
+
 def _pending_enq_read() -> int:
     """Gate-time read. Returns int. Always lock-protected when the lock
     is initialised so a torn read (mid-increment-by-listener) can't
@@ -4202,6 +4280,30 @@ def start_firestore_start_listener(job_queue, loop):
                         f"reason={_defer_reason}",
                         "INFO",
                     )
+                    # Bug A fix (2026-05-22): write authoritative
+                    # queuePosition to the research doc so the FE
+                    # displays the correct cross-account number. The
+                    # FE's optimistic `existingQueuedCount + 1` only
+                    # sees the current user's runs (per-user Firestore
+                    # rules); deferred submits from other accounts are
+                    # invisible to it. Without this write the wrong
+                    # number persists indefinitely (BE never updates it
+                    # for deferred docs in the original code).
+                    try:
+                        _pos, _b_rid, _b_title = _compute_global_queue_position(
+                            col_ref, doc.id)
+                        _update_research_doc(uid, research_id, {
+                            "status": "queued",
+                            "queuePosition": _pos,
+                            "queuedBehindRunId": _b_rid,
+                            "queuedBehindTitle": _b_title,
+                        })
+                    except Exception as _pwerr:
+                        log(
+                            f"[start-listener] worker {WORKER_ID}: position write failed for "
+                            f"{research_id[:8]}… (non-fatal): {_pwerr}",
+                            "DEBUG",
+                        )
                     continue
                 if _firebase_db is not None:
                     _claim_ref = doc.reference
@@ -4334,26 +4436,35 @@ def start_firestore_start_listener(job_queue, loop):
                 if int(time.time() * 1000) < _gate_deadline:
                     _gate_will_block = True
             if is_busy or _gate_will_block:
-                # Position in queue = current pending + 1 (this one)
-                position = job_queue.qsize() + 1
-                behind_rid = ""
-                behind_title = ""
-                current = _QUEUE_STATE.get("current_job")
-                if current:
-                    behind_rid = current.get("research_id") or ""
-                    behind_title = (current.get("topic") or "")[:60]
-                elif job_queue.qsize() > 0:
-                    try:
-                        pending_list = list(job_queue._queue)  # snapshot deque
-                        if pending_list:
-                            first = pending_list[0]
-                            behind_rid = first.get("research_id") or ""
-                            behind_title = (first.get("topic") or "")[:60]
-                    except Exception:
-                        pass
-                elif _gate_will_block:
-                    # Gate-blocked path: behind-target is the prior run whose
-                    # FE-P5 the gate is waiting on. Best-effort title read.
+                # Bug A fix (2026-05-22): position calc via device-wide
+                # FIFO scan instead of per-worker `job_queue.qsize()+1`.
+                # In multi-worker installs the local qsize misses
+                # sibling-worker busy jobs (and FE's optimistic number
+                # misses cross-user submits), so the original code
+                # under-reported position for sharer's runs and over-
+                # reported for owner's runs when the queue spanned
+                # accounts. Helper at research.py:_compute_global_queue_position
+                # uses the same FIFO predicate as the pre-claim sort
+                # (timestamp ASC, doc-id tiebreaker, action==start,
+                # !processed, !assignedWorker-by-other) so positions
+                # and head-decisions agree.
+                try:
+                    position, behind_rid, behind_title = \
+                        _compute_global_queue_position(col_ref, doc.id)
+                except Exception as _pcerr:
+                    log(
+                        f"[start-listener] worker {WORKER_ID}: global position calc failed "
+                        f"({_pcerr}); falling back to local qsize+1",
+                        "DEBUG",
+                    )
+                    position = job_queue.qsize() + 1
+                    behind_rid = ""
+                    behind_title = ""
+                # Gate-blocked path special-case: when no behind-doc
+                # found in the global queue (we're head), fill behind
+                # from the prior run whose FE-P5 the gate is waiting
+                # on. Best-effort title read.
+                if not behind_rid and _gate_will_block:
                     behind_rid = _gate_prid
                     try:
                         _prior_doc = _firebase_db.collection("users").document(_gate_puid) \
@@ -4363,6 +4474,15 @@ def start_firestore_start_listener(job_queue, loop):
                             behind_title = (_prior_data.get("title") or _prior_data.get("topic") or "")[:60]
                     except Exception:
                         pass
+                # Falling back to local current_job ONLY if global helper
+                # returned no behind AND we're not in gate-block — happens
+                # when I'm position 1 and worker has a job mid-completion
+                # not yet visible as currentRunId on device doc.
+                if not behind_rid:
+                    current = _QUEUE_STATE.get("current_job")
+                    if current:
+                        behind_rid = current.get("research_id") or ""
+                        behind_title = (current.get("topic") or "")[:60]
                 status_payload = {
                     "backendRunId": run_id,
                     "status": "queued",
