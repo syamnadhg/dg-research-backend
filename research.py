@@ -2215,6 +2215,126 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
     return (position, behind_rid, behind_title)
 
 
+def _recompute_deferred_queue_positions() -> None:
+    """Re-write `queuePosition` / `queuedBehindRunId` / `queuedBehindTitle`
+    on every research doc whose queue entry is still deferred in
+    Firestore (sitting in `devices/{id}/queue/` without `assignedWorker`).
+
+    Why this exists separately from `_recompute_queue_positions`:
+      - `_recompute_queue_positions` (run_server closure, ~line 27030)
+        reads only `_job_queue._queue` — the LOCAL asyncio deque of
+        jobs that have already been claimed (queue doc deleted, status
+        flipped to ongoing/queued). It cannot see Firestore-deferred
+        docs.
+      - When a worker claims a deferred doc, the docs behind it should
+        shift up by one immediately. Pre-fix, those positions stayed
+        stale on the research doc until the next event happened to re-
+        fire their defer path (next BE restart, etc.). The FE banner
+        kept showing the wrong number for minutes-to-hours.
+
+    Mechanism: single Firestore scan of `devices/{id}/queue/`, apply
+    the same FIFO sort + filter as `_compute_global_queue_position`
+    (so callers and pre-claim agree on ordering), then commit one
+    WriteBatch updating every remaining deferred doc. Chunks at 450
+    ops to stay under Firestore's 500-op batch ceiling.
+
+    Eventual-consistency window: between the scan and the batch commit,
+    a sibling worker may claim a doc and delete its queue entry. The
+    batch update on that now-orphan research doc still lands but is
+    benign (FE filters on status, which transitions to ongoing first).
+    Worst case: ~50ms of a momentarily wrong queuePosition before the
+    next event corrects it. Mitigation via TX was rejected as too
+    expensive given the 500-op batch cap.
+
+    SYNC implementation — wrap in `asyncio.to_thread` from asyncio call
+    sites so the Firestore scan + write doesn't block the event loop
+    (heartbeat, watchdog, listener callbacks all live there)."""
+    if not _firebase_db:
+        return
+    device_id = load_device_id()
+    if not device_id:
+        return
+    col = _firebase_db.collection("devices").document(device_id).collection("queue")
+    try:
+        candidates = list(col.limit(50).stream())
+    except Exception as e:
+        log(f"[deferred-recompute] scan failed (best-effort): {e}", "DEBUG")
+        return
+    if not candidates:
+        return
+
+    def _fifo_key(snap):
+        d = snap.to_dict() or {}
+        ms = _queue_doc_fifo_ms(d)
+        if ms is not None:
+            return (0, ms, snap.id)
+        return (1, 0, snap.id)
+
+    sorted_cands = sorted(candidates, key=_fifo_key)
+    queue: "list[tuple[str, dict]]" = []
+    for snap in sorted_cands:
+        d = snap.to_dict() or {}
+        if d.get("processed"):
+            continue
+        if d.get("assignedWorker"):
+            # Skip any-worker-assigned (including self). Self-claimed
+            # docs are in the local deque path's recompute scope; this
+            # helper handles only unclaimed deferred docs.
+            continue
+        if (d.get("action") or "start") != "start":
+            continue
+        queue.append((snap.id, d))
+
+    if not queue:
+        return
+
+    try:
+        from google.cloud.firestore import DELETE_FIELD
+    except Exception:
+        DELETE_FIELD = None  # pyright: ignore[reportConstantRedefinition]
+
+    patches: "list[tuple[str, str, dict]]" = []
+    for idx, (_sid, d) in enumerate(queue):
+        uid_v = (d.get("uid") or "").strip()
+        rid_v = (d.get("researchId") or "").strip()
+        if not (uid_v and rid_v):
+            continue
+        new_pos = idx + 1
+        if idx > 0:
+            _, prev_d = queue[idx - 1]
+            patch = {
+                "queuePosition": new_pos,
+                "queuedBehindRunId": (prev_d.get("researchId") or ""),
+                "queuedBehindTitle": (prev_d.get("topic") or "")[:60],
+            }
+        else:
+            # Head of deferred queue — no doc ahead in queue. FE falls
+            # back to `device.currentRunTitle` for the "queued behind
+            # running X" message (see ChatMessage.QueuedBanner). Clear
+            # behind fields explicitly so a stale prior value can't
+            # render as "behind a cancelled/already-completed run."
+            patch = {"queuePosition": new_pos}
+            if DELETE_FIELD is not None:
+                patch["queuedBehindRunId"] = DELETE_FIELD
+                patch["queuedBehindTitle"] = DELETE_FIELD
+        patches.append((uid_v, rid_v, patch))
+
+    if not patches:
+        return
+
+    CHUNK = 450
+    for i in range(0, len(patches), CHUNK):
+        batch = _firebase_db.batch()
+        for uid_v, rid_v, patch in patches[i:i + CHUNK]:
+            ref = _firebase_db.collection("users").document(uid_v) \
+                .collection("researches").document(rid_v)
+            batch.update(ref, _be_payload(patch))
+        try:
+            batch.commit()
+        except Exception as e:
+            log(f"[deferred-recompute] batch commit failed [{i}:{i+CHUNK}]: {e}", "WARN")
+
+
 def _pending_enq_read() -> int:
     """Gate-time read. Returns int. Always lock-protected when the lock
     is initialised so a torn read (mid-increment-by-listener) can't
@@ -4223,6 +4343,25 @@ def start_firestore_start_listener(job_queue, loop):
                                 fn = _QUEUE_STATE.get("recompute_fn")
                                 if fn:
                                     fn()
+                            else:
+                                # Deferred cancel: cancelled doc was
+                                # somewhere in the global FIFO; everyone
+                                # behind it shifts up. Real-time renumber
+                                # (2026-05-22) so the remaining queued
+                                # tiles reflect the new order
+                                # immediately. Fire-and-forget via
+                                # to_thread — we're on the asyncio loop
+                                # via call_soon_threadsafe, and the scan
+                                # is bounded.
+                                fn_d = _QUEUE_STATE.get("recompute_deferred_fn")
+                                if fn_d is not None:
+                                    try:
+                                        asyncio.create_task(asyncio.to_thread(fn_d))
+                                    except Exception as _re:
+                                        log(
+                                            f"Cancel: deferred-recompute launch failed: {_re}",
+                                            "DEBUG",
+                                        )
                         # Log the outcome. The `cancelled: True` field on
                         # the research doc (Q6) is the FE signal that
                         # drives the red Cancelled dialog AND the
@@ -4750,6 +4889,22 @@ def start_firestore_start_listener(job_queue, loop):
                             _recompute()
                         except Exception as _re:
                             log(f"[start-listener] post-enqueue recompute failed: {_re}", "WARN")
+                    # Real-time deferred-doc renumber (2026-05-22): a
+                    # successful claim implicitly shifted everyone behind
+                    # me in the global FIFO up by one. The local recompute
+                    # above only sees local-deque jobs; the Firestore-
+                    # deferred set is renumbered here. Fire-and-forget
+                    # via to_thread so the listener-thread callback
+                    # doesn't block on the Firestore scan.
+                    _recompute_deferred = _QUEUE_STATE.get("recompute_deferred_fn")
+                    if _recompute_deferred is not None:
+                        try:
+                            asyncio.create_task(asyncio.to_thread(_recompute_deferred))
+                        except Exception as _re:
+                            log(
+                                f"[start-listener] deferred-recompute launch failed: {_re}",
+                                "WARN",
+                            )
                 else:
                     # _safe_enqueue dropped this job (cancel landed
                     # between claim and call_soon_threadsafe). The
@@ -27112,6 +27267,12 @@ async def run_server(port=8000):
     # Expose the recompute helper to the module-level Firestore listener so
     # the cancel-queued action can also trigger a position refresh.
     _QUEUE_STATE["recompute_fn"] = _recompute_queue_positions
+    # Real-time deferred-doc renumber (2026-05-22): module-level
+    # `_recompute_deferred_queue_positions` updates positions for the
+    # Firestore-deferred docs the local recompute can't see. Wired into
+    # the listener claim path, idle-rescan after claim, and the
+    # _do_cancel deferred-cancel branch. See helper docstring.
+    _QUEUE_STATE["recompute_deferred_fn"] = _recompute_deferred_queue_positions
     # 2026-05-15: initialise the hard-reset lock here, before the device-cmd
     # listener thread is spawned at research.py:24898. The lock makes the
     # gate-state clear+persist (in the device-cmd thread) atomic w.r.t. the
@@ -27532,11 +27693,22 @@ async def run_server(port=8000):
 
             # Flip research-doc status to ongoing (the listener path
             # writes this when the worker is idle on first dequeue;
-            # mirror that here for the rescanned doc).
+            # mirror that here for the rescanned doc). Clear the stale
+            # queue fields too — pre-fix, the orphan carried its
+            # deferred-state `queuePosition` / `queuedBehindRunId` /
+            # `queuedBehindTitle` into ongoing, briefly rendering a
+            # stale "queue position" badge on the tile during the
+            # listener round-trip before the FE filter on `status` took
+            # effect. Listener claim path does this cleanup via the
+            # status_payload branches; mirror here for parity.
             try:
+                from google.cloud.firestore import DELETE_FIELD as _DF_RESCAN
                 _update_research_doc(uid, research_id, {
                     "backendRunId": run_id,
                     "status": "ongoing",
+                    "queuePosition": _DF_RESCAN,
+                    "queuedBehindRunId": _DF_RESCAN,
+                    "queuedBehindTitle": _DF_RESCAN,
                 })
             except Exception as _ue:
                 log(f"[idle-rescan] research-doc update failed: {_ue}", "WARN")
@@ -27561,6 +27733,20 @@ async def run_server(port=8000):
                 "user_sources": d.get("userSources") or [],
                 "user_links": d.get("userLinks") or [],
             }, source="idle-rescan")
+            # Real-time deferred-doc renumber (2026-05-22): the just-
+            # claimed orphan was at some position N in the global FIFO
+            # (often head — idle-rescan picks the oldest unclaimed).
+            # Shift everyone behind it up by one. Fire-and-forget via
+            # to_thread; the scan is bounded to limit(50).
+            _recompute_deferred = _QUEUE_STATE.get("recompute_deferred_fn")
+            if _recompute_deferred is not None:
+                try:
+                    asyncio.create_task(asyncio.to_thread(_recompute_deferred))
+                except Exception as _re:
+                    log(
+                        f"[idle-rescan] deferred-recompute launch failed: {_re}",
+                        "WARN",
+                    )
             return  # one at a time — let the worker process this before next rescan
 
     async def _job_worker():
