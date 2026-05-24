@@ -16277,6 +16277,95 @@ async def _claude_send_clarification_reply(page, label):
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Gemini Deep Research — kickoff-stall detection
+# ─────────────────────────────────────────────────────────────────────
+#
+# Failure mode (observed in production 2026-05-22 — user screenshot):
+# After "Start research" is sent, Gemini sometimes ACKs with "OK,
+# starting now. As soon as your report is ready, I'll let you know"
+# but never actually kicks off — the canonical "Researching N sources"
+# card never appears and the run silently stalls. A single polite
+# follow-up nudge reliably re-triggers the kickoff (the user
+# previously unblocked these stalls by typing "Done?" which produced
+# the same "I'm on it" → card-appears sequence).
+#
+# Mirrors the Claude clarification block above (research.py:16179):
+# regex + lightweight DOM probe + one-shot nudge + state reset.
+
+# ACK patterns Gemini emits after "Start research" — confirm Gemini
+# DID respond. Anchored on phrases unique to the start-ack UX
+# ("starting now", "let you know when", "feel free to leave this
+# chat", "I'm on it"). Permissive — any ACK variant should match.
+_GEMINI_KICKOFF_ACK_RE = re.compile(
+    r"(starting\s+now|"
+    r"let\s+you\s+know\s+when|"
+    r"feel\s+free\s+to\s+leave\s+this\s+chat|"
+    r"i[''’]?m\s+on\s+it)",
+    re.IGNORECASE,
+)
+
+# Canonical "research is actually running" card text. Gemini Deep
+# Research renders "Researching N sources..." while the worker
+# scrapes — once visible, kickoff succeeded and the nudge must NOT
+# fire.
+_GEMINI_RESEARCH_CARD_RE = re.compile(
+    r"researching\s+\d+\s+sources?",  # singular form covers the N=1 edge
+    re.IGNORECASE,
+)
+
+# Completion message Gemini emits when the report is ready — same
+# pattern as the in-app "research complete" banner. Suppresses the
+# nudge if the report already arrived between ticks.
+_GEMINI_COMPLETION_RE = re.compile(
+    r"(completed\s+your\s+research|"
+    r"feel\s+free\s+to\s+ask\s+me\s+follow[\s-]?up)",
+    re.IGNORECASE,
+)
+
+
+async def _gemini_kickoff_pending(page):
+    """Lightweight DOM probe: did Gemini ACK without actually starting?
+
+    Returns (pending: bool, reason: str). pending=True iff:
+      - ACK pattern matches somewhere in page innerText (Gemini DID respond)
+      - "Researching N sources" card is NOT visible (research has NOT started)
+      - Completion pattern is NOT visible (research is not already done)
+
+    Safe to call every round-robin tick — reads first 8000 chars of
+    body innerText only.
+    """
+    try:
+        body = await page.evaluate("""() => (document.body.innerText || "").slice(0, 8000)""")
+    except Exception:
+        return False, "evaluate-failed"
+    if not body:
+        return False, "empty-body"
+    if _GEMINI_COMPLETION_RE.search(body):
+        return False, "completion-present"
+    if _GEMINI_RESEARCH_CARD_RE.search(body):
+        return False, "card-present"
+    if not _GEMINI_KICKOFF_ACK_RE.search(body):
+        return False, "no-ack-yet"
+    return True, "ack-no-card"
+
+
+async def _gemini_send_kickoff_nudge(page, label):
+    """Send a single polite nudge to re-trigger Gemini's research kickoff.
+
+    Reuses paste_followup so the nudge picks up _PASTE_SELECTORS["gemini"]
+    composer selectors + the unified Send-button fallback chain — same
+    machinery as the existing user-poke follow-up at research.py:~17498.
+    Returns True on send, False if the composer was unreachable."""
+    nudge = "Please proceed with the deep research now."
+    ok = await paste_followup(page, nudge, "gemini", label=f"{label}-kickoff-nudge")
+    if ok:
+        log(f"[{label}] Sent Gemini kickoff nudge: {nudge!r}", "INFO")
+    else:
+        log(f"[{label}] Gemini kickoff nudge failed to send", "WARN")
+    return ok
+
+
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -16336,6 +16425,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "claude_artifact_cua_attempts": 0,
             "observer_text_len": 0,              # MutationObserver sets this (see B2)
             "claude_clarification_replied": False,  # one-shot flag for clarification-defer reply
+            "gemini_kickoff_nudged": False,         # one-shot flag for Gemini kickoff-stall nudge
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -16869,6 +16959,51 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                     continue
                 except Exception as _cer:
                     log(f"[{name}] Clarification-check failed (non-fatal): {_cer}", "DEBUG")
+
+            # ── Gemini kickoff-stall auto-nudge ──
+            # User-observed (2026-05-22 screenshot): Gemini ACKs "OK,
+            # starting now" but the "Researching N sources" card never
+            # appears — silently stalls until the user pokes with a
+            # follow-up like "Done?". A single polite nudge ("Please
+            # proceed with the deep research now.") reliably restarts
+            # the kickoff. One-shot per agent — if a second stall
+            # happens, the 20-min general watchdog at research.py:~17441
+            # takes over.
+            #
+            # Time window: 45s ≤ elapsed ≤ 180s. Real kickoffs land
+            # within 10-15s; 45s gives healthy margin without delaying
+            # recovery past 3 min (after which the general stuck
+            # detector fires).
+            if (
+                name == "Gemini"
+                and not p.get("gemini_kickoff_nudged")
+                and 45 <= elapsed <= 180
+            ):
+                try:
+                    pending_kickoff, reason = await _gemini_kickoff_pending(p["page"])
+                    if pending_kickoff:
+                        log(f"[{name}] Kickoff-stall detected ({reason}) — "
+                            f"sending nudge.", "INFO")
+                        emit_event(
+                            "agent_progress", phase=2, agent="gemini",
+                            status="generating",
+                            progress="Gemini stalled after ACK — auto-nudging to start research.",
+                        )
+                        sent = await _gemini_send_kickoff_nudge(p["page"], name)
+                        p["gemini_kickoff_nudged"] = True
+                        if sent:
+                            # Reset baselines so the no-growth + wall-
+                            # clock watchdogs don't fire from the pre-
+                            # nudge stall window (same rationale as the
+                            # Claude reset above at research.py:~16863).
+                            _now = time.time()
+                            p["start_time"] = _now
+                            p["last_heartbeat"] = _now
+                            p["last_growth_time"] = _now
+                            p["stuck_warned_at"] = 0
+                            continue
+                except Exception as _gke:
+                    log(f"[{name}] Gemini-kickoff-check failed (non-fatal): {_gke}", "DEBUG")
 
             # 2026-05-04: per-agent wall-clock timeout REMOVED entirely.
             # Phase-level soft warn from _await_phase_with_active_deadline
