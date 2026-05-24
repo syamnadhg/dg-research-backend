@@ -8098,6 +8098,61 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
                           cua_attempted=cua_attempted)
 
 
+async def _gemini_share_closer(new_page):
+    """Per-page event handler for Gemini share-preview tab closure.
+
+    Closes any page that settles to a `gemini.google.com/share/<id>`
+    or `g.co/gemini/<id>` URL. Used inside `extract_share_link_gemini`
+    to catch preview tabs that Gemini's Share & Export dialog
+    spontaneously spawns when the public-link toggle flips. Mirrors
+    `_guard_popup`'s URL-settle pattern (8 × 0.5s polls) so timing
+    matches the global guard's allowlist evaluation.
+
+    Path-boundary match (`/share/` and `/gemini/` with the trailing
+    slash) — prevents false-positives on neighbouring paths like
+    `gemini.google.com/sharer` or `gemini.google.com/shared` or a
+    foreign URL that contains "g.co/gemini" as a substring (e.g. a
+    Reddit/Twitter URL embedding the share-link as a query parameter).
+
+    Top-level (not closure-captured) so unit tests can call it directly
+    with a mock page object.
+    """
+    try:
+        url = ""
+        for _ in range(8):  # 8 × 0.5s = 4s window (matches _guard_popup)
+            try:
+                url = new_page.url or ""
+            except Exception:
+                return
+            if url and url != "about:blank":
+                break
+            await asyncio.sleep(0.5)
+        if not url or url == "about:blank":
+            return
+        # Path-boundary check — `/share/` and `/gemini/` with the
+        # trailing slash ensures we match share-PREVIEW URLs only,
+        # not legitimate gemini.google.com/app/* or g.co/gemini-app
+        # variants that happen to contain "gemini" as a substring.
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            path = parsed.path or ""
+        except Exception:
+            return
+        is_share_preview = (
+            (host == "gemini.google.com" and path.startswith("/share/")) or
+            (host == "g.co" and path.startswith("/gemini/"))
+        )
+        if is_share_preview:
+            try:
+                await new_page.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Research", verbose=False):
     """Extract shareable Gemini conversation link with public visibility.
 
@@ -8116,6 +8171,13 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
     - Structured error attribution: errors are tagged in `LinkResult.error`
       with a short stage tag (`open_dialog` / `public_toggle` / `link_lookup`
       / `cua_fallback`) so operators can see *where* the flow failed.
+
+    Hardened 2026-05-24:
+    - Wrapped the body in `_gemini_share_preview_guard` so preview tabs
+      Gemini spontaneously spawns when the public-link toggle flips
+      are closed in ~ms (instead of accumulating until the finally-block
+      snapshot diff fires). Eliminates the visible 5-tab pileup users
+      observed during long (50-90s) extraction windows.
     """
     page = browser.page
     url = await browser.current_url() or ""
@@ -8131,6 +8193,24 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
         _pages_snapshot = set(getattr(browser.context, "pages", []))
     except Exception:
         _pages_snapshot = set()
+    # 2026-05-24: real-time share-preview tab closer. Catches share-URL
+    # tabs the instant they spawn (Gemini's dialog spontaneously opens
+    # `gemini.google.com/share/...` preview tabs when the public-link
+    # toggle flips). Wrap `_gemini_share_closer` in a unique local
+    # closure per call so `remove_listener` targets EXACTLY this call's
+    # listener — defensive against any future caller running multiple
+    # share-extracts in parallel against the same BrowserContext (which
+    # would otherwise accumulate duplicate handlers as pyee's
+    # EventEmitter allows duplicate registrations and remove_listener
+    # only removes one match at a time).
+    async def _share_preview_closer(new_page):
+        await _gemini_share_closer(new_page)
+    _share_preview_listener_attached = False
+    try:
+        browser.context.on("page", _share_preview_closer)
+        _share_preview_listener_attached = True
+    except Exception:
+        pass
     try:
         # 2026-04-26: close-first preamble — close any open dialog/drawer
         # that could intercept the Share & Export click. Same pattern as
@@ -8376,6 +8456,18 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
                           error=f"{last_stage}: {type(e).__name__}: {e}",
                           cua_attempted=cua_attempted)
     finally:
+        # 2026-05-24: deregister the real-time share-preview listener
+        # FIRST so subsequent (unrelated) page events post-extraction
+        # don't accidentally close legitimate Gemini share tabs that
+        # might be opened by a later flow. Log removal failures so an
+        # operator can detect listener leaks accumulating across runs
+        # (pyee's EventEmitter doesn't auto-prune on context teardown).
+        if _share_preview_listener_attached:
+            try:
+                browser.context.remove_listener("page", _share_preview_closer)
+            except Exception as _rle:
+                log(f"[{label}] Failed to deregister share-preview listener "
+                    f"(may accumulate on BrowserContext): {_rle}", "WARN")
         # 2026-04-29 dup-tabs hardening: close any pages that opened during
         # this function. Gemini's share dialog occasionally spawns a
         # `gemini.google.com/share/...` preview tab when the public-link
@@ -8383,6 +8475,10 @@ async def extract_share_link_gemini(browser, cua_client, label="Gemini Deep Rese
         # — we don't want to close legitimate agent tabs globally). The
         # function-scoped diff catches duplicate share-page tabs without
         # weakening the global allowlist.
+        # Post-2026-05-24: the real-time listener above catches most
+        # tabs at spawn — this snapshot diff stays as belt-and-suspenders
+        # for any that escape (e.g., if listener removal raced with a
+        # late spawn event).
         try:
             _pages_after = set(getattr(browser.context, "pages", []))
             extras = (_pages_after - _pages_snapshot) - {page}
