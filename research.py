@@ -21697,12 +21697,17 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         log(f"[{label}] CUA validation failed — proceeding anyway but agent may misbehave", "WARN")
 
     # ── Brief delivery ──
-    # Gemini Deep Research ignores file attachments — it only processes text
-    # input to generate its research plan. Always paste the brief for Gemini.
-    # ChatGPT and Claude: prefer file-attachment (they auto-convert large pastes
-    # to attachments and the paste verification then fails).
-    is_gemini = platform.lower() == "gemini"
-    use_file_attach = brief_path and Path(brief_path).exists() and not is_gemini
+    # All three platforms (ChatGPT, Claude, Gemini) accept .md file attachments
+    # in Deep Research mode and use them as the research plan input. Prefer
+    # file-attach when we have a brief_path on disk — it sidesteps composer-
+    # truncation edge cases (Gemini's Lit/Angular composer truncates long
+    # pastes at ~5600 chars; ChatGPT auto-converts large pastes to attachments
+    # and the paste verification then fails) and gives all three agents the
+    # same starting context + inline prompt.
+    # Fall back to inline paste only when brief_path is missing/unavailable —
+    # paste path still serves as the failure-mode fallback inside the attach
+    # branch below if file-attach itself fails.
+    use_file_attach = brief_path and Path(brief_path).exists()
 
     if use_file_attach:
         log(f"[{label}] Attaching brief file: {Path(brief_path).name}")
@@ -21729,11 +21734,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                            "Both file-attach and DOM+CUA paste failed. Retry to relaunch the agent.")
                 return page, False
     else:
-        # Gemini always uses paste; legacy path also uses paste
-        if is_gemini:
-            log(f"[{label}] Pasting brief directly (Gemini Deep Research requires text input, not file)")
-        else:
-            log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
+        # Legacy path — brief_path not on disk; fall back to inline paste of
+        # the brief string. Hit when the brief was generated in-memory only.
+        log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
         # DOM-once → CUA contract: single DOM attempt, then a CUA-assisted
         # fallback (CUA focuses composer, Python pastes via clipboard).
         # Removed the old page-reload + 2nd-DOM-retry path — it amplified
@@ -22137,9 +22140,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # pipeline_error with Retry/Skip actions. Mark Gemini terminally
             # failed so the [2D] wait loop is skipped and the round-robin
             # poller treats it as done. No more lying about "generating plan".
-            log("[2C] Gemini setup/paste failed — marking agent failed, skipping [2D] plan wait", "ERROR")
+            log("[2C] Gemini setup/brief delivery failed — marking agent failed, skipping [2D] plan wait", "ERROR")
             emit_event("agent_progress", phase=2, agent="gemini", status="failed",
-                       progress="Gemini setup/paste failed — agent did not start.")
+                       progress="Gemini setup/brief delivery failed — agent did not start.")
             try:
                 _controls.skipped_agents.add("gemini")
             except Exception:
