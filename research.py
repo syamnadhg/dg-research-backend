@@ -19651,6 +19651,18 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         await asyncio.sleep(0.5)
         await page.keyboard.press("Control+c")
         await asyncio.sleep(0.5)
+        # 2026-05-24: clear the highlight after the copy event fires.
+        # Without this, the full-page selection persists visually for
+        # the user (observed on Claude where a Publish modal opens
+        # shortly after — the highlighted text is visible behind the
+        # modal). The hijack JS hook has already captured clipboardData
+        # by this point, so removing the selection is safe.
+        try:
+            await page.evaluate(
+                "() => { try { window.getSelection()?.removeAllRanges(); } catch (_) {} }"
+            )
+        except Exception:
+            pass
 
     log(f"[{label}] Falling back to select-all + clipboard hijack (Tier 3)", "WARN")
     md = await _run_with_clipboard_hijack(
@@ -19957,6 +19969,20 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                         verbose=verbose, target_page=page),
                     timeout=180.0)
                 await asyncio.sleep(1)
+                # 2026-05-24: clear the selection the CUA's Ctrl+A
+                # left behind. Without this, the artifact text stays
+                # visibly highlighted while the subsequent
+                # publish_open_claude_artifact flow opens the Publish
+                # modal — the user sees the blue highlight bleeding
+                # behind the modal. Hijack JS hook has already
+                # captured clipboardData (sleep 1 above), so removing
+                # the selection is safe.
+                try:
+                    await page.evaluate(
+                        "() => { try { window.getSelection()?.removeAllRanges(); } catch (_) {} }"
+                    )
+                except Exception:
+                    pass
 
             log(f"[{label}] CUA: Tier 3 navigate + copy with clipboard hijack")
             try:
