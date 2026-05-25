@@ -4230,8 +4230,64 @@ def start_firestore_start_listener(job_queue, loop):
                 except Exception:
                     pass
                 continue
-            # UNCLAIMED-RECENT or missing-timestamp — fall through to
-            # action handling + normal claim path.
+            # 2026-05-25: Missing-timestamp legacy queue docs (typically
+            # pre-2026-05-15 schema) used to fall straight through to the
+            # claim path. That re-ran the entire pipeline today for a
+            # queue doc from 10 days ago (Venom OS E2E 2026-05-25 —
+            # predates the P4/P5 FE cutover so feP5State was never
+            # written, status stayed "ongoing", queue doc never deleted).
+            # Fall back to the linked research doc's updatedAt/createdAt
+            # as a secondary staleness signal. Scoped to action="start"
+            # so cancel/skip-action docs (rare but valid path for
+            # orchestrator cleanups) are unaffected. Adds one Firestore
+            # read per legacy doc, zero overhead for modern (timestamped)
+            # docs. Sync .get() mirrors the existing existence check at
+            # research.py:4647 — same listener thread, same pattern.
+            elif _age_ms == 0 and _aw is None and data.get("action", "start") == "start":
+                try:
+                    _rid_legacy = data.get("researchId") or ""
+                    _uid_legacy = data.get("uid") or ""
+                    if _rid_legacy and _uid_legacy:
+                        _rd_snap = _firebase_db.collection("users") \
+                            .document(_uid_legacy) \
+                            .collection("researches") \
+                            .document(_rid_legacy).get()
+                        if _rd_snap.exists:
+                            _rd_data = _rd_snap.to_dict() or {}
+
+                            def _to_ms(v):
+                                if v is None:
+                                    return 0
+                                if hasattr(v, "timestamp"):
+                                    return int(v.timestamp() * 1000)
+                                if isinstance(v, (int, float)):
+                                    return int(v)
+                                return 0
+                            _rd_ms = max(_to_ms(_rd_data.get("updatedAt")),
+                                         _to_ms(_rd_data.get("createdAt")))
+                            _rd_age_ms = int(time.time() * 1000) - _rd_ms
+                            if _rd_ms > 0 and _rd_age_ms > ABANDONED_MAX_MS:
+                                log(
+                                    f"Queue: stale-skip ABANDONED-BY-RESEARCH "
+                                    f"{_rid_legacy[:24]}… "
+                                    f"topic={(data.get('topic') or '')[:40]!r} "
+                                    f"research_age={_rd_age_ms // 1000}s — deleting",
+                                    "INFO",
+                                )
+                                try:
+                                    doc.reference.delete()
+                                except Exception:
+                                    pass
+                                continue
+                except Exception as _stale_check_err:
+                    log(
+                        f"Queue: research-doc staleness fallback failed "
+                        f"(allowing through): {_stale_check_err}",
+                        "DEBUG",
+                    )
+            # UNCLAIMED-RECENT or missing-timestamp (research-doc fresh
+            # or unreadable) — fall through to action handling + normal
+            # claim path.
             action = data.get("action", "start")
             # Handle cancel-queued: remove the target research from the job
             # queue before it reaches the worker and mark it stopped. The
