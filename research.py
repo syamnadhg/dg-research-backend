@@ -14995,7 +14995,16 @@ def _make_stream_callback(page_id: int):
         try:
             st = _agent_streams.setdefault(page_id, {})
             st["observer_text_len"] = int(data.get("len", 0) or 0)
-            st["observer_preview"] = str(data.get("text", "") or "")[:500]
+            # 2026-05-25: strip ChatGPT's PUA-delimited citation runs from
+            # the streamed preview. Without this, ChatGPT DR's mid-flight
+            # observer text gets emitted into `partialTextPreview` via
+            # agent_progress events, and the FE wraps the unbreakable
+            # citation blobs as a wall of low-information noise — exact
+            # symptom in the user's 2026-05-25 P2 ChatGPT MD screenshot.
+            # No-op for Gemini/Claude (no PUA sentinels in their DOM).
+            st["observer_preview"] = _strip_chatgpt_citation_tokens(
+                str(data.get("text", "") or "")
+            )[:500]
             st["last_update"] = time.time()
         except Exception:
             pass
@@ -15102,7 +15111,15 @@ async def inject_chatgpt_dr_iframe_observer(page) -> bool:
     def _iframe_cb(data):
         try:
             iframe_len = int(data.get("len", 0) or 0)
-            iframe_preview = str(data.get("text", "") or "")[:500]
+            # 2026-05-25: strip ChatGPT's PUA-delimited citation runs from
+            # iframe-side observer preview. This callback fires for the DR
+            # sandbox iframe specifically — the same noise source as the
+            # host-page callback above (citation tokens render to the DR
+            # canvas DOM). Mirror the host-side strip so both observer
+            # paths emit clean text.
+            iframe_preview = _strip_chatgpt_citation_tokens(
+                str(data.get("text", "") or "")
+            )[:500]
             st = _agent_streams.setdefault(page_id, {})
             # Take max — host and iframe observers may both fire
             if iframe_len > int(st.get("observer_text_len", 0) or 0):
@@ -19162,6 +19179,39 @@ def html_to_markdown(html):
         return ""
 
 
+# ChatGPT Deep Research wraps inline citation markers in Private Use Area
+# sentinels:  starts a run,  separates tokens,  ends it.
+# Two known prefix variants: "cite" (web/view/search citations) and
+# "filecite" (file citations from user-attached docs). The PUA glyphs
+# render as nothing in most fonts, so the user sees a long unbreakable
+# token blob ("citeturn18view0turn18view1...") that the FE wraps as a
+# wall of low-information noise. Stripping is safe by construction —
+# PUA codepoints cannot appear in any legitimate prose (browser would
+# render them as boxes), and the regex only matches between the two
+# specific sentinels, so it cannot collide with the literal word "cite"
+# elsewhere in text. Verified 2026-05-25 against a 39KB chatgpt.md
+# from prod: 67 runs matched, 3,657 chars removed, zero PUA residue,
+# zero false-matches on legitimate prose. Gemini/Claude extractors
+# don't emit these sentinels (verified on same-day gemini.md / claude.md).
+#
+# Converting to numbered footnotes [1][2][3] was considered + rejected:
+# the turn{N}{view|search|file}{M} indices reference ChatGPT's internal
+# source list, NOT the source URLs we capture via observer-side
+# extraction (research.py:~18261). Without a mapping we'd produce
+# footnotes that point nowhere — strip is the correct choice.
+_CHATGPT_CITE_TOKEN_RE = re.compile('[^]*')
+
+
+def _strip_chatgpt_citation_tokens(md: str) -> str:
+    """Strip ChatGPT's PUA-delimited citation token runs from extracted MD.
+    Idempotent. No-op on input that doesn't contain the sentinels (e.g.,
+    Gemini/Claude extractions), so safe to call from shared helpers if
+    needed later."""
+    if not md:
+        return md
+    return _CHATGPT_CITE_TOKEN_RE.sub('', md)
+
+
 async def _extract_html_to_md(page, selectors, label):
     """Extract response HTML from page, convert to clean markdown.
 
@@ -19986,6 +20036,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
                 except Exception:
                     pass
             else:
+                md = _strip_chatgpt_citation_tokens(md)
                 log(f"[{label}] Extracted via T1 CUA download (Export to Markdown): {len(md)} chars")
                 return md
 
@@ -20029,6 +20080,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         elif _looks_like_nav_sidebar(md):
             log(f"[{label}] T2 HTML→MD looks-like-nav-sidebar ({len(md)} chars) — falling to Tier 3", "WARN")
         else:
+            md = _strip_chatgpt_citation_tokens(md)
             log(f"[{label}] Extracted via T2 HTML→MD (canvas/artifact): {len(md)} chars")
             return md
 
@@ -20066,6 +20118,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
                 except Exception:
                     pass
             else:
+                md = _strip_chatgpt_citation_tokens(md)
                 log(f"[{label}] Extracted via T3 CUA + clipboard hijack: {len(md)} chars")
                 return md
 
