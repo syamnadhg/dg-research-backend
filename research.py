@@ -19415,8 +19415,10 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     "T1 = X, T2 = Y, T3 = Z" describes the META-pattern — DOM → CUA →
     clipboard-hijack — not a uniform per-agent mapping):
       - ChatGPT (this fn): CUA download → HTML→MD → CUA copy hijack
-      - Gemini (`extract_gemini_response`, research.py:16539): HTML→MD →
-        Share&Export hijack → Ctrl+A/C hijack
+      - Gemini (`extract_gemini_response`, research.py:19575): Share&Export
+        hijack → HTML→MD → Ctrl+A/C hijack (reordered 2026-05-24 — native
+        Share & Export menu is Gemini's authoritative export path; DOM
+        scrape is the deterministic fallback when CUA can't drive the menu)
       - Claude (`extract_claude_response`, research.py:16640): two-mode —
         3 tiers in Deep Research artifact-aware mode (T1 CUA-download →
         T2 publish + HTML→MD on claude.site → T3 CUA + clipboard hijack;
@@ -19574,8 +19576,9 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 
 async def extract_gemini_response(page, browser=None, cua_client=None, label="Gemini", verbose=False):
     """Dedicated Gemini extractor — 3 Wayland-safe tiers:
-      Tier 1: HTML→MD from Gemini's response containers (proven primary).
-      Tier 2: Share & Export → "Copy contents" via JS clipboard hijack.
+      Tier 1: Share & Export → "Copy contents" via JS clipboard hijack
+              (Gemini's native authoritative export path).
+      Tier 2: HTML→MD from Gemini's response containers (DOM-scrape fallback).
       Tier 3: Ctrl+A / Ctrl+C with JS clipboard hijack (no OS clipboard).
     Each tier emits an explicit log line so the path that succeeded (or
     silently returned empty) is visible in the run log.
@@ -19584,16 +19587,66 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
-    # 2026-05-13 ARCHITECTURE: collapsed from 5 tiers (1 + 2A/2B/2C + 3) to
-    # exactly 3 Wayland-safe tiers. Old Tier 2A (direct Copy blind hunt)
-    # and 2C (CDK overlay guess) never matched in any historical run; old
-    # Tier 3's OS clipboard read was Wayland-gated and useless on Linux.
-    # New Tier 3 uses a JS clipboard hijack around Ctrl+A/C, which works
-    # on every platform.
+    # 2026-05-24 ARCHITECTURE: tier reorder — Share & Export → Copy
+    # contents promoted from T2 to T1, HTML→MD demoted from T1 to T2.
+    # Today's E2E (Salaar) showed HTML→MD scraping only the chat-side
+    # ack (144 chars) instead of the artifact panel, then falling
+    # through to T3 select-all which captured 2476 chars of chat
+    # transcript — total miss of the actual research report.
+    #
+    # Rationale: Share & Export is Gemini's NATIVE export menu —
+    # whatever Gemini's UI considers "the report content" is what
+    # this path copies. HTML→MD depends on our selectors matching
+    # the current DOM shape (which the 2026-05+ side-panel rollout
+    # has been quietly changing). Putting Share & Export first means
+    # we get the authoritative content when CUA can drive the menu,
+    # and only fall back to DOM scrape when CUA isn't available or
+    # the menu doesn't yield content.
 
-    # ── Tier 1: HTML→MD from Gemini's response containers ──
-    # 2026-05-21: side-panel selectors added FIRST. The new Gemini UI
-    # renders the Deep Research report in a side-panel artifact
+    # ── Tier 1 (PRIMARY): CUA-driven Share & Export → "Copy contents" + hijack ──
+    # Gemini's "Copy contents" action lives inside a "Share & Export"
+    # dropdown in the response toolbar. CUA clicks Share & Export,
+    # then clicks "Copy contents"; the page's own handler calls
+    # clipboard.writeText with the canonical markdown which the JS
+    # hijack catches via the writeText monkey-patch (and the copy
+    # event listener). Wayland-safe — no OS clipboard read.
+    #
+    # min_chars=2000 (was 100 when this was T2 fallback). As the
+    # primary, we expect the full report — anything below 2000 chars
+    # is almost certainly an incomplete copy, fall through to T2.
+    if browser and cua_client:
+        async def _gemini_t1_trigger():
+            await browser.switch_to_page(page)
+            await asyncio.wait_for(
+                agent_loop(cua_client, browser, PROMPT_GEMINI_COPY_CONTENTS,
+                    "Click the Share & Export button in the response toolbar, "
+                    "then click Copy contents in the dropdown menu.",
+                    model=CUA_MODEL, max_iterations=8,
+                    verbose=verbose, target_page=page),
+                timeout=90.0)
+
+        log(f"[{label}] T1: CUA Share & Export → Copy contents")
+        try:
+            md = await _run_with_clipboard_hijack(
+                page, label, _gemini_t1_trigger,
+                timeout_ms=120000, min_chars=2000,
+            )
+        except Exception as _e:
+            log(f"[{label}] T1 clipboard hijack raised: {_e}", "WARN")
+            md = ""
+        if md and len(md) >= 2000:
+            log(f"[{label}] Extracted via T1 CUA Share & Export + hijack: {len(md)} chars")
+            return md
+        elif md:
+            log(f"[{label}] T1 returned {len(md)} chars (below 2000-char threshold — "
+                f"likely partial copy or chat ack) — falling to Tier 2", "WARN")
+
+    # ── Tier 2 (FALLBACK): HTML→MD from Gemini's response containers ──
+    # (was Tier 1 pre-2026-05-24; demoted to fallback when CUA Share &
+    # Export doesn't produce a full-length report)
+    #
+    # 2026-05-21: side-panel selectors come FIRST. The 2026-05+ Gemini
+    # UI renders the Deep Research report in a side-panel artifact
     # (Contents | Share & Export | Create toolbar) separate from the
     # chat history. Prior selector list targeted the chat side only —
     # would return the 200-char ack ("I've completed your research…")
@@ -19623,46 +19676,15 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # tolerates partial-render glitches while rejecting the ack shape.
     if md and len(md) > 2000:
         if _is_sources_not_document(md, platform="generic"):
-            log(f"[{label}] HTML→MD wrong-artifact — falling to Tier 2", "WARN")
+            log(f"[{label}] T2 HTML→MD wrong-artifact — falling to Tier 3", "WARN")
         elif _looks_like_nav_sidebar(md):
-            log(f"[{label}] HTML→MD looks-like-nav-sidebar — falling to Tier 2", "WARN")
+            log(f"[{label}] T2 HTML→MD looks-like-nav-sidebar — falling to Tier 3", "WARN")
         else:
-            log(f"[{label}] Extracted via HTML→MD: {len(md)} chars")
+            log(f"[{label}] Extracted via T2 HTML→MD: {len(md)} chars")
             return md
     elif md:
-        log(f"[{label}] HTML→MD returned {len(md)} chars (below 2000-char threshold — "
-            f"likely chat-side ack, not the report panel) — falling to Tier 2", "WARN")
-
-    # ── Tier 2: CUA-driven Share & Export → "Copy contents" + hijack ──
-    # Gemini's "Copy contents" action lives inside a "Share & Export"
-    # dropdown in the response toolbar (per user screenshot). CUA clicks
-    # Share & Export, then clicks "Copy contents"; the page's own
-    # handler calls clipboard.writeText with the canonical markdown
-    # which the JS hijack catches via the writeText monkey-patch (and
-    # the copy event listener). Wayland-safe — no OS clipboard read.
-    if browser and cua_client:
-        async def _gemini_t2_trigger():
-            await browser.switch_to_page(page)
-            await asyncio.wait_for(
-                agent_loop(cua_client, browser, PROMPT_GEMINI_COPY_CONTENTS,
-                    "Click the Share & Export button in the response toolbar, "
-                    "then click Copy contents in the dropdown menu.",
-                    model=CUA_MODEL, max_iterations=8,
-                    verbose=verbose, target_page=page),
-                timeout=90.0)
-
-        log(f"[{label}] T2: CUA Share & Export → Copy contents")
-        try:
-            md = await _run_with_clipboard_hijack(
-                page, label, _gemini_t2_trigger,
-                timeout_ms=120000, min_chars=100,
-            )
-        except Exception as _e:
-            log(f"[{label}] T2 clipboard hijack raised: {_e}", "WARN")
-            md = ""
-        if md and len(md) >= 100:
-            log(f"[{label}] Extracted via T2 CUA Share & Export + hijack: {len(md)} chars")
-            return md
+        log(f"[{label}] T2 HTML→MD returned {len(md)} chars (below 2000-char threshold — "
+            f"likely chat-side ack, not the report panel) — falling to Tier 3", "WARN")
 
     # ── Tier 3 (LAST RESORT, Wayland-safe): Ctrl+A/C + clipboard hijack ──
     # JS clipboard hijack intercepts the browser's own copy event before
