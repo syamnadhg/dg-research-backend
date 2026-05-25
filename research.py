@@ -16924,6 +16924,20 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "claude_clarification_replied": False,  # one-shot flag for clarification-defer reply
             "gemini_kickoff_nudge_count": 0,        # multi-shot nudge counter (max 3, 3min apart) for Gemini kickoff-stall
             "gemini_last_kickoff_nudge_at": 0.0,    # timestamp gate enforcing 3min spacing between Gemini kickoff nudges
+            # 2026-05-25 Gemini 15-min DOM-staleness safety net. User-
+            # observed: post-2026-05 Gemini UI update, the conversation
+            # DOM sometimes freezes while server-side research is done —
+            # CUA reads the stale screenshot as "still generating" and
+            # the run sits indefinitely. Manual workaround: reload tab
+            # + send "Is the Research completed?" — both empirically
+            # required to unstick. Encoded here as a one-shot at
+            # elapsed >= 15min. If a long Gemini run stalls TWICE (rare
+            # — would need post-15min recovery + later re-stall), this
+            # net only catches the first stall; the generic no-growth
+            # watchdog at 20-min flat covers later ones (though Gemini's
+            # status="researching" can suppress it — known gap, tracked
+            # for future iteration if it surfaces in prod).
+            "gemini_safety_net_done": False,
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -17073,7 +17087,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "claude_artifact_dom_misses": 0,
                                              "claude_artifact_cua_attempts": 0,
                                              "observer_text_len": 0,
-                                             "claude_clarification_replied": False}
+                                             "claude_clarification_replied": False,
+                                             # 2026-05-25: explicit-init parity with the
+                                             # main pending dict (research.py:~16940). A
+                                             # post-resume Gemini run gets a fresh 15-min
+                                             # safety net relative to its new start_time.
+                                             "gemini_safety_net_done": False}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
                         else:
@@ -17275,6 +17294,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "empty_retries": 0,
                 "hard_retry_count": _hard_count,
                 "claude_clarification_replied": False,
+                # 2026-05-25: explicit-init parity with the main pending
+                # dict (research.py:~16940). A hard-retried Gemini run gets
+                # a fresh 15-min safety net relative to its new start_time.
+                "gemini_safety_net_done": False,
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
@@ -17594,6 +17617,110 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # 'continue_partial' / 'timeout' — user idle; keep polling
                     # with the stale session (likely 30min re-grace from platforms)
                     continue
+
+            # ── Gemini 15-min DOM-staleness safety net ──
+            # Empirical 2026-05-25 user observation: post-recent-UI-update
+            # Gemini's conversation DOM can freeze mid-research while the
+            # server side is actually done. CUA's vision read sees the
+            # stale "Researching…" screenshot as proof of life → run sits
+            # for 90+ min (verified in backend-2.log: 123-min Golden
+            # Retriever run, 20 consecutive CUA "still generating"
+            # confirmations from 10:10 to 12:03 until the user manually
+            # sent "Is the Research completed?" in the browser and the
+            # DOM unstuck within seconds, after which CUA confirmed done
+            # at 12:07 and extraction returned 101k chars). The manual
+            # action that unstuck it is what's automated here.
+            #
+            # Race-safe: short-circuit before reload if completion text
+            # is already on page (the run literally just finished in the
+            # last few seconds; no point reloading + asking).
+            #
+            # Orthogonal to the kickoff-stall multi-shot nudge (lines
+            # ~17421-17485) which only fires at elapsed ≤ 600s for the
+            # ACK-without-research-card case. The two cannot overlap.
+            # Resets on content growth so a long-but-genuinely-streaming
+            # run can re-arm the net if it stalls again past minute 15.
+            if (
+                name == "Gemini"
+                and elapsed >= 15 * 60
+                and not p.get("gemini_safety_net_done")
+                and not p.get("dns_retry_at")
+            ):
+                try:
+                    _body_text = await p["page"].evaluate(
+                        "() => (document.body.innerText || '').slice(0, 8000)"
+                    )
+                    if _GEMINI_COMPLETION_RE.search(_body_text or ""):
+                        # Completion already showing — skip the reload+ask
+                        # entirely. Mark done so we don't re-check on each
+                        # tick. The detect_completion_gemini path will pick
+                        # up the actual extraction on the next iteration.
+                        p["gemini_safety_net_done"] = True
+                        log(
+                            "[Gemini] 15-min safety net: completion text "
+                            "already on page — skipping reload+ask"
+                        )
+                    else:
+                        p["gemini_safety_net_done"] = True
+                        log(
+                            "[Gemini] 15-min safety net firing — page.reload "
+                            "+ 'Is the Research completed?' (DOM-staleness "
+                            "workaround for post-2026-05 Gemini UI)"
+                        )
+                        try:
+                            emit_event(
+                                "agent_progress", phase=2, agent="gemini",
+                                status="generating",
+                                progress=(
+                                    "Gemini past 15 min — refreshing the page "
+                                    "and asking it to confirm completion."
+                                ),
+                            )
+                        except Exception:
+                            pass
+                        await p["page"].reload(
+                            wait_until="domcontentloaded", timeout=20000
+                        )
+                        # 8s sleep lets Gemini's composer remount fully —
+                        # advisor verified 5s was too thin for the post-DR
+                        # conversation layout. Without it paste_followup
+                        # races verified_paste_brief through retries.
+                        await asyncio.sleep(8.0)
+                        try:
+                            await inject_agent_observer(p["page"], "gemini")
+                        except Exception as _inj_err:
+                            log(
+                                f"[Gemini] safety-net observer re-inject "
+                                f"failed (non-fatal): {_inj_err}",
+                                "DEBUG",
+                            )
+                        await paste_followup(
+                            p["page"],
+                            "Is the Research completed?",
+                            "gemini",
+                            label="Gemini-safety-net",
+                        )
+                        # Reset baselines so the no-growth + stuck watchdog
+                        # don't fire from the pre-reload stall window.
+                        # last_cua_check reset prevents a CUA tier-3 from
+                        # piling on within seconds of the reload (the gate
+                        # at line ~18094 wants > 1200s since last CUA).
+                        _now = time.time()
+                        p["last_growth_time"] = _now
+                        p["last_heartbeat"] = _now
+                        p["stuck_warned_at"] = 0
+                        p["last_cua_check"] = _now
+                except Exception as _gse:
+                    log(
+                        f"[Gemini] 15-min safety net raised "
+                        f"(non-fatal): {_gse}",
+                        "WARN",
+                    )
+                    # Don't unflip gemini_safety_net_done — if the reload
+                    # itself failed (network blip, tab crashed), the
+                    # browser-crash sweep above will catch a dead tab on
+                    # next tick. We don't want to spam retries.
+                continue
 
             # DOM scrape (primary); MutationObserver handles token-level stream separately.
             scrape_fn = SCRAPE_FNS.get(name)
