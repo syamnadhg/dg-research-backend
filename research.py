@@ -14472,10 +14472,18 @@ async def verify_chatgpt_generating(page) -> bool:
             // "Thought for X seconds" badge persists during Extended Thinking
             // (P1 Pro) and DR (P2). With stop button + cards + CSS-animation
             // all negative above, this confirms the page is settled. Kept
-            // outside the DR gate — it's a NEGATIVE (done) signal, so a
-            // false-fire on assistant narrative just means we correctly
-            // detect done sooner; can't cause a 27-min stall.
-            if (bl.includes('thought for ')) return false;
+            // outside the DR gate — it's a NEGATIVE (done) signal.
+            // 2026-05-24: tightened from `includes('thought for ')` to the
+            // canonical "thought for + whitespace + digit" regex used by
+            // detect_completion_chatgpt (research.py:12505/12546). The
+            // substring match could false-fire on assistant narrative like
+            // "I thought for a moment about Salaar..." and declare done
+            // prematurely if the earlier stop/animation checks happened to
+            // be momentarily negative between token batches. Requiring a
+            // digit immediately after "thought for " locks the match to
+            // the actual badge format ("Thought for 23 seconds", "Thought
+            // for 2 minutes"), not prose.
+            if (/thought for\\s+\\d/i.test(bl)) return false;
             return !!document.querySelector('.result-streaming, [data-is-streaming="true"]');
         }""")
         if host_hit:
@@ -14547,7 +14555,10 @@ async def verify_chatgpt_generating(page) -> bool:
                             // contain "after reading sources" / "searching the web"),
                             // and any keyword match would re-introduce the same
                             // false-positive class as the deleted length>200 fallback.
-                            if (bl.includes('thought for ')) return false;
+                            // 2026-05-24: same regex tightening as host path —
+                            // require a digit after "thought for " to lock to badge
+                            // format and not match narrative prose.
+                            if (/thought for\\s+\\d/i.test(bl)) return false;
                             return false;
                         }""")
                         if active:
