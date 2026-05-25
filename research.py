@@ -14683,6 +14683,85 @@ async def verify_chatgpt_generating(page) -> bool:
         return False
 
 
+async def _verify_chatgpt_generating_diag(page) -> str:
+    """Diagnostic twin of verify_chatgpt_generating's host_hit JS — returns
+    the reason string for "still generating" instead of just a bool. Used
+    by poll_until_done's safety-net CUA escalation so the log shows
+    WHICH path inside the verify function is the false-positive when DOM
+    keeps reporting generating but content is flat.
+
+    Returns empty string when the verify would have returned False (done).
+    Returns one of: "stop_composer:<aria-label>", "card_stop:<class>",
+    "card_progress:<class>", "generic_stop_label:<label>",
+    "css_animation:<class>", "host_kw:<phrase>", "researching_ellipsis",
+    "data_streaming_attr", or "no_hit" (which should round-trip to False
+    in the real verify too).
+
+    NOTE: kept in sync MANUALLY with verify_chatgpt_generating's host_hit
+    block (research.py:~14495-14597). If you touch one, touch the other.
+    Drift only affects diagnostic accuracy — the real verify path is
+    unaffected and the safety-net CUA escalation still works."""
+    try:
+        return await page.evaluate("""() => {
+            const stop = document.querySelector('button[aria-label="Stop generating"]')
+                || document.querySelector('button[data-testid="stop-button"]')
+                || document.querySelector('button[aria-label="Stop streaming"]')
+                || document.querySelector('button[aria-label="Stop"]');
+            if (stop) return "stop_composer:" + (stop.getAttribute('aria-label') || stop.getAttribute('data-testid') || '?');
+
+            const cards = document.querySelectorAll(
+                '[data-testid*="research"], [data-testid*="canvas"], [class*="research"], ' +
+                '[aria-label*="Deep research"], [aria-label*="deep research"]'
+            );
+            for (const c of cards) {
+                const cBtns = c.querySelectorAll('button');
+                for (const b of cBtns) {
+                    const lbl = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    if (lbl.includes('stop') || lbl.includes('cancel') || t === 'stop')
+                        return "card_stop:" + ((c.className || c.getAttribute('data-testid') || '?') + '').slice(0, 60);
+                }
+                if (c.querySelector('[role="progressbar"], [class*="progress"], [class*="spinner"]'))
+                    return "card_progress:" + ((c.className || c.getAttribute('data-testid') || '?') + '').slice(0, 60);
+            }
+
+            const btns = document.querySelectorAll('button');
+            for (const b of btns) {
+                const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (label.includes('stop'))
+                    return "generic_stop_label:" + label.slice(0, 60);
+            }
+
+            const animated = document.querySelectorAll(
+                '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], [class*="streaming"]'
+            );
+            for (const el of animated) {
+                if (el.offsetParent === null) continue;
+                if (typeof el.getAnimations !== 'function') continue;
+                const anims = el.getAnimations();
+                if (anims.some(a => a.playState === 'running'))
+                    return "css_animation:" + ((el.className || el.tagName) + '').slice(0, 80);
+            }
+
+            const bl = (document.body?.innerText || '').toLowerCase();
+            const drModePresent = document.querySelector(
+                '[data-testid*="research"], [data-testid*="canvas"], '
+                + '[aria-label*="Deep research"], [aria-label*="deep research"]'
+            ) !== null;
+            if (drModePresent) {
+                const hostKws = ['sources and counting', 'searching the web', 'reading sources'];
+                const hit = hostKws.find(k => bl.includes(k));
+                if (hit) return "host_kw:" + hit;
+                if (bl.includes('researching...')) return "researching_ellipsis";
+            }
+
+            if (/thought for\\s+\\d/i.test(bl)) return "";
+            return document.querySelector('.result-streaming, [data-is-streaming="true"]') ? "data_streaming_attr" : "";
+        }""") or "no_hit"
+    except Exception as e:
+        return f"diag_error:{type(e).__name__}"
+
+
 async def verify_gemini_generating(page) -> bool:
     """Check if Gemini is actively generating — broad stop button + animation detection."""
     try:
@@ -15229,6 +15308,19 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     last_seen_steps_sig = 0
     stall_window_start = None  # time.time() when ALL signals stopped growing
     STALL_THRESHOLD_SEC = 1200  # 20 min of multi-signal flatness → likely stuck
+    # 2026-05-25: secondary safety-net CUA escalation at 5 min of flatness
+    # (well before the 20 min stall-surface). The polling loop's existing
+    # CUA path only fires when verify_fn returns False — if DOM detection
+    # has a false-positive that keeps verify returning True forever, CUA
+    # never gets asked. This safety-net triggers a visual CUA confirm
+    # solely on content-flat-while-detector-says-generating. CUA can
+    # override the stuck DOM read and let us extract early. Per-agent
+    # gated so verify_fn != verify_chatgpt_generating skips the diagnostic
+    # (other verify functions don't have a matching diag helper yet) but
+    # the CUA escalation still fires. Tracked separately from cua_checked
+    # so it doesn't collide with the verify-False path.
+    SAFETY_NET_CUA_SEC = 300
+    safety_net_cua_asked = False
 
     # 2026-05-06 (Stream 2 D2): no inner wall-clock cap. The outer
     # _await_phase_with_active_deadline at the call site is the sole
@@ -15423,6 +15515,11 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     last_seen_sources = max(last_seen_sources, _p1_sources)
                     last_seen_steps_sig = max(last_seen_steps_sig, _p1_steps_sig)
                     stall_window_start = None
+                    # Content actively growing → arm safety-net for the
+                    # next flat window. Without this reset, a single CUA
+                    # safety-net trigger early in the run would suppress
+                    # re-checks even if a real stall hits later.
+                    safety_net_cua_asked = False
                 elif (_merged_partial_len > 0 or _p1_sources > 0) and stall_window_start is None:
                     stall_window_start = time.time()
                 # Vision fallback merge (Gemini Flash) — fills gaps when the
@@ -15740,6 +15837,109 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
         else:
             consecutive_not_generating = 0
             cua_checked = False  # Reset so CUA can check again if needed
+
+            # 2026-05-25 safety-net CUA escalation: content flat 5+ min
+            # while detector says generating → most likely a DOM-detector
+            # false-positive (Salaar/Kalki movie briefs hit this when
+            # CSS-animation / card-progress / data-streaming-attr checks
+            # match persistent post-stream-end UI chrome). Without this
+            # path the loop would wait the full 20 min STALL_THRESHOLD_SEC
+            # before surfacing Retry/Skip to the user — way too slow.
+            # Diagnostic log captures WHICH verify check is firing so a
+            # follow-up commit can fix the root cause; CUA visual confirm
+            # is the immediate mitigation.
+            if (browser and cua_client
+                    and stall_window_start is not None
+                    and (time.time() - stall_window_start) > SAFETY_NET_CUA_SEC
+                    and not safety_net_cua_asked):
+                safety_net_cua_asked = True
+                _flat_sec = int(time.time() - stall_window_start)
+                # Diagnostic: log which verify path is producing the
+                # false-positive. ChatGPT-only for now — other verify
+                # functions don't have a matching diag helper. Doesn't
+                # block the CUA call if the diag eval fails.
+                _verify_fn_name = getattr(verify_fn, "__name__", "")
+                if _verify_fn_name == "verify_chatgpt_generating":
+                    try:
+                        _diag_reason = await _verify_chatgpt_generating_diag(page)
+                        log(f"[{label}] Safety-net diag: verify_chatgpt_generating "
+                            f"true via [{_diag_reason}] "
+                            f"(text={last_seen_len}, sources={last_seen_sources}, "
+                            f"steps={last_seen_steps_sig}, flat={_flat_sec}s)", "INFO")
+                    except Exception as _sde:
+                        log(f"[{label}] Safety-net diag failed: {_sde}", "DEBUG")
+                log(f"[{label}] Safety-net: content flat for {_flat_sec}s while "
+                    f"detector says generating — CUA visual confirm "
+                    f"(threshold={SAFETY_NET_CUA_SEC}s)", "INFO")
+                await browser.switch_to_page(page)
+                try:
+                    await page.evaluate("""() => {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        document.querySelectorAll('[class*="react-scroll"], [class*="chat-messages"], main, [role="presentation"]')
+                            .forEach(c => { try { c.scrollTop = c.scrollHeight; } catch(e){} });
+                    }""")
+                    await asyncio.sleep(0.4)
+                except Exception:
+                    pass
+                _sn_diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
+                    "Look at the BOTTOM of the chat (composer / end of response). "
+                    "Is there a Stop button visible? Is there a loading animation or 'Researching...' indicator? "
+                    "If a Stop button is visible anywhere, say 'still generating'. "
+                    "Only say 'response complete' if there is NO stop button AND the final paragraph of the response is visible.",
+                    model=CUA_MODEL, max_iterations=3, verbose=verbose)
+                if _sn_diag.get("status") == "error":
+                    log(f"[{label}] Safety-net CUA unavailable "
+                        f"({(_sn_diag.get('text') or '')[:80]}) — "
+                        f"falling back to existing 20m stall surface", "WARN")
+                    # Don't reset stall_window_start; existing stall path fires
+                else:
+                    _sn_text = (_sn_diag.get("text") or "").lower()
+                    # Parse mirrors the existing CUA-after-verify-fail block
+                    # (research.py:~15698-15717). Default to "still generating"
+                    # on ambiguous reads so we DON'T early-exit on a false-done.
+                    # (The verify-False CUA path defaults to "complete" because
+                    # DOM already says done; here DOM says generating + content
+                    # flat — keeping it open is safer.)
+                    _sn_is_generating = False
+                    _sn_is_complete = False
+                    if "response complete" in _sn_text:
+                        _sn_is_complete = True
+                    elif "still generating" in _sn_text:
+                        _sn_is_generating = True
+                    elif "needs click" in _sn_text:
+                        _sn_is_generating = True
+                    else:
+                        _sn_has_stop = ("stop" in _sn_text and "yes" in _sn_text.split("stop")[0][-30:])
+                        _sn_has_loading = ("loading" in _sn_text and "yes" in _sn_text.split("loading")[0][-30:])
+                        _sn_has_response = (("completed" in _sn_text or "response visible" in _sn_text)
+                                            and "yes" in _sn_text)
+                        if _sn_has_stop or _sn_has_loading:
+                            _sn_is_generating = True
+                        elif _sn_has_response:
+                            _sn_is_complete = True
+                        else:
+                            # AMBIGUOUS — keep waiting (opposite of verify-False
+                            # path's default). Content was flat but CUA didn't
+                            # give a clear read; better to fall to the 20m
+                            # stall surface than risk extracting an in-flight
+                            # response.
+                            _sn_is_generating = True
+                    if _sn_is_complete:
+                        _elapsed = int(time.time() - wait_start)
+                        log(f"[{label}] Safety-net CUA confirms response complete ✓ "
+                            f"({_elapsed}s) — DOM detector was the false-positive")
+                        return True
+                    if _sn_is_generating:
+                        log(f"[{label}] Safety-net CUA confirms still generating — "
+                            f"reset stall window, continue poll")
+                        # Reset flat-window so the safety-net doesn't loop-fire
+                        # every poll. The next 5 min of true flatness will
+                        # re-arm it; if content actually grows in the
+                        # meantime the regular stall_window_start gets
+                        # cleared by the growth-detection branch above.
+                        stall_window_start = time.time()
+                        safety_net_cua_asked = False
+
             # Stall surface: detector still says "running" but ALL three
             # signals (text + sources + steps) stopped growing for
             # STALL_THRESHOLD_SEC. Catches the "ChatGPT alive but frozen
@@ -15748,6 +15948,8 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             # distinct from a wall-clock timeout. Multi-signal makes false
             # alarms vanishingly rare: ChatGPT DR's researching phase
             # always grows sources/steps even when text doesn't.
+            # (Now serves as final fallback — safety-net above should
+            # catch DOM false-positives at the 5m mark.)
             if (stall_window_start is not None
                     and (time.time() - stall_window_start) > STALL_THRESHOLD_SEC):
                 _stall = int(time.time() - stall_window_start)
