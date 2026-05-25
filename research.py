@@ -14437,29 +14437,44 @@ async def verify_chatgpt_generating(page) -> bool:
                 const anims = el.getAnimations();
                 if (anims.some(a => a.playState === 'running')) return true;
             }
-            // Body-level DR keyword sweep — narrowed to present-progressive
-            // phrases that don't survive the finished response. Removed
-            // 'deep research' (the model badge persists), 'sources found'
-            // (appears in finished summary), 'researching' (could be in any
-            // narrative). Kept the unambiguous in-progress phrases.
+            // 2026-05-24 P1-stall fix: gate body-text keyword checks on the
+            // presence of DR-mode UI. hostKws ('searching the web' / 'reading
+            // sources' / 'sources and counting') and 'researching...' literal
+            // were added (2026-05-14, commit 4003d38) to catch P2 DR active
+            // state when the clarification card transitions post-Start-click.
+            // For P1 Pro + Extended Thinking, no DR card exists — and the
+            // brief response for research-themed prompts (e.g. movie research
+            // briefs) naturally writes literal phrases like "searching the
+            // web" / "reading sources" / "researching..." in its narrative
+            // content. That made the body-text sweep return true forever
+            // after a P1 brief completed, stalling verify for 27+ minutes
+            // (Salaar/Kalki E2E 2026-05-24). The fix: only run keyword sweep
+            // when a DR-mode marker is actually mounted; for non-DR pages,
+            // rely on CSS-animation + .result-streaming structural signals.
+            // Gate selectors are narrow on purpose: [class*="research"] from
+            // the cards loop above is too broad (response containers can have
+            // research-themed class names); data-testid + aria-label are
+            // DR-specific affordances that don't appear in P1.
             const bl = (document.body?.innerText || '').toLowerCase();
-            // "Thought for X seconds" badge persists while DR continues; it's
-            // NOT a definitive done signal. With stop button + cards + buttons
-            // + CSS-animation checks above all negative, treat the page as
-            // settled — but only if no in-progress keyword appears below.
-            const hostKws = ['sources and counting', 'searching the web', 'reading sources'];
-            if (hostKws.some(k => bl.includes(k))) return true;
-            // 2026-05-14 (post-E2E): post-Start "Researching..." status (with
-            // the literal ellipsis) is the definitive in-progress signal
-            // shown inside the DR clarification card after the user/CUA
-            // clicks Start. It MUST beat the 'thought for ' short-circuit
-            // below — otherwise the badge ("Thought for X seconds") that
-            // also persists during active research wins and verify returns
-            // false 15× while the agent is really running, triggering the
-            // false-alarm fail_agent banner. The ellipsis distinguishes the
-            // live status pattern from any narrative "researching" prose
-            // that finished responses might contain.
-            if (bl.includes('researching...')) return true;
+            const drModePresent = document.querySelector(
+                '[data-testid*="research"], [data-testid*="canvas"], '
+                + '[aria-label*="Deep research"], [aria-label*="deep research"]'
+            ) !== null;
+            if (drModePresent) {
+                const hostKws = ['sources and counting', 'searching the web', 'reading sources'];
+                if (hostKws.some(k => bl.includes(k))) return true;
+                // post-Start "Researching..." status lives inside the DR
+                // clarification card affordance. Gated on drModePresent so it
+                // can't false-positive on P1 brief narrative that writes
+                // "researching..." in prose.
+                if (bl.includes('researching...')) return true;
+            }
+            // "Thought for X seconds" badge persists during Extended Thinking
+            // (P1 Pro) and DR (P2). With stop button + cards + CSS-animation
+            // all negative above, this confirms the page is settled. Kept
+            // outside the DR gate — it's a NEGATIVE (done) signal, so a
+            // false-fire on assistant narrative just means we correctly
+            // detect done sooner; can't cause a 27-min stall.
             if (bl.includes('thought for ')) return false;
             return !!document.querySelector('.result-streaming, [data-is-streaming="true"]');
         }""")
