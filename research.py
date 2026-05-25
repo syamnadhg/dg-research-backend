@@ -21954,17 +21954,22 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         log(f"[{label}] CUA validation failed — proceeding anyway but agent may misbehave", "WARN")
 
     # ── Brief delivery ──
-    # All three platforms (ChatGPT, Claude, Gemini) accept .md file attachments
-    # in Deep Research mode and use them as the research plan input. Prefer
-    # file-attach when we have a brief_path on disk — it sidesteps composer-
-    # truncation edge cases (Gemini's Lit/Angular composer truncates long
-    # pastes at ~5600 chars; ChatGPT auto-converts large pastes to attachments
-    # and the paste verification then fails) and gives all three agents the
-    # same starting context + inline prompt.
-    # Fall back to inline paste only when brief_path is missing/unavailable —
-    # paste path still serves as the failure-mode fallback inside the attach
-    # branch below if file-attach itself fails.
-    use_file_attach = brief_path and Path(brief_path).exists()
+    # ChatGPT + Claude accept .md file attachments in Deep Research mode and
+    # use them as the research plan input. Prefer file-attach for those two
+    # platforms when we have a brief_path on disk — it sidesteps composer-
+    # truncation edge cases (ChatGPT auto-converts large pastes to
+    # attachments and the paste verification then fails).
+    #
+    # GEMINI EXCEPTION (2026-05-24 revert): file-attach `set_input_files()`
+    # returns True (DOM call succeeds) but Gemini's UI silently drops the
+    # upload — observed in production E2E where the conversation only
+    # contained the inline prompt with no file chip, and extraction yielded
+    # 2476 chars of chat transcript instead of the 20-45k char research
+    # report seen historically with the paste path. Revert to text paste
+    # for Gemini only; ChatGPT + Claude file-attach remains untouched.
+    # Fall back to inline paste also when brief_path is missing/unavailable.
+    is_gemini = platform.lower() == "gemini"
+    use_file_attach = brief_path and Path(brief_path).exists() and not is_gemini
 
     if use_file_attach:
         log(f"[{label}] Attaching brief file: {Path(brief_path).name}")
@@ -21991,9 +21996,16 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                            "Both file-attach and DOM+CUA paste failed. Retry to relaunch the agent.")
                 return page, False
     else:
-        # Legacy path — brief_path not on disk; fall back to inline paste of
-        # the brief string. Hit when the brief was generated in-memory only.
-        log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
+        # Inline paste path — engaged in two cases:
+        #   (a) Gemini (file-attach silently drops the upload on Gemini's
+        #       UI as of 2026-05-24; paste is the empirically reliable path
+        #       that yielded 15-45k char extractions historically)
+        #   (b) brief_path not on disk (in-memory brief from older callers)
+        if is_gemini:
+            log(f"[{label}] Pasting brief directly (Gemini file-attach silently "
+                f"drops the upload; paste path empirically works)")
+        else:
+            log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
         # DOM-once → CUA contract: single DOM attempt, then a CUA-assisted
         # fallback (CUA focuses composer, Python pastes via clipboard).
         # Removed the old page-reload + 2nd-DOM-retry path — it amplified
