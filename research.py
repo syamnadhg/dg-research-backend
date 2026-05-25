@@ -3881,20 +3881,58 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
         f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o"
         f"?uploadType=media&name={_quote(object_path, safe='')}"
     )
-    try:
-        with open(local_path, "rb") as f:
-            resp = _requests.post(
-                upload_url,
-                headers={
-                    "Authorization": f"Firebase {id_token}",
-                    "Content-Type": ct,
-                },
-                data=f,
-                timeout=120,
-            )
-    except _requests.RequestException as e:
-        log(f"[storage REST] audio upload network error: {e}", "WARN")
+    def _do_upload(_id_token: str):
+        """Single POST attempt. Returns the requests.Response or None on
+        network error (already logged). Pulled out so the 403 retry path
+        below can call it twice with fresh tokens."""
+        try:
+            with open(local_path, "rb") as f:
+                return _requests.post(
+                    upload_url,
+                    headers={
+                        "Authorization": f"Firebase {_id_token}",
+                        "Content-Type": ct,
+                    },
+                    data=f,
+                    timeout=120,
+                )
+        except _requests.RequestException as e:
+            log(f"[storage REST] audio upload network error: {e}", "WARN")
+            return None
+
+    resp = _do_upload(id_token)
+    if resp is None:
         return None
+
+    # 2026-05-25: one-shot retry-on-403 with a force-refreshed token.
+    # The Track D claim-side fix (api/devices/claim + unshare) writes
+    # setCustomUserClaims AFTER its Firestore commit; if the share-claim
+    # endpoint runs concurrently with this upload, our initial id_token
+    # was minted from claims that didn't yet include the new sharedWith
+    # entry. Firebase Auth's claim-write latency is sub-second to a few
+    # seconds, so a single fresh-mint retry catches the race cleanly.
+    # If the retry still 403s, the failure is structural (sharer not in
+    # claims at all, device unlinked, etc.) — falls through to the
+    # diagnostic log + return None path below.
+    if resp.status_code == 403:
+        _retry_id_token = _fresh_user_mode_id_token()
+        if _retry_id_token and _retry_id_token != id_token:
+            log("[storage REST] 403 on initial upload — minted fresh token, retrying once "
+                "(catches claim-propagation race after share-claim / unshare)", "INFO")
+            _retry_resp = _do_upload(_retry_id_token)
+            if _retry_resp is not None and _retry_resp.status_code == 200:
+                log("[storage REST] retry succeeded — claim refresh resolved the 403")
+                resp = _retry_resp
+                id_token = _retry_id_token
+            elif _retry_resp is not None:
+                # Retry also 403'd (or other non-200) — keep the FIRST response
+                # for the diagnostic log below so the user sees the initial-
+                # token claim state (the more informative one for a structural
+                # failure). The retry log line above already records that we
+                # tried.
+                resp = _retry_resp
+                id_token = _retry_id_token
+
     if resp.status_code != 200:
         # Surface enough diagnostic to debug the common Track D regression:
         # synth-user upload getting 403 because the device doc's `ownerUid`
@@ -3912,6 +3950,7 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
             _claim_dump = (
                 f" claims={{deviceId={_claims.get('deviceId')!r}, "
                 f"ownerUid={_claims.get('ownerUid')!r}, "
+                f"sharedWith={_claims.get('sharedWith')!r}, "
                 f"sub={_claims.get('sub')!r}}}"
             )
         except Exception:
@@ -3924,10 +3963,11 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
         )
         if resp.status_code == 403:
             log(
-                "[storage REST] 403 hint: device doc may have lost ownerUid "
-                "(check FE Unlink without token revoke) — re-pair via FE "
-                "Account → Add Device to restore device.ownerUid + bootstrap "
-                "fresh synth-user claims.",
+                "[storage REST] 403 hint (after retry): rule expected "
+                "token.ownerUid == path-uid OR path-uid in token.sharedWith. "
+                "If sharer firing on shared device: confirm sharer is in the "
+                "device's sharedWith via FE Account → Manage Sharers. If owner: "
+                "device may have lost ownerUid — re-pair via FE Account → Add Device.",
                 "WARN",
             )
         return None
