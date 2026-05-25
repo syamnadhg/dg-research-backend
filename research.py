@@ -3440,6 +3440,60 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 except Exception as _dr_err:
                     log(f"[device-cmds] HARD_RESET: queue drain failed: {_dr_err}", "WARN")
 
+                # 2026-05-25: Firestore queue-collection sweep. The drain
+                # above only deletes queue docs corresponding to entries
+                # in the in-memory `_job_queue` deque. Docs sitting in
+                # `devices/{deviceId}/queue/` that BE never had a chance
+                # to claim — submitted while BE was off, deferred from a
+                # prior crash, FE-replay residue, etc. — stayed put.
+                # On next BE startup the start-listener replayed them
+                # silently, re-running work the user thought they cleared
+                # (Venom OS 10-day-old doc re-fired 2026-05-25 even after
+                # user did Reset Backend). Enumerate + delete the entire
+                # collection so HARD_RESET means HARD_RESET.
+                #
+                # Multi-worker: only WORKER_ID==1 sweeps. The collection
+                # is device-scoped so all workers see the same docs;
+                # running the loop N times is just wasted RPC. A doc
+                # might be mid-claim by a sibling worker — deleting it
+                # under that worker is acceptable for HARD_RESET (the
+                # user explicitly asked to nuke everything; sibling's
+                # claim TX fails and it skips). Best-effort, gated on
+                # _firebase_db presence; failures logged not raised.
+                try:
+                    if _firebase_db and WORKER_ID == 1:
+                        try:
+                            _hr_did = load_device_id() or ""
+                        except Exception:
+                            _hr_did = ""
+                        if _hr_did:
+                            try:
+                                _q_col_root = _firebase_db.collection("devices") \
+                                    .document(_hr_did).collection("queue")
+                                _q_deleted = 0
+                                _q_failed = 0
+                                for _qsnap in _q_col_root.stream():
+                                    try:
+                                        _qsnap.reference.delete()
+                                        _q_deleted += 1
+                                    except Exception:
+                                        _q_failed += 1
+                                if _q_deleted or _q_failed:
+                                    log(
+                                        f"[device-cmds] HARD_RESET: Firestore "
+                                        f"queue-collection sweep — deleted "
+                                        f"{_q_deleted} doc(s), "
+                                        f"{_q_failed} failed"
+                                    )
+                                else:
+                                    log("[device-cmds] HARD_RESET: Firestore queue-collection sweep — already empty")
+                            except Exception as _qc_err:
+                                log(f"[device-cmds] HARD_RESET: Firestore queue-collection sweep failed: {_qc_err}", "WARN")
+                        else:
+                            log("[device-cmds] HARD_RESET: skipping queue-collection sweep — device id missing", "WARN")
+                except Exception as _qcw_err:
+                    log(f"[device-cmds] HARD_RESET: queue-collection sweep wrapper failed: {_qcw_err}", "WARN")
+
                 # 2026-05-21: bulk-sweep ANY stale ongoing/paused/running
                 # research docs for the paired owner. The drain above only
                 # closes jobs that are CURRENTLY queued or running in BE
