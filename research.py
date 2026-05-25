@@ -16402,11 +16402,15 @@ _GEMINI_KICKOFF_ACK_RE = re.compile(
 )
 
 # Canonical "research is actually running" card text. Gemini Deep
-# Research renders "Researching N sources..." while the worker
-# scrapes — once visible, kickoff succeeded and the nudge must NOT
-# fire.
+# Research renders varying card text while the worker scrapes:
+#   - "Researching 25 sources..." (numbered count — Golden Retrievers run)
+#   - "Researching websites..." (no number — Salaar Part 2 run 2026-05-24)
+#   - "Researching N searches..." / "Researching N sites..." (variants)
+# Match any of these to suppress the nudge once kickoff succeeded.
+# Mirrors the noun list in scrape_progress_gemini at research.py:~12054
+# (`websites?|sources?|searches?|sites?`).
 _GEMINI_RESEARCH_CARD_RE = re.compile(
-    r"researching\s+\d+\s+sources?",  # singular form covers the N=1 edge
+    r"researching\s+(?:\d+\s+)?(?:websites?|sources?|searches?|sites?)",
     re.IGNORECASE,
 )
 
@@ -16446,19 +16450,38 @@ async def _gemini_kickoff_pending(page):
     return True, "ack-no-card"
 
 
-async def _gemini_send_kickoff_nudge(page, label):
-    """Send a single polite nudge to re-trigger Gemini's research kickoff.
+# Escalating nudge wording — attempt 0 is a polite directive, attempt 1
+# is a yes/no check-in question, attempt 2 mirrors the terse "Done?" that
+# empirically jolted Gemini in the user's manual intervention (2026-05-24).
+# Each wording targets a different parser path; if Gemini ignores the
+# polite directive, the question may engage it, and if both ignored, the
+# terse one-word check is the empirical last resort.
+_GEMINI_KICKOFF_NUDGES = (
+    "Please proceed with the deep research now.",
+    "Are you researching?",
+    "Done?",
+)
+
+
+async def _gemini_send_kickoff_nudge(page, label, attempt_idx=0):
+    """Send a kickoff nudge to re-trigger Gemini's research with escalating
+    wording across attempts (0-indexed). Clamps to the final wording for
+    any attempt_idx beyond the list length.
 
     Reuses paste_followup so the nudge picks up _PASTE_SELECTORS["gemini"]
     composer selectors + the unified Send-button fallback chain — same
     machinery as the existing user-poke follow-up at research.py:~17498.
     Returns True on send, False if the composer was unreachable."""
-    nudge = "Please proceed with the deep research now."
-    ok = await paste_followup(page, nudge, "gemini", label=f"{label}-kickoff-nudge")
+    idx = max(0, min(attempt_idx, len(_GEMINI_KICKOFF_NUDGES) - 1))
+    nudge = _GEMINI_KICKOFF_NUDGES[idx]
+    ok = await paste_followup(
+        page, nudge, "gemini",
+        label=f"{label}-kickoff-nudge-{idx + 1}",
+    )
     if ok:
-        log(f"[{label}] Sent Gemini kickoff nudge: {nudge!r}", "INFO")
+        log(f"[{label}] Sent Gemini kickoff nudge #{idx + 1}/{len(_GEMINI_KICKOFF_NUDGES)}: {nudge!r}", "INFO")
     else:
-        log(f"[{label}] Gemini kickoff nudge failed to send", "WARN")
+        log(f"[{label}] Gemini kickoff nudge #{idx + 1} failed to send", "WARN")
     return ok
 
 
@@ -16521,7 +16544,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "claude_artifact_cua_attempts": 0,
             "observer_text_len": 0,              # MutationObserver sets this (see B2)
             "claude_clarification_replied": False,  # one-shot flag for clarification-defer reply
-            "gemini_kickoff_nudged": False,         # one-shot flag for Gemini kickoff-stall nudge
+            "gemini_kickoff_nudge_count": 0,        # multi-shot nudge counter (max 3, 3min apart) for Gemini kickoff-stall
+            "gemini_last_kickoff_nudge_at": 0.0,    # timestamp gate enforcing 3min spacing between Gemini kickoff nudges
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -17056,42 +17080,63 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as _cer:
                     log(f"[{name}] Clarification-check failed (non-fatal): {_cer}", "DEBUG")
 
-            # ── Gemini kickoff-stall auto-nudge ──
-            # User-observed (2026-05-22 screenshot): Gemini ACKs "OK,
-            # starting now" but the "Researching N sources" card never
-            # appears — silently stalls until the user pokes with a
-            # follow-up like "Done?". A single polite nudge ("Please
-            # proceed with the deep research now.") reliably restarts
-            # the kickoff. One-shot per agent — if a second stall
-            # happens, the 20-min general watchdog at research.py:~17441
+            # ── Gemini kickoff-stall auto-nudge (multi-shot) ──
+            # User-observed (2026-05-22 + 2026-05-24): Gemini ACKs "Great,
+            # I'm on it" but the "Researching N sources" / "Researching
+            # websites..." card never appears — silently stalls. A single
+            # polite nudge ("Please proceed with the deep research now.")
+            # sometimes works but Gemini also sometimes ignores it
+            # (observed in the 2026-05-24 E2E), and the user had to
+            # manually type "Done?" to unstick. Multi-shot with escalating
+            # wording across attempts hardens against this:
+            #   - Nudge 1 (polite directive)       at ~45s
+            #   - Nudge 2 (yes/no check-in)        at ~225s (180s spacing)
+            #   - Nudge 3 (terse, "Done?")         at ~405s (180s spacing)
+            # All three fit inside the 600s outer cap, well before the
+            # 20-min general no-growth watchdog at research.py:~17441
             # takes over.
             #
-            # Time window: 45s ≤ elapsed ≤ 180s. Real kickoffs land
-            # within 10-15s; 45s gives healthy margin without delaying
-            # recovery past 3 min (after which the general stuck
-            # detector fires).
+            # Gates (all must hold):
+            #   - name == Gemini
+            #   - nudge count < 3
+            #   - 45s ≤ elapsed ≤ 600s (since last reset)
+            #   - either no prior nudge OR ≥180s since the last one
             if (
                 name == "Gemini"
-                and not p.get("gemini_kickoff_nudged")
-                and 45 <= elapsed <= 180
+                and p.get("gemini_kickoff_nudge_count", 0) < len(_GEMINI_KICKOFF_NUDGES)
+                and 45 <= elapsed <= 600
+                and (
+                    p.get("gemini_last_kickoff_nudge_at", 0.0) == 0.0
+                    or (time.time() - p.get("gemini_last_kickoff_nudge_at", 0.0)) >= 180
+                )
             ):
                 try:
                     pending_kickoff, reason = await _gemini_kickoff_pending(p["page"])
                     if pending_kickoff:
+                        attempt_idx = p.get("gemini_kickoff_nudge_count", 0)
+                        total = len(_GEMINI_KICKOFF_NUDGES)
                         log(f"[{name}] Kickoff-stall detected ({reason}) — "
-                            f"sending nudge.", "INFO")
+                            f"sending nudge #{attempt_idx + 1}/{total}.", "INFO")
                         emit_event(
                             "agent_progress", phase=2, agent="gemini",
                             status="generating",
-                            progress="Gemini stalled after ACK — auto-nudging to start research.",
+                            progress=(
+                                f"Gemini stalled after ACK — auto-nudge "
+                                f"#{attempt_idx + 1}/{total} to start research."
+                            ),
                         )
-                        sent = await _gemini_send_kickoff_nudge(p["page"], name)
-                        p["gemini_kickoff_nudged"] = True
+                        sent = await _gemini_send_kickoff_nudge(
+                            p["page"], name, attempt_idx=attempt_idx,
+                        )
+                        p["gemini_kickoff_nudge_count"] = attempt_idx + 1
+                        p["gemini_last_kickoff_nudge_at"] = time.time()
                         if sent:
                             # Reset baselines so the no-growth + wall-
                             # clock watchdogs don't fire from the pre-
                             # nudge stall window (same rationale as the
                             # Claude reset above at research.py:~16863).
+                            # Reset per-nudge — gives Gemini a fresh
+                            # window after each attempt.
                             _now = time.time()
                             p["start_time"] = _now
                             p["last_heartbeat"] = _now

@@ -86,25 +86,46 @@ class TestGeminiResearchCardRegex:
     follow-up that confuses Gemini."""
 
     def test_user_image_card_matches(self):
-        """Exact card text from the user's E2E image."""
+        """Exact card text from the user's E2E image (Avengers run)."""
         from research import _GEMINI_RESEARCH_CARD_RE
         s = "Researching 25 sources..."
         assert _GEMINI_RESEARCH_CARD_RE.search(s)
 
+    def test_no_digit_websites_variant_matches(self):
+        """User-observed 2026-05-24 Salaar E2E: Gemini's card emitted
+        'Researching websites...' (no number) ~28 times. The detector
+        MUST match this variant — historical regex requiring `\\d+`
+        missed it entirely and the kickoff stall went undetected."""
+        from research import _GEMINI_RESEARCH_CARD_RE
+        s = "Researching websites..."
+        assert _GEMINI_RESEARCH_CARD_RE.search(s)
+
     @pytest.mark.parametrize("text", [
+        # Original digit + sources/source variants
         "Researching 1 source",
         "Researching 42 sources",
         "researching 100 sources",  # lowercase
         "Researching  25  sources",  # extra spaces
+        # New: no-digit variants (today's bug class)
+        "Researching websites",
+        "Researching sources",
+        "Researching searches",
+        "Researching sites",
+        # New: digit + alt-noun variants (mirrors scrape_progress_gemini)
+        "Researching 12 websites",
+        "Researching 3 searches",
+        "Researching 7 sites",
     ])
     def test_card_variants_match(self, text):
         from research import _GEMINI_RESEARCH_CARD_RE
         assert _GEMINI_RESEARCH_CARD_RE.search(text), f"should match: {text!r}"
 
     @pytest.mark.parametrize("text", [
-        "Researching the topic",   # no digit
-        "Found sources",            # no "Researching N"
+        "Researching the topic",   # noun not in allowlist
+        "Found sources",            # no "Researching" prefix
         "Research started",         # not the canonical card text
+        "Researching",              # noun missing entirely
+        "Re-searching websites",    # different word (hyphen)
     ])
     def test_non_card_text_doesnt_match(self, text):
         from research import _GEMINI_RESEARCH_CARD_RE
@@ -235,12 +256,11 @@ class TestGeminiKickoffPending:
 
 class TestGeminiSendKickoffNudge:
     """Thin wrapper around paste_followup — confirms it's called with
-    the verbatim nudge string and the right platform key. Mock
-    paste_followup so we don't hit a real composer."""
+    the verbatim nudge string + right platform key + correct attempt-
+    indexed wording. Mock paste_followup so we don't hit a real composer."""
 
-    def test_exact_nudge_text_and_platform(self):
-        """The nudge must be the verbatim user-approved string —
-        don't drift the wording silently."""
+    def test_default_attempt_uses_first_nudge(self):
+        """No attempt_idx argument → defaults to 0 → polite directive."""
         import research
         page = mock.AsyncMock()
         with mock.patch.object(research, "paste_followup",
@@ -252,7 +272,7 @@ class TestGeminiSendKickoffNudge:
         assert args[0] is page
         assert args[1] == "Please proceed with the deep research now."
         assert args[2] == "gemini"
-        assert "kickoff-nudge" in kwargs.get("label", "")
+        assert "kickoff-nudge-1" in kwargs.get("label", "")
 
     def test_paste_followup_failure_propagates(self):
         """If paste_followup fails (no composer), return False."""
@@ -262,3 +282,61 @@ class TestGeminiSendKickoffNudge:
                                new=mock.AsyncMock(return_value=False)):
             result = _run(research._gemini_send_kickoff_nudge(page, "Gemini"))
         assert result is False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Escalating wording across multi-shot attempts
+# ─────────────────────────────────────────────────────────────────────
+
+class TestGeminiMultiShotNudgeWording:
+    """Multi-shot nudges escalate wording across attempts to defend
+    against Gemini ignoring a repeated polite phrasing. Attempt 0 is
+    the polite directive, attempt 1 is a yes/no check-in question,
+    attempt 2 mirrors the terse 'Done?' that empirically jolted Gemini
+    in the user's manual intervention (2026-05-24)."""
+
+    @pytest.mark.parametrize("attempt_idx,expected_text", [
+        (0, "Please proceed with the deep research now."),
+        (1, "Are you researching?"),
+        (2, "Done?"),
+    ])
+    def test_attempt_wording(self, attempt_idx, expected_text):
+        """Each attempt index maps to its verbatim wording."""
+        import research
+        page = mock.AsyncMock()
+        with mock.patch.object(research, "paste_followup",
+                               new=mock.AsyncMock(return_value=True)) as pf:
+            _run(research._gemini_send_kickoff_nudge(page, "Gemini",
+                                                     attempt_idx=attempt_idx))
+        args, kwargs = pf.call_args
+        assert args[1] == expected_text
+        # Label includes 1-indexed attempt number for log readability
+        assert f"kickoff-nudge-{attempt_idx + 1}" in kwargs.get("label", "")
+
+    def test_attempt_idx_beyond_list_clamps_to_last(self):
+        """Defensive clamp — attempt_idx=99 (caller bug) still produces
+        the last wording rather than IndexError."""
+        import research
+        page = mock.AsyncMock()
+        with mock.patch.object(research, "paste_followup",
+                               new=mock.AsyncMock(return_value=True)) as pf:
+            _run(research._gemini_send_kickoff_nudge(page, "Gemini", attempt_idx=99))
+        args, _ = pf.call_args
+        assert args[1] == "Done?"
+
+    def test_attempt_idx_negative_clamps_to_first(self):
+        """Defensive clamp — negative attempt_idx (caller bug) falls
+        back to the first wording."""
+        import research
+        page = mock.AsyncMock()
+        with mock.patch.object(research, "paste_followup",
+                               new=mock.AsyncMock(return_value=True)) as pf:
+            _run(research._gemini_send_kickoff_nudge(page, "Gemini", attempt_idx=-5))
+        args, _ = pf.call_args
+        assert args[1] == "Please proceed with the deep research now."
+
+    def test_nudge_list_has_three_entries(self):
+        """The constant should have exactly 3 entries. Adding/removing
+        nudges changes the multi-shot fan-out — this is an alarm test."""
+        from research import _GEMINI_KICKOFF_NUDGES
+        assert len(_GEMINI_KICKOFF_NUDGES) == 3
