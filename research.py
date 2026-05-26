@@ -2324,10 +2324,236 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
     return (position, behind_rid, behind_title)
 
 
+# Phase-duration heuristics for ETA estimation. Values are ROUGH typical
+# durations from prod traces; ETA copy on the FE is intentionally fuzzy
+# (rounded to 5-min granularity above 15min, "~1 hr 14 min" above 60min)
+# to honor the imprecision. Tune from `run_analytics.json` longer-term.
+QUEUE_ETA_PHASE_MS = {
+    0: 30 * 1000,       # P0 init — ~30s
+    1: 7 * 60 * 1000,   # P1 brief — ~7 min
+    2: 22 * 60 * 1000,  # P2 deep research — ~22 min (slowest)
+    3: 18 * 60 * 1000,  # P3 audio gen — ~18 min
+    4: 3 * 60 * 1000,   # P4 FE YouTube — ~3 min
+    5: 30 * 1000,       # P5 FE delivery — ~30s
+}
+QUEUE_ETA_TYPICAL_RUN_MS = sum(QUEUE_ETA_PHASE_MS.values())  # ~51 min
+
+
+def _estimate_queue_eta_ms(
+    head_phase: int,
+    head_phase_started_at_ms: int,
+    position: int,
+    worker_count: int,
+) -> int:
+    """Best-effort ETA for a queued doc.
+
+    Inputs:
+      head_phase: which phase the head-of-queue is currently in (0-5).
+                  Falls back to 0 if unknown — caller passes 0 then.
+      head_phase_started_at_ms: when the head entered its current phase,
+                                in epoch ms. 0 means unknown — falls
+                                back to "0 elapsed in phase" (worst-case
+                                conservative).
+      position: this doc's 1-indexed position in the global FIFO.
+      worker_count: device's workerCount (parallelism).
+
+    Returns: estimated ms-until-this-doc-starts. Always >= 0.
+
+    Math:
+      remaining_for_head = (remaining time in head_phase) + sum of
+                          expected durations for phases AFTER head_phase
+      eta = remaining_for_head + TYPICAL_RUN_MS * floor((position - 1) / W)
+
+      Multi-worker rationale: W workers process W runs in parallel. The
+      first run to complete frees a worker for position 1. With W=2 and
+      both workers running, position 1 ≈ remaining_for_head (assumes
+      both workers finish around the same time — true approximation),
+      position 2 also ≈ remaining_for_head (other worker frees up
+      similarly), position 3 ≈ remaining_for_head + TYPICAL_RUN_MS
+      (next rotation), etc.
+
+      Single-worker (W=1): position N ≈ remaining_for_head +
+                          (N-1) * TYPICAL_RUN_MS — purely serial.
+    """
+    if position < 1:
+        return 0
+    _head_phase = max(0, min(5, int(head_phase or 0)))
+    _expected_head_phase_ms = QUEUE_ETA_PHASE_MS.get(_head_phase, 0)
+    _started_at = int(head_phase_started_at_ms or 0)
+    _now_ms = int(time.time() * 1000)
+    if _started_at > 0:
+        _elapsed_in_phase = max(0, _now_ms - _started_at)
+        _remaining_in_head_phase = max(0, _expected_head_phase_ms - _elapsed_in_phase)
+    else:
+        # Unknown elapsed — conservative: assume head just entered its
+        # current phase (full duration ahead). Better to overshoot ETA
+        # than undershoot — undershoots produce "stuck at 0 min" UX.
+        _remaining_in_head_phase = _expected_head_phase_ms
+    _remaining_phases_for_head = sum(
+        QUEUE_ETA_PHASE_MS.get(p, 0) for p in range(_head_phase + 1, 6)
+    )
+    _remaining_for_head = _remaining_in_head_phase + _remaining_phases_for_head
+    _w = max(1, int(worker_count or 1))
+    _rotations = max(0, (position - 1) // _w)
+    return int(_remaining_for_head + QUEUE_ETA_TYPICAL_RUN_MS * _rotations)
+
+
+def _compute_queue_enrichment(col_ref, my_doc_id: str, my_uid: str) -> dict:
+    """Extended queue-position scan returning the full enrichment payload
+    needed by the FE banner. Wraps the same global-FIFO scan as
+    `_compute_global_queue_position` but also breaks down "ahead of me"
+    by submitter UID so the FE can render copy like:
+
+        "Your run starts after 2 other runs. 1 from your account,
+         including 1 from another account."
+
+    Returns dict keys (all present; defaults shown):
+      position:           1-indexed slot (>= 1)
+      total_ahead:        position - 1
+      ahead_from_self:    count of ahead docs whose submittedBy == my_uid
+      ahead_from_others:  total_ahead - ahead_from_self
+      other_uids:         sorted list of distinct submittedBy UIDs ahead
+                          (excluding self). Lets the FE compute
+                          per-other-account counts if it ever wants
+                          a richer breakdown.
+      behind_rid:         rid of doc immediately ahead (empty if head)
+      behind_title:       topic of doc immediately ahead (empty if head)
+      behind_uid:         submittedBy of doc immediately ahead
+
+    Best-effort. Falls back to defaults on Firestore error.
+    """
+    defaults = {
+        "position": 1,
+        "total_ahead": 0,
+        "ahead_from_self": 0,
+        "ahead_from_others": 0,
+        "other_uids": [],
+        "behind_rid": "",
+        "behind_title": "",
+        "behind_uid": "",
+    }
+    try:
+        candidates = list(col_ref.limit(50).stream())
+    except Exception as _qe:
+        log(f"[queue-enrich] global-scan failed (best-effort): {_qe}", "DEBUG")
+        return defaults
+
+    def _fifo_key(snap):
+        d = snap.to_dict() or {}
+        ms = _queue_doc_fifo_ms(d)
+        if ms is not None:
+            return (0, ms, snap.id)
+        return (1, 0, snap.id)
+
+    sorted_cands = sorted(candidates, key=_fifo_key)
+    queue = []
+    for snap in sorted_cands:
+        d = snap.to_dict() or {}
+        is_me = snap.id == my_doc_id
+        if d.get("processed"):
+            continue
+        aw = d.get("assignedWorker")
+        if aw and not is_me:
+            continue
+        if (d.get("action") or "start") != "start":
+            continue
+        queue.append((snap.id, d, is_me))
+
+    my_idx = -1
+    for i, (_id, _d, is_me) in enumerate(queue):
+        if is_me:
+            my_idx = i
+            break
+    if my_idx < 0:
+        return defaults
+
+    position = my_idx + 1
+    ahead = queue[:my_idx]
+    other_uids = []
+    ahead_from_self = 0
+    ahead_from_others = 0
+    for _id, _d, _ in ahead:
+        _u = (_d.get("submittedBy") or "")
+        if _u == my_uid and my_uid:
+            ahead_from_self += 1
+        else:
+            ahead_from_others += 1
+            if _u and _u not in other_uids:
+                other_uids.append(_u)
+    behind_rid = ""
+    behind_title = ""
+    behind_uid = ""
+    if my_idx > 0:
+        _, prev_data, _ = queue[my_idx - 1]
+        behind_rid = (prev_data.get("researchId") or "")
+        behind_title = (prev_data.get("topic") or "")[:60]
+        behind_uid = (prev_data.get("submittedBy") or "")
+    return {
+        "position": position,
+        "total_ahead": position - 1,
+        "ahead_from_self": ahead_from_self,
+        "ahead_from_others": ahead_from_others,
+        "other_uids": sorted(other_uids),
+        "behind_rid": behind_rid,
+        "behind_title": behind_title,
+        "behind_uid": behind_uid,
+    }
+
+
+def _read_eta_inputs_and_compute(position: int) -> "tuple[int, int]":
+    """Helper that wraps `_estimate_queue_eta_ms` with a Firestore read
+    of the device doc's `currentRunPhase` + `currentRunPhaseStartedAt`
+    + `workerCount` (head-of-queue context). Returns (eta_ms, computed_at_ms).
+
+    Sentinel: returns `(-1, now)` when Firestore is unavailable, device
+    id is missing, the device doc doesn't exist, or any read raises.
+    FE banner reads `queueEtaMs < 0` as "unknown" and suppresses the
+    ETA line. When the device doc DOES exist but has no phase data
+    yet (pre-first-run), falls through to the conservative
+    `_estimate_queue_eta_ms(0, 0, …)` ~51min estimate — matches what
+    `_recompute_deferred_queue_positions` does on the same condition,
+    so the two paths can't diverge.
+    """
+    _now_ms = int(time.time() * 1000)
+    if not _firebase_db:
+        return (-1, _now_ms)
+    try:
+        _did = load_device_id()
+        if not _did:
+            return (-1, _now_ms)
+        _dev_snap = _firebase_db.collection("devices").document(_did).get()
+        if not _dev_snap.exists:
+            return (-1, _now_ms)
+        _dd = _dev_snap.to_dict() or {}
+        _head_phase = int(_dd.get("currentRunPhase") or 0)
+        _head_phase_started = int(_dd.get("currentRunPhaseStartedAt") or 0)
+        _wc = int(_dd.get("workerCount") or load_worker_count() or 1)
+        _eta = _estimate_queue_eta_ms(_head_phase, _head_phase_started, position, _wc)
+        return (_eta, _now_ms)
+    except Exception as _eta_err:
+        log(f"[queue-eta] device-doc read failed (best-effort): {_eta_err}", "DEBUG")
+        return (-1, _now_ms)
+
+
+# 2026-05-25 (banner enrichment): single-flight lock for the deferred-
+# queue ETA recompute. The phase_start hook fires recompute on every
+# phase transition; if a prior recompute is still running (slow
+# Firestore round-trip on a busy device), the new one short-circuits.
+# Prevents thread piling and concurrent batch-write races over the same
+# research docs. try_acquire-skip semantics: if lock is busy, skip
+# this recompute — the next phase_start will refresh ETAs anyway, and
+# the in-flight recompute will pick up whatever device-doc state was
+# fresh when it started.
+_ETA_RECOMPUTE_LOCK = _threading.Lock()
+
+
 def _recompute_deferred_queue_positions() -> None:
     """Re-write `queuePosition` / `queuedBehindRunId` / `queuedBehindTitle`
     on every research doc whose queue entry is still deferred in
     Firestore (sitting in `devices/{id}/queue/` without `assignedWorker`).
+
+    Single-flight guarded by `_ETA_RECOMPUTE_LOCK` — concurrent callers
+    skip rather than queue. See lock's defining comment for rationale.
 
     Why this exists separately from `_recompute_queue_positions`:
       - `_recompute_queue_positions` (run_server closure, ~line 27030)
@@ -2358,6 +2584,20 @@ def _recompute_deferred_queue_positions() -> None:
     SYNC implementation — wrap in `asyncio.to_thread` from asyncio call
     sites so the Firestore scan + write doesn't block the event loop
     (heartbeat, watchdog, listener callbacks all live there)."""
+    # Single-flight: if a prior recompute is still running, skip.
+    # The next phase_start (or claim/finally) will refresh ETAs.
+    if not _ETA_RECOMPUTE_LOCK.acquire(blocking=False):
+        return
+    try:
+        _recompute_deferred_queue_positions_locked()
+    finally:
+        _ETA_RECOMPUTE_LOCK.release()
+
+
+def _recompute_deferred_queue_positions_locked() -> None:
+    """Lock-protected body of `_recompute_deferred_queue_positions`.
+    Do not call directly — use the public wrapper above which enforces
+    single-flight via `_ETA_RECOMPUTE_LOCK`."""
     if not _firebase_db:
         return
     device_id = load_device_id()
@@ -2402,6 +2642,25 @@ def _recompute_deferred_queue_positions() -> None:
     except Exception:
         DELETE_FIELD = None  # pyright: ignore[reportConstantRedefinition]
 
+    # 2026-05-25 (banner enrichment): also recompute ETA + ahead-by-
+    # account split. Read device-doc ETA inputs ONCE outside the loop
+    # (head phase doesn't change per-doc; only position/worker_count
+    # matter), then derive each doc's ETA from its position.
+    _eta_head_phase = 0
+    _eta_head_started = 0
+    _eta_worker_count = 1
+    try:
+        _dev_snap_r = _firebase_db.collection("devices").document(device_id).get()
+        if _dev_snap_r.exists:
+            _dd_r = _dev_snap_r.to_dict() or {}
+            _eta_head_phase = int(_dd_r.get("currentRunPhase") or 0)
+            _eta_head_started = int(_dd_r.get("currentRunPhaseStartedAt") or 0)
+            _eta_worker_count = int(_dd_r.get("workerCount") or load_worker_count() or 1)
+    except Exception as _eta_r_err:
+        log(f"[deferred-recompute] device-doc read failed (best-effort): {_eta_r_err}", "DEBUG")
+
+    _now_ms_recompute = int(time.time() * 1000)
+
     patches: "list[tuple[str, str, dict]]" = []
     for idx, (_sid, d) in enumerate(queue):
         uid_v = (d.get("uid") or "").strip()
@@ -2409,12 +2668,28 @@ def _recompute_deferred_queue_positions() -> None:
         if not (uid_v and rid_v):
             continue
         new_pos = idx + 1
+        # Per-doc ahead-by-account breakdown (uses each doc's own uid).
+        _ahead_self = 0
+        _ahead_others = 0
+        for _ji, (_jsid, _jd) in enumerate(queue[:idx]):
+            _ju = (_jd.get("submittedBy") or _jd.get("uid") or "")
+            if _ju == uid_v and uid_v:
+                _ahead_self += 1
+            else:
+                _ahead_others += 1
+        _eta_ms_r = _estimate_queue_eta_ms(
+            _eta_head_phase, _eta_head_started, new_pos, _eta_worker_count)
         if idx > 0:
             _, prev_d = queue[idx - 1]
             patch = {
                 "queuePosition": new_pos,
                 "queuedBehindRunId": (prev_d.get("researchId") or ""),
                 "queuedBehindTitle": (prev_d.get("topic") or "")[:60],
+                "queueTotalAhead": new_pos - 1,
+                "queueAheadFromSelf": _ahead_self,
+                "queueAheadFromOthers": _ahead_others,
+                "queueEtaMs": _eta_ms_r,
+                "queueEtaComputedAt": _now_ms_recompute,
             }
         else:
             # Head of deferred queue — no doc ahead in queue. FE falls
@@ -2422,7 +2697,14 @@ def _recompute_deferred_queue_positions() -> None:
             # running X" message (see ChatMessage.QueuedBanner). Clear
             # behind fields explicitly so a stale prior value can't
             # render as "behind a cancelled/already-completed run."
-            patch = {"queuePosition": new_pos}
+            patch = {
+                "queuePosition": new_pos,
+                "queueTotalAhead": 0,
+                "queueAheadFromSelf": 0,
+                "queueAheadFromOthers": 0,
+                "queueEtaMs": _eta_ms_r,
+                "queueEtaComputedAt": _now_ms_recompute,
+            }
             if DELETE_FIELD is not None:
                 patch["queuedBehindRunId"] = DELETE_FIELD
                 patch["queuedBehindTitle"] = DELETE_FIELD
@@ -4904,14 +5186,27 @@ def start_firestore_start_listener(job_queue, loop):
                     # invisible to it. Without this write the wrong
                     # number persists indefinitely (BE never updates it
                     # for deferred docs in the original code).
+                    #
+                    # 2026-05-25 (banner enrichment): also write the
+                    # enriched fields the FE banner consumes — total
+                    # ahead count split by self vs other accounts,
+                    # ETA, and head-of-queue refs. _compute_queue_
+                    # enrichment subsumes _compute_global_queue_position
+                    # and adds the breakdown. Device-doc current run
+                    # phase fields drive the ETA approximation.
                     try:
-                        _pos, _b_rid, _b_title = _compute_global_queue_position(
-                            col_ref, doc.id)
+                        _enrich = _compute_queue_enrichment(col_ref, doc.id, uid)
+                        _eta_ms, _eta_at = _read_eta_inputs_and_compute(_enrich["position"])
                         _update_research_doc(uid, research_id, {
                             "status": "queued",
-                            "queuePosition": _pos,
-                            "queuedBehindRunId": _b_rid,
-                            "queuedBehindTitle": _b_title,
+                            "queuePosition": _enrich["position"],
+                            "queuedBehindRunId": _enrich["behind_rid"],
+                            "queuedBehindTitle": _enrich["behind_title"],
+                            "queueTotalAhead": _enrich["total_ahead"],
+                            "queueAheadFromSelf": _enrich["ahead_from_self"],
+                            "queueAheadFromOthers": _enrich["ahead_from_others"],
+                            "queueEtaMs": _eta_ms,
+                            "queueEtaComputedAt": _eta_at,
                         })
                     except Exception as _pwerr:
                         log(
@@ -4984,14 +5279,23 @@ def start_firestore_start_listener(job_queue, loop):
                             # 3rd submitted → 3rd FIFO-deferred → 3rd
                             # showed Pipeline Started instead of "Place in
                             # queue #1". This write closes the gap.
+                            #
+                            # 2026-05-25 (banner enrichment): also write
+                            # enriched fields — see busy-running branch
+                            # comment for field-set rationale.
                             try:
-                                _pos, _b_rid, _b_title = _compute_global_queue_position(
-                                    col_ref, doc.id)
+                                _enrich = _compute_queue_enrichment(col_ref, doc.id, uid)
+                                _eta_ms, _eta_at = _read_eta_inputs_and_compute(_enrich["position"])
                                 _update_research_doc(uid, research_id, {
                                     "status": "queued",
-                                    "queuePosition": _pos,
-                                    "queuedBehindRunId": _b_rid,
-                                    "queuedBehindTitle": _b_title,
+                                    "queuePosition": _enrich["position"],
+                                    "queuedBehindRunId": _enrich["behind_rid"],
+                                    "queuedBehindTitle": _enrich["behind_title"],
+                                    "queueTotalAhead": _enrich["total_ahead"],
+                                    "queueAheadFromSelf": _enrich["ahead_from_self"],
+                                    "queueAheadFromOthers": _enrich["ahead_from_others"],
+                                    "queueEtaMs": _eta_ms,
+                                    "queueEtaComputedAt": _eta_at,
                                 })
                             except Exception as _fifo_pwerr:
                                 log(
@@ -9484,6 +9788,41 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # the updated value. Agnostic of caller — every phase_start site gets
     # the runtime invariant for free.
     if event_type == "phase_start" and isinstance(phase, int) and phase >= 0:
+        # 2026-05-25 (queue ETA): publish currentRunPhase +
+        # currentRunPhaseStartedAt to the device doc so queued-doc ETA
+        # computations + the FE banner's "Current run is in Phase X"
+        # line have live source of truth. Worker-1 only (mirrors
+        # currentRunId/Title/StartedAt convention at research.py:~29193;
+        # multi-worker per-worker tracking is a future schema bump).
+        # Fire-and-forget — never block emit_event on a Firestore write.
+        try:
+            if WORKER_ID == 1 and _firebase_db:
+                _did_for_phase = load_device_id()
+                if _did_for_phase:
+                    _phase_patch = {
+                        "currentRunPhase": int(phase),
+                        "currentRunPhaseStartedAt": event["timestamp"],
+                    }
+                    _firebase_db.collection("devices").document(_did_for_phase).update(_phase_patch)
+                    # Refresh ETA on all deferred docs so the FE banner
+                    # countdown stays accurate as the head advances
+                    # through phases. _recompute_deferred_queue_positions
+                    # reads the device doc ETA inputs we just wrote and
+                    # writes updated queueEtaMs to every queued doc.
+                    # Fire-and-forget on a thread so emit_event itself
+                    # stays sub-ms (the recompute does ≤50 Firestore
+                    # reads + ≤450 batch writes — would block the
+                    # event loop if synchronous).
+                    try:
+                        _threading.Thread(
+                            target=_recompute_deferred_queue_positions,
+                            daemon=True,
+                            name="eta-recompute",
+                        ).start()
+                    except Exception as _eta_t_err:
+                        log(f"[device] ETA recompute thread launch failed (non-fatal): {_eta_t_err}", "DEBUG")
+        except Exception as _phase_pub_err:
+            log(f"[device] currentRunPhase publish failed (non-fatal): {_phase_pub_err}", "DEBUG")
         try:
             _runtime.phase = phase
         except Exception:
