@@ -2196,12 +2196,23 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
             continue
         patch: dict = {
             "status": "stopped",
-            "cancelled": True,
             "updatedAt": now_ms,
             "stoppedAt": now_ms,
             "stoppedBy": stopped_by,
             "summary": summary,
         }
+        # 2026-05-26: only mark `cancelled: True` for runs that were
+        # QUEUED (pre-claim, never started executing). Ongoing /
+        # paused / paused_backend_restart runs have partial work
+        # (browser state, intermediate artifacts, possibly emitted
+        # phase events) that the user should see in their listing as
+        # "Stopped" — not silently disappear. The FE's chat-close
+        # cascade-delete fires only on cancelled=true (see
+        # ChatContainer.tsx cancelledRef cleanup ~line 596), so
+        # leaving cancelled unset preserves these runs in the
+        # listing as historical Stopped entries.
+        if status == "queued":
+            patch["cancelled"] = True
         if _DF is not None:
             patch["queuePosition"] = _DF
             patch["queuedBehindRunId"] = _DF
