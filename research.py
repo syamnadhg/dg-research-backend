@@ -34659,6 +34659,13 @@ def run_unpair(deep: bool = False):
         process's os.environ + _RESOLVED_KEY_CACHE — so the next
         --pair Stage 3 actually re-prompts and re-verifies instead
         of short-circuiting on a leftover key.
+      • Transient multi-worker state files at queues/ root
+        (`.worker.*.lock` and `_pending_queue*.json`, including
+        their `.tmp` siblings). Per-run history dirs (research
+        outputs) under queues/ are still preserved. The wiped
+        files are auto-recreated by the next worker's first job
+        pickup, so a same-account re-pair sees a clean slate
+        without losing research history.
     Use this when re-pairing to a different account or when the
     multi-account safety check refuses pair due to stale Google auth.
 
@@ -34974,6 +34981,48 @@ def run_unpair(deep: bool = False):
     if api_keys_wiped:
         print(f"  {_c(_OK, '✓')}  Pair-time API keys cleared (`--deep`) — Stage 3 will re-prompt and re-verify on next --pair.")
 
+    # 2026-05-26: also wipe queues/ runtime-state files under --deep.
+    # Per-run history dirs are intentionally preserved (the rest of
+    # queues/ is "research history" per the docstring); only the
+    # transient multi-worker state files at the root get cleaned —
+    # they're rehydrated lazily on the next worker's first job
+    # pickup (_write_worker_lock auto-creates the dir + lock,
+    # _persist_pending_queue tmp+replaces the snapshot). Stale ones
+    # surviving a cross-account re-pair cause the new BE to try
+    # reprocessing the prior pair's jobs under a uid that doesn't
+    # own them (Firestore 403 noise) and the worker-lock sibling-
+    # claim scanner to see dead-PID locks (handled by the PID-
+    # liveness guard but still ugly). Globs at queues/ root only
+    # — never per-run subdirs, never README.md.
+    queue_state_wiped = 0
+    if deep:
+        try:
+            queues_root = Path(__file__).parent / "queues"
+            if queues_root.exists():
+                _patterns = (
+                    ".worker.*.lock",
+                    ".worker.*.lock.tmp",
+                    "_pending_queue.json",
+                    "_pending_queue_worker_*.json",
+                    "_pending_queue.json.tmp",
+                    "_pending_queue_worker_*.json.tmp",
+                )
+                for _pat in _patterns:
+                    for _stale in queues_root.glob(_pat):
+                        try:
+                            _stale.unlink()
+                            queue_state_wiped += 1
+                        except Exception as _qse:
+                            log(
+                                f"[unpair] queue-state wipe failed for {_stale.name}: {_qse}",
+                                "DEBUG",
+                            )
+        except Exception as _qe:
+            log(f"[unpair] queue-state wipe pass failed (continuing): {_qe}", "WARN")
+    if queue_state_wiped:
+        _plural = "s" if queue_state_wiped != 1 else ""
+        print(f"  {_c(_OK, '✓')}  Cleared {queue_state_wiped} stale worker-state file{_plural} from queues/ (`--deep`).")
+
     # ── [5/5] Verify ──
     _setup_step(5, total, "Confirming silence")
     stragglers = [p for p in _enumerate_research_py_procs()
@@ -35101,7 +35150,7 @@ def run_commands_help():
         ("python research.py --unpair",
          "Fully disconnect this PC (deletes token + device doc + local config)"),
         ("python research.py --unpair --deep",
-         "Same as --unpair, but ALSO wipes browser-profile*/ dirs + pair-time API keys + resets workerCount"),
+         "Same as --unpair, but ALSO wipes browser-profile*/ dirs + pair-time API keys + stale worker-state files + resets workerCount"),
     ])
 
     _section("Advanced", [
