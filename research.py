@@ -4972,6 +4972,33 @@ def start_firestore_start_listener(job_queue, loop):
                                 f"(older unclaimed {_head_id[:8]}… is head)",
                                 "INFO",
                             )
+                            # 2026-05-25 (3rd-run queue regression fix):
+                            # mirror the busy-running defer's authoritative
+                            # queuePosition write so FIFO-deferred docs
+                            # also surface a queue banner on the FE. Prior
+                            # to this, the FIFO branch did `continue` with
+                            # no research-doc write — the doc retained its
+                            # FE-optimistic `status="ongoing"` and the FE
+                            # rendered pipeline tiles for a queued run.
+                            # The user's 2-worker repro: 2 runs running +
+                            # 3rd submitted → 3rd FIFO-deferred → 3rd
+                            # showed Pipeline Started instead of "Place in
+                            # queue #1". This write closes the gap.
+                            try:
+                                _pos, _b_rid, _b_title = _compute_global_queue_position(
+                                    col_ref, doc.id)
+                                _update_research_doc(uid, research_id, {
+                                    "status": "queued",
+                                    "queuePosition": _pos,
+                                    "queuedBehindRunId": _b_rid,
+                                    "queuedBehindTitle": _b_title,
+                                })
+                            except Exception as _fifo_pwerr:
+                                log(
+                                    f"[start-listener] worker {WORKER_ID}: FIFO-defer position write failed for "
+                                    f"{research_id[:8]}… (non-fatal): {_fifo_pwerr}",
+                                    "DEBUG",
+                                )
                             continue
                     except Exception as _fe:
                         log(
