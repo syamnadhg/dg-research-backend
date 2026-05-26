@@ -3522,23 +3522,44 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
             action = (data.get("action") or "").strip()
             log(f"[device-cmds] received action={action!r} doc={doc.id}")
 
-            # Tail-delete BEFORE acting on the command. If we instead
-            # delete after, the brief window between handler-start and
-            # delete is one where a quick reattach (e.g. SDK reconnect)
-            # could observe and re-fire the same command. For
-            # hard_reset specifically, deleting first also means the
-            # *new* serve that respawns won't re-see it.
-            try:
-                doc.reference.delete()
-            except Exception as _de:
-                # Fall back to mark-processed if delete fails (e.g.
-                # transient permission glitch) — at least the doc won't
-                # replay. The startup sweep cleans it up later.
+            # 2026-05-26: HARD_RESET defers the cmd-doc DELETE until AFTER
+            # the sweep completes. The route at reset-pair-code/route.ts:140
+            # polls for cmd-doc deletion as the ack signal, then proceeds
+            # to clear sharedWith[] on the device doc (step 5). Pre-fix the
+            # early-delete acked the route IMMEDIATELY, and route step 5
+            # then ran in parallel with the BE sweep → sharedWith was
+            # cleared mid-sweep → Firestore rule (deviceOwnership re-reads
+            # sharedWith on every write) denied the sharer-tree updates
+            # with 403. Observable in BE log line 37642 at 09:08:58:
+            #   [sweep:hard_reset_sweep] update failed for chat_…: 403
+            #   [sweep:hard_reset_sweep] sharer LQwUbFUp: swept=0 failed=1
+            # → sharer's queued runs stayed at status=queued indefinitely
+            # while owner's runs were correctly flipped.
+            #
+            # Mark processed=true upfront so SDK-reconnect mid-handler
+            # re-fires skip via the processed check at the top of on_snap.
+            # The actual delete happens at the END of the hard_reset
+            # branch (just before the `continue` at line ~4017), so the
+            # route's ack lands only after sharedWith-dependent writes are
+            # done. Other actions keep the original tail-delete-first
+            # semantics.
+            if action == "hard_reset":
                 try:
                     doc.reference.update({"processed": True})
-                except Exception:
-                    pass
-                log(f"[device-cmds] doc cleanup failed for {doc.id}: {_de}", "WARN")
+                except Exception as _de:
+                    log(f"[device-cmds] processed-marker write failed for {doc.id}: {_de}", "DEBUG")
+            else:
+                try:
+                    doc.reference.delete()
+                except Exception as _de:
+                    # Fall back to mark-processed if delete fails (e.g.
+                    # transient permission glitch) — at least the doc won't
+                    # replay. The startup sweep cleans it up later.
+                    try:
+                        doc.reference.update({"processed": True})
+                    except Exception:
+                        pass
+                    log(f"[device-cmds] doc cleanup failed for {doc.id}: {_de}", "WARN")
 
             # ── Action dispatch ──
             if action == "hard_reset":
@@ -3986,6 +4007,16 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                             break
                 except Exception as _enum_err:
                     log(f"[device-cmds] HARD_RESET: supervisor detect failed (assuming foreground): {_enum_err}", "DEBUG")
+
+                # 2026-05-26: delete the cmd doc NOW — sweep is done, so
+                # acking the route here means sharedWith stays populated
+                # through every cross-account write. See the comment block
+                # at the top of the dispatch (action == "hard_reset"
+                # branch) for the full race + fix narrative.
+                try:
+                    doc.reference.delete()
+                except Exception as _de_end:
+                    log(f"[device-cmds] HARD_RESET: cmd-doc delete (post-sweep) failed for {doc.id}: {_de_end}", "DEBUG")
 
                 if _supervisor_alive:
                     log("[device-cmds] HARD_RESET: scheduling exit in 1.5s — daemon-loop will respawn")
