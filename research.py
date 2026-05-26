@@ -20145,6 +20145,43 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
 
+    # 2026-05-25 PRE-FLIGHT: verify a Deep Research side-panel exists
+    # before any tier runs. Two recent E2Es (Kalki + Golden Retriever)
+    # saved 318/101,274 chars of CHAT-side content as gemini.md because
+    # the panel selectors didn't match and tiers fell through to chat
+    # selectors. Failing fast with status=failed (no MD upload) is
+    # better than silently shipping chat as the research output.
+    # Best-effort poll up to ~10s to absorb transient render lag.
+    _panel_selectors_preflight = [
+        'immersive-panel',
+        'deep-research-panel',
+        'aside[class*="artifact" i]',
+        'aside[class*="report" i]',
+        'aside[class*="research" i]',
+        '[role="complementary"][aria-label*="research" i]',
+        '[role="region"][aria-label*="research" i]',
+    ]
+    _panel_found_sel = ""
+    for _attempt in range(5):
+        for _sel in _panel_selectors_preflight:
+            try:
+                _count = await page.evaluate(
+                    f"() => document.querySelectorAll('{_sel}').length"
+                )
+                if _count and int(_count) > 0:
+                    _panel_found_sel = _sel
+                    break
+            except Exception:
+                continue
+        if _panel_found_sel:
+            break
+        await asyncio.sleep(2.0)
+    if _panel_found_sel:
+        log(f"[{label}] DR panel present (selector='{_panel_found_sel}')")
+    else:
+        log(f"[{label}] DR panel NOT present after 10s — upstream submit/Start "
+            f"likely failed; running tiers anyway but expect failure", "WARN")
+
     # 2026-05-24 ARCHITECTURE: tier reorder — Share & Export → Copy
     # contents promoted from T2 to T1, HTML→MD demoted from T1 to T2.
     # Today's E2E (Salaar) showed HTML→MD scraping only the chat-side
@@ -20199,32 +20236,40 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
             log(f"[{label}] T1 returned {len(md)} chars (below 2000-char threshold — "
                 f"likely partial copy or chat ack) — falling to Tier 2", "WARN")
 
-    # ── Tier 2 (FALLBACK): HTML→MD from Gemini's response containers ──
+    # ── Tier 2 (FALLBACK): HTML→MD from Gemini's research-panel containers ──
     # (was Tier 1 pre-2026-05-24; demoted to fallback when CUA Share &
     # Export doesn't produce a full-length report)
     #
-    # 2026-05-21: side-panel selectors come FIRST. The 2026-05+ Gemini
-    # UI renders the Deep Research report in a side-panel artifact
-    # (Contents | Share & Export | Create toolbar) separate from the
-    # chat history. Prior selector list targeted the chat side only —
-    # would return the 200-char ack ("I've completed your research…")
-    # instead of the 23k-47k report. Panel selectors are best-effort
-    # shotgun (we don't know Gemini's exact class names without DOM
-    # inspection) — first match wins via _extract_html_to_md.
+    # 2026-05-25 selector tighten: prior list included `[class*="immersive" i]
+    # message-content` and `[class*="immersive" i] .markdown` — these are
+    # TOO GREEDY because Gemini's 2026-05+ app wraps EVERYTHING (chat
+    # included) in immersive ancestors. The greedy descendants matched
+    # the chat's <message-content>, returning 101,274 chars of chat
+    # (Golden Retriever E2E) as gemini.md. Legacy chat-inline fallbacks
+    # (`message-content`, `.model-response-text`, `.response-container`)
+    # also stripped — they would catch chat-side content when no real
+    # panel exists. Now keep only STRICT side-panel scopes: custom
+    # elements (`immersive-panel`, `deep-research-panel`), aside scopes
+    # with class wildcards, and ARIA role-complementary/role-region
+    # with aria-label="research". If none match, return empty (T3 follows).
     md = await _extract_html_to_md(page, [
-        # New UI (2026-05+): side-panel artifact
-        'immersive-panel', 'deep-research-panel',
-        '[class*="immersive" i] message-content',
-        '[class*="immersive" i] .markdown',
-        '[class*="artifact" i] .markdown',
-        '[class*="report-panel" i] .markdown',
+        # Custom elements — only match the actual panel, not descendants
+        'immersive-panel',
+        'deep-research-panel',
+        # Aside-scoped (aside is structural for side content)
+        'aside immersive-panel',
+        'aside deep-research-panel',
+        'aside[class*="artifact" i] .markdown',
         'aside[class*="artifact" i]',
+        'aside[class*="report" i] .markdown',
         'aside[class*="report" i]',
+        'aside[class*="research" i] .markdown',
         'aside[class*="research" i]',
+        # ARIA role-scoped — explicit research panel intent
+        '[role="complementary"][aria-label*="research" i] .markdown',
         '[role="complementary"][aria-label*="research" i]',
+        '[role="region"][aria-label*="research" i] .markdown',
         '[role="region"][aria-label*="research" i]',
-        # Chat-inline (legacy / accounts pre-artifact rollout)
-        'message-content', '.model-response-text', '.response-container',
     ], label)
     # 2026-05-21: threshold raised 100 → 2000. The new UI's chat side
     # carries a ~200-char ack that would pass both _is_sources_not_
@@ -20248,24 +20293,26 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # JS clipboard hijack intercepts the browser's own copy event before
     # the OS clipboard is touched, so this works on Wayland, X11, Windows,
     # and macOS uniformly. No _IS_WAYLAND gate (that was the old OS-
-    # clipboard path's limitation). First click the response container to
-    # ensure focus is on the response (not the composer); otherwise Ctrl+A
-    # would select only the composer's input text.
+    # clipboard path's limitation). First click the research panel to
+    # ensure focus is on it (not the chat or composer); otherwise Ctrl+A
+    # would select chat history or only the composer's input text.
     async def _gemini_t3_trigger():
-        # Focus the response area before select-all. Without this, focus
-        # may still be in the composer and Ctrl+A selects only the
-        # composer's text (the old Tier 3 inherited this failure mode).
-        # 2026-05-21: side-panel selectors added first so the new UI's
-        # artifact panel (where the report renders) gets focus before
-        # the chat-inline response selectors. Playwright returns first
-        # match, so side panel wins if present, else falls back to
-        # legacy message-content.
+        # Focus the research panel before select-all.
+        # 2026-05-25: focus selectors tightened to side-panel ONLY —
+        # prior list included `[class*="immersive" i]` (too greedy,
+        # matches whole-app immersive wrapper) and chat selectors
+        # `message-content`, `.model-response-text` (selecting these
+        # makes Ctrl+A grab chat transcript, not the research). Now
+        # restricted to explicit panel scopes; if none match, Ctrl+A
+        # selects the page focus default (which is often the panel
+        # after a completed run, but if not, we'll reject by threshold).
         try:
             await page.click(
-                '[class*="immersive" i], aside[class*="artifact" i], '
+                'immersive-panel, deep-research-panel, '
+                'aside[class*="artifact" i], '
                 'aside[class*="report" i], aside[class*="research" i], '
                 '[role="complementary"][aria-label*="research" i], '
-                'message-content, .model-response-text',
+                '[role="region"][aria-label*="research" i]',
                 timeout=2000)
         except Exception:
             # Best-effort — proceed even if click missed; the response
@@ -20289,14 +20336,29 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         except Exception:
             pass
 
+    # 2026-05-25 min_chars raised 100 → 2000 to match T1/T2 floor.
+    # Prior Kalki E2E captured 318 chars of chat fragments and saved
+    # it; with the 2000 floor that path now rejects, agent flips to
+    # status=failed (which is the correct outcome over "ship chat
+    # as research").
     log(f"[{label}] Falling back to select-all + clipboard hijack (Tier 3)", "WARN")
     md = await _run_with_clipboard_hijack(
         page, label, _gemini_t3_trigger,
-        timeout_ms=30000, min_chars=100,
+        timeout_ms=30000, min_chars=2000,
     )
-    if md and len(md) >= 100:
-        log(f"[{label}] Extracted via select-all + clipboard hijack: {len(md)} chars")
-        return md
+    if md and len(md) >= 2000:
+        # Apply same wrong-artifact filters as T2 — T3 has historically
+        # been too permissive (raw select-all can grab anything).
+        if _is_sources_not_document(md, platform="generic"):
+            log(f"[{label}] T3 hijack wrong-artifact ({len(md)} chars) — rejecting", "WARN")
+        elif _looks_like_nav_sidebar(md):
+            log(f"[{label}] T3 hijack looks-like-nav-sidebar ({len(md)} chars) — rejecting", "WARN")
+        else:
+            log(f"[{label}] Extracted via select-all + clipboard hijack: {len(md)} chars")
+            return md
+    elif md:
+        log(f"[{label}] T3 returned {len(md)} chars (below 2000-char threshold — "
+            f"likely chat fragment, not research panel) — rejecting", "WARN")
 
     log(f"[{label}] All extraction tiers failed — returning empty", "ERROR")
     return ""
