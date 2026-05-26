@@ -2544,7 +2544,15 @@ def _read_eta_inputs_and_compute(position: int) -> "tuple[int, int]":
 # this recompute — the next phase_start will refresh ETAs anyway, and
 # the in-flight recompute will pick up whatever device-doc state was
 # fresh when it started.
-_ETA_RECOMPUTE_LOCK = _threading.Lock()
+#
+# 2026-05-25 P0 fix: local `import threading` here — the module-level
+# `import threading as _threading` at line ~4050 is AFTER this code,
+# so the original `_threading.Lock()` raised NameError at module load
+# (worker crashed on startup, daemon-loop respawned tightly = 67+
+# restarts in <5min on the affected E2E). stdlib `threading` is
+# always importable; the local import + alias is the smallest fix.
+import threading as _threading_for_eta_lock  # noqa: E402
+_ETA_RECOMPUTE_LOCK = _threading_for_eta_lock.Lock()
 
 
 def _recompute_deferred_queue_positions() -> None:
