@@ -20615,8 +20615,26 @@ async def _run_with_clipboard_hijack(
             await asyncio.sleep(0.2)
 
         if not captured or len(captured) < min_chars:
+            # Per-frame capture-length distribution — distinguishes
+            # "one frame caught a short capture, others dry" (selector
+            # / scope problem) from "all frames dry" (trigger never
+            # produced a copy event in any frame at all). The aggregate
+            # `frames=N` count alone can't tell those apart, which made
+            # the 2026-05-25 Kalki Gemini T1 zero-char failure hard to
+            # diagnose. -1 entries mean the frame detached between the
+            # poll loop and this introspection.
+            per_frame_lens = []
+            for tgt in installed_targets:
+                try:
+                    _l = await tgt.evaluate(
+                        "() => (window.__dg_cb_captured_text || '').length"
+                    )
+                    per_frame_lens.append(int(_l))
+                except Exception:
+                    per_frame_lens.append(-1)
             log(f"[{label}] Clipboard hijack: captured {len(captured or '')} "
-                f"chars < min {min_chars} (frames={len(installed_targets)})", "WARN")
+                f"chars < min {min_chars} (frames={len(installed_targets)} "
+                f"lens={per_frame_lens})", "WARN")
             return ""
         log(f"[{label}] Clipboard hijack captured {len(captured)} chars "
             f"(across {len(installed_targets)} frame target(s))")
