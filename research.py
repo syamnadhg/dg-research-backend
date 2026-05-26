@@ -16962,6 +16962,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # it — known gap, tracked for future iteration).
             "gemini_safety_net_reload_done": False,
             "gemini_safety_net_done": False,
+            # Pinned at the 10-min reload (after goto-back settle).
+            # The 15-min paste branch checks current URL against this
+            # to guarantee the follow-up lands in the SAME research
+            # conversation, not a fresh chat the SPA might have opened.
+            "gemini_safety_net_conv_url": "",
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -17117,7 +17122,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              # post-resume Gemini run gets fresh 10/15min
                                              # safety-net timers relative to its new start.
                                              "gemini_safety_net_reload_done": False,
-                                             "gemini_safety_net_done": False}
+                                             "gemini_safety_net_done": False,
+                                             "gemini_safety_net_conv_url": ""}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
                         else:
@@ -17325,6 +17331,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # new start_time.
                 "gemini_safety_net_reload_done": False,
                 "gemini_safety_net_done": False,
+                "gemini_safety_net_conv_url": "",
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
@@ -17798,6 +17805,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 f"failed (non-fatal): {_inj_err}",
                                 "DEBUG",
                             )
+                        # Pin the canonical research-conversation URL —
+                        # whatever we landed on AFTER reload + goto-back
+                        # settled. The 15-min paste branch will verify
+                        # the URL still matches this exact value before
+                        # firing paste_followup; if it has drifted to
+                        # any other URL (e.g., a fresh chat opened by
+                        # a stray SPA event), the paste aborts.
+                        try:
+                            p["gemini_safety_net_conv_url"] = (
+                                p["page"].url or ""
+                            )
+                            log(
+                                f"[Gemini] safety-net pinned conversation "
+                                f"URL: {p['gemini_safety_net_conv_url']}"
+                            )
+                        except Exception:
+                            p["gemini_safety_net_conv_url"] = (
+                                _url_pre_reload or ""
+                            )
                         # Reset baselines so the no-growth + stuck
                         # watchdog don't fire from the reload window.
                         _now = time.time()
@@ -17837,27 +17863,59 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             _safety_url_now = p["page"].url or ""
                         except Exception:
                             _safety_url_now = ""
-                        # URL sanity gate — only send into a URL that
-                        # looks like a real conversation. Sending into
-                        # the bare /app root would create a NEW chat
-                        # (the prior 2-E2E miss) and BE extraction
-                        # would then pull from the empty new chat.
-                        _looks_like_conversation = (
-                            "/chat/" in _safety_url_now
-                            or (
-                                "/app/" in _safety_url_now
-                                and _safety_url_now.rstrip("/").split("/app/")[-1].strip() != ""
+                        # STRICT canonical-URL check — must equal the URL
+                        # pinned at the 10-min reload (after goto-back
+                        # settle). This is stronger than a /chat/ or
+                        # /app/<id> shape check: if Gemini's SPA opened
+                        # a fresh chat at a DIFFERENT /app/<id> sometime
+                        # between minute 10 and 15, the shape check
+                        # would still pass but the paste would land in
+                        # the wrong chat. The strict equality guards
+                        # against that.
+                        #
+                        # Fallback (no pinned URL — means the 10-min
+                        # branch never ran, e.g., the run was paused/
+                        # resumed past 15min so the reload was skipped):
+                        # apply the looser shape check so we at least
+                        # never paste into a bare /app root.
+                        _pinned_conv_url = p.get(
+                            "gemini_safety_net_conv_url", ""
+                        ) or ""
+                        if _pinned_conv_url:
+                            _url_ok = (_safety_url_now == _pinned_conv_url)
+                            if not _url_ok:
+                                log(
+                                    f"[Gemini] 15-min safety-net paste "
+                                    f"ABORTED — URL drifted off the "
+                                    f"pinned research conversation: "
+                                    f"pinned={_pinned_conv_url} now="
+                                    f"{_safety_url_now}. 20-min flat "
+                                    f"watchdog will catch if truly stuck.",
+                                    "WARN",
+                                )
+                        else:
+                            _url_ok = (
+                                "/chat/" in _safety_url_now
+                                or (
+                                    "/app/" in _safety_url_now
+                                    and _safety_url_now.rstrip("/").split(
+                                        "/app/"
+                                    )[-1].strip() != ""
+                                )
                             )
-                        )
-                        if not _looks_like_conversation:
-                            log(
-                                f"[Gemini] 15-min safety-net paste ABORTED "
-                                f"— URL doesn't look like a research "
-                                f"conversation: {_safety_url_now} (would "
-                                f"create a new chat). 20-min flat watchdog "
-                                f"will catch if truly stuck.",
-                                "WARN",
-                            )
+                            if not _url_ok:
+                                log(
+                                    f"[Gemini] 15-min safety-net paste "
+                                    f"ABORTED — no pinned URL (10-min "
+                                    f"reload was skipped) and current "
+                                    f"URL doesn't look like a research "
+                                    f"conversation: {_safety_url_now}. "
+                                    f"20-min flat watchdog will catch "
+                                    f"if truly stuck.",
+                                    "WARN",
+                                )
+                        if not _url_ok:
+                            pass  # already logged above
                         else:
                             log(
                                 "[Gemini] 15-min safety net firing — "
