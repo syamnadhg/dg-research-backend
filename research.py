@@ -16941,19 +16941,26 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "claude_clarification_replied": False,  # one-shot flag for clarification-defer reply
             "gemini_kickoff_nudge_count": 0,        # multi-shot nudge counter (max 3, 3min apart) for Gemini kickoff-stall
             "gemini_last_kickoff_nudge_at": 0.0,    # timestamp gate enforcing 3min spacing between Gemini kickoff nudges
-            # 2026-05-25 Gemini 15-min DOM-staleness safety net. User-
-            # observed: post-2026-05 Gemini UI update, the conversation
-            # DOM sometimes freezes while server-side research is done —
-            # CUA reads the stale screenshot as "still generating" and
-            # the run sits indefinitely. Manual workaround: reload tab
-            # + send "Is the Research completed?" — both empirically
-            # required to unstick. Encoded here as a one-shot at
-            # elapsed >= 15min. If a long Gemini run stalls TWICE (rare
-            # — would need post-15min recovery + later re-stall), this
-            # net only catches the first stall; the generic no-growth
-            # watchdog at 20-min flat covers later ones (though Gemini's
-            # status="researching" can suppress it — known gap, tracked
-            # for future iteration if it surfaces in prod).
+            # 2026-05-25 Gemini DOM-staleness safety net (iter #2).
+            # Post-2026-05 Gemini UI: conversation DOM sometimes freezes
+            # while server-side research is done — CUA reads the stale
+            # screenshot as "still generating" and the run sits.
+            # Manual workaround empirically validated by user:
+            #   (a) hard refresh re-enables the disabled-post-DR composer
+            #   (b) sending "Is the Research completed?" then unsticks
+            # Encoded as TWO one-shot timers split for safety:
+            #   reload at elapsed >= 10*60  (unblocks composer)
+            #   paste  at elapsed >= 15*60  (asks for confirmation)
+            # 5-min gap lets Gemini's SPA rehydrate the conversation
+            # URL before the paste — without the gap (prior single-shot
+            # at 15min) the paste landed in a new chat and the BE
+            # extracted the wrong content (Kalki + Golden Retriever
+            # 2026-05-25 E2Es). If a long Gemini run stalls TWICE
+            # (rare), these nets only catch the first stall; the
+            # generic no-growth watchdog at 20-min flat covers later
+            # ones (though Gemini's status="researching" can suppress
+            # it — known gap, tracked for future iteration).
+            "gemini_safety_net_reload_done": False,
             "gemini_safety_net_done": False,
         }
         # Register for mid-run input dispatcher
@@ -17107,8 +17114,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "claude_clarification_replied": False,
                                              # 2026-05-25: explicit-init parity with the
                                              # main pending dict (research.py:~16940). A
-                                             # post-resume Gemini run gets a fresh 15-min
-                                             # safety net relative to its new start_time.
+                                             # post-resume Gemini run gets fresh 10/15min
+                                             # safety-net timers relative to its new start.
+                                             "gemini_safety_net_reload_done": False,
                                              "gemini_safety_net_done": False}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
@@ -17312,8 +17320,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "hard_retry_count": _hard_count,
                 "claude_clarification_replied": False,
                 # 2026-05-25: explicit-init parity with the main pending
-                # dict (research.py:~16940). A hard-retried Gemini run gets
-                # a fresh 15-min safety net relative to its new start_time.
+                # dict (research.py:~16940). A hard-retried Gemini run
+                # gets fresh 10/15min safety-net timers relative to its
+                # new start_time.
+                "gemini_safety_net_reload_done": False,
                 "gemini_safety_net_done": False,
             }
             _runtime.register_page(_agent_key, new_page,
@@ -17657,6 +17667,153 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # ACK-without-research-card case. The two cannot overlap.
             # Resets on content growth so a long-but-genuinely-streaming
             # run can re-arm the net if it stalls again past minute 15.
+            # 2026-05-25 (post-2-E2E iteration #2) — Gemini safety net
+            # SPLIT into two timers, per user's empirical workflow:
+            #
+            #   T=10min  one-shot page.reload()  → unblocks the composer
+            #            (post-DR Gemini disables follow-up input until
+            #            a hard refresh; reload re-enables it but lands
+            #            us on a freshly-hydrated chat view).
+            #
+            #   T=15min  one-shot paste_followup ("Is the Research
+            #            completed?")  → unsticks the stale-DOM / CUA-
+            #            misreads-complete state. Sends into whichever
+            #            chat the page is currently on — guarded by a
+            #            URL sanity gate so we don't write to a NEW
+            #            chat if the prior reload drifted us to the
+            #            app root.
+            #
+            # Why split: the prior single-shot at 15min did reload+paste
+            # back-to-back. The 8s post-reload sleep wasn't enough for
+            # Gemini's SPA to rehydrate the conversation; paste_followup
+            # then landed in a fresh new-chat composer instead of the
+            # ongoing research chat. The BE later extracted from that
+            # new chat (which had no DR panel at all) and shipped the
+            # short reply as gemini.md — the "literally invaluable"
+            # MDs in both 2026-05-25 E2Es (Kalki + Golden Retriever).
+            # 5min gap between reload and paste gives the SPA ample
+            # time to settle on the conversation URL before we send.
+            #
+            # Each timer is one-shot per run (reset on hard-retry, see
+            # research.py:~17313). Orthogonal to the kickoff-stall
+            # multi-shot nudge (lines ~17421-17485) which only fires
+            # at elapsed ≤ 600s for the ACK-without-research-card case.
+
+            # ── 10-min reload (one-shot) ──
+            if (
+                name == "Gemini"
+                and elapsed >= 10 * 60
+                and not p.get("gemini_safety_net_reload_done")
+                and not p.get("dns_retry_at")
+            ):
+                try:
+                    _body_text_10 = await p["page"].evaluate(
+                        "() => (document.body.innerText || '').slice(0, 8000)"
+                    )
+                    if _GEMINI_COMPLETION_RE.search(_body_text_10 or ""):
+                        # Already complete by 10min — both timers skip;
+                        # detect_completion_gemini handles the actual
+                        # extract on next iteration.
+                        p["gemini_safety_net_reload_done"] = True
+                        p["gemini_safety_net_done"] = True
+                        log(
+                            "[Gemini] 10-min safety net: completion text "
+                            "already on page — skipping reload + paste"
+                        )
+                    else:
+                        p["gemini_safety_net_reload_done"] = True
+                        _url_pre_reload = ""
+                        try:
+                            _url_pre_reload = p["page"].url or ""
+                        except Exception:
+                            _url_pre_reload = ""
+                        log(
+                            "[Gemini] 10-min safety-net reload firing — "
+                            f"page.reload() to unblock composer for the "
+                            f"15min follow-up. URL pre-reload={_url_pre_reload}"
+                        )
+                        try:
+                            emit_event(
+                                "agent_progress", phase=2, agent="gemini",
+                                status="generating",
+                                progress=(
+                                    "Gemini past 10 min — refreshing the "
+                                    "page so the composer can accept a "
+                                    "follow-up at 15 min."
+                                ),
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await p["page"].reload(
+                                wait_until="domcontentloaded", timeout=20000
+                            )
+                        except Exception as _re:
+                            log(
+                                f"[Gemini] 10-min reload raised "
+                                f"(non-fatal): {_re}",
+                                "WARN",
+                            )
+                        await asyncio.sleep(5.0)
+                        # If the reload drifted us off the conversation
+                        # URL, navigate back. Only attempt if the
+                        # pre-reload URL had a path component beyond
+                        # the bare app root.
+                        try:
+                            _url_post_reload = p["page"].url or ""
+                            _pre_meaningful = (
+                                _url_pre_reload
+                                and _url_pre_reload != _url_post_reload
+                                and ("/app/" in _url_pre_reload
+                                     or "/chat/" in _url_pre_reload)
+                                and _url_pre_reload.rstrip("/").split("/")[-1] != "app"
+                            )
+                            if _pre_meaningful:
+                                log(
+                                    f"[Gemini] post-reload URL drifted: "
+                                    f"{_url_pre_reload} → {_url_post_reload} "
+                                    f"— navigating back to preserve conversation",
+                                    "WARN",
+                                )
+                                try:
+                                    await p["page"].goto(
+                                        _url_pre_reload,
+                                        wait_until="domcontentloaded",
+                                        timeout=20000,
+                                    )
+                                    await asyncio.sleep(3.0)
+                                except Exception as _gge:
+                                    log(
+                                        f"[Gemini] safety-net goto back "
+                                        f"raised (non-fatal): {_gge}",
+                                        "WARN",
+                                    )
+                        except Exception:
+                            pass
+                        try:
+                            await inject_agent_observer(p["page"], "gemini")
+                        except Exception as _inj_err:
+                            log(
+                                f"[Gemini] post-reload observer re-inject "
+                                f"failed (non-fatal): {_inj_err}",
+                                "DEBUG",
+                            )
+                        # Reset baselines so the no-growth + stuck
+                        # watchdog don't fire from the reload window.
+                        _now = time.time()
+                        p["last_growth_time"] = _now
+                        p["last_heartbeat"] = _now
+                        p["stuck_warned_at"] = 0
+                        p["last_cua_check"] = _now
+                except Exception as _gre:
+                    log(
+                        f"[Gemini] 10-min safety net raised "
+                        f"(non-fatal): {_gre}",
+                        "WARN",
+                    )
+                continue
+
+            # ── 15-min paste_followup (one-shot, URL-sanity-gated) ──
             if (
                 name == "Gemini"
                 and elapsed >= 15 * 60
@@ -17668,75 +17825,106 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "() => (document.body.innerText || '').slice(0, 8000)"
                     )
                     if _GEMINI_COMPLETION_RE.search(_body_text or ""):
-                        # Completion already showing — skip the reload+ask
-                        # entirely. Mark done so we don't re-check on each
-                        # tick. The detect_completion_gemini path will pick
-                        # up the actual extraction on the next iteration.
                         p["gemini_safety_net_done"] = True
                         log(
                             "[Gemini] 15-min safety net: completion text "
-                            "already on page — skipping reload+ask"
+                            "already on page — skipping paste"
                         )
                     else:
                         p["gemini_safety_net_done"] = True
-                        log(
-                            "[Gemini] 15-min safety net firing — page.reload "
-                            "+ 'Is the Research completed?' (DOM-staleness "
-                            "workaround for post-2026-05 Gemini UI)"
-                        )
+                        _safety_url_now = ""
                         try:
-                            emit_event(
-                                "agent_progress", phase=2, agent="gemini",
-                                status="generating",
-                                progress=(
-                                    "Gemini past 15 min — refreshing the page "
-                                    "and asking it to confirm completion."
-                                ),
-                            )
+                            _safety_url_now = p["page"].url or ""
                         except Exception:
-                            pass
-                        await p["page"].reload(
-                            wait_until="domcontentloaded", timeout=20000
-                        )
-                        # 8s sleep lets Gemini's composer remount fully —
-                        # advisor verified 5s was too thin for the post-DR
-                        # conversation layout. Without it paste_followup
-                        # races verified_paste_brief through retries.
-                        await asyncio.sleep(8.0)
-                        try:
-                            await inject_agent_observer(p["page"], "gemini")
-                        except Exception as _inj_err:
-                            log(
-                                f"[Gemini] safety-net observer re-inject "
-                                f"failed (non-fatal): {_inj_err}",
-                                "DEBUG",
+                            _safety_url_now = ""
+                        # URL sanity gate — only send into a URL that
+                        # looks like a real conversation. Sending into
+                        # the bare /app root would create a NEW chat
+                        # (the prior 2-E2E miss) and BE extraction
+                        # would then pull from the empty new chat.
+                        _looks_like_conversation = (
+                            "/chat/" in _safety_url_now
+                            or (
+                                "/app/" in _safety_url_now
+                                and _safety_url_now.rstrip("/").split("/app/")[-1].strip() != ""
                             )
-                        await paste_followup(
-                            p["page"],
-                            "Is the Research completed?",
-                            "gemini",
-                            label="Gemini-safety-net",
                         )
-                        # Reset baselines so the no-growth + stuck watchdog
-                        # don't fire from the pre-reload stall window.
-                        # last_cua_check reset prevents a CUA tier-3 from
-                        # piling on within seconds of the reload (the gate
-                        # at line ~18094 wants > 1200s since last CUA).
-                        _now = time.time()
-                        p["last_growth_time"] = _now
-                        p["last_heartbeat"] = _now
-                        p["stuck_warned_at"] = 0
-                        p["last_cua_check"] = _now
+                        if not _looks_like_conversation:
+                            log(
+                                f"[Gemini] 15-min safety-net paste ABORTED "
+                                f"— URL doesn't look like a research "
+                                f"conversation: {_safety_url_now} (would "
+                                f"create a new chat). 20-min flat watchdog "
+                                f"will catch if truly stuck.",
+                                "WARN",
+                            )
+                        else:
+                            log(
+                                "[Gemini] 15-min safety net firing — "
+                                f"sending 'Is the Research completed?' "
+                                f"to URL={_safety_url_now}"
+                            )
+                            try:
+                                emit_event(
+                                    "agent_progress", phase=2, agent="gemini",
+                                    status="generating",
+                                    progress=(
+                                        "Gemini past 15 min — asking it "
+                                        "to confirm completion in the "
+                                        "existing research chat."
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                await inject_agent_observer(p["page"], "gemini")
+                            except Exception as _inj_err:
+                                log(
+                                    f"[Gemini] safety-net observer re-inject "
+                                    f"failed (non-fatal): {_inj_err}",
+                                    "DEBUG",
+                                )
+                            _paste_ok = await paste_followup(
+                                p["page"],
+                                "Is the Research completed?",
+                                "gemini",
+                                label="Gemini-safety-net",
+                            )
+                            # Post-paste URL log — catches the case where
+                            # paste_followup itself navigated (shouldn't,
+                            # but belt-and-suspenders given today's miss).
+                            try:
+                                _safety_url_post = p["page"].url or ""
+                                if (_safety_url_now and _safety_url_post
+                                        and _safety_url_post != _safety_url_now):
+                                    log(
+                                        f"[Gemini] safety-net post-paste "
+                                        f"URL drifted: {_safety_url_now} → "
+                                        f"{_safety_url_post} — the follow-"
+                                        f"up may have landed in a wrong chat",
+                                        "WARN",
+                                    )
+                            except Exception:
+                                pass
+                            if not _paste_ok:
+                                log(
+                                    "[Gemini] safety-net paste_followup "
+                                    "returned False — composer rejected "
+                                    "input; 20-min flat watchdog will "
+                                    "catch if no growth",
+                                    "WARN",
+                                )
+                            _now = time.time()
+                            p["last_growth_time"] = _now
+                            p["last_heartbeat"] = _now
+                            p["stuck_warned_at"] = 0
+                            p["last_cua_check"] = _now
                 except Exception as _gse:
                     log(
                         f"[Gemini] 15-min safety net raised "
                         f"(non-fatal): {_gse}",
                         "WARN",
                     )
-                    # Don't unflip gemini_safety_net_done — if the reload
-                    # itself failed (network blip, tab crashed), the
-                    # browser-crash sweep above will catch a dead tab on
-                    # next tick. We don't want to spam retries.
                 continue
 
             # DOM scrape (primary); MutationObserver handles token-level stream separately.
