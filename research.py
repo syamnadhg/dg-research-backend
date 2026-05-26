@@ -3618,17 +3618,28 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                                     from google.cloud.firestore import DELETE_FIELD as _ACT_DF
                                 except Exception:
                                     _ACT_DF = None  # type: ignore
+                                # 2026-05-26: do NOT set `cancelled: True`
+                                # on the active run. It was status=ongoing
+                                # with real partial work (browser state,
+                                # intermediate phase artifacts, possibly
+                                # emitted phase events). User wants it
+                                # preserved in the listing as "Stopped"
+                                # rather than silently purged by FE's
+                                # chat-close cascade. Summary copy also
+                                # reflects the actual event (Stopped, not
+                                # Cancelled).
                                 _act_patch: dict = {
                                     "status": "stopped",
-                                    "summary": "Cancelled by Reset Backend",
-                                    "cancelled": True,
+                                    "summary": "Stopped by Reset Backend",
+                                    "stoppedBy": "hard_reset_active",
+                                    "stoppedAt": int(time.time() * 1000),
                                 }
                                 if _ACT_DF is not None:
                                     _act_patch["queuePosition"] = _ACT_DF
                                     _act_patch["queuedBehindRunId"] = _ACT_DF
                                     _act_patch["queuedBehindTitle"] = _ACT_DF
                                 _update_research_doc(_au, _ar, _act_patch)
-                                log(f"[device-cmds] HARD_RESET: flipped active run {_ar[:24]}… to cancelled")
+                                log(f"[device-cmds] HARD_RESET: flipped active run {_ar[:24]}… to stopped (preserved in listing)")
                         except Exception as _act_err:
                             log(f"[device-cmds] HARD_RESET: active-run cancel-flip failed: {_act_err}", "WARN")
                 except NameError:
@@ -3731,10 +3742,20 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                             _qr = _qjob.get("research_id") or ""
                             if not _qu or not _qr:
                                 continue
+                            # 2026-05-26: drained deque jobs were CLAIMED
+                            # by this worker (status=ongoing in Firestore
+                            # via the claim path) but the actual phase
+                            # work hadn't started yet. They have SOME
+                            # state (queue_dir on disk, claim metadata)
+                            # so preserve them in the listing as
+                            # "Stopped" — same semantic as the active
+                            # run above. User can manually delete from
+                            # the listing if undesired.
                             _patch: dict = {
                                 "status": "stopped",
-                                "summary": "Cancelled by Reset Backend",
-                                "cancelled": True,
+                                "summary": "Stopped by Reset Backend",
+                                "stoppedBy": "hard_reset_drained",
+                                "stoppedAt": int(time.time() * 1000),
                             }
                             if _DRAIN_DF is not None:
                                 _patch["queuePosition"] = _DRAIN_DF
