@@ -13873,6 +13873,55 @@ def _is_sources_not_document(text, *, platform="generic"):
     return False
 
 
+def _strip_gemini_panel_noise(md: str) -> str:
+    """Trim Gemini's research-panel chrome + post-report noise from the
+    raw HTML→MD (T2) or select-all (T3) extraction.
+
+    Gemini's `<immersive-panel>` legitimately contains, after the formal
+    report body, a "Sources used in the report" section followed by
+    hundreds of citation chips interleaved with Gemini's own thinking-
+    trace narration ("Researching websites…", planning-header runs
+    without `##` markers). All of that lives inside the same DOM scope
+    our selectors match — tighter selectors can't exclude it, strip
+    after the html2text pass instead.
+
+    Strips:
+      1. Leading toolbar chrome (`Contents` / `Share & Export` / `Create`)
+         that Gemini's app shell renders inside the panel root.
+      2. Everything at and after `Sources used in the report` — the
+         marker is Gemini's UI label, never an author-written heading;
+         additionally require a URL-shaped token within ~200 chars
+         after the marker to guard against a hypothetical user-prompt
+         phrasing collision.
+      3. Collapses runs of 3+ blank lines left by the strips.
+
+    Idempotent — safe to call twice."""
+    if not md:
+        return md
+    # Toolbar chrome. Gemini renders this as a single line
+    # "ContentsShare & Export" (no separator between the section
+    # heading text and the menu label after html_to_markdown collapses
+    # the nested elements) followed by "Create" on its own line. Both
+    # sit near the top of the panel but AFTER the Gemini Deep Research
+    # header + prompt-echo, so MULTILINE not start-anchored.
+    md = re.sub(
+        r'(?m)^\s*ContentsShare & Export\s*$\n+\s*Create\s*$\n+',
+        '',
+        md,
+    )
+    # Strip from "Sources used in the report" to EOF iff a URL appears
+    # in the next ~200 chars (confirms Gemini citation panel, not a
+    # collision with author phrasing).
+    m = re.search(r'^\s*Sources used in the report\s*$', md, re.MULTILINE)
+    if m:
+        lookahead = md[m.end(): m.end() + 200]
+        if re.search(r'https?://', lookahead):
+            md = md[:m.start()].rstrip()
+    # Collapse 3+ blank lines (the strips can leave awkward gaps).
+    md = re.sub(r'\n{3,}', '\n\n', md)
+    return md
+
+
 async def _close_claude_artifact_panel(page):
     """Close the artifact panel by pressing Escape or clicking close."""
     try:
@@ -20891,6 +20940,14 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         '[role="region"][aria-label*="research" i] .markdown',
         '[role="region"][aria-label*="research" i]',
     ], label)
+    # 2026-05-25: strip Gemini's panel chrome + post-report sources/
+    # thinking-trace noise BEFORE the threshold check. The 146kb Kalki
+    # gemini.md (2026-05-25 E2E) had ~70kb of clean report and ~76kb of
+    # citation chips + planning narration after a "Sources used in the
+    # report" marker; selectors can't exclude that because it lives
+    # inside the same panel DOM. Helper is idempotent.
+    if md:
+        md = _strip_gemini_panel_noise(md)
     # 2026-05-21: threshold raised 100 → 2000. The new UI's chat side
     # carries a ~200-char ack that would pass both _is_sources_not_
     # document and _looks_like_nav_sidebar — shipping it as the report
@@ -20966,6 +21023,10 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         page, label, _gemini_t3_trigger,
         timeout_ms=30000, min_chars=2000,
     )
+    # 2026-05-25: same noise strip as T2 — select-all can grab the
+    # panel chrome + sources tail too.
+    if md:
+        md = _strip_gemini_panel_noise(md)
     if md and len(md) >= 2000:
         # Apply same wrong-artifact filters as T2 — T3 has historically
         # been too permissive (raw select-all can grab anything).
