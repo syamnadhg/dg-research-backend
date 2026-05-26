@@ -2327,7 +2327,10 @@ def _compute_global_queue_position(col_ref, my_doc_id: str) -> "tuple[int, str, 
 # Phase-duration heuristics for ETA estimation. Values are ROUGH typical
 # durations from prod traces; ETA copy on the FE is intentionally fuzzy
 # (rounded to 5-min granularity above 15min, "~1 hr 14 min" above 60min)
-# to honor the imprecision. Tune from `run_analytics.json` longer-term.
+# to honor the imprecision. Prefer per-device analytics (loaded by
+# `load_analytics()` into `_phase_averages` from run_analytics.json) via
+# `_phase_estimate_ms` — these constants are the FRESH-INSTALL fallback
+# when analytics is empty.
 QUEUE_ETA_PHASE_MS = {
     0: 30 * 1000,       # P0 init — ~30s
     1: 7 * 60 * 1000,   # P1 brief — ~7 min
@@ -2336,6 +2339,41 @@ QUEUE_ETA_PHASE_MS = {
     4: 3 * 60 * 1000,   # P4 FE YouTube — ~3 min
     5: 30 * 1000,       # P5 FE delivery — ~30s
 }
+
+
+def _phase_estimate_ms(phase: int) -> int:
+    """Per-phase duration estimate, in milliseconds. Prefers the learned
+    per-device analytics (in-memory `_phase_averages`, populated from
+    `run_analytics.json` at startup + after each phase completes) over
+    the device-agnostic hardcoded `QUEUE_ETA_PHASE_MS`. Falls back to
+    the hardcoded value when analytics is empty (fresh install) or
+    missing for this specific phase. `_phase_averages` stores SECONDS
+    keyed by phase int; convert to ms here.
+
+    Forward-reference safe — `_phase_averages` is defined at module
+    line ~4001 (post-helper-definition) but Python resolves globals
+    at call time so this works as long as `load_analytics()` has run
+    before any `_estimate_queue_eta_ms` call (it runs in server
+    startup, well before listeners fire)."""
+    try:
+        avg_sec = _phase_averages.get(phase, 0)
+        if avg_sec and avg_sec > 0:
+            return int(avg_sec * 1000)
+    except Exception:
+        pass
+    return QUEUE_ETA_PHASE_MS.get(phase, 0)
+
+
+def _typical_run_ms() -> int:
+    """Sum of per-phase estimates for one full run, using analytics where
+    available. Replaces the module-level QUEUE_ETA_TYPICAL_RUN_MS
+    constant — computing per-call is cheap (6 dict lookups) and keeps
+    the value live with analytics updates from `record_phase_duration`."""
+    return sum(_phase_estimate_ms(p) for p in range(6))
+
+
+# Legacy alias retained for any external callers; deprecated in favor of
+# `_typical_run_ms()` which respects learned analytics.
 QUEUE_ETA_TYPICAL_RUN_MS = sum(QUEUE_ETA_PHASE_MS.values())  # ~51 min
 
 
@@ -2378,7 +2416,13 @@ def _estimate_queue_eta_ms(
     if position < 1:
         return 0
     _head_phase = max(0, min(5, int(head_phase or 0)))
-    _expected_head_phase_ms = QUEUE_ETA_PHASE_MS.get(_head_phase, 0)
+    # 2026-05-26: switched from hardcoded QUEUE_ETA_PHASE_MS lookups to
+    # _phase_estimate_ms which prefers per-device analytics. The
+    # heuristic constants under-estimate by ~half on this device's
+    # actual traces (P1: 7min hardcoded vs 12min analytics; P2: 22min
+    # vs 56min). Switching halves the "Estimated start" undershoot
+    # and produces ETAs that match observed completion times.
+    _expected_head_phase_ms = _phase_estimate_ms(_head_phase)
     _started_at = int(head_phase_started_at_ms or 0)
     _now_ms = int(time.time() * 1000)
     if _started_at > 0:
@@ -2390,12 +2434,12 @@ def _estimate_queue_eta_ms(
         # than undershoot — undershoots produce "stuck at 0 min" UX.
         _remaining_in_head_phase = _expected_head_phase_ms
     _remaining_phases_for_head = sum(
-        QUEUE_ETA_PHASE_MS.get(p, 0) for p in range(_head_phase + 1, 6)
+        _phase_estimate_ms(p) for p in range(_head_phase + 1, 6)
     )
     _remaining_for_head = _remaining_in_head_phase + _remaining_phases_for_head
     _w = max(1, int(worker_count or 1))
     _rotations = max(0, (position - 1) // _w)
-    return int(_remaining_for_head + QUEUE_ETA_TYPICAL_RUN_MS * _rotations)
+    return int(_remaining_for_head + _typical_run_ms() * _rotations)
 
 
 def _compute_queue_enrichment(col_ref, my_doc_id: str, my_uid: str) -> dict:
