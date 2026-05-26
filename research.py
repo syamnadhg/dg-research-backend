@@ -5240,6 +5240,53 @@ def start_firestore_start_listener(job_queue, loop):
                         f"reason={_defer_reason}",
                         "INFO",
                     )
+                    # 2026-05-26 (2nd-fire-on-2-worker flicker fix): settle
+                    # window + re-check before writing status=queued. If a
+                    # sibling worker is idle and claims this doc within the
+                    # window, the doc transitions queue → ongoing in <1s.
+                    # Without the settle, our busy-defer wrote status=queued
+                    # FIRST, the FE's listener rendered the amber queue
+                    # banner, THEN the sibling's claim wrote status=ongoing
+                    # and the banner transitioned to green/hidden — the
+                    # user-visible "shows queue banner (#1) → pipeline
+                    # started banner → goes into the run" flicker on the
+                    # 2nd fire. Skipping the queued write when a sibling
+                    # has already claimed (assignedWorker set, OR queue doc
+                    # deleted post-claim) eliminates the flicker. For the
+                    # genuine-queue case (all workers busy), the sibling
+                    # check fails after the window and we proceed to write
+                    # — the 600ms latency is invisible against minutes of
+                    # queue wait. Per user spec: "If there are N workers,
+                    # only post Nth fire gets queue treatment."
+                    try:
+                        time.sleep(0.6)
+                        _q_snap = doc.reference.get()
+                        if not _q_snap.exists:
+                            log(
+                                f"[start-listener] worker {WORKER_ID}: post-defer re-check "
+                                f"{research_id[:8]}… — sibling claimed + deleted, skipping queued write",
+                                "DEBUG",
+                            )
+                            continue
+                        _q_data = _q_snap.to_dict() or {}
+                        if _q_data.get("assignedWorker"):
+                            log(
+                                f"[start-listener] worker {WORKER_ID}: post-defer re-check "
+                                f"{research_id[:8]}… — sibling claimed (worker={_q_data.get('assignedWorker')}), "
+                                f"skipping queued write",
+                                "DEBUG",
+                            )
+                            continue
+                    except Exception as _rce:
+                        # Re-check failed (transient Firestore error). Fall
+                        # through to the queued write — the FE banner is
+                        # better than a silent stale state if the doc
+                        # genuinely IS queued.
+                        log(
+                            f"[start-listener] worker {WORKER_ID}: post-defer re-check raised "
+                            f"(allowing queued write): {_rce}",
+                            "DEBUG",
+                        )
                     # Bug A fix (2026-05-22): write authoritative
                     # queuePosition to the research doc so the FE
                     # displays the correct cross-account number. The
