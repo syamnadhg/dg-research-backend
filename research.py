@@ -5819,11 +5819,21 @@ def _clear_current_run_id_best_effort(reason: str) -> None:
         _did = load_device_id()
         if not _did:
             return
+        # 2026-05-26: also clear the phase fields. Without these, a STOP /
+        # hard_reset / Phoenix exit left `currentRunPhase` pointing at the
+        # terminal phase of the just-stopped run. The next run's first
+        # phase_start emit would overwrite, but in the gap between worker-1
+        # picking up the new job and that emit landing, the FE QueuedBanner
+        # head-phase line would show the prior run's stale phase. Pair this
+        # with the publish-on-pickup patch in `_job_worker` (~line 29773)
+        # which writes phase=0 the moment a new job is claimed.
         _firebase_db.collection("devices").document(_did).update({
             "currentRunId": _CR_DF,
             "currentRunOwnerUid": _CR_DF,
             "currentRunTitle": _CR_DF,
             "currentRunStartedAt": _CR_DF,
+            "currentRunPhase": _CR_DF,
+            "currentRunPhaseStartedAt": _CR_DF,
         })
     except Exception as _crun_clear_err:
         log(
@@ -29774,11 +29784,28 @@ async def run_server(port=8000):
                 try:
                     _did = load_device_id()
                     if _firebase_db and _did:
+                        # 2026-05-26: publish phase=0 alongside the run-meta
+                        # fields. The phase_start emit at ~line 26504 will
+                        # re-write the same value within a few hundred ms
+                        # — but BEFORE that fires there's a gap (job claim
+                        # → run_pipeline entry → first phase_start) during
+                        # which the FE QueuedBanner's "Current run is in
+                        # Phase X" head-phase line either rendered the
+                        # PRIOR run's stale phase or stayed silent (if the
+                        # field was never set on this device). Publishing
+                        # phase=0 on pickup eliminates that window. Paired
+                        # with the matching clear in
+                        # `_clear_current_run_id_best_effort` so STOP /
+                        # hard_reset don't leak a stale value into the
+                        # next run's pickup.
+                        _now_ms = int(time.time() * 1000)
                         _crun_patch: dict = {
                             "currentRunId": job.get("research_id") or "",
                             "currentRunOwnerUid": job.get("uid") or "",
                             "currentRunTitle": (job.get("topic") or "")[:60],
-                            "currentRunStartedAt": int(time.time() * 1000),
+                            "currentRunStartedAt": _now_ms,
+                            "currentRunPhase": 0,
+                            "currentRunPhaseStartedAt": _now_ms,
                         }
                         _firebase_db.collection("devices").document(_did).update(_crun_patch)
                 except Exception as _crun_err:
