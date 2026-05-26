@@ -29066,6 +29066,24 @@ async def run_server(port=8000):
         """Process pipeline jobs one at a time from the queue."""
         while True:
             job = await _job_queue.get()
+            # 2026-05-25: clear stale stop flag before gate-wait. A
+            # prior HARD_RESET that fired while the worker was idle
+            # (no run in flight to consume the flag) leaves
+            # _controls.is_stop()=True dangling. Without this reset,
+            # the next job's gate-wait check at ~29094 sees the stale
+            # flag and bails with "cancelled during gate wait — skipping
+            # run_pipeline" — the user's Kalki repro from today's E2E
+            # (HARD_RESET at 18:13:28 with no active run → Kalki claimed
+            # at 18:20:45 → bailed 18:20:46 without ever starting).
+            # Safe because (a) cancels for in-queue jobs remove from
+            # queue (never reach pop), (b) cancels for THIS job's gate-
+            # pending phase will RE-SET the flag via the gate_pending_job
+            # match at research.py:4421, (c) cancels for the running job
+            # set the flag and run_pipeline consumes it internally.
+            try:
+                _controls.reset()
+            except Exception:
+                pass
             # 2026-05-11: gate on prior run's FE-P5 completion. Phases
             # 4+5 are FE-owned — BE PIPELINE COMPLETE fires after P3,
             # but the actual run isn't done until FE Doc+Email lands.
