@@ -6864,6 +6864,13 @@ class PipelineControls:
         self.stop_event = asyncio.Event()
         self.pause_event = asyncio.Event()
         self.resume_event = asyncio.Event()
+        # Fix D (2026-05-27): True while a phase is blocked on a user
+        # decision (await_phase_decision). The outer worker-watchdog
+        # excludes this time from its active-time ceiling so a legitimate
+        # wait-for-the-user is never mislabeled "stuck" and killed. Reset
+        # in reset() too — a stale True would freeze the next run's
+        # watchdog (active-time would never accrue → never fire).
+        self._awaiting_user: bool = False
         self.extra_context: list = []
         self._config_updates: dict = {}
         # B1: per-agent link-fail decision ("retry" | "skip" | "stop")
@@ -7090,6 +7097,7 @@ class PipelineControls:
         self.stop_event.clear()
         self.pause_event.clear()
         self.resume_event.clear()
+        self._awaiting_user = False  # Fix D: clear stale wait-for-user flag
         self.pause_reason = ""
         self.pause_target_agent = ""
         self.extra_context.clear()
@@ -7231,15 +7239,23 @@ class PipelineControls:
         watchdog stays alive while paused for user decision."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
-        while loop.time() < deadline:
-            if self.stop_event.is_set():
-                return "stop"
-            if self.consume_retry_phase(phase):
-                return "retry"
-            if self.consume_phase_skip(phase):
-                return "skip"
-            await asyncio.sleep(0.5)
-        return "timeout"
+        # Fix D (2026-05-27): mark "blocked on a user decision" so the outer
+        # worker-watchdog excludes this wait from its active-time ceiling — a
+        # legitimate human wait must never be mislabeled "stuck" and killed.
+        # finally guarantees the flag clears on every return path below.
+        self._awaiting_user = True
+        try:
+            while loop.time() < deadline:
+                if self.stop_event.is_set():
+                    return "stop"
+                if self.consume_retry_phase(phase):
+                    return "retry"
+                if self.consume_phase_skip(phase):
+                    return "skip"
+                await asyncio.sleep(0.5)
+            return "timeout"
+        finally:
+            self._awaiting_user = False
 
     def request_retry_agent(self, agent: str):
         """User clicked 'Retry [Agent]' on a Phase 2 agent warning."""
@@ -29265,18 +29281,21 @@ async def run_server(port=8000):
     # function — it lives in a different scope).
     _QUEUE_STATE["persist_fn"] = _persist_pending_queue
 
-    # Outer wall-clock ceiling for a single pipeline run. Phase budgets
-    # inside run_pipeline are cooperative — long Playwright/CUA awaits
-    # without timeouts can deadlock the worker indefinitely, leaving
-    # /api/queue stuck at running:true and any pending jobs starved.
-    # Q7 watchdog: if a single run exceeds this, we declare it stuck,
-    # request_stop, mark the doc stopped_by_watchdog, and schedule a
-    # process exit so the daemon-loop respawns a fresh worker that can
-    # drain the rest of the queue. Generous 5h ceiling — a healthy run
-    # is under 90min; the 5h is sized to allow P1+P2+P3-audio soft-warn
-    # advisories (60+120+90 = 270 min) plus a couple of user Wait clicks
-    # before the deadlock backstop kicks in. 2026-05-06 (Stream 2 F12):
-    # bumped 4h → 5h.
+    # Outer ACTIVE-TIME ceiling for a single pipeline run (Fix D 2026-05-27:
+    # was raw wall-clock). Phase budgets inside run_pipeline are cooperative
+    # — long Playwright/CUA awaits without timeouts can deadlock the worker
+    # indefinitely, leaving /api/queue stuck at running:true and pending
+    # jobs starved. Q7 watchdog: if a run's ACTIVE work-time exceeds this we
+    # declare it stuck, request_stop, mark the doc stopped_by_watchdog, and
+    # schedule a process exit so the daemon-loop respawns a fresh worker that
+    # drains the rest of the queue. The supervisor at the run_pipeline call
+    # site does NOT accrue time while _controls.is_pause() or
+    # _controls._awaiting_user (blocked on a user decision) — so legitimate
+    # waits never trip it (the old wall-clock version false-killed a run that
+    # sat for hours on an unbounded await_phase_decision). Generous 5h of
+    # active time — a healthy run is under 90min; sized to allow P1+P2+P3-
+    # audio soft-warn advisories (60+120+90 = 270 min) of real work before
+    # the deadlock backstop. 2026-05-06 (Stream 2 F12): bumped 4h → 5h.
     WORKER_OUTER_TIMEOUT_SEC = 5 * 60 * 60
     # BE_PHASES_TIMEOUT_SEC lives at module scope (research.py:1224) since
     # 2026-05-12 so the Firestore start listener (also module-level) can
@@ -29816,23 +29835,68 @@ async def run_server(port=8000):
                     log(f"[worker] Proceeding despite skipped flip — actual_status={actual_status} is active (FE pre-flipped or normal mid-run resume)", "INFO")
             try:
                 if should_run:
-                    await asyncio.wait_for(
+                    # Fix D (2026-05-27): ACTIVE-TIME-aware outer ceiling. The
+                    # old asyncio.wait_for counted raw wall-clock, so a run
+                    # that legitimately waited on a user decision (or was
+                    # paused) got mislabeled "stuck" and killed at the 5h mark.
+                    # Run run_pipeline as a task and only accrue toward the
+                    # ceiling while it's doing ACTIVE work — never while
+                    # _controls.is_pause() (HV/login/user pause) or
+                    # _controls._awaiting_user (blocked on await_phase_decision).
+                    # Genuine active-spin deadlocks still trip it. _controls is
+                    # a per-PROCESS singleton (reset in place, never rebound),
+                    # so each worker is independently guarded ⇒ N-worker safe.
+                    # On breach we raise asyncio.TimeoutError, reusing the
+                    # existing handler below unchanged.
+                    _pipe_task = asyncio.ensure_future(
                         run_pipeline(topic=job["topic"], email=job.get("email", ""),
                                      verbose=True, resume_dir=job.get("resume_dir"),
                                      config=job.get("config"), run_id=job.get("run_id"),
                                      uid=job.get("uid"), research_id=job.get("research_id"),
                                      brief_text=job.get("brief_text", ""),
                                      user_sources=job.get("user_sources") or [],
-                                     user_links=job.get("user_links") or []),
-                        timeout=WORKER_OUTER_TIMEOUT_SEC,
-                    )
+                                     user_links=job.get("user_links") or []))
+                    _wd_active_sec = 0.0
+                    _wd_tick = 10.0
+                    while not _pipe_task.done():
+                        try:
+                            await asyncio.sleep(_wd_tick)
+                        except asyncio.CancelledError:
+                            # Worker loop / server shutting down — cancel the
+                            # pipeline and propagate (drain with BaseException
+                            # so its finally blocks run first).
+                            _pipe_task.cancel()
+                            try:
+                                await _pipe_task
+                            except BaseException:
+                                pass
+                            raise
+                        if not (_controls.is_pause() or _controls._awaiting_user):
+                            _wd_active_sec += _wd_tick
+                        if _wd_active_sec >= WORKER_OUTER_TIMEOUT_SEC and not _pipe_task.done():
+                            _pipe_task.cancel()
+                            # Drain with BaseException (CancelledError is
+                            # BaseException-derived since 3.8) so run_pipeline's
+                            # finally blocks (browser close, etc.) complete
+                            # before we raise — mirrors asyncio.wait_for's own
+                            # cancel-then-await semantics.
+                            try:
+                                await _pipe_task
+                            except BaseException:
+                                pass
+                            raise asyncio.TimeoutError(
+                                f"pipeline exceeded {WORKER_OUTER_TIMEOUT_SEC}s active-time ceiling")
+                    # Natural completion: surface result / re-raise any
+                    # run_pipeline exception exactly as asyncio.wait_for did
+                    # (the except Exception handler below catches it).
+                    await _pipe_task
             except asyncio.TimeoutError:
                 # Q7 outer-ceiling deadlock guard. Mark the doc, request
                 # cooperative stop, schedule hard exit. Daemon-loop
                 # respawns a fresh worker; pending jobs drain on the
                 # next process.
                 hours = WORKER_OUTER_TIMEOUT_SEC // 3600
-                log(f"[worker-watchdog] Pipeline exceeded {hours}h ceiling — declaring stuck and scheduling restart", "ERROR")
+                log(f"[worker-watchdog] Pipeline exceeded {hours}h ACTIVE-time ceiling (excludes paused / user-decision waits) — declaring stuck and scheduling restart", "ERROR")
                 try:
                     _controls.request_stop()
                 except Exception:
