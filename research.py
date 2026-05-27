@@ -3741,14 +3741,27 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     # cancelled anyway, so the counter mismatch doesn't
                     # matter — the process will exit + respawn fresh.
                     _drained_jobs: list[dict] = []
-                    try:
-                        while True:
-                            _drained_jobs.append(_job_queue._queue.popleft())
-                    except IndexError:
-                        # deque empty — done draining
-                        pass
-                    except Exception as _drain_pop_err:
-                        log(f"[device-cmds] HARD_RESET: deque pop failed mid-drain: {_drain_pop_err}", "WARN")
+                    # 2026-05-26 FIX: reach the in-memory queue via
+                    # _QUEUE_STATE["queue_ref"] (set in --serve at
+                    # research.py:~28894). The bare name `_job_queue` is a
+                    # LOCAL of the serve function — NOT in scope in this
+                    # Firestore-listener callback thread — so referencing it
+                    # raised NameError on every reset ("name '_job_queue' is
+                    # not defined"), silently skipping the in-memory drain
+                    # (harmless only because the deque was empty; a job queued
+                    # in memory at reset time would have survived the reset).
+                    _qref = _QUEUE_STATE.get("queue_ref")
+                    if _qref is not None:
+                        try:
+                            while True:
+                                _drained_jobs.append(_qref._queue.popleft())
+                        except IndexError:
+                            # deque empty — done draining
+                            pass
+                        except Exception as _drain_pop_err:
+                            log(f"[device-cmds] HARD_RESET: deque pop failed mid-drain: {_drain_pop_err}", "WARN")
+                    else:
+                        log("[device-cmds] HARD_RESET: no in-memory queue_ref yet (boot race) — skipping deque drain", "DEBUG")
                     log(f"[device-cmds] HARD_RESET: drain found {len(_drained_jobs)} queued job(s)")
                     if _drained_jobs and _firebase_db:
                         try:
@@ -17485,6 +17498,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     _min_agent_wait = int(os.environ.get("MIN_AGENT_WAIT_MIN", "5")) * 60
     MIN_WAIT = {"ChatGPT": _min_agent_wait, "Gemini": _min_agent_wait, "Claude": _min_agent_wait}
     CUA_CHECK_INTERVAL = 300   # 5 min between CUA completion checks
+    # Gemini-only periodic refresh. Post-2026-05 Gemini does NOT push the
+    # completed Deep-Research panel into the live DOM — the done-state
+    # ("Share & Export" button + completion text) only renders after a page
+    # reload. Reload every ~10 min so detect_completion_gemini can see the
+    # done-marker on its own. Replaces the old one-shot 10-min reload +
+    # 15-min "Is the Research completed?" paste crutch (removed 2026-05-26).
+    GEMINI_REFRESH_INTERVAL = int(os.environ.get("GEMINI_REFRESH_INTERVAL_SEC", str(10 * 60)))
     ARTIFACT_SCRAPE_INTERVAL = 60   # 1 min between Claude artifact-tracking scrapes (was 180; iteration #1 must pass — see init at last_artifact_scrape=0 below)
 
     pending = {}
@@ -17528,32 +17548,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "claude_clarification_replied": False,  # one-shot flag for clarification-defer reply
             "gemini_kickoff_nudge_count": 0,        # multi-shot nudge counter (max 3, 3min apart) for Gemini kickoff-stall
             "gemini_last_kickoff_nudge_at": 0.0,    # timestamp gate enforcing 3min spacing between Gemini kickoff nudges
-            # 2026-05-25 Gemini DOM-staleness safety net (iter #2).
-            # Post-2026-05 Gemini UI: conversation DOM sometimes freezes
-            # while server-side research is done — CUA reads the stale
-            # screenshot as "still generating" and the run sits.
-            # Manual workaround empirically validated by user:
-            #   (a) hard refresh re-enables the disabled-post-DR composer
-            #   (b) sending "Is the Research completed?" then unsticks
-            # Encoded as TWO one-shot timers split for safety:
-            #   reload at elapsed >= 10*60  (unblocks composer)
-            #   paste  at elapsed >= 15*60  (asks for confirmation)
-            # 5-min gap lets Gemini's SPA rehydrate the conversation
-            # URL before the paste — without the gap (prior single-shot
-            # at 15min) the paste landed in a new chat and the BE
-            # extracted the wrong content (Kalki + Golden Retriever
-            # 2026-05-25 E2Es). If a long Gemini run stalls TWICE
-            # (rare), these nets only catch the first stall; the
-            # generic no-growth watchdog at 20-min flat covers later
-            # ones (though Gemini's status="researching" can suppress
-            # it — known gap, tracked for future iteration).
-            "gemini_safety_net_reload_done": False,
-            "gemini_safety_net_done": False,
-            # Pinned at the 10-min reload (after goto-back settle).
-            # The 15-min paste branch checks current URL against this
-            # to guarantee the follow-up lands in the SAME research
-            # conversation, not a fresh chat the SPA might have opened.
-            "gemini_safety_net_conv_url": "",
+            # 2026-05-26 Gemini periodic refresh. Post-2026-05 Gemini does
+            # NOT push the completed Deep-Research panel into the live DOM —
+            # the done-state only renders after a reload. We reload every
+            # GEMINI_REFRESH_INTERVAL (~10 min) so detect_completion_gemini
+            # can see the done-marker on its own. Seeded to research start so
+            # the first refresh fires ~10 min in (matches the old one-shot
+            # 10-min reload). Replaces the prior one-shot reload + 15-min
+            # "Is the Research completed?" paste crutch — Flash 3.5 completes
+            # cleanly and needs no nudge (user-validated 2026-05-26).
+            "last_refresh": _research_t,
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -17704,13 +17708,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "claude_artifact_cua_attempts": 0,
                                              "observer_text_len": 0,
                                              "claude_clarification_replied": False,
-                                             # 2026-05-25: explicit-init parity with the
-                                             # main pending dict (research.py:~16940). A
-                                             # post-resume Gemini run gets fresh 10/15min
-                                             # safety-net timers relative to its new start.
-                                             "gemini_safety_net_reload_done": False,
-                                             "gemini_safety_net_done": False,
-                                             "gemini_safety_net_conv_url": ""}
+                                             # Periodic-refresh gate — a post-resume Gemini
+                                             # run gets a fresh refresh clock relative to its
+                                             # reconstructed start_time.
+                                             "last_refresh": time.time() - results[name]["elapsed_sec"]}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
                         else:
@@ -17807,6 +17808,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "empty_retries": 0,
                     "hard_retry_count": 0,
                     "claude_clarification_replied": False,
+                    "last_refresh": time.time(),
                 }
             p = pending[_agent_name]
             _hard_count = int(p.get("hard_retry_count", 0)) + 1
@@ -17912,13 +17914,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "empty_retries": 0,
                 "hard_retry_count": _hard_count,
                 "claude_clarification_replied": False,
-                # 2026-05-25: explicit-init parity with the main pending
-                # dict (research.py:~16940). A hard-retried Gemini run
-                # gets fresh 10/15min safety-net timers relative to its
-                # new start_time.
-                "gemini_safety_net_reload_done": False,
-                "gemini_safety_net_done": False,
-                "gemini_safety_net_conv_url": "",
+                # Periodic-refresh gate — a hard-retried Gemini run gets a
+                # fresh refresh clock relative to its new start_time.
+                "last_refresh": _now,
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
@@ -18239,101 +18237,61 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # with the stale session (likely 30min re-grace from platforms)
                     continue
 
-            # ── Gemini 15-min DOM-staleness safety net ──
-            # Empirical 2026-05-25 user observation: post-recent-UI-update
-            # Gemini's conversation DOM can freeze mid-research while the
-            # server side is actually done. CUA's vision read sees the
-            # stale "Researching…" screenshot as proof of life → run sits
-            # for 90+ min (verified in backend-2.log: 123-min Golden
-            # Retriever run, 20 consecutive CUA "still generating"
-            # confirmations from 10:10 to 12:03 until the user manually
-            # sent "Is the Research completed?" in the browser and the
-            # DOM unstuck within seconds, after which CUA confirmed done
-            # at 12:07 and extraction returned 101k chars). The manual
-            # action that unstuck it is what's automated here.
+            # ── Gemini periodic refresh (every GEMINI_REFRESH_INTERVAL) ──
+            # Post-2026-05 Gemini does NOT push the completed Deep-Research
+            # panel into the live DOM — the "Share & Export" done-marker +
+            # completion text only render after a page reload (verified in
+            # backend-2.log: a 123-min Golden Retriever run sat on 20 straight
+            # CUA "still generating" reads until a manual refresh surfaced the
+            # finished report). So we reload every GEMINI_REFRESH_INTERVAL
+            # (~10 min); detect_completion_gemini then sees the done-state on
+            # its own and extracts, instead of leaning on the CUA visual check.
             #
-            # Race-safe: short-circuit before reload if completion text
-            # is already on page (the run literally just finished in the
-            # last few seconds; no point reloading + asking).
+            # Replaces the prior one-shot 10-min reload + 15-min
+            # paste_followup("Is the Research completed?") crutch: on 3.1 Pro
+            # the DOM froze for the whole 1-2h run and needed a manual nudge,
+            # but Flash 3.5 completes cleanly and the periodic reload alone
+            # surfaces the done-state (user-validated 2026-05-26).
             #
-            # Orthogonal to the kickoff-stall multi-shot nudge (lines
-            # ~17421-17485) which only fires at elapsed ≤ 600s for the
-            # ACK-without-research-card case. The two cannot overlap.
-            # Resets on content growth so a long-but-genuinely-streaming
-            # run can re-arm the net if it stalls again past minute 15.
-            # 2026-05-25 (post-2-E2E iteration #2) — Gemini safety net
-            # SPLIT into two timers, per user's empirical workflow:
-            #
-            #   T=10min  one-shot page.reload()  → unblocks the composer
-            #            (post-DR Gemini disables follow-up input until
-            #            a hard refresh; reload re-enables it but lands
-            #            us on a freshly-hydrated chat view).
-            #
-            #   T=15min  one-shot paste_followup ("Is the Research
-            #            completed?")  → unsticks the stale-DOM / CUA-
-            #            misreads-complete state. Sends into whichever
-            #            chat the page is currently on — guarded by a
-            #            URL sanity gate so we don't write to a NEW
-            #            chat if the prior reload drifted us to the
-            #            app root.
-            #
-            # Why split: the prior single-shot at 15min did reload+paste
-            # back-to-back. The 8s post-reload sleep wasn't enough for
-            # Gemini's SPA to rehydrate the conversation; paste_followup
-            # then landed in a fresh new-chat composer instead of the
-            # ongoing research chat. The BE later extracted from that
-            # new chat (which had no DR panel at all) and shipped the
-            # short reply as gemini.md — the "literally invaluable"
-            # MDs in both 2026-05-25 E2Es (Kalki + Golden Retriever).
-            # 5min gap between reload and paste gives the SPA ample
-            # time to settle on the conversation URL before we send.
-            #
-            # Each timer is one-shot per run (reset on hard-retry, see
-            # research.py:~17313). Orthogonal to the kickoff-stall
-            # multi-shot nudge (lines ~17421-17485) which only fires
-            # at elapsed ≤ 600s for the ACK-without-research-card case.
-
-            # ── 10-min reload (one-shot) ──
+            # Race-safe: if completion text is already on page we skip the
+            # reload and let the detector extract on the next tick. Gated to
+            # Gemini, never during a DNS retry. Orthogonal to the kickoff-stall
+            # multi-shot nudge (~17421-17485, elapsed ≤ 600s only).
             if (
                 name == "Gemini"
-                and elapsed >= 10 * 60
-                and not p.get("gemini_safety_net_reload_done")
+                and (time.time() - p.get("last_refresh", p["start_time"])) >= GEMINI_REFRESH_INTERVAL
                 and not p.get("dns_retry_at")
             ):
+                p["last_refresh"] = time.time()
                 try:
                     _body_text_10 = await p["page"].evaluate(
                         "() => (document.body.innerText || '').slice(0, 8000)"
                     )
                     if _GEMINI_COMPLETION_RE.search(_body_text_10 or ""):
-                        # Already complete by 10min — both timers skip;
-                        # detect_completion_gemini handles the actual
-                        # extract on next iteration.
-                        p["gemini_safety_net_reload_done"] = True
-                        p["gemini_safety_net_done"] = True
+                        # Completion text already on page — skip this reload;
+                        # detect_completion_gemini extracts on the next tick.
                         log(
-                            "[Gemini] 10-min safety net: completion text "
-                            "already on page — skipping reload + paste"
+                            "[Gemini] periodic refresh: completion text "
+                            "already on page — skipping reload"
                         )
                     else:
-                        p["gemini_safety_net_reload_done"] = True
                         _url_pre_reload = ""
                         try:
                             _url_pre_reload = p["page"].url or ""
                         except Exception:
                             _url_pre_reload = ""
                         log(
-                            "[Gemini] 10-min safety-net reload firing — "
-                            f"page.reload() to unblock composer for the "
-                            f"15min follow-up. URL pre-reload={_url_pre_reload}"
+                            "[Gemini] periodic refresh firing — "
+                            f"page.reload() so the completed DR panel + "
+                            f"done-marker can render. URL pre-reload={_url_pre_reload}"
                         )
                         try:
                             emit_event(
                                 "agent_progress", phase=2, agent="gemini",
                                 status="generating",
                                 progress=(
-                                    "Gemini past 10 min — refreshing the "
-                                    "page so the composer can accept a "
-                                    "follow-up at 15 min."
+                                    "Refreshing Gemini so the finished "
+                                    "research panel can load."
                                 ),
                             )
                         except Exception:
@@ -18344,7 +18302,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             )
                         except Exception as _re:
                             log(
-                                f"[Gemini] 10-min reload raised "
+                                f"[Gemini] periodic reload raised "
                                 f"(non-fatal): {_re}",
                                 "WARN",
                             )
@@ -18392,25 +18350,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 f"failed (non-fatal): {_inj_err}",
                                 "DEBUG",
                             )
-                        # Pin the canonical research-conversation URL —
-                        # whatever we landed on AFTER reload + goto-back
-                        # settled. The 15-min paste branch will verify
-                        # the URL still matches this exact value before
-                        # firing paste_followup; if it has drifted to
-                        # any other URL (e.g., a fresh chat opened by
-                        # a stray SPA event), the paste aborts.
-                        try:
-                            p["gemini_safety_net_conv_url"] = (
-                                p["page"].url or ""
-                            )
-                            log(
-                                f"[Gemini] safety-net pinned conversation "
-                                f"URL: {p['gemini_safety_net_conv_url']}"
-                            )
-                        except Exception:
-                            p["gemini_safety_net_conv_url"] = (
-                                _url_pre_reload or ""
-                            )
                         # Reset baselines so the no-growth + stuck
                         # watchdog don't fire from the reload window.
                         _now = time.time()
@@ -18420,154 +18359,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         p["last_cua_check"] = _now
                 except Exception as _gre:
                     log(
-                        f"[Gemini] 10-min safety net raised "
+                        f"[Gemini] periodic refresh raised "
                         f"(non-fatal): {_gre}",
-                        "WARN",
-                    )
-                continue
-
-            # ── 15-min paste_followup (one-shot, URL-sanity-gated) ──
-            if (
-                name == "Gemini"
-                and elapsed >= 15 * 60
-                and not p.get("gemini_safety_net_done")
-                and not p.get("dns_retry_at")
-            ):
-                try:
-                    _body_text = await p["page"].evaluate(
-                        "() => (document.body.innerText || '').slice(0, 8000)"
-                    )
-                    if _GEMINI_COMPLETION_RE.search(_body_text or ""):
-                        p["gemini_safety_net_done"] = True
-                        log(
-                            "[Gemini] 15-min safety net: completion text "
-                            "already on page — skipping paste"
-                        )
-                    else:
-                        p["gemini_safety_net_done"] = True
-                        _safety_url_now = ""
-                        try:
-                            _safety_url_now = p["page"].url or ""
-                        except Exception:
-                            _safety_url_now = ""
-                        # STRICT canonical-URL check — must equal the URL
-                        # pinned at the 10-min reload (after goto-back
-                        # settle). This is stronger than a /chat/ or
-                        # /app/<id> shape check: if Gemini's SPA opened
-                        # a fresh chat at a DIFFERENT /app/<id> sometime
-                        # between minute 10 and 15, the shape check
-                        # would still pass but the paste would land in
-                        # the wrong chat. The strict equality guards
-                        # against that.
-                        #
-                        # Fallback (no pinned URL — means the 10-min
-                        # branch never ran, e.g., the run was paused/
-                        # resumed past 15min so the reload was skipped):
-                        # apply the looser shape check so we at least
-                        # never paste into a bare /app root.
-                        _pinned_conv_url = p.get(
-                            "gemini_safety_net_conv_url", ""
-                        ) or ""
-                        if _pinned_conv_url:
-                            _url_ok = (_safety_url_now == _pinned_conv_url)
-                            if not _url_ok:
-                                log(
-                                    f"[Gemini] 15-min safety-net paste "
-                                    f"ABORTED — URL drifted off the "
-                                    f"pinned research conversation: "
-                                    f"pinned={_pinned_conv_url} now="
-                                    f"{_safety_url_now}. 20-min flat "
-                                    f"watchdog will catch if truly stuck.",
-                                    "WARN",
-                                )
-                        else:
-                            _url_ok = (
-                                "/chat/" in _safety_url_now
-                                or (
-                                    "/app/" in _safety_url_now
-                                    and _safety_url_now.rstrip("/").split(
-                                        "/app/"
-                                    )[-1].strip() != ""
-                                )
-                            )
-                            if not _url_ok:
-                                log(
-                                    f"[Gemini] 15-min safety-net paste "
-                                    f"ABORTED — no pinned URL (10-min "
-                                    f"reload was skipped) and current "
-                                    f"URL doesn't look like a research "
-                                    f"conversation: {_safety_url_now}. "
-                                    f"20-min flat watchdog will catch "
-                                    f"if truly stuck.",
-                                    "WARN",
-                                )
-                        if not _url_ok:
-                            pass  # already logged above
-                        else:
-                            log(
-                                "[Gemini] 15-min safety net firing — "
-                                f"sending 'Is the Research completed?' "
-                                f"to URL={_safety_url_now}"
-                            )
-                            try:
-                                emit_event(
-                                    "agent_progress", phase=2, agent="gemini",
-                                    status="generating",
-                                    progress=(
-                                        "Gemini past 15 min — asking it "
-                                        "to confirm completion in the "
-                                        "existing research chat."
-                                    ),
-                                )
-                            except Exception:
-                                pass
-                            try:
-                                await inject_agent_observer(p["page"], "gemini")
-                            except Exception as _inj_err:
-                                log(
-                                    f"[Gemini] safety-net observer re-inject "
-                                    f"failed (non-fatal): {_inj_err}",
-                                    "DEBUG",
-                                )
-                            _paste_ok = await paste_followup(
-                                p["page"],
-                                "Is the Research completed?",
-                                "gemini",
-                                label="Gemini-safety-net",
-                            )
-                            # Post-paste URL log — catches the case where
-                            # paste_followup itself navigated (shouldn't,
-                            # but belt-and-suspenders given today's miss).
-                            try:
-                                _safety_url_post = p["page"].url or ""
-                                if (_safety_url_now and _safety_url_post
-                                        and _safety_url_post != _safety_url_now):
-                                    log(
-                                        f"[Gemini] safety-net post-paste "
-                                        f"URL drifted: {_safety_url_now} → "
-                                        f"{_safety_url_post} — the follow-"
-                                        f"up may have landed in a wrong chat",
-                                        "WARN",
-                                    )
-                            except Exception:
-                                pass
-                            if not _paste_ok:
-                                log(
-                                    "[Gemini] safety-net paste_followup "
-                                    "returned False — composer rejected "
-                                    "input; 20-min flat watchdog will "
-                                    "catch if no growth",
-                                    "WARN",
-                                )
-                            _now = time.time()
-                            p["last_growth_time"] = _now
-                            p["last_heartbeat"] = _now
-                            p["stuck_warned_at"] = 0
-                            p["last_cua_check"] = _now
-                except Exception as _gse:
-                    log(
-                        f"[Gemini] 15-min safety net raised "
-                        f"(non-fatal): {_gse}",
                         "WARN",
                     )
                 continue
@@ -20984,11 +20777,14 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 
 
 async def extract_gemini_response(page, browser=None, cua_client=None, label="Gemini", verbose=False):
-    """Dedicated Gemini extractor — 3 Wayland-safe tiers:
-      Tier 1: Share & Export → "Copy contents" via JS clipboard hijack
-              (Gemini's native authoritative export path).
-      Tier 2: HTML→MD from Gemini's response containers (DOM-scrape fallback).
-      Tier 3: Ctrl+A / Ctrl+C with JS clipboard hijack (no OS clipboard).
+    """Dedicated Gemini extractor — 3 panel-aware tiers:
+      Tier 1: CUA Share & Export → "Copy contents", then read the OS
+              clipboard (Gemini's native authoritative export; we read the
+              clipboard because the in-page hijack misses Gemini's async-
+              Clipboard-API copy — see the T1 fix note below).
+      Tier 2: HTML→MD from Gemini's strict side-panel containers (DOM-scrape
+              fallback — returns the full 90k-146k-char report).
+      Tier 3: Ctrl+A / Ctrl+C with JS clipboard hijack (panel-focused).
     Each tier emits an explicit log line so the path that succeeded (or
     silently returned empty) is visible in the run log.
     Returns the markdown/text or "" on total failure."""
@@ -21033,36 +20829,44 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         log(f"[{label}] DR panel NOT present after 10s — upstream submit/Start "
             f"likely failed; running tiers anyway but expect failure", "WARN")
 
-    # 2026-05-24 ARCHITECTURE: tier reorder — Share & Export → Copy
-    # contents promoted from T2 to T1, HTML→MD demoted from T1 to T2.
-    # Today's E2E (Salaar) showed HTML→MD scraping only the chat-side
-    # ack (144 chars) instead of the artifact panel, then falling
-    # through to T3 select-all which captured 2476 chars of chat
-    # transcript — total miss of the actual research report.
+    # 2026-05-26 ARCHITECTURE: T1 = CUA Share & Export → "Copy contents" (the
+    # authoritative native export), T2 = HTML→MD side-panel scrape, T3 = CUA
+    # Ctrl+A/C select-all. All three are PANEL-AWARE — the post-2026-05 Gemini
+    # UI renders the report in a right-side panel (immersive-panel /
+    # deep-research-panel) and Share & Export lives on that panel's toolbar.
     #
-    # Rationale: Share & Export is Gemini's NATIVE export menu —
-    # whatever Gemini's UI considers "the report content" is what
-    # this path copies. HTML→MD depends on our selectors matching
-    # the current DOM shape (which the 2026-05+ side-panel rollout
-    # has been quietly changing). Putting Share & Export first means
-    # we get the authoritative content when CUA can drive the menu,
-    # and only fall back to DOM scrape when CUA isn't available or
-    # the menu doesn't yield content.
+    # T1 0-char FIX (2026-05-26): the CUA click was always working (backend-2
+    # logs: CUA clicks Share & Export → Copy contents, page shows "copied")
+    # but the in-page clipboard hijack captured 0 chars. Root cause: Gemini's
+    # "Copy contents" writes the markdown to the REAL OS clipboard via the
+    # async Clipboard API against a writeText reference it cached at page-load,
+    # so our late writeText monkey-patch never sees it (and no `copy` event
+    # fires for the async API, and nothing is visually selected, so the copy-
+    # event + getSelection sources are dry too). The fix: after the click,
+    # READ the OS clipboard (navigator.clipboard.readText → PowerShell
+    # get_clipboard fallback — the same ladder the share-link extractor uses).
+    # The hijack capture is still attempted first for the cases where it works.
 
-    # ── Tier 1 (PRIMARY): CUA-driven Share & Export → "Copy contents" + hijack ──
-    # Gemini's "Copy contents" action lives inside a "Share & Export"
-    # dropdown in the response toolbar. CUA clicks Share & Export,
-    # then clicks "Copy contents"; the page's own handler calls
-    # clipboard.writeText with the canonical markdown which the JS
-    # hijack catches via the writeText monkey-patch (and the copy
-    # event listener). Wayland-safe — no OS clipboard read.
-    #
-    # min_chars=2000 (was 100 when this was T2 fallback). As the
-    # primary, we expect the full report — anything below 2000 chars
-    # is almost certainly an incomplete copy, fall through to T2.
+    # ── Tier 1 (PRIMARY): CUA Share & Export → "Copy contents" + clipboard ──
+    # The "Copy contents" action lives in the Share & Export dropdown on the
+    # report PANEL's toolbar (top-right, same row as Contents / Create / X).
+    # CUA opens it and clicks "Copy contents"; the report markdown lands on
+    # the OS clipboard. We capture via (a) the in-page hijack, then (b)
+    # navigator.clipboard.readText(), then (c) the OS clipboard (get_clipboard).
+    # min_chars=2000 rejects a partial copy / chat ack.
     if browser and cua_client:
         async def _gemini_t1_trigger():
             await browser.switch_to_page(page)
+            # Clear the clipboard first so a stale read (e.g. a prior copy)
+            # can't masquerade as this run's "Copy contents". Best-effort —
+            # if clipboard-write is denied, the post-copy read still gets the
+            # fresh report (we just clicked Copy contents this iteration).
+            try:
+                await asyncio.wait_for(
+                    page.evaluate("() => navigator.clipboard.writeText('')"),
+                    timeout=2.0)
+            except Exception:
+                pass
             await asyncio.wait_for(
                 agent_loop(cua_client, browser, PROMPT_GEMINI_COPY_CONTENTS,
                     "Click the Share & Export button in the response toolbar, "
@@ -21080,16 +20884,46 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         except Exception as _e:
             log(f"[{label}] T1 clipboard hijack raised: {_e}", "WARN")
             md = ""
+        # The hijack misses Gemini's async-Clipboard-API copy (see the
+        # ARCHITECTURE note above) — so read the OS clipboard, where the
+        # report markdown actually landed. readText() first (in-browser, 2s
+        # cap for the permission-prompt hang), then PowerShell get_clipboard()
+        # (3s cap for a locked clipboard). Longest wins.
+        if not md or len(md) < 2000:
+            _clip = ""
+            try:
+                _clip = await asyncio.wait_for(
+                    page.evaluate("() => navigator.clipboard.readText()"),
+                    timeout=2.0,
+                ) or ""
+            except (asyncio.TimeoutError, Exception):
+                _clip = ""
+            if not _clip or len(_clip) < 2000:
+                try:
+                    _os_clip = await asyncio.wait_for(
+                        asyncio.to_thread(get_clipboard),
+                        timeout=3.0,
+                    )
+                    if _os_clip and len(_os_clip) > len(_clip):
+                        _clip = _os_clip
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            if _clip and len(_clip) >= 2000:
+                md = _clip
+                log(f"[{label}] T1 recovered {len(md)} chars from OS clipboard "
+                    f"after Copy contents")
         if md and len(md) >= 2000:
-            log(f"[{label}] Extracted via T1 CUA Share & Export + hijack: {len(md)} chars")
+            log(f"[{label}] Extracted via T1 CUA Share & Export + clipboard: {len(md)} chars")
             return md
         elif md:
             log(f"[{label}] T1 returned {len(md)} chars (below 2000-char threshold — "
                 f"likely partial copy or chat ack) — falling to Tier 2", "WARN")
 
     # ── Tier 2 (FALLBACK): HTML→MD from Gemini's research-panel containers ──
-    # (was Tier 1 pre-2026-05-24; demoted to fallback when CUA Share &
-    # Export doesn't produce a full-length report)
+    # Panel-aware: STRICT side-panel scopes only (no chat-side ack). Fallback
+    # for when CUA/clipboard is blocked (e.g. clipboard permission denied AND
+    # the menu didn't render). Returns the full report straight from the panel
+    # DOM — the path that reliably got 90k-146k chars in prior E2Es.
     #
     # 2026-05-25 selector tighten: prior list included `[class*="immersive" i]
     # message-content` and `[class*="immersive" i] .markdown` — these are
@@ -22064,38 +21898,38 @@ async def setup_chatgpt_dr(page) -> bool:
         return False
 
 
-async def _gemini_select_pro_model(page) -> bool:
-    """Pre-DR step: open the model dropdown and select 3.1 Pro.
+async def _gemini_select_flash_model(page) -> bool:
+    """Pre-DR step: open the model dropdown and select 3.5 Flash.
 
-    Why this matters: Gemini Advanced accounts default to "3.1 Flash" /
-    "Flash-Lite" in the composer; enabling Deep Research without first
-    picking 3.1 Pro leaves the DR job running on whatever the dropdown
-    happens to show. The shallower model produces a far weaker report —
-    same class of regression as ChatGPT Free vs Pro.
+    Why this matters: the pipeline runs Gemini Deep Research on 3.5 Flash
+    (user-validated 2026-05-26 — Flash completes cleanly and its done-state
+    becomes detectable after the periodic refresh, whereas 3.1 Pro DR ran
+    1-2h and needed manual "is it done?" nudges to unstick). If the composer
+    is left on whatever the dropdown defaults to, the DR job can run on the
+    wrong model — so we explicitly pick 3.5 Flash before enabling DR.
 
     Approach: find the model-name button at the top of the chat panel
-    (text shows current model — "Gemini", "3.1", "Flash", "Pro", etc.),
-    click it, then click the menu item whose label includes "3.1 Pro".
-    Best-effort: if the dropdown structure has rotated or 3.1 Pro is
+    (text shows current model — "Gemini", "3.5", "Flash", "Pro", etc.),
+    click it, then click the menu item whose label includes "3.5 Flash"
+    (rejecting Flash-Lite / Pro / Deep Think siblings so we don't land on
+    a weaker or slower variant).
+    Best-effort: if the dropdown structure has rotated or 3.5 Flash is
     not available on this account, return False — the caller proceeds
     with DR enablement anyway and the run uses whatever model the
-    dropdown was on. We do NOT fail-hard because (a) the run is still
-    usable on Flash if Pro selection breaks, and (b) the existing
-    Pro-tier alert surfaces tier misconfiguration through a different
-    path.
+    dropdown was on.
 
-    Returns True when 3.1 Pro is visibly selected; False on any miss.
+    Returns True when 3.5 Flash is visibly selected; False on any miss.
     """
     try:
         # Step 1: find the model dropdown button. Gemini's current UI uses
         # a button at the top of the chat header whose text is the current
-        # model name ("3.1 Flash", "3.1 Pro", "Gemini 3.1 Pro", etc.). The
+        # model name ("3.5 Flash", "3.1 Pro", "Gemini 3.5 Flash", etc.). The
         # button usually has aria-haspopup="menu" or a chevron icon.
         # Common selectors across UI versions:
         #   - bard-mode-menu-button (legacy data-test-id)
         #   - button[aria-label*="model" i]
         #   - button[aria-haspopup="menu"] near the top of the page whose
-        #     text contains "Gemini" / "3.1" / "Flash" / "Pro"
+        #     text contains "Gemini" / "3.5" / "Flash" / "Pro"
         opened = await page.evaluate("""() => {
             // No top-of-page guard: on the home-screen UI Gemini centers
             // the composer at ~30-50% of viewport, so the prior < 25%
@@ -22138,14 +21972,16 @@ async def _gemini_select_pro_model(page) -> bool:
             return false;
         }""")
         if not opened:
-            log("[setup_gemini_dr] model-pick: dropdown button not found — skipping Pro selection", "INFO")
+            log("[setup_gemini_dr] model-pick: dropdown button not found — skipping Flash selection", "INFO")
             return False
         await asyncio.sleep(0.8)
 
-        # Step 2: click the "3.1 Pro" menu item. Match defensively against
-        # the variants Gemini uses: "3.1 Pro", "Gemini 3.1 Pro", and
-        # "Gemini 3.1 Pro (Preview)". Reject Flash / Flash-Lite / Deep
-        # Think items to avoid clicking the wrong sibling.
+        # Step 2: click the "3.5 Flash" menu item. Match defensively against
+        # the variants Gemini uses: "3.5 Flash", "Gemini 3.5 Flash", and
+        # "Gemini 3.5 Flash (Preview)". Reject Flash-Lite / Lite (a weaker
+        # variant), Pro, and Deep Think siblings to avoid clicking the wrong
+        # row. ORDER MATTERS: the lite/pro/deep-think rejects run BEFORE the
+        # flash-accept test, since "Flash-Lite" also contains "flash".
         picked = await page.evaluate("""() => {
             const items = document.querySelectorAll(
                 '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li');
@@ -22154,9 +21990,10 @@ async def _gemini_select_pro_model(page) -> bool:
                 const t = (el.textContent || '').trim().toLowerCase();
                 if (!t) continue;
                 // Hard-reject sibling items so we don't accidentally click them.
-                if (t.includes('flash') || t.includes('deep think')) continue;
-                // Accept any item whose first line names 3.1 Pro.
-                if (/\\b3\\.1\\s*pro\\b/i.test(t) || /gemini\\s*3\\.1\\s*pro/i.test(t)) {
+                if (t.includes('lite') || t.includes('deep think') ||
+                    /\\bpro\\b/.test(t)) continue;
+                // Accept any item whose label names 3.5 Flash.
+                if (/\\b3\\.5\\s*flash\\b/i.test(t) || /gemini\\s*3\\.5\\s*flash/i.test(t)) {
                     el.click();
                     return t.slice(0, 40);
                 }
@@ -22164,7 +22001,7 @@ async def _gemini_select_pro_model(page) -> bool:
             return '';
         }""")
         if not picked:
-            log("[setup_gemini_dr] model-pick: 3.1 Pro item not found in dropdown — closing menu", "WARN")
+            log("[setup_gemini_dr] model-pick: 3.5 Flash item not found in dropdown — closing menu", "WARN")
             # Best-effort: close the open dropdown so the next step's + button
             # isn't sitting under an overlay.
             try:
@@ -22197,16 +22034,16 @@ async def setup_gemini_dr(page) -> bool:
     silently shipped chat-mode briefs as Deep Research output. Strict
     verification is the cost of avoiding that class of bug.
 
-    2026-05-21: also pre-selects "3.1 Pro" via _gemini_select_pro_model
-    before enabling DR — without that, the dropdown's default of 3.1
-    Flash / Flash-Lite carried into the DR run (regression: user-
-    reported P2 Gemini brief shipped on Flash-Lite).
+    2026-05-26: pre-selects "3.5 Flash" via _gemini_select_flash_model
+    before enabling DR (the pipeline runs Gemini DR on 3.5 Flash — see
+    that helper's docstring for why). Without an explicit pick, the
+    dropdown's default could carry the wrong model into the DR run.
     """
     try:
         await asyncio.sleep(2)
-        # Best-effort: pick 3.1 Pro before opening + menu. Non-fatal if it
+        # Best-effort: pick 3.5 Flash before opening + menu. Non-fatal if it
         # misses (run proceeds on whatever model the dropdown was on).
-        await _gemini_select_pro_model(page)
+        await _gemini_select_flash_model(page)
         await asyncio.sleep(0.5)
         direct_clicked = False
 
