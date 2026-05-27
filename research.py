@@ -24563,6 +24563,28 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     if audio_done:
         (queue_dir / "podcasts").mkdir(exist_ok=True)
 
+        # Fix A (2026-05-27): re-anchor to THIS run's notebook before the
+        # download agent_loop. Between generate and download the page can
+        # drift (a stray CUA navigation, an NLM redirect, a recent-notebooks
+        # click) and a drifted page surfaces a DIFFERENT notebook's audio
+        # card — the verified root cause of a failed audio stream (the
+        # download CUA saw two cards incl. a foreign prior-run one and
+        # downloaded nothing). Re-assert the held notebook_url so the Studio
+        # panel shows only this notebook's single card. No-op when already
+        # anchored (happy path), so it can't disturb a correctly-placed page.
+        try:
+            _cur_url = await browser.current_url()
+        except Exception:
+            _cur_url = ""
+        _want_nb = _nlm_notebook_id(notebook_url)
+        if _want_nb and _want_nb != _nlm_notebook_id(_cur_url):
+            log(f"[Phase3] Download re-anchor: page drifted to '{_cur_url[:70]}' — navigating back to this notebook", "WARN")
+            try:
+                await browser.navigate(notebook_url)
+                await asyncio.sleep(5)
+            except Exception as _ra_e:
+                log(f"[Phase3] Download re-anchor navigate failed: {_ra_e}", "WARN")
+
         # Use Playwright download event to capture the file reliably
         download_future = asyncio.get_event_loop().create_future()
 
@@ -24595,8 +24617,15 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # / Long Deep Dive), not the hardcoded Long + Deep Dive that
             # would either not exist (short) or pick the wrong card if a
             # parallel Deep Dive misclick existed (default).
-            await agent_loop(cua_client, browser, make_prompt_audio_download(podcast_length),
+            _dl_result = await agent_loop(cua_client, browser, make_prompt_audio_download(podcast_length),
                 "Download the audio file.", model=CUA_MODEL, max_iterations=8, verbose=verbose)
+            # Fix A (2026-05-27): the download agent_loop return was previously
+            # ignored, so the new "abort: not on notebook" guard would be
+            # swallowed. Surface it in the log for diagnostics — the existing
+            # no-file fail_phase below still handles the recovery.
+            _dl_text = (_dl_result.get("text") or "").lower() if isinstance(_dl_result, dict) else ""
+            if "abort:" in _dl_text:
+                log(f"[Phase3] Download CUA reported abort: {_dl_text[:160]}", "WARN")
         finally:
             await stop_narration_ticker(_stop_d, _task_d)
 
@@ -24884,6 +24913,19 @@ async def _check_audio_complete_dom(page) -> bool:
         }""") or False
     except Exception:
         return False
+
+
+def _nlm_notebook_id(url: str) -> str:
+    """Extract the NotebookLM notebook id from a /notebook/{id} URL.
+    Used to detect CUA drift off the run's own notebook before the audio
+    download (Fix A 2026-05-27): a drifted page surfaces a DIFFERENT
+    notebook's audio card and breaks the download target. Returns "" when
+    no id is present (e.g. the page navigated off NotebookLM entirely)."""
+    try:
+        m = re.search(r"/notebook/([\w-]+)", url or "")
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
 
 
 # ── Audio-card invariant helpers (2026-05-02) ──────────────────────────────

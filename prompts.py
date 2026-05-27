@@ -807,6 +807,12 @@ default alongside the one you generated), target ONLY {v['card_desc']} —
 {v['match_hint']}. Do NOT click any other audio entry's play button,
 download button, or three-dot menu.
 
+NEVER navigate away from THIS notebook: do not open another notebook, the
+NotebookLM home page, or any recent-notebooks list. Stay on the notebook
+page you are already on. If you are NOT on a notebook page (no Studio panel
+with an audio card is visible), STOP and say "abort: not on notebook" — do
+not click anything to try to find one.
+
 Steps:
 1. Locate the correct audio entry in the Studio panel.
 2. On THAT entry, open its three-dot menu (or find its download affordance).
