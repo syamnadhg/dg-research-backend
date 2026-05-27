@@ -152,7 +152,8 @@ the current UI). Try these paths in order:
 PRIMARY path (current UI, 2 clicks):
 1. In the composer (bottom input area), find the "+" button on the LEFT
    side of the textarea. It is an icon button — a plus that morphs into
-   an × when its menu opens — and may have NO visible text label. Click it.
+   an × when its menu opens — with NO visible text label; its tooltip /
+   accessibility label reads "Upload & tools". Click it.
 2. In the menu that opens, click "Deep Research" at the TOP LEVEL.
 
 SECONDARY path (3 clicks — only if step 2 shows no top-level "Deep Research"):

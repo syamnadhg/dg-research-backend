@@ -22030,8 +22030,11 @@ async def _gemini_select_flash_model(page) -> bool:
                 // Hard-reject sibling items so we don't accidentally click them.
                 if (t.includes('lite') || t.includes('deep think') ||
                     /\\bpro\\b/.test(t)) continue;
-                // Accept any item whose label names 3.5 Flash.
-                if (/\\b3\\.5\\s*flash\\b/i.test(t) || /gemini\\s*3\\.5\\s*flash/i.test(t)) {
+                // Accept any item naming Flash. The current UI labels it just
+                // "Flash" (mode picker shows "currently Flash"); older builds
+                // used "3.5 Flash". Flash-Lite is already rejected above, so a
+                // bare \\bflash\\b match is safe.
+                if (/\\bflash\\b/i.test(t)) {
                     el.click();
                     return t.slice(0, 40);
                 }
@@ -22039,7 +22042,7 @@ async def _gemini_select_flash_model(page) -> bool:
             return '';
         }""")
         if not picked:
-            log("[setup_gemini_dr] model-pick: 3.5 Flash item not found in dropdown — closing menu", "WARN")
+            log("[setup_gemini_dr] model-pick: Flash item not found in dropdown — closing menu", "WARN")
             # Best-effort: close the open dropdown so the next step's + button
             # isn't sitting under an overlay.
             try:
@@ -22112,15 +22115,27 @@ async def setup_gemini_dr(page) -> bool:
                         'mat-icon, .material-symbols-outlined, .material-icons')]
                     .some(ic => { const n = (ic.textContent || '').trim().toLowerCase();
                                   return n === 'add' || n === 'add_circle'; });
-                return a === 'add' || a === 'add files' || a.includes('add files') ||
-                       a === 'attach' || a === 'attachments' || a === 'more' ||
-                       a === 'more options' || tt === 'add' || tt === 'more' ||
-                       tt.includes('attach') || tx === '+' || addIcon;
+                // "Upload & tools" is the current (2026-05) Gemini composer +
+                // button aria-label (an mdc-icon-button with aria-haspopup=menu);
+                // older builds used add/attach/more — keep them all.
+                return a.includes('upload') || a === 'add' || a === 'add files' ||
+                       a.includes('add files') || a === 'attach' || a === 'attachments' ||
+                       a === 'more' || a === 'more options' || tt === 'add' ||
+                       tt === 'more' || tt.includes('attach') || tx === '+' || addIcon;
             };
             const isBad = (b) => {
-                const s = ((b.getAttribute('aria-label') || '') + ' '
-                         + (b.getAttribute('title') || '')).toLowerCase();
-                return /mic|microph|voice|dictat|speak|send|submit|stop|cancel/.test(s);
+                const lbl = ((b.getAttribute('aria-label') || '') + ' '
+                          + (b.getAttribute('title') || '')).toLowerCase();
+                if (/mic|microph|voice|dictat|speak|send|submit|stop|cancel/.test(lbl))
+                    return true;
+                // Recent-chats sidebar "More options for <chat>" menus sit on
+                // the composer's row when the sidebar is expanded, so same-row +
+                // left-of-input would otherwise match them — exclude explicitly.
+                const cls = (b.className || '').toString().toLowerCase();
+                const tid = (b.getAttribute('data-test-id') || '').toLowerCase();
+                return tid === 'actions-menu-button' ||
+                       cls.includes('conversation-actions') ||
+                       /more options for/.test(lbl);
             };
             const cands = [];
             for (const b of document.querySelectorAll('button, [role="button"]')) {
