@@ -16678,12 +16678,16 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
 
     Returns `(new_page, verified_bool)` or `None` on hard failure (including
     paste/setup failure where start_agent_no_gemini_wait returned ok=False)."""
+    # Re-deliver user source docs on hard-retry too (read from disk so the
+    # retried agent gets the same attachments the original run did).
+    source_paths = _read_p2_source_paths()
     if name == "ChatGPT":
         new_page, _setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://chatgpt.com",
             PROMPT_CHATGPT_DEEP_RESEARCH,
             "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2A-retry", "ChatGPT", verbose, brief_path=brief_path)
+            brief_text, "2A-retry", "ChatGPT", verbose, brief_path=brief_path,
+            source_paths=source_paths)
         if not _setup_ok:
             return (new_page, False)
         verified = await wait_until_verified(
@@ -16697,7 +16701,8 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             browser, cua_client, "https://claude.ai/new",
             PROMPT_CLAUDE_DEEP_RESEARCH,
             "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2C-retry", "Claude", verbose, brief_path=brief_path)
+            brief_text, "2C-retry", "Claude", verbose, brief_path=brief_path,
+            source_paths=source_paths)
         if not _setup_ok:
             return (new_page, False)
         verified = await wait_until_verified(
@@ -16711,7 +16716,8 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
             "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2B-retry", "Gemini", verbose, brief_path=brief_path)
+            brief_text, "2B-retry", "Gemini", verbose, brief_path=brief_path,
+            source_paths=source_paths)
         if not _setup_ok:
             return (new_page, False)
         await browser.switch_to_page(new_page)
@@ -22702,6 +22708,164 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
 # receive long input and dodges all the paste-verification issues.
 # ═════════════════════════════════════════════════════════════════════
 
+# ── Phase-2 user-source delivery ──────────────────────────────────────────
+# When P1 is skipped and the user attaches source files, those files must
+# reach every P2 agent. ChatGPT/Claude attach them natively (extra_files on
+# the file input); Gemini drops uploads, so it gets their text pasted under
+# the brief. The files live in queues/<run>/documents/ alongside the
+# synthetic brief.md + (on resume/retry) agent-written artifacts, so we
+# track an explicit ALLOWLIST manifest of user-attached filenames rather
+# than a brief/consolidated denylist that would sweep agent outputs.
+
+def _p2_run_dir():
+    if not _tracks_dir:
+        return None
+    return Path(__file__).parent / "queues" / _tracks_dir.name
+
+
+def _p2_sources_manifest_path():
+    rd = _p2_run_dir()
+    return (rd / ".p2_sources.json") if rd else None
+
+
+def _write_user_sources_manifest(names):
+    """Record which documents/ files are user-attached sources. Called by
+    Flow B after downloads. `attach_to_p2` stays False until the orchestrator
+    confirms P1 didn't run live this session (see _finalize_p2_source_decision)."""
+    mp = _p2_sources_manifest_path()
+    if not mp:
+        return
+    try:
+        data = {}
+        if mp.exists():
+            data = json.loads(mp.read_text(encoding="utf-8"))
+        merged = list(dict.fromkeys((data.get("files") or []) + [str(n) for n in names]))
+        data["files"] = merged
+        data.setdefault("attach_to_p2", False)
+        mp.write_text(json.dumps(data), encoding="utf-8")
+    except Exception as e:
+        log(f"[p2-sources] manifest write failed: {e}", "WARN")
+
+
+def _finalize_p2_source_decision(attach):
+    """Record the definitive 'attach user sources to P2' decision exactly once,
+    just before P2 runs. `attach` should be True only when P1 did NOT run a
+    live brief generation this session (P1-ON already absorbed the files into
+    the ChatGPT brief — re-attaching would double-feed). Idempotent via a
+    `decided` flag: a P1-ON run that pauses and resumes INTO P2 (where the P1
+    block is skipped and the gate would flip) keeps its original decision."""
+    mp = _p2_sources_manifest_path()
+    if not mp or not mp.exists():
+        return
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+        if data.get("decided"):
+            return
+        data["attach_to_p2"] = bool(attach) and bool(data.get("files"))
+        data["decided"] = True
+        mp.write_text(json.dumps(data), encoding="utf-8")
+        if data["attach_to_p2"]:
+            log(f"[p2-sources] {len(data['files'])} user source(s) flagged for P2 delivery")
+    except Exception as e:
+        log(f"[p2-sources] manifest finalize failed: {e}", "WARN")
+
+
+def _read_p2_source_paths():
+    """Absolute paths of user source docs to hand each P2 agent. Empty unless
+    the manifest exists AND attach_to_p2 is set. Durable across pause/resume
+    and hard-retry because it reads from disk, not runtime state."""
+    mp = _p2_sources_manifest_path()
+    rd = _p2_run_dir()
+    if not mp or not rd or not mp.exists():
+        return []
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+        if not data.get("attach_to_p2"):
+            return []
+        out = []
+        for name in (data.get("files") or []):
+            p = rd / "documents" / name
+            if p.exists() and p.is_file():
+                out.append(str(p))
+        return out
+    except Exception as e:
+        log(f"[p2-sources] manifest read failed: {e}", "WARN")
+        return []
+
+
+# Per-doc + total caps so a large PDF can't blow Gemini's composer paste
+# (Gemini gets pasted text, not a file attachment).
+_P2_SRC_CHARS_PER_DOC = 50000
+_P2_SRC_CHARS_TOTAL = 150000
+
+
+def _extract_source_text(path):
+    """Best-effort plaintext of a user source. md/txt read natively; pdf/docx
+    via import-guarded optional libs. Returns None when text can't be
+    extracted (missing lib / parse failure) — caller logs + skips that file."""
+    p = Path(path)
+    suf = p.suffix.lower()
+    try:
+        if suf in (".md", ".txt"):
+            return p.read_text(encoding="utf-8", errors="replace")
+        if suf == ".pdf":
+            try:
+                from pypdf import PdfReader
+            except Exception:
+                try:
+                    from PyPDF2 import PdfReader  # legacy fallback name
+                except Exception:
+                    return None
+            parts = []
+            for pg in PdfReader(str(p)).pages:
+                parts.append(pg.extract_text() or "")
+            return "\n".join(parts)
+        if suf == ".docx":
+            try:
+                import docx
+            except Exception:
+                return None
+            return "\n".join(par.text for par in docx.Document(str(p)).paragraphs)
+    except Exception as e:
+        log(f"[p2-extract] {p.name}: {e}", "WARN")
+    return None
+
+
+def _augment_brief_with_sources(brief, source_paths, label):
+    """Append extracted source-doc text to a brief for paste-based delivery
+    (Gemini). Honors per-doc + total size caps; returns the brief unchanged
+    if nothing could be inlined."""
+    if not source_paths:
+        return brief
+    chunks = []
+    total = 0
+    inlined = 0
+    for sp in source_paths:
+        name = Path(sp).name
+        txt = _extract_source_text(sp)
+        if not txt or not txt.strip():
+            log(f"[{label}] Source '{name}' not inlined (no extractable text — "
+                f"file still reaches NotebookLM in P3)", "WARN")
+            continue
+        txt = txt.strip()
+        if len(txt) > _P2_SRC_CHARS_PER_DOC:
+            txt = txt[:_P2_SRC_CHARS_PER_DOC] + "\n…[truncated]"
+            log(f"[{label}] Source '{name}' truncated to {_P2_SRC_CHARS_PER_DOC} chars for paste", "WARN")
+        if total + len(txt) > _P2_SRC_CHARS_TOTAL:
+            log(f"[{label}] Source paste budget reached — '{name}' and any remaining sources dropped", "WARN")
+            break
+        chunks.append(f"--- SOURCE DOCUMENT: {name} ---\n{txt}")
+        total += len(txt)
+        inlined += 1
+    if not chunks:
+        return brief
+    log(f"[{label}] Inlined {inlined} source doc(s) ({total} chars) into brief for paste")
+    header = ("\n\n══════ ATTACHED SOURCE DOCUMENTS ══════\n"
+              "Below are the full contents of the source files the user attached. "
+              "Use them as the primary source material for your research.\n\n")
+    return brief + header + "\n\n".join(chunks)
+
+
 async def attach_brief_file(browser, page, brief_path, platform, label, extra_files=None):
     """Attach brief.md (and optional extra user-supplied files) to the
     composer via the hidden file input. Returns True if at least the
@@ -23432,8 +23596,12 @@ async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=2
 
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
                                      brief, label, platform, verbose=False,
-                                     brief_path=None):
+                                     brief_path=None, source_paths=None):
     """Start agent: open tab → Playwright-direct setup → CUA validation → paste brief → submit.
+
+    source_paths: user-attached source docs (skip-P1 flow). ChatGPT/Claude
+    attach them natively alongside the brief; Gemini gets their text pasted
+    (it silently drops file uploads). Empty/None = legacy behavior.
 
     Two-layer setup for reliability:
     1. Playwright clicks known selectors (fast, deterministic when UI is stable)
@@ -23560,8 +23728,12 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     use_file_attach = brief_path and Path(brief_path).exists() and not is_gemini
 
     if use_file_attach:
-        log(f"[{label}] Attaching brief file: {Path(brief_path).name}")
-        attached = await attach_brief_file(browser, page, brief_path, platform, label)
+        if source_paths:
+            log(f"[{label}] Attaching brief file + {len(source_paths)} user source(s): {Path(brief_path).name}")
+        else:
+            log(f"[{label}] Attaching brief file: {Path(brief_path).name}")
+        attached = await attach_brief_file(browser, page, brief_path, platform, label,
+                                           extra_files=source_paths)
         if attached:
             typed = await type_short_inline_prompt(page, platform, label)
             if not typed:
@@ -23573,11 +23745,14 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     model=CUA_MODEL, max_iterations=6, verbose=verbose)
         else:
             log(f"[{label}] Brief attachment failed — falling back to inline paste", "WARN")
+            # Attach failed → inline the source docs' text so the agent still
+            # gets the primary material it would have received as files.
+            brief_to_paste = _augment_brief_with_sources(brief, source_paths, label)
             # DOM-once → CUA contract.
-            paste_ok = await verified_paste_brief(page, brief, platform, label)
+            paste_ok = await verified_paste_brief(page, brief_to_paste, platform, label)
             if not paste_ok:
                 paste_ok = await cua_paste_fallback(page, browser, cua_client,
-                                                     brief, platform, label, verbose)
+                                                     brief_to_paste, platform, label, verbose)
             if not paste_ok:
                 log(f"[{label}] CRITICAL: Both attach and paste (DOM+CUA) failed — skipping this agent", "ERROR")
                 fail_agent(platform_l, "Brief delivery failed",
@@ -23594,15 +23769,19 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 f"drops the upload; paste path empirically works)")
         else:
             log(f"[{label}] Pasting full brief ({len(brief)} chars) with verification...")
+        # Gemini (and the brief_path-missing fallback): inline the user's
+        # source docs into the pasted brief. Gemini silently drops file
+        # uploads, so paste is the only way it sees the primary material.
+        brief_to_paste = _augment_brief_with_sources(brief, source_paths, label)
         # DOM-once → CUA contract: single DOM attempt, then a CUA-assisted
         # fallback (CUA focuses composer, Python pastes via clipboard).
         # Removed the old page-reload + 2nd-DOM-retry path — it amplified
         # tab-spam risk (off-target click on a fresh page) without buying
         # reliability that CUA doesn't provide.
-        paste_ok = await verified_paste_brief(page, brief, platform, label)
+        paste_ok = await verified_paste_brief(page, brief_to_paste, platform, label)
         if not paste_ok:
             paste_ok = await cua_paste_fallback(page, browser, cua_client,
-                                                 brief, platform, label, verbose)
+                                                 brief_to_paste, platform, label, verbose)
         if not paste_ok:
             log(f"[{label}] CRITICAL: Brief paste failed (DOM + CUA) — skipping this agent", "ERROR")
             fail_agent(platform_l, "Brief paste failed",
@@ -23838,6 +24017,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             log(f"Could not prepare brief.md for attachment: {e}", "WARN")
             brief_path = None
 
+    # User-attached source docs to deliver to every agent (skip-P1 flow).
+    # Empty unless the orchestrator flagged them (P1 didn't run live). Read
+    # from disk so it survives pause/resume + hard-retry.
+    source_paths = _read_p2_source_paths()
+    if source_paths:
+        log(f"Phase 2: delivering {len(source_paths)} user source doc(s) to each agent: "
+            f"{[Path(p).name for p in source_paths]}")
+
     agents = {}
     chatgpt_page = None
     claude_page = None
@@ -23856,7 +24043,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 browser, cua_client, "https://chatgpt.com",
                 PROMPT_CHATGPT_DEEP_RESEARCH,
                 "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-                brief_text, "2A", "ChatGPT", verbose, brief_path=brief_path)
+                brief_text, "2A", "ChatGPT", verbose, brief_path=brief_path,
+                source_paths=source_paths)
             if not _chatgpt_setup_ok:
                 # Setup/paste failed — start_agent_no_gemini_wait already
                 # emitted pipeline_error with Retry/Skip actions. Don't try
@@ -23931,7 +24119,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 browser, cua_client, "https://claude.ai/new",
                 PROMPT_CLAUDE_DEEP_RESEARCH,
                 "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-                brief_text, "2B", "Claude", verbose, brief_path=brief_path)
+                brief_text, "2B", "Claude", verbose, brief_path=brief_path,
+                source_paths=source_paths)
             if not _claude_setup_ok:
                 verified_c = False
                 break
@@ -23988,7 +24177,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
             "Enable Deep Research mode in Gemini. Do NOT type — just set up and focus input. Say 'ready for paste'.",
-            brief_text, "2C", "Gemini", verbose, brief_path=brief_path)
+            brief_text, "2C", "Gemini", verbose, brief_path=brief_path,
+            source_paths=source_paths)
         if gemini_setup_ok:
             log("[2C] Gemini brief submitted — letting it generate research plan")
             emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini generating research plan...")
@@ -26094,6 +26284,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # NotebookLM.
                 _bucket_label = _resolve_storage_bucket() or "(unresolved)"
                 _ok, _fail = 0, 0
+                _dl_names = []  # user-source filenames → P2 delivery allowlist
                 for _src in user_sources:
                     _name = (_src.get("name") or "source").strip() or "source"
                     _path = (_src.get("storagePath") or "").strip()
@@ -26118,11 +26309,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         if not _download_user_source_via_storage_rest(_path, _dest):
                             raise RuntimeError("Storage REST download failed")
                         log(f"Flow B source: gs://{_bucket_label}/{_path} → {_dest.name} ({_dest.stat().st_size} bytes)")
+                        _dl_names.append(_dest.name)
                         _ok += 1
                     except Exception as _e:
                         log(f"Flow B source download FAILED ({_path}): {_e}", "WARN")
                         _fail += 1
                 log(f"Flow B sources: {_ok} downloaded, {_fail} failed")
+                # Record the allowlist so P2 delivery (and hard-retry) never
+                # pick up agent-written artifacts in documents/. attach_to_p2
+                # stays False until the orchestrator confirms P1 didn't run.
+                if _dl_names:
+                    _write_user_sources_manifest(_dl_names)
                 # If every download failed, the run is doomed — P3 will trip
                 # the gate and surface a generic "no documents" alert. Better
                 # to fail fast with the actual reason so the user can retry
@@ -27090,6 +27287,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # SKIP branch (which then emits phase_skipped + creates BriefArtifact).
         # No-op when init verified normally.
         _gate_skipped_p1 = False
+        # Did Phase 1 run a LIVE brief generation (ChatGPT) this session? Init
+        # above the P1 block so it's always defined — including resume-into-P2
+        # where the P1 block is skipped. Gates P2 source-doc delivery: only
+        # attach the user's sources to P2 when P1 did NOT distill them into a
+        # brief itself (P1-ON would double-feed). Set True only at the live
+        # `brief_text = p1["text"]` point below.
+        _p1_ran_live = False
         if (start_phase <= 1 and 1 not in skip_phases
                 and 1 not in _controls.skipped_phases
                 and _controls.skip_init_verify
@@ -27402,6 +27606,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     return
                 brief_text = p1["text"]
                 brief_url = p1.get("url", "")
+                _p1_ran_live = True  # ChatGPT generated the brief — sources already absorbed
+                # Stamp the "don't attach to P2" decision durably NOW, not at
+                # P2 entry — otherwise a pause AFTER P1 but BEFORE P2 entry
+                # leaves the manifest un-decided, and resume-into-P2 (where the
+                # P1 block is skipped + _p1_ran_live re-inits False) would flip
+                # it to attach, double-feeding sources P1 already distilled.
+                _finalize_p2_source_decision(False)
                 # Propagate the ChatGPT-share / conversation URL to the
                 # Firestore aggregate so P5's Doc body shows the
                 # "ChatGPT Brief: <url>" line. This URL is NOT emitted as
@@ -27606,6 +27817,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 log("No brief text available — cannot run Phase 2", "ERROR")
                 fail_phase(2, "No brief text available", "Phase 1 produced no brief; cannot run Phase 2.")
                 return
+            # Record the P2 source-doc decision once, before run_phase2 reads
+            # the manifest: attach the user's sources only when P1 did NOT run
+            # a live brief generation this session (skip-P1 / manual brief /
+            # brief-from-file / resume-into-P2). A no-op when no sources were
+            # attached; idempotent so a P1-ON run that resumes into P2 keeps
+            # its original "don't re-attach" decision.
+            _finalize_p2_source_decision(not _p1_ran_live)
             # Note: pre-2026-05-13 had an inline phase2-config-guard here that
             # re-read pipelineConfig.agents from Firestore. That logic is now
             # in reload_config() above (the [config-overlay] block) so every

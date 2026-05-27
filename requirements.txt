@@ -11,6 +11,14 @@ patchright>=1.59
 # Extraction
 markdownify>=0.14
 requests>=2.31
+# Phase-2 source-doc inlining for Gemini (paste path): when P1 is skipped
+# and the user attaches .pdf/.docx sources, Gemini gets their text pasted
+# (it silently drops file uploads). md/txt need no lib; these cover the
+# rest. Both imports are guarded in _extract_source_text — a missing lib
+# degrades to "source not inlined" (WARN) rather than crashing, so an
+# un-upgraded venv still runs.
+pypdf>=4.0
+python-docx>=1.1
 
 # Image/video
 Pillow>=10.0
