@@ -145,17 +145,21 @@ PROMPT_GEMINI_DEEP_RESEARCH = SYSTEM_BASE + """
 
 Your task: Enable Deep Research mode in Gemini. Nothing else.
 
-UI navigation (current as of 2026-05): the Deep Research control is
-nested behind a "More tools" submenu. Try these paths in order:
+UI navigation (current as of 2026-05): "Deep Research" lives at the TOP
+LEVEL of the composer "+" menu (it is NOT nested under "More tools" in
+the current UI). Try these paths in order:
 
-PRIMARY path (current UI):
-1. In the composer (bottom input area), find the "+" button on the left
-   side of the textarea (often labelled "Add", "Add files", or shown as
-   a plus icon). Click it.
-2. In the menu that opens, click "More tools".
-3. In the More tools submenu, click "Deep Research".
+PRIMARY path (current UI, 2 clicks):
+1. In the composer (bottom input area), find the "+" button on the LEFT
+   side of the textarea. It is an icon button — a plus that morphs into
+   an × when its menu opens — and may have NO visible text label. Click it.
+2. In the menu that opens, click "Deep Research" at the TOP LEVEL.
 
-FALLBACK paths (if the + button or More tools is not visible):
+SECONDARY path (3 clicks — only if step 2 shows no top-level "Deep Research"):
+2b. Click "More tools" in the + menu, then click "Deep Research" in the
+    submenu that opens.
+
+FALLBACK paths (only if the + button itself is not visible):
 - Older UI: click a "Tools" button next to the composer, then click
   "Deep Research" in the menu that opens.
 - Even older: a "Deep research" chip/pill may be visible directly in
@@ -174,8 +178,9 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 - DO NOT send anything.
 - DO NOT click Send / Submit.
 - If Deep Research is already on: say "ready for paste" immediately and STOP.
-- If you cannot find Deep Research after trying the + → More tools path
-  AND the legacy Tools path: say "deep research unavailable" and STOP.
+- If you cannot find Deep Research after trying + → Deep Research,
+  + → More tools → Deep Research, AND the legacy Tools path: say
+  "deep research unavailable" and STOP.
 
 Once Deep Research pill is ACTIVE (visibly selected) and input is focused,
 your job is DONE."""

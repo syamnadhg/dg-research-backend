@@ -22087,42 +22087,120 @@ async def setup_gemini_dr(page) -> bool:
 
         # ── Step 1 (current UI 2026-05): + → More tools → Deep Research ──
         # The + button sits in the composer toolbar (left of the textarea).
-        # Gemini exposes it via aria-label "Add", "Add files", "Attach",
-        # "Attachments", "More", "More options"; sometimes a literal "+"
-        # text node; sometimes only via a Material icon span with name="add".
-        # Restrict by viewport position (bottom half) to avoid the top-bar
-        # "+" found in some account-switcher panels.
-        plus_opened = await page.evaluate("""() => {
-            const inComposer = (b) => {
-                const r = b.getBoundingClientRect();
-                return r.top > window.innerHeight * 0.4 && r.width > 0;
-            };
-            const matchesPlus = (b) => {
-                if (!b.offsetParent) return false;
-                const text = (b.textContent || '').trim();
+        # As of 2026-05 it's an SVG icon that morphs +↔× on tap — it has NO
+        # stable text "+", NO whitelisted aria-label in some builds, and is
+        # NOT a Material FONT glyph, so the old text/label/mat-icon matching
+        # missed it entirely ("+ button not in composer" every run). Detect it
+        # by STRUCTURE instead: anchor on the composer input, then take visible
+        # buttons to its LEFT on the same row (this excludes send/mic/stop,
+        # which sit right of or are labelled), label-matchers ranked first.
+        # We then click candidates best-first and REQUIRE a popup menu to open
+        # before accepting — a wrong click can't silently arm mic/attach.
+        n_cands = await page.evaluate("""() => {
+            document.querySelectorAll('[data-dg-plus-cand]').forEach(
+                el => el.removeAttribute('data-dg-plus-cand'));
+            const input = document.querySelector(
+                'rich-textarea div[contenteditable="true"], rich-textarea, '
+                + 'div[contenteditable="true"][data-placeholder], '
+                + 'div[contenteditable="true"], textarea');
+            const ir = input ? input.getBoundingClientRect() : null;
+            const looksPlus = (b) => {
                 const a = (b.getAttribute('aria-label') || '').toLowerCase();
                 const tt = (b.getAttribute('title') || '').toLowerCase();
-                return (a === 'add' || a === 'add files' || a.includes('add files') ||
-                        a === 'attach' || a === 'attachments' ||
-                        a === 'more options' || a === 'more' ||
-                        tt === 'add' || tt === 'more' || tt.includes('attach') ||
-                        text === '+');
+                const tx = (b.textContent || '').trim();
+                const addIcon = [...b.querySelectorAll(
+                        'mat-icon, .material-symbols-outlined, .material-icons')]
+                    .some(ic => { const n = (ic.textContent || '').trim().toLowerCase();
+                                  return n === 'add' || n === 'add_circle'; });
+                return a === 'add' || a === 'add files' || a.includes('add files') ||
+                       a === 'attach' || a === 'attachments' || a === 'more' ||
+                       a === 'more options' || tt === 'add' || tt === 'more' ||
+                       tt.includes('attach') || tx === '+' || addIcon;
             };
+            const isBad = (b) => {
+                const s = ((b.getAttribute('aria-label') || '') + ' '
+                         + (b.getAttribute('title') || '')).toLowerCase();
+                return /mic|microph|voice|dictat|speak|send|submit|stop|cancel/.test(s);
+            };
+            const cands = [];
             for (const b of document.querySelectorAll('button, [role="button"]')) {
-                if (matchesPlus(b) && inComposer(b)) { b.click(); return true; }
-            }
-            // Last resort — find Material "add" icon inside a button.
-            for (const ic of document.querySelectorAll(
-                    'mat-icon, .material-symbols-outlined, .material-icons')) {
-                const name = (ic.textContent || '').trim().toLowerCase();
-                if (name !== 'add' && name !== 'add_circle') continue;
-                const btn = ic.closest('button, [role="button"]');
-                if (btn && btn.offsetParent && inComposer(btn)) {
-                    btn.click(); return true;
+                if (!b.offsetParent || isBad(b)) continue;
+                const r = b.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                const labelHit = looksPlus(b);
+                let score = 0;
+                if (ir) {
+                    // Input anchor available: candidate MUST sit on the
+                    // composer's row, left of the input (where + lives). Ties
+                    // us to the composer by STRUCTURE regardless of absolute
+                    // position — setup runs on the empty new-chat page where
+                    // Gemini centers the composer (~30-50% of viewport), so an
+                    // absolute "bottom-half only" gate would wrongly drop it.
+                    const sameRow = r.top < ir.bottom && r.bottom > ir.top;
+                    const leftOfInput = r.right <= ir.left + 8;
+                    if (!(sameRow && leftOfInput)) continue;
+                    score = 50 + (labelHit ? 100 : 0)
+                          + Math.max(0, 20 - Math.round((ir.left - r.right) / 10));
+                } else {
+                    // No input anchor: fall back to a labelled button in the
+                    // bottom region (the pre-2026-05 heuristic).
+                    if (r.top < window.innerHeight * 0.4 || !labelHit) continue;
+                    score = 100;
                 }
+                cands.push({ b, score, x: r.left });
             }
-            return false;
+            cands.sort((p, q) => q.score - p.score || p.x - q.x);
+            cands.slice(0, 5).forEach((c, i) =>
+                c.b.setAttribute('data-dg-plus-cand', String(i)));
+            return Math.min(cands.length, 5);
         }""")
+
+        _count_visible_menus = """() => {
+            let v = 0;
+            for (const m of document.querySelectorAll(
+                    '[role="menu"], [role="listbox"], [role="menuitem"], [role="option"]'))
+                if (m.offsetParent) v++;
+            return v;
+        }"""
+        plus_opened = False
+        for _ci in range(int(n_cands or 0)):
+            # Baseline visible-menu count BEFORE the click so the assertion
+            # measures a DELTA, not an absolute — a menu/listbox already open
+            # on the page can't false-positive us into accepting a dead click.
+            _menu_before = await page.evaluate(_count_visible_menus)
+            clicked = await page.evaluate(
+                """(i) => { const el = document.querySelector(
+                    '[data-dg-plus-cand="' + i + '"]');
+                    if (!el) return false; el.click(); return true; }""", _ci)
+            if not clicked:
+                continue
+            await asyncio.sleep(0.7)
+            # Mandatory "menu opened" assertion — a real "+" click renders a
+            # popup menu (and morphs the button to ×/aria-expanded). No new
+            # menu = wrong control: dismiss and try the next candidate.
+            menu_open = await page.evaluate("""(before) => {
+                let v = 0;
+                for (const m of document.querySelectorAll(
+                        '[role="menu"], [role="listbox"], [role="menuitem"], [role="option"]'))
+                    if (m.offsetParent) v++;
+                const expanded = document.querySelector(
+                    '[data-dg-plus-cand][aria-expanded="true"]');
+                return v > before || !!expanded;
+            }""", _menu_before)
+            if menu_open:
+                plus_opened = True
+                break
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+        try:
+            await page.evaluate(
+                """() => document.querySelectorAll('[data-dg-plus-cand]').forEach(
+                    el => el.removeAttribute('data-dg-plus-cand'))""")
+        except Exception:
+            pass
         if plus_opened:
             await asyncio.sleep(0.8)
             log("[setup_gemini_dr] Step 1 (current UI): opened + menu")
@@ -22191,7 +22269,7 @@ async def setup_gemini_dr(page) -> bool:
                 else:
                     log("[setup_gemini_dr] Step 1 (current UI): no Deep Research top-level AND no More tools — falling back", "INFO")
         else:
-            log("[setup_gemini_dr] Step 1 (current UI): + button not in composer — trying legacy paths", "INFO")
+            log("[setup_gemini_dr] Step 1 (current UI): no + candidate opened a menu — trying legacy paths", "INFO")
 
         # ── Step 2 (legacy 2026-04): Tools button → Deep Research ────
         if not direct_clicked:
