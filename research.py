@@ -9676,16 +9676,23 @@ async def _verify_paste_landed(page, brief_text, platform, label, source="dom"):
     return False
 
 
-async def _grant_clipboard_permission(page):
-    """Best-effort CDP clipboard permission grant. Silent on failure —
-    Strategy still has the keyboard-typing fallback."""
+async def _grant_clipboard_permission(page) -> bool:
+    """Best-effort CDP clipboard permission grant. Returns True on success,
+    False on failure (silent — the paste path still has the keyboard-typing
+    fallback, so callers that don't care can ignore the result).
+
+    Browser.grantPermissions with no `origin`/`browserContextId` applies to
+    the default browser context (the persistent context here) and persists
+    for the session, so a single call at browser bootstrap covers every
+    agent tab in every phase — see Browser.start()."""
     try:
         cdp = await page.context.new_cdp_session(page)
         await cdp.send("Browser.grantPermissions",
                        {"permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]})
         await cdp.detach()
+        return True
     except Exception:
-        pass
+        return False
 
 
 async def verified_paste_brief(page, brief_text, platform, label, max_retries=1):
@@ -14560,6 +14567,21 @@ class Browser:
         self.context.on("page", self._attach_file_handler)
         self.context.on("page", self._guard_popup)
         self._attach_file_handler(self.page)
+
+        # Clipboard read/write — granted ONCE here at browser bootstrap.
+        # Browser.grantPermissions (CDP, no origin) applies to the persistent
+        # context and persists for the session, so this single grant covers
+        # every agent tab in every phase (new_tab + open_isolated_tab both
+        # reuse this same context). Without it, navigator.clipboard.writeText/
+        # readText are denied in the automated context, which SILENTLY breaks
+        # both P1/P2 brief-paste (Strategy A: clipboard + Ctrl+V) AND P2
+        # response extraction (Gemini "Copy contents" → clipboard, ChatGPT/
+        # Claude copy). verified_paste_brief still grants per-paste as a
+        # defensive fallback in case this bootstrap grant ever fails.
+        if await _grant_clipboard_permission(self.page):
+            log("[browser] clipboard read/write permission granted browser-wide")
+        else:
+            log("[browser] clipboard permission grant failed — paste/extraction may degrade", "WARN")
 
         # F4 / DGOPS-7451 — security deny-list at the Playwright route layer.
         # Blocks ANY navigation, sub-frame request, fetch, or XHR to internal
