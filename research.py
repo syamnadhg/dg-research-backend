@@ -24228,8 +24228,16 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
 
 # ── Phase 3 (audio): Audio Overview Generation ───────────────────────────────
 
-async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False, podcast_length="long"):
+async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose=False, podcast_length="long", prefer_existing_audio: bool = False):
     """Phase 3 (step b): Generate audio overview in NotebookLM + share public.
+
+    `prefer_existing_audio` (2026-05-27, Fix B): set by the no-audio
+    auto-retry. When True and the notebook already holds exactly ONE
+    completed audio card, treat it as THIS run's own (a prior attempt
+    generated it but the download failed) — skip Generate + verification
+    and go straight to the (re-anchored) download. Without this, a retry
+    re-trips the "1 completed audio from a prior run" pre-flight guard and
+    never downloads, or re-runs generation and risks a duplicate card.
 
     `podcast_length` (2026-05-13 feature): "short" / "default" / "long".
     Drives the customize-panel Format/Length selection via the
@@ -24267,6 +24275,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # _PhaseSoftDecision('retry') OR through the post-helper no-audio loop
     # — no inner retry/timeout machinery here.
     audio_done = False
+    # Fix B (2026-05-27): set when prefer_existing_audio + a single complete
+    # card → reuse it (skip Generate + verification, download only).
+    _reuse_existing = False
 
     # Pre-flight invariant check (2026-05-02). Per the user's
     # no-delete constraint, we cannot recover from a duplicate-audio
@@ -24292,14 +24303,29 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         return {"audio_path": None}
 
     if existing_cards == 1 and not already_generating:
-        fail_phase(3,
-                   "NotebookLM Studio has 1 completed audio from a prior run",
-                   "Open the notebook, delete that audio entry manually, then retry. We never auto-delete to avoid touching the wrong one.",
-                   agent="notebooklm",
-                   can_retry=True)
-        return {"audio_path": None}
+        if prefer_existing_audio:
+            # Fix B (2026-05-27): on a no-audio auto-retry the single
+            # completed card is THIS run's own audio — a prior attempt
+            # generated it but the download drifted/failed. It is NOT a
+            # foreign orphan, so reuse it: skip Generate and go straight to
+            # the (Fix-A re-anchored) download. Re-running the full generate
+            # path here would re-trip this very guard and never download.
+            log("[Phase3] Retry: 1 existing audio card is THIS run's — reusing it (skip Generate, download only)")
+            _reuse_existing = True
+        else:
+            fail_phase(3,
+                       "NotebookLM Studio has 1 completed audio from a prior run",
+                       "Open the notebook, delete that audio entry manually, then retry. We never auto-delete to avoid touching the wrong one.",
+                       agent="notebooklm",
+                       can_retry=True)
+            return {"audio_path": None}
 
-    if already_generating:
+    if _reuse_existing:
+        # Do NOT click Generate. The poll loop's first DOM check
+        # (_check_audio_complete_dom) confirms the existing card is complete
+        # and breaks straight into the download.
+        log("[Phase3] Reuse path: skipping Generate — poll loop will confirm the existing card and download it")
+    elif already_generating:
         log("Audio already generating — skipping Generate click")
     else:
         # 2026-05-13: per-variant format + length names for log / narrator
@@ -24371,11 +24397,19 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 )
             return {"audio_path": None}
 
-    # Verify it started
-    verified = await wait_until_verified(
-        lambda page: _check_audio_generating(page),
-        browser.page, "Phase3-audio", browser=browser, cua_client=cua_client,
-        max_retries=10, interval=5, verbose=verbose)
+    # Verify it started. Fix B (2026-05-27): on the reuse path the card is
+    # ALREADY complete, so "verify generation started" is both meaningless
+    # and dangerous — wait_until_verified escalates to a CUA "click any
+    # needed buttons" fix attempt at its retry 7 (research.py wait_until_verified
+    # Phase 3), which on a finished notebook can fire a duplicate/default
+    # audio — the exact state the no-delete invariant can't recover from.
+    if _reuse_existing:
+        verified = True
+    else:
+        verified = await wait_until_verified(
+            lambda page: _check_audio_generating(page),
+            browser.page, "Phase3-audio", browser=browser, cua_client=cua_client,
+            max_retries=10, interval=5, verbose=verbose)
 
     if not verified:
         log("Could not verify audio generation started", "WARN")
@@ -24413,8 +24447,11 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # Minimum 2 minute wait — audio generation typically starts within 1-2 min;
     # waiting 5 min was burning slack for no reason. First poll at 2 min is
     # safe (NotebookLM has reliably emitted progress signals by then).
-    log("Waiting 2 minutes before first audio check (generation takes ~10-20 min)...")
-    interrupt = await _controls.interruptible_sleep(2 * 60, check_interval=10)
+    # Fix B: skip the pre-poll wait on the reuse path — the card is already
+    # done, so the poll loop's first DOM check detects + breaks immediately.
+    if not _reuse_existing:
+        log("Waiting 2 minutes before first audio check (generation takes ~10-20 min)...")
+    interrupt = await _controls.interruptible_sleep(0 if _reuse_existing else 2 * 60, check_interval=10)
     if interrupt == "stop":
         log("[Phase3] STOP during initial wait — aborting", "WARN")
         return {"audio_path": None}
@@ -28307,68 +28344,110 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # both notebook AND audio are obtained. Surface a [Retry, Skip]
             # alert when audio is missing rather than emitting phase_complete
             # with stale-audio risk and tripping P4's no-audio fail_phase.
+            # Fix B (2026-05-27): bounded AUTO-retry for missing audio,
+            # replacing the old UNBOUNDED await_phase_decision(3). In
+            # autonomous/serve mode no human clicks Retry, so that wait
+            # dead-hung the run for hours until the outer watchdog killed it
+            # (the verified deadlock). Instead, auto-retry up to 3× at 5-min
+            # intervals, reusing THIS run's already-generated card via
+            # prefer_existing_audio=True (Fix A re-anchors each download to
+            # the run's own notebook). Only after all 3 fail do we fall back
+            # to notebook-link-only — a non-blocking outcome.
+            # INVARIANT: no path here waits unboundedly for a human.
+            _AUDIO_MAX_AUTO_RETRIES = 3
+            _AUDIO_RETRY_INTERVAL_SEC = 5 * 60
+            _audio_auto_retries = 0
             while bool(notebook_url) and not audio_path and not _p3_audio_user_skipped:
-                log("Phase 3: audio file missing after run — awaiting user decision", "WARN")
-                fail_phase(
-                    phase=3,
-                    error="No audio file from NotebookLM",
-                    reason="Phase 3 finished without producing a downloadable audio file. Retry re-runs the audio step (NotebookLM may have stalled or the download was missed); Skip moves past Phase 3 with the notebook link only — Phase 4 (YouTube) will skip too.",
-                    agent="notebooklm",
-                )
-                decision = await _controls.await_phase_decision(3)
-                if decision == "retry":
-                    log("Phase 3: user requested audio retry (no audio file)", "INFO")
-                    emit_event("phase_restart", phase=3, reason="user_retry_audio_missing")
+                if _controls.is_stop():
+                    log("Phase 3: stop requested during no-audio handling — aborting", "INFO")
+                    return
+                if _audio_auto_retries >= _AUDIO_MAX_AUTO_RETRIES:
+                    # Exhausted auto-retries → graceful, non-blocking fallback:
+                    # continue with notebook-link-only. P5 still delivers the
+                    # notebook link + report; P4 (YouTube) cascades off. Inform
+                    # the user with a dismissible amber warning (NOT a red error
+                    # — the run succeeded apart from the podcast file).
+                    log(f"Phase 3: audio still missing after {_AUDIO_MAX_AUTO_RETRIES} auto-retries — continuing with notebook link only", "WARN")
                     try:
-                        _p3_audio = await _await_phase_with_active_deadline(
-                            3, PHASE_3_AUDIO_MAX_MIN,
-                            lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose, podcast_length=podcast_length),
-                            soft_warn_only=True,  # 2026-05-06 (Stream 2 D4): match primary call at :20018
+                        emit_event(
+                            "pipeline_warning", phase=3, agent="notebooklm",
+                            message="Audio Overview couldn't be captured after 3 retries — continuing with the notebook link only.",
+                            details=("NotebookLM produced the podcast but the audio file couldn't be downloaded and streamed "
+                                     "after 3 attempts. The notebook link is still delivered in your report and email; the "
+                                     "YouTube upload step is skipped. Re-run this research if you want to retry the audio."),
+                            alertType="warn", dismissible=True,
+                            alert_id=f"phase3_audio_giveup_{int(time.time())}",
                         )
-                        audio_path = _p3_audio.get("audio_path")
-                        _ao_url = _p3_audio.get("audio_overview_url", "")
-                        if _ao_url:
-                            audio_overview_url = _ao_url
-                            emit_validated_link(3, "notebooklm", _ao_url, "Audio Overview", link_kind="audio")
-                            if validate_link("notebooklm", _ao_url) and not any(l.get("url") == _ao_url for l in _p3_links):
-                                _p3_links.append({"label": "Audio Overview", "url": _ao_url, "verified": True})
-                        if audio_path:
-                            save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
-                                            notebook_url=notebook_url,
-                                            audio_path=str(audio_path),
-                                            audio_overview_url=audio_overview_url)
-                    except _PhaseSoftDecision as _sd:
-                        # User picked Retry/Skip on the soft-warn during the
-                        # retry attempt. Skip → exit the no-audio loop and
-                        # cascade P4 skip. Retry → fall through with
-                        # audio_path=None so the outer `while ... not audio_path:`
-                        # re-prompts (user can retry again or skip).
-                        log(f"Phase 3 audio retry soft decision: {_sd.decision}", "INFO")
-                        if _sd.decision == "skip":
-                            # Telemetry symmetric with the fail_phase-decision skip
-                            # path at :20146 and the primary helper soft-skip.
-                            emit_event("phase_skipped", phase=3, reason="user_skip_after_audio_retry_soft_timeout")
-                            _p3_audio_user_skipped = True
-                            _controls.skipped_phases.add(4)
-                            audio_path = None
-                            break
-                        audio_path = None
-                    except asyncio.TimeoutError:
-                        log("Phase 3 audio retry timed out", "WARN")
-                        audio_path = None
-                    except Exception as _ar:
-                        log(f"Phase 3 audio retry failed: {_ar}", "WARN")
-                        audio_path = None
-                    continue
-                if decision == "skip":
-                    log("Phase 3: user skipped after no audio — cascading P4 skip (P3-OFF ⇒ P4-OFF)", "INFO")
-                    emit_event("phase_skipped", phase=3, reason="user_skip_after_no_audio")
+                    except Exception:
+                        pass
+                    emit_event("phase_skipped", phase=3, reason="audio_unavailable_after_auto_retries")
                     _p3_audio_user_skipped = True
                     _controls.skipped_phases.add(4)
                     break
-                log(f"Phase 3: user {decision} after no audio — terminating pipeline", "INFO")
-                emit_event("pipeline_stopped", phase=3, reason=f"user_{decision}_after_no_audio")
-                return
+
+                _audio_auto_retries += 1
+                _wait_min = _AUDIO_RETRY_INTERVAL_SEC // 60
+                log(f"Phase 3: audio file missing — auto-retry {_audio_auto_retries}/{_AUDIO_MAX_AUTO_RETRIES} in {_wait_min} min", "WARN")
+                emit_event("agent_progress", phase=3, agent="notebooklm", status="downloading",
+                           progress=f"Audio not captured yet — retrying ({_audio_auto_retries}/{_AUDIO_MAX_AUTO_RETRIES}) in {_wait_min} min…")
+
+                # 5-min interval wait — interruptible so Stop/Pause are honored
+                # (the wait must never become an unbounded human hang).
+                _interrupt = await _controls.interruptible_sleep(_AUDIO_RETRY_INTERVAL_SEC, check_interval=10)
+                if _interrupt == "stop":
+                    log("Phase 3: stop during no-audio retry wait — aborting", "INFO")
+                    return
+                if _interrupt == "pause":
+                    emit_event("pipeline_paused", phase=3)
+                    await _controls.wait_if_paused()
+                    if _controls.is_stop():
+                        return
+
+                emit_event("phase_restart", phase=3, reason="auto_retry_audio_missing", attempt=_audio_auto_retries)
+                try:
+                    _p3_audio = await _await_phase_with_active_deadline(
+                        3, PHASE_3_AUDIO_MAX_MIN,
+                        lambda: run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose,
+                                                 podcast_length=podcast_length, prefer_existing_audio=True),
+                        soft_warn_only=True,
+                    )
+                    audio_path = _p3_audio.get("audio_path")
+                    _ao_url = _p3_audio.get("audio_overview_url", "")
+                    if _ao_url:
+                        audio_overview_url = _ao_url
+                        emit_validated_link(3, "notebooklm", _ao_url, "Audio Overview", link_kind="audio")
+                        if validate_link("notebooklm", _ao_url) and not any(l.get("url") == _ao_url for l in _p3_links):
+                            _p3_links.append({"label": "Audio Overview", "url": _ao_url, "verified": True})
+                    if audio_path:
+                        log(f"Phase 3: audio recovered on auto-retry {_audio_auto_retries}/{_AUDIO_MAX_AUTO_RETRIES}", "INFO")
+                        save_checkpoint(queue_dir, 3, topic=topic, brief_url=brief_url,
+                                        notebook_url=notebook_url,
+                                        audio_path=str(audio_path),
+                                        audio_overview_url=audio_overview_url)
+                        # Parity with the primary path: refresh delivery.json's
+                        # audio link so P5's report/email point at the recovered
+                        # audio overview. (FE streaming uses the Firestore audioUrl
+                        # written inside run_phase3_audio's tail, independent of this.)
+                        update_delivery(audio_url=(audio_overview_url or notebook_url))
+                except _PhaseSoftDecision as _sd:
+                    # A user clicked Retry/Skip on the soft-timeout warn during
+                    # this attempt. Skip → notebook-link-only + cascade P4.
+                    # Retry → loop again (the next auto-retry handles it).
+                    log(f"Phase 3 audio auto-retry soft decision: {_sd.decision}", "INFO")
+                    if _sd.decision == "skip":
+                        emit_event("phase_skipped", phase=3, reason="user_skip_during_audio_auto_retry")
+                        _p3_audio_user_skipped = True
+                        _controls.skipped_phases.add(4)
+                        audio_path = None
+                        break
+                    audio_path = None
+                except asyncio.TimeoutError:
+                    log("Phase 3 audio auto-retry timed out", "WARN")
+                    audio_path = None
+                except Exception as _ar:
+                    log(f"Phase 3 audio auto-retry failed: {_ar}", "WARN")
+                    audio_path = None
+                continue
             if not _p3_audio_user_skipped:
                 emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
                     summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}{', audio link extracted' if audio_overview_url else ''}")
