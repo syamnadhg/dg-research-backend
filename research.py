@@ -21946,17 +21946,18 @@ async def _gemini_select_flash_model(page) -> bool:
     is left on whatever the dropdown defaults to, the DR job can run on the
     wrong model — so we explicitly pick 3.5 Flash before enabling DR.
 
-    Approach: find the model-name button at the top of the chat panel
-    (text shows current model — "Gemini", "3.5", "Flash", "Pro", etc.),
-    click it, then click the menu item whose label includes "3.5 Flash"
-    (rejecting Flash-Lite / Pro / Deep Think siblings so we don't land on
-    a weaker or slower variant).
-    Best-effort: if the dropdown structure has rotated or 3.5 Flash is
-    not available on this account, return False — the caller proceeds
-    with DR enablement anyway and the run uses whatever model the
-    dropdown was on.
+    Approach: open the model button (data-test-id="bard-mode-menu-button"),
+    click the "3.5 Flash" row (rejecting Flash-Lite / Pro / Deep Think
+    siblings), then open the "Thinking level" submenu and click "Extended"
+    — the pipeline wants "Flash Extended", not the default "Standard".
+    Menu-row text is title+description concatenated ("3.5 FlashAll-around
+    help"), so the model match avoids a trailing word boundary.
+    Best-effort: if the dropdown rotated or 3.5 Flash isn't available,
+    return False — the caller enables DR anyway. The Extended step is
+    softer still: a miss only leaves the default thinking level (logged).
 
-    Returns True when 3.5 Flash is visibly selected; False on any miss.
+    Returns True when 3.5 Flash is selected (Extended is set best-effort
+    within); False if the model couldn't be picked.
     """
     try:
         # Step 1: find the model dropdown button. Gemini's current UI uses
@@ -22014,12 +22015,12 @@ async def _gemini_select_flash_model(page) -> bool:
             return False
         await asyncio.sleep(0.8)
 
-        # Step 2: click the "3.5 Flash" menu item. Match defensively against
-        # the variants Gemini uses: "3.5 Flash", "Gemini 3.5 Flash", and
-        # "Gemini 3.5 Flash (Preview)". Reject Flash-Lite / Lite (a weaker
-        # variant), Pro, and Deep Think siblings to avoid clicking the wrong
-        # row. ORDER MATTERS: the lite/pro/deep-think rejects run BEFORE the
-        # flash-accept test, since "Flash-Lite" also contains "flash".
+        # Step 2: click the "3.5 Flash" model row. The menu row's textContent
+        # is the title CONCATENATED with its description ("3.5 FlashAll-around
+        # help"), so match "3.5 flash" WITHOUT a trailing word boundary (a
+        # \\bflash\\b would fail against "flashall..."). Reject Flash-Lite /
+        # Pro / Deep Think siblings first — order matters ("Flash-Lite" also
+        # contains "flash").
         picked = await page.evaluate("""() => {
             const items = document.querySelectorAll(
                 '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li');
@@ -22027,14 +22028,9 @@ async def _gemini_select_flash_model(page) -> bool:
                 if (!el.offsetParent) continue;
                 const t = (el.textContent || '').trim().toLowerCase();
                 if (!t) continue;
-                // Hard-reject sibling items so we don't accidentally click them.
                 if (t.includes('lite') || t.includes('deep think') ||
                     /\\bpro\\b/.test(t)) continue;
-                // Accept any item naming Flash. The current UI labels it just
-                // "Flash" (mode picker shows "currently Flash"); older builds
-                // used "3.5 Flash". Flash-Lite is already rejected above, so a
-                // bare \\bflash\\b match is safe.
-                if (/\\bflash\\b/i.test(t)) {
+                if (/3\\.5\\s*flash/i.test(t)) {
                     el.click();
                     return t.slice(0, 40);
                 }
@@ -22042,7 +22038,7 @@ async def _gemini_select_flash_model(page) -> bool:
             return '';
         }""")
         if not picked:
-            log("[setup_gemini_dr] model-pick: Flash item not found in dropdown — closing menu", "WARN")
+            log("[setup_gemini_dr] model-pick: 3.5 Flash item not found in dropdown — closing menu", "WARN")
             # Best-effort: close the open dropdown so the next step's + button
             # isn't sitting under an overlay.
             try:
@@ -22050,8 +22046,82 @@ async def _gemini_select_flash_model(page) -> bool:
             except Exception:
                 pass
             return False
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(0.6)
         log(f"[setup_gemini_dr] model-pick OK: clicked '{picked}'")
+
+        # Step 3: set Thinking level = Extended (the pipeline wants "Flash
+        # Extended", not the default "Standard"). The model menu carries a
+        # "Thinking level" submenu trigger; clicking it expands a Standard /
+        # Extended choice (click-driven, per captured UI). The menu stays open
+        # after the model pick, but if it closed we reopen via the mode button.
+        # Best-effort: a miss leaves the default level (Standard) and is logged,
+        # not fatal.
+        _reopen_js = """() => {
+            const b = document.querySelector(
+                'button[data-test-id="bard-mode-menu-button"], bard-mode-menu-button button');
+            if (b && b.offsetParent) { b.click(); return true; }
+            return false;
+        }"""
+        _click_tl_js = """() => {
+            const items = document.querySelectorAll(
+                '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li');
+            for (const el of items) {
+                if (!el.offsetParent) continue;
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t.startsWith('thinking level') || t.includes('thinking level')) {
+                    try { el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true})); } catch(e){}
+                    try { el.dispatchEvent(new MouseEvent('pointerover', {bubbles:true})); } catch(e){}
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }"""
+        tl_opened = await page.evaluate(_click_tl_js)
+        if not tl_opened:
+            await page.evaluate(_reopen_js)
+            await asyncio.sleep(0.6)
+            tl_opened = await page.evaluate(_click_tl_js)
+        if tl_opened:
+            await asyncio.sleep(0.6)
+            ext_picked = await page.evaluate("""() => {
+                const items = document.querySelectorAll(
+                    '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li');
+                for (const el of items) {
+                    if (!el.offsetParent) continue;
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    if (t.startsWith('standard')) continue;
+                    if (t.startsWith('extended') || /\\bextended\\b/.test(t)) {
+                        el.click();
+                        return t.slice(0, 40);
+                    }
+                }
+                return '';
+            }""")
+            await asyncio.sleep(0.5)
+            if ext_picked:
+                log(f"[setup_gemini_dr] model-pick: Thinking level -> Extended ('{ext_picked}')")
+            else:
+                log("[setup_gemini_dr] model-pick: 'Extended' option not found — leaving default thinking level", "WARN")
+        else:
+            log("[setup_gemini_dr] model-pick: 'Thinking level' submenu not found — leaving default thinking level", "WARN")
+
+        # Verify the mode button now reflects Extended (best-effort), then close
+        # the menu so it can't cover the composer + button in the next step.
+        try:
+            _mode_txt = await page.evaluate("""() => {
+                const b = document.querySelector(
+                    'button[data-test-id="bard-mode-menu-button"], bard-mode-menu-button button');
+                return b ? ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).toLowerCase() : '';
+            }""")
+            if 'extended' in (_mode_txt or ''):
+                log("[setup_gemini_dr] model-pick verify: mode button shows Extended")
+        except Exception:
+            pass
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
         return True
     except Exception as e:
         log(f"[setup_gemini_dr] model-pick exception: {e}", "WARN")
