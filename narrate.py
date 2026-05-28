@@ -31,14 +31,17 @@ from typing import Any
 
 import requests
 
+# Central model registry — see research-automate/models.py.
+from models import GEMINI_NARRATE, GEMINI_NARRATE_FALLBACK
+
 logger = logging.getLogger("narrate")
 
 
-GEMINI_MODEL_PRIMARY = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash")
-# 2.0-flash was the prior fallback but was deprecated for new users (404).
-# Use 2.5-pro as the fallback so we hedge against flash-specific outages
-# with a different model family rather than retrying the same one.
-GEMINI_MODEL_FALLBACK = "gemini-2.5-pro"
+GEMINI_MODEL_PRIMARY = GEMINI_NARRATE
+# Fallback hedges against a Flash-specific outage by using a different
+# Gemini generation rather than retrying the same model. Lives in
+# models.py so a future 3.x-pro GA bump lands in one place.
+GEMINI_MODEL_FALLBACK = GEMINI_NARRATE_FALLBACK
 GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_NARRATE_TIMEOUT", "8.0"))
 # Vision narrator retired 2026-04-30 — per-agent narrator (Anthropic
 # Haiku 4.5 primary, Gemini 2.5 Flash fallback) fully covers the

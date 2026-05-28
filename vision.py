@@ -35,6 +35,12 @@ from typing import Any, Awaitable, Callable, Literal
 
 import anthropic
 
+# Central model registry — see research-automate/models.py for env-var
+# overrides + rationale. Aliased locally so existing call sites continue
+# to read `MODEL_SONNET` / `MODEL_OPUS` without churn, while bumps land
+# centrally in models.py.
+from models import VISION_LIGHT_MODEL, VISION_HEAVY_MODEL
+
 logger = logging.getLogger("vision")
 
 
@@ -45,8 +51,11 @@ ActionVerb = Literal[
 
 # Sonnet is the default. Opus is the high-stakes / retry-after-failure model.
 # Haiku confirmed too weak by V1 advisor — never used.
-MODEL_SONNET = "claude-sonnet-4-6"
-MODEL_OPUS = "claude-opus-4-7"
+# Names kept as MODEL_SONNET / MODEL_OPUS for backwards-compat with all
+# in-file references (cost dicts, call sites, etc.) — the actual model
+# strings flow in from models.py and bumps land there.
+MODEL_SONNET = VISION_LIGHT_MODEL
+MODEL_OPUS = VISION_HEAVY_MODEL
 
 # Per-call hard timeout — matches the user-perceived stall threshold. Above
 # this, the user sees a frozen UI. asyncio.wait_for around the SDK call.
@@ -63,9 +72,13 @@ LOW_CONFIDENCE_THRESHOLD = 0.6
 # burning the budget. Caller surfaces as pipeline_warning when raised.
 DEFAULT_CALL_BUDGET = 50
 
-# Cost coefficients for rough $/run estimates ($/Mtok). Anthropic pricing
-# as of 2026-04 — refresh annually. Used by VisionMetrics.estimated_cost_usd
-# for surfacing in run analytics, not for billing.
+# Cost coefficients for rough $/run estimates ($/Mtok). Used by
+# VisionMetrics.estimated_cost_usd for surfacing in run analytics, not
+# for billing. Refresh against the current Anthropic pricing page when
+# the underlying MODEL_* constant changes — the figures below were set
+# against Opus 4.7 / Sonnet 4.6; the dict keys flow from the imported
+# constants (now Opus 4.8 default) so the lookup still works, but the
+# coefficient values may drift from actuals until they get re-pinned.
 _COST_PER_MTOK_INPUT = {MODEL_SONNET: 3.00, MODEL_OPUS: 15.00}
 _COST_PER_MTOK_OUTPUT = {MODEL_SONNET: 15.00, MODEL_OPUS: 75.00}
 

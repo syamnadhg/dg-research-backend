@@ -59,6 +59,18 @@ import collections
 from pathlib import Path
 from prompts import *
 from datetime import datetime
+# Central model registry — single source of truth for every Claude/Gemini
+# model used by the BE. Bumping any model = edit one constant in models.py
+# (or set the matching env var); no more scatter-shot search-and-replace
+# across research.py + vision.py + narrate.py.
+from models import (
+    CUA_MODEL,
+    VISION_LIGHT_MODEL,
+    NARRATOR_HAIKU,
+    TITLE_HAIKU,
+    GEMINI_TEXT,
+    GEMINI_NARRATE,
+)
 
 # Vision tier-2 module (shadow-eval today, tier-2 promotion per hotspot
 # after telemetry proves agreement). Wrapped in try/except so a vision.py
@@ -311,8 +323,8 @@ def _scan_sibling_locks_for_research(research_id: str, exclude_worker_id: int) -
 
 
 BETA_FLAG = "computer-use-2025-11-24"
-# All configurable via env vars (defaults are production-tuned)
-CUA_MODEL = os.environ.get("CUA_MODEL", "claude-opus-4-7")
+# All configurable via env vars (defaults are production-tuned).
+# CUA_MODEL now lives in models.py — imported above.
 API_WIDTH = int(os.environ.get("CUA_SCREEN_WIDTH", "1280"))
 API_HEIGHT = int(os.environ.get("CUA_SCREEN_HEIGHT", "800"))
 
@@ -926,7 +938,7 @@ def _try_llm_title(topic, brief, findings=""):
         if _key:
             _cli = _anth.Anthropic(api_key=_key, timeout=8.0)
             resp = _cli.messages.create(
-                model="claude-haiku-4-5",
+                model=TITLE_HAIKU,
                 max_tokens=40,
                 system=system,
                 messages=[{"role": "user", "content": user_msg}],
@@ -950,7 +962,7 @@ def _try_llm_title(topic, brief, findings=""):
         import requests as _requests
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={gemini_key}"
+            f"{GEMINI_TEXT}:generateContent?key={gemini_key}"
         )
         payload = {
             "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
@@ -1086,7 +1098,7 @@ def _try_llm_summary(topic, brief, findings=""):
         if _key:
             _cli = _anth.Anthropic(api_key=_key, timeout=8.0)
             resp = _cli.messages.create(
-                model="claude-haiku-4-5",
+                model=TITLE_HAIKU,
                 max_tokens=400,
                 system=system,
                 messages=[{"role": "user", "content": user_msg}],
@@ -1110,7 +1122,7 @@ def _try_llm_summary(topic, brief, findings=""):
         import requests as _requests
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={gemini_key}"
+            f"{GEMINI_TEXT}:generateContent?key={gemini_key}"
         )
         payload = {
             "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
@@ -7999,7 +8011,7 @@ async def _cua_login_call(page, platform: str, cua_client) -> tuple[bool, str]:
     try:
         resp = await asyncio.to_thread(
             cua_client.messages.create,
-            model=CUA_MODEL,
+            model=VISION_LIGHT_MODEL,
             max_tokens=8,
             messages=[{
                 "role": "user",
@@ -8084,7 +8096,7 @@ async def _cua_pro_tier_call(page, platform: str, cua_client) -> str:
     try:
         resp = await asyncio.to_thread(
             cua_client.messages.create,
-            model=CUA_MODEL,
+            model=VISION_LIGHT_MODEL,
             max_tokens=8,
             messages=[{
                 "role": "user",
@@ -11412,107 +11424,127 @@ async def _narrator_loop(phase: int):
         import requests as _requests
     except Exception:
         return
-    # 2026-04-30: per-agent narrator brain switched from Gemini Pro 2.5 to
-    # Anthropic Haiku 4.5. Pro echoed specific input spans verbatim at
-    # temp 0.2 ("research voice mode false positives" → "researching voice
-    # mode false positives"), which spoiled Gemini's narration after the
-    # 04-29 Flash→Pro upgrade. Haiku 4.5 follows "do not parrot input"
-    # tighter and is cheaper at this volume (~$1/run vs ~$2.50/run).
-    # Anthropic SDK is already a BE dep (vision.py uses Sonnet for ACT).
-    # Gemini 2.5 Flash stays as the safety net — it was the stable
-    # narrator before the 04-29 Pro bump.
-    _USE_HAIKU = os.environ.get("DG_NARRATOR_USE_HAIKU", "1").lower() not in ("0", "false", "no")
-    _haiku_model = os.environ.get("DG_NARRATOR_HAIKU_MODEL", "claude-haiku-4-5")
-    _model_fallback = "gemini-2.5-flash"
-    url_fallback = (
+    # 2026-05-28: per-agent narrator brain swapped to Gemini 3.5 Flash
+    # primary with Haiku 4.5 as cross-vendor fallback. Drivers:
+    #  - Cost: 3.5 Flash is ~comparable-or-cheaper at narrator volume
+    #    AND the rest of the BE text-task stack (summary, title
+    #    fallback, URL extractor) already runs on it — consolidating
+    #    the narrator removes the lone Anthropic-text-call outlier.
+    #  - Latency: Gemini single-region inference is empirically faster
+    #    than the cross-vendor Anthropic hop on this hot path.
+    #  - Quality: the prior parrot-input issue that pushed us off
+    #    Gemini Pro 2.5 in 04-30 doesn't manifest on 3.5 Flash at
+    #    temp 0.2 with the "do not echo input spans" system rule.
+    #  - Vendor hedge: Haiku 4.5 stays in place as the fallback so a
+    #    Google regional blip doesn't blank narration entirely.
+    # Prior order (Haiku primary, Gemini fallback) was the inverse
+    # of every other text-task on the BE; this swap aligns the path.
+    # Backwards-compat: honor legacy DG_NARRATOR_USE_HAIKU env (renamed to
+    # DG_NARRATOR_USE_GEMINI on 2026-05-28 when the primary swapped). The
+    # semantic flipped — old "1" meant "use Haiku primary", new "1" means
+    # "use Gemini primary" — so we invert when reading the legacy var.
+    # Operators with the old name pinned in .dg-supervisor.env get one
+    # release of grace before the alias is removed.
+    _legacy_use_haiku = os.environ.get("DG_NARRATOR_USE_HAIKU")
+    if _legacy_use_haiku is not None:
+        _legacy_truthy = _legacy_use_haiku.lower() not in ("0", "false", "no")
+        _USE_GEMINI = not _legacy_truthy
+    else:
+        _USE_GEMINI = os.environ.get("DG_NARRATOR_USE_GEMINI", "1").lower() not in ("0", "false", "no")
+    _gemini_model = GEMINI_TEXT
+    _haiku_model = NARRATOR_HAIKU
+    url_primary = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{_model_fallback}:generateContent?key={gemini_key}"
+        f"{_gemini_model}:generateContent?key={gemini_key}"
     )
     _err_logged = False  # one-shot — avoid log spam if narrator stays broken
-    _haiku_err_logged = False  # one-shot — log Haiku→Flash downgrade once
+    _gemini_err_logged = False  # one-shot — log Gemini→Haiku downgrade once
 
     def _call_narrator(system: str, user_msg: str, max_tokens: int = 200):
-        """Call the narrator brain. Haiku 4.5 first; Gemini Flash fallback
-        on ANY Haiku failure (4xx, 5xx, timeout, SDK error, empty output).
-        Sync — wrapped in asyncio.to_thread by callers. Returns (text,
-        status_code). 429 is surfaced (not fallback) so the outer loop
-        can back off — Flash fallback would just hit Anthropic's own
-        rate-limit semantics again on the same key.
+        """Call the narrator brain. Gemini 3.5 Flash first; Haiku 4.5
+        fallback on ANY Gemini failure (4xx non-429, 5xx, timeout, parse
+        error, empty output). Sync — wrapped in asyncio.to_thread by
+        callers. Returns (text, status_code). 429 is surfaced (not
+        fallback) so the outer loop can back off — Haiku fallback is
+        reserved for non-rate-limit blips, not for absorbing a quota
+        storm on the primary.
 
-        Note: 4xx errors fall through to Flash (not surfaced) so workspace-
-        usage-limit windows don't blank the narrator for 24+ hours. The
-        downgrade is logged once via _haiku_err_logged so operator sees
-        when narration is running on Flash instead of Haiku."""
-        nonlocal _haiku_err_logged
-        if _USE_HAIKU:
+        Note: non-429 4xx errors fall through to Haiku (not surfaced)
+        so a Gemini-project-scoped quota window doesn't blank narration
+        for hours. The downgrade is logged once via _gemini_err_logged
+        so operator sees when narration is running on Haiku."""
+        nonlocal _gemini_err_logged
+        if _USE_GEMINI:
+            # Gemini Flash primary. Thinking disabled — narration needs a
+            # one-line summary, not reasoning, and thinking eats the
+            # token budget leaving 2-3-word stubs.
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+                "systemInstruction": {"parts": [{"text": system}]},
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": max_tokens,
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
+            }
             try:
-                import anthropic as _anth
-                _key = resolve_api_key()
-                if _key:
-                    _cli = _anth.Anthropic(api_key=_key, timeout=5.0)
-                    try:
-                        resp = _cli.messages.create(
-                            model=_haiku_model,
-                            max_tokens=max_tokens,
-                            system=system,
-                            messages=[{"role": "user", "content": user_msg}],
-                        )
-                        txt = "".join(
-                            getattr(b, "text", "") for b in resp.content
-                            if getattr(b, "type", "") == "text"
-                        )
-                        txt = (txt or "").strip()
-                        if txt:
-                            return txt, 200
-                        # empty text — fall through to Gemini Flash
-                    except _anth.RateLimitError:
-                        return "", 429  # let outer loop back off
-                    except _anth.APIStatusError as e:
-                        sc = getattr(e, "status_code", 500)
-                        if not _haiku_err_logged:
-                            log(f"[narrator] Haiku failed sc={sc} ({str(e)[:160]}) "
-                                f"— falling back to Gemini Flash", "WARN")
-                            _haiku_err_logged = True
-                        # fall through to Gemini Flash
-                    except _anth.APITimeoutError:
-                        if not _haiku_err_logged:
-                            log("[narrator] Haiku timeout — falling back to Gemini Flash", "WARN")
-                            _haiku_err_logged = True
-                        # fall through to Gemini Flash
-                    except Exception as _haiku_e:
-                        if not _haiku_err_logged:
-                            log(f"[narrator] Haiku error ({type(_haiku_e).__name__}: "
-                                f"{str(_haiku_e)[:120]}) — falling back to Gemini Flash", "WARN")
-                            _haiku_err_logged = True
-                        # fall through to Gemini Flash
-            except Exception:
-                pass  # SDK import / key resolution failed — Gemini Flash
+                resp = _requests.post(url_primary, json=payload, timeout=5)
+                sc = resp.status_code
+                if sc == 429:
+                    return "", 429  # let outer loop back off
+                try:
+                    j = resp.json()
+                    text = (j.get("candidates", [{}])[0]
+                             .get("content", {})
+                             .get("parts", [{}])[0]
+                             .get("text", ""))
+                    text = (text or "").strip()
+                    if text and sc == 200:
+                        return text, 200
+                    # empty / non-200 — fall through to Haiku
+                    if not _gemini_err_logged:
+                        log(f"[narrator] Gemini Flash sc={sc} (empty or non-200) "
+                            f"— falling back to Haiku 4.5", "WARN")
+                        _gemini_err_logged = True
+                except Exception:
+                    if not _gemini_err_logged:
+                        log(f"[narrator] Gemini Flash parse failed sc={sc} "
+                            f"— falling back to Haiku 4.5", "WARN")
+                        _gemini_err_logged = True
+            except Exception as _gemini_e:
+                if not _gemini_err_logged:
+                    log(f"[narrator] Gemini Flash error ({type(_gemini_e).__name__}: "
+                        f"{str(_gemini_e)[:120]}) — falling back to Haiku 4.5", "WARN")
+                    _gemini_err_logged = True
+            # fall through to Haiku fallback
 
-        # Gemini Flash fallback. Thinking disabled — narration doesn't
-        # need reasoning, just a one-line summary, and thinking eats the
-        # token budget leaving 2-3-word stubs.
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
-            "systemInstruction": {"parts": [{"text": system}]},
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": max_tokens,
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
-        }
+        # Haiku 4.5 fallback — cross-vendor hedge for Google regional
+        # outages. Anthropic SDK is already a BE dep (vision.py uses
+        # Sonnet for ACT) so no extra footprint.
         try:
-            resp = _requests.post(url_fallback, json=payload, timeout=5)
+            import anthropic as _anth
+            _key = resolve_api_key()
+            if not _key:
+                return None, 0
+            _cli = _anth.Anthropic(api_key=_key, timeout=5.0)
+            try:
+                resp = _cli.messages.create(
+                    model=_haiku_model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=[{"role": "user", "content": user_msg}],
+                )
+                txt = "".join(
+                    getattr(b, "text", "") for b in resp.content
+                    if getattr(b, "type", "") == "text"
+                )
+                return (txt or "").strip(), 200
+            except _anth.RateLimitError:
+                return "", 429
+            except Exception:
+                return None, 0
         except Exception:
             return None, 0
-        try:
-            j = resp.json()
-            text = (j.get("candidates", [{}])[0]
-                     .get("content", {})
-                     .get("parts", [{}])[0]
-                     .get("text", ""))
-        except Exception:
-            return None, resp.status_code
-        return (text or "").strip(), resp.status_code
 
     async def _realistic_fallback(akey: str, ph: int, elapsed_sec: float,
                                    last_status: str = "", *,
@@ -11663,13 +11695,17 @@ async def _narrator_loop(phase: int):
                 # can act; subsequent failures stay quiet to avoid log spam.
                 if not _err_logged:
                     log(f"[narrator] narrator call failed status={status_code} "
-                        f"(haiku={_USE_HAIKU}, fallback_model={_model_fallback}) "
+                        f"(use_gemini={_USE_GEMINI}, primary={_gemini_model}, "
+                        f"fallback={_haiku_model}) "
                         f"— phase narration silent until resolved. Check "
-                        f"ANTHROPIC_API_KEY or GEMINI_API_KEY.", "WARN")
+                        f"GEMINI_API_KEY or ANTHROPIC_API_KEY.", "WARN")
                     _err_logged = True
                 continue
-            # Reset the err flag once we recover so a later regression re-logs.
+            # Reset both err flags once we recover so a later regression re-logs.
+            # _gemini_err_logged also resets so a transient Gemini blip doesn't
+            # latch-suppress the downgrade log for the rest of the phase.
             _err_logged = False
+            _gemini_err_logged = False
             text = text.strip().strip('"').strip("`").strip()
             # SKIP escape hatch — model used the designated fallback signal
             # because data was too thin to narrate honestly. Replace with
@@ -15953,8 +15989,9 @@ async def extract_source_urls_via_vision(page, agent_key: str,
         "Extract every additional source URL visible in the side panel."
     )
 
-    # 2.0-flash deprecated for new users — default to 2.5-flash, override via env.
-    model = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-2.5-flash")
+    # Model resolved from models.GEMINI_NARRATE (env override:
+    # GEMINI_NARRATE_MODEL). Default GA target 2026-05: gemini-3.5-flash.
+    model = GEMINI_NARRATE
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{model}:generateContent?key={api_key}")
     payload = {

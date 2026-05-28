@@ -477,13 +477,13 @@ Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT P
 
 Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min before writing, NotebookLM renders for **5–10 min on Short, 10–20 on Default, 30–45 on Long** mode — `_AUDIO_TYPICAL_RANGE_MIN` in research.py drives the in-chat ETA narration), but a dead-looking tile makes the whole app feel broken even when nothing's wrong. The narration system was consolidated 2026-04-30 from four overlapping writers down to a single per-agent narrator with a backend-fallback tail. Result: cheaper, less duplication, less parroting.
 
-- **Per-agent narrator (the only writer now)** — every Phase 1/2 agent has a narrator worker that reads a bounded ring buffer of recent events (~50) and emits a `phase_narration` / `agent_narration` event about every 6s per active agent. Brain: **Anthropic Haiku 4.5** primary (`claude-haiku-4-5`); **Gemini 2.5 Flash** fallback on any 4xx/5xx/timeout/empty response so workspace-usage-limit windows don't blank the narrator for 24+ hours. Pre-04-30 used Gemini Pro 2.5; Pro echoed input verbatim at temp 0.2 — Haiku follows the no-parrot prompt rules more tightly. Cost envelope: ~200 input / 30 output tokens per call → <$0.02 per full pipeline run on Haiku.
+- **Per-agent narrator (the only writer now)** — every Phase 1/2 agent has a narrator worker that reads a bounded ring buffer of recent events (~50) and emits a `phase_narration` / `agent_narration` event about every 6s per active agent. Brain (as of 2026-05-28): **Gemini 3.5 Flash** primary (`gemini-3.5-flash`, env `GEMINI_TEXT_MODEL`); **Anthropic Haiku 4.5** cross-vendor fallback (`claude-haiku-4-5`, env `DG_NARRATOR_HAIKU_MODEL`) on any non-429 4xx/5xx/timeout/empty response. 429 is surfaced to the outer loop for backoff rather than absorbed by the fallback. The swap consolidates the narrator onto the same text-task stack as summary / title-fallback / URL-extractor (was the lone Anthropic-text-call outlier); Haiku stays as the hedge for Google regional blips. Pre-04-30 used Gemini Pro 2.5 (parrot issue at temp 0.2 — fixed on 3.5 Flash). Cost envelope: ~200 input / 30 output tokens per call → <$0.02 per full pipeline run.
 - **Anti-parroting prompt + chrome scrub.** The narrator system prompt (research.py:5904-5933) has explicit anti-pattern rules: don't echo input verbatim, don't start with "currently" or "Status:", skip chat-thread chrome (`You said:` / `Claude responded:` / `Gemini said` / `brief.md`). Above the narrator, `_compact_event_for_narration` (research.py:5550-5625) scrubs those same chrome strings out of the input window BEFORE the narrator sees them — scrape outputs (chip / step counts) are untouched.
 - **DOM scrape rules per platform:** Claude scrape (research.py:7116-7124) is panel-scoped to `aside` / `[class*="artifact"]` / `[class*="research"]` — dropped `.font-claude-message` and `.contents` heading selectors that grabbed conversation-chrome. ChatGPT P2 panel walker (research.py:7979-7984) dropped the loose `[class*="row" i]` selector and added a 23-verb `VERB_GATE` regex with min-length raised 4→12 to drop "OK" / "Done" single-word noise.
 - **Vision narrator (`narrate.py`) RETIRED.** `PHASE_BUDGET=0` by default — the per-agent narrator covers the same slot via DOM events without burning a separate Gemini call. Set `DG_VISION_NARRATE=1` to re-enable it as a coverage escape hatch.
-- **BE phase-fallback tail.** When the narrator is silent (Haiku + Flash both failing, or 6s startup gap), research.py:9601-9604 emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. The FE renders this as a final tail under the agent narration (PhaseDropdown.tsx:1880-1885). No more dead silence on a working agent.
+- **BE phase-fallback tail.** When the narrator is silent (Gemini + Haiku both failing, or 6s startup gap), research.py:9601-9604 emits `Extended Thinking active · 12,400 chars drafted` into `progress["progress"]`. The FE renders this as a final tail under the agent narration (PhaseDropdown.tsx:1880-1885). No more dead silence on a working agent.
 
-> **Narration brain envs:** `DG_NARRATOR_USE_HAIKU` (default `1`; set `0` to skip Haiku and go straight to Flash), `DG_NARRATOR_HAIKU_MODEL` (default `claude-haiku-4-5`), `DG_VISION_NARRATE` (default `0`; set `1` to re-enable the retired vision narrator). All optional.
+> **Narration brain envs:** `DG_NARRATOR_USE_GEMINI` (default `1`; set `0` to skip Gemini and go straight to the Haiku fallback — renamed from `DG_NARRATOR_USE_HAIKU` on 2026-05-28 when the primary swapped, with the old name honored as a backwards-compat alias for one release), `GEMINI_TEXT_MODEL` (default `gemini-3.5-flash`, also drives narrator primary), `DG_NARRATOR_HAIKU_MODEL` (default `claude-haiku-4-5`, the cross-vendor fallback), `DG_VISION_NARRATE` (default `0`; set `1` to re-enable the retired vision narrator). All optional.
 
 ## Phase 0 verification (sequential, Apr 19; 2026-04-24 simplified)
 
@@ -574,17 +574,23 @@ After completing the login in the Chrome window the backend opened, type `r` + E
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | (required) | Anthropic API key for browser automation (CUA) + narrator's Haiku 4.5 primary brain. Industry-standard name (matches the Anthropic SDK's auto-pickup). Legacy `CUA_API_KEY` is auto-migrated to this name on next BE startup. |
-| `CUA_MODEL` | `claude-opus-4-7` | Claude model for CUA |
+| `ANTHROPIC_API_KEY` | (required) | Anthropic API key for browser automation (CUA) + narrator's Haiku 4.5 cross-vendor fallback. Industry-standard name (matches the Anthropic SDK's auto-pickup). Legacy `CUA_API_KEY` is auto-migrated to this name on next BE startup. |
+| `CUA_MODEL` | `claude-sonnet-4-6` | Claude model for CUA. Sonnet 4.6 is Anthropic's recommended CUA model (largest OSWorld jump in the 4.x lineup) and ~40% cheaper than Opus. Override via env for A/B tests. |
+| `VISION_LIGHT_MODEL` | `claude-sonnet-4-6` | Claude model for the lightweight vision checks (login-wall detection, pro-tier detection). Decoupled from `CUA_MODEL` so they can evolve independently. |
+| `VISION_HEAVY_MODEL` | `claude-opus-4-8` | Claude model for the vision tier-2 high-stakes / retry-after-failure path. |
 | `CUA_SCREEN_WIDTH` | `1280` | Browser viewport width |
 | `CUA_SCREEN_HEIGHT` | `800` | Browser viewport height |
-| `GEMINI_API_KEY` | (optional) | Gemini API key. Used only as the narrator's Flash fallback when Haiku is unavailable. (P4 thumbnail generation lives on the FE — `web/src/lib/album-art.ts` — and uses the FE-side env / per-user-pref Gemini key, not this BE one.) |
+| `GEMINI_API_KEY` | (optional) | Gemini API key. Used by the narrator (Gemini 3.5 Flash primary), summary helper, URL extractor, and other BE text tasks. (P4 thumbnail generation lives on the FE — `web/src/lib/album-art.ts` — and uses the FE-side env / per-user-pref Gemini key, not this BE one.) |
+| `GEMINI_TEXT_MODEL` | `gemini-3.5-flash` | Gemini text model for summary, URL extraction, narrator primary. 2.5 Flash hard-deprecates 2026-06-17 on the generativelanguage API path — leave at default unless reproducing on the prior model. |
+| `GEMINI_NARRATE_MODEL` | `gemini-3.5-flash` | Gemini model for the vision-narrator (`narrate.py`) screenshot panel reader. Kept as its own env so the narrator can be tuned independently from text-only sites. |
+| `GEMINI_NARRATE_FALLBACK_MODEL` | `gemini-2.5-pro` | Hedge against a Flash-specific outage in the vision narrator. Holding on 2.5 Pro until 3.x Pro reaches GA. |
+| `TITLE_MODEL` | `claude-haiku-4-5` | Claude model for research-title generation + API-key-validation tests. Same family as the narrator fallback. |
 | `MAX_WAIT_DEEP` | `90` | Max minutes to wait per Phase 2 agent |
 | `POLL_DEEP_RESEARCH` | `120` | Seconds between polling cycles (Phase 2 round-robin) |
 | `MIN_AGENT_WAIT_MIN` | `5` | Minimum minutes from research-start before CUA completion check is allowed to fire |
 | `BUG_REPORT_EMAIL` | (optional) | Where bug-report submissions land if FE bug-report uses the BE relay. FE has its own `BUG_REPORT_EMAIL` env on `/api/bug` — see FE README. |
-| `DG_NARRATOR_USE_HAIKU` | `1` | Enable Anthropic Haiku 4.5 as the narrator primary (Gemini Flash as fallback). Set `0` to use Flash directly. |
-| `DG_NARRATOR_HAIKU_MODEL` | `claude-haiku-4-5` | Haiku model id for the narrator. |
+| `DG_NARRATOR_USE_GEMINI` | `1` | Enable Gemini 3.5 Flash as the narrator primary (Haiku 4.5 as cross-vendor fallback). Set `0` to force the Haiku path directly. (Renamed from `DG_NARRATOR_USE_HAIKU` 2026-05-28 when the primary swapped.) |
+| `DG_NARRATOR_HAIKU_MODEL` | `claude-haiku-4-5` | Haiku model id for the narrator fallback. |
 | `DG_VISION_NARRATE` | `0` | Re-enable the retired vision narrator (`narrate.py`, `PHASE_BUDGET=80/phase`). Set `1` if a coverage gap appears in DOM-derived narration. |
 | `DG_ORPHAN_MAX_AGE_HOURS` | `4` | Cutoff age for `--retire`'s "manual one-off `--serve` runs" preservation. |
 
