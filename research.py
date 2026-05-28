@@ -224,6 +224,7 @@ def _write_worker_lock(worker_id: int, research_id: str, run_id: str) -> None:
     between tmp write and replace) leaves an orphan `.lock.tmp` that's
     invisible to the scanner — safe.
     """
+    tmp = None
     try:
         lock_dir = Path(__file__).parent / "queues"
         lock_dir.mkdir(parents=True, exist_ok=True)
@@ -239,6 +240,7 @@ def _write_worker_lock(worker_id: int, research_id: str, run_id: str) -> None:
         for attempt in range(5):
             try:
                 os.replace(tmp, path)
+                tmp = None  # consumed by os.replace — nothing left to clean
                 break
             except PermissionError:
                 if attempt == 4:
@@ -246,6 +248,16 @@ def _write_worker_lock(worker_id: int, research_id: str, run_id: str) -> None:
                 time.sleep(0.01 * (attempt + 1))  # 10ms / 20ms / 30ms / 40ms
     except Exception as _le:
         log(f"[worker-lock] write failed for worker {worker_id} (non-fatal): {_le}", "DEBUG")
+    finally:
+        # If os.replace never consumed the tmp (Windows ERROR_ACCESS_DENIED
+        # persisting past the retry budget, or a write_text failure), remove
+        # the orphan `.lock.tmp` so it can't accumulate in the queues dir.
+        # Kills mid-write are swept separately by the queues-dir cleanup glob.
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
 
 def _delete_worker_lock(worker_id: int) -> None:
@@ -2685,6 +2697,12 @@ def _recompute_deferred_queue_positions_locked() -> None:
         log(f"[deferred-recompute] scan failed (best-effort): {e}", "DEBUG")
         return
     if not candidates:
+        # Queue subcollection empty — clear any stale queueOwners (amber
+        # badges) left from a drained/cancelled queue. Best-effort.
+        try:
+            _firebase_db.collection("devices").document(device_id).update({"queueOwners": []})
+        except Exception:
+            pass
         return
 
     def _fifo_key(snap):
@@ -2710,6 +2728,12 @@ def _recompute_deferred_queue_positions_locked() -> None:
         queue.append((snap.id, d))
 
     if not queue:
+        # All candidates filtered out (claimed/processed) — the queue just
+        # drained, so clear amber badges. Best-effort.
+        try:
+            _firebase_db.collection("devices").document(device_id).update({"queueOwners": []})
+        except Exception:
+            pass
         return
 
     try:
@@ -2737,12 +2761,22 @@ def _recompute_deferred_queue_positions_locked() -> None:
     _now_ms_recompute = int(time.time() * 1000)
 
     patches: "list[tuple[str, str, dict]]" = []
+    _queue_owners: "list[dict]" = []
     for idx, (_sid, d) in enumerate(queue):
         uid_v = (d.get("uid") or "").strip()
         rid_v = (d.get("researchId") or "").strip()
         if not (uid_v and rid_v):
             continue
         new_pos = idx + 1
+        # 2026-05-28: per-sharer amber-badge source for the "Shared with"
+        # popup. submittedBy is the sharer who queued the run (uid fallback);
+        # position is the 1-indexed global FIFO slot the FE joins on by uid.
+        _queue_owners.append({
+            "uid": (d.get("submittedBy") or d.get("uid") or "").strip(),
+            "runId": rid_v,
+            "title": (d.get("topic") or "")[:60],
+            "position": new_pos,
+        })
         # Per-doc ahead-by-account breakdown (uses each doc's own uid).
         _ahead_self = 0
         _ahead_others = 0
@@ -2784,6 +2818,18 @@ def _recompute_deferred_queue_positions_locked() -> None:
                 patch["queuedBehindRunId"] = DELETE_FIELD
                 patch["queuedBehindTitle"] = DELETE_FIELD
         patches.append((uid_v, rid_v, patch))
+
+    # 2026-05-28: publish the ordered queue summary onto the device doc so the
+    # owner's "Shared with" popup shows amber "#N" badges per sharer (joined
+    # by uid). Full-array overwrite — this single-flight recompute is the
+    # authoritative snapshot; positions shift as the queue drains, so a
+    # partial merge would leak stale entries. Best-effort / non-fatal.
+    try:
+        _firebase_db.collection("devices").document(device_id).update({
+            "queueOwners": _queue_owners,
+        })
+    except Exception as _qo_err:
+        log(f"[deferred-recompute] queueOwners publish failed (best-effort): {_qo_err}", "DEBUG")
 
     if not patches:
         return
@@ -5894,9 +5940,15 @@ def _clear_current_run_id_best_effort(reason: str) -> None:
         return
     # ── (1) Release this worker's busyWorkerIds slot (all workers) ──
     try:
-        from google.cloud.firestore import ArrayRemove as _AR
+        from google.cloud.firestore import ArrayRemove as _AR, DELETE_FIELD as _WK_DF
+        # 2026-05-28: also drop this worker's per-sharer `workers.<id>` usage
+        # entry (the "Shared with" green badge) in lockstep with
+        # busyWorkerIds. Runs for ALL workers so a crash / STOP / hard_reset
+        # can't leak a phantom badge — every exit funnels through here, and
+        # the next boot-clear self-heals the slot, same as busyWorkerIds.
         _firebase_db.collection("devices").document(_did).update({
             "busyWorkerIds": _AR([WORKER_ID]),
+            f"workers.{WORKER_ID}": _WK_DF,
         })
     except Exception as _bw_err:
         log(
@@ -10086,6 +10138,11 @@ def emit_event(event_type, phase=None, agent=None, **data):
                     _phase_patch = {
                         "currentRunPhase": int(phase),
                         "currentRunPhaseStartedAt": event["timestamp"],
+                        # 2026-05-28: fold worker-1's per-sharer phase into
+                        # the SAME write so phase_start issues one device-doc
+                        # update, not two. Workers >=2 write this in the
+                        # block below (they have no currentRunPhase write).
+                        f"workers.{WORKER_ID}.phase": int(phase),
                     }
                     _firebase_db.collection("devices").document(_did_for_phase).update(_phase_patch)
                     # Refresh ETA on all deferred docs so the FE banner
@@ -10107,6 +10164,20 @@ def emit_event(event_type, phase=None, agent=None, **data):
                         log(f"[device] ETA recompute thread launch failed (non-fatal): {_eta_t_err}", "DEBUG")
         except Exception as _phase_pub_err:
             log(f"[device] currentRunPhase publish failed (non-fatal): {_phase_pub_err}", "DEBUG")
+        # 2026-05-28: per-sharer usage — refresh phase on the device-doc
+        # `workers.<id>` map for workers >=2 (worker-1 folds this into its
+        # _phase_patch above to avoid a second round-trip). Dotted leaf path
+        # merges just the phase, leaving the uid/runId/title/totalPhases
+        # seeded at claim intact. Fire-and-forget — never block emit_event.
+        try:
+            if WORKER_ID != 1 and _firebase_db:
+                _did_wph = load_device_id()
+                if _did_wph:
+                    _firebase_db.collection("devices").document(_did_wph).update({
+                        f"workers.{WORKER_ID}.phase": int(phase),
+                    })
+        except Exception as _wph_err:
+            log(f"[device] workers phase publish (w{WORKER_ID}) failed (non-fatal): {_wph_err}", "DEBUG")
         try:
             _runtime.phase = phase
         except Exception:
@@ -30265,8 +30336,24 @@ async def run_server(port=8000):
                 _did_bw = load_device_id()
                 if _firebase_db and _did_bw:
                     from google.cloud.firestore import ArrayUnion as _AU
+                    # 2026-05-28: also seed this worker's per-sharer usage
+                    # entry for the owner's "Shared with" popup. Dotted-path
+                    # `workers.<id>` merges only this slot (never clobbers a
+                    # sibling worker's entry). Runs for ALL workers (mirrors
+                    # busyWorkerIds), unlike the worker-1-only currentRun*
+                    # block below — so a sharer's run on worker N>=2 still
+                    # gets a green badge. Cleared in
+                    # _clear_current_run_id_best_effort on every exit. phase
+                    # starts at 0; emit_event refreshes it live per worker.
                     _firebase_db.collection("devices").document(_did_bw).update({
                         "busyWorkerIds": _AU([WORKER_ID]),
+                        f"workers.{WORKER_ID}": {
+                            "uid": job.get("uid") or "",
+                            "runId": job.get("research_id") or "",
+                            "title": (job.get("topic") or "")[:60],
+                            "phase": 0,
+                            "totalPhases": 6,
+                        },
                     })
             except Exception as _bw_pub_err:
                 log(

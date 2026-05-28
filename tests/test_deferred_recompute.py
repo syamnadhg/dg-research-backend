@@ -109,13 +109,36 @@ class _FakeDeviceQueue:
         )
 
 
+class _FakeDevSnap:
+    def __init__(self, exists: bool, payload: "dict | None" = None):
+        self.exists = exists
+        self._payload = payload or {}
+
+    def to_dict(self):
+        return dict(self._payload)
+
+
 class _FakeDeviceDoc:
-    def __init__(self, queue_store: dict, raise_on_stream: bool = False):
+    def __init__(self, queue_store: dict, device_writes: list,
+                 raise_on_stream: bool = False):
         self._queue = _FakeDeviceQueue(queue_store, raise_on_stream=raise_on_stream)
+        self._device_writes = device_writes
 
     def collection(self, name):
         assert name == "queue"
         return self._queue
+
+    def get(self):
+        # Device-doc ETA inputs read. Return exists=False so the recompute
+        # falls back to its phase/worker defaults — matches the behavior from
+        # before the fake gained this method, keeping position assertions
+        # stable while still letting the queueOwners .update() be captured.
+        return _FakeDevSnap(False)
+
+    def update(self, patch):
+        # Captures the queueOwners device-doc write (and the empty-queue
+        # clears) so tests can assert the per-sharer amber-badge summary.
+        self._device_writes.append(dict(patch))
 
 
 class _FakeDB:
@@ -125,6 +148,7 @@ class _FakeDB:
         self._raise = raise_on_stream
         self._commit_raise = commit_should_raise
         self.batch_writes: "list[tuple[str, str, dict]]" = []
+        self.device_writes: "list[dict]" = []
 
     def collection(self, name):
         if name == "devices":
@@ -133,6 +157,7 @@ class _FakeDB:
             class _DevicesCol:
                 def document(_inner, _device_id):
                     return _FakeDeviceDoc(store_ref._queue_store,
+                                          store_ref.device_writes,
                                           raise_on_stream=store_ref._raise)
 
             return _DevicesCol()
@@ -208,6 +233,9 @@ def test_empty_queue_is_noop(stub_module, monkeypatch):
     monkeypatch.setattr(research_mod, "_firebase_db", db)
     research_mod._recompute_deferred_queue_positions()
     assert db.batch_writes == []
+    # An empty queue clears queueOwners ([]) on the device doc so stale amber
+    # badges from a drained queue don't linger in the "Shared with" popup.
+    assert any(w.get("queueOwners") == [] for w in db.device_writes)
 
 
 def test_scan_failure_logs_and_returns(stub_module, monkeypatch):
@@ -259,6 +287,15 @@ def test_five_fire_repro_after_husky_claim(stub_module, monkeypatch):
     assert sb_patch["queuePosition"] == 2
     assert sb_patch["queuedBehindRunId"] == "rid-bulldog"
     assert sb_patch["queuedBehindTitle"] == "Bull Dog"
+
+    # queueOwners device-doc summary published for the owner's "Shared with"
+    # popup (amber #N badges, joined by sharer uid). FIFO order, 1-indexed.
+    qo_writes = [w["queueOwners"] for w in db.device_writes if "queueOwners" in w]
+    assert qo_writes, "expected a queueOwners device-doc write"
+    assert [(o["uid"], o["runId"], o["title"], o["position"]) for o in qo_writes[-1]] == [
+        ("sharer-uid", "rid-bulldog", "Bull Dog", 1),
+        ("owner-uid", "rid-stbernard", "St Bernard", 2),
+    ]
 
 
 def test_claimed_docs_excluded_from_recount(stub_module, monkeypatch):
