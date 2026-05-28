@@ -128,7 +128,12 @@ def test_paused_backend_restart_now_in_stuck_set():
     assert fail == 0
     # Post-sweep status reflects the patch
     assert store["rid-stbernard"]["status"] == "stopped"
-    assert store["rid-stbernard"]["cancelled"] is True
+    # 2026-05-26: `cancelled` is set ONLY for queued (pre-claim) runs. A
+    # paused_backend_restart run has partial work (browser state, emitted
+    # phase events), so the sweep leaves it as a historical "Stopped" entry
+    # — cancelled unset — rather than triggering the FE cascade-delete that
+    # cancelled=true fires. (Was asserting the pre-2026-05-26 behavior.)
+    assert "cancelled" not in store["rid-stbernard"]
     assert store["rid-stbernard"]["stoppedBy"] == "hard_reset_sweep"
     assert store["rid-stbernard"]["summary"] == "Cancelled by Reset Backend"
     # Position fields removed
@@ -149,6 +154,9 @@ def test_queued_status_now_swept():
     )
     assert n == 1
     assert store["rid-queued"]["status"] == "stopped"
+    # Queued (pre-claim) runs DO get cancelled=true — no partial work to
+    # preserve, so the FE cascade-delete is the desired outcome (2026-05-26).
+    assert store["rid-queued"]["cancelled"] is True
     assert store["rid-queued"]["stoppedBy"] == "unpair_sweep"
     assert store["rid-queued"]["summary"] == "Cancelled by Unpair"
 

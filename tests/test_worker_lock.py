@@ -264,6 +264,13 @@ def test_write_is_atomic_concurrent_scan_never_empty():
     t_s.start()
     t_w.join(timeout=5)
     stop.set()
+    # Re-join the writer AFTER signalling stop so its in-flight write (tmp
+    # written, os.replace not yet committed) fully completes — including the
+    # failure-path tmp cleanup — before we assert on a leftover .tmp. The
+    # first join above can time out with the writer still running on slow /
+    # contended machines (Windows + AV widen the os.replace retry window);
+    # without this second join the assertion samples mid-write and flakes.
+    t_w.join(timeout=5)
     t_s.join(timeout=2)
 
     assert not errors, f"scanner saw exceptions during concurrent writes: {errors}"
