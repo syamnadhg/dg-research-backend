@@ -20822,12 +20822,14 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
 
 async def extract_gemini_response(page, browser=None, cua_client=None, label="Gemini", verbose=False):
     """Dedicated Gemini extractor — 3 panel-aware tiers:
-      Tier 1: CUA Share & Export → "Copy contents", then read the OS
+      Tier 1: HTML→MD from Gemini's strict side-panel containers (DOM-scrape
+              from immersive-panel / deep-research-panel — returns the full
+              90k-146k-char report with heading hierarchy preserved by the
+              semantic HTML, which the clipboard dump sometimes flattens).
+      Tier 2: CUA Share & Export → "Copy contents", then read the OS
               clipboard (Gemini's native authoritative export; we read the
               clipboard because the in-page hijack misses Gemini's async-
-              Clipboard-API copy — see the T1 fix note below).
-      Tier 2: HTML→MD from Gemini's strict side-panel containers (DOM-scrape
-              fallback — returns the full 90k-146k-char report).
+              Clipboard-API copy — see the T2 fix note below).
       Tier 3: Ctrl+A / Ctrl+C with JS clipboard hijack (panel-focused).
     Each tier emits an explicit log line so the path that succeeded (or
     silently returned empty) is visible in the run log.
@@ -20873,101 +20875,41 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
         log(f"[{label}] DR panel NOT present after 10s — upstream submit/Start "
             f"likely failed; running tiers anyway but expect failure", "WARN")
 
-    # 2026-05-26 ARCHITECTURE: T1 = CUA Share & Export → "Copy contents" (the
-    # authoritative native export), T2 = HTML→MD side-panel scrape, T3 = CUA
-    # Ctrl+A/C select-all. All three are PANEL-AWARE — the post-2026-05 Gemini
-    # UI renders the report in a right-side panel (immersive-panel /
-    # deep-research-panel) and Share & Export lives on that panel's toolbar.
+    # 2026-05-28 ARCHITECTURE (T1↔T2 swap from 2026-05-26 ordering): T1 =
+    # HTML→MD side-panel scrape (the report DOM is already authoritative; the
+    # markdown rendered from the panel's semantic HTML preserves heading
+    # hierarchy + list structure that the clipboard dump occasionally
+    # flattens — cross-run comparisons showed the HTML→MD output looked
+    # cleaner than the CUA Copy-contents output). T2 = CUA Share & Export →
+    # "Copy contents" (Gemini's native authoritative export, kept as the
+    # fallback when panel selectors don't match the latest UI revision).
+    # T3 = CUA Ctrl+A/C select-all. All three are PANEL-AWARE — the
+    # post-2026-05 Gemini UI renders the report in a right-side panel
+    # (immersive-panel / deep-research-panel) and Share & Export lives on
+    # that panel's toolbar.
     #
-    # T1 0-char FIX (2026-05-26): the CUA click was always working (backend-2
-    # logs: CUA clicks Share & Export → Copy contents, page shows "copied")
-    # but the in-page clipboard hijack captured 0 chars. Root cause: Gemini's
-    # "Copy contents" writes the markdown to the REAL OS clipboard via the
-    # async Clipboard API against a writeText reference it cached at page-load,
-    # so our late writeText monkey-patch never sees it (and no `copy` event
-    # fires for the async API, and nothing is visually selected, so the copy-
-    # event + getSelection sources are dry too). The fix: after the click,
-    # READ the OS clipboard (navigator.clipboard.readText → PowerShell
-    # get_clipboard fallback — the same ladder the share-link extractor uses).
-    # The hijack capture is still attempted first for the cases where it works.
+    # T2 0-char FIX (2026-05-26, originally a T1 fix pre-swap): the CUA
+    # click was always working (backend-2 logs: CUA clicks Share & Export →
+    # Copy contents, page shows "copied") but the in-page clipboard hijack
+    # captured 0 chars. Root cause: Gemini's "Copy contents" writes the
+    # markdown to the REAL OS clipboard via the async Clipboard API against
+    # a writeText reference it cached at page-load, so our late writeText
+    # monkey-patch never sees it (and no `copy` event fires for the async
+    # API, and nothing is visually selected, so the copy-event + getSelection
+    # sources are dry too). The fix: after the click, READ the OS clipboard
+    # (navigator.clipboard.readText → PowerShell get_clipboard fallback —
+    # the same ladder the share-link extractor uses). The hijack capture is
+    # still attempted first for the cases where it works.
 
-    # ── Tier 1 (PRIMARY): CUA Share & Export → "Copy contents" + clipboard ──
-    # The "Copy contents" action lives in the Share & Export dropdown on the
-    # report PANEL's toolbar (top-right, same row as Contents / Create / X).
-    # CUA opens it and clicks "Copy contents"; the report markdown lands on
-    # the OS clipboard. We capture via (a) the in-page hijack, then (b)
-    # navigator.clipboard.readText(), then (c) the OS clipboard (get_clipboard).
-    # min_chars=2000 rejects a partial copy / chat ack.
-    if browser and cua_client:
-        async def _gemini_t1_trigger():
-            await browser.switch_to_page(page)
-            # Clear the clipboard first so a stale read (e.g. a prior copy)
-            # can't masquerade as this run's "Copy contents". Best-effort —
-            # if clipboard-write is denied, the post-copy read still gets the
-            # fresh report (we just clicked Copy contents this iteration).
-            try:
-                await asyncio.wait_for(
-                    page.evaluate("() => navigator.clipboard.writeText('')"),
-                    timeout=2.0)
-            except Exception:
-                pass
-            await asyncio.wait_for(
-                agent_loop(cua_client, browser, PROMPT_GEMINI_COPY_CONTENTS,
-                    "Click the Share & Export button in the response toolbar, "
-                    "then click Copy contents in the dropdown menu.",
-                    model=CUA_MODEL, max_iterations=8,
-                    verbose=verbose, target_page=page),
-                timeout=90.0)
-
-        log(f"[{label}] T1: CUA Share & Export → Copy contents")
-        try:
-            md = await _run_with_clipboard_hijack(
-                page, label, _gemini_t1_trigger,
-                timeout_ms=120000, min_chars=2000,
-            )
-        except Exception as _e:
-            log(f"[{label}] T1 clipboard hijack raised: {_e}", "WARN")
-            md = ""
-        # The hijack misses Gemini's async-Clipboard-API copy (see the
-        # ARCHITECTURE note above) — so read the OS clipboard, where the
-        # report markdown actually landed. readText() first (in-browser, 2s
-        # cap for the permission-prompt hang), then PowerShell get_clipboard()
-        # (3s cap for a locked clipboard). Longest wins.
-        if not md or len(md) < 2000:
-            _clip = ""
-            try:
-                _clip = await asyncio.wait_for(
-                    page.evaluate("() => navigator.clipboard.readText()"),
-                    timeout=2.0,
-                ) or ""
-            except (asyncio.TimeoutError, Exception):
-                _clip = ""
-            if not _clip or len(_clip) < 2000:
-                try:
-                    _os_clip = await asyncio.wait_for(
-                        asyncio.to_thread(get_clipboard),
-                        timeout=3.0,
-                    )
-                    if _os_clip and len(_os_clip) > len(_clip):
-                        _clip = _os_clip
-                except (asyncio.TimeoutError, Exception):
-                    pass
-            if _clip and len(_clip) >= 2000:
-                md = _clip
-                log(f"[{label}] T1 recovered {len(md)} chars from OS clipboard "
-                    f"after Copy contents")
-        if md and len(md) >= 2000:
-            log(f"[{label}] Extracted via T1 CUA Share & Export + clipboard: {len(md)} chars")
-            return md
-        elif md:
-            log(f"[{label}] T1 returned {len(md)} chars (below 2000-char threshold — "
-                f"likely partial copy or chat ack) — falling to Tier 2", "WARN")
-
-    # ── Tier 2 (FALLBACK): HTML→MD from Gemini's research-panel containers ──
-    # Panel-aware: STRICT side-panel scopes only (no chat-side ack). Fallback
-    # for when CUA/clipboard is blocked (e.g. clipboard permission denied AND
-    # the menu didn't render). Returns the full report straight from the panel
-    # DOM — the path that reliably got 90k-146k chars in prior E2Es.
+    # ── Tier 1 (PRIMARY): HTML→MD from Gemini's research-panel containers ──
+    # Panel-aware: STRICT side-panel scopes only (no chat-side ack). Reads
+    # the report straight from the panel DOM and renders it through the
+    # same html_to_md path the brief extractor uses — historically the path
+    # that reliably got 90k-146k chars in prior E2Es and (per the user's
+    # cross-run review on 2026-05-28) produced cleaner markdown than the
+    # CUA Copy-contents export (semantic HTML preserves heading hierarchy +
+    # list structure that the clipboard dump occasionally flattens). Falls
+    # to T2 only when the panel selectors don't match the current UI.
     #
     # 2026-05-25 selector tighten: prior list included `[class*="immersive" i]
     # message-content` and `[class*="immersive" i] .markdown` — these are
@@ -20980,7 +20922,7 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # panel exists. Now keep only STRICT side-panel scopes: custom
     # elements (`immersive-panel`, `deep-research-panel`), aside scopes
     # with class wildcards, and ARIA role-complementary/role-region
-    # with aria-label="research". If none match, return empty (T3 follows).
+    # with aria-label="research". If none match, return empty (T2 follows).
     md = await _extract_html_to_md(page, [
         # Custom elements — only match the actual panel, not descendants
         'immersive-panel',
@@ -21016,15 +20958,88 @@ async def extract_gemini_response(page, browser=None, cua_client=None, label="Ge
     # tolerates partial-render glitches while rejecting the ack shape.
     if md and len(md) > 2000:
         if _is_sources_not_document(md, platform="generic"):
-            log(f"[{label}] T2 HTML→MD wrong-artifact — falling to Tier 3", "WARN")
+            log(f"[{label}] T1 HTML→MD wrong-artifact — falling to Tier 2", "WARN")
         elif _looks_like_nav_sidebar(md):
-            log(f"[{label}] T2 HTML→MD looks-like-nav-sidebar — falling to Tier 3", "WARN")
+            log(f"[{label}] T1 HTML→MD looks-like-nav-sidebar — falling to Tier 2", "WARN")
         else:
-            log(f"[{label}] Extracted via T2 HTML→MD: {len(md)} chars")
+            log(f"[{label}] Extracted via T1 HTML→MD: {len(md)} chars")
             return md
     elif md:
-        log(f"[{label}] T2 HTML→MD returned {len(md)} chars (below 2000-char threshold — "
-            f"likely chat-side ack, not the report panel) — falling to Tier 3", "WARN")
+        log(f"[{label}] T1 HTML→MD returned {len(md)} chars (below 2000-char threshold — "
+            f"likely chat-side ack, not the report panel) — falling to Tier 2", "WARN")
+
+    # ── Tier 2 (FALLBACK): CUA Share & Export → "Copy contents" + clipboard ──
+    # The "Copy contents" action lives in the Share & Export dropdown on the
+    # report PANEL's toolbar (top-right, same row as Contents / Create / X).
+    # CUA opens it and clicks "Copy contents"; the report markdown lands on
+    # the OS clipboard. We capture via (a) the in-page hijack, then (b)
+    # navigator.clipboard.readText(), then (c) the OS clipboard (get_clipboard).
+    # min_chars=2000 rejects a partial copy / chat ack. Kept as fallback for
+    # the case where T1's panel selectors don't match the current UI revision.
+    if browser and cua_client:
+        async def _gemini_t2_trigger():
+            await browser.switch_to_page(page)
+            # Clear the clipboard first so a stale read (e.g. a prior copy)
+            # can't masquerade as this run's "Copy contents". Best-effort —
+            # if clipboard-write is denied, the post-copy read still gets the
+            # fresh report (we just clicked Copy contents this iteration).
+            try:
+                await asyncio.wait_for(
+                    page.evaluate("() => navigator.clipboard.writeText('')"),
+                    timeout=2.0)
+            except Exception:
+                pass
+            await asyncio.wait_for(
+                agent_loop(cua_client, browser, PROMPT_GEMINI_COPY_CONTENTS,
+                    "Click the Share & Export button in the response toolbar, "
+                    "then click Copy contents in the dropdown menu.",
+                    model=CUA_MODEL, max_iterations=8,
+                    verbose=verbose, target_page=page),
+                timeout=90.0)
+
+        log(f"[{label}] T2: CUA Share & Export → Copy contents")
+        try:
+            md = await _run_with_clipboard_hijack(
+                page, label, _gemini_t2_trigger,
+                timeout_ms=120000, min_chars=2000,
+            )
+        except Exception as _e:
+            log(f"[{label}] T2 clipboard hijack raised: {_e}", "WARN")
+            md = ""
+        # The hijack misses Gemini's async-Clipboard-API copy (see the
+        # ARCHITECTURE note above) — so read the OS clipboard, where the
+        # report markdown actually landed. readText() first (in-browser, 2s
+        # cap for the permission-prompt hang), then PowerShell get_clipboard()
+        # (3s cap for a locked clipboard). Longest wins.
+        if not md or len(md) < 2000:
+            _clip = ""
+            try:
+                _clip = await asyncio.wait_for(
+                    page.evaluate("() => navigator.clipboard.readText()"),
+                    timeout=2.0,
+                ) or ""
+            except (asyncio.TimeoutError, Exception):
+                _clip = ""
+            if not _clip or len(_clip) < 2000:
+                try:
+                    _os_clip = await asyncio.wait_for(
+                        asyncio.to_thread(get_clipboard),
+                        timeout=3.0,
+                    )
+                    if _os_clip and len(_os_clip) > len(_clip):
+                        _clip = _os_clip
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            if _clip and len(_clip) >= 2000:
+                md = _clip
+                log(f"[{label}] T2 recovered {len(md)} chars from OS clipboard "
+                    f"after Copy contents")
+        if md and len(md) >= 2000:
+            log(f"[{label}] Extracted via T2 CUA Share & Export + clipboard: {len(md)} chars")
+            return md
+        elif md:
+            log(f"[{label}] T2 returned {len(md)} chars (below 2000-char threshold — "
+                f"likely partial copy or chat ack) — falling to Tier 3", "WARN")
 
     # ── Tier 3 (LAST RESORT, Wayland-safe): Ctrl+A/C + clipboard hijack ──
     # JS clipboard hijack intercepts the browser's own copy event before
