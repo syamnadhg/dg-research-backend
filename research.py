@@ -5240,6 +5240,47 @@ def start_firestore_start_listener(job_queue, loop):
                     except Exception:
                         pass
                     continue
+                # 2026-05-28 (duplicate-retry defense): if research is
+                # already "ongoing" AND a sibling worker holds the lock
+                # for it, this queue doc is a duplicate — drop it. Repro:
+                # user at queue position #1, BE stalls (listener missed
+                # event / network blip), user clicks Retry → FE writes a
+                # new queue doc with the same researchId. The atomic FE
+                # batch (firestore.ts startPipelineViaFirestore with
+                # dedupForRetry) deletes the old doc + adds the new one
+                # in one commit, but a cross-user race (sibling fires
+                # between the FE's delete and add) can leave both docs
+                # live momentarily. This guard catches that race + any
+                # other path that landed two queue docs on the same rid.
+                #
+                # Discriminator vs. legitimate FE pre-flip ("ongoing"
+                # written client-side before BE claims): the sibling
+                # lock check. _scan_sibling_locks_for_research returns
+                # non-empty ONLY when another worker on THIS device has
+                # already claimed the same research_id (live PID, fresh
+                # started_at). FE pre-flip alone leaves no sibling lock
+                # → check passes → normal flow continues. Without this
+                # branch, a duplicate doc proceeds into _flip_queued_to_
+                # ongoing (which no-ops on already-ongoing, NOT in the
+                # BAIL_STATUSES set) and worker enters run_pipeline for
+                # an already-running research → dual-spawn.
+                if _rd_status == "ongoing":
+                    _siblings = _scan_sibling_locks_for_research(
+                        research_id, WORKER_ID
+                    )
+                    if _siblings:
+                        _h = _siblings[0]
+                        log(
+                            f"Queue: skipped — research {research_id[:24]}… "
+                            f"already running on sibling worker {_h['worker_id']} "
+                            f"(PID {_h['pid']}); duplicate queue doc, deleting",
+                            "INFO",
+                        )
+                        try:
+                            doc.reference.delete()
+                        except Exception:
+                            pass
+                        continue
             except Exception as e:
                 log(f"Queue: research-doc existence check failed (allowing through): {e}", "WARN")
 
@@ -5800,38 +5841,61 @@ def _safe_enqueue(job_queue, job, source: str) -> bool:
 
 
 def _clear_current_run_id_best_effort(reason: str) -> None:
-    """Worker-1-only clear of the device-doc `currentRunId` /
-    `currentRunOwnerUid` / `currentRunTitle` / `currentRunStartedAt`
-    fields. Best-effort, swallows errors.
+    """Release this worker's footprint on the device doc. Best-effort,
+    swallows errors.
 
-    Why a shared helper: the in-worker `finally` clear (after each
-    job completes) was the only call site, but ANY worker-1 exit
-    that skips the `finally` — STOP, hard_reset, watchdog T3,
-    `_schedule_server_exit` from agent-decision-stop / firestore-
-    command / http-endpoint / token-cancel-current / device-hard-
-    reset — leaves the field pointing at the now-stopped run.
+    Two responsibilities:
+      1. (ALL workers) array_remove THIS WORKER_ID from
+         `devices/{deviceId}.busyWorkerIds`. The FE QueuedBanner stall
+         detector reads `busyWorkerIds.length < workerCount` to know
+         whether ANY worker is idle (powering the 5-min retry gate at
+         position #1). Each worker manages its own membership so
+         crash-leftovers self-heal on next boot-clear.
+      2. (Worker-1 only) clear the device-doc `currentRunId` /
+         `currentRunOwnerUid` / `currentRunTitle` / `currentRunStartedAt`
+         /`currentRunPhase` / `currentRunPhaseStartedAt` fields. These
+         track worker-1's run only (single-field schema; per-worker
+         tracking is intentional scope-limit per #552), so worker N>1
+         has no signal here to clear.
+
+    Why a shared helper: ANY exit that skips the in-worker `finally`
+    — STOP, hard_reset, watchdog T3, `_schedule_server_exit` from
+    agent-decision-stop / firestore-command / http-endpoint /
+    token-cancel-current / device-hard-reset — leaves stale state on
+    the device doc. Patching the helper once covers all paths.
 
     Stale `currentRunId` is the data-layer root cause of the
-    QueuedBanner-shows-on-fresh-run regression (2026-05-22 repro):
-    owner fires a new run after STOP; FE sees `device.currentRunId`
-    set to the prior (stopped) run, falls through the cross-user
-    banner fallback, and renders "queued behind X" even though
-    nothing's queued. Each exit path that bypasses the finally
-    needs to call this helper.
-
-    Worker-1-only gate mirrors the publish in `_job_worker` —
-    currentRunId tracks worker 1's run; worker N>1 has no signal
-    here to clear.
+    QueuedBanner-shows-on-fresh-run regression (2026-05-22 repro);
+    a leaked busyWorkerIds entry is the analogous 2026-05-28 repro
+    where the retry button false-fires immediately after a worker
+    "appears" to free up (it didn't — entry just leaked from prior
+    process death).
     """
-    if WORKER_ID != 1:
-        return
     if not _firebase_db:
+        return
+    _did = None
+    try:
+        _did = load_device_id()
+    except Exception:
+        pass
+    if not _did:
+        return
+    # ── (1) Release this worker's busyWorkerIds slot (all workers) ──
+    try:
+        from google.cloud.firestore import ArrayRemove as _AR
+        _firebase_db.collection("devices").document(_did).update({
+            "busyWorkerIds": _AR([WORKER_ID]),
+        })
+    except Exception as _bw_err:
+        log(
+            f"[device] busyWorkerIds release ({reason}, w{WORKER_ID}) failed (non-fatal): {_bw_err}",
+            "DEBUG",
+        )
+    # ── (2) Worker-1 clears the currentRun* mirror fields ──
+    if WORKER_ID != 1:
         return
     try:
         from google.cloud.firestore import DELETE_FIELD as _CR_DF
-        _did = load_device_id()
-        if not _did:
-            return
         # 2026-05-26: also clear the phase fields. Without these, a STOP /
         # hard_reset / Phoenix exit left `currentRunPhase` pointing at the
         # terminal phase of the just-stopped run. The next run's first
@@ -30153,6 +30217,25 @@ async def run_server(port=8000):
                 job.get("research_id") or "",
                 job.get("run_id") or "",
             )
+            # 2026-05-28: mark this worker busy in the device-doc
+            # `busyWorkerIds` array. Runs for ALL workers (not gated
+            # to worker-1) — FE QueuedBanner stall detector reads
+            # `busyWorkerIds.length < workerCount` to know whether
+            # any worker is idle while a queued run sits at position
+            # #1. Released by _clear_current_run_id_best_effort on
+            # finally / exit / next-boot. Idempotent via array_union.
+            try:
+                _did_bw = load_device_id()
+                if _firebase_db and _did_bw:
+                    from google.cloud.firestore import ArrayUnion as _AU
+                    _firebase_db.collection("devices").document(_did_bw).update({
+                        "busyWorkerIds": _AU([WORKER_ID]),
+                    })
+            except Exception as _bw_pub_err:
+                log(
+                    f"[device] busyWorkerIds claim (w{WORKER_ID}) failed (non-fatal): {_bw_pub_err}",
+                    "DEBUG",
+                )
             log(f"Starting queued job: {job['topic'][:60]}")
             # Publish currentRunId on the device doc so sharers / sibling
             # tabs can see "device is busy with run X" and render the
@@ -30762,13 +30845,17 @@ async def run_server(port=8000):
         # Refresh the paired device doc so the Account page sees this PC
         # online immediately on server start.
         paired_uid = load_paired_uid()
-        # Worker-1 boot: clear device-doc `currentRunId` fields proactively.
-        # This is the backstop for any exit path that bypassed
-        # `_schedule_server_exit` (commit 2a) — process SIGKILL, OOM,
+        # Boot-clear: release this worker's footprint on the device doc.
+        # The helper handles both responsibilities — array_remove'ing
+        # THIS WORKER_ID from busyWorkerIds (all workers; powers the FE
+        # multi-worker idle signal) AND, for worker-1, clearing the
+        # currentRun* mirror fields. Backstop for any exit path that
+        # bypassed `_schedule_server_exit` — process SIGKILL, OOM,
         # daemon-loop crash, `--retire` (externally killed). Without
-        # this, a stale currentRunId from a prior session persists and
-        # the owner's first new submission's FE renders a spurious
-        # QueuedBanner (Bug X).
+        # this, a stale currentRunId persists into the next session AND
+        # a leaked busyWorkerIds entry would make the FE think a worker
+        # is busy when it isn't (false-positive on the queue-stall
+        # detector's worker-idle check).
         #
         # If a job is auto-resumed by rehydration below, its dequeue at
         # research.py:~26948 will re-write the fields. The 1-15s window
@@ -30776,7 +30863,7 @@ async def run_server(port=8000):
         # because the cross-user fallback predicate requires
         # `currentRunId` set; cleared state ⇒ fallback not engaged ⇒ no
         # banner.
-        _clear_current_run_id_best_effort("worker-1-boot")
+        _clear_current_run_id_best_effort(f"worker-{WORKER_ID}-boot")
         # Track every Firestore research_id touched by rehydration — used by
         # the disk-restore block below so an ongoing run that got marked
         # paused_backend_restart isn't falsely re-enqueued from
