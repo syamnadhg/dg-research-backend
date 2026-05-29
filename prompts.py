@@ -637,6 +637,36 @@ Steps:
 3. Press Enter.
 4. Say "renamed" when done."""
 
+PROMPT_NOTEBOOKLM_VERIFY_SOURCES = SYSTEM_BASE + """
+
+Your task: Inspect the NotebookLM Sources panel and report which sources, if any, FAILED to import. Do NOT type, paste, generate, delete, or click anything — just observe and report.
+
+Steps:
+1. Look at the Sources panel (left side). Each uploaded source is a row showing its filename.
+2. A HEALTHY source shows a normal document icon / checkbox. A FAILED source shows an error state: a red icon, red text, an error/warning/retry badge, or wording like "couldn't be added" / "failed" / "error".
+3. If any source still shows a processing spinner (not yet done), wait a few seconds for it to settle before judging.
+
+Report — the LAST line of your reply must be EXACTLY one of:
+- ALL OK
+- FAILED: <filename>, <filename>   (list the exact filename shown for each source in an error state)
+
+The FAILED line must contain ONLY the comma-separated failed filename(s) and nothing else — no prose, no parentheses, no mention of the healthy sources. If every source is healthy, use "ALL OK" (never "FAILED: none").
+
+Do not click, delete, or change anything. Observation only."""
+
+PROMPT_NOTEBOOKLM_REUPLOAD = SYSTEM_BASE + """
+
+Your task: Repair ONE NotebookLM source that failed to import. Do NOT type, paste, or generate anything.
+
+Steps:
+1. In the Sources panel, find the failed source (red/error icon) matching the filename you were told to fix.
+2. PREFER a non-destructive retry: if that source offers a "Retry" / "Try again" / "Re-import" action (a button on the row, or inside its 3-dot/⋮ menu), click it. This re-processes the existing source in place — do this and skip step 3.
+3. ONLY if there is no retry option: open the failed source's 3-dot/⋮ menu and Remove/Delete it, then click "Add source" / "+", choose Upload / the upload area (the file dialog is auto-handled — just click upload).
+4. Wait for the source to finish processing (no spinner, no red error).
+5. Say "reuploaded" when done.
+
+IMPORTANT: Only touch the ONE failed source named for you. Never remove a healthy source. File dialog is auto-handled — do not type or paste."""
+
 # ── Phase 4: Audio Overview ───────────────────────────────────────────────────
 
 # 2026-05-13 (feature): podcast length is now configurable from the FE

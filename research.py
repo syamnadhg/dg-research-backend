@@ -24860,6 +24860,76 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
 
 # ── Phase 3: NotebookLM Upload ───────────────────────────────────────────────
 
+async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=False, max_rounds=2):
+    """Post-upload health check for NotebookLM sources.
+
+    NotebookLM ingests sources ASYNC after the file lands in the panel, so a
+    source can appear (the per-file CUA "uploaded" check passes) and then flip
+    to a red "failed" state during processing — observed 2026-05 where the
+    first source uploaded *during notebook creation* (claude.md) went red and
+    the audio overview was built from only 2/3 sources, silently.
+
+    Gives ingestion a moment to settle, asks the CUA to report any source stuck
+    in an error state BY FILENAME, and silently re-uploads each failed one
+    (preferring NotebookLM's in-place retry over delete+re-add). Bounded to
+    `max_rounds`. CONSERVATIVE: an "ALL OK" / ambiguous / unmappable verdict
+    takes NO action, so the outcome is never worse than skipping this step.
+    The caller wraps this so any exception just proceeds with what processed."""
+    if not cua_client or not md_files:
+        return
+    by_name = {p.name: p for p in md_files}
+    for _round in range(1, max_rounds + 1):
+        # Let async ingestion settle before judging (spinners → ✓ or red).
+        await asyncio.sleep(8)
+        verdict = await agent_loop(
+            cua_client, browser, PROMPT_NOTEBOOKLM_VERIFY_SOURCES,
+            "Check the Sources panel and report any source in a failed/error (red) state.",
+            model=CUA_MODEL, max_iterations=8, verbose=verbose)
+        text = (verdict.get("text") if isinstance(verdict, dict) else "") or ""
+        low = text.lower()
+        # Conservative parse: only act on an explicit "FAILED:" verdict. "ALL
+        # OK", empty, or anything without "failed:" → assume healthy and stop
+        # (never blind-delete/re-add a good source on an ambiguous read).
+        if "failed:" not in low:
+            log(f"[NotebookLM] source verify (round {_round}): all sources OK")
+            return
+        failed_part = low.split("failed:", 1)[1]
+        # Bail on explicit "no failure" phrasing the model may put after FAILED:.
+        if failed_part.strip().split(",")[0].strip() in ("", "none", "n/a", "-", "nothing"):
+            log(f"[NotebookLM] source verify (round {_round}): all sources OK")
+            return
+        # Token-equality match (split on commas/whitespace, trim stray
+        # punctuation) — NOT a raw substring scan. A healthy filename mentioned
+        # in prose after FAILED: (e.g. "FAILED: claude.md (gemini.md is fine)")
+        # must NOT be matched and "repaired" by mistake.
+        import re as _re
+        _tokens = {t.strip().strip(".,;:()[]'\"") for t in _re.split(r"[\s,]+", failed_part) if t.strip()}
+        failed = [name for name in by_name if name.lower() in _tokens]
+        if not failed:
+            log(f"[NotebookLM] source verify: failure reported but no known filename matched — "
+                f"verdict='{text[:160]}' (skipping repair to avoid touching healthy sources)", "WARN")
+            return
+        log(f"[NotebookLM] source verify (round {_round}): {len(failed)} failed → re-uploading {failed}", "WARN")
+        try:
+            emit_event("agent_progress", phase=3, agent="notebooklm", status="repairing",
+                       progress=f"Re-uploading {len(failed)} source(s) that failed to import…")
+        except Exception:
+            pass
+        for name in failed:
+            md_path = by_name[name]
+            browser.set_upload_file(str(md_path))
+            try:
+                await agent_loop(
+                    cua_client, browser, PROMPT_NOTEBOOKLM_REUPLOAD,
+                    f"The source '{name}' failed to import. Retry it in place if possible, "
+                    f"otherwise remove that one failed source and re-add the file (dialog auto-handled).",
+                    model=CUA_MODEL, max_iterations=12, verbose=verbose)
+            finally:
+                browser.clear_upload_file()
+            await asyncio.sleep(3)
+    log("[NotebookLM] source verify: re-upload rounds exhausted — proceeding with whatever processed", "WARN")
+
+
 async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose=False):
     """Phase 3: upload P2-built MDs to NotebookLM and make notebook public.
     Share-URL extraction lives entirely in P2 — this phase is pure NotebookLM."""
@@ -24945,6 +25015,19 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
 
                 browser.clear_upload_file()
                 await asyncio.sleep(3)
+
+            # Verify each source actually PROCESSED. NotebookLM ingests sources
+            # ASYNC after the file lands in the panel, so a source can pass the
+            # per-file "uploaded" check above and then flip to a red "failed"
+            # state during processing — observed 2026-05: claude.md (the first
+            # source, uploaded during notebook creation) went red and the audio
+            # overview was built from only 2/3 sources, silently. This settles +
+            # verifies + silently re-uploads any failed source. Best-effort:
+            # wrapped so any error just proceeds with whatever processed.
+            try:
+                await _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=verbose)
+            except Exception as _ve:
+                log(f"[NotebookLM] source verify/repair skipped (non-fatal): {_ve}", "WARN")
 
             # Rename notebook — use the smart title (Firestore-synced) so NotebookLM,
             # YouTube, and the email subject all line up on the same short name.
