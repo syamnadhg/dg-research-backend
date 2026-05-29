@@ -4858,6 +4858,11 @@ def start_firestore_start_listener(job_queue, loop):
             if action == "cancel":
                 target_rid = data.get("researchId", "")
                 target_uid = data.get("uid", "")
+                # 2026-05-28: owner-initiated stop/cancel of a SHARER's run
+                # (the "Shared with" popup badge long-press). "stop" =
+                # running run → preserve; "cancel" = queued run → purge.
+                # Absent for a normal self-cancel. See _owner_control_patch.
+                _oc = data.get("ownerControl") or ""
                 if not target_rid or not target_uid:
                     log("Cancel: missing researchId/uid", "WARN")
                     try:
@@ -4888,11 +4893,11 @@ def start_firestore_start_listener(job_queue, loop):
                 # gate_pending_job marker closes this gap.
                 gate_pending = _QUEUE_STATE.get("gate_pending_job") or {}
                 if gate_pending.get("research_id") == target_rid:
-                    log(f"Cancel: target {target_rid[:8]}… is in gate wait — requesting stop + flipping status", "INFO")
+                    log(f"Cancel: target {target_rid[:8]}… is in gate wait — requesting stop + flipping status{' (owner '+_oc+')' if _oc else ''}", "INFO")
                     loop.call_soon_threadsafe(_controls.request_stop)
                     if _firebase_db:
                         from google.cloud.firestore import DELETE_FIELD as _DF
-                        _update_research_doc(target_uid, target_rid, {
+                        _update_research_doc(target_uid, target_rid, _owner_control_patch(_oc, running=False) or {
                             "status": "stopped",
                             "summary": "Cancelled while queued",
                             "cancelled": True,
@@ -4906,7 +4911,7 @@ def start_firestore_start_listener(job_queue, loop):
                         pass
                     continue
                 if current.get("research_id") == target_rid:
-                    log(f"Cancel: target {target_rid[:8]}… is the running job — requesting stop + scheduling exit", "INFO")
+                    log(f"Cancel: target {target_rid[:8]}… is the running job — requesting stop + scheduling exit{' (owner '+_oc+')' if _oc else ''}", "INFO")
                     loop.call_soon_threadsafe(_controls.request_stop)
                     run_id = current.get("run_id") or ""
                     if run_id:
@@ -4920,7 +4925,15 @@ def start_firestore_start_listener(job_queue, loop):
                         # consumes for the red dialog and the auto-delete-on-
                         # close. queuePosition/queuedBehind* dropped — banner
                         # reads them as still-queued otherwise.
-                        _update_research_doc(target_uid, target_rid, {
+                        # Owner-stop (running) preserves the run (no cancelled,
+                        # no cascade-delete); _owner_control_patch returns {}
+                        # for a self-cancel so the original write is kept.
+                        # Only THIS worker (the one holding current_job) writes
+                        # the terminal status for an owner-stop — idle siblings
+                        # that also see the cancel doc skip the flip in
+                        # _do_cancel (see the owner-stop guard there), avoiding a
+                        # cancelled=True clobber that would wrongly purge the run.
+                        _update_research_doc(target_uid, target_rid, _owner_control_patch(_oc, running=True) or {
                             "status": "stopped",
                             "summary": "Cancelled",
                             "cancelled": True,
@@ -4934,7 +4947,7 @@ def start_firestore_start_listener(job_queue, loop):
                         pass
                     _schedule_server_exit("token-cancel-current")
                     continue
-                def _do_cancel(rid=target_rid, u=target_uid, dref=doc.reference):
+                def _do_cancel(rid=target_rid, u=target_uid, dref=doc.reference, oc=_oc):
                     try:
                         # 2026-05-12: also re-check gate_pending_job. The
                         # listener-thread initial check above could miss a
@@ -4942,11 +4955,11 @@ def start_firestore_start_listener(job_queue, loop):
                         # the sync path.
                         gate_pending_now = _QUEUE_STATE.get("gate_pending_job") or {}
                         if gate_pending_now.get("research_id") == rid:
-                            log(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop", "INFO")
+                            log(f"Cancel: target {rid[:8]}… moved to gate wait between listener checks — requesting stop{' (owner '+oc+')' if oc else ''}", "INFO")
                             _controls.request_stop()
                             if _firebase_db:
                                 from google.cloud.firestore import DELETE_FIELD as _DF
-                                _update_research_doc(u, rid, {
+                                _update_research_doc(u, rid, _owner_control_patch(oc, running=False) or {
                                     "status": "stopped",
                                     "summary": "Cancelled while queued",
                                     "cancelled": True,
@@ -4969,7 +4982,7 @@ def start_firestore_start_listener(job_queue, loop):
                         # current_job here closes that window.
                         current_now = _QUEUE_STATE.get("current_job") or {}
                         if current_now.get("research_id") == rid:
-                            log(f"Cancel: target {rid[:8]}… popped to current_job between listener checks — routing to stop+exit", "INFO")
+                            log(f"Cancel: target {rid[:8]}… popped to current_job between listener checks — routing to stop+exit{' (owner '+oc+')' if oc else ''}", "INFO")
                             _controls.request_stop()
                             run_id_now = current_now.get("run_id") or ""
                             if run_id_now:
@@ -4979,7 +4992,7 @@ def start_firestore_start_listener(job_queue, loop):
                                     pass
                             if _firebase_db:
                                 from google.cloud.firestore import DELETE_FIELD as _DF
-                                _update_research_doc(u, rid, {
+                                _update_research_doc(u, rid, _owner_control_patch(oc, running=True) or {
                                     "status": "stopped",
                                     "summary": "Cancelled",
                                     "cancelled": True,
@@ -5014,9 +5027,12 @@ def start_firestore_start_listener(job_queue, loop):
                         # Idempotent for cross-worker case (sibling already
                         # handled it via its own listener — duplicate
                         # writes of the same payload are no-ops).
+                        # Hoisted out of the `if not removed` block so the
+                        # deferred-flip owner-stop guard below can test whether
+                        # THIS worker actually located the start doc.
+                        _start_doc_id = None
                         if not removed and _firebase_db:
                             try:
-                                _start_doc_id = None
                                 for _qsnap in col_ref.limit(50).stream():
                                     _qd = _qsnap.to_dict() or {}
                                     if (_qd.get("researchId") == rid
@@ -5042,14 +5058,34 @@ def start_firestore_start_listener(job_queue, loop):
                                     f"Cancel: deferred start doc scan failed (non-fatal): {_se}",
                                     "DEBUG",
                                 )
-                        if _firebase_db:
+                        # Owner-STOP of a running run: only the worker holding
+                        # current_job (handled in the sync + late re-check
+                        # branches above) writes the terminal status. An idle
+                        # sibling worker also sees the cancel doc, reaches here,
+                        # finds nothing (removed=False, no start doc), and must
+                        # NOT flip — for an owner-stop that would clobber the
+                        # holding worker's preserve-write and there is no
+                        # deferred run to cancel. Skip the flip in that case.
+                        # Owner-CANCEL of a queued run is genuinely deferred, so
+                        # it always flips (matching the self-cancel path).
+                        _op_def = _owner_control_patch(oc, running=False)
+                        _owner_stop_not_held = (
+                            oc == "stop" and not (removed or _start_doc_id is not None)
+                        )
+                        if _firebase_db and _owner_stop_not_held:
+                            log(
+                                f"Cancel: owner-stop rid={rid[:8]}… not held by "
+                                f"this worker — skipping deferred flip",
+                                "DEBUG",
+                            )
+                        elif _firebase_db:
                             # Always flip status — the removed=True case
                             # had this; the removed=False case used to
                             # skip it. Both paths now converge on the
                             # same write so the FE banner clears either
                             # way.
                             from google.cloud.firestore import DELETE_FIELD as _DF
-                            _update_research_doc(u, rid, {
+                            _update_research_doc(u, rid, _op_def or {
                                 "status": "stopped",
                                 "phase": 0,
                                 "summary": (
@@ -6258,6 +6294,54 @@ def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = T
             "WARN",
         )
         return False
+
+
+def _owner_control_patch(oc: str, *, running: bool) -> dict:
+    """Research-doc patch for an OWNER-initiated device-queue stop/cancel.
+
+    The owner long-presses a sharer's worker/queue badge in the "Shared
+    with" popup; the FE enqueues a device-queue `action="cancel"` doc
+    carrying `ownerControl` = "stop" (a RUNNING run → preserve partial
+    work, NO cascade-delete) or "cancel" (a QUEUED run → cascade-delete on
+    chat close, mirror the self-cancel queued field set). `running` says
+    whether the matched job is the active/gate-pending one (so the queued
+    `phase: 0` reset is skipped for a run that already started).
+
+    The sharer's FE matches `summary`/`stoppedBy` to render the
+    owner-attributed chat notice + freeze the live pipeline tile (the
+    ChatContainer `isResetStop` sibling branch). Queue-position markers
+    are always cleared so a stale "queued #N" banner doesn't linger.
+
+    Returns {} for an unrecognized `oc` so callers fall back to their
+    existing self-cancel write verbatim (zero behavior change for the
+    user-cancels-own-run path)."""
+    if oc not in ("stop", "cancel"):
+        return {}
+    from google.cloud.firestore import DELETE_FIELD as _DF
+    patch: dict = {
+        "status": "stopped",
+        "stoppedAt": int(time.time() * 1000),
+        "queuePosition": _DF,
+        "queuedBehindRunId": _DF,
+        "queuedBehindTitle": _DF,
+    }
+    if oc == "stop":
+        # Owner stopped a RUNNING run. Mirror the HARD_RESET active-run
+        # flip (research.py:_sweep / hard_reset_active): leave `cancelled`
+        # UNSET so the run survives in the listing as a historical
+        # "Stopped" entry with partial results.
+        patch["summary"] = "Stopped by the device owner"
+        patch["stoppedBy"] = "owner_stop"
+    else:  # cancel
+        # Owner cancelled a QUEUED run — never started, safe to purge.
+        # `cancelled=True` drives the FE red dialog + auto-delete-on-close
+        # cascade, same as a self-cancel of a queued run.
+        patch["summary"] = "Cancelled by the device owner"
+        patch["stoppedBy"] = "owner_cancel"
+        patch["cancelled"] = True
+        if not running:
+            patch["phase"] = 0
+    return patch
 
 
 # ════════════════════════════════════════════════════════════════════
