@@ -5488,6 +5488,20 @@ def start_firestore_start_listener(job_queue, loop):
                             f"{research_id[:8]}… (non-fatal): {_pwerr}",
                             "DEBUG",
                         )
+                    # 2026-05-28: refresh the device-doc queueOwners array so
+                    # the owner's "Shared with" popup shows this run's amber
+                    # queue badge immediately. Without this, queueOwners only
+                    # refreshed on worker-1 phase_start / claim / cancel, so a
+                    # freshly-deferred run had no amber badge until the next
+                    # (sparse) phase boundary. Threaded so it never blocks the
+                    # start-listener; single-flight via its own lock.
+                    try:
+                        _threading.Thread(
+                            target=_recompute_deferred_queue_positions,
+                            daemon=True, name="queueowners-defer",
+                        ).start()
+                    except Exception as _qo_t_err:
+                        log(f"[start-listener] queueOwners recompute launch failed (non-fatal): {_qo_t_err}", "DEBUG")
                     continue
                 if _firebase_db is not None:
                     _claim_ref = doc.reference
@@ -5577,6 +5591,16 @@ def start_firestore_start_listener(job_queue, loop):
                                     f"{research_id[:8]}… (non-fatal): {_fifo_pwerr}",
                                     "DEBUG",
                                 )
+                            # 2026-05-28: refresh queueOwners so the owner's
+                            # popup amber badge appears for this FIFO-deferred
+                            # run too (see busy-running branch above).
+                            try:
+                                _threading.Thread(
+                                    target=_recompute_deferred_queue_positions,
+                                    daemon=True, name="queueowners-defer",
+                                ).start()
+                            except Exception as _fifo_qo_err:
+                                log(f"[start-listener] queueOwners recompute launch failed (non-fatal): {_fifo_qo_err}", "DEBUG")
                             continue
                     except Exception as _fe:
                         log(
