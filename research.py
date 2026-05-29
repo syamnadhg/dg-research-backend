@@ -5593,7 +5593,13 @@ def start_firestore_start_listener(job_queue, loop):
                                 )
                             # 2026-05-28: refresh queueOwners so the owner's
                             # popup amber badge appears for this FIFO-deferred
-                            # run too (see busy-running branch above).
+                            # run too (see busy-running branch above). Unlike
+                            # that branch, the FIFO path has no 0.6s sibling-
+                            # claim settle — intentional: if an idle sibling
+                            # claims this doc right after, the next recompute
+                            # (claim / phase_start) re-scans and drops it from
+                            # queueOwners via full-array overwrite, so the
+                            # worst case is a self-correcting sub-second badge.
                             try:
                                 _threading.Thread(
                                     target=_recompute_deferred_queue_positions,
