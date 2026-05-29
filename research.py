@@ -22857,14 +22857,17 @@ async def setup_gemini_dr(page) -> bool:
 
 
 async def setup_claude_dr(page) -> bool:
-    """Enable Claude Opus 4.7 + Adaptive Thinking + Research tool via
-    direct Playwright selectors. These are THREE independent controls in
-    the current Claude.ai UI:
-        1. Model dropdown        → Opus 4.7
-        2. Adaptive Thinking     → on (separate toggle/pill, often next to the model name)
-        3. Research tool         → on (inside the "+" tools menu)
-    The CUA fallback lives one layer up in setup_agent so this routine can
-    hard-return False the moment any step fails, without fighting the DOM."""
+    """Enable Claude Opus 4.8 + Max Effort + Adaptive Thinking + Research
+    tool via direct Playwright selectors. As of 2026-05-28 the claude.ai UI
+    splits these across the model popover + the tools menu:
+        1. Model dropdown        → Opus 4.8
+        2. Effort submenu        → Max          (inside the model popover)
+        3. Adaptive Thinking     → on (toggle)  (inside the model popover)
+        4. Research tool         → on (inside the "+" tools menu)
+    Steps 2 + 3 are quality knobs (best-effort: WARN on miss). Correctness
+    gates are the model + Research tool — those hard-return False on miss.
+    The CUA fallback lives one layer up in setup_agent + validate_setup_with_cua
+    so this routine can fail fast without fighting the DOM."""
     try:
         await asyncio.sleep(2)
 
@@ -22886,10 +22889,10 @@ async def setup_claude_dr(page) -> bool:
             await asyncio.sleep(0.8)
             opus_selected = await page.evaluate("""() => {
                 const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, a, li')];
-                // Priority 1: exact "Opus 4.7"
+                // Priority 1: exact "Opus 4.8"
                 let pick = items.find(el => {
                     const t = (el.textContent || '').trim().toLowerCase();
-                    return t.includes('opus') && t.includes('4.7');
+                    return t.includes('opus') && t.includes('4.8');
                 });
                 // Priority 2: any Opus 4.x variant (future-proof)
                 if (!pick) pick = items.find(el => {
@@ -22904,10 +22907,85 @@ async def setup_claude_dr(page) -> bool:
             if opus_selected:
                 log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected}")
             else:
-                log("[setup_claude_dr] Step 1B FAIL: Opus 4.7 option not in dropdown — rollout or A/B difference?", "WARN")
+                log("[setup_claude_dr] Step 1B FAIL: Opus 4.8 option not in dropdown — rollout or A/B difference?", "WARN")
                 return False
             await asyncio.sleep(0.6)
-            # Dismiss the dropdown so the Adaptive Thinking toggle is clickable
+
+            # ── Step 1C: set Effort = Max ──────────────────────────────
+            # 2026-05-28: claude.ai split the old single "Opus 4.7 Adaptive"
+            # option into Model (Opus 4.8) + an Effort submenu (Low/Medium/
+            # High/Extra/Max) + an Adaptive-thinking toggle — all inside the
+            # model popover, which STAYS open after picking a model. So we
+            # open the Effort submenu and pick Max WITHOUT dismissing first.
+            # Best-effort: Effort/Adaptive are quality knobs, not correctness
+            # gates, so a miss here only WARNs — the CUA validate layer
+            # (PROMPT_VALIDATE_CLAUDE_SETUP) is the real backstop.
+            try:
+                _eff_opened = await page.evaluate("""() => {
+                    const els = [...document.querySelectorAll('[role="menuitem"], button, [role="option"], li')]
+                        .filter(el => el.offsetParent !== null);
+                    // The Effort row shows its current value + a submenu chevron.
+                    const trigger = els.find(el => {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        return t === 'effort' || t.startsWith('effort');
+                    });
+                    if (trigger) { trigger.click(); return true; }
+                    return false;
+                }""")
+                if _eff_opened:
+                    await asyncio.sleep(0.5)
+                    _eff_set = await page.evaluate("""() => {
+                        const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, li')]
+                            .filter(el => el.offsetParent !== null);
+                        // Exact-match the trimmed label so we don't catch the
+                        // "Higher effort means…" helper text or a "Max Effort" blurb.
+                        let pick = items.find(el => (el.textContent || '').trim().toLowerCase() === 'max');
+                        if (!pick) pick = items.find(el => (el.textContent || '').trim().toLowerCase() === 'max effort');
+                        if (pick) { pick.click(); return pick.textContent.trim().slice(0, 40); }
+                        return null;
+                    }""")
+                    if _eff_set:
+                        log(f"[setup_claude_dr] Step 1C OK: Effort set to '{_eff_set}'")
+                    else:
+                        log("[setup_claude_dr] Step 1C WARN: Effort submenu opened but 'Max' not found — CUA validate will fix", "WARN")
+                else:
+                    log("[setup_claude_dr] Step 1C WARN: Effort control not found (older UI / popover closed?) — CUA validate will fix", "WARN")
+            except Exception as _ee:
+                log(f"[setup_claude_dr] Step 1C errored: {_ee}", "WARN")
+            await asyncio.sleep(0.4)
+
+            # ── Step 1D: toggle Adaptive Thinking ON ───────────────────
+            # Now a toggle inside the same model/effort popover (was a
+            # separate composer control pre-2026-05-28). State-aware: only
+            # click when not already on. Page-wide search so it works whether
+            # the popover is open or the toggle lives elsewhere in a variant.
+            adaptive_state = await page.evaluate("""() => {
+                const els = [...document.querySelectorAll(
+                    'button, [role="switch"], [role="checkbox"], [role="menuitem"], [role="option"], label'
+                )].filter(el => el.offsetParent !== null);
+                const matches = els.filter(el => {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    const a = (el.getAttribute('aria-label') || '').toLowerCase();
+                    return t === 'adaptive thinking' ||
+                           a === 'adaptive thinking' ||
+                           t.startsWith('adaptive thinking') ||
+                           a.startsWith('adaptive thinking');
+                });
+                if (!matches.length) return { found: false };
+                const el = matches[0];
+                const checked = el.getAttribute('aria-checked') === 'true' ||
+                                 el.getAttribute('aria-pressed') === 'true' ||
+                                 el.dataset.state === 'checked' || el.dataset.state === 'on';
+                if (!checked) { el.click(); return { found: true, toggled: true, label: el.textContent.trim() }; }
+                return { found: true, toggled: false, label: el.textContent.trim() };
+            }""")
+            if not adaptive_state.get("found"):
+                log("[setup_claude_dr] Step 1D WARN: Adaptive Thinking toggle not found — UI may have shipped under a new label", "WARN")
+            else:
+                log(f"[setup_claude_dr] Step 1D OK: Adaptive Thinking {'just enabled' if adaptive_state.get('toggled') else 'already on'} "
+                    f"(label='{adaptive_state.get('label')}')")
+            await asyncio.sleep(0.4)
+            # Dismiss the model popover so the tools menu + input are clickable.
             try:
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(0.3)
@@ -22916,40 +22994,6 @@ async def setup_claude_dr(page) -> bool:
         else:
             log("[setup_claude_dr] Step 1A FAIL: model dropdown button not found — selector list likely stale", "WARN")
             return False
-
-        # ── Step 2: toggle Adaptive Thinking ON ────────────────────────
-        # The toggle is a separate control — usually a pill/switch near
-        # the model name or inside a "Thinking" submenu. State-aware:
-        # only click when not already on. "Extended Thinking" as a label
-        # no longer exists on current Claude.ai (was renamed to Adaptive
-        # Thinking) — matching it risks clicking a stale/cached pill on
-        # a partially-loaded page, so that fallback is intentionally gone.
-        adaptive_state = await page.evaluate("""() => {
-            const els = [...document.querySelectorAll(
-                'button, [role="switch"], [role="checkbox"], [role="menuitem"], [role="option"], label'
-            )].filter(el => el.offsetParent !== null);
-            const matches = els.filter(el => {
-                const t = (el.textContent || '').trim().toLowerCase();
-                const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                return t === 'adaptive thinking' ||
-                       a === 'adaptive thinking' ||
-                       t.startsWith('adaptive thinking') ||
-                       a.startsWith('adaptive thinking');
-            });
-            if (!matches.length) return { found: false };
-            const el = matches[0];
-            const checked = el.getAttribute('aria-checked') === 'true' ||
-                             el.getAttribute('aria-pressed') === 'true' ||
-                             el.dataset.state === 'checked' || el.dataset.state === 'on';
-            if (!checked) { el.click(); return { found: true, toggled: true, label: el.textContent.trim() }; }
-            return { found: true, toggled: false, label: el.textContent.trim() };
-        }""")
-        if not adaptive_state.get("found"):
-            log("[setup_claude_dr] Step 2 WARN: Adaptive Thinking toggle not found — UI may have shipped under a new label", "WARN")
-        else:
-            log(f"[setup_claude_dr] Step 2 OK: Adaptive Thinking {'just enabled' if adaptive_state.get('toggled') else 'already on'} "
-                f"(label='{adaptive_state.get('label')}')")
-        await asyncio.sleep(0.4)
 
         # ── Step 3: open tools menu and enable Research ────────────────
         # Precise selectors first — the old `button[aria-label*="+"]`
@@ -23039,7 +23083,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
         "gemini": "Verify the Deep Research pill is ACTIVE in Gemini composer. Fix if not. Do not type.",
-        "claude": "Verify Opus 4.7 Adaptive + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
+        "claude": "Verify Opus 4.8 + Max effort + Adaptive thinking + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())

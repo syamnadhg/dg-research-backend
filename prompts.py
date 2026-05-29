@@ -51,7 +51,7 @@ PROMPT_DETECT_CLAUDE_PRO = SYSTEM_BASE + """
 Screenshot of Claude (claude.ai), user is logged in.
 
 Look ONLY for these PRO subscription signals:
-- Model selector / message header shows "Opus" — e.g. "Opus 4.7", "Opus 4.7 Adaptive", "Claude Opus"
+- Model selector / message header shows "Opus" — e.g. "Opus 4.8", "Opus 4.7", "Claude Opus"
 - Account/profile menu shows "Pro" / "Max" / "Team" / "Enterprise" plan label
 - "Research" tool toggle is selectable in the composer (paid feature)
 
@@ -192,7 +192,7 @@ Your task: Configure Claude for research. Nothing else.
 
 Steps:
 1. Look at the Claude.ai page.
-2. Click the model selector; pick "Opus 4.7 Adaptive" (the Adaptive Thinking variant).
+2. Click the model selector and pick "Opus 4.8". In that SAME popover: open the "Effort" submenu and choose "Max", and turn the "Adaptive thinking" toggle ON. (Older UI may show a single "Opus 4.7 Adaptive" option instead — pick that if 4.8/Effort aren't present.)
 3. Click the "+" or tools menu near the input; enable the "Research" mode/tool.
 4. Close the menu (Escape) and click the message input area to focus it.
 5. Say "ready for paste" and STOP.
@@ -204,7 +204,7 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 - DO NOT send anything.
 - DO NOT click Send / Submit.
 - DO NOT attach any files.
-- If the Adaptive variant is already selected: say "ready for paste" immediately and STOP.
+- If Opus 4.8 + Max effort + Adaptive thinking are already set: say "ready for paste" immediately and STOP.
 - If Research mode toggle is already on: leave it alone.
 - If options are unavailable: say "partial setup" and STOP.
 
@@ -254,19 +254,19 @@ ABSOLUTELY FORBIDDEN:
 
 PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + """
 
-Your task: Verify Claude is correctly configured for Research (Opus 4.7 Adaptive Thinking + Research mode), and fix it if not.
+Your task: Verify Claude is correctly configured for Research (Opus 4.8 + Max effort + Adaptive thinking + Research mode), and fix it if not.
 
 Check visually (screenshot):
-1. Does the model selector show "Opus 4.7 Adaptive" (or the Adaptive Thinking variant)?
+1. Does the model selector show "Opus 4.8" with Effort = Max and Adaptive thinking ON? (Older UI may show a single "Opus 4.7 Adaptive" — that's acceptable if 4.8/Effort aren't offered.)
 2. Is the "Research" mode/tool enabled (usually indicated by a highlighted icon/badge near input)?
 3. Is the input area focused / ready for pasting?
 4. Are there any attachments already visible? If YES, that's a leftover — click the X to remove them.
 
-If model is Opus 4.7 Adaptive + Research mode is on + input is focused + NO stale attachments:
+If model is Opus 4.8 (Max effort + Adaptive thinking) + Research mode is on + input is focused + NO stale attachments:
   → Say "setup verified" and STOP immediately.
 
 Otherwise:
-  → If model is wrong: click model selector → pick "Opus 4.7 Adaptive" or the Adaptive Thinking variant.
+  → If model is wrong: click model selector → pick "Opus 4.8", then set Effort = Max and Adaptive thinking ON in the same popover (or pick "Opus 4.7 Adaptive" on older UI).
   → If Research mode is off: click "+" or tools menu → enable "Research".
   → If stale attachments exist: click the X/remove button on each to clear them.
   → Click input area to focus.
