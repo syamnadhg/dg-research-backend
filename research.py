@@ -4779,7 +4779,15 @@ def start_firestore_start_listener(job_queue, loop):
                 # listener fire but don't delete. Doc gets re-evaluated
                 # on next process bounce (replay → ZOMBIE → delete).
                 continue
-            elif _age_ms > ABANDONED_MAX_MS:
+            elif _age_ms > ABANDONED_MAX_MS and data.get("action", "start") != "cancel":
+                # 2026-05-28: exempt action="cancel" docs from the 12h
+                # ABANDONED sweep. A cancel doc is a terminal SIGNAL, not
+                # queued work — silently deleting one before the
+                # action=="cancel" handler runs would drop a stop/cancel
+                # (incl. an owner-initiated Stop/Cancel) with no feedback.
+                # Processing a stale cancel is a cheap idempotent no-op
+                # (the target run is long terminal), so let it through.
+                # (resume docs keep their prior behavior — out of scope.)
                 log(
                     f"Queue: stale-skip ABANDONED {(data.get('researchId') or '')[:8]}… "
                     f"topic={(data.get('topic') or '')[:40]!r} "
@@ -6303,9 +6311,10 @@ def _owner_control_patch(oc: str, *, running: bool) -> dict:
     with" popup; the FE enqueues a device-queue `action="cancel"` doc
     carrying `ownerControl` = "stop" (a RUNNING run → preserve partial
     work, NO cascade-delete) or "cancel" (a QUEUED run → cascade-delete on
-    chat close, mirror the self-cancel queued field set). `running` says
-    whether the matched job is the active/gate-pending one (so the queued
-    `phase: 0` reset is skipped for a run that already started).
+    chat close, mirror the self-cancel queued field set). `running` is
+    consulted ONLY on the "cancel" branch — it skips the queued `phase: 0`
+    reset for a run that already started; the "stop" branch ignores it
+    (so gate-pending callers may pass either value).
 
     The sharer's FE matches `summary`/`stoppedBy` to render the
     owner-attributed chat notice + freeze the live pipeline tile (the
