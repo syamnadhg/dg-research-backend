@@ -29796,7 +29796,18 @@ async def run_server(port=8000):
                 log(f"[flip] {research_id_val[:8]}… research doc missing — Q3 cascade-cancel should catch this", "WARN")
             return outcome
         except Exception as e:
-            log(f"Failed to flip queued→ongoing for {research_id_val}: {e}", "WARN")
+            # 2026-05-28: surface the ROOT cause. A permission error inside the
+            # transaction makes google-cloud-firestore raise "transaction has no
+            # transaction ID, so it cannot be rolled back", which MASKS the real
+            # 403 (the flip's research-doc update was denied — see the
+            # deviceUpdatingFor self-heal fix). Log __cause__/__context__ so any
+            # future flip failure is diagnosable instead of misleading.
+            _root = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+            log(
+                f"Failed to flip queued→ongoing for {research_id_val}: {e}"
+                + (f" | root: {_root!r}" if _root is not None else ""),
+                "WARN",
+            )
             return None
 
     def _recompute_queue_positions():
