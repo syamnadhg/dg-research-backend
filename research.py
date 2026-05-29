@@ -4315,6 +4315,30 @@ def _resolve_storage_bucket() -> str:
         return ""
 
 
+# Bounded backoff for transient Firebase Storage REST failures on the Track D
+# synth-user upload/download paths. A 403 here is almost always a claim-
+# propagation race — a sharer was just added (share-claim) or the device
+# re-paired, and the synth user's custom claims (ownerUid / sharedWith) hadn't
+# caught up when the token was minted. Each retry re-mints a FRESH id token
+# (_fresh_user_mode_id_token force-refreshes, so it re-reads the latest
+# claims), which lets the request self-heal with no user action. 429 / 5xx /
+# network blips get the same treatment. Total added wait is bounded (~6.5s)
+# so a genuinely doomed request still returns well inside the Track-D silence-
+# watchdog window — and a structural failure (refresh token revoked →
+# fresh-mint returns None) breaks out immediately instead of burning the
+# whole schedule.
+_STORAGE_REST_RETRY_DELAYS = (1.0, 2.0, 3.5)
+
+
+def _storage_rest_should_retry(status_code: "int | None") -> bool:
+    """True when a Storage REST outcome warrants a silent retry: an auth race
+    (403), throttling (429), or a transient server error (5xx). status_code is
+    None for a network-level exception, which is also retryable."""
+    if status_code is None:
+        return True
+    return status_code == 403 or status_code == 429 or status_code >= 500
+
+
 def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_id: str) -> "str | None":
     """Track D user-mode audio upload — Firebase Storage REST API using
     the synth-device-user's ID token. The Storage rule for
@@ -4329,6 +4353,7 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
     Object path mirrors legacy: audio/{ownerUid}/{researchId}/{filename}.
     """
     import requests as _requests
+    import time as _t
     from urllib.parse import quote as _quote
 
     bucket = _resolve_storage_bucket()
@@ -4351,8 +4376,8 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
     )
     def _do_upload(_id_token: str):
         """Single POST attempt. Returns the requests.Response or None on
-        network error (already logged). Pulled out so the 403 retry path
-        below can call it twice with fresh tokens."""
+        network error (already logged). Pulled out so the bounded retry
+        loop below can re-issue it with freshly minted tokens."""
         try:
             with open(local_path, "rb") as f:
                 return _requests.post(
@@ -4369,37 +4394,32 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
             return None
 
     resp = _do_upload(id_token)
+
+    # Silent bounded retry on transient failures (claim-propagation 403 / 429 /
+    # 5xx / network). Each pass re-mints a fresh token so a just-propagated
+    # claim (sharer added via share-claim, device re-paired) is picked up; the
+    # upload heals itself with no user-facing Retry. A revoked-token None
+    # breaks out immediately — that's structural (re-pair required), not
+    # something a retry can fix — and falls through to the diagnostic below.
+    _retried = False
+    for _delay in _STORAGE_REST_RETRY_DELAYS:
+        _status = resp.status_code if resp is not None else None
+        if not _storage_rest_should_retry(_status):
+            break
+        _t.sleep(_delay)
+        _retry_id_token = _fresh_user_mode_id_token()
+        if not _retry_id_token:
+            break
+        log(f"[storage REST] transient audio-upload outcome ({_status}) — re-minted token, "
+            f"retrying after {_delay:.1f}s (silent self-heal)", "INFO")
+        _retried = True
+        id_token = _retry_id_token
+        resp = _do_upload(id_token)
+
     if resp is None:
         return None
-
-    # 2026-05-25: one-shot retry-on-403 with a force-refreshed token.
-    # The Track D claim-side fix (api/devices/claim + unshare) writes
-    # setCustomUserClaims AFTER its Firestore commit; if the share-claim
-    # endpoint runs concurrently with this upload, our initial id_token
-    # was minted from claims that didn't yet include the new sharedWith
-    # entry. Firebase Auth's claim-write latency is sub-second to a few
-    # seconds, so a single fresh-mint retry catches the race cleanly.
-    # If the retry still 403s, the failure is structural (sharer not in
-    # claims at all, device unlinked, etc.) — falls through to the
-    # diagnostic log + return None path below.
-    if resp.status_code == 403:
-        _retry_id_token = _fresh_user_mode_id_token()
-        if _retry_id_token and _retry_id_token != id_token:
-            log("[storage REST] 403 on initial upload — minted fresh token, retrying once "
-                "(catches claim-propagation race after share-claim / unshare)", "INFO")
-            _retry_resp = _do_upload(_retry_id_token)
-            if _retry_resp is not None and _retry_resp.status_code == 200:
-                log("[storage REST] retry succeeded — claim refresh resolved the 403")
-                resp = _retry_resp
-                id_token = _retry_id_token
-            elif _retry_resp is not None:
-                # Retry also 403'd (or other non-200) — keep the FIRST response
-                # for the diagnostic log below so the user sees the initial-
-                # token claim state (the more informative one for a structural
-                # failure). The retry log line above already records that we
-                # tried.
-                resp = _retry_resp
-                id_token = _retry_id_token
+    if _retried and resp.status_code == 200:
+        log("[storage REST] audio upload succeeded after retry — transient outcome resolved")
 
     if resp.status_code != 200:
         # Surface enough diagnostic to debug the common Track D regression:
@@ -4431,11 +4451,15 @@ def _upload_audio_via_storage_rest(local_path: "Path", owner_uid: str, research_
         )
         if resp.status_code == 403:
             log(
-                "[storage REST] 403 hint (after retry): rule expected "
+                "[storage REST] 403 hint (after retries): rule expected "
                 "token.ownerUid == path-uid OR path-uid in token.sharedWith. "
                 "If sharer firing on shared device: confirm sharer is in the "
                 "device's sharedWith via FE Account → Manage Sharers. If owner: "
-                "device may have lost ownerUid — re-pair via FE Account → Add Device.",
+                "device may have lost ownerUid — re-pair via FE Account → Add Device. "
+                "If ALL identifiers already match yet it still 403s, suspect a "
+                "DEPLOYED-ruleset lag (the rules engine 403s blanket when the "
+                "live storage.rules differs from the repo) — redeploy via "
+                "`firebase deploy --only storage` and confirm.",
                 "WARN",
             )
         return None
@@ -4467,6 +4491,7 @@ def _download_user_source_via_storage_rest(storage_path: str, dest_path: "Path")
     when the token's `deviceId` claim resolves to a device authorized
     for `userId`. Streams to disk; returns True on success."""
     import requests as _requests
+    import time as _t
     from urllib.parse import quote as _quote
 
     bucket = _resolve_storage_bucket()
@@ -4482,16 +4507,48 @@ def _download_user_source_via_storage_rest(storage_path: str, dest_path: "Path")
         f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o/"
         f"{_quote(storage_path, safe='')}?alt=media"
     )
-    try:
-        resp = _requests.get(
-            url,
-            headers={"Authorization": f"Firebase {id_token}"},
-            stream=True,
-            timeout=60,
-        )
-    except _requests.RequestException as e:
-        log(f"[storage REST] source download network error ({storage_path}): {e}", "WARN")
+
+    def _do_get(_tok: str):
+        """Single GET attempt. Returns the requests.Response, or None on a
+        network-level error (already logged) so the retry loop treats it as
+        retryable."""
+        try:
+            return _requests.get(
+                url,
+                headers={"Authorization": f"Firebase {_tok}"},
+                stream=True,
+                timeout=60,
+            )
+        except _requests.RequestException as e:
+            log(f"[storage REST] source download network error ({storage_path}): {e}", "WARN")
+            return None
+
+    resp = _do_get(id_token)
+
+    # Silent bounded retry — parity with the audio-upload path. A source-
+    # download 403 is the same claim-propagation race, and this path had NO
+    # retry before, so a transient stale-claim window aborted the whole run.
+    # Re-minting a fresh token each pass lets it self-heal; 429/5xx/network
+    # blips retry too; a revoked-token None breaks out (structural re-pair).
+    _retried = False
+    for _delay in _STORAGE_REST_RETRY_DELAYS:
+        _status = resp.status_code if resp is not None else None
+        if not _storage_rest_should_retry(_status):
+            break
+        _t.sleep(_delay)
+        _retry_tok = _fresh_user_mode_id_token()
+        if not _retry_tok:
+            break
+        log(f"[storage REST] transient source-download outcome ({_status}) for {storage_path} "
+            f"— re-minted token, retrying after {_delay:.1f}s (silent self-heal)", "INFO")
+        _retried = True
+        id_token = _retry_tok
+        resp = _do_get(id_token)
+
+    if resp is None:
         return False
+    if _retried and resp.status_code == 200:
+        log(f"[storage REST] source download succeeded after retry ({storage_path}) — transient outcome resolved")
     if resp.status_code != 200:
         log(f"[storage REST] source download HTTP {resp.status_code} ({storage_path}): {resp.text[:200]}", "WARN")
         # 2026-05-21: 403 diagnostic. The Track D synth-user storage read
@@ -4548,7 +4605,7 @@ def _download_user_source_via_storage_rest(storage_path: str, dest_path: "Path")
                 # vs a sharing issue (owner needs to share with sharer).
                 if _path_owner != "?" and _dev_owner != "?":
                     if _path_owner == _dev_owner:
-                        log("[storage REST] 403 root: path is for THIS device's owner — claim/token freshness issue. Try Reset Pair Code → re-pair.", "ERROR")
+                        log("[storage REST] 403 root: path is for THIS device's owner yet still denied AFTER retries — either claim/token freshness (try Reset Pair Code → re-pair) OR a DEPLOYED-ruleset lag (live storage.rules differs from repo → blanket 403 regardless of claims; redeploy via `firebase deploy --only storage`).", "ERROR")
                     elif _path_owner in _dev_shared:
                         log("[storage REST] 403 root: path is for a sharer who IS in sharedWith — device-doc state OK, suspect synth-token claim staleness (re-pair to refresh)", "ERROR")
                     else:
