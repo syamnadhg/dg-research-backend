@@ -229,27 +229,39 @@ PROMPT_VALIDATE_GEMINI_SETUP = SYSTEM_BASE + """
 
 Your task: Verify Gemini is correctly configured for Deep Research, and fix it if not.
 
-Check visually (screenshot):
-1. Is the "Deep research" chip/pill highlighted/active in the composer (bottom input area)?
-2. Is the input area focused / ready for pasting?
-3. Is Pro model preferred (if visible)?
+THE SINGLE RELIABLE PROOF that Deep Research is ACTIVE is the COMPOSER
+PLACEHOLDER text:
+  • Deep Research ON  → placeholder reads "What do you want to research?"
+  • Deep Research OFF → placeholder reads "Ask Gemini"
+A "Deep research" chip being merely VISIBLE in the composer is NOT proof it
+is active — the chip can appear while the mode is still off. Do NOT report a
+present-but-not-armed chip as active.
 
-If Deep research pill is ACTIVE + input is focused:
+Check visually (screenshot):
+1. Does the composer placeholder read "What do you want to research?"
+   (NOT "Ask Gemini")?
+2. Is the "Deep research" chip filled/highlighted (pressed), not just present?
+
+If the placeholder reads "What do you want to research?":
   → Say "setup verified" and STOP immediately.
 
-If Deep research is NOT active:
+If the placeholder still reads "Ask Gemini" (chip present but mode not armed):
   → Click the "Deep research" chip/pill in the composer to activate it.
-  → Click the input area to focus.
-  → Say "setup fixed" and STOP.
+  → Wait, then RE-CHECK the placeholder.
+  → If it now reads "What do you want to research?", say "setup fixed" and STOP.
+  → If the placeholder will NOT change to research mode, say
+    "setup failed: Deep Research chip visible but mode did not activate (placeholder still 'Ask Gemini')"
+    and STOP.
 
-If you cannot enable Deep Research:
+If you cannot find or enable Deep Research at all:
   → Say "setup failed: <specific reason>" and STOP.
 
 ABSOLUTELY FORBIDDEN:
 - DO NOT type any text.
 - DO NOT paste any text.
 - DO NOT send any message.
-- DO NOT compose prompts."""
+- DO NOT compose prompts.
+- DO NOT treat a merely-visible chip as active — the placeholder is the proof."""
 
 
 PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + """

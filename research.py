@@ -10998,55 +10998,67 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
                 except Exception: pass
 
 
-def _emit_claude_chat_mode_alert():
-    """E2 / DGOPS-7364 — Claude Research-mode unavailable alert. Emitted
-    when setup_claude_dr (Layer 1) + CUA fallback (Layer 2) + pre-send
-    re-evaluation in ensure_deep_mode_active all confirm Research mode is
-    NOT active on Claude. Surfaces a degraded-mode decision to the user
-    instead of silently sending a chat-mode prompt that produces wrong-
-    output (regular chat reply where the prompt expected a Deep Research
-    artifact).
+def _emit_chat_mode_alert(platform_l: str):
+    """Deep-Research-mode-unavailable decision alert for a P2 agent.
+
+    E2 / DGOPS-7364 introduced this for Claude; #709 (2026-05-29) generalized
+    it to ChatGPT + Gemini after both exhibited the same regression in E2E.
+    Emitted when an agent's Layer 1 (setup_*_dr) + Layer 2
+    (validate_setup_with_cua) + pre-send ensure_deep_mode_active all fail to
+    confirm Deep Research is ACTIVE. Without this gate the agent silently
+    sends in chat mode, returns a fast short chat answer, and the completion
+    ladder green-ticks it as a 'Deep Research' result before any real report
+    streams (the #709 premature-green-tick symptom).
 
     Uses pipeline_error semantics (not fail_phase / fail_agent) — same
-    pattern as _emit_pro_required_alert: we haven't FAILED the agent;
-    we're asking the user to decide between accepting degraded output,
-    skipping the agent, or stopping the run. fail_agent would write a
-    terminal 'errored' status which is wrong here.
+    pattern as _emit_pro_required_alert: we haven't FAILED the agent; we're
+    asking the user to decide between accepting degraded output, skipping the
+    agent, or stopping the run. fail_agent would write a terminal 'errored'
+    status which is wrong here.
 
     Action set:
       [Continue in chat mode] → continue_anyway → send in chat mode,
-                                 set agent_modes['claude'] sticky flag.
-      [Skip Claude]           → skip_agent claude → drop Phase 2B Claude
+                                 set agent_modes[<agent>] sticky flag.
+      [Skip <agent>]          → skip_agent <agent> → drop this agent's P2
                                  output; pipeline continues.
       [Stop]                  → stop_pipeline → halt the run."""
+    names = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
+    name = names.get(platform_l, platform_l.title())
     emit_event(
-        "pipeline_error", phase=2, agent="claude",
-        error="Claude Research mode unavailable",
+        "pipeline_error", phase=2, agent=platform_l,
+        error=f"{name} Deep Research mode unavailable",
         details=(
-            "Claude's Research mode setup failed: Playwright selectors "
-            "didn't find the Research tool, the CUA visual fallback also "
+            f"{name}'s Deep Research setup failed: the Playwright selectors "
+            "didn't activate Deep Research, the CUA visual fallback also "
             "couldn't enable it, and the just-before-send re-activation "
             "didn't take. Continuing here would send the prompt in regular "
-            "chat mode — Claude returns a normal reply instead of the "
-            "multi-tool Deep Research artifact the pipeline expects.\n\n"
+            f"chat mode — {name} returns a normal reply instead of the "
+            "Deep Research report the pipeline expects, and the agent would "
+            "complete almost immediately (a fast chat answer rather than a "
+            "streamed report).\n\n"
             "• Continue in chat mode — accept the degraded output for "
-            "this run; Phase 2B will use Claude's chat reply as its result.\n"
-            "• Skip Claude — drop Phase 2B Claude output entirely; the "
-            "pipeline continues with ChatGPT and Gemini results.\n"
+            f"this run; Phase 2 will use {name}'s chat reply as its result.\n"
+            f"• Skip {name} — drop this agent's Phase 2 output; the "
+            "pipeline continues with the other agents.\n"
             "• Stop — halt the run."
         ),
         actions=[
             {"id": "continue_in_chat_mode", "label": "Continue in chat mode", "style": "default",
              "command": {"action": "continue_anyway"}},
-            {"id": "skip_claude", "label": "Skip Claude", "style": "default",
-             "command": {"action": "skip_agent", "agent": "claude"}},
+            {"id": f"skip_{platform_l}", "label": f"Skip {name}", "style": "default",
+             "command": {"action": "skip_agent", "agent": platform_l}},
             {"id": "stop", "label": "Stop", "style": "danger",
              "command": {"action": "stop"}},
         ],
         dismissible=True,
-        alert_id="phase2_claude_chat_mode",
-        source="phase2/claude_setup_research_unavailable",
+        alert_id=f"phase2_{platform_l}_chat_mode",
+        source=f"phase2/{platform_l}_setup_research_unavailable",
     )
+
+
+def _emit_claude_chat_mode_alert():
+    """Back-compat shim — #709 generalized this into _emit_chat_mode_alert."""
+    _emit_chat_mode_alert("claude")
 
 
 def emit_browser_recovery_status(phase: int, agent: str | None = None):
@@ -22312,18 +22324,68 @@ async def setup_chatgpt_dr(page) -> bool:
             return False
         log(f"[setup_chatgpt_dr] Step 1 OK: opened tools menu via {menu_sel}")
 
-        # Step 2: click "Deep research" option in the menu
-        clicked = await page.evaluate("""() => {
-            const items = document.querySelectorAll('[role="menuitem"], button, div[role="option"]');
+        # Step 2: click "Deep research" option in the menu.
+        # 2026-05-29 (#709): the DOM Step 2 FAILed 100% of last E2E on every
+        # worker — the run only succeeded when the non-deterministic CUA
+        # fallback happened to recover it. ROOT CAUSE (user-captured live "+"
+        # dump): "Deep research" is a **role="menuitemradio"** with exact text
+        # "Deep research" and EMPTY aria-label + EMPTY data-testid — but the
+        # prior selector set was '[role="menuitem"], button, div[role="option"]'
+        # which OMITTED role="menuitemradio", so the item was never even a
+        # candidate. The text/`===` matching was fine; the element-role filter
+        # excluded it. (Siblings "Create image"/"Web search" are also radios,
+        # so we match EXACTLY "deep research", never a contains.) DR is
+        # top-level in "+" — no "More" submenu. role+text is the only signal
+        # (aria/testid empty), so that's what we pin; aria-label + starts-with
+        # are kept as defensive fallbacks for a future relabel/icon-prefix.
+        _dr_click_js = """() => {
+            const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const items = document.querySelectorAll(
+                '[role="menuitemradio"], [role="menuitem"], [role="option"], button, a, li');
+            // Pass 1 — the real, current shape: exact "deep research".
             for (const el of items) {
-                const t = (el.textContent || '').trim().toLowerCase();
-                if (t === 'deep research' || t.startsWith('deep research')) {
+                if (!el.offsetParent) continue;
+                if (norm(el.textContent) === 'deep research' ||
+                    norm(el.getAttribute('aria-label')) === 'deep research') {
+                    el.click(); return true;
+                }
+            }
+            // Pass 2 — defensive: starts-with / contains for a future icon-
+            // prefixed or relabeled variant ("travel_exploreDeep research").
+            for (const el of items) {
+                if (!el.offsetParent) continue;
+                const t = norm(el.textContent);
+                const a = norm(el.getAttribute('aria-label'));
+                if (t.startsWith('deep research') || t.includes('deep research') ||
+                    a.startsWith('deep research')) {
                     el.click(); return true;
                 }
             }
             return false;
-        }""")
+        }"""
+        clicked = await page.evaluate(_dr_click_js)
         if not clicked:
+            # One-shot diagnostic dump (mirrors #708 Step 3A) so the NEXT E2E
+            # pins the exact menu-item structure instead of us guessing the
+            # selector. Grep backend.log for "Step 2 menu-item dump".
+            try:
+                dump = await page.evaluate("""() => {
+                    const out = [];
+                    for (const el of document.querySelectorAll(
+                            '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')) {
+                        if (!el.offsetParent) continue;
+                        const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        const a = el.getAttribute('aria-label') || '';
+                        if (!t && !a) continue;
+                        out.push({ role: el.getAttribute('role') || el.tagName.toLowerCase(),
+                                   text: t.slice(0, 60), aria: a.slice(0, 60),
+                                   testid: el.getAttribute('data-testid') || '' });
+                    }
+                    return out.slice(0, 30);
+                }""")
+                log("[setup_chatgpt_dr] Step 2 menu-item dump: " + json.dumps(dump))
+            except Exception as _de:
+                log(f"[setup_chatgpt_dr] Step 2 dump failed: {_de}", "WARN")
             log("[setup_chatgpt_dr] Step 2 FAIL: 'Deep research' menu item not found — menu opened but option missing", "WARN")
             return False
         log("[setup_chatgpt_dr] Step 2 OK: clicked Deep research menu option")
@@ -22554,6 +22616,59 @@ async def _gemini_select_flash_model(page) -> bool:
     except Exception as e:
         log(f"[setup_gemini_dr] model-pick exception: {e}", "WARN")
         return False
+
+
+# #709 (2026-05-29) — single source of truth for "is Gemini Deep Research
+# ACTIVE?". Shared by setup_gemini_dr's verification AND the pre-send
+# ensure_deep_mode_active check so both agree exactly. The authoritative signal
+# is the COMPOSER PLACEHOLDER (DR ON → "What do you want to research?"; chat →
+# "Ask Gemini") — the DR pill's class (mat-tonal-button…) carries NO reliable
+# pressed marker, so a pressed-class-only check false-negatived an ACTIVE pill
+# last E2E and the CUA fallback then toggled the working DR OFF. Anchored to the
+# composer (rich-textarea / lowest contenteditable) to avoid reading a stale
+# dialog placeholder. Returns placeholderResearch (active), placeholderChat
+# (confidently off), pressed (secondary), + pill diagnostics for the dump.
+_GEMINI_DR_STATE_JS = """() => {
+    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    let ce = document.querySelector('rich-textarea div[contenteditable="true"]')
+          || document.querySelector('rich-textarea')
+          || null;
+    if (!ce) {
+        const cands = [...document.querySelectorAll(
+            'div[contenteditable="true"][data-placeholder], textarea[placeholder]')]
+            .filter(e => e.offsetParent);
+        if (cands.length) {
+            cands.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+            ce = cands[0];
+        }
+    }
+    let placeholder = '';
+    if (ce) placeholder = norm(ce.getAttribute('data-placeholder')
+        || ce.getAttribute('placeholder') || ce.getAttribute('aria-label'));
+    const placeholderResearch = placeholder.includes('research') ||
+        placeholder.includes('what do you want to');
+    const placeholderChat = placeholder.includes('ask gemini');
+    let pill = null;
+    for (const p of document.querySelectorAll('button, [role="button"]')) {
+        if (!p.offsetParent) continue;
+        if (norm(p.textContent) === 'deep research') { pill = p; break; }
+    }
+    let pillText = '', pillCls = '', pillAria = '';
+    if (pill) {
+        pillText = (pill.textContent || '').trim().slice(0, 40);
+        pillCls = (pill.className || '').toString().toLowerCase();
+        pillAria = (pill.getAttribute('aria-label') || '');
+    }
+    const pressed = pill ? (
+        pill.getAttribute('aria-pressed') === 'true' ||
+        pill.getAttribute('aria-selected') === 'true' ||
+        pill.getAttribute('data-active') === 'true' ||
+        pillCls.includes('--selected') || pillCls.includes('selected') ||
+        pillCls.includes('active') || pillCls.includes('--filled')) : false;
+    return { pillVisible: !!pill, pressed, placeholderResearch, placeholderChat,
+             placeholder: placeholder.slice(0, 60),
+             pillText, pillCls: pillCls.slice(0, 100), pillAria };
+}"""
 
 
 async def setup_gemini_dr(page) -> bool:
@@ -22872,39 +22987,61 @@ async def setup_gemini_dr(page) -> bool:
 
         await asyncio.sleep(1.5)
 
-        # ── Verification: STRICT. DR must be visibly active before we
-        # return True. If the pill is visible but no active-state signal
-        # fires, we return False so the caller's CUA fallback can re-try
-        # — this is the fix for the 2026-05-21 silent-chat-mode regression
-        # (UI changed; Step 2 happened to click the wrong control, pill
-        # appeared without being pressed, function returned True anyway,
-        # pipeline shipped a chat-mode brief as DR output).
-        active = await page.evaluate("""() => {
-            const pills = document.querySelectorAll('button, [role="button"]');
-            for (const p of pills) {
-                if (!p.offsetParent) continue;
-                const t = (p.textContent || '').trim().toLowerCase();
-                if (t !== 'deep research') continue;
-                const cls = (p.className || '').toLowerCase();
-                // Material chips mark active via mat-mdc-chip-selected / .mdc-evolution-chip--selected,
-                // generic ARIA via aria-pressed / aria-selected, sometimes a data-active attr.
-                const pressed = p.getAttribute('aria-pressed') === 'true' ||
-                                 p.getAttribute('aria-selected') === 'true' ||
-                                 p.getAttribute('data-active') === 'true' ||
-                                 cls.includes('active') ||
-                                 cls.includes('selected') ||
-                                 cls.includes('--filled');
-                return { ok: true, pressed, text: p.textContent.trim().slice(0, 40), cls: cls.slice(0, 80) };
-            }
-            return { ok: false };
-        }""")
-        if not active or not active.get("ok"):
-            log("[setup_gemini_dr] Verify FAIL: DR pill not visible after click — UI did not reflect the selection", "WARN")
+        # ── Verification: STRICT. DR must be visibly active before True.
+        # 2026-05-29 (#709): the prior check relied SOLELY on the pill's
+        # pressed/selected class. The real Gemini DR pill class
+        # (`mdc-button mat-mdc-button-base mat-badge mat-tonal-button …`)
+        # carries NONE of aria-pressed / --selected / .active even when DR is
+        # OFF, so a present-but-INACTIVE pill returned False → CUA fallback →
+        # the CUA falsely reported "chip already visible and active" → the run
+        # proceeded in Flash chat mode (last E2E). The authoritative, cross-
+        # version signal is the COMPOSER PLACEHOLDER: DR mode shows
+        # "What do you want to research?"; chat mode shows "Ask Gemini". Lead
+        # with the placeholder; treat the pressed-class as a secondary signal.
+        _gem_active_js = _GEMINI_DR_STATE_JS
+        st = await page.evaluate(_gem_active_js)
+        # If — and ONLY if — we are CONFIDENT Deep Research is OFF (the composer
+        # placeholder explicitly reads "Ask Gemini"), click the pill once to arm
+        # the mode, then re-measure. This is the #709 "don't remove the working
+        # DOM" guard: last E2E our verify false-negatived an ALREADY-ACTIVE pill
+        # (its mat-tonal-button class has no pressed marker), the CUA fallback
+        # then clicked that active pill and TOGGLED DEEP RESEARCH OFF. We never
+        # click on an ambiguous read (placeholder unreadable / no chat signal) —
+        # a toggle can only ever turn a confirmed-off pill ON, never an on pill
+        # OFF.
+        if (st.get("pillVisible") and st.get("placeholderChat")
+                and not st.get("placeholderResearch") and not st.get("pressed")):
+            log("[setup_gemini_dr] Verify: composer in chat mode ('Ask Gemini') "
+                "with DR pill present — clicking pill to arm Deep Research")
+            try:
+                await page.evaluate("""() => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    for (const p of document.querySelectorAll('button, [role="button"]')) {
+                        if (p.offsetParent && norm(p.textContent) === 'deep research') {
+                            p.click(); return true;
+                        }
+                    }
+                    return false;
+                }""")
+                await asyncio.sleep(1.2)
+            except Exception:
+                pass
+            st = await page.evaluate(_gem_active_js)
+        active_ok = bool(st.get("placeholderResearch") or st.get("pressed"))
+        if not active_ok:
+            # One-shot diagnostic dump (mirrors #708) so the next E2E pins the
+            # real active class / placeholder. Grep backend.log for
+            # "Verify FAIL: DR not active — dump".
+            try:
+                log("[setup_gemini_dr] Verify FAIL: DR not active — dump " + json.dumps(st))
+            except Exception:
+                pass
+            log(f"[setup_gemini_dr] Verify FAIL: DR pill visible but NOT active "
+                f"(placeholder={st.get('placeholder')!r} pillCls={st.get('pillCls')!r}) "
+                f"— returning False so CUA fallback retries", "WARN")
             return False
-        if not active.get("pressed"):
-            log(f"[setup_gemini_dr] Verify FAIL: DR pill visible but NOT marked active (text={active.get('text')!r} cls={active.get('cls')!r}) — returning False so CUA fallback retries", "WARN")
-            return False
-        log(f"[setup_gemini_dr] Verify OK: DR pill active → {active.get('text')}")
+        log(f"[setup_gemini_dr] Verify OK: DR active "
+            f"(placeholder={st.get('placeholder')!r}, pressed={st.get('pressed')})")
         return True
     except Exception as e:
         log(f"[setup_gemini_dr] exception: {e}", "WARN")
@@ -23235,7 +23372,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
     }
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
-        "gemini": "Verify the Deep Research pill is ACTIVE in Gemini composer. Fix if not. Do not type.",
+        "gemini": "Verify Gemini Deep Research is ACTIVE — the composer placeholder MUST read 'What do you want to research?' (NOT 'Ask Gemini'). A merely-visible chip is NOT enough proof. Fix if not. Do not type.",
         "claude": "Verify Opus 4.8 + Max effort + Adaptive thinking + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
     }
     sys_prompt = validator_map.get(platform.lower())
@@ -23561,35 +23698,51 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
     platform_l = platform.lower()
     try:
         if platform_l == "chatgpt":
-            # Verify "Deep research" pill/badge is still on
-            active = await page.evaluate("""() => {
-                const txt = (document.body.innerText || '').toLowerCase();
-                // Look for the Deep Research pill shown near composer
-                const pills = document.querySelectorAll('[aria-pressed="true"], [data-state="on"], .pill, [role="button"]');
-                for (const p of pills) {
-                    const t = (p.textContent || '').trim().toLowerCase();
-                    if (t === 'deep research' || t.startsWith('deep research')) return true;
+            # 2026-05-29 (#709): return the REAL measured state (was always
+            # active=True, so the caller could never gate the send). The prior
+            # check also fell back to `body.innerText.includes('deep research')`
+            # — a tooltip/help mention false-positived it. Scope the pill scan
+            # to the composer/form; pill VISIBLE in the composer is ChatGPT's
+            # active-DR signal (same as setup_chatgpt_dr Step 3).
+            _cgpt_state_js = """() => {
+                const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const form = document.querySelector('form') || document.body;
+                let pillVisible = false;
+                for (const p of form.querySelectorAll('button, [role="button"], span, div')) {
+                    if (!p.offsetParent) continue;
+                    const t = norm(p.textContent);
+                    if (t === 'deep research') { pillVisible = true; break; }
                 }
-                // Heuristic: composer area mentions Deep research
-                return txt.includes('deep research');
-            }""")
-            if not active:
-                log(f"[{label}] Deep Research OFF before send — re-activating", "WARN")
+                let placeholder = '';
+                const ta = document.querySelector('#prompt-textarea, textarea, [contenteditable="true"]');
+                if (ta) placeholder = norm(ta.getAttribute('placeholder') || ta.getAttribute('data-placeholder'));
+                return { active: pillVisible || placeholder.includes('research'),
+                         pillVisible, placeholder: placeholder.slice(0, 60) };
+            }"""
+            state = await page.evaluate(_cgpt_state_js)
+            if not state.get("active"):
+                log(f"[{label}] ChatGPT Deep Research OFF before send "
+                    f"(pillVisible={state.get('pillVisible')}) — re-activating", "WARN")
                 await setup_chatgpt_dr(page)
-            return {"platform": "chatgpt", "active": True}
+                state = await page.evaluate(_cgpt_state_js)
+                log(f"[{label}] ChatGPT DR post-re-activate: active={state.get('active')}", "INFO")
+            return {"platform": "chatgpt", "active": bool(state.get("active"))}
         if platform_l == "gemini":
-            active = await page.evaluate("""() => {
-                const pills = document.querySelectorAll('button, [role="button"], span');
-                for (const p of pills) {
-                    const t = (p.textContent || '').trim().toLowerCase();
-                    if (t === 'deep research' && p.offsetParent !== null) return true;
-                }
-                return false;
-            }""")
+            # 2026-05-29 (#709): return the REAL state (was always active=True),
+            # using the SHARED _GEMINI_DR_STATE_JS (composer-placeholder
+            # authoritative) so this pre-send check and setup_gemini_dr's verify
+            # agree exactly. A present-but-inactive pill must NOT read as active.
+            st = await page.evaluate(_GEMINI_DR_STATE_JS)
+            active = bool(st.get("placeholderResearch") or st.get("pressed"))
             if not active:
-                log(f"[{label}] Gemini Deep Research chip OFF before send — re-activating", "WARN")
+                log(f"[{label}] Gemini Deep Research not active before send "
+                    f"(placeholder={st.get('placeholder')!r}) — re-activating", "WARN")
                 await setup_gemini_dr(page)
-            return {"platform": "gemini", "active": True}
+                st = await page.evaluate(_GEMINI_DR_STATE_JS)
+                active = bool(st.get("placeholderResearch") or st.get("pressed"))
+                log(f"[{label}] Gemini DR post-re-activate: active={active} "
+                    f"placeholder={st.get('placeholder')!r}", "INFO")
+            return {"platform": "gemini", "active": active}
         if platform_l == "claude":
             # Check BOTH: high-tier Opus model AND Research tool are on.
             _claude_state_js = """() => {
@@ -24376,67 +24529,70 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # between setup and send. Re-activate if needed.
     mode_state = await ensure_deep_mode_active(page, platform, label)
 
-    # ── E2 / DGOPS-7364 — Claude chat-mode gate ──
-    # If Layer 1 (setup_claude_dr) + Layer 2 (CUA validation) + the just-
-    # done pre-send re-activation have all failed to enable Research mode
-    # on Claude, do NOT silently send a regular chat prompt — that produces
-    # a wrong-output (chat reply) instead of a multi-tool Deep Research
-    # artifact. Pause and emit a phase_alert so the operator decides.
-    # ChatGPT/Gemini paths intentionally NOT gated here per ticket scope
-    # (filed separately if they ever exhibit the same regression).
-    if platform_l == "claude":
-        research_ok = bool((mode_state or {}).get("researchOn"))
+    # ── E2/DGOPS-7364 + #709 — Deep-Research chat-mode gate (all P2 agents) ──
+    # If Layer 1 (setup_*_dr) + Layer 2 (CUA validation) + the just-done
+    # pre-send re-activation have all failed to enable Deep Research, do NOT
+    # silently send a regular chat prompt — that produces wrong-output (a fast
+    # chat reply) instead of a Deep Research report AND the completion ladder
+    # then green-ticks the short answer prematurely (#709). Pause and emit a
+    # decision alert so the operator decides. Originally Claude-only
+    # (DGOPS-7364); generalized to ChatGPT + Gemini on 2026-05-29 (#709) after
+    # both stuck in chat mode in E2E (ChatGPT Extended Pro, Gemini Flash).
+    if platform_l in ("claude", "gemini", "chatgpt"):
+        _name_map = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
+        _agent_name = _name_map.get(platform_l, platform_l.title())
+        # Per-platform "is Deep Research actually active?" signal. Claude
+        # carries an explicit researchOn flag; ChatGPT/Gemini report `active`.
+        if platform_l == "claude":
+            research_ok = bool((mode_state or {}).get("researchOn"))
+        else:
+            research_ok = bool((mode_state or {}).get("active"))
         if not research_ok:
-            log(f"[{label}] Research mode unavailable after Layer 1 + Layer 2 + "
+            log(f"[{label}] Deep Research unavailable after Layer 1 + Layer 2 + "
                 f"pre-send re-activation — emitting chat-mode decision alert", "WARN")
-            _emit_claude_chat_mode_alert()
-            _controls.request_pause("claude_chat_mode")
-            emit_event("pipeline_paused", phase=2, agent="claude", reason="claude_chat_mode")
+            _emit_chat_mode_alert(platform_l)
+            _controls.request_pause(f"{platform_l}_chat_mode")
+            emit_event("pipeline_paused", phase=2, agent=platform_l,
+                       reason=f"{platform_l}_chat_mode")
             await _controls.wait_if_paused()
             if _controls.is_stop():
-                emit_event("pipeline_stopped", phase=2, agent="claude",
+                emit_event("pipeline_stopped", phase=2, agent=platform_l,
                            reason="user_stop_chat_mode")
                 return page, False
-            # 2026-05-12: bumped timeout 600s → 3h (10800s). Claude Pro
-            # users get Research mode automatically — if we land here it's
-            # an exceptional state (Pro tier issue / Anthropic UI rev /
-            # locked region) that NEEDS human eyes on the alert. The old
-            # 10-min auto-continue silently degraded these runs to chat
-            # mode if the operator was AFK; per user request 2026-05-12
-            # we now wait long enough that a daily check-in catches it,
-            # and on timeout we SKIP the agent (rather than fall to chat
-            # mode) so a missed decision doesn't auto-degrade fidelity.
-            decision = await _controls.await_agent_decision("claude", timeout=10800.0)
+            # 3h timeout (matches the Claude default from 2026-05-12): a
+            # DR-unavailable state is exceptional and NEEDS human eyes — a
+            # short auto-continue would silently degrade an AFK operator's run
+            # to chat mode. On timeout we SKIP the agent (rather than fall to
+            # chat mode) so a missed decision doesn't auto-degrade fidelity.
+            decision = await _controls.await_agent_decision(platform_l, timeout=10800.0)
             log(f"[{label}] Chat-mode user decision: {decision}", "INFO")
             if decision == "stop":
-                emit_event("pipeline_stopped", phase=2, agent="claude",
+                emit_event("pipeline_stopped", phase=2, agent=platform_l,
                            reason="user_stop_chat_mode")
                 return page, False
-            # 2026-05-14: the chat-mode alert action set is
-            # [Continue in chat mode] / [Skip Claude] / [Stop] — there is
-            # NO Retry button here. But await_agent_decision now also
-            # drains the hard-retry set (so the human-intervention Retry
-            # on other Claude alerts auto-resumes the pipeline). To stay
-            # safe if a stray retry_agent command lands while this wait
-            # is active, surface a SKIP rather than silently falling
-            # through to continue_anyway (which would auto-degrade the
-            # agent to chat mode without consent).
+            # The chat-mode alert action set is [Continue in chat mode] /
+            # [Skip <agent>] / [Stop] — there is NO Retry button here. But
+            # await_agent_decision also drains the hard-retry set. To stay safe
+            # if a stray retry_agent command lands while this wait is active,
+            # surface a SKIP rather than silently falling through to
+            # continue_anyway (which would auto-degrade the agent to chat mode
+            # without consent).
             if decision == "retry":
                 log(f"[{label}] Retry requested on chat-mode alert (no retry path here) "
                     f"— treating as Skip to avoid silent chat-mode degradation", "WARN")
-                _runtime.agent_modes["claude"] = {
+                _runtime.agent_modes[platform_l] = {
                     "requested": "research", "actual": "skipped",
                     "user_acknowledged_chat": False,
                 }
-                emit_event("agent_skipped", phase=2, agent="claude",
+                emit_event("agent_skipped", phase=2, agent=platform_l,
                            reason="retry_on_chat_mode_alert_unsupported")
-                fail_agent(platform_l, "Claude skipped — retry not supported in chat-mode alert",
-                           "Retry isn't a valid action on the Research-mode-unavailable "
+                fail_agent(platform_l, f"{_agent_name} skipped — retry not supported in chat-mode alert",
+                           "Retry isn't a valid action on the Deep-Research-mode-unavailable "
                            "alert. The agent was skipped to avoid silently running in "
                            "chat mode without your consent.")
                 return page, False
             if decision == "skip" or decision == "timeout":
-                _runtime.agent_modes["claude"] = {
+                _runtime.agent_modes[platform_l] = {
                     "requested": "research",
                     "actual": "skipped",
                     "user_acknowledged_chat": False,
@@ -24444,27 +24600,26 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 _reason = ("research_unavailable_user_skip"
                            if decision == "skip"
                            else "research_unavailable_timeout_default_skip")
-                emit_event("agent_skipped", phase=2, agent="claude", reason=_reason)
-                fail_agent(platform_l, "Claude skipped — Research unavailable",
-                           ("User opted to skip Phase 2B Claude after Research mode "
+                emit_event("agent_skipped", phase=2, agent=platform_l, reason=_reason)
+                fail_agent(platform_l, f"{_agent_name} skipped — Deep Research unavailable",
+                           (f"User opted to skip Phase 2 {_agent_name} after Deep Research "
                             "could not be enabled." if decision == "skip"
-                            else "Decision alert timed out after 3h — skipping Claude "
-                                 "rather than silently falling to chat mode."))
+                            else "Decision alert timed out after 3h — skipping "
+                                 f"{_agent_name} rather than silently falling to chat mode."))
                 return page, False
             # continue_anyway → proceed in chat mode with sticky flag.
-            # (Was the timeout default too; moved to explicit-only 2026-05-12
-            # so an AFK operator doesn't accidentally consent to lower-
-            # fidelity chat-mode output.)
-            _runtime.agent_modes["claude"] = {
+            # (Explicit-only per 2026-05-12: an AFK operator must not
+            # accidentally consent to lower-fidelity chat-mode output.)
+            _runtime.agent_modes[platform_l] = {
                 "requested": "research", "actual": "chat",
                 "user_acknowledged_chat": True,
             }
             log(f"[{label}] Proceeding in CHAT MODE — user acknowledged "
                 f"(downstream extraction will use mode-agnostic path)", "WARN")
-            emit_event("pipeline_resumed", phase=2, agent="claude",
+            emit_event("pipeline_resumed", phase=2, agent=platform_l,
                        reason="continue_chat_mode")
         else:
-            _runtime.agent_modes["claude"] = {
+            _runtime.agent_modes[platform_l] = {
                 "requested": "research", "actual": "research",
                 "user_acknowledged_chat": False,
             }
