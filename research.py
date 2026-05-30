@@ -11195,17 +11195,16 @@ async def _advance_dns_backoff(p, name, now, elapsed):
     return True
 
 
-def fail_agent(agent_key: str, title: str, details: str = "",
-               include_wait: bool = False):
+def fail_agent(agent_key: str, title: str, details: str = ""):
     """Template B: Phase 2 per-agent error alert. Emits pipeline_error
-    scoped to one agent with [Retry (hard), Skip, Dismiss]. NO Stop.
+    scoped to one agent with [Retry (hard), Skip]. NO Stop.
     Retry uses mode=hard (close tab + re-run setup) — the more recoverable
     branch for genuine agent failures.
 
-    `include_wait=True` adds a Wait button between Retry and Skip — used by
-    stall/timeout sites where extending the agent's budget by 15 min is a
-    valid alternative to abandoning its progress. The BE handler is
-    `wait_longer_agent` (research.py request_wait_longer_agent + consume).
+    #705: the [Wait] button was removed — the locked alert spec is
+    Decision = [Retry] [Skip] only (no Poke/Wait). Stall sites already get a
+    20-min no-growth silent grace before this fires, so an extra budget-
+    extension affordance is redundant.
 
     Every alert carries `dismissible: True` + a unique
     `alert_id = agent_<key>_error` so the FE store can dedupe dismiss."""
@@ -11217,9 +11216,6 @@ def fail_agent(agent_key: str, title: str, details: str = "",
         {"id": "retry", "label": "Retry (hard)", "style": "primary",
          "command": {"action": "retry_agent", "agent": agent_key, "mode": "hard"}},
     ]
-    if include_wait:
-        actions.append({"id": "wait", "label": "Wait", "style": "default",
-                        "command": {"action": "wait_longer_agent", "agent": agent_key}})
     actions.append({"id": "skip", "label": "Skip", "style": "default",
                     "command": {"action": "skip_agent", "agent": agent_key}})
     emit_event("pipeline_error", phase=2, agent=agent_key,
@@ -19359,9 +19355,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                            (f"{name} stalled — no growth for {int(no_growth_secs/60)} min "
                             f"(currently {_partial_text_len} chars, {_src_count} sources)"),
                            ("The agent's output hasn't grown in a while. "
-                            "Retry re-runs the agent from scratch. Wait grants another 20 min of no-growth budget. "
-                            "Skip drops this agent."),
-                           include_wait=True)
+                            "Retry re-runs the agent from scratch. Skip drops this agent."))
                 # Non-blocking: we don't await here since other agents are
                 # still healthy. The command bus applies the user's choice
                 # asynchronously — check on next tick.
