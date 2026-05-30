@@ -10665,7 +10665,7 @@ _PRO_TIER_DETAILS_BY_KEY = {
                 "Or click Continue with Free to accept the degraded brief."),
     "claude":  ("Claude Pro required for Phase 2",
                 "This account isn't on Claude Pro ($20/mo). Phase 2's Claude "
-                "agent uses Opus 4.7 + Research mode — Free tiers don't expose "
+                "agent uses Opus 4.8 + Research mode — Free tiers don't expose "
                 "Opus or Research and the report will be far shallower.\n\n"
                 "To upgrade: sign out of Claude in the open browser, sign back in "
                 "with a Pro-tier account, then click Retry to re-verify. "
@@ -11292,7 +11292,7 @@ AGENT_PHASE_FLOWS: dict[tuple[str, int], list[str]] = {
         "50m+: Finalizing the report with citations",
     ],
     ("claude", 2): [
-        "0-60s: Opening Claude with Opus 4.7 Adaptive + Research tools",
+        "0-60s: Opening Claude with Opus 4.8 (Max effort + Adaptive Thinking) + Research tools",
         "60s-3m: Loading the brief and planning the research scope",
         "3-15m: Conducting web searches and reading sources, artifact preview building",
         "15-40m: Building the artifact with research findings and citations",
@@ -17109,7 +17109,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         new_page, _setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://claude.ai/new",
             PROMPT_CLAUDE_DEEP_RESEARCH,
-            "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+            "Select Opus 4.8 + Max effort + Adaptive Thinking + Research tool (if Opus 4.8 isn't offered, pick the highest Opus available — never downgrade to 4.7 when 4.8 exists). Do NOT type — just set up and focus input. Say 'ready for paste'.",
             brief_text, "2C-retry", "Claude", verbose, brief_path=brief_path,
             source_paths=source_paths)
         if not _setup_ok:
@@ -19876,7 +19876,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         pass
 
                 # Claude-specific: validate completion via artifact count.
-                # Research mode on Opus 4.7 with Adaptive Thinking USED to
+                # Research mode on Opus 4.8 with Adaptive Thinking USED to
                 # produce TWO artifacts — (1) references, (2) the final
                 # report. The 2026 layout collapses to ONE artifact card
                 # whose text reads "Research complete · N sources · Xm Ys"
@@ -22926,7 +22926,7 @@ async def setup_claude_dr(page) -> bool:
     try:
         await asyncio.sleep(2)
 
-        # ── Step 1: open model dropdown and pick Opus 4.7 ─────────────
+        # ── Step 1: open model dropdown and pick Opus 4.8 ─────────────
         dropdown_clicked = await page.evaluate("""() => {
             const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
             // Model selector button shows the currently-selected model name.
@@ -22942,27 +22942,54 @@ async def setup_claude_dr(page) -> bool:
         if dropdown_clicked:
             log("[setup_claude_dr] Step 1A OK: opened model dropdown")
             await asyncio.sleep(0.8)
-            opus_selected = await page.evaluate("""() => {
-                const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, a, li')];
-                // Priority 1: exact "Opus 4.8"
-                let pick = items.find(el => {
-                    const t = (el.textContent || '').trim().toLowerCase();
-                    return t.includes('opus') && t.includes('4.8');
-                });
-                // Priority 2: any Opus 4.x variant (future-proof)
-                if (!pick) pick = items.find(el => {
-                    const t = (el.textContent || '').trim().toLowerCase();
-                    return t.includes('opus') && t.includes('4');
-                });
-                // Priority 3: any Opus at all
-                if (!pick) pick = items.find(el => (el.textContent || '').toLowerCase().includes('opus'));
-                if (pick) { pick.click(); return pick.textContent.trim(); }
+            # Step 1B: pick the STRONGEST Opus (>= 4.8) from the OPEN popover.
+            # Two prod failures (2026-05-28, backend.log 48681/49653) had this
+            # land on "Opus 4.7 Extra" instead of "Opus 4.8 Max":
+            #   (1) the model-selector TRIGGER button (which shows the CURRENT
+            #       model, e.g. "Opus 4.7 Extra") was in the candidate set, and
+            #   (2) when the 4.8 menu item hadn't rendered by the 0.8s mark, the
+            #       old "any Opus 4.x" priority grabbed that trigger's 4.7.
+            # Fixes: (a) scope candidates to the OPEN popover (role=menu/listbox/
+            # dialog) so the composer trigger button is excluded; (b) version-gate
+            # to >= 4.8 so we NEVER downgrade to 4.7/4.6/... even if 4.8 is slow;
+            # (c) poll for the option to appear. If only sub-4.8 Opus exists,
+            # return null so the CUA fallback (Opus-4.8 prompt) handles it rather
+            # than silently selecting 4.7. Future-proof: picks the highest version.
+            _pick_opus_js = """() => {
+                const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
+                    .filter(m => m.offsetParent !== null);
+                const roots = menus.length ? menus : [document.body];
+                const seen = new Set();
+                const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="option"], button, a, li')])
+                    .filter(el => el.offsetParent !== null && !seen.has(el) && seen.add(el));
+                const verOf = t => {
+                    const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
+                    return m ? parseFloat(m[1]) : null;
+                };
+                // Prefer leaf menu items over wrapper containers at the same
+                // version (shorter text = more specific element).
+                let best = null, bestV = -1, bestLen = Infinity;
+                for (const el of items) {
+                    const t = (el.textContent || '').trim();
+                    const v = verOf(t);
+                    if (v === null || v < 4.8) continue;   // only Opus >= 4.8 — never downgrade
+                    if (v > bestV || (v === bestV && t.length < bestLen)) {
+                        best = el; bestV = v; bestLen = t.length;
+                    }
+                }
+                if (best) { best.click(); return best.textContent.trim(); }
                 return null;
-            }""")
+            }"""
+            opus_selected = None
+            for _attempt in range(8):
+                opus_selected = await page.evaluate(_pick_opus_js)
+                if opus_selected:
+                    break
+                await asyncio.sleep(0.4)
             if opus_selected:
                 log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected}")
             else:
-                log("[setup_claude_dr] Step 1B FAIL: Opus 4.8 option not in dropdown — rollout or A/B difference?", "WARN")
+                log("[setup_claude_dr] Step 1B FAIL: Opus >= 4.8 option not found in popover after polling — rollout/A-B difference or 4.8 retired?", "WARN")
                 return False
             await asyncio.sleep(0.6)
 
@@ -23054,6 +23081,13 @@ async def setup_claude_dr(page) -> bool:
         # Precise selectors first — the old `button[aria-label*="+"]`
         # wildcard was matching unrelated buttons ("New chat", etc.)
         # and occasionally opened the wrong surface.
+        # 2026-05-29 (#708): these precise selectors matched NOTHING on every
+        # prod run (backend.log Step 3A FAIL x100%), so Research never enabled
+        # via DOM → setup returned False → the CUA fallback fired needlessly on
+        # EVERY run. The CUA fallback proved the real control is the composer's
+        # "+" button. So after the precise selectors we add a composer-scoped
+        # "+" detector, and on total failure we DUMP the composer buttons so a
+        # single E2E reveals the exact selector (no more blind selector-guessing).
         tools_opened = False
         tools_sel_used = None
         for sel in ['button[aria-label="Open tools menu"]',
@@ -23072,10 +23106,74 @@ async def setup_claude_dr(page) -> bool:
                     break
             except Exception:
                 continue
+        if not tools_opened:
+            # Composer-scoped "+" detector. Bounded to the editor's container
+            # (NOT the whole page like the old wildcard), and explicitly skips
+            # the model selector (opus/sonnet/haiku text) and the send button.
+            try:
+                plus_label = await page.evaluate("""() => {
+                    const ce = document.querySelector('div[contenteditable="true"], .ProseMirror, [role="textbox"]');
+                    // No composer found → do NOT click anything page-wide (would
+                    // risk a sidebar "+"/menu button). Bail so the diagnostic
+                    // dump runs and the CUA fallback handles it instead.
+                    if (!ce) return null;
+                    let scope = ce;
+                    for (let i = 0; i < 5 && scope && scope.parentElement; i++) scope = scope.parentElement;
+                    const root = scope || ce;   // never document.body — stay inside the composer subtree
+                    const btns = [...root.querySelectorAll('button')].filter(b => b.offsetParent !== null);
+                    const isModel = s => /opus|sonnet|haiku|claude|model/i.test(s || '');
+                    const isSend  = s => /\\bsend\\b|submit/i.test(s || '');
+                    // Never the model-selector or the send/submit button (check
+                    // BOTH text and aria-label so an icon-only Send is excluded).
+                    const skip = b => {
+                        const a = (b.getAttribute('aria-label') || '');
+                        const t = (b.textContent || '').trim();
+                        return isModel(t) || isModel(a) || isSend(t) || isSend(a);
+                    };
+                    // Primary: an icon button that opens a menu.
+                    let cand = btns.find(b => {
+                        const pop = b.getAttribute('aria-haspopup');
+                        return (pop === 'menu' || pop === 'true') && !skip(b);
+                    });
+                    // Fallback: an add/attach/tools/plus-labelled button.
+                    if (!cand) cand = btns.find(b => {
+                        if (skip(b)) return false;
+                        const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                        const t = (b.textContent || '').trim();
+                        return a.includes('attach') || a.includes('tool') || a.includes('add') ||
+                               a.includes('plus') || a.includes('upload') || a.includes('more') || t === '+';
+                    });
+                    if (cand) { cand.click(); return (cand.getAttribute('aria-label') || cand.textContent || '+').trim().slice(0, 40); }
+                    return null;
+                }""")
+                if plus_label:
+                    await asyncio.sleep(0.6)
+                    tools_opened = True
+                    tools_sel_used = f"composer-plus[{plus_label}]"
+            except Exception as _pe:
+                log(f"[setup_claude_dr] Step 3A '+' detector errored: {_pe}", "WARN")
         if tools_opened:
             log(f"[setup_claude_dr] Step 3A OK: opened tools menu via {tools_sel_used}")
         else:
             log("[setup_claude_dr] Step 3A FAIL: tools menu button not found — aria-labels rotated or language changed", "WARN")
+            # Diagnostic: dump the composer's buttons so the next E2E pins the
+            # exact selector. Self-documenting — replaces blind selector-guessing.
+            try:
+                _btn_dump = await page.evaluate("""() => {
+                    const ce = document.querySelector('div[contenteditable="true"], .ProseMirror, [role="textbox"]');
+                    let scope = ce;
+                    for (let i = 0; i < 5 && scope && scope.parentElement; i++) scope = scope.parentElement;
+                    const root = scope || document.body;
+                    return [...root.querySelectorAll('button')].filter(b => b.offsetParent !== null).slice(0, 25).map(b => ({
+                        al: (b.getAttribute('aria-label') || '').slice(0, 40),
+                        t: (b.textContent || '').trim().slice(0, 24),
+                        pop: b.getAttribute('aria-haspopup') || '',
+                        tid: b.getAttribute('data-testid') || ''
+                    }));
+                }""")
+                log(f"[setup_claude_dr] Step 3A composer-button dump (fix selector from this): {json.dumps(_btn_dump, ensure_ascii=False)}", "WARN")
+            except Exception:
+                pass
         research_enabled = False
         if tools_opened:
             # State-aware + accept label variations ("Research", "Research
@@ -23493,10 +23591,29 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
                 await setup_gemini_dr(page)
             return {"platform": "gemini", "active": True}
         if platform_l == "claude":
-            # Check BOTH: Opus Extended model AND Research tool are on.
+            # Check BOTH: high-tier Opus model AND Research tool are on.
             _claude_state_js = """() => {
                 const txt = (document.body.innerText || '').toLowerCase();
-                const hasExtended = txt.includes('opus') && txt.includes('extended');
+                // 2026-05-28: the UI dropped the word "Extended" — the model
+                // button now reads "Opus 4.8 Max" and Adaptive shows as a
+                // "Thinking" toggle behind the popover. A body-wide "extended"
+                // scan was therefore ALWAYS false → a needless re-activation on
+                // EVERY Claude send (backend.log 49728). Read the model-selector
+                // button instead: Opus >= 4.8 showing == the high-tier model is
+                // active. (Adaptive/effort live behind the closed popover and are
+                // confirmed by the CUA validate layer, not gated here.)
+                const verOf = t => {
+                    const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
+                    return m ? parseFloat(m[1]) : null;
+                };
+                // Read the composer's model-selector TRIGGER button only —
+                // EXCLUDE any Opus option rendered inside an open dropdown/menu
+                // (a stale "Opus 4.8" menu item while the current model is 4.7
+                // would otherwise false-positive). The trigger lives outside any
+                // [role=menu]/[role=listbox]/[role=dialog] popover.
+                const hasExtended = [...document.querySelectorAll('button, [role="button"]')]
+                    .filter(b => !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'))
+                    .some(b => { const v = verOf(b.textContent); return v !== null && v >= 4.8; });
                 // Research tool shows as a magnifying-glass icon / label near composer
                 const researchOn = Array.from(document.querySelectorAll('button, [role="button"]'))
                     .some(b => {
@@ -24572,10 +24689,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         log("\n[Startup gap] Waiting 30s before opening Claude...")
         await asyncio.sleep(30)
 
-    # ── Step 2 (2B): Claude — Opus 4.7 + Adaptive Thinking + Research tool ──
+    # ── Step 2 (2B): Claude — Opus 4.8 + Max effort + Adaptive Thinking + Research tool ──
     if enabled_agents is None or "claude" in enabled_agents:
         log("\n--- 2B: Claude Deep Research ---")
-        emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Opus 4.7 Adaptive + Research tools...")
+        emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Opus 4.8 (Max effort + Adaptive Thinking) + Research tools...")
         for attempt in range(2):
             if attempt > 0:
                 log("[2B] Retrying Claude (fresh tab)...", "WARN")
@@ -24584,7 +24701,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             claude_page, _claude_setup_ok = await start_agent_no_gemini_wait(
                 browser, cua_client, "https://claude.ai/new",
                 PROMPT_CLAUDE_DEEP_RESEARCH,
-                "Select Opus 4.7 + Adaptive Thinking + Research tool. Do NOT type — just set up and focus input. Say 'ready for paste'.",
+                "Select Opus 4.8 + Max effort + Adaptive Thinking + Research tool (if Opus 4.8 isn't offered, pick the highest Opus available — never downgrade to 4.7 when 4.8 exists). Do NOT type — just set up and focus input. Say 'ready for paste'.",
                 brief_text, "2B", "Claude", verbose, brief_path=brief_path,
                 source_paths=source_paths)
             if not _claude_setup_ok:
