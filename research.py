@@ -8273,13 +8273,47 @@ async def _cua_login_call(page, platform: str, cua_client) -> tuple[bool, str]:
         # pipeline_error ("CUA unavailable — [Skip] [Stop]") instead of
         # spinning on login_required.
         err = str(e)
-        low = err.lower()
-        if ("workspace api usage limits" in low
-            or ("400" in err and "usage limit" in low)
-            or ("401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low))
-            or "overloaded" in low or "529" in err):
+        # 2026-05-29: classify explicitly. A 429 here was NOT caught before
+        # and fell through to a False ("not logged in") verdict — the run then
+        # showed a phantom login/key alert that self-healed when the limit
+        # cleared (the appear-then-vanish bug). rate_limit / key / overload all
+        # raise so Phase 0 surfaces the paused 'load or switch your key, then
+        # Retry' card that persists until the user acts.
+        if _anthropic_err_kind(err) in ("rate_limit", "key", "overload"):
             raise CuaUnavailableError(err) from e
         return (False, f"API error: {e}")
+
+
+def _anthropic_err_kind(err: str) -> str:
+    """Classify an Anthropic API/SDK error string for alert routing.
+
+    Returns:
+      'rate_limit' — 429 / too-many-requests / quota → user must load or
+                     switch their API key (immediate paused key card).
+      'key'        — 401 / invalid key / workspace usage cap → same key card.
+      'overload'   — 529 / overloaded → transient (server-side).
+      'transient'  — 403 / 5xx / timeout / connection blip → transient.
+      'other'      — anything else.
+
+    Routing: rate_limit + key surface the paused 'load or switch your key,
+    then Retry' card; overload + transient are retried rather than alarming
+    the user with a key prompt.
+    """
+    low = err.lower()
+    if "429" in err or "rate_limit" in low or "rate limit" in low or "too many requests" in low:
+        return "rate_limit"
+    if ("workspace api usage limits" in low
+            or ("400" in err and "usage limit" in low)
+            or ("401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low))
+            or "authentication_error" in low):
+        return "key"
+    if "529" in err or "overloaded" in low:
+        return "overload"
+    if ("403" in err or "500" in err or "502" in err or "503" in err
+            or "504" in err or "timeout" in low or "timed out" in low
+            or "connection" in low):
+        return "transient"
+    return "other"
 
 
 # Set membership only — every caller uses this for "is this platform in
@@ -8354,11 +8388,7 @@ async def _cua_pro_tier_call(page, platform: str, cua_client) -> str:
         return "unsure"
     except Exception as e:
         err = str(e)
-        low = err.lower()
-        if ("workspace api usage limits" in low
-            or ("400" in err and "usage limit" in low)
-            or ("401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low))
-            or "overloaded" in low or "529" in err):
+        if _anthropic_err_kind(err) in ("rate_limit", "key", "overload"):
             raise CuaUnavailableError(err) from e
         log(f"[pro_tier:{pname}] API error: {e}", "WARN")
         return "unsure"
@@ -27504,7 +27534,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     fail_phase(
                         0, "CUA vision check can't run",
                         (f"{str(cua_err)[:180]}\n\n"
-                         "This usually means one of three things:\n"
+                         "This usually means one of these:\n"
+                         "• Rate-limited (429) — the key hit its request / quota "
+                         "limit. Load or switch to another key in Account → API "
+                         "Config, then Retry.\n"
                          "• Invalid or missing Anthropic key — add or rotate it in "
                          "Account → API Config (preferred, no restart), or set "
                          "ANTHROPIC_API_KEY on the backend machine and restart.\n"
