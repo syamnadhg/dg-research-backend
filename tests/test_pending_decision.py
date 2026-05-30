@@ -70,3 +70,34 @@ def test_phase0_login_event_now_carries_alert_id():
         "the Phase 0 login_required event must carry a stable alert_id so the "
         "live and hydrated cards dedup (#710)."
     )
+
+
+def test_parity_all_decision_gates_persist_pendingdecision():
+    # #710 parity: env-check, human-verify, agent-link, and pro_required all
+    # mirror their decision onto the doc so a cold chat-open re-surfaces the
+    # card, not just login.
+    mod_src = inspect.getsource(research)
+    for kind in ("human_verification_required", "agent_link_failed", "pro_required"):
+        assert f'"kind": "{kind}"' in mod_src, (
+            f"the {kind} gate must persist a pendingDecision of that kind (#710)."
+        )
+    # env-check reuses the login_required kind but with a distinct alert_id.
+    assert "phase0_env_check" in mod_src, (
+        "the env-check gate must persist a pendingDecision (alert_id "
+        "phase0_env_check) so an env failure re-surfaces on cold open (#710)."
+    )
+    # Each carded gate stamps an alert_id so live + hydrated cards dedup.
+    assert "_human_verify_" in mod_src and "_agent_link_" in mod_src, (
+        "human-verify and agent-link events must carry stable alert_ids (#710)."
+    )
+
+
+def test_pending_decision_cleared_on_universal_resolve_signal():
+    # The clear is centralized on the resolve EVENTS every gate emits, so it
+    # covers gates that wait via their own poll loop (human-verify) as well as
+    # those using wait_if_paused.
+    src = inspect.getsource(research.emit_event)
+    assert '("pipeline_resumed", "pipeline_stopped")' in src and "_clear_pending_decision()" in src, (
+        "emit_event must clear pendingDecision on pipeline_resumed/"
+        "pipeline_stopped so every gate's resolution retracts the card (#710)."
+    )

@@ -9957,8 +9957,9 @@ async def wait_for_agent_decision(agent: str, reason: str, phase: int = 2,
     button; pipeline-level stop lives in the chat bar only (2026-04-19
     design rule applied to AgentAlertPanel)."""
     _controls.pending_agent_decision = None
+    _al_alert_id = f"phase{phase}_agent_link_{agent}"
     emit_event("agent_link_failed", phase=phase, agent=agent,
-               reason=reason, options=list(options))
+               reason=reason, options=list(options), alert_id=_al_alert_id)
     # DGOPS-7710-followup: pause with explicit reason + target agent so the
     # CLI dispatcher can discriminate (without this, CLI `r` falls through
     # to the generic branch which only calls request_resume, leaving
@@ -9966,9 +9967,24 @@ async def wait_for_agent_decision(agent: str, reason: str, phase: int = 2,
     _controls.pause_target_agent = (agent or "").strip().lower()
     _controls.request_pause("agent_link_failed")
     emit_event("pipeline_paused", phase=phase, reason="agent_link_failed", agent=agent)
+    # #710 parity: durable mirror so opening this chat re-surfaces the
+    # Retry/Skip card even if it wasn't the viewed tab. Cleared on the
+    # pipeline_resumed this gate emits when the user decides.
+    _persist_pending_decision({
+        "kind": "agent_link_failed",
+        "phase": phase,
+        "agent": agent,
+        "reason": reason,
+        "options": list(options),
+        "alert_id": _al_alert_id,
+    })
     log(f"[{agent}] Waiting for user decision (retry/skip) — reason: {reason}")
     await _controls.wait_if_paused()
     if _controls.is_stop():
+        # Stop exits without emitting pipeline_resumed/stopped, so retract the
+        # durable mirror here too (#710) rather than relying on the universal
+        # emit_event clear.
+        _clear_pending_decision()
         return "stop"
     decision = _controls.pop_agent_decision() or "skip"
     emit_event("pipeline_resumed", phase=phase, reason=f"agent_decision:{decision}", agent=agent)
@@ -10381,6 +10397,17 @@ def emit_event(event_type, phase=None, agent=None, **data):
         # Status persistence is best-effort — never let it break event
         # emission (which is the critical path for FE state updates).
         pass
+    # #710 parity: a Decision pause's durable pendingDecision mirror is
+    # retracted on the UNIVERSAL resolve signal — every gate (login, env,
+    # pro, human-verify, agent-link) emits pipeline_resumed (retry/skip/ack)
+    # or pipeline_stopped when it unblocks, regardless of whether it waited
+    # via wait_if_paused or its own poll loop. Clearing here (one chokepoint)
+    # covers them all without per-site clears. Best-effort.
+    try:
+        if event_type in ("pipeline_resumed", "pipeline_stopped"):
+            _clear_pending_decision()
+    except Exception:
+        pass
     # Write to Firestore (frontend real-time transport)
     _emit_to_firestore(event)
     # Drop into the narrator ring buffer (after Firestore so ordering
@@ -10760,27 +10787,44 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
         (f"{agent.title()} Pro required",
          f"{agent.title()} isn't on a Pro tier — quality degrades. Sign in with a Pro account and Retry, or Continue with Free."),
     )
+    _pro_actions = [
+        {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
+         "command": {"action": "continue_anyway"}},
+        {"id": "retry", "label": "Retry", "style": "primary",
+         "command": {"action": "retry_phase", "phase": phase}},
+        # Skip: at P0 → skip_init_verify (handed off to per-phase
+        # _phase_verify_gate). At phase ≥ 1 → skip_agent for this
+        # platform only, leaving siblings to run normally. The agent-key
+        # in the command lets phase-time skip target one platform without
+        # touching the others (P2 has 3 concurrent agents).
+        {"id": "skip", "label": "Skip", "style": "default",
+         "command": ({"action": "skip_init_verify"} if phase == 0
+                     else {"action": "skip_agent", "agent": agent.lower()})},
+    ]
+    _pro_alert_id = f"phase{phase}_pro_required_{agent.lower()}"
     emit_event(
         "pipeline_error", phase=phase, agent=agent,
         error=title, details=details,
-        actions=[
-            {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
-             "command": {"action": "continue_anyway"}},
-            {"id": "retry", "label": "Retry", "style": "primary",
-             "command": {"action": "retry_phase", "phase": phase}},
-            # Skip: at P0 → skip_init_verify (handed off to per-phase
-            # _phase_verify_gate). At phase ≥ 1 → skip_agent for this
-            # platform only, leaving siblings to run normally. The agent-key
-            # in the command lets phase-time skip target one platform without
-            # touching the others (P2 has 3 concurrent agents).
-            {"id": "skip", "label": "Skip", "style": "default",
-             "command": ({"action": "skip_init_verify"} if phase == 0
-                         else {"action": "skip_agent", "agent": agent.lower()})},
-        ],
+        actions=_pro_actions,
         dismissible=True,
-        alert_id=f"phase{phase}_pro_required_{agent.lower()}",
+        alert_id=_pro_alert_id,
         source=source or None,
     )
+    # #710 parity: durable mirror so a Pro-tier decision raised while this
+    # chat wasn't the viewed tab re-surfaces on cold open. pro_required is a
+    # BE-authored card (the FE renders pipeline_error's actions verbatim), so
+    # we persist the full payload; the FE applies it to the same surface the
+    # live pipeline_error handler uses (agentAlert at P2-with-agent, else
+    # phaseAlert). Cleared on the pipeline_resumed the ack/retry/skip emits.
+    _persist_pending_decision({
+        "kind": "pro_required",
+        "phase": phase,
+        "agent": agent.lower(),
+        "title": title,
+        "details": details,
+        "actions": _pro_actions,
+        "alert_id": _pro_alert_id,
+    })
 
 
 def _clear_pro_required_alerts(triggered_at_phase: int) -> None:
@@ -24181,11 +24225,14 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
 
     # ── User manual fallback — pause pipeline, banner with Resume/Skip ──
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
+    _hv_alert_id = f"phase{phase}_human_verify_{platform_key}"
+    _hv_msg = f"{platform.capitalize()} is asking for human verification. I tried and couldn't clear it — solve it in the browser and tap Resume, or Skip this agent."
     emit_event("human_verification_required", phase=phase, agent=platform_key,
                platform=platform_key,
                platformLabel=platform.capitalize(),
                reason=reason or "Human verification challenge",
-               message=f"{platform.capitalize()} is asking for human verification. I tried and couldn't clear it — solve it in the browser and tap Resume, or Skip this agent.")
+               message=_hv_msg,
+               alert_id=_hv_alert_id)
     # DGOPS-7710-followup: pause with explicit reason + target agent so the
     # CLI dispatcher's `s` can target THIS platform via request_skip_agent
     # (the poll loop below checks skipped_agents; without target_agent, CLI
@@ -24193,6 +24240,18 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     _controls.pause_target_agent = (platform_key or "").strip().lower()
     _controls.request_pause("human_verification_required")
     emit_event("pipeline_paused", phase=phase, reason="human_verification_required", agent=platform_key)
+    # #710 parity: durable mirror so opening this chat re-surfaces the
+    # Resume/Skip card even if it wasn't the viewed tab when HV fired.
+    # Cleared on the pipeline_resumed/stopped this gate emits when it unblocks.
+    _persist_pending_decision({
+        "kind": "human_verification_required",
+        "phase": phase,
+        "agent": platform_key,
+        "platformLabel": platform.capitalize(),
+        "reason": reason or "Human verification challenge",
+        "message": _hv_msg,
+        "alert_id": _hv_alert_id,
+    })
 
     # Poll every 5s — if the user solves the challenge without tapping Resume,
     # we still notice and auto-continue. Also yields to stop/skip/resume signals.
@@ -24220,7 +24279,8 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                            platform=platform_key,
                            platformLabel=platform.capitalize(),
                            reason=reason or "Human verification challenge",
-                           message=f"{platform.capitalize()} still shows verification. Solve it first, then Resume.")
+                           message=f"{platform.capitalize()} still shows verification. Solve it first, then Resume.",
+                           alert_id=_hv_alert_id)
                 # Re-set target_agent (request_resume cleared it on the
                 # initial resume) so CLI `s` still targets this platform.
                 _controls.pause_target_agent = (platform_key or "").strip().lower()
@@ -24238,6 +24298,12 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             return True
 
     log(f"[{label}] Human verification timed out ({max_wait_loops * 5}s) — skipping agent", "WARN")
+    # #710: this timeout exit drops the agent WITHOUT emitting
+    # pipeline_resumed/stopped, so the universal emit_event clear never fires —
+    # retract the durable mirror here (load-bearing, like the login
+    # skip_init_verify break) so a cold chat-open can't paint a ghost
+    # "needs human verification" card for an agent that already timed out.
+    _clear_pending_decision()
     return False
 
 
@@ -28129,7 +28195,22 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        machineName=socket.gethostname(),
                        envErrors=_env_errors,
                        attempt=1,
-                       message="Environment check failed — see errors above.")
+                       message="Environment check failed — see errors above.",
+                       alert_id="phase0_env_check")
+            # #710 parity: durable mirror so an env-check failure raised while
+            # this chat wasn't the viewed tab re-surfaces the card on open.
+            # (Same kind as login_required — the FE's isEnv branch renders it.)
+            _persist_pending_decision({
+                "kind": "login_required",
+                "phase": 0,
+                "platforms": [],
+                "platformLabels": [],
+                "machineName": socket.gethostname(),
+                "envErrors": _env_errors,
+                "attempt": 1,
+                "message": "Environment check failed — see errors above.",
+                "alert_id": "phase0_env_check",
+            })
             _controls.request_pause()
             emit_event("pipeline_paused", phase=0, reason="login_required")
             await _controls.wait_if_paused()
