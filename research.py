@@ -66,6 +66,7 @@ from datetime import datetime
 from models import (
     CUA_MODEL,
     VISION_LIGHT_MODEL,
+    VISION_HEAVY_MODEL,
     NARRATOR_HAIKU,
     TITLE_HAIKU,
     GEMINI_TEXT,
@@ -8223,7 +8224,7 @@ _PLATFORM_DISPLAY = {
 }
 
 
-async def _cua_login_call(page, platform: str, cua_client) -> tuple[bool, str]:
+async def _cua_login_call(page, platform: str, cua_client, heavy: bool = False) -> tuple[bool, str]:
     """Single CUA vision call. Returns (verdict_yes, raw_response)."""
     display = _PLATFORM_DISPLAY.get(platform.lower(), platform)
     try:
@@ -8257,7 +8258,7 @@ async def _cua_login_call(page, platform: str, cua_client) -> tuple[bool, str]:
     try:
         resp = await asyncio.to_thread(
             cua_client.messages.create,
-            model=VISION_LIGHT_MODEL,
+            model=(VISION_HEAVY_MODEL if heavy else VISION_LIGHT_MODEL),
             max_tokens=8,
             messages=[{
                 "role": "user",
@@ -8338,7 +8339,7 @@ def _anthropic_err_kind(err: str) -> str:
 _PRO_TIER_PLATFORMS = frozenset({"chatgpt", "claude", "gemini"})
 
 
-async def _cua_pro_tier_call(page, platform: str, cua_client) -> str:
+async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = False) -> str:
     """Single-screenshot Pro/Free verdict for ChatGPT/Claude/Gemini.
 
     Returns 'pro' | 'free' | 'unsure'. UNSURE is a fail-open signal — caller
@@ -8376,7 +8377,7 @@ async def _cua_pro_tier_call(page, platform: str, cua_client) -> str:
     try:
         resp = await asyncio.to_thread(
             cua_client.messages.create,
-            model=VISION_LIGHT_MODEL,
+            model=(VISION_HEAVY_MODEL if heavy else VISION_LIGHT_MODEL),
             max_tokens=8,
             messages=[{
                 "role": "user",
@@ -8440,9 +8441,14 @@ async def verify_login_cua(page, platform: str, cua_client) -> bool:
             pass
     except Exception:
         pass
-    ok2, raw2 = await _cua_login_call(page, platform, cua_client)
+    # #705: the retry pass escalates the vision verdict to the heavy model
+    # (Opus 4.8) — a stronger reader is worth the cost on a hard second look
+    # at a possible login wall, matching vision tier-2's attempts>=2 rule.
+    # The computer-use loop stays on Sonnet 4.6 (the CUA-recommended model);
+    # only the vision VERDICT escalates.
+    ok2, raw2 = await _cua_login_call(page, platform, cua_client, heavy=True)
     if ok2:
-        log(f"[verify_login_cua:{platform}] LOGGED IN ✓ on retry (Claude: {raw2[:30]})", "INFO")
+        log(f"[verify_login_cua:{platform}] LOGGED IN ✓ on retry (Opus: {raw2[:30]})", "INFO")
         return True
 
     log(f"[verify_login_cua:{platform}] NOT LOGGED IN ✗ (Claude both passes: '{raw1[:20]}' / '{raw2[:20]}')", "INFO")
