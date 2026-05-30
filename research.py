@@ -6655,7 +6655,14 @@ def _start_command_listener(uid, research_id, loop):
     except Exception as _sweep_err:
         log(f"[commands] startup sweep failed: {_sweep_err}", "DEBUG")
 
+    # First-snapshot tracker — gates the stale-command defense below (#704).
+    _cmd_first_snapshot = {"v": True}
+
     def on_snapshot(_col_snapshot, changes, _read_time):
+        # Firestore delivers all pre-existing docs as ADDED in the FIRST
+        # callback after attach; every later callback is a live delta.
+        is_first_snapshot = _cmd_first_snapshot["v"]
+        _cmd_first_snapshot["v"] = False
         for change in changes:
             if change.type.name != 'ADDED':
                 continue
@@ -6663,28 +6670,35 @@ def _start_command_listener(uid, research_id, loop):
             data = doc.to_dict() or {}
             if data.get("processed"):
                 continue
-            # Stale-command defense: Firestore's onSnapshot replays every
-            # existing doc as ADDED on first attach. If a previous session
-            # wrote a stop/pause/etc and either (a) never reached the
-            # mark-processed line (os._exit crashed the Firestore write) or
-            # (b) the SDK buffered the write and the process died before
-            # flush, that doc stays unprocessed forever. Next serve then
-            # re-executes it the moment the listener reattaches — which has
-            # killed multiple test sessions within seconds of startup.
-            # 30s is well past the frontend's typical command round-trip,
-            # so any command older than that is from a previous session.
-            STALE_COMMAND_AGE_MS = 30_000
-            _ts = data.get("timestamp")
-            if isinstance(_ts, (int, float)) and _ts > 0:
-                _age_ms = int(time.time() * 1000) - int(_ts)
-                if _age_ms > STALE_COMMAND_AGE_MS:
-                    # Mark it processed so it stops replaying on future
-                    # listener attaches, but do NOT execute.
-                    try:
-                        doc.reference.update({"processed": True, "staleSkipped": True})
-                    except Exception:
-                        pass
-                    continue
+            # Stale-command defense — FIRST-ATTACH REPLAY ONLY. Firestore
+            # replays every pre-existing doc as ADDED when the listener first
+            # attaches; a prior session's unprocessed stop/pause/etc would
+            # otherwise re-execute the moment a fresh serve reattaches (this
+            # killed multiple sessions within seconds of startup). 30s is well
+            # past a normal command round-trip, so a first-snapshot doc older
+            # than that is from a previous session.
+            #
+            # CRITICAL (#704): this gate must NOT touch LIVE commands (those
+            # delivered AFTER attach). The command listener attaches at
+            # pipeline start (setup_firestore_run), so every Retry / Resume /
+            # Skip the user clicks on a paused alert arrives LIVE. Applying
+            # the client-`timestamp` check to those silently skipped legit
+            # clicks whenever the browser clock that wrote `timestamp` was
+            # skewed vs this machine's clock — leaving the run stuck on pause
+            # after the user had already acted. Live commands always execute.
+            if is_first_snapshot:
+                STALE_COMMAND_AGE_MS = 30_000
+                _ts = data.get("timestamp")
+                if isinstance(_ts, (int, float)) and _ts > 0:
+                    _age_ms = int(time.time() * 1000) - int(_ts)
+                    if _age_ms > STALE_COMMAND_AGE_MS:
+                        # Mark processed so it stops replaying on future
+                        # attaches, but do NOT execute.
+                        try:
+                            doc.reference.update({"processed": True, "staleSkipped": True})
+                        except Exception:
+                            pass
+                        continue
             action = data.get("action", "")
             if action == "ping":
                 # Watchdog confirmation ping. Frontend writes this when it
