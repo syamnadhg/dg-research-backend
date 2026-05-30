@@ -5843,7 +5843,15 @@ def start_firestore_start_listener(job_queue, loop):
                     "queuedBehindTitle": behind_title,
                 }
             else:
-                status_payload = {"backendRunId": run_id, "status": "ongoing"}
+                # Clear any stale pendingDecision from a PRIOR run of this same
+                # research doc (#710). A run that paused at a gate then died (or
+                # resumed straight into a later phase, bypassing the gate's own
+                # _clear_pending_decision) could leave a stale "Log in / Retry"
+                # mirror on the doc; wiping it at every fresh start guarantees a
+                # cold chat-open never paints a decision the run has moved past.
+                from google.cloud.firestore import DELETE_FIELD as _DF_START
+                status_payload = {"backendRunId": run_id, "status": "ongoing",
+                                  "pendingDecision": _DF_START}
             # Write run_id + initial status back to the research doc.
             # `_update_research_doc` returns False on failure (logs WARN);
             # we then attempt a set(merge=True) as a fallback for the
@@ -6310,6 +6318,41 @@ def _update_firestore_research(updates):
     if not _fb_uid or not _fb_research_id:
         return
     _update_research_doc(_fb_uid, _fb_research_id, updates)
+
+
+def _persist_pending_decision(payload: dict):
+    """Mirror a structured 'pending decision' (login_required, pro_required,
+    human_verification_required, agent_link_failed, …) onto the ROOT research
+    doc so a frontend that opens the chat AFTER the pause was raised — i.e.
+    while the user was viewing a different chat — can re-surface the actionable
+    card from durable state.
+
+    Why this exists: decision alerts are otherwise emitted ONLY as transient
+    `pipeline_events`. The FE renders the card by consuming that live stream
+    behind a per-browser `seq` cursor; a background notifications listener can
+    advance (burn) that cursor past the event before the user ever opens the
+    chat, so on cold open there is nothing left to replay and the chat looks
+    "stuck at init" with no Retry. Persisting the decision on the run doc makes
+    re-surfacing cursor-independent. Paired with `_clear_pending_decision`,
+    which retracts it the instant the gate resolves (resume / skip / stop) so a
+    stale card can never re-appear on a later open. Best-effort; never blocks
+    the run."""
+    try:
+        _update_firestore_research({"pendingDecision": payload})
+    except Exception as e:
+        log(f"[pending-decision] persist failed (non-fatal): {e}", "DEBUG")
+
+
+def _clear_pending_decision():
+    """Retract a previously-persisted `pendingDecision` once the gate resolves.
+    Idempotent — harmless when none was set. Must be paired with every
+    `_persist_pending_decision` call so a resolved decision cannot linger on the
+    doc and re-surface on a later cold chat-open."""
+    try:
+        from google.cloud.firestore import DELETE_FIELD
+        _update_firestore_research({"pendingDecision": DELETE_FIELD})
+    except Exception as e:
+        log(f"[pending-decision] clear failed (non-fatal): {e}", "DEBUG")
 
 
 def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
@@ -10891,17 +10934,32 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
                 emit_event("agent_progress", phase=phase, agent=agent_key,
                            status="needs_login",
                            progress=f"{label}: login required ✗ (phase-time check)")
+                _pt_login_msg = f"Log into {label} in the browser on your setup PC."
+                _pt_login_alert_id = f"phase{phase}_login_required_{agent_key}"
                 emit_event("login_required",
                            phase=phase,
                            platforms=[agent_key],
                            platformLabels=[label],
                            machineName=socket.gethostname(),
                            attempt=1,
-                           message=f"Log into {label} in the browser on your setup PC.",
-                           alert_id=f"phase{phase}_login_required_{agent_key}")
+                           message=_pt_login_msg,
+                           alert_id=_pt_login_alert_id)
                 _controls.request_pause("login_required")
                 emit_event("pipeline_paused", phase=phase, reason="login_required")
+                # Durable mirror — see _persist_pending_decision. Lets a cold
+                # chat-open at a phase-time login gate re-surface the Retry card.
+                _persist_pending_decision({
+                    "kind": "login_required",
+                    "phase": phase,
+                    "platforms": [agent_key],
+                    "platformLabels": [label],
+                    "machineName": socket.gethostname(),
+                    "attempt": 1,
+                    "message": _pt_login_msg,
+                    "alert_id": _pt_login_alert_id,
+                })
                 await _controls.wait_if_paused()
+                _clear_pending_decision()
                 if _controls.is_stop():
                     emit_event("pipeline_stopped", phase=phase, reason="stopped during login_required")
                     return "stop"
@@ -27963,16 +28021,36 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # platform and wait for user retry.
                 emit_event("agent_progress", phase=0, agent=key,
                            status="needs_login", progress=f"{label}: login required ✗")
+                _login_msg = f"Log into {label} in the browser on your setup PC."
+                # alert_id aligns Phase 0 with the phase>=1 path so the live
+                # event card and the doc-hydrated card dedup on the same key.
+                _login_alert_id = f"phase0_login_required_{key}"
                 emit_event("login_required",
                            phase=0,
                            platforms=[key],
                            platformLabels=[label],
                            machineName=socket.gethostname(),
                            attempt=attempt,
-                           message=f"Log into {label} in the browser on your setup PC.")
+                           message=_login_msg,
+                           alert_id=_login_alert_id)
                 _controls.request_pause("login_required")
                 emit_event("pipeline_paused", phase=0, reason="login_required")
+                # Durable mirror so opening this chat re-surfaces the Retry card
+                # even when it wasn't the viewed tab as the gate fired.
+                _persist_pending_decision({
+                    "kind": "login_required",
+                    "phase": 0,
+                    "platforms": [key],
+                    "platformLabels": [label],
+                    "machineName": socket.gethostname(),
+                    "attempt": attempt,
+                    "message": _login_msg,
+                    "alert_id": _login_alert_id,
+                })
                 await _controls.wait_if_paused()
+                # Gate resolved (resume / skip / stop) — retract the durable
+                # card. A still-failing retry re-persists on the next loop.
+                _clear_pending_decision()
                 if _controls.is_stop():
                     emit_event("pipeline_stopped", phase=0, reason="stopped during login_required")
                     return
