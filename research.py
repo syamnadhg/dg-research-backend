@@ -15460,8 +15460,19 @@ async def agent_loop(client, browser, system_prompt, user_message,
             _agent = agent_name or None
             low = err.lower()
             if "rate_limit" in low or "429" in err:
-                log("Rate limited — waiting 30s", "WARN")
-                await asyncio.sleep(30); continue
+                # #705: a 429 is a key/quota problem the user must act on —
+                # switching to another key clears it. Don't silent-retry (that
+                # hid a persistent rate limit and made the alert appear-then-
+                # vanish); pause immediately with a Retry-only 'load or switch
+                # your key' card, same as the cap / key-rejected branches below.
+                log(f"Claude API rate limited (429) — pausing for key action: {err[:160]}", "ERROR")
+                _rl_msg = ("Rate-limited (429) on the current Anthropic key. Load or "
+                           "switch to another key in Account → API Config, then Retry.")
+                if _phase == 2 and _agent:
+                    fail_agent(_agent, "Claude API rate limit", _rl_msg)
+                else:
+                    fail_phase(_phase, "Claude API rate limit", _rl_msg)
+                return {"status": "error", "text": str(e)}
             elif "overloaded" in low or "529" in err:
                 log("API overloaded — waiting 60s", "WARN")
                 await asyncio.sleep(60); continue
