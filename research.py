@@ -27108,8 +27108,14 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
 
     # ── Phase timeline (for timeline graph) ──
     phases = meta.get("phases", [])
+    # Canonical 6-phase timeline (0-5). Audio is part of NotebookLM (phase 3),
+    # NOT a separate phase — the BE records the whole NLM+audio span as phase 3
+    # (see the phase_complete phase=3 with the full _p3_start duration). Phase 4
+    # is YouTube, phase 5 is Delivery (both FE-stamped). The old 7-entry array
+    # split "Audio Overview" out as its own phase, which mislabeled the Analytics
+    # timeline; kept in lockstep with web PHASE_META + the FE P4/P5 phase stamps.
     phase_labels = ["Initializing", "Research Brief", "Deep Research",
-                    "Links + NotebookLM", "Audio Overview", "Video + YouTube", "Delivery"]
+                    "Links + NotebookLM + Audio", "Video + YouTube", "Delivery"]
     now_ms = int(time.time() * 1000)
     # Ensure all phases up to current exist
     while len(phases) <= phase:
