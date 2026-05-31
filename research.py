@@ -8485,6 +8485,19 @@ async def verify_login_cua(page, platform: str, cua_client) -> bool:
 
     Returns True iff at least one of the checks clearly says YES.
     """
+    # ── TEST INJECTION — REMOVE after #715 validation ───────────────────────
+    # DG_FORCE_CUA_UNAVAILABLE=1 deterministically simulates an Anthropic/CUA
+    # outage (rate-limit / capped / rejected key) so the Phase-0 cua_unavailable
+    # pause + its #715 durable decision card can be exercised on an E2E WITHOUT
+    # touching the real key. The Phase-0 caller (research.py ~28003) catches
+    # this and routes to fail_phase(Retry) + request_pause("cua_unavailable").
+    # Requires Settings → "Skip login verification" OFF so init verify runs.
+    if os.environ.get("DG_FORCE_CUA_UNAVAILABLE", "").lower() in ("1", "true", "yes"):
+        log(f"[verify_login_cua:{platform}] DG_FORCE_CUA_UNAVAILABLE set — "
+            f"simulating CUA/Anthropic unavailable (TEST)", "WARN")
+        raise CuaUnavailableError(
+            "DG_FORCE_CUA_UNAVAILABLE — simulated CUA/Anthropic outage (test injection)"
+        )
     ok1, raw1 = await _cua_login_call(page, platform, cua_client)
     if ok1:
         log(f"[verify_login_cua:{platform}] LOGGED IN ✓ (Claude: {raw1[:30]})", "INFO")
