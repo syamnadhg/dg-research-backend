@@ -22406,7 +22406,12 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             if _controls.pro_warning_acknowledged:
                 log("Phase 1: Pro unavailable — user opted into Free at Phase 0 (continuing)", "INFO")
                 break
-            log("Phase 1: Pro mode not available — Phase 0 was skipped or Pro was revoked; surfacing alert", "WARN")
+            # Log the exact CUA verdict that triggered the escalation so a
+            # post-E2E review can tell a TRANSIENT detection miss (e.g.
+            # "no pro available (cua_timeout)", selector not yet rendered) from a
+            # genuine no-Pro subscription. The former is the Tier-1 silent-retry
+            # candidate (#705 item 5); the latter is a correct Tier-2 escalation.
+            log(f"Phase 1: Pro mode not available (cua verdict: {last[:120]!r}) — Phase 0 was skipped or Pro was revoked; surfacing alert", "WARN")
             _emit_pro_required_alert(phase=1, agent="chatgpt", source="phase1/setup_pro_backstop")
             _controls.request_pause("pro_required")
             emit_event("pipeline_paused", phase=1, reason="pro_required")
