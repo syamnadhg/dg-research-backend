@@ -8537,6 +8537,74 @@ def _anthropic_err_kind(err: str) -> str:
     return "other"
 
 
+async def _probe_cua_available(cua_client) -> None:
+    """#705 — one-shot CUA/Anthropic availability probe for Phase 0.
+
+    This is an INFRASTRUCTURE check, NOT a login check, and the distinction
+    is the whole point. The Anthropic key powers BOTH the Vision and CUA
+    tiers; a capped / invalid / rate-limited key knocks out tiers 2+3 and
+    silently degrades the run to the raw-DOM tier the codebase explicitly
+    distrusts ("cookies lie", "DOM selectors match cached fragments").
+
+    Before this, the ONLY place a dead key surfaced was the P0 per-platform
+    login walk (verify_login_cua) — which `skipInitVerify` blanks entirely
+    (`preflight_platforms = []`). So with "Skip login verification" on, a dead
+    key flowed straight into the run and FAILED OPEN at every phase-time gate
+    (_phase_verify_gate:11194), never alerting. "Skip login verification" is a
+    statement about platform sign-ins; it must NOT also disable the vision
+    infra every phase depends on.
+
+    So this probe decouples availability from login: the P0 caller runs it
+    REGARDLESS of skipInitVerify, it makes ONE minimal Anthropic call, and it
+    raises CuaUnavailableError (the SAME class the login walk uses, so the
+    caller reuses the existing fail-closed `cua_unavailable` card) on a
+    structural Anthropic failure. Transient blips (529 / 5xx / net) are NOT
+    cardable — they're left to the per-phase retry/fail-open paths, matching
+    the #705 taxonomy (transient → silent, structural → paused decision).
+
+    Honors DG_FORCE_CUA_UNAVAILABLE so the #715/#716 test injection now fires
+    at P0 even under skipInitVerify (previously it needed the login walk).
+    """
+    # TEST INJECTION — REMOVE after #715/#716 validation. Mirrors the gate in
+    # verify_login_cua (:8639) so the simulated outage now also trips the P0
+    # availability probe, i.e. fires even when login verification is skipped.
+    if os.environ.get("DG_FORCE_CUA_UNAVAILABLE", "").lower() in ("1", "true", "yes"):
+        log("[probe_cua] DG_FORCE_CUA_UNAVAILABLE set — simulating CUA/Anthropic "
+            "unavailable at Phase 0 (TEST)", "WARN")
+        raise CuaUnavailableError(
+            "DG_FORCE_CUA_UNAVAILABLE — simulated CUA/Anthropic outage (test injection)"
+        )
+    if cua_client is None:
+        # No client == no key resolved. run_pipeline returns early on an empty
+        # key (:27272) so this is belt-and-suspenders, but treat it as a hard
+        # unavailable rather than silently degrading.
+        raise CuaUnavailableError("No Anthropic client (API key did not resolve)")
+    try:
+        await asyncio.to_thread(
+            cua_client.messages.create,
+            model=VISION_LIGHT_MODEL,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except Exception as e:
+        err = str(e)
+        kind = _anthropic_err_kind(err)
+        # Only the unambiguously-structural classes block the run: a bad/capped
+        # key (401 / workspace cap) or a rate-limit (429) the user must clear.
+        # These are exactly the classes verify_login_cua raises on (:8503).
+        if kind in ("rate_limit", "key"):
+            log(f"[probe_cua] Anthropic unavailable ({kind}) — fail-closed at P0: {err[:160]}", "ERROR")
+            raise CuaUnavailableError(err) from e
+        # overload (529) / transient (5xx, net) / unrecognized SDK quirk: do
+        # NOT card before the run even starts. A flaky probe false-alarm is
+        # worse than letting the run proceed — the per-phase CUA paths have
+        # their own retry + fail-open handling. #705 taxonomy: transient →
+        # silent.
+        log(f"[probe_cua] probe error treated as non-blocking ({kind}): {err[:160]}", "WARN")
+    else:
+        log("[probe_cua] CUA/Anthropic reachable ✓", "INFO")
+
+
 # Set membership only — every caller uses this for "is this platform in
 # the pro-tier-detection list" and then resolves the actual prompt via
 # `prompt_map` below. Previous shape mapped key→prompt-name-as-string
@@ -28078,6 +28146,86 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         if _need_gemini:     preflight_platforms.append(("Gemini", "gemini"))
         if _need_claude:     preflight_platforms.append(("Claude", "claude"))
         if _need_notebooklm: preflight_platforms.append(("NotebookLM", "notebooklm"))
+
+        # ── #705: CUA/Anthropic availability probe (infra, NOT login) ──
+        # The per-platform login walk below is the ONLY place a dead Anthropic
+        # key ever surfaced, and `skipInitVerify` blanks that walk entirely
+        # (preflight_platforms=[] below). So with "Skip login verification" on,
+        # a capped/invalid/429'd key flowed straight into the run and failed
+        # open at every phase-time gate, never alerting. The key powers BOTH
+        # Vision and CUA, so that's a structural failure, not a login nicety.
+        #
+        # This probe decouples the two: it runs REGARDLESS of skipInitVerify
+        # (it sits ABOVE the _skip_verify_pref blanking), checks availability
+        # with ONE minimal Anthropic call, and reuses the same fail-closed
+        # `cua_unavailable` card the login walk emits. Gate: only when the run
+        # actually uses a CUA-driven platform — `preflight_platforms` here is
+        # the real would-verify set (still pre-blanking), so a pure links-only
+        # Flow-C run (no agents/NLM → empty list) correctly skips the probe.
+        if preflight_platforms:
+            while True:
+                if _controls.is_stop():
+                    emit_event("pipeline_stopped", phase=0, reason="user_stop_cua_probe")
+                    return
+                emit_event("agent_progress", phase=0, agent="system", status="checking",
+                           progress="Checking vision/CUA availability…")
+                try:
+                    await _probe_cua_available(cua_client)
+                    break  # reachable — proceed to login walk / phases
+                except CuaUnavailableError as cua_err:
+                    log(f"Phase 0: CUA availability probe failed — {cua_err}", "ERROR")
+                    fail_phase(
+                        0, "CUA vision check can't run",
+                        (f"{str(cua_err)[:180]}\n\n"
+                         "The Vision/CUA tier — it drives Pro detection, "
+                         "Deep-Research toggling, and human-verification "
+                         "recovery — needs a working Anthropic key before the "
+                         "run can start. Common causes:\n"
+                         "• Rate-limited (429) or workspace usage cap — load or "
+                         "switch to another key in Account → API Config, then "
+                         "Retry.\n"
+                         "• Invalid or missing key — add or rotate it in "
+                         "Account → API Config (no restart needed), then Retry.\n"
+                         "• Anthropic briefly overloaded (529) — wait a moment, "
+                         "then Retry.\n\n"
+                         "Note: this check runs even with “Skip login "
+                         "verification” on — that setting only skips your "
+                         "platform sign-ins, it can't skip the vision "
+                         "infrastructure every phase depends on. Click Retry "
+                         "once the key is sorted."),
+                        agent="system",
+                        actions=[
+                            {"id": "retry", "label": "Retry", "style": "primary",
+                             "command": {"action": "retry_phase", "phase": 0}},
+                        ],
+                    )
+                    _controls.request_pause("cua_unavailable")
+                    emit_event("pipeline_paused", phase=0, reason="cua_unavailable")
+                    await _controls.wait_if_paused()
+                    if _controls.is_stop():
+                        emit_event("pipeline_stopped", phase=0, reason="stopped during cua_unavailable")
+                        return
+                    # Retract the durable pendingDecision the #715 seam mirrored
+                    # when fail_phase fired. The central clear keys off
+                    # pipeline_resumed/stopped (research.py:~10591); in the
+                    # skipInitVerify path NO downstream P0 gate emits one (the
+                    # platform walk is blanked + env-check passes), so without
+                    # this the card re-surfaces on a cold chat-open during a
+                    # HEALTHY run — the exact #705/#715 false-alarm. Emit it
+                    # UNCONDITIONALLY on resume (covers Retry; a stray non-retry
+                    # resume just re-cards cleanly next cycle). Parity with the
+                    # login_required / env-check / pro_required P0 gates. The
+                    # platform-walk cua handler omits this but is incidentally
+                    # saved by its follow-on login_required gate — this block
+                    # has none, so the emit is load-bearing here.
+                    emit_event("pipeline_resumed", phase=0, reason="retry")
+                    # Retry — re-probe with the (presumably) fixed key. NO Skip
+                    # branch here (unlike the login walk): a dead-key infra
+                    # failure is fail-closed and skipInitVerify must not bypass
+                    # it. Mirrors the platform-walk retry tail at :28229.
+                    _controls.consume_retry_phase(0)
+                    _controls.retry_init_verify = False
+                    continue
 
         # Honor the user's preference (global Settings → Pipeline → Skip
         # login verification, plus any per-run override in pipeline_config).
