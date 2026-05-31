@@ -90,16 +90,17 @@ def test_reconnect_loop_exists_and_is_tight_and_gated():
         "the reconnect loop must bump _last_loop_tick_ms each iteration so the "
         "watchdog has a per-worker pulse (#717)."
     )
-    # Boot-time blip → clean respawn so listeners bind.
-    assert "listeners_armed" in src and "_schedule_server_exit" in src, (
-        "a boot-time reconnect (listeners never bound) must schedule a clean "
-        "respawn rather than swap a client under unbound listeners (#717)."
+    # #718 — any reconnect schedules a CLEAN respawn so the fresh boot re-binds
+    # the Firestore listeners. The in-process client swap restores the heartbeat
+    # but leaves the old on_snapshot Watch streams dead on a sustained outage
+    # ("online but deaf"); a respawn makes listener health deterministic.
+    assert "_schedule_server_exit" in src, (
+        "a reconnect must schedule a clean respawn to re-bind listeners (#718)."
     )
-    # …but the boot respawn must not os._exit an ACTIVE run (a local /api/runs
-    # submit can start one during the boot window) — it's gated on idle.
-    assert '_QUEUE_STATE.get("running")' in src and "pending_boot_respawn" in src, (
-        "the boot respawn must be deferred while a run is active so it never "
-        "kills a mid-run worker (#717)."
+    # …but the respawn must NOT os._exit an ACTIVE run — it's deferred to idle.
+    assert '_QUEUE_STATE.get("running")' in src and "pending_respawn" in src, (
+        "the respawn must be deferred while a run is active so it never kills a "
+        "mid-run worker (#718)."
     )
 
 

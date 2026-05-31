@@ -3410,7 +3410,7 @@ async def _heartbeat_loop():
         await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
 
 
-async def _firebase_reconnect_loop(listeners_armed: bool = True):
+async def _firebase_reconnect_loop():
     """Self-heal a DROPPED Firestore client after a transient network/DNS blip
     — the autopilot fix for the 2026-05-31 incident where a `getaddrinfo`
     failure nulled `_firebase_db`, the heartbeat's inline reinit was
@@ -3432,35 +3432,36 @@ async def _firebase_reconnect_loop(listeners_armed: bool = True):
     runs in a thread because its live creds.refresh() has a 10s timeout that
     would otherwise stall the loop past its own cadence.
 
-    `listeners_armed` is captured at boot: True if init_firebase succeeded at
-    startup (the serve already bound its Firestore listeners). If it's False (a
-    boot-time blip left the listeners unbound — they're gated on `_firebase_db`
-    at startup), the first successful reconnect schedules a CLEAN respawn so the
-    fresh boot wires everything, rather than swapping a client under
-    never-started listeners. A mid-serve drop (listeners_armed=True) rebuilds
-    in-process — the heartbeat resumes and the google-cloud-firestore Watch
-    streams retry their own gRPC channel.
+    Re-bind (#718): a reconnect rebuilds `_firebase_db` in-process, which restores
+    the heartbeat + writes immediately — but the existing on_snapshot Watch
+    streams (job listener, device-command listener) are bound to the OLD client
+    object. For a short blip they auto-resume on their own gRPC channel; for a
+    SUSTAINED outage they can give up (_on_rpc_done → close) and never
+    re-subscribe, leaving the worker "online but deaf" — heartbeat back, but new
+    jobs / device-commands silently dropped. A boot-time blip never bound them at
+    all. So after ANY successful reconnect we schedule a CLEAN respawn, which
+    re-runs boot and re-wires every listener deterministically. Never respawn
+    mid-run (it would os._exit a live browser) — defer until the worker is idle.
 
     Bumps `_last_loop_tick_ms` every iteration so the supervisor watchdog has a
     per-worker liveness pulse (lastHeartbeatAt is worker-1-only)."""
     global _last_loop_tick_ms, _firebase_down_reason
     BACKOFF = (5, 5, 10, 30)
     idx = 0
-    # A boot-time blip leaves the serve with no Firestore listeners bound; the
-    # clean respawn that re-binds them must NOT fire while a run is active (a
-    # local /api/runs submit can start one during the boot window even with
-    # Firestore down). Defer the respawn until the worker goes idle. (#717)
-    pending_boot_respawn = False
+    # After a reconnect, re-bind listeners via a clean respawn — deferred while a
+    # run is active so we never os._exit a live browser (a local /api/runs submit
+    # can start one even with Firestore down). (#718)
+    pending_respawn = False
     log("[reconnect] watcher armed (idle while Firestore healthy)", "DEBUG")
     while True:
         try:
             _last_loop_tick_ms = int(time.time() * 1000)
             if _firebase_db is not None:
                 idx = 0
-                if pending_boot_respawn and not _QUEUE_STATE.get("running"):
-                    log("[reconnect] run finished — scheduling deferred clean respawn so boot-skipped listeners bind", "INFO")
-                    _schedule_server_exit("firestore-boot-reconnect")
-                    pending_boot_respawn = False
+                if pending_respawn and not _QUEUE_STATE.get("running"):
+                    log("[reconnect] run finished — clean respawn to re-bind Firestore listeners", "INFO")
+                    _schedule_server_exit("firestore-reconnect")
+                    pending_respawn = False
                 await asyncio.sleep(5)
                 continue
             if _firebase_down_reason == "revoked":
@@ -3474,23 +3475,18 @@ async def _firebase_reconnect_loop(listeners_armed: bool = True):
             ok = await asyncio.to_thread(init_firebase)
             if ok:
                 idx = 0
-                if not listeners_armed:
-                    # Boot-time blip: the serve never bound its Firestore
-                    # listeners (gated on _firebase_db at startup). A clean
-                    # respawn re-runs boot with everything wired — safer than
-                    # starting listeners under a half-built session. Guard the
-                    # exit on idle: a local /api/runs submit during the boot
-                    # window can start a run (no _firebase_db gate on that
-                    # path), and an os._exit mid-run would kill the browser.
-                    # Defer to the idle branch above if a run is active. (#717)
-                    if _QUEUE_STATE.get("running"):
-                        pending_boot_respawn = True
-                        log("[reconnect] Firestore back after a boot-time outage, but a run is active — deferring clean respawn until idle", "INFO")
-                    else:
-                        log("[reconnect] Firestore reachable again after a boot-time outage — scheduling clean respawn so listeners bind", "INFO")
-                        _schedule_server_exit("firestore-boot-reconnect")
+                # Client rebuilt in-process — heartbeat + writes resume now. Then
+                # re-bind listeners via a clean respawn (immediately if idle;
+                # deferred to the idle branch if a run is active so we don't
+                # os._exit a live browser). Covers boot-time blips (listeners
+                # never bound) AND sustained mid-serve outages (Watch streams
+                # gave up and won't re-subscribe to the new client). (#718)
+                if _QUEUE_STATE.get("running"):
+                    pending_respawn = True
+                    log("[reconnect] Firestore back, run active — rebuilt in-process; clean respawn deferred to idle to re-bind listeners", "INFO")
                 else:
-                    log("[reconnect] Firestore client rebuilt in-process after transient outage — device back online", "INFO")
+                    log("[reconnect] Firestore reachable again — clean respawn to re-bind listeners", "INFO")
+                    _schedule_server_exit("firestore-reconnect")
                 await asyncio.sleep(5)
             else:
                 if _firebase_down_reason == "revoked":
@@ -31971,13 +31967,12 @@ async def run_server(port=8000):
     # still auto-relink the moment the owner enters the new code at
     # Account → Add Device. Loop is idle while _firebase_db is set.
     asyncio.create_task(_revoked_recovery_loop())
-    # Transient-outage reconnect watcher (#717). Armed unconditionally on EVERY
-    # worker so a dropped Firestore client (DNS/network blip) self-heals on a
-    # tight backoff — no manual restart, no 1-hour-cap wait. Idle while
-    # _firebase_db is set. `listeners_armed` snapshots whether boot bound the
-    # Firestore listeners (gated on _firebase_db just above); a boot-time blip
-    # leaves them unbound, so the first reconnect schedules a clean respawn.
-    asyncio.create_task(_firebase_reconnect_loop(listeners_armed=bool(_firebase_db)))
+    # Transient-outage reconnect watcher (#717/#718). Armed unconditionally on
+    # EVERY worker so a dropped Firestore client (DNS/network blip) self-heals on
+    # a tight backoff — no manual restart, no 1-hour-cap wait. Idle while
+    # _firebase_db is set. After any reconnect it schedules a clean respawn (when
+    # idle) so the fresh boot re-binds every Firestore listener.
+    asyncio.create_task(_firebase_reconnect_loop())
     # Start heartbeat so frontend can show Online/Offline status.
     # Multi-worker (2026-05-21): only worker 1 heartbeats. FE only needs
     # a single "device alive" signal and devices/{deviceId}.lastHeartbeat
