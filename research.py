@@ -8586,19 +8586,7 @@ async def _probe_cua_available(cua_client) -> None:
     structural Anthropic failure. Transient blips (529 / 5xx / net) are NOT
     cardable — they're left to the per-phase retry/fail-open paths, matching
     the #705 taxonomy (transient → silent, structural → paused decision).
-
-    Honors DG_FORCE_CUA_UNAVAILABLE so the #715/#716 test injection now fires
-    at P0 even under skipInitVerify (previously it needed the login walk).
     """
-    # TEST INJECTION — REMOVE after #715/#716 validation. Mirrors the gate in
-    # verify_login_cua (:8639) so the simulated outage now also trips the P0
-    # availability probe, i.e. fires even when login verification is skipped.
-    if os.environ.get("DG_FORCE_CUA_UNAVAILABLE", "").lower() in ("1", "true", "yes"):
-        log("[probe_cua] DG_FORCE_CUA_UNAVAILABLE set — simulating CUA/Anthropic "
-            "unavailable at Phase 0 (TEST)", "WARN")
-        raise CuaUnavailableError(
-            "DG_FORCE_CUA_UNAVAILABLE — simulated CUA/Anthropic outage (test injection)"
-        )
     if cua_client is None:
         # No client == no key resolved. run_pipeline returns early on an empty
         # key (:27272) so this is belt-and-suspenders, but treat it as a hard
@@ -8722,19 +8710,6 @@ async def verify_login_cua(page, platform: str, cua_client) -> bool:
 
     Returns True iff at least one of the checks clearly says YES.
     """
-    # ── TEST INJECTION — REMOVE after #715 validation ───────────────────────
-    # DG_FORCE_CUA_UNAVAILABLE=1 deterministically simulates an Anthropic/CUA
-    # outage (rate-limit / capped / rejected key) so the Phase-0 cua_unavailable
-    # pause + its #715 durable decision card can be exercised on an E2E WITHOUT
-    # touching the real key. The Phase-0 caller (research.py ~28003) catches
-    # this and routes to fail_phase(Retry) + request_pause("cua_unavailable").
-    # Requires Settings → "Skip login verification" OFF so init verify runs.
-    if os.environ.get("DG_FORCE_CUA_UNAVAILABLE", "").lower() in ("1", "true", "yes"):
-        log(f"[verify_login_cua:{platform}] DG_FORCE_CUA_UNAVAILABLE set — "
-            f"simulating CUA/Anthropic unavailable (TEST)", "WARN")
-        raise CuaUnavailableError(
-            "DG_FORCE_CUA_UNAVAILABLE — simulated CUA/Anthropic outage (test injection)"
-        )
     ok1, raw1 = await _cua_login_call(page, platform, cua_client)
     if ok1:
         log(f"[verify_login_cua:{platform}] LOGGED IN ✓ (Claude: {raw1[:30]})", "INFO")

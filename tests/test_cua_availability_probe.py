@@ -12,9 +12,7 @@ Fix: `_probe_cua_available` makes ONE minimal Anthropic call at P0, ABOVE the
 skipInitVerify blanking, and reuses the existing fail-closed `cua_unavailable`
 card. It fail-closes ONLY on structural classes (bad/capped key, rate-limit);
 transient blips (529 / 5xx / net) stay non-blocking per the #705 taxonomy
-(transient → silent, structural → paused decision). It also honors the
-DG_FORCE_CUA_UNAVAILABLE (#716) test injection so the simulated outage now
-fires at P0 even under skip-verify.
+(transient → silent, structural → paused decision).
 
 Functional tests exercise the classification directly; source guards pin the
 P0 wiring (runs before the skip-verify blanking, fail-closed, no Skip branch).
@@ -50,24 +48,6 @@ class _FakeClient:
 
 def _run(coro):
     return asyncio.run(coro)
-
-
-@pytest.fixture(autouse=True)
-def _clear_force_flag(monkeypatch):
-    # Default every test to flag-OFF; the flag test opts back in. Prevents a
-    # stray machine-level value from leaking into the classification tests.
-    monkeypatch.delenv("DG_FORCE_CUA_UNAVAILABLE", raising=False)
-    yield
-
-
-def test_force_flag_trips_before_any_api_call(monkeypatch):
-    monkeypatch.setenv("DG_FORCE_CUA_UNAVAILABLE", "1")
-    client = _FakeClient()
-    with pytest.raises(CuaUnavailableError):
-        _run(research._probe_cua_available(client))
-    # The #716 flag must short-circuit BEFORE the network call — that's what
-    # lets it fire at P0 even when skip-verify would have skipped the walk.
-    assert client.messages.calls == 0
 
 
 def test_none_client_is_unavailable():
@@ -134,10 +114,6 @@ def test_success_makes_one_minimal_text_only_call():
 # ── source guards on the P0 wiring ───────────────────────────────────────────
 def test_probe_classifies_structural_only():
     psrc = inspect.getsource(research._probe_cua_available)
-    assert "DG_FORCE_CUA_UNAVAILABLE" in psrc, (
-        "the probe must honor the #716 test injection so it fires at P0 even "
-        "under skip-verify."
-    )
     assert 'in ("rate_limit", "key")' in psrc, (
         "the probe must fail-closed ONLY on structural classes (key / "
         "rate_limit); transient + overload stay non-blocking (#705 taxonomy)."
