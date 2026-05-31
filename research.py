@@ -6139,6 +6139,31 @@ def _safe_enqueue(job_queue, job, source: str) -> bool:
     if not (rid and uid_v):
         log(f"[safe_enqueue:{source}] skipped — missing research_id/uid", "WARN")
         return False
+    # ── .stop sentinel: a terminally-stopped run must NEVER be re-enqueued ──
+    # The STOP command handler + HARD_RESET touch queues/<run>/.stop. That
+    # signal is LOCAL and permission-independent, so it must be the FIRST gate
+    # here — BEFORE the Firestore status read below, which 403s for the
+    # synth-device-user (user-tree read rule) and then FAILS OPEN ("trust the
+    # FE"). Pre-fix, a reconnect-respawn's disk-restore/rehydrate hit that 403
+    # fall-through and re-fired a run the user had already stopped (the
+    # German-Shepherd resurrection). The resume HTTP/listener paths already
+    # gate on .stop (research.py:~5415); this closes the same hole in the
+    # enqueue funnel. Derive the run dir from resume_dir (full path) or run_id.
+    _rd = (job or {}).get("resume_dir")
+    _stop_path = None
+    if _rd:
+        _stop_path = Path(_rd) / ".stop"
+    else:
+        _rid_dir = (job or {}).get("run_id")
+        if _rid_dir:
+            _stop_path = Path(__file__).parent / "queues" / _rid_dir / ".stop"
+    if _stop_path is not None:
+        try:
+            if _stop_path.exists():
+                log(f"[safe_enqueue:{source}] skipped — run {rid[:24]}… has .stop sentinel (terminally stopped)", "INFO")
+                return False
+        except Exception:
+            pass
     if _firebase_db is None:
         log(f"[safe_enqueue:{source}] skipped — Firestore unavailable", "WARN")
         return False
