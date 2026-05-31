@@ -92,12 +92,49 @@ def test_parity_all_decision_gates_persist_pendingdecision():
     )
 
 
+def test_generic_pipeline_error_persists_in_emit_event():
+    # #715 universal alert persistence: emit_event must mirror ANY blocking
+    # pipeline_error (actions present, not quiet) as a kind='pipeline_error'
+    # pendingDecision so cua_unavailable / chat_mode / 429-key-card /
+    # phase_timeout / bare fail_phase all re-surface on cold chat-open.
+    src = inspect.getsource(research.emit_event)
+    assert 'event_type == "pipeline_error"' in src and 'data.get("actions")' in src, (
+        "emit_event must gate the generic persist on a pipeline_error carrying "
+        "actions (#715)."
+    )
+    assert 'not data.get("quiet")' in src, (
+        "the generic persist must EXCLUDE quiet pipeline_errors so transient "
+        "auto-retry infra banners stay non-durable (#715)."
+    )
+    assert '"kind": "pipeline_error"' in src, (
+        "the generic persist must write kind='pipeline_error' (#715)."
+    )
+    assert "suppress_generic_mirror" in src, (
+        "emit_event must honor suppress_generic_mirror so a richer kind-specific "
+        "mirror (pro_required) isn't clobbered (#715)."
+    )
+
+
+def test_pro_required_suppresses_generic_mirror():
+    # pro_required persists its own richer kind; it must tell emit_event's
+    # generic seam to stand down so it isn't overwritten in the same tick.
+    src = inspect.getsource(research._emit_pro_required_alert)
+    assert "suppress_generic_mirror=True" in src, (
+        "_emit_pro_required_alert must pass suppress_generic_mirror=True to "
+        "emit_event (#715)."
+    )
+
+
 def test_pending_decision_cleared_on_universal_resolve_signal():
     # The clear is centralized on the resolve EVENTS every gate emits, so it
     # covers gates that wait via their own poll loop (human-verify) as well as
     # those using wait_if_paused.
     src = inspect.getsource(research.emit_event)
-    assert '("pipeline_resumed", "pipeline_stopped")' in src and "_clear_pending_decision()" in src, (
-        "emit_event must clear pendingDecision on pipeline_resumed/"
-        "pipeline_stopped so every gate's resolution retracts the card (#710)."
-    )
+    assert "_clear_pending_decision()" in src, "emit_event must clear pendingDecision (#710)."
+    # Every resolution signal retracts the mirror: resume/stop AND skip
+    # (#715 — a Skip emits agent_skipped/phase_skipped, not pipeline_resumed).
+    for ev in ("pipeline_resumed", "pipeline_stopped", "agent_skipped", "phase_skipped"):
+        assert f'"{ev}"' in src, (
+            f"emit_event must clear pendingDecision on {ev} so every gate's "
+            f"resolution (incl. Skip) retracts the card (#710/#715)."
+        )

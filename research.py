@@ -10404,8 +10404,48 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # via wait_if_paused or its own poll loop. Clearing here (one chokepoint)
     # covers them all without per-site clears. Best-effort.
     try:
-        if event_type in ("pipeline_resumed", "pipeline_stopped"):
+        # Resolution signals that retract a pending decision: resume/stop, AND
+        # skip (#715 — a chat_mode/agent gate resolved via Skip emits
+        # agent_skipped/phase_skipped but NOT pipeline_resumed, so without these
+        # the skipped decision's mirror would re-surface stale on a same-phase
+        # cold open). Safe because a decision pause blocks the whole coroutine
+        # (single pause_event) — no unrelated skip fires while one is pending;
+        # a config-disabled-agent skip at phase start finds no pending decision
+        # and is a harmless no-op.
+        if event_type in ("pipeline_resumed", "pipeline_stopped",
+                          "agent_skipped", "phase_skipped"):
             _clear_pending_decision()
+    except Exception:
+        pass
+    # #715 universal alert persistence: ANY blocking pipeline_error decision
+    # card gets a durable pendingDecision mirror so it RE-SURFACES on a cold
+    # chat-open (the run is paused waiting on the user — the card must not
+    # vanish behind the per-browser pipeline_events seq cursor). One seam here
+    # covers every blocking card that funnels through emit_event('pipeline_error',
+    # actions=[...]) — cua_unavailable, {platform}_chat_mode, the Anthropic
+    # 429/workspace-cap/401 key cards, phase_timeout, and any future
+    # fail_phase/fail_agent — with kind='pipeline_error' (FE decisionToCard
+    # rebuilds it byte-identically from the persisted actions). GATE: must carry
+    # `actions` AND not be `quiet` — this excludes the transient auto-retry infra
+    # banners (529/overload sleep+continue never emit actions; quiet-preflight
+    # sets quiet=True), which correctly stay non-durable and vanish on recovery.
+    # Retracted by the SAME central clear above on pipeline_resumed/stopped +
+    # the run-startup wipe. `suppress_generic_mirror` lets a richer kind-specific
+    # persist (pro_required) own the mirror without this generic one clobbering it.
+    try:
+        _suppress_generic_mirror = bool(data.pop("suppress_generic_mirror", False))
+        if (event_type == "pipeline_error" and data.get("actions")
+                and not data.get("quiet") and not _suppress_generic_mirror):
+            _persist_pending_decision({
+                "kind": "pipeline_error",
+                "phase": phase if isinstance(phase, int) else 0,
+                "agent": (agent.lower() if agent else None),
+                "title": data.get("error"),
+                "details": data.get("details"),
+                "actions": data.get("actions"),
+                "dismissible": data.get("dismissible", True),
+                "alert_id": data.get("alert_id"),
+            })
     except Exception:
         pass
     # Write to Firestore (frontend real-time transport)
@@ -10809,6 +10849,10 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
         dismissible=True,
         alert_id=_pro_alert_id,
         source=source or None,
+        # #715: this site persists the richer kind='pro_required' mirror below;
+        # tell emit_event's generic pipeline_error mirror to stand down so it
+        # doesn't overwrite it with a plain kind='pipeline_error' in the same tick.
+        suppress_generic_mirror=True,
     )
     # #710 parity: durable mirror so a Pro-tier decision raised while this
     # chat wasn't the viewed tab re-surfaces on cold open. pro_required is a
