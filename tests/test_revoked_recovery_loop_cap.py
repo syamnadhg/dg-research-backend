@@ -56,6 +56,14 @@ class TestRevokedRecoveryLoopCap:
         # _firebase_db is a module global; setting it directly works.
         monkeypatch.setattr(research, "_firebase_db", firebase_db_value)
 
+        # #717 — the relink loop now only drives recovery on a GENUINE revoke
+        # (_firebase_down_reason == "revoked"); a transient None is owned by
+        # _firebase_reconnect_loop. The recovery-path tests below run with
+        # _firebase_db=None, which in production is paired with reason="revoked"
+        # (init_firebase sets it when init_firestore_user_scoped returns None).
+        # Establish that state so the loop enters its poll/cap path.
+        monkeypatch.setattr(research, "_firebase_down_reason", "revoked")
+
         # Stub research_config helpers so the early-return guard
         # doesn't fire on `(poll_secret, device_id)` being empty.
         monkeypatch.setattr(research, "load_poll_secret", lambda: "ps")

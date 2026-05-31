@@ -2009,6 +2009,17 @@ def normalize_agent_key(name):
 # ── Firebase Bridge (Firestore real-time transport) ──────────────────────────
 
 _firebase_db = None     # Firestore client (module-level, init once)
+# #717 — why the client is down, so recovery routes correctly. Overloading
+# `_firebase_db is None` for BOTH a transient network/DNS blip AND a genuine
+# token revoke was the 2026-05-31 incident: a `getaddrinfo` blip nulled the
+# client, the relink loop assumed revoke and spun on a stale customToken
+# (INVALID_CUSTOM_TOKEN), and the device sat OFFLINE until the 1-hour cap.
+#   None        → healthy
+#   "transient" → DNS/network/5xx; refresh token still valid (keystore intact).
+#                 _firebase_reconnect_loop retries init_firebase on a tight backoff.
+#   "revoked"   → refresh token rejected (Reset Pair Code / keystore wiped).
+#                 _revoked_recovery_loop owns recovery (customToken relink).
+_firebase_down_reason = None
 _fb_uid = None          # Per-run: user ID for Firestore path
 _fb_research_id = None  # Per-run: research ID for Firestore path
 _fb_seq = 0             # Per-run: last-emitted seq (monotonic guard; ms-based)
@@ -2971,14 +2982,24 @@ def init_firebase():
     Returns True on success, False if the keystore is empty (user hasn't
     paired) or the refresh token has been revoked (owner triggered
     Reset). Caller's typical recovery is to log the user-facing message
-    and prompt re-pair."""
-    global _firebase_db
+    and prompt re-pair.
+
+    #717 — also sets `_firebase_down_reason` so recovery routes correctly. This
+    is the AUTHORITATIVE classification point: init_firestore_user_scoped does a
+    live creds.refresh(), catching RevokedError internally (returns None,
+    keystore wiped) but letting a transient RequestException/RuntimeError
+    PROPAGATE. So a propagated exception == transient (token intact, retry);
+    a None return == genuine revoke (relink). Unknown defaults to transient so a
+    novel failure self-heals via retry rather than spinning the relink path."""
+    global _firebase_db, _firebase_down_reason
     if _firebase_db:
+        _firebase_down_reason = None
         return True
     try:
         from auth import v2_flow, keystore as _ks
     except ImportError as e:
         log(f"Firestore init: auth/ package import failed: {e}", "ERROR")
+        _firebase_down_reason = "transient"  # import hiccup — let reconnect retry
         return False
     install_uuid = _ks.install_uuid()
     if _ks.try_recover(install_uuid) is None:
@@ -2987,8 +3008,21 @@ def init_firebase():
             "to establish a refresh token.",
             "ERROR",
         )
+        # Nothing to reconnect with — post-Reset / never-paired. The relink
+        # loop (not the reconnect loop) owns this. (#717)
+        _firebase_down_reason = "revoked"
         return False
-    client = v2_flow.init_firestore_user_scoped(install_uuid)
+    try:
+        client = v2_flow.init_firestore_user_scoped(install_uuid)
+    except Exception as _net_err:
+        # init_firestore_user_scoped swallows RevokedError (returns None); what
+        # PROPAGATES here is the live creds.refresh() hitting the network —
+        # getaddrinfo/DNS, ConnectionError, timeout, or a non-revoke 5xx
+        # (RuntimeError). Token is still valid ("leaving keystore intact"), so
+        # classify transient and let _firebase_reconnect_loop retry. (#717)
+        log(f"Firestore init: transient network error ({type(_net_err).__name__}: {_net_err}) — will retry", "WARN")
+        _firebase_down_reason = "transient"
+        return False
     if client is None:
         log(
             "Firestore init: refresh token rejected (revoked or expired). "
@@ -2997,8 +3031,12 @@ def init_firebase():
             "watcher will pick it up and respawn the backend automatically.",
             "ERROR",
         )
+        # init_firestore_user_scoped already wiped the keystore on RevokedError
+        # — genuine revoke → relink loop owns recovery. (#717)
+        _firebase_down_reason = "revoked"
         return False
     _firebase_db = client
+    _firebase_down_reason = None
     log(f"Firestore client initialized ✓ (install={install_uuid[:8]}…)")
     return True
 
@@ -3031,6 +3069,11 @@ _start_listener = None  # Global start-command listener
 # to a stale Firestore client). Reinit threshold below.
 _last_heartbeat_at_ms = 0
 _heartbeat_failures = 0
+# #717 — per-worker liveness pulse, bumped every iteration of
+# _firebase_reconnect_loop (which runs on ALL workers). /api/health surfaces it
+# as `lastTickAt` so the supervisor watchdog can spot a wedged event loop on ANY
+# worker — `_last_heartbeat_at_ms` is worker-1-only and can't see a hung worker 2.
+_last_loop_tick_ms = 0
 HEARTBEAT_REINIT_THRESHOLD = 3  # consecutive fails before reinit_firebase()
 # Heartbeat cadence. Paired with the frontend's 15s offline threshold at
 # `DEVICE_OFFLINE_THRESHOLD_MS` in web/src/lib/firestore.ts so missing
@@ -3308,7 +3351,7 @@ async def _heartbeat_loop():
     from google.cloud.firestore import DELETE_FIELD
     # All globals must be declared at the top of the function — Python
     # rejects `global X` if X has already been read in this scope.
-    global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db
+    global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db, _firebase_down_reason
     while True:
         try:
             # Update top-level `devices/{deviceId}` — BE is signed in as
@@ -3347,22 +3390,122 @@ async def _heartbeat_loop():
         except Exception as e:
             _heartbeat_failures += 1
             log(f"[heartbeat] write failed (consecutive={_heartbeat_failures}): {e}", "WARN")
-            # Self-heal: drop the cached Firestore client + reinit. The
-            # underlying gRPC channel may have died silently (server-side
-            # token revoke, network flap). Without recovery, the FE
-            # perpetually shows "offline" despite localhost being live.
-            if _heartbeat_failures >= HEARTBEAT_REINIT_THRESHOLD:
-                log(f"[heartbeat] {_heartbeat_failures} consecutive failures — attempting Firestore reinit", "WARN")
-                try:
-                    _firebase_db = None  # Force init_firebase()'s fast-path to fall through.
-                    if init_firebase():
-                        _heartbeat_failures = 0
-                        log("[heartbeat] reinit succeeded — next tick will retry", "INFO")
-                    else:
-                        log("[heartbeat] reinit returned False (keystore empty? run --pair)", "ERROR")
-                except Exception as reinit_err:
-                    log(f"[heartbeat] reinit raised: {reinit_err}", "ERROR")
+            # Hand recovery to _firebase_reconnect_loop instead of reiniting
+            # inline. #717: the old inline reinit was UNREACHABLE after the
+            # first failed rebuild — it lived in THIS except block, but once
+            # `_firebase_db` is None the write `if` above is skipped, so no
+            # exception fires, so this block never runs again. The loop went
+            # silent and a transient DNS blip never self-healed (it waited out
+            # the relink loop's 1-hour cap). Now we just drop the client +
+            # tentatively flag transient; the always-armed reconnect loop (every
+            # worker) retries init_firebase on a tight backoff, and that call is
+            # where the authoritative revoked-vs-transient classification
+            # happens (init_firebase probes the live token refresh). If it's
+            # actually a revoke, init_firebase flips the reason to "revoked" and
+            # the relink loop takes over.
+            if _heartbeat_failures >= HEARTBEAT_REINIT_THRESHOLD and _firebase_db is not None:
+                log(f"[heartbeat] {_heartbeat_failures} consecutive failures — dropping client; reconnect loop will rebuild", "WARN")
+                _firebase_db = None
+                _firebase_down_reason = "transient"
         await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+
+
+async def _firebase_reconnect_loop(listeners_armed: bool = True):
+    """Self-heal a DROPPED Firestore client after a transient network/DNS blip
+    — the autopilot fix for the 2026-05-31 incident where a `getaddrinfo`
+    failure nulled `_firebase_db`, the heartbeat's inline reinit was
+    unreachable, and the device sat OFFLINE until the relink loop's 1-hour
+    wall-clock cap force-exited (#717).
+
+    Runs on EVERY worker (decoupled from the worker-1-only heartbeat and from
+    boot-init success) so workers 2+ and a boot-time blip recover too. Owns ALL
+    transient reconnection; the relink loop owns genuine revokes. They are
+    mutually exclusive on `_firebase_down_reason`:
+        "transient" (or unknown) + down → THIS loop retries init_firebase.
+        "revoked"               + down → idle here; _revoked_recovery_loop
+        drives the customToken relink.
+
+    Backoff is deliberately TIGHT (5→10→30s, never minutes — the FE flips a
+    device Offline at ~15s, so a short blip clears before the tile changes).
+    Don't borrow `_DNS_BACKOFF_SECS` (30s/2m/8m) — that's tuned for the 90-min
+    Phase-2 agent path, far too slow for a device-liveness signal. init_firebase
+    runs in a thread because its live creds.refresh() has a 10s timeout that
+    would otherwise stall the loop past its own cadence.
+
+    `listeners_armed` is captured at boot: True if init_firebase succeeded at
+    startup (the serve already bound its Firestore listeners). If it's False (a
+    boot-time blip left the listeners unbound — they're gated on `_firebase_db`
+    at startup), the first successful reconnect schedules a CLEAN respawn so the
+    fresh boot wires everything, rather than swapping a client under
+    never-started listeners. A mid-serve drop (listeners_armed=True) rebuilds
+    in-process — the heartbeat resumes and the google-cloud-firestore Watch
+    streams retry their own gRPC channel.
+
+    Bumps `_last_loop_tick_ms` every iteration so the supervisor watchdog has a
+    per-worker liveness pulse (lastHeartbeatAt is worker-1-only)."""
+    global _last_loop_tick_ms, _firebase_down_reason
+    BACKOFF = (5, 5, 10, 30)
+    idx = 0
+    # A boot-time blip leaves the serve with no Firestore listeners bound; the
+    # clean respawn that re-binds them must NOT fire while a run is active (a
+    # local /api/runs submit can start one during the boot window even with
+    # Firestore down). Defer the respawn until the worker goes idle. (#717)
+    pending_boot_respawn = False
+    log("[reconnect] watcher armed (idle while Firestore healthy)", "DEBUG")
+    while True:
+        try:
+            _last_loop_tick_ms = int(time.time() * 1000)
+            if _firebase_db is not None:
+                idx = 0
+                if pending_boot_respawn and not _QUEUE_STATE.get("running"):
+                    log("[reconnect] run finished — scheduling deferred clean respawn so boot-skipped listeners bind", "INFO")
+                    _schedule_server_exit("firestore-boot-reconnect")
+                    pending_boot_respawn = False
+                await asyncio.sleep(5)
+                continue
+            if _firebase_down_reason == "revoked":
+                # Genuine revoke — _revoked_recovery_loop owns this. Stay idle
+                # (but keep ticking liveness) so recovery isn't double-driven.
+                idx = 0
+                await asyncio.sleep(5)
+                continue
+            # Down + transient → rebuild the client. Live refresh in a thread so
+            # a slow/hung DNS resolve can't stall this loop.
+            ok = await asyncio.to_thread(init_firebase)
+            if ok:
+                idx = 0
+                if not listeners_armed:
+                    # Boot-time blip: the serve never bound its Firestore
+                    # listeners (gated on _firebase_db at startup). A clean
+                    # respawn re-runs boot with everything wired — safer than
+                    # starting listeners under a half-built session. Guard the
+                    # exit on idle: a local /api/runs submit during the boot
+                    # window can start a run (no _firebase_db gate on that
+                    # path), and an os._exit mid-run would kill the browser.
+                    # Defer to the idle branch above if a run is active. (#717)
+                    if _QUEUE_STATE.get("running"):
+                        pending_boot_respawn = True
+                        log("[reconnect] Firestore back after a boot-time outage, but a run is active — deferring clean respawn until idle", "INFO")
+                    else:
+                        log("[reconnect] Firestore reachable again after a boot-time outage — scheduling clean respawn so listeners bind", "INFO")
+                        _schedule_server_exit("firestore-boot-reconnect")
+                else:
+                    log("[reconnect] Firestore client rebuilt in-process after transient outage — device back online", "INFO")
+                await asyncio.sleep(5)
+            else:
+                if _firebase_down_reason == "revoked":
+                    # init_firebase reclassified this as a real revoke — hand to
+                    # the relink loop on the next tick.
+                    continue
+                wait = BACKOFF[min(idx, len(BACKOFF) - 1)]
+                idx += 1
+                log(f"[reconnect] Firestore still unreachable — retrying init in {wait}s", "WARN")
+                await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            return
+        except Exception as _e:
+            log(f"[reconnect] loop error: {_e}", "WARN")
+            await asyncio.sleep(10)
 
 
 async def _revoked_recovery_loop():
@@ -3398,9 +3541,14 @@ async def _revoked_recovery_loop():
     first_recovery_attempt_ts: "float | None" = None
     while True:
         try:
-            if _firebase_db is not None:
-                # Healthy state — reset the wall-clock anchor so a NEW
-                # revoke later doesn't inherit the old timer.
+            if _firebase_db is not None or _firebase_down_reason != "revoked":
+                # Idle unless the client is down AND classified a genuine
+                # revoke. #717: a transient DNS/network blip ALSO nulls
+                # _firebase_db (keystore intact), but it's owned by
+                # _firebase_reconnect_loop. Entering the customToken poll for a
+                # transient blip is exactly what caused the stale-token
+                # INVALID_CUSTOM_TOKEN spin. Reset the wall-clock anchor so a
+                # later genuine revoke doesn't inherit a stale timer.
                 first_recovery_attempt_ts = None
                 await asyncio.sleep(15)
                 continue
@@ -31550,6 +31698,15 @@ async def run_server(port=8000):
             "pending": _job_queue.qsize(),
             "lastHeartbeatAt": _last_heartbeat_at_ms,
             "heartbeatFailures": _heartbeat_failures,
+            # #717 — supervisor watchdog signals. lastTickAt is a per-worker
+            # liveness pulse (every worker bumps it via _firebase_reconnect_loop),
+            # so the watchdog spots a wedged event loop on ANY worker — not just
+            # worker 1 (the only one that writes lastHeartbeatAt). `relinking`
+            # tells the watchdog this worker is in a legit up-to-15-min revoke
+            # relink poll and must not be force-respawned.
+            "lastTickAt": _last_loop_tick_ms,
+            "downReason": _firebase_down_reason,
+            "relinking": _firebase_down_reason == "revoked",
         }
 
     @app.patch("/api/runs/{run_id}/config")
@@ -31808,6 +31965,13 @@ async def run_server(port=8000):
     # still auto-relink the moment the owner enters the new code at
     # Account → Add Device. Loop is idle while _firebase_db is set.
     asyncio.create_task(_revoked_recovery_loop())
+    # Transient-outage reconnect watcher (#717). Armed unconditionally on EVERY
+    # worker so a dropped Firestore client (DNS/network blip) self-heals on a
+    # tight backoff — no manual restart, no 1-hour-cap wait. Idle while
+    # _firebase_db is set. `listeners_armed` snapshots whether boot bound the
+    # Firestore listeners (gated on _firebase_db just above); a boot-time blip
+    # leaves them unbound, so the first reconnect schedules a clean respawn.
+    asyncio.create_task(_firebase_reconnect_loop(listeners_armed=bool(_firebase_db)))
     # Start heartbeat so frontend can show Online/Offline status.
     # Multi-worker (2026-05-21): only worker 1 heartbeats. FE only needs
     # a single "device alive" signal and devices/{deviceId}.lastHeartbeat
@@ -34925,6 +35089,20 @@ def run_daemon_loop(port: int = 8000):
     # blocking loop below — same behavior as pre-PR.
     CRASH_WINDOW_SEC = 30
     CRASH_THRESHOLD = 3
+    # #717 — liveness watchdog. The crash tracker above only fires on process
+    # EXIT; a worker can also WEDGE (event loop stalled, or Firestore stuck
+    # offline despite localhost up) without exiting. The watchdog polls
+    # /api/health and force-respawns a wedged worker. It is damped by its OWN
+    # window (NOT crash_window) so a watchdog respawn NEVER trips the worker-1
+    # keystore-wipe path, and capped so a sustained global outage (every worker
+    # unreachable) doesn't storm. Backstops are idle-only and worker-aware to
+    # avoid false-killing a busy run or the heartbeat-silent worker 2.
+    WATCHDOG_HANG_SEC = 180          # /api/health unreachable this long while IDLE → wedged
+    WATCHDOG_HANG_RUNNING_SEC = 420  # ...lenient if it was mid-run (runs can briefly block the loop)
+    WATCHDOG_TICK_STALE_SEC = 120    # health OK but reconnect-loop pulse frozen → event loop wedged
+    WATCHDOG_OFFLINE_SEC = 150       # worker-1 only: health OK but device heartbeat stale → reconnect failing
+    WATCHDOG_KILL_THRESHOLD = 3      # watchdog respawns within the window → give up (likely a sustained outage)
+    WATCHDOG_KILL_WINDOW_SEC = 600
     n_workers = load_worker_count()
     if n_workers > 1:
         log(f"[daemon-loop] Multi-worker mode: spawning {n_workers} workers")
@@ -34981,7 +35159,94 @@ def run_daemon_loop(port: int = 8000):
                 "crash_window": [],
                 "keystore_wiped": False,
                 "restarts": 0,
+                # #717 watchdog state (separate from crash tracking)
+                "watchdog_window": [],
+                "unreachable_since": None,
+                "last_running": False,
+                "watchdog_killing": False,
+                "watchdog_gaveup": False,
             }
+
+        def _probe_worker_health(w_port: int):
+            """GET /api/health on a worker. Returns the parsed dict, or None if
+            unreachable (connection refused / timeout / bad response). stdlib
+            urllib so the supervisor needs no extra deps. (#717)"""
+            try:
+                import urllib.request as _u
+                with _u.urlopen(f"http://127.0.0.1:{w_port}/api/health", timeout=3) as _r:
+                    return json.loads(_r.read().decode("utf-8"))
+            except Exception:
+                return None
+
+        def _watchdog_respawn(k: int, state: dict, reason: str):
+            """Force-respawn a wedged worker. Uses a SEPARATE damping window so
+            it never feeds the crash tracker (which wipes worker-1's keystore on
+            a 3x loop). Hard terminate — a wedged event loop can't run its own
+            graceful exit; the respawned worker's Browser.start() orphan sweep
+            reaps any leftover chromium. Gives up after WATCHDOG_KILL_THRESHOLD
+            respawns in the window so a sustained outage (every worker
+            unreachable at once) doesn't storm. (#717)"""
+            now = _time.time()
+            win = [t for t in state.get("watchdog_window", []) if t > now - WATCHDOG_KILL_WINDOW_SEC]
+            if len(win) >= WATCHDOG_KILL_THRESHOLD:
+                if not state.get("watchdog_gaveup"):
+                    log(f"[watchdog] worker {k}: {WATCHDOG_KILL_THRESHOLD} respawns in "
+                        f"<{WATCHDOG_KILL_WINDOW_SEC}s — GIVING UP watchdog respawns "
+                        f"(likely a sustained outage, not a per-worker wedge). "
+                        f"Last reason: {reason}", "ERROR")
+                    state["watchdog_gaveup"] = True
+                return
+            win.append(now)
+            state["watchdog_window"] = win
+            state["watchdog_killing"] = True
+            state["unreachable_since"] = None
+            log(f"[watchdog] worker {k}: force-respawning — {reason}", "WARN")
+            try:
+                state["process"].terminate()
+            except Exception as _te:
+                log(f"[watchdog] worker {k}: terminate failed: {_te}", "WARN")
+
+        def _watchdog_check(k: int, state: dict):
+            """Poll a RUNNING worker's health and respawn it if wedged. Scoped to
+            avoid false-kills: device-heartbeat staleness is worker-1 only (only
+            w1 writes it); active-run + relink workers are exempt from the idle
+            backstops; the frozen-pulse check uses the per-worker lastTickAt so
+            it also covers the heartbeat-silent worker 2. (#717)"""
+            if state.get("watchdog_gaveup") or state.get("watchdog_killing"):
+                return
+            now = _time.time()
+            health = _probe_worker_health(state.get("port"))
+            if health is None:
+                # Unreachable — could be a wedge, or a worker still booting.
+                if state.get("unreachable_since") is None:
+                    state["unreachable_since"] = now
+                was_running = state.get("last_running", False)
+                limit = WATCHDOG_HANG_RUNNING_SEC if was_running else WATCHDOG_HANG_SEC
+                if now - state["unreachable_since"] > limit:
+                    _watchdog_respawn(k, state,
+                        f"/api/health unreachable {int(now - state['unreachable_since'])}s "
+                        f"(was_running={was_running})")
+                return
+            # Reachable — refresh cached state, clear the unreachable timer.
+            state["unreachable_since"] = None
+            running = bool(health.get("running"))
+            relinking = bool(health.get("relinking"))
+            state["last_running"] = running
+            # Idle backstops only — never force-respawn mid-run or mid-relink
+            # (defer to the in-run watchdog / the legit 15-min relink poll).
+            if running or relinking:
+                return
+            tick = int(health.get("lastTickAt") or 0)
+            if tick > 0 and (now * 1000 - tick) > WATCHDOG_TICK_STALE_SEC * 1000:
+                _watchdog_respawn(k, state,
+                    f"reconnect-loop pulse frozen {int(now - tick / 1000)}s (event loop wedged)")
+                return
+            if k == 1:
+                hb = int(health.get("lastHeartbeatAt") or 0)
+                if hb > 0 and (now * 1000 - hb) > WATCHDOG_OFFLINE_SEC * 1000:
+                    _watchdog_respawn(k, state,
+                        f"device heartbeat stale {int(now - hb / 1000)}s despite reachable "
+                        f"health (in-process reconnect failing)")
 
         # Initial spawn of all workers.
         for k in range(1, n_workers + 1):
@@ -35002,7 +35267,9 @@ def run_daemon_loop(port: int = 8000):
                         continue
                     rc = state["process"].poll()
                     if rc is None:
-                        continue  # still running
+                        # Still running — liveness watchdog (#717).
+                        _watchdog_check(k, state)
+                        continue
                     # Worker exited — close logs, track crash, decide.
                     log(f"[daemon-loop] worker {k}: exited with code {rc}")
                     try:
@@ -35010,9 +35277,24 @@ def run_daemon_loop(port: int = 8000):
                         state["err_fh"].close()
                     except Exception:
                         pass
+                    # A watchdog-initiated terminate must NOT feed the crash
+                    # tracker — that path wipes worker-1's keystore on a 3x loop
+                    # and would force a re-pair. Respawn clean, carrying only the
+                    # watchdog's own damping window. (#717)
+                    if state.pop("watchdog_killing", False):
+                        log(f"[daemon-loop] worker {k}: respawning after watchdog terminate")
+                        _time.sleep(2)
+                        new_state = _spawn_worker(k)
+                        if new_state is not None:
+                            new_state["watchdog_window"] = state.get("watchdog_window", [])
+                            workers[k] = new_state
+                        else:
+                            workers[k] = {"_dead": True}
+                        continue
                     if rc == 0:
                         state["crash_window"] = []
                         state["keystore_wiped"] = False
+                        state["watchdog_window"] = []  # clean exit resets watchdog damping too
                     else:
                         _now = _time.time()
                         state["crash_window"].append(_now)
@@ -35065,6 +35347,7 @@ def run_daemon_loop(port: int = 8000):
                         new_state["crash_window"] = state["crash_window"]
                         new_state["keystore_wiped"] = state["keystore_wiped"]
                         new_state["restarts"] = state["restarts"]
+                        new_state["watchdog_window"] = state.get("watchdog_window", [])  # (#717)
                         workers[k] = new_state
                     else:
                         workers[k] = {"_dead": True}
