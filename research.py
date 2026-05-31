@@ -8989,8 +8989,8 @@ async def resume_browser_from_checkpoint(browser, queue_dir):
             except SessionExpiredError as e:
                 log(f"[resume] {e}", "ERROR")
                 fail_agent(platform,
-                           "Session expired — re-authenticate to retry",
-                           f"{e}")
+                           f"{platform.capitalize()} session expired",
+                           f"{platform.capitalize()} signed out. Sign back in using the open browser, then Retry — or Skip it.")
                 continue
             restored[platform] = page
             _runtime.register_page(platform, page, url)
@@ -11035,27 +11035,18 @@ def fail_phase(phase: int, title: str = "", details: str = "",
 
 
 _PRO_TIER_DETAILS_BY_KEY = {
-    "chatgpt": ("ChatGPT Pro required for Phase 1",
-                "This account isn't on ChatGPT Pro ($200/mo). Phase 1 was tuned "
-                "for Pro + Extended Thinking — Free produces a much shallower "
-                "brief, and Phase 2 agents are tuned against that brief.\n\n"
-                "To upgrade: sign out of ChatGPT in the open browser, sign back in "
-                "with a Pro-tier account, then click Retry to re-verify. "
-                "Or click Continue with Free to accept the degraded brief."),
-    "claude":  ("Claude Pro required for Phase 2",
-                "This account isn't on Claude Pro ($20/mo). Phase 2's Claude "
-                "agent uses Opus 4.8 + Research mode — Free tiers don't expose "
-                "Opus or Research and the report will be far shallower.\n\n"
-                "To upgrade: sign out of Claude in the open browser, sign back in "
-                "with a Pro-tier account, then click Retry to re-verify. "
-                "Or click Continue with Free to accept the degraded report."),
-    "gemini":  ("Gemini Advanced required for Phase 2",
-                "This account isn't on Gemini Advanced ($20/mo). Phase 2's "
-                "Gemini agent expects 2.5 Pro / Deep Think + Deep Research — "
-                "Free tiers cap turn limits and depth.\n\n"
-                "To upgrade: sign out of Gemini in the open browser, sign back in "
-                "with an Advanced-tier account, then click Retry to re-verify. "
-                "Or click Continue with Free to accept the degraded report."),
+    "chatgpt": ("ChatGPT isn't on a Pro account",
+                "Research quality drops a lot on the free tier. Sign into "
+                "ChatGPT with a Pro account in the open browser, then Retry "
+                "— or continue on free."),
+    "claude":  ("Claude isn't on a Pro account",
+                "Research quality drops a lot on the free tier. Sign into "
+                "Claude with a Pro account in the open browser, then Retry "
+                "— or continue on free."),
+    "gemini":  ("Gemini isn't on an Advanced account",
+                "Research quality drops a lot on the free tier. Sign into "
+                "Gemini with an Advanced account in the open browser, then "
+                "Retry — or continue on free."),
 }
 
 
@@ -11093,8 +11084,8 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
     _controls.pro_alert_emitted.add((phase, agent.lower()))
     title, details = _PRO_TIER_DETAILS_BY_KEY.get(
         agent.lower(),
-        (f"{agent.title()} Pro required",
-         f"{agent.title()} isn't on a Pro tier — quality degrades. Sign in with a Pro account and Retry, or Continue with Free."),
+        (f"{agent.title()} isn't on a Pro account",
+         f"Research quality drops a lot on the free tier. Sign into {agent.title()} with a Pro account, then Retry — or continue on free."),
     )
     _pro_actions = [
         {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
@@ -11291,7 +11282,7 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
                 emit_event("agent_progress", phase=phase, agent=agent_key,
                            status="needs_login",
                            progress=f"{label}: login required ✗ (phase-time check)")
-                _pt_login_msg = f"Log into {label} in the browser on your setup PC."
+                _pt_login_msg = f"{label} needs a login. Sign in using the open browser, then Retry."
                 _pt_login_alert_id = f"phase{phase}_login_required_{agent_key}"
                 emit_event("login_required",
                            phase=phase,
@@ -11441,21 +11432,11 @@ def _emit_chat_mode_alert(platform_l: str):
     name = names.get(platform_l, platform_l.title())
     emit_event(
         "pipeline_error", phase=2, agent=platform_l,
-        error=f"{name} Deep Research mode unavailable",
+        error=f"{name} couldn't turn on Deep Research",
         details=(
-            f"{name}'s Deep Research setup failed: the Playwright selectors "
-            "didn't activate Deep Research, the CUA visual fallback also "
-            "couldn't enable it, and the just-before-send re-activation "
-            "didn't take. Continuing here would send the prompt in regular "
-            f"chat mode — {name} returns a normal reply instead of the "
-            "Deep Research report the pipeline expects, and the agent would "
-            "complete almost immediately (a fast chat answer rather than a "
-            "streamed report).\n\n"
-            "• Continue in chat mode — accept the degraded output for "
-            f"this run; Phase 2 will use {name}'s chat reply as its result.\n"
-            f"• Skip {name} — drop this agent's Phase 2 output; the "
-            "pipeline continues with the other agents.\n"
-            "• Stop — halt the run."
+            f"{name} would answer as a normal chat instead of a full "
+            "research report. Continue with the shorter answer, skip "
+            f"{name}, or stop."
         ),
         actions=[
             {"id": "continue_in_chat_mode", "label": "Continue in chat mode", "style": "default",
@@ -15895,32 +15876,33 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 # vanish); pause immediately with a Retry-only 'load or switch
                 # your key' card, same as the cap / key-rejected branches below.
                 log(f"Claude API rate limited (429) — pausing for key action: {err[:160]}", "ERROR")
-                _rl_msg = ("Rate-limited (429) on the current Anthropic key. Load or "
-                           "switch to another key in Account → API Config, then Retry.")
+                _rl_msg = ("Your Anthropic API key hit its rate limit. Switch to "
+                           "another key in Account → API Config, then Retry.")
                 if _phase == 2 and _agent:
-                    fail_agent(_agent, "Claude API rate limit", _rl_msg)
+                    fail_agent(_agent, "API key is rate-limited", _rl_msg)
                 else:
-                    fail_phase(_phase, "Claude API rate limit", _rl_msg)
+                    fail_phase(_phase, "API key is rate-limited", _rl_msg)
                 return {"status": "error", "text": str(e)}
             elif "overloaded" in low or "529" in err:
                 log("API overloaded — waiting 60s", "WARN")
                 await asyncio.sleep(60); continue
             elif "workspace api usage limits" in low or ("400" in err and "usage limit" in low):
                 log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
-                _cap_detail = err[:200] or "Workspace cap hit on the current Anthropic key."
-                _cap_hint = "Paste a different key in Account → API Config (preferred), raise the cap in the Anthropic Console, or wait for reset."
+                _cap_hint = ("Your Anthropic API key hit its usage cap. Switch to "
+                             "another key in Account → API Config (or raise the cap "
+                             "in the Anthropic console), then Retry.")
                 if _phase == 2 and _agent:
-                    fail_agent(_agent, "Claude API workspace cap hit", f"{_cap_detail} {_cap_hint}")
+                    fail_agent(_agent, "API key is over its limit", _cap_hint)
                 else:
-                    fail_phase(_phase, "Claude API workspace cap hit", f"{_cap_detail} {_cap_hint}")
+                    fail_phase(_phase, "API key is over its limit", _cap_hint)
                 return {"status": "error", "text": str(e)}
             elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
                 log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
-                _bad_key_hint = "Paste a fresh key in Account → API Config (preferred, no restart), or update ANTHROPIC_API_KEY on the BE machine and restart."
+                _bad_key_hint = "Your Anthropic API key is invalid or expired. Paste a working key in Account → API Config, then Retry."
                 if _phase == 2 and _agent:
-                    fail_agent(_agent, "Claude API key rejected", _bad_key_hint)
+                    fail_agent(_agent, "API key was rejected", _bad_key_hint)
                 else:
-                    fail_phase(_phase, "Claude API key rejected", _bad_key_hint)
+                    fail_phase(_phase, "API key was rejected", _bad_key_hint)
                 return {"status": "error", "text": str(e)}
             else:
                 log(f"API error: {e}", "ERROR")
@@ -18710,10 +18692,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if _tab_dead:
                     log(f"[{_agent_name}] Hard retry cap + dead tab — failing agent", "WARN")
                     fail_agent(_agent_key,
-                               f"{_agent_name} hard retries exhausted, tab gone",
-                               "All hard-retry attempts have been used and the "
-                               "agent's browser tab is no longer alive. Skip drops "
-                               "this agent; the others continue.")
+                               f"{_agent_name} couldn't recover",
+                               f"{_agent_name} kept failing and its browser tab "
+                               "closed. Retry to start it fresh, or Skip it and "
+                               "keep the others.")
                     del pending[_agent_name]
                     results[_agent_name] = {
                         "status": "hard_retry_exhausted_dead_tab",
@@ -18746,7 +18728,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _brief_text_hr, _brief_path_hr, verbose)
             except Exception as _e:
                 log(f"[{_agent_name}] Hard retry setup crashed: {_e}", "ERROR")
-                fail_agent(_agent_key, "Hard retry failed", str(_e)[:200])
+                fail_agent(_agent_key, f"{_agent_name} couldn't restart", f"{_agent_name} hit an error while restarting. Retry to try again, or Skip it.")
                 del pending[_agent_name]
                 results[_agent_name] = {"status": "hard_retry_failed", "text": "",
                                          "url": "", "page": None, "elapsed_sec": 0}
@@ -19090,9 +19072,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] Session expired mid-run ({reason}) — confirmed by 2 consecutive checks", "WARN")
                     p["session_expiry_hits"] = 0  # reset for next time
                     fail_agent(agent_key_auth,
-                               f"{name} session expired mid-run",
-                               (f"The {name} tab drifted to a login page ({reason}). "
-                                "Log in again in the browser, then Retry. Skip drops this agent."))
+                               f"{name} signed out",
+                               (f"{name} got logged out mid-run. Sign back in using "
+                                "the open browser, then Retry — or Skip it."))
                     # Block this agent's polling until user decides. Other
                     # agents keep polling (they don't hit this await).
                     auth_decision = await _controls.await_agent_decision(agent_key_auth, timeout=1800.0)
@@ -19785,10 +19767,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     and not status_is_active and _cua_check_age > 1200):
                 p["stuck_warned_at"] = time.time()
                 fail_agent(agent_key_stuck,
-                           (f"{name} stalled — no growth for {int(no_growth_secs/60)} min "
-                            f"(currently {_partial_text_len} chars, {_src_count} sources)"),
-                           ("The agent's output hasn't grown in a while. "
-                            "Retry re-runs the agent from scratch. Skip drops this agent."))
+                           f"{name} seems stuck",
+                           (f"{name} hasn't produced anything new for a while. "
+                            "Retry to run it fresh, or Skip it."))
                 # Non-blocking: we don't await here since other agents are
                 # still healthy. The command bus applies the user's choice
                 # asynchronously — check on next tick.
@@ -20075,11 +20056,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     p["done_marker_first_at"] = 0.0
                     if p["extraction_attempts"] >= 1:
                         fail_agent(agent_key,
-                                   f"{name} extraction failed",
-                                   ("Playwright confirmed done, but the extraction came back empty "
-                                    "(DOM HTML→MD, JS innerText, and CUA clipboard fallback all "
-                                    "returned no content). Retry re-runs extraction; Skip drops "
-                                    "this agent."))
+                                   f"Couldn't read {name}'s report",
+                                   (f"{name} finished but we couldn't pull its results. "
+                                    "Retry to try again, or Skip it."))
                         decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
                         log(f"[{name}] Extraction-failed decision: {decision}")
                         if decision == "retry":
@@ -20249,10 +20228,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] Salvage extract during error verdict failed: {_e_err}", "WARN")
                 if not p.get("failed_alert_emitted"):
                     fail_agent(agent_key_err,
-                               f"{name} reported a failure mid-run",
-                               (f"The {name} UI surfaced an error (e.g. 'Research failed'). "
-                                f"Salvaged {len(_err_text)} chars of partial output. "
-                                "Retry re-runs the agent fresh; Skip drops it."))
+                               f"{name} reported an error",
+                               (f"{name} showed a 'research failed' error and we kept "
+                                "what little it produced. Retry to run it fresh, or Skip it."))
                     p["failed_alert_emitted"] = True
                 results[name] = {
                     "status": "agent_error",
@@ -20413,7 +20391,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         try:
                             emit_event("agent_link_failed", phase=2, agent=agent_key_hf,
                                        attempts=1,
-                                       lastError=f"Claude produced only {_art_count} artifact — final document missing")
+                                       lastError="Claude produced its sources but not the full report. Retry to let it finish, or Skip it.")
                         except Exception:
                             pass
                         p.setdefault("hf_timeouts", 0)
@@ -20492,10 +20470,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     f"{p['empty_retries']}) — surfacing user decision", "WARN")
                 ag_key_empty = name.lower().replace(" ", "")
                 fail_agent(ag_key_empty,
-                           f"{name} finished but no readable text was extracted",
-                           ("CUA says the agent is done, but the extraction came back empty "
-                            "(DOM HTML→MD, JS innerText, and CUA clipboard fallback all returned "
-                            "no content). Retry runs the agent fresh; Skip drops this agent."))
+                           f"Couldn't read {name}'s report",
+                           (f"{name} finished but came back empty. "
+                            "Retry to run it fresh, or Skip it."))
                 empty_decision = await _controls.await_agent_decision(ag_key_empty, timeout=300.0)
                 log(f"[{name}] Empty-final user decision: {empty_decision}")
                 if empty_decision == "stop":
@@ -22603,8 +22580,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         _runtime.unregister_page("chatgpt", final_status="stalled")
         retries_left_p1s = max(0, 2 - _retry_count)
         fail_phase(1,
-                   "ChatGPT stream stalled — text + sources flat for 20 min",
-                   "ChatGPT stopped streaming output mid-brief. Retry restarts the brief from scratch; Skip drops Phase 1 and asks for a manual brief.",
+                   "ChatGPT stopped responding",
+                   "ChatGPT stalled while writing the brief. Retry to start the brief over, or Skip and write your own.",
                    agent="chatgpt",
                    can_retry=retries_left_p1s > 0)
         if retries_left_p1s > 0:
@@ -22678,8 +22655,8 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     if brief_text and brief_len >= 100 and brief_len < 500:
         retries_left = max(0, P1_MAX_USER_RETRIES - _retry_count)
         fail_phase(1,
-                   f"Brief looks short ({brief_len} chars) — expected >1000",
-                   "ChatGPT returned a brief well below typical length. Retry regenerates from scratch.",
+                   "The brief looks unusually short",
+                   "ChatGPT's brief came back much shorter than expected. Retry to regenerate it, or continue with it.",
                    agent="chatgpt",
                    can_retry=retries_left > 0)
         # Wait for the user's decision via the standard phase-decision bus.
@@ -24544,7 +24521,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     # ── User manual fallback — pause pipeline, banner with Resume/Skip ──
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
     _hv_alert_id = f"phase{phase}_human_verify_{platform_key}"
-    _hv_msg = f"{platform.capitalize()} is asking for human verification. I tried and couldn't clear it — solve it in the browser and tap Resume, or Skip this agent."
+    _hv_msg = f"Solve the check ({platform.capitalize()}'s 'are you human' prompt) in the open browser, then Resume — or Skip {platform.capitalize()}."
     emit_event("human_verification_required", phase=phase, agent=platform_key,
                platform=platform_key,
                platformLabel=platform.capitalize(),
@@ -24597,7 +24574,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                            platform=platform_key,
                            platformLabel=platform.capitalize(),
                            reason=reason or "Human verification challenge",
-                           message=f"{platform.capitalize()} still shows verification. Solve it first, then Resume.",
+                           message=f"The check isn't cleared yet. Finish it in the open browser, then Resume.",
                            alert_id=_hv_alert_id)
                 # Re-set target_agent (request_resume cleared it on the
                 # initial resume) so CLI `s` still targets this platform.
@@ -24799,8 +24776,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
         if not cleared:
             fail_agent(platform_l,
-                       f"Couldn't clear human verification for {platform.capitalize()}",
-                       "The human-verification challenge couldn't be cleared. Retry to relaunch the agent; Skip to drop it.")
+                       f"{platform.capitalize()} verification not cleared",
+                       f"We couldn't get past {platform.capitalize()}'s verification check. Retry to try {platform.capitalize()} again, or Skip it.")
             return page, False
         # Settle after clearance — page often reloads to the real content
         await asyncio.sleep(2)
@@ -24933,8 +24910,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                                      brief_to_paste, platform, label, verbose)
             if not paste_ok:
                 log(f"[{label}] CRITICAL: Both attach and paste (DOM+CUA) failed — skipping this agent", "ERROR")
-                fail_agent(platform_l, "Brief delivery failed",
-                           "Both file-attach and DOM+CUA paste failed. Retry to relaunch the agent.")
+                fail_agent(platform_l, f"Couldn't send the brief to {label}",
+                           f"We couldn't hand the research brief to {label}. Retry to try again, or Skip it.")
                 return page, False
     else:
         # Inline paste path — engaged in two cases:
@@ -24962,8 +24939,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                                  brief_to_paste, platform, label, verbose)
         if not paste_ok:
             log(f"[{label}] CRITICAL: Brief paste failed (DOM + CUA) — skipping this agent", "ERROR")
-            fail_agent(platform_l, "Brief paste failed",
-                       "DOM and CUA paste both failed. Retry to relaunch the agent.")
+            fail_agent(platform_l, f"Couldn't send the brief to {label}",
+                       f"We couldn't hand the research brief to {label}. Retry to try again, or Skip it.")
             return page, False
 
     # ── Just-before-send: ensure the required mode is STILL active ──
@@ -25028,10 +25005,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 }
                 emit_event("agent_skipped", phase=2, agent=platform_l,
                            reason="retry_on_chat_mode_alert_unsupported")
-                fail_agent(platform_l, f"{_agent_name} skipped — retry not supported in chat-mode alert",
-                           "Retry isn't a valid action on the Deep-Research-mode-unavailable "
-                           "alert. The agent was skipped to avoid silently running in "
-                           "chat mode without your consent.")
+                fail_agent(platform_l, f"{_agent_name} was skipped",
+                           f"{_agent_name} couldn't run Deep Research, so it was "
+                           "skipped. The other agents continue.")
                 return page, False
             if decision == "skip" or decision == "timeout":
                 _runtime.agent_modes[platform_l] = {
@@ -25043,11 +25019,11 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                            if decision == "skip"
                            else "research_unavailable_timeout_default_skip")
                 emit_event("agent_skipped", phase=2, agent=platform_l, reason=_reason)
-                fail_agent(platform_l, f"{_agent_name} skipped — Deep Research unavailable",
-                           (f"User opted to skip Phase 2 {_agent_name} after Deep Research "
-                            "could not be enabled." if decision == "skip"
-                            else "Decision alert timed out after 3h — skipping "
-                                 f"{_agent_name} rather than silently falling to chat mode."))
+                fail_agent(platform_l, f"{_agent_name} was skipped",
+                           (f"{_agent_name} couldn't run Deep Research, so it was "
+                            "skipped. The other agents continue." if decision == "skip"
+                            else f"{_agent_name} couldn't run Deep Research, so it was "
+                                 "skipped. The other agents continue."))
                 return page, False
             # continue_anyway → proceed in chat mode with sticky flag.
             # (Explicit-only per 2026-05-12: an AFK operator must not
@@ -25268,8 +25244,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # forever waiting for events that will never arrive.
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
                            progress="ChatGPT setup/paste failed — agent did not start.")
-                fail_agent("chatgpt", "ChatGPT failed to start after 2 attempts",
-                           "Setup or brief paste failed twice. Retry to open a fresh tab.")
+                fail_agent("chatgpt", "ChatGPT didn't start",
+                           "ChatGPT failed to launch after two tries. Retry to start it fresh, or Skip it.")
                 try:
                     _controls.skipped_agents.add("chatgpt")
                 except Exception:
@@ -25334,8 +25310,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2B] Claude failed after 2 attempts", "ERROR")
                 emit_event("agent_progress", phase=2, agent="claude", status="failed",
                            progress="Claude setup/paste failed — agent did not start.")
-                fail_agent("claude", "Claude failed to start after 2 attempts",
-                           "Setup or brief paste failed twice. Retry to open a fresh tab.")
+                fail_agent("claude", "Claude didn't start",
+                           "Claude failed to launch after two tries. Retry to start it fresh, or Skip it.")
                 try:
                     _controls.skipped_agents.add("claude")
                 except Exception:
@@ -25838,12 +25814,12 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             _low = _err_msg.lower()
             is_login_err = any(k in _low for k in ("login", "signin", "auth", "unauthor"))
             retries_left = max(0, p3_max_retries - p3_attempt)
-            _title = ("NotebookLM login expired"
+            _title = ("Sign in to NotebookLM"
                       if is_login_err else
-                      f"NotebookLM upload failed: {_err_msg[:200]}")
-            _details = ("Re-authenticate in the browser and Retry."
+                      "NotebookLM upload failed")
+            _details = ("NotebookLM signed out. Sign back in using the open browser, then Retry."
                         if is_login_err else
-                        f"{_err_msg[:300]}")
+                        "We couldn't upload the reports to NotebookLM. Retry to try again, or Skip it.")
             fail_phase(3, _title, _details, agent="notebooklm",
                        can_retry=retries_left > 0)
             # Wait up to 10 min for user decision. Retry → re-run upload; skip →
@@ -25950,8 +25926,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
     if existing_cards >= 2:
         fail_phase(3,
-                   f"NotebookLM Studio shows {existing_cards} audio entries (expected 0)",
-                   "Open the notebook, delete the extra audio entries manually, then retry. We never auto-delete to avoid removing the wrong one.",
+                   "Extra audio in your notebook",
+                   f"Your NotebookLM notebook already has {existing_cards} audio overviews. Open it, delete the extras, then Retry.",
                    agent="notebooklm",
                    can_retry=True)
         return {"audio_path": None}
@@ -25968,8 +25944,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             _reuse_existing = True
         else:
             fail_phase(3,
-                       "NotebookLM Studio has 1 completed audio from a prior run",
-                       "Open the notebook, delete that audio entry manually, then retry. We never auto-delete to avoid touching the wrong one.",
+                       "Old audio in your notebook",
+                       "Your NotebookLM notebook already has an audio overview. Open it, delete that entry, then Retry.",
                        agent="notebooklm",
                        can_retry=True)
             return {"audio_path": None}
@@ -26026,26 +26002,25 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             if "audio already present" in _ag_text:
                 fail_phase(
                     3,
-                    "NotebookLM already has an audio overview at start of Phase 3",
-                    "CUA aborted because the Studio panel surfaced an existing audio "
-                    "entry after our pre-flight check passed (panel-render lag). "
-                    "Open the notebook, delete any lingering audio, then retry.",
+                    "Audio already in your notebook",
+                    "Your NotebookLM notebook already has an audio overview. "
+                    "Open it, delete it, then Retry.",
                     agent="notebooklm",
                     can_retry=True,
                 )
             else:
                 # Other abort phrases: no_customize_affordance,
-                # customize_did_not_open, misclick_default_fired. Fail
-                # loud with the verbatim phrase so the user/log makes the
-                # cause obvious.
+                # customize_did_not_open, misclick_default_fired. Log the
+                # verbatim phrase (the card stays plain) so the cause is
+                # obvious in backend.log.
                 _reason_phrase = _ag_text.split("abort:", 1)[1].split("\n", 1)[0].strip()[:160]
+                log(f"[Phase3] Audio generation aborted by CUA: {_reason_phrase}", "ERROR")
                 fail_phase(
                     3,
-                    f"Phase 3 audio generation aborted by CUA — {_reason_phrase or 'unknown reason'}",
-                    "The audio-generation step bailed out early to avoid an unsafe NotebookLM state "
-                    "(missing customize affordance, default audio fired from a misclick, etc.). "
-                    "Retry to try again; if it keeps aborting, open the notebook directly and "
-                    "generate the audio overview manually.",
+                    "Couldn't create the audio overview",
+                    "NotebookLM's audio step couldn't complete safely. "
+                    "Retry to try again — or open the notebook and make the "
+                    "audio overview yourself.",
                     agent="notebooklm",
                     can_retry=True,
                 )
@@ -26091,9 +26066,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             "long": "Deep Dive · Long (~20–30 min)",
         }.get(podcast_length, "Deep Dive · Long (~20–30 min)")
         fail_phase(3,
-                   f"Duplicate audio overview detected — NotebookLM Studio shows {post_gen_cards} entries",
-                   f"Likely a CUA misclick fired a default audio alongside the {_kept} one you requested. "
-                   f"Open the notebook, KEEP the {_kept} entry, delete the other one manually, then retry.",
+                   "Two audio overviews were created",
+                   f"NotebookLM made an extra audio by mistake. Open the notebook, "
+                   f"keep the '{_kept}' one, delete the other, then Retry.",
                    agent="notebooklm",
                    can_retry=True)
         return {"audio_path": None}
@@ -26149,7 +26124,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 emit_event("login_required", phase=3,
                            platforms=["notebooklm"],
                            platformLabels=["NotebookLM"],
-                           message="NotebookLM session expired during audio generation. Sign back in to resume.",
+                           message="Your NotebookLM session signed out. Sign back in using the open browser to keep going.",
                            attempt=1)
                 emit_event("pipeline_paused", phase=3, reason="notebooklm_login_expired")
                 await _controls.wait_if_paused()
@@ -26188,10 +26163,9 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 }.get(podcast_length, "Deep Dive · Long (~20–30 min)")
                 fail_phase(
                     3,
-                    f"Duplicate audio detected mid-generation — NotebookLM Studio shows {_live_cards} entries",
-                    f"NotebookLM started a second audio (likely a CUA misclick on the Audio Overview card). "
-                    f"Open the notebook, KEEP the {_kept} entry you requested, delete the other one manually, then retry. "
-                    f"We don't auto-delete in-flight audios to avoid removing the wrong one.",
+                    "Two audio overviews were created",
+                    f"NotebookLM made an extra audio by mistake. Open the notebook, "
+                    f"keep the '{_kept}' one, delete the other, then Retry.",
                     agent="notebooklm",
                     can_retry=True,
                 )
@@ -26354,8 +26328,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # That's a real error — surface it so the user knows Phase 5 will
         # skip and can decide whether to re-run or accept report-only.
         if not audio_path:
-            fail_phase(3, "Audio file not located on disk",
-                       "NotebookLM finished but neither the Playwright download event nor the Downloads scan found the file.",
+            fail_phase(3, "Couldn't save the audio file",
+                       "NotebookLM finished the audio but we couldn't download it. Retry to try again, or Skip it.",
                        agent="notebooklm")
 
     # Strict-keep cleanup (moved 2026-05-02). Was inside the poll loop at
@@ -27610,8 +27584,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _alert_phase = getattr(_runtime, "phase", 0) or 0
                     fail_phase(
                         phase=_alert_phase,
-                        error=f"Couldn't download {_fail} attached source(s) from Storage",
-                        reason="The pipeline couldn't fetch the file(s) you attached. Most often this is a Storage rules / auth-token race — Retry first. If it keeps failing, Skip drops the attachments and continues with no NotebookLM ingestion.",
+                        error="Couldn't open your attached files",
+                        reason="We couldn't load the file(s) you attached. Retry to try again, or Skip them and continue without NotebookLM.",
                         actions=[
                             {"id": "retry", "label": "Retry", "style": "primary",
                              "command": {"action": "retry_phase", "phase": _alert_phase}},
@@ -27874,27 +27848,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             {"id": "skip", "label": "Skip phase", "style": "default",
              "command": {"action": "skip_phase", "phase": phase}},
         ]
-        # Phase-aware example so the banner's reassurance fits what's
-        # actually running. P2 = Claude/ChatGPT/Gemini deep research,
-        # P3 = NotebookLM podcast gen. Generic fallback covers any
-        # future phase that opts into soft-warn.
-        if phase == 1:
-            _example = "ChatGPT brief generation can legitimately take 30+ minutes for large PDFs or complex topics"
-        elif phase == 2:
-            _example = "deep-research runs can legitimately take 1-2 hours"
-        elif phase == 3:
-            _example = "NotebookLM podcast generation can legitimately take 30-60 minutes on long sources"
-        else:
-            _example = "long-running phases can legitimately exceed this estimate"
         try:
             emit_event(
                 "pipeline_warning", phase=phase,
-                message=f"Phase {phase} has been running for {max_min} min — agent may still be working",
+                message=f"This step is taking a while",
                 details=(
-                    f"The pipeline is still polling normally. Wait keeps watching ({_example}). "
-                    "Retry restarts from the last checkpoint with a fresh budget. Skip "
-                    "moves past this phase. You can also Stop the pipeline from "
-                    "the chat input bar."
+                    "This step is still running and may just be a long one. "
+                    "Keep waiting, or restart it / skip it."
                 ),
                 actions=actions,
                 alertType="warn",
@@ -27937,22 +27897,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         try:
             fail_phase(
                 phase=phase,
-                error=f"Phase {phase} exceeded {max_min}-minute active-time ceiling",
+                error="This step seems stuck",
                 reason=(
-                    f"This phase has been running for {max_min} minutes of active work "
-                    "without completing — likely stuck on a CUA loop, frozen Playwright "
-                    "operation, or a platform UI hiccup. Retry restores from the last "
-                    "checkpoint and reruns this phase with a fresh budget. Skip moves "
-                    "past this phase and continues with whatever artifacts are on disk. "
-                    "You can also Stop the pipeline from the chat input bar."
+                    "This step has run a long time without finishing. "
+                    "Restart it, or skip it and keep going."
                 ),
                 agent=agent,
                 actions=actions,
             )
         except Exception as _e:
             log(f"_phase_timeout_decision: fail_phase fallback ({_e})", "WARN")
-            fail_phase(phase, f"Phase {phase} exceeded {max_min}-minute active-time ceiling",
-                       "Stuck — Retry from checkpoint or Skip the phase.",
+            fail_phase(phase, "This step seems stuck",
+                       "This step has run a long time without finishing. Restart it, or skip it and keep going.",
                        agent=agent, actions=actions)
         # Pause flag freezes the active-time clock during the user's
         # decision wait, so a 20-min decision delay doesn't burn budget
@@ -28129,15 +28085,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _err_msg = str(_launch_err)
                 _low = _err_msg.lower()
                 if "profile" in _low and ("lock" in _low or "in use" in _low or "singleton" in _low):
-                    _friendly = f"Chrome profile is locked by another session. Close any running automation browsers (or previous pipeline runs), then click Retry."
+                    _friendly = "The automation browser is already open elsewhere. Close any other research runs or browser windows, then Retry."
                 elif "executable" in _low or "chromium" in _low or "browser" in _low:
-                    _friendly = f"Browser binary missing or failed to start. Run `playwright install chromium`, then click Retry."
+                    _friendly = "The automation browser isn't set up on this machine. Reinstall it, then Retry."
                 else:
-                    _friendly = f"Browser launch failed: {_err_msg[:200]}"
+                    _friendly = "The automation browser couldn't start. Retry — if it keeps failing, check the setup on this machine."
                 log(f"Phase 0 browser launch failed: {_err_msg[:200]} — awaiting user decision", "ERROR")
                 fail_phase(
                     phase=0,
-                    error=f"Browser launch failed: {_err_msg[:200]}",
+                    error="Couldn't start the browser",
                     reason=_friendly,
                     agent="system",
                     actions=[
@@ -28343,26 +28299,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # doing, run without CUA on purpose".
                     log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
                     fail_phase(
-                        0, "CUA vision check can't run",
-                        (f"{str(cua_err)[:180]}\n\n"
-                         "This usually means one of these:\n"
-                         "• Rate-limited (429) — the key hit its request / quota "
-                         "limit. Load or switch to another key in Account → API "
-                         "Config, then Retry.\n"
-                         "• Invalid or missing Anthropic key — add or rotate it in "
-                         "Account → API Config (preferred, no restart), or set "
-                         "ANTHROPIC_API_KEY on the backend machine and restart.\n"
-                         "• Workspace usage cap or 400 overage — raise the cap in "
-                         "console.anthropic.com → Workspaces, wait for the "
-                         "monthly reset, OR paste a key from a different "
-                         "workspace (or a personal key) in Account → API Config "
-                         "to bypass the capped one.\n"
-                         "• Anthropic temporarily overloaded (529) — wait a moment "
-                         "and click Retry.\n\n"
-                         "Without CUA verification, the pipeline can't reliably "
-                         "tell login walls from authenticated sessions, so we "
-                         "don't allow continuing without it. Click Retry once "
-                         "you've fixed the underlying issue."),
+                        0, "AI service unavailable",
+                        (f"Can't verify your {label} login right now — your "
+                         "Anthropic API key looks rate-limited, invalid, or over "
+                         "its limit. Update or switch it in Account → API Config, "
+                         "then Retry."),
                         agent=key,
                         actions=[
                             {"id": "retry", "label": "Retry", "style": "primary",
@@ -28477,7 +28418,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # platform and wait for user retry.
                 emit_event("agent_progress", phase=0, agent=key,
                            status="needs_login", progress=f"{label}: login required ✗")
-                _login_msg = f"Log into {label} in the browser on your setup PC."
+                _login_msg = f"{label} needs a login. Sign in using the open browser, then Retry."
                 # alert_id aligns Phase 0 with the phase>=1 path so the live
                 # event card and the doc-hydrated card dedup on the same key.
                 _login_alert_id = f"phase0_login_required_{key}"
@@ -28576,7 +28517,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Account → API Config" instead of a mid-phase vision crash.
         if not resolve_api_key():
             _env_ok = False
-            _env_errors.append("Anthropic API key missing — add it in Account → API Config (preferred), or set ANTHROPIC_API_KEY on the BE machine. Vision/CUA tiers can't run without it.")
+            _env_errors.append("The run needs an Anthropic API key to start. Add it in Account → API Config, then Retry.")
         if not _env_ok:
             emit_event("login_required",
                        phase=0,
@@ -28585,7 +28526,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        machineName=socket.gethostname(),
                        envErrors=_env_errors,
                        attempt=1,
-                       message="Environment check failed — see errors above.",
+                       message="The run needs an Anthropic API key to start. Add it in Account → API Config, then Retry.",
                        alert_id="phase0_env_check")
             # #710 parity: durable mirror so an env-check failure raised while
             # this chat wasn't the viewed tab re-surfaces the card on open.
@@ -28598,7 +28539,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 "machineName": socket.gethostname(),
                 "envErrors": _env_errors,
                 "attempt": 1,
-                "message": "Environment check failed — see errors above.",
+                "message": "The run needs an Anthropic API key to start. Add it in Account → API Config, then Retry.",
                 "alert_id": "phase0_env_check",
             })
             _controls.request_pause()
@@ -28696,11 +28637,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     if (time.time() - _brief_wait_start) > _BRIEF_WAIT_BACKSTOP_S:
                         log("Phase 1: manual brief wait exceeded 3h — auto-failing", "WARN")
                         fail_phase(1,
-                                   "Manual brief not received in 3h",
-                                   "Phase 1 was waiting for you to type a research "
-                                   "brief into chat after skipping ChatGPT verification, "
-                                   "but no brief arrived in 3 hours. Retry to re-prompt "
-                                   "and start over, or Skip to abandon Phase 1.")
+                                   "No brief received",
+                                   "We waited for you to type a research brief in chat, "
+                                   "but none arrived. Retry to keep waiting, or Skip "
+                                   "this step.")
                         emit_event("pipeline_stopped", phase=1,
                                    reason="manual_brief_wait_backstop_3h")
                         return
@@ -28877,8 +28817,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     log("Phase 1 failed — no brief generated; awaiting user decision", "ERROR")
                     fail_phase(
                         phase=1,
-                        error="no brief generated",
-                        reason="ChatGPT Pro didn't produce a research brief after all retries. Check the ChatGPT session is signed in, then try again.",
+                        error="No brief was generated",
+                        reason="ChatGPT didn't produce a brief. Make sure ChatGPT is signed in, then Retry — or Skip and write your own.",
                         agent="chatgpt",
                     )
                     decision = await _controls.await_phase_decision(1)
@@ -28922,11 +28862,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 # decision, and act on it. Mirrors the
                                 # pattern at research.py:22131-22146.
                                 fail_phase(1,
-                                           "Manual brief not received in 3h",
-                                           "Phase 1 was waiting for you to type a research "
-                                           "brief into chat, but no brief arrived in 3 hours. "
-                                           "Retry to wait another 3 hours, or Skip to "
-                                           "abandon Phase 1.")
+                                           "No brief received",
+                                           "We waited for you to type a research brief in "
+                                           "chat, but none arrived. Retry to keep waiting, "
+                                           "or Skip this step.")
                                 _bs_decision = await _controls.await_phase_decision(1)
                                 if _bs_decision == "retry":
                                     emit_event("phase_restart", phase=1,
@@ -29188,7 +29127,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         elif start_phase <= 2:
             if not brief_text:
                 log("No brief text available — cannot run Phase 2", "ERROR")
-                fail_phase(2, "No brief text available", "Phase 1 produced no brief; cannot run Phase 2.")
+                fail_phase(2, "No brief to research", "There's no research brief yet, so deep research can't start. Retry the brief step, or Skip.")
                 return
             # Record the P2 source-doc decision once, before run_phase2 reads
             # the manifest: attach the user's sources only when P1 did NOT run
@@ -29244,9 +29183,9 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if not enabled_agents:
                     log("Phase 2: all agents skipped at verify gate — aborting", "WARN")
                     fail_phase(2,
-                               "All Phase 2 agents skipped at verify gate",
-                               "All Phase 2 agents were skipped during phase-time "
-                               "login verification. Phase 2 cannot run with no agents.")
+                               "No agents left to run",
+                               "Every research agent was skipped, so there's nothing "
+                               "to run. Retry to re-check logins, or Skip.")
                     emit_event("pipeline_stopped", phase=2,
                                reason="all_agents_skipped_at_verify_gate")
                     return
@@ -29709,15 +29648,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # whatever the pipeline can salvage) or stop.
                 fail_phase(
                     phase=3,
-                    error="No source documents found for NotebookLM",
-                    reason=("Phase 1 + Phase 2 are skipped, so the pipeline "
-                            "expects you to attach source files (.md/.txt/"
-                            ".pdf/.docx) for NotebookLM to ingest. None of "
-                            "your attachments landed on disk — they may "
-                            "have failed to upload, or the run was started "
-                            "without any. Skip Phase 3 to continue with "
-                            "whatever artifacts the later phases can "
-                            "produce, or stop and re-attach."),
+                    error="No files to research",
+                    reason=("This run skips the AI agents and needs files you "
+                            "attach (PDF, Word, text, or Markdown), but none "
+                            "came through. Skip this step, or stop and "
+                            "re-attach your files."),
                     actions=[
                         {"id": "skip", "label": "Skip Phase 3", "style": "primary",
                          "command": {"action": "skip_phase", "phase": 3}},
@@ -29726,8 +29661,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             else:
                 fail_phase(
                     phase=3,
-                    error="Phase 2 produced no documents — can't continue to NotebookLM.",
-                    reason="All three agents timed out, errored, or returned empty. Retry re-runs Phase 2 with the same brief; Skip moves past Phase 3 (no notebook, no audio).",
+                    error="No research to turn into a notebook",
+                    reason="None of the agents produced a report. Retry the research, or Skip the notebook step.",
                     actions=[
                         {"id": "retry", "label": "Retry Phase 2", "style": "primary",
                          "command": {"action": "retry_phase", "phase": 3}},
@@ -29986,8 +29921,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     log(f"Phase 3: no verified NotebookLM URL after retries — awaiting user decision ({nb_res.error})", "ERROR")
                     fail_phase(
                         phase=3,
-                        error=f"Could not extract verified NotebookLM URL: {nb_res.error}",
-                        reason="NotebookLM extraction couldn't confirm a valid notebook URL. Retry tries again; Skip moves past Phase 3 without a notebook link.",
+                        error="Couldn't get the NotebookLM link",
+                        reason="NotebookLM finished but we couldn't get its share link. Retry to try again, or Skip it.",
                         agent="notebooklm",
                     )
                     decision = await _controls.await_phase_decision(3)
@@ -30353,8 +30288,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             pass
         fail_phase(
             phase=last_phase,
-            error=str(e)[:200] or "unexpected failure",
-            reason="The pipeline hit an unexpected error. Details saved to backend.log.",
+            error="Something went wrong",
+            reason="The run hit an unexpected error and stopped. Retry to start this step again, or Skip it.",
             agent=None,
         )
     finally:
