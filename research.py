@@ -28200,24 +28200,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 except CuaUnavailableError as cua_err:
                     log(f"Phase 0: CUA availability probe failed — {cua_err}", "ERROR")
                     fail_phase(
-                        0, "CUA vision check can't run",
-                        (f"{str(cua_err)[:180]}\n\n"
-                         "The Vision/CUA tier — it drives Pro detection, "
-                         "Deep-Research toggling, and human-verification "
-                         "recovery — needs a working Anthropic key before the "
-                         "run can start. Common causes:\n"
-                         "• Rate-limited (429) or workspace usage cap — load or "
-                         "switch to another key in Account → API Config, then "
-                         "Retry.\n"
-                         "• Invalid or missing key — add or rotate it in "
-                         "Account → API Config (no restart needed), then Retry.\n"
-                         "• Anthropic briefly overloaded (529) — wait a moment, "
-                         "then Retry.\n\n"
-                         "Note: this check runs even with “Skip login "
-                         "verification” on — that setting only skips your "
-                         "platform sign-ins, it can't skip the vision "
-                         "infrastructure every phase depends on. Click Retry "
-                         "once the key is sorted."),
+                        0, "AI service unavailable",
+                        ("The run can't start — your Anthropic API key looks "
+                         "rate-limited, invalid, or over its cap. Update or "
+                         "switch it in Account → API Config, then Retry."),
                         agent="system",
                         actions=[
                             {"id": "retry", "label": "Retry", "style": "primary",
