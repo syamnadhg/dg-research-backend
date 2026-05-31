@@ -6320,12 +6320,21 @@ def _update_firestore_research(updates):
     _update_research_doc(_fb_uid, _fb_research_id, updates)
 
 
+# Observability flag (worker-local): True while a pendingDecision mirror is
+# believed live, so `_clear_pending_decision` only emits its INFO line when it
+# actually retracts something — the central clear fires on every
+# resume/skip/stop, so an unconditional "cleared" log would be pure noise.
+# NOT load-bearing for correctness (the Firestore field is the source of truth;
+# the DELETE_FIELD always runs regardless of this flag).
+_pending_decision_active = False
+
+
 def _persist_pending_decision(payload: dict):
     """Mirror a structured 'pending decision' (login_required, pro_required,
-    human_verification_required, agent_link_failed, …) onto the ROOT research
-    doc so a frontend that opens the chat AFTER the pause was raised — i.e.
-    while the user was viewing a different chat — can re-surface the actionable
-    card from durable state.
+    human_verification_required, agent_link_failed, pipeline_error, …) onto the
+    ROOT research doc so a frontend that opens the chat AFTER the pause was
+    raised — i.e. while the user was viewing a different chat — can re-surface
+    the actionable card from durable state.
 
     Why this exists: decision alerts are otherwise emitted ONLY as transient
     `pipeline_events`. The FE renders the card by consuming that live stream
@@ -6337,8 +6346,14 @@ def _persist_pending_decision(payload: dict):
     which retracts it the instant the gate resolves (resume / skip / stop) so a
     stale card can never re-appear on a later open. Best-effort; never blocks
     the run."""
+    global _pending_decision_active
     try:
         _update_firestore_research({"pendingDecision": payload})
+        _pending_decision_active = True
+        # E2E-observable lifecycle: confirms the durable mirror was written.
+        log(f"[pending-decision] persisted kind={payload.get('kind')} "
+            f"phase={payload.get('phase')} agent={payload.get('agent')} "
+            f"alert_id={payload.get('alert_id')}", "INFO")
     except Exception as e:
         log(f"[pending-decision] persist failed (non-fatal): {e}", "DEBUG")
 
@@ -6348,9 +6363,13 @@ def _clear_pending_decision():
     Idempotent — harmless when none was set. Must be paired with every
     `_persist_pending_decision` call so a resolved decision cannot linger on the
     doc and re-surface on a later cold chat-open."""
+    global _pending_decision_active
     try:
         from google.cloud.firestore import DELETE_FIELD
         _update_firestore_research({"pendingDecision": DELETE_FIELD})
+        if _pending_decision_active:
+            log("[pending-decision] cleared (decision resolved)", "INFO")
+            _pending_decision_active = False
     except Exception as e:
         log(f"[pending-decision] clear failed (non-fatal): {e}", "DEBUG")
 
