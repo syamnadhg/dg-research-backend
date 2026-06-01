@@ -3373,26 +3373,31 @@ def load_device_id():
 
 
 def _sharer_rehydration_enabled() -> bool:
-    """#724 item 3 / #725 item 6: sharer-tree rehydration is armed by EITHER
-    the `ENABLE_SHARER_REHYDRATION=1` environment variable OR a
-    `research_config.json` entry `{"enableSharerRehydration": true}`.
+    """#724 item 3 / #725: worker-reboot rehydration of SHARER-submitted runs.
 
-    The config-file fallback exists because a Windows User-scope env var did
-    NOT propagate to the relaunched daemon (the supervisor that respawns the
-    worker inherited the OLD process environment, so the boot log kept
-    reporting `=off`). The JSON file is re-read from disk on every boot, so a
-    flag flipped there always takes effect on the next worker start. Reads via
-    the same `Path` + `json` path used for `deviceId` — fully cross-platform
-    (Windows / Linux / macOS); no shell-specific env quoting involved."""
-    if os.environ.get("ENABLE_SHARER_REHYDRATION") == "1":
-        return True
+    DEFAULT ON (validated live 2026-06-01: a clean 3-sharer-tree scan with no
+    permission denials, and both owner + sharer runs recovered across an
+    in-flight restart). Opt OUT via the `ENABLE_SHARER_REHYDRATION` env var set
+    to `0`/`false`/`off`/`no`, OR `research_config.json {"enableSharerRehydration": false}`.
+
+    Precedence: explicit env override → explicit config entry → default(=on).
+    The config path exists because a Windows User-scope env var did NOT
+    propagate to the relaunched daemon (the supervisor inherited the OLD
+    process environment); the JSON file is re-read from disk every boot. Reads
+    via the same `Path` + `json` path used for `deviceId` — fully cross-platform
+    (Windows / Linux / macOS), no shell-specific env quoting involved."""
+    env = os.environ.get("ENABLE_SHARER_REHYDRATION")
+    if env is not None and env.strip() != "":
+        return env.strip().lower() not in ("0", "false", "off", "no")
     try:
         if RESEARCH_CONFIG_PATH.exists():
             cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
-            return bool(cfg.get("enableSharerRehydration"))
+            v = cfg.get("enableSharerRehydration")
+            if v is not None:
+                return bool(v)
     except Exception:
         pass
-    return False
+    return True  # default ON
 
 
 def load_poll_secret() -> str | None:
@@ -32959,208 +32964,17 @@ async def run_server(port=8000):
             try:
                 if WORKER_ID != 1:
                     raise _SkipRehydration()  # local sentinel, caught below
-                researches_col = _firebase_db.collection("users").document(paired_uid) \
-                    .collection("researches")
-                # 2026-05-22: dropped "queued" from rehydration. The
-                # Firestore on_snapshot listener replays every existing
-                # queue doc as ADDED on first attach (research.py:3458)
-                # and the FIFO pre-query (3955-3989) handles ordering
-                # across all submitters (owner + sharers). Rehydrating
-                # queued docs from `users/{paired_uid}/researches/` was
-                # owner-tree-only AND created a dual-processing race:
-                # worker 1 ran the rehydrated job locally while
-                # worker 2's idle-rescan claimed the UNTOUCHED Firestore
-                # queue doc and ran a second copy. The on-disk safety
-                # net for "FE wrote research doc but queue write failed"
-                # is covered by the FE-side orphan-queue watchdog
-                # (commit 4 of this batch). "ongoing" status is still
-                # rehydrated for paused_backend_restart marking +
-                # supervised auto-resume — independent code path.
-                for status_val in ("ongoing",):
-                    try:
-                        snaps = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                lambda sv=status_val: list(
-                                    researches_col.where("status", "==", sv).get()
-                                )
-                            ),
-                            timeout=15.0,
-                        )
-                    except asyncio.TimeoutError:
-                        log(f"Rehydrate query ({status_val}) timed out after 15s — skipping", "WARN")
-                        continue
-                    except Exception as e:
-                        err_str = str(e)
-                        if (
-                            "403" in err_str
-                            or "PERMISSION_DENIED" in err_str
-                            or "Missing or insufficient permissions" in err_str
-                        ):
-                            # Track D: synth-device-user can't read
-                            # users/{ownerUid}/researches/* under the
-                            # current rules (allow read: if request.auth.uid
-                            # == userId). The device-side queue at
-                            # devices/{deviceId}/queue/* is the source of
-                            # truth for new submissions; on-disk queues/
-                            # checkpoints handle mid-run resume. Skip
-                            # Firestore-side rehydration silently.
-                            #
-                            # Structural fix (cleanup #552): add a
-                            # `deviceMemberOf` Firestore rule analogous to
-                            # `deviceWritingTo` so the synth user can read
-                            # research docs routed to its device.
-                            log(
-                                f"[rehydrate:{status_val}] read denied (synth user can't read user-tree research docs) — relying on device-queue + on-disk state",
-                                "DEBUG",
-                            )
-                        else:
-                            log(f"Rehydrate query ({status_val}) failed: {e}", "WARN")
-                        continue
-                    for snap in snaps:
-                        data = snap.to_dict() or {}
-                        research_id = snap.id
-                        _rehydrated_rids.add(research_id)
-                        if status_val == "ongoing":
-                            # Sibling-claim guard (2026-05-22). If a
-                            # sibling worker on this device has the lock
-                            # for this research_id (.worker.N.lock with
-                            # live PID + fresh started_at), the sibling
-                            # is actively running the pipeline.
-                            # Auto-resuming locally would dual-spawn
-                            # (two browsers, two FE phase streams, two
-                            # Doc/Email writes). Skip both the auto-
-                            # resume AND the paused_backend_restart
-                            # marker — the sibling owns this run and
-                            # the FE should keep seeing "ongoing".
-                            #
-                            # Repro context: STOP killed worker 1, the
-                            # user fired a new submission while worker 1
-                            # was restarting, worker 2 claimed it via
-                            # the start-listener (Firestore queue doc
-                            # deleted post-claim — no Firestore signal
-                            # available 4s later when worker 1 booted),
-                            # worker 1 saw research status=ongoing +
-                            # queue_dir on disk and re-enqueued the
-                            # same job. The lock files are the only
-                            # cross-worker signal that survives queue-
-                            # doc deletion.
-                            _sibling_holders = _scan_sibling_locks_for_research(
-                                research_id, WORKER_ID
-                            )
-                            if _sibling_holders:
-                                h = _sibling_holders[0]
-                                _age_s = (int(time.time() * 1000) - h["started_at"]) // 1000
-                                log(
-                                    f"[rehydrate] {research_id[:24]}… already claimed by sibling "
-                                    f"worker {h['worker_id']} (PID {h['pid']}, started {_age_s}s ago) "
-                                    f"— skipping auto-resume + paused mark to avoid dual-spawn",
-                                    "INFO",
-                                )
-                                continue
-                            # Mid-run runs need either auto-resume (supervised
-                            # device — supervisor just respawned us, take the
-                            # natural next step and resume the runs too) or a
-                            # paused_backend_restart marker so the FE shows a
-                            # Resume CTA. Browser + CUA state is gone either
-                            # way, but checkpoints on disk
-                            # (documents/*.md + checkpoint.json + delivery.json
-                            # under queues/{run}/) let detect_resume_phase()
-                            # skip already-completed phases.
-                            #
-                            # Resolve the run's device's supervised flag — if
-                            # supervised, attempt auto-resume so the FE's
-                            # passive banner clears via pipeline_resumed
-                            # without any user click.
-                            device_id = data.get("deviceId") or ""
-                            is_supervised = False
-                            if device_id:
-                                # Track D: top-level devices/{deviceId} is the
-                                # canonical home; synth user CAN read its own
-                                # doc (rule: auth.uid == syntheticDeviceUid).
-                                # Legacy users/{ownerUid}/devices/{deviceId}
-                                # read 403s under synth auth, so try modern
-                                # first and only fall back on miss.
-                                try:
-                                    dev_snap = _firebase_db.collection("devices") \
-                                        .document(device_id).get()
-                                    if dev_snap.exists:
-                                        is_supervised = bool(
-                                            (dev_snap.to_dict() or {})
-                                            .get("supervised", False))
-                                except Exception as _de:
-                                    log(f"Rehydrate: top-level device read failed for {research_id[:24]}…: {_de}", "WARN")
-                                if not is_supervised:
-                                    try:
-                                        dev_snap = _firebase_db.collection("users") \
-                                            .document(paired_uid) \
-                                            .collection("devices") \
-                                            .document(device_id).get()
-                                        if dev_snap.exists:
-                                            is_supervised = bool(
-                                                (dev_snap.to_dict() or {})
-                                                .get("supervised", False))
-                                    except Exception:
-                                        # Synth user is denied on user-tree
-                                        # devices subcollection — expected.
-                                        pass
-
-                            auto_resumed = False
-                            if is_supervised:
-                                run_id = data.get("backendRunId") or ""
-                                if run_id:
-                                    queue_dir = Path(__file__).parent / "queues" / run_id
-                                    # Only auto-resume if the on-disk artifacts
-                                    # are intact and the run wasn't terminally
-                                    # stopped (.stop sentinel set by Stop /
-                                    # watchdog T3).
-                                    if queue_dir.exists() and not (queue_dir / ".stop").exists():
-                                        cp = load_checkpoint(queue_dir)
-                                        topic = (cp or {}).get("topic", "") or data.get("topic", "")
-                                        cfg = dict(data.get("pipelineConfig") or {})
-                                        if "skippedPhases" in cfg and "skipPhases" not in cfg:
-                                            cfg["skipPhases"] = cfg.pop("skippedPhases")
-                                        if topic:
-                                            # Clear any stale .pause signal so
-                                            # the resumed run drains immediately.
-                                            p_signal = queue_dir / ".pause"
-                                            if p_signal.exists():
-                                                try: p_signal.unlink()
-                                                except Exception: pass
-                                            if _safe_enqueue(_job_queue, {
-                                                "topic": topic,
-                                                "email": "",  # delivery prefs are on disk in delivery.json
-                                                "config": cfg,
-                                                "run_id": run_id,
-                                                "resume_dir": str(queue_dir),
-                                                "uid": paired_uid,
-                                                "research_id": research_id,
-                                            }, source="rehydrate-supervised-auto-resume"):
-                                                rehydrated += 1
-                                                auto_resumed = True
-                                                log(f"Rehydrate: auto-resumed {research_id[:24]}… on supervised device")
-
-                            if not auto_resumed:
-                                # Either unsupervised, or supervised-but-couldn't-
-                                # auto-resume (queue_dir missing, run_id absent,
-                                # .stop sentinel set, etc.). Mark
-                                # paused_backend_restart so the FE recovery
-                                # banner fires — actionable for unsupervised,
-                                # passive-with-2min-escalation for supervised.
-                                # #720: route through _update_research_doc so it
-                                # gets _be_payload's deviceId injection AND the
-                                # gRPC 403 self-heal — this fires at worker-1 boot,
-                                # the exact window a stale/claim-propagation-race
-                                # token would 403 and the FE Resume CTA never fire.
-                                if _update_research_doc(paired_uid, research_id, {
-                                    "status": "paused_backend_restart",
-                                    "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
-                                }):
-                                    orphaned += 1
-                                else:
-                                    log(f"Rehydrate: mark paused_backend_restart failed for {research_id}", "WARN")
-                        # queued-status branch removed 2026-05-22 — see
-                        # comment at the for-loop above for rationale.
-                        # The on_snapshot listener handles queued docs.
+                # #725 (DRY): owner-tree rehydration now delegates to the shared
+                # _rehydrate_ongoing_for_tree helper. The inline block this
+                # replaced was byte-for-byte the same logic (sibling-lock guard,
+                # modern-then-legacy supervised read, supervised auto-resume,
+                # paused_backend_restart mark); for the owner tree_uid ==
+                # owner_uid == paired_uid. Worker-gating, the _SkipRehydration
+                # sentinel, the sharer loop, and the aggregate log line stay here.
+                _own_r, _own_o = await _rehydrate_ongoing_for_tree(
+                    paired_uid, paired_uid, _rehydrated_rids)
+                rehydrated += _own_r
+                orphaned += _own_o
                 # #724 item 3 (flag-gated): the scan above is OWNER-tree only.
                 # A SHARER-submitted run lives in users/{sharer}/researches and
                 # was never marked paused_backend_restart on reconnect — it

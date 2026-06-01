@@ -179,29 +179,39 @@ def test_no_queue_dir_is_noop():
 
 
 # ── _sharer_rehydration_enabled ────────────────────────────────────────
+def test_sharer_rehydration_on_by_default(monkeypatch, tmp_path):
+    # #725: flipped default-ON after live validation. No env, config has no
+    # flag → enabled.
+    cfg = tmp_path / "research_config.json"
+    cfg.write_text(json.dumps({"deviceId": "d1"}), encoding="utf-8")
+    monkeypatch.setattr(research, "RESEARCH_CONFIG_PATH", cfg)
+    monkeypatch.delenv("ENABLE_SHARER_REHYDRATION", raising=False)
+    assert research._sharer_rehydration_enabled() is True
+
+
+def test_sharer_rehydration_on_when_no_config_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(research, "RESEARCH_CONFIG_PATH", tmp_path / "missing.json")
+    monkeypatch.delenv("ENABLE_SHARER_REHYDRATION", raising=False)
+    assert research._sharer_rehydration_enabled() is True
+
+
 def test_sharer_rehydration_env_var_arms(monkeypatch, tmp_path):
     monkeypatch.setattr(research, "RESEARCH_CONFIG_PATH", tmp_path / "research_config.json")
     monkeypatch.setenv("ENABLE_SHARER_REHYDRATION", "1")
     assert research._sharer_rehydration_enabled() is True
 
 
-def test_sharer_rehydration_config_file_arms(monkeypatch, tmp_path):
+def test_sharer_rehydration_env_disables(monkeypatch, tmp_path):
+    # Explicit env opt-out wins even over a config that says true.
     cfg = tmp_path / "research_config.json"
-    cfg.write_text(json.dumps({"deviceId": "d1", "enableSharerRehydration": True}), encoding="utf-8")
+    cfg.write_text(json.dumps({"enableSharerRehydration": True}), encoding="utf-8")
     monkeypatch.setattr(research, "RESEARCH_CONFIG_PATH", cfg)
-    monkeypatch.delenv("ENABLE_SHARER_REHYDRATION", raising=False)
-    assert research._sharer_rehydration_enabled() is True
+    for val in ("0", "false", "off", "no"):
+        monkeypatch.setenv("ENABLE_SHARER_REHYDRATION", val)
+        assert research._sharer_rehydration_enabled() is False, val
 
 
-def test_sharer_rehydration_off_by_default(monkeypatch, tmp_path):
-    cfg = tmp_path / "research_config.json"
-    cfg.write_text(json.dumps({"deviceId": "d1"}), encoding="utf-8")
-    monkeypatch.setattr(research, "RESEARCH_CONFIG_PATH", cfg)
-    monkeypatch.delenv("ENABLE_SHARER_REHYDRATION", raising=False)
-    assert research._sharer_rehydration_enabled() is False
-
-
-def test_sharer_rehydration_config_false_stays_off(monkeypatch, tmp_path):
+def test_sharer_rehydration_config_false_opts_out(monkeypatch, tmp_path):
     cfg = tmp_path / "research_config.json"
     cfg.write_text(json.dumps({"enableSharerRehydration": False}), encoding="utf-8")
     monkeypatch.setattr(research, "RESEARCH_CONFIG_PATH", cfg)

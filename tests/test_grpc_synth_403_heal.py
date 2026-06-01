@@ -269,10 +269,21 @@ def test_routed_writers_use_wrapped_helpers():
     assert "_set_research_doc(" in agent_src and ".collection(" not in agent_src, (
         "per-agent terminal status must route through _set_research_doc (#720)."
     )
-    server_src = inspect.getsource(research.run_server)
-    assert "_update_research_doc(paired_uid, research_id" in server_src, (
+    # #725 (DRY): the owner inline rehydration was migrated into
+    # _rehydrate_ongoing_for_tree (run_server now delegates to it for BOTH the
+    # owner and each sharer tree), so the paused_backend_restart mark lives in
+    # the helper. The invariant is unchanged — it must still route through
+    # _update_research_doc for deviceId injection + heal.
+    rehydrate_src = inspect.getsource(research._rehydrate_ongoing_for_tree)
+    assert "_update_research_doc(tree_uid, research_id" in rehydrate_src, (
         "rehydration's paused_backend_restart mark must route through "
         "_update_research_doc (deviceId injection + heal) (#720)."
+    )
+    # And run_server must actually delegate to the helper (no resurrected
+    # inline duplicate).
+    server_src = inspect.getsource(research.run_server)
+    assert "_rehydrate_ongoing_for_tree(" in server_src, (
+        "run_server must delegate rehydration to _rehydrate_ongoing_for_tree (#725 DRY)."
     )
 
 
