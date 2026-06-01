@@ -8996,6 +8996,22 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
             return "pro"
         if verdict.startswith("free"):
             return "free"
+        # #724 item 2: an ambiguous LIGHT-model verdict gets one escalated
+        # re-read on the heavy model (Opus 4.8) before we fall back to fail-open
+        # "unsure" — mirrors verify_login_cua's attempts>=2 rule (research.py
+        # ~9040). A fresh screenshot after a short settle covers the common
+        # case where the Pro/Free chrome simply hadn't finished rendering when
+        # the first shot was taken. heavy=True passes don't recurse (guard is
+        # `not heavy`), so this is at most ONE extra screenshot + Opus call,
+        # and only on a genuinely ambiguous verdict (not on infra failures,
+        # which return "unsure" above without reaching here).
+        if not heavy:
+            log(f"[pro_tier:{pname}] light verdict unsure ({raw[:30]!r}) — escalating to heavy re-read", "INFO")
+            try:
+                await asyncio.sleep(2.0)
+            except Exception:
+                pass
+            return await _cua_pro_tier_call(page, platform, cua_client, heavy=True)
         return "unsure"
     except Exception as e:
         err = str(e)
@@ -28522,6 +28538,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                            progress="Checking vision/CUA availability…")
                 try:
                     await _probe_cua_available(cua_client)
+                    # #724 item 4: a PRIOR failed probe iteration set the queue
+                    # gate's "_errored" flag via fail_phase; clear it now that
+                    # the probe succeeded, so a run that fully RECOVERED (user
+                    # fixed the key + Retry) isn't mis-flagged as errored in the
+                    # job-finally gate (which would short-circuit the next
+                    # dequeue's FE-P5 wait, "next run starts sooner"). Fail-open
+                    # no-op on a first-try success. See gate at job-finally
+                    # (_QUEUE_STATE.pop("_errored", ...)).
+                    try:
+                        _QUEUE_STATE.pop("_errored", None)
+                    except Exception:
+                        pass
                     break  # reachable — proceed to login walk / phases
                 except CuaUnavailableError as cua_err:
                     log(f"Phase 0: CUA availability probe failed — {cua_err}", "ERROR")
