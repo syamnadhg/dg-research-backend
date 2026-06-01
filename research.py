@@ -6932,6 +6932,37 @@ def _fire_fe_p4_trigger(uid, research_id):
     return False
 
 
+# #722 Bug A: save_meta() rebuilds the whole agents map + phases array and
+# propagates them with `.update({"agents": …, "phases": …})` — a whole-FIELD
+# REPLACE, not a recursive merge — which WIPES the per-agent/per-phase
+# `status` that _write_agent/phase_terminal_status wrote via merge moments
+# earlier. Result: chatgpt/claude/gemini icons never green-ticked on reload
+# (only FE-written gdocs/gmail status survived, because save_meta only rebuilds
+# the 3 P2 agents). Fix: record each terminal status SYNCHRONOUSLY here (keyed
+# by research id so a long-lived worker handling multiple runs never leaks
+# status across them) and re-stamp it onto the rebuilt entries inside
+# save_meta, so the clobbering whole-field write carries the status itself and
+# ordering vs the daemon-thread merge no longer matters.
+_agent_status_by_rid: dict = {}
+_phase_status_by_rid: dict = {}
+# Bound the per-rid status maps so a long-lived worker that processes many
+# runs can't grow them without limit. Each entry is tiny (a few platform/phase
+# → status strings); 64 recent runs is far more than any worker holds live.
+_STATUS_BY_RID_CAP = 64
+
+
+def _record_terminal_status(store: dict, rid: str, key, status: str) -> None:
+    """Synchronously record a terminal status under store[rid][key], evicting
+    the oldest rid (FIFO) once the cap is exceeded. Callers guarantee rid is
+    truthy (the public _write_* helpers early-return on a missing rid)."""
+    bucket = store.get(rid)
+    if bucket is None:
+        bucket = store[rid] = {}
+        while len(store) > _STATUS_BY_RID_CAP:
+            store.pop(next(iter(store)), None)
+    bucket[key] = status
+
+
 def _do_agent_terminal_status_write(agent_key: str, status: str):
     """Inner sync write — kept separate so the public _write_*
     helpers can fire-and-forget on a daemon thread, avoiding the
@@ -6991,6 +7022,11 @@ def _write_agent_terminal_status(agent_key: str, status: str):
         return
     if not agent_key or status not in ("complete", "skipped", "errored", "running"):
         return
+    # #722 Bug A: record synchronously (BEFORE the async write) so a
+    # concurrent save_meta() rebuild re-stamps this status onto its agents
+    # map instead of clobbering it. Carries the actual status (complete/
+    # skipped/errored/running), never a blanket "complete".
+    _record_terminal_status(_agent_status_by_rid, _fb_research_id, (agent_key or "").lower(), status)
     try:
         _threading.Thread(
             target=_do_agent_terminal_status_write,
@@ -7065,6 +7101,10 @@ def _write_phase_terminal_status(phase_num: int, status: str):
         return
     if status not in ("complete", "skipped", "errored", "running"):
         return
+    # #722 Bug A: record synchronously so save_meta()'s whole-array rebuild
+    # re-stamps this phase status (an array can't be dotted-merged, so the
+    # status MUST be carried in the rebuilt entries).
+    _record_terminal_status(_phase_status_by_rid, _fb_research_id, phase_num, status)
     try:
         _threading.Thread(
             target=_do_phase_terminal_status_write,
@@ -7633,6 +7673,13 @@ def _start_cli_command_reader(loop):
                     if tgt:
                         loop.call_soon_threadsafe(_controls.request_skip_agent, tgt)
                     loop.call_soon_threadsafe(_controls.request_resume)
+                elif pr == "cua_unavailable":
+                    # #705: cua_unavailable is a fail-closed INFRA gate — the P0
+                    # probe loop (research.py:28426) re-probes and ignores
+                    # skip_init_verify, so `s` would silently re-card forever.
+                    # Don't pretend to skip; tell the user the real recovery.
+                    log("[CMD] skip unavailable at cua_unavailable — vision/CUA is required infra. "
+                        "Fix the Anthropic key, then r) resume; or Ctrl+C to stop.")
                 elif ph == 0:
                     log(f"[CMD] skip phase {ph}")
                     # Phase 0's verify loop watches _controls.skip_init_verify,
@@ -7869,7 +7916,11 @@ class PipelineControls:
                 actions = f"  r) resume (re-check verification)   s) skip {target or 'agent'}"
             elif reason == "cua_unavailable":
                 header = "[PAUSE] cua_unavailable — fix Anthropic key/cap, then:"
-                actions = "  r) resume (retry CUA)   s) skip verification (bail to Phase 1)"
+                # #705: NO skip option. The P0 probe loop (research.py:28426)
+                # is fail-closed and ignores skip_init_verify — vision/CUA is
+                # required infra, not a login the user can wave past. Advertising
+                # `s` here only re-cards forever (Stop was the sole real exit).
+                actions = "  r) resume (retry CUA)   (Ctrl+C to stop — vision/CUA is required infrastructure)"
             elif reason:
                 header = f"[PAUSE] {reason} — waiting."
                 actions = "  r) resume   s) skip phase"
@@ -22683,6 +22734,13 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         #  • Stop pressed during the alert → return None
         #  • Continue with Free / generic resume → ack flag set, break
         #  • pro_warning_acknowledged already set on entry → break
+        # #705 item 5: silent Tier-1 retries before any pro_required card —
+        # a "no pro" verdict is usually a transient detection miss (cua_timeout
+        # / picker not yet rendered), not a real downgrade. Counter persists
+        # across loop iterations so a user-driven Retry re-escalates instead of
+        # silently swallowing a genuine no-Pro.
+        _pro_silent_retries = 0
+        _PRO_SILENT_RETRY_MAX = 2
         while True:
             log("Selecting Pro + Extended Thinking...")
             emit_event("agent_progress", phase=1, agent="chatgpt",
@@ -22709,11 +22767,24 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             if _controls.pro_warning_acknowledged:
                 log("Phase 1: Pro unavailable — user opted into Free at Phase 0 (continuing)", "INFO")
                 break
-            # Log the exact CUA verdict that triggered the escalation so a
-            # post-E2E review can tell a TRANSIENT detection miss (e.g.
-            # "no pro available (cua_timeout)", selector not yet rendered) from a
-            # genuine no-Pro subscription. The former is the Tier-1 silent-retry
-            # candidate (#705 item 5); the latter is a correct Tier-2 escalation.
+            # #705 item 5: Tier-1 silent retry. A "no pro" verdict is most often
+            # a TRANSIENT detection miss — the CUA selection timed out
+            # ("no pro available (cua_timeout)") or the model-picker menu hadn't
+            # finished rendering when CUA looked. Re-run PROMPT_SELECT_PRO a
+            # bounded number of times silently (no card, no pause) to recover
+            # those. A GENUINE no-Pro subscription returns "no pro" on every
+            # attempt, so we still escalate once the retries exhaust — the only
+            # cost on a real downgrade is a few extra seconds.
+            if _pro_silent_retries < _PRO_SILENT_RETRY_MAX:
+                _pro_silent_retries += 1
+                log(f"Phase 1: Pro selector returned no-Pro (verdict: {last[:80]!r}) — "
+                    f"silent retry {_pro_silent_retries}/{_PRO_SILENT_RETRY_MAX} before escalating", "INFO")
+                await asyncio.sleep(2)
+                continue
+            # Silent retries exhausted — this is a genuine downgrade (or a
+            # persistent detection failure). Log the exact CUA verdict so a
+            # post-E2E review can confirm it wasn't a transient miss, then
+            # escalate to the Tier-2 pro_required decision card.
             log(f"Phase 1: Pro mode not available (cua verdict: {last[:120]!r}) — Phase 0 was skipped or Pro was revoked; surfacing alert", "WARN")
             _emit_pro_required_alert(phase=1, agent="chatgpt", source="phase1/setup_pro_backstop")
             _controls.request_pause("pro_required")
@@ -24859,15 +24930,43 @@ async def check_hv_gate(browser, cua_client, platform: str, label: str,
     if not blocked:
         return True
     log(f"[{label}] Phase {phase}: HV gate detected ({reason or 'unknown'}) — clearing before phase work", "WARN")
-    try:
-        return await wait_for_verification_clearance(
-            browser, cua_client, browser.page,
-            platform=platform, label=label,
-            verbose=verbose, phase=phase,
-        )
-    except Exception as e:
-        log(f"[{label}] wait_for_verification_clearance errored: {e}", "WARN")
-        return False
+    # #705 item 6: Tier-1 silent retry around the clearance machinery. The
+    # clearance chain (Playwright → CUA → cooldown → kill-tab → user pause)
+    # already owns the Tier-2 user escalation as its FINAL tier and returns
+    # True/False normally. An EXCEPTION out of it (CUA blip, navigation
+    # timeout, page-context teardown) is transient infra noise — hard-failing
+    # the phase on it makes a self-recoverable hiccup look like a structural
+    # block. So on a raise: re-probe the gate (it often self-cleared while the
+    # machinery faulted) and, if still blocked, re-run the chain ONCE more
+    # before giving up. A genuine still-present gate just re-enters the chain
+    # and reaches the user pause as designed; we never swallow a real block.
+    #
+    # Cost note: the retry re-runs only on a RAISE (not the normal True/False
+    # return — the chain try/excepts each internal tier), which is a rare infra
+    # fault. Capped at one extra attempt, so worst case is two passes through
+    # the chain's 180s cooldown (~6 min) — acceptable for a rare exception
+    # recovery, and far better than hard-aborting the phase on transient noise.
+    for _hv_attempt in range(2):
+        try:
+            return await wait_for_verification_clearance(
+                browser, cua_client, browser.page,
+                platform=platform, label=label,
+                verbose=verbose, phase=phase,
+            )
+        except Exception as e:
+            log(f"[{label}] wait_for_verification_clearance errored "
+                f"(attempt {_hv_attempt + 1}/2): {e}", "WARN")
+            try:
+                still_blocked, _ = await detect_human_verification(browser.page, platform, label)
+            except Exception:
+                still_blocked = True
+            if not still_blocked:
+                log(f"[{label}] HV gate clear after a transient clearance error — proceeding silently", "INFO")
+                return True
+            if _hv_attempt == 0:
+                await asyncio.sleep(3)  # brief backoff before the single silent retry
+    log(f"[{label}] HV clearance failed after silent retry — aborting phase", "WARN")
+    return False
 
 
 async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=20):
@@ -27327,6 +27426,13 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
 
     # ── Per-agent stats (for analytics graphs, radar chart, health score) ──
     agents = meta.get("agents", {})
+    # #722 Bug A: snapshot any status ALREADY persisted (from a prior tick /
+    # a prior worker on resume) BEFORE the rebuild below replaces the entries
+    # wholesale — so the status re-stamp can fall back to it when the live
+    # runtime dict is empty (fresh resumed process).
+    _prior_agent_status = {
+        _p: ((agents.get(_p, {}) or {}).get("status")) for _p in ["chatgpt", "gemini", "claude"]
+    }
     for platform in ["chatgpt", "gemini", "claude"]:
         md_file = doc_dir / f"{platform}.md" if doc_dir.exists() else None
         if md_file and md_file.exists() and md_file.stat().st_size > 100:
@@ -27406,6 +27512,23 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
                 "observedSources": int(_snap.get("observed_sources", 0) or existing.get("observedSources", 0) or 0),
                 "progressHistory": _down_hist,
             }
+        # #722 Bug A: carry the per-agent terminal status (written by
+        # _write_agent_terminal_status) onto the entry for EVERY platform —
+        # NOT just those with a markdown file. A skipped/errored agent has no
+        # .md, so it never entered the rebuild above; without this, the
+        # whole-field .update({"agents": …}) below would DROP its merge-written
+        # status (the agent vanishes from the map entirely), reverting the tile
+        # to a stale all-green check. Runs once per platform regardless of md:
+        # use the live runtime status, falling back to a status already
+        # persisted in meta.json (survives resume into a fresh worker), and
+        # setdefault so a no-md skipped/errored agent still gets a minimal
+        # entry to hold the status. Config-disabled agents never call
+        # _write_agent_terminal_status and have no md, so _astat stays falsy →
+        # no spurious entry is created for them.
+        _astat = (_agent_status_by_rid.get(_fb_research_id, {}) or {}).get(platform) \
+            or _prior_agent_status.get(platform)
+        if _astat:
+            agents.setdefault(platform, {})["status"] = _astat
 
     # ── Phase timeline (for timeline graph) ──
     phases = meta.get("phases", [])
@@ -27437,6 +27560,20 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
         phases[phase]["completedAt"] = now_ms
         started = phases[phase].get("startedAt", now_ms)
         phases[phase]["durationSec"] = max(0, (now_ms - started) // 1000)
+
+    # #722 Bug A: carry per-phase terminal status onto the rebuilt entries.
+    # A Firestore array can't be dotted-merged, so the whole-array
+    # .update({"phases": …}) below always replaces it — the status that
+    # _write_phase_terminal_status wrote (via the daemon-thread read-modify-
+    # write) would be lost unless we re-stamp it here. Only overwrite when the
+    # runtime knows a status for that phase; otherwise leave any status already
+    # carried in meta.json (resume) intact.
+    _pstat = _phase_status_by_rid.get(_fb_research_id, {}) or {}
+    for _entry in phases:
+        if isinstance(_entry, dict):
+            _ps = _pstat.get(_entry.get("phase"))
+            if _ps:
+                _entry["status"] = _ps
 
     # ── Write meta ──
     meta.update({
