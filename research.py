@@ -2254,7 +2254,13 @@ def _sweep_stuck_research_docs(db, paired_uid: str, device_id: str, *,
             patch["queuedBehindRunId"] = _DF
             patch["queuedBehindTitle"] = _DF
         try:
-            snap.reference.update(patch)
+            # #720: _be_payload injects the deviceId deviceUpdatingFor REQUIRES
+            # (this was a raw dict → denied even with a fresh token), and the
+            # heal recovers a stale-token 403 (this runs on the long-lived
+            # device-command listener thread, where the token can be stale).
+            _grpc_write_with_heal(
+                lambda snap=snap, patch=patch: snap.reference.update(_be_payload(patch)),
+                what=f"sweep:{stopped_by} {snap.id[:8]}")
             swept_n += 1
         except Exception as _sw_err:
             swept_fail += 1
@@ -2848,13 +2854,18 @@ def _recompute_deferred_queue_positions_locked() -> None:
 
     CHUNK = 450
     for i in range(0, len(patches), CHUNK):
-        batch = _firebase_db.batch()
-        for uid_v, rid_v, patch in patches[i:i + CHUNK]:
-            ref = _firebase_db.collection("users").document(uid_v) \
-                .collection("researches").document(rid_v)
-            batch.update(ref, _be_payload(patch))
-        try:
+        chunk = patches[i:i + CHUNK]
+        def _commit_chunk(chunk=chunk):
+            batch = _firebase_db.batch()
+            for uid_v, rid_v, patch in chunk:
+                ref = _firebase_db.collection("users").document(uid_v) \
+                    .collection("researches").document(rid_v)
+                batch.update(ref, _be_payload(patch))
             batch.commit()
+        try:
+            # #720: heal a stale-token 403 on the renumber; rebuild the batch
+            # inside the op so a retry commits a fresh batch, not a consumed one.
+            _grpc_write_with_heal(_commit_chunk, what=f"deferred queue-pos batch [{i}:{i+CHUNK}]")
         except Exception as e:
             log(f"[deferred-recompute] batch commit failed [{i}:{i+CHUNK}]: {e}", "WARN")
 
@@ -3038,6 +3049,47 @@ def init_firebase():
     _firebase_db = client
     _firebase_down_reason = None
     log(f"Firestore client initialized ✓ (install={install_uuid[:8]}…)")
+    # #720: verify the gRPC client's freshly-minted idToken actually carries the
+    # deviceId custom claim the user-tree rules require. A claim-propagation race
+    # at bootstrap can mint a claim-less token; force one more refresh so the
+    # first real research write doesn't 403. Also surfaces a config-vs-claim
+    # deviceId mismatch (which force-refresh CAN'T fix — it needs a re-pair) at
+    # startup instead of buried under run-time 403s. Best-effort; never blocks.
+    try:
+        # The heal + _grpc_token_claims read the gRPC client's credential at the
+        # private `._credentials` attr. If a google-cloud-firestore upgrade
+        # renames it, the heal silently can't force-refresh — assert loudly.
+        try:
+            from auth.credentials import RefreshTokenCredentials as _RTC
+            _c = getattr(_firebase_db, "_credentials", None)
+            if not isinstance(_c, _RTC):
+                log(f"[init] ⚠ _firebase_db._credentials is {type(_c).__name__}, not "
+                    f"RefreshTokenCredentials — the #720 gRPC 403 self-heal is "
+                    f"NEUTERED (can't force-refresh); a google-cloud-firestore "
+                    f"upgrade likely moved the attr.", "WARN")
+        except Exception:
+            pass
+        claims = _grpc_token_claims()
+        cfg_did = _config_device_id_uncached()
+        tok_did = claims.get("deviceId")
+        if not tok_did:
+            creds = getattr(_firebase_db, "_credentials", None)
+            if creds is not None:
+                creds.refresh(None)
+                tok_did = _grpc_token_claims().get("deviceId")
+            log(f"[init] gRPC token lacked deviceId claim at bootstrap; "
+                f"re-refreshed → deviceId={tok_did!r}", "WARN")
+        if tok_did and cfg_did and tok_did != cfg_did:
+            log(f"[init] ⚠ gRPC token deviceId claim ({tok_did!r}) != config "
+                f"deviceId ({cfg_did!r}) — user-tree writes will 403 until "
+                f"re-pair reconciles them", "WARN")
+        elif tok_did:
+            log(f"[init] gRPC token deviceId claim ✓ ({tok_did!r})", "INFO")
+        else:
+            log("[init] ⚠ gRPC token carries NO deviceId claim even after "
+                "re-refresh — user-tree writes will 403; re-pair required", "WARN")
+    except Exception as _ve:
+        log(f"[init] token-claim verification skipped (non-fatal): {_ve}", "DEBUG")
     return True
 
 
@@ -3059,6 +3111,179 @@ def _be_payload(data: dict) -> dict:
         log("_be_payload: deviceId missing from research_config.json — re-pair required", "WARN")
         return data
     return {**data, "deviceId": did}
+
+
+# ── Track D synth-user 403 self-heal + instrumentation (#720) ──────────────
+# Every user-tree research write below authenticates as the synthetic device
+# user via the gRPC `_firebase_db` client, gated by the deviceMemberOf (read) /
+# deviceWritingTo (create) / deviceUpdatingFor (update) rules. Those require the
+# request's idToken to carry a `deviceId` custom claim AND (for writes) the
+# payload's deviceId to equal that claim AND the device doc to list this user.
+# The deployed rules, the synth user's persisted claims, and the device doc
+# were all verified CORRECT — yet writes 403 ("Missing or insufficient
+# permissions"; the flip masks it as "transaction has no transaction ID").
+#
+# The denying clause is NOT assumed. It could be (a) a cached token missing the
+# claim — read-side deviceMemberOf, which a force-refresh CLEARS; (b) a config-
+# vs-claim deviceId mismatch — write-side payload clause, which a refresh CANNOT
+# fix (needs re-pair); or (c) a device-ownership / doc-deviceId mismatch. So the
+# heal is empirical: on a synth-user 403 it force-refreshes the credential
+# (re-minting from the live claims) and retries ONCE, and LOGS the decoded
+# token.deviceId/ownerUid vs the UNCACHED config deviceId + the likely cause, so
+# the next run reveals which mechanism is actually at play rather than asserting
+# one. Throttled (≤1 force-refresh per cooldown) so a 403 storm can't hammer
+# securetoken; latches "structural" after N unhealed denials so a deterministic
+# mismatch escalates ONCE (re-pair required) instead of churning the keystore
+# for the whole run. All refreshes serialize via auth.credentials._REFRESH_LOCK
+# so the heal can't corrupt the keystore rotation.
+_GRPC_HEAL_COOLDOWN_S = 30.0
+# After this many consecutive heals that DON'T clear the denial, stop force-
+# refreshing (cause is structural — a refresh can't fix it) and escalate once.
+_GRPC_HEAL_STRUCTURAL_AFTER = 3
+_grpc_heal_last_ts = 0.0
+_grpc_heal_consec_fail = 0
+_grpc_heal_structural = False
+# The module-level `import threading as _threading` lives further down (~line
+# 4633); import here too so this lock resolves at import time (re-import is a
+# harmless rebind of the same module object).
+import threading as _threading  # noqa: E402
+_grpc_heal_lock = _threading.Lock()
+
+
+def _decode_jwt_claims(tok: "str | None") -> dict:
+    """Best-effort no-verify decode of a Firebase ID token's payload → dict.
+    Returns {} on any malformation; never raises. We only read claims for
+    diagnostics + the rules-visible deviceId, so signature verification is
+    irrelevant (Firestore verifies server-side)."""
+    if not tok or not isinstance(tok, str):
+        return {}
+    try:
+        import base64 as _b64
+        parts = tok.split(".")
+        if len(parts) != 3:
+            return {}
+        seg = parts[1]
+        seg += "=" * (-len(seg) % 4)
+        return json.loads(_b64.urlsafe_b64decode(seg.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _grpc_token_claims() -> dict:
+    """Decode the gRPC `_firebase_db` client's CURRENT cached idToken claims —
+    i.e. exactly what the Firestore rules evaluate for the next write. {} if
+    the client / credential / token is unavailable."""
+    creds = getattr(_firebase_db, "_credentials", None)
+    return _decode_jwt_claims(getattr(creds, "token", None)) if creds is not None else {}
+
+
+def _is_synth_permission_denied(exc: "BaseException | None") -> bool:
+    """True if `exc` (walking __cause__/__context__) is a Firestore rules
+    denial. Covers google.api_core.exceptions.PermissionDenied AND the
+    transactional wrapper's "transaction has no transaction ID" ValueError
+    that masks a denied read inside `_flip_queued_to_ongoing`."""
+    seen: "set[int]" = set()
+    stack = [exc]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if type(e).__name__ == "PermissionDenied":
+            return True
+        s = str(e)
+        if "Missing or insufficient permissions" in s or "PERMISSION_DENIED" in s:
+            return True
+        stack.append(getattr(e, "__cause__", None))
+        stack.append(getattr(e, "__context__", None))
+    return False
+
+
+def _config_device_id_uncached() -> "str | None":
+    """Read deviceId straight from research_config.json, bypassing the module
+    `load_device_id()` cache. The cache can hold a STALE deviceId after a
+    mid-process re-pair, which would poison the heal's config-vs-claim
+    diagnostic — so the diagnostic must compare against the file's live value."""
+    try:
+        with open(RESEARCH_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return (json.load(f) or {}).get("deviceId")
+    except Exception:
+        return None
+
+
+def _grpc_write_with_heal(op, *, what: str):
+    """Run a gRPC user-tree write `op` (a zero-arg callable). On a synth-user
+    rules denial, force the credential to re-mint a claim-bearing idToken and
+    retry `op` ONCE; re-raise so the caller's existing try/except still logs +
+    degrades. Throttled to ≤1 force-refresh per `_GRPC_HEAL_COOLDOWN_S`; latches
+    structural after `_GRPC_HEAL_STRUCTURAL_AFTER` unhealed denials. Logs the
+    token vs (uncached) config deviceId + the likely denying clause so the true
+    mechanism is diagnosable (#720)."""
+    global _grpc_heal_last_ts, _grpc_heal_consec_fail, _grpc_heal_structural
+    try:
+        result = op()
+        # A write just succeeded → any prior denial is resolved; drop the latch.
+        if _grpc_heal_consec_fail or _grpc_heal_structural:
+            with _grpc_heal_lock:
+                _grpc_heal_consec_fail = 0
+                _grpc_heal_structural = False
+        return result
+    except Exception as exc:
+        if not _is_synth_permission_denied(exc):
+            raise
+        # Throttle + structural latch under the lock so concurrent worker
+        # threads can't all slip past the cooldown and fire simultaneous heals.
+        with _grpc_heal_lock:
+            now = time.time()
+            if _grpc_heal_structural or (now - _grpc_heal_last_ts < _GRPC_HEAL_COOLDOWN_S):
+                # Structural (a refresh won't fix it), or just force-refreshed —
+                # let the caller degrade this write rather than churn securetoken.
+                raise
+            _grpc_heal_last_ts = now
+        before = _grpc_token_claims()
+        cfg_did = _config_device_id_uncached()
+        healed_did = None
+        creds = getattr(_firebase_db, "_credentials", None)
+        try:
+            if creds is not None:
+                creds.refresh(None)  # serialized + coalesced re-mint (live claims)
+                healed_did = _grpc_token_claims().get("deviceId")
+        except Exception as ref_e:
+            log(f"[grpc-heal] {what}: force-refresh failed: {ref_e}", "WARN")
+        tok_did = before.get("deviceId")
+        if not tok_did:
+            cause = "token MISSING deviceId claim — read-side deviceMemberOf (a refresh CLEARS this)"
+        elif cfg_did and tok_did != cfg_did:
+            cause = (f"token/config deviceId MISMATCH ({tok_did!r} != {cfg_did!r}) — "
+                     "write-side payload clause; force-refresh CANNOT fix, re-pair")
+        else:
+            cause = "token+config deviceId AGREE — deviceOwnership / doc-deviceId mismatch"
+        log(
+            f"[grpc-heal] {what}: synth-user 403. token.deviceId={tok_did!r} "
+            f"ownerUid={before.get('ownerUid')!r} | config deviceId={cfg_did!r} | "
+            f"likely cause: {cause} | after force-refresh deviceId={healed_did!r}. "
+            f"Retrying once.",
+            "WARN",
+        )
+        try:
+            result = op()  # retry with the freshly-minted token
+            with _grpc_heal_lock:
+                _grpc_heal_consec_fail = 0
+            return result
+        except Exception:
+            with _grpc_heal_lock:
+                _grpc_heal_consec_fail += 1
+                if (_grpc_heal_consec_fail >= _GRPC_HEAL_STRUCTURAL_AFTER
+                        and not _grpc_heal_structural):
+                    _grpc_heal_structural = True
+                    log(
+                        f"[grpc-heal] STRUCTURAL: {_grpc_heal_consec_fail} consecutive "
+                        f"heals failed to clear the synth-user 403 ({cause}). A force-"
+                        f"refresh cannot fix this — re-pair required. Suppressing further "
+                        f"force-refreshes until a write succeeds.",
+                        "ERROR",
+                    )
+            raise
 
 
 _start_listener = None  # Global start-command listener
@@ -4795,17 +5020,19 @@ def save_audio_to_firestore(audio_id: str, name: str, duration_sec: int, audio_u
         return
     try:
         mins, secs = divmod(max(0, int(duration_sec)), 60)
-        _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id) \
-            .collection("audios").document(audio_id) \
-            .set(_be_payload({
-                "id": audio_id,
-                "name": name,
-                "duration": f"{mins}:{secs:02d}" if duration_sec else "",
-                "durationSec": int(duration_sec or 0),
-                "createdAt": int(time.time() * 1000),
-                **({"audioUrl": audio_url} if audio_url else {}),
-            }))
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(_fb_uid)
+                .collection("researches").document(_fb_research_id)
+                .collection("audios").document(audio_id)
+                .set(_be_payload({
+                    "id": audio_id,
+                    "name": name,
+                    "duration": f"{mins}:{secs:02d}" if duration_sec else "",
+                    "durationSec": int(duration_sec or 0),
+                    "createdAt": int(time.time() * 1000),
+                    **({"audioUrl": audio_url} if audio_url else {}),
+                })),
+            what=f"audio {audio_id}")
     except Exception as e:
         log(f"Failed to sync audio to Firestore: {e}", "WARN")
 
@@ -4831,17 +5058,19 @@ def save_document_to_firestore(doc_type: str, content: str, name: str | None = N
     if not content or not content.strip():
         return False
     try:
-        _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id) \
-            .collection("documents").document(doc_type) \
-            .set(_be_payload({
-                "id": doc_type,
-                "name": name or f"{doc_type}.md",
-                "type": doc_type,
-                "content": content,
-                "size": f"{len(content) / 1024:.0f} KB",
-                "createdAt": int(time.time() * 1000),
-            }))
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(_fb_uid)
+                .collection("researches").document(_fb_research_id)
+                .collection("documents").document(doc_type)
+                .set(_be_payload({
+                    "id": doc_type,
+                    "name": name or f"{doc_type}.md",
+                    "type": doc_type,
+                    "content": content,
+                    "size": f"{len(content) / 1024:.0f} KB",
+                    "createdAt": int(time.time() * 1000),
+                })),
+            what=f"document {doc_type}")
         return True
     except Exception as e:
         # F5 (2026-05-13): include exception class + gRPC/HTTP status code
@@ -6395,9 +6624,12 @@ def _emit_to_firestore(event):
         "expireAt": datetime.now(timezone.utc) + timedelta(days=30),
     }
     try:
-        _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id) \
-            .collection("pipeline_events").add(_be_payload(doc_data))
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(_fb_uid)
+                .collection("researches").document(_fb_research_id)
+                .collection("pipeline_events").add(_be_payload(doc_data)),
+            what="emit_event",
+        )
     except Exception as e:
         log(f"Firestore emit failed: {e}", "WARN")
 
@@ -6434,9 +6666,12 @@ def update_link_in_firestore(kind: str, url: str, **fields):
         return
     payload = {"url": url, **fields}
     try:
-        _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id) \
-            .set(_be_payload({"links": {kind: payload}}), merge=True)
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(_fb_uid)
+                .collection("researches").document(_fb_research_id)
+                .set(_be_payload({"links": {kind: payload}}), merge=True),
+            what=f"link {kind}",
+        )
     except Exception as e:
         log(f"Firestore link update failed ({kind}): {e}", "WARN")
 
@@ -6468,9 +6703,12 @@ def append_user_source_in_firestore(kind: str, url: str, label: str = "", phase:
             "phase": phase,
             "ts": int(time.time() * 1000),
         }
-        _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id) \
-            .set({"userSources": _gcfs.ArrayUnion([entry])}, merge=True)
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(_fb_uid)
+                .collection("researches").document(_fb_research_id)
+                .set(_be_payload({"userSources": _gcfs.ArrayUnion([entry])}), merge=True),
+            what=f"userSource {entry['kind']}",
+        )
     except Exception as e:
         log(f"Firestore userSources append failed ({kind}): {e}", "WARN")
 
@@ -6558,9 +6796,12 @@ def _update_research_doc(uid: str, research_id: str, updates: dict) -> bool:
     if not _firebase_db or not uid or not research_id:
         return False
     try:
-        _firebase_db.collection("users").document(uid) \
-            .collection("researches").document(research_id) \
-            .update(_be_payload(updates))
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(uid)
+                .collection("researches").document(research_id)
+                .update(_be_payload(updates)),
+            what=f"update research {research_id[:8]}…",
+        )
         return True
     except Exception as e:
         log(
@@ -6580,9 +6821,12 @@ def _set_research_doc(uid: str, research_id: str, data: dict, *, merge: bool = T
     if not _firebase_db or not uid or not research_id:
         return False
     try:
-        _firebase_db.collection("users").document(uid) \
-            .collection("researches").document(research_id) \
-            .set(_be_payload(data), merge=merge)
+        _grpc_write_with_heal(
+            lambda: _firebase_db.collection("users").document(uid)
+                .collection("researches").document(research_id)
+                .set(_be_payload(data), merge=merge),
+            what=f"set research {research_id[:8]}…",
+        )
         return True
     except Exception as e:
         log(
@@ -6695,13 +6939,11 @@ def _do_agent_terminal_status_write(agent_key: str, status: str):
     sync Firestore I/O on the main asyncio loop."""
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return
-    try:
-        ak = (agent_key or "").lower()
-        _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id) \
-            .set({"agents": {ak: {"status": status}}}, merge=True)
-    except Exception as e:
-        log(f"Firestore agent-status write failed ({agent_key}={status}): {e}", "WARN")
+    # #720: route through _set_research_doc so the write carries _be_payload's
+    # deviceId (deviceUpdatingFor's payload clause REQUIRES it — a raw dict
+    # 403s even with a fresh token) AND gets the gRPC 403 self-heal.
+    ak = (agent_key or "").lower()
+    _set_research_doc(_fb_uid, _fb_research_id, {"agents": {ak: {"status": status}}}, merge=True)
 
 
 def _write_agent_terminal_status(agent_key: str, status: str):
@@ -6764,9 +7006,14 @@ def _do_phase_terminal_status_write(phase_num: int, status: str):
     """Inner sync write — see _do_agent_terminal_status_write rationale."""
     if not _firebase_db or not _fb_uid or not _fb_research_id:
         return
-    try:
-        ref = _firebase_db.collection("users").document(_fb_uid) \
-            .collection("researches").document(_fb_research_id)
+    ref = _firebase_db.collection("users").document(_fb_uid) \
+        .collection("researches").document(_fb_research_id)
+
+    def _op():
+        # #720: the .get() is itself deviceMemberOf-gated, so a stale token 403s
+        # the READ too — wrap the whole read+upsert+update so the heal's force-
+        # refresh re-runs both. _be_payload the update (deviceUpdatingFor's
+        # payload clause REQUIRES deviceId; a raw dict 403s even fresh).
         snap = ref.get()
         data = (snap.to_dict() or {}) if snap.exists else {}
         phases = list(data.get("phases") or [])
@@ -6780,7 +7027,10 @@ def _do_phase_terminal_status_write(phase_num: int, status: str):
         if not found:
             phases.append({"phase": phase_num, "label": f"Phase {phase_num}",
                            "startedAt": int(time.time() * 1000), "status": status})
-        ref.update({"phases": phases})
+        ref.update(_be_payload({"phases": phases}))
+
+    try:
+        _grpc_write_with_heal(_op, what=f"phase-status phase={phase_num}")
     except Exception as e:
         log(f"Firestore phase-status write failed (phase={phase_num}, status={status}): {e}", "WARN")
 
@@ -6881,7 +7131,7 @@ def _start_command_listener(uid, research_id, loop):
     try:
         for d in col_ref.where("processed", "==", True).stream():
             try:
-                d.reference.delete()
+                _grpc_write_with_heal(lambda d=d: d.reference.delete(), what="cmd-sweep delete")
             except Exception:
                 pass
     except Exception as _sweep_err:
@@ -6927,7 +7177,9 @@ def _start_command_listener(uid, research_id, loop):
                         # Mark processed so it stops replaying on future
                         # attaches, but do NOT execute.
                         try:
-                            doc.reference.update({"processed": True, "staleSkipped": True})
+                            _grpc_write_with_heal(
+                                lambda: doc.reference.update({"processed": True, "staleSkipped": True}),
+                                what="cmd stale-skip mark")
                         except Exception:
                             pass
                         continue
@@ -6939,10 +7191,12 @@ def _start_command_listener(uid, research_id, loop):
                 # effects, just mark the doc processed with a pongedAt
                 # timestamp the watchdog can read back.
                 try:
-                    doc.reference.update({
-                        "processed": True,
-                        "pongedAt": int(time.time() * 1000),
-                    })
+                    _grpc_write_with_heal(
+                        lambda: doc.reference.update({
+                            "processed": True,
+                            "pongedAt": int(time.time() * 1000),
+                        }),
+                        what="cmd ping pong")
                 except Exception:
                     pass
                 continue
@@ -6955,7 +7209,9 @@ def _start_command_listener(uid, research_id, loop):
                 # the next serve replays it the moment the listener
                 # reattaches — killing the fresh session within seconds.
                 try:
-                    doc.reference.update({"processed": True})
+                    _grpc_write_with_heal(
+                        lambda: doc.reference.update({"processed": True}),
+                        what="cmd stop mark")
                 except Exception:
                     pass
                 loop.call_soon_threadsafe(_controls.request_stop)
@@ -7261,7 +7517,9 @@ def _start_command_listener(uid, research_id, loop):
                         # schedule the server exit. Previously this path set
                         # only the event, leaving the backend alive.
                         try:
-                            doc.reference.update({"processed": True})
+                            _grpc_write_with_heal(
+                                lambda: doc.reference.update({"processed": True}),
+                                what="cmd agent-decision-stop mark")
                         except Exception:
                             pass
                         loop.call_soon_threadsafe(_controls.request_stop)
@@ -7280,7 +7538,7 @@ def _start_command_listener(uid, research_id, loop):
             # os._exit may kill the buffered delete. Ping action also keeps
             # update() because pingBackendForResearch reads pongedAt back.
             try:
-                doc.reference.delete()
+                _grpc_write_with_heal(lambda: doc.reference.delete(), what="cmd tail delete")
             except Exception:
                 pass
 
@@ -30410,7 +30668,19 @@ async def run_server(port=8000):
                                         "pipeline_events", "commands"):
                                 try:
                                     for sd in ref.collection(sub).stream():
-                                        try: sd.reference.delete()
+                                        try:
+                                            # #720: `commands` deletes are
+                                            # deviceMemberOf-gated (heal-eligible on a
+                                            # stale token); the other four + the doc
+                                            # are OWNER-ONLY in rules (synth user denied
+                                            # by design), so leave those bare — wrapping
+                                            # them would false-fire the structural latch.
+                                            if sub == "commands":
+                                                _grpc_write_with_heal(
+                                                    lambda sd=sd: sd.reference.delete(),
+                                                    what="cascade-sweep cmd delete")
+                                            else:
+                                                sd.reference.delete()
                                         except Exception: pass
                                 except Exception: pass
                             try: ref.delete()
@@ -30762,7 +31032,14 @@ async def run_server(port=8000):
                 }))
                 return "flipped"
 
-            outcome = _flip_txn(_firebase_db.transaction())
+            # #720: a stale gRPC idToken (missing the deviceId claim) makes the
+            # transaction's first READ fail deviceMemberOf → google-cloud-firestore
+            # masks it as "transaction has no transaction ID". Heal re-mints a
+            # claim-bearing token and re-runs with a FRESH transaction object.
+            outcome = _grpc_write_with_heal(
+                lambda: _flip_txn(_firebase_db.transaction()),
+                what=f"flip queued→ongoing {research_id_val[:8]}…",
+            )
             if outcome.startswith("skipped"):
                 log(f"[flip] {research_id_val[:8]}… {outcome} — leaving status as-is (cancel race won)", "INFO")
             elif outcome == "missing":
@@ -30855,13 +31132,18 @@ async def run_server(port=8000):
             patches.append((uid_v, rid_v, patch))
         CHUNK = 450
         for i in range(0, len(patches), CHUNK):
-            batch = _firebase_db.batch()
-            for uid_v, rid_v, patch in patches[i:i + CHUNK]:
-                ref = _firebase_db.collection("users").document(uid_v) \
-                    .collection("researches").document(rid_v)
-                batch.update(ref, _be_payload(patch))
-            try:
+            chunk = patches[i:i + CHUNK]
+            def _commit_chunk(chunk=chunk):
+                batch = _firebase_db.batch()
+                for uid_v, rid_v, patch in chunk:
+                    ref = _firebase_db.collection("users").document(uid_v) \
+                        .collection("researches").document(rid_v)
+                    batch.update(ref, _be_payload(patch))
                 batch.commit()
+            try:
+                # #720: heal a stale-token 403 on the renumber; rebuild the batch
+                # inside the op so a retry commits a fresh batch, not a consumed one.
+                _grpc_write_with_heal(_commit_chunk, what=f"queue-pos batch [{i}:{i+CHUNK}]")
             except Exception as e:
                 log(f"Failed to commit queue-position batch [{i}:{i+CHUNK}]: {e}", "WARN")
 
@@ -31832,7 +32114,15 @@ async def run_server(port=8000):
                                 "pipeline_events", "commands"):
                         try:
                             for sd in research_ref.collection(sub).stream():
-                                try: sd.reference.delete()
+                                try:
+                                    # #720: only the deviceMemberOf-gated `commands`
+                                    # delete is heal-eligible; the rest are owner-only.
+                                    if sub == "commands":
+                                        _grpc_write_with_heal(
+                                            lambda sd=sd: sd.reference.delete(),
+                                            what="delete_run cmd delete")
+                                    else:
+                                        sd.reference.delete()
                                 except Exception: pass
                         except Exception as _se:
                             log(f"[delete_run] subcollection {sub} sweep: {_se}", "WARN")
@@ -32345,14 +32635,18 @@ async def run_server(port=8000):
                                 # paused_backend_restart so the FE recovery
                                 # banner fires — actionable for unsupervised,
                                 # passive-with-2min-escalation for supervised.
-                                try:
-                                    researches_col.document(research_id).update({
-                                        "status": "paused_backend_restart",
-                                        "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
-                                    })
+                                # #720: route through _update_research_doc so it
+                                # gets _be_payload's deviceId injection AND the
+                                # gRPC 403 self-heal — this fires at worker-1 boot,
+                                # the exact window a stale/claim-propagation-race
+                                # token would 403 and the FE Resume CTA never fire.
+                                if _update_research_doc(paired_uid, research_id, {
+                                    "status": "paused_backend_restart",
+                                    "summary": "Backend restarted mid-run — hit Resume to pick up from the last checkpoint.",
+                                }):
                                     orphaned += 1
-                                except Exception as e:
-                                    log(f"Rehydrate: mark paused_backend_restart failed for {research_id}: {e}", "WARN")
+                                else:
+                                    log(f"Rehydrate: mark paused_backend_restart failed for {research_id}", "WARN")
                         # queued-status branch removed 2026-05-22 — see
                         # comment at the for-loop above for rationale.
                         # The on_snapshot listener handles queued docs.

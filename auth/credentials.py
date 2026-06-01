@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
 from typing import Any
 
 import google.auth.credentials
@@ -32,6 +33,21 @@ from . import keystore
 log = logging.getLogger(__name__)
 
 _SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
+
+# #720: PROCESS-WIDE refresh lock shared by EVERY RefreshTokenCredentials
+# instance. Multiple independent refreshers rotate the SAME single keystore
+# refresh token: google-auth's on-expiry refresh (fired by the gRPC
+# AuthMetadataPlugin metadata thread), the #720 gRPC-write 403 self-heal,
+# init_firebase's startup force-refresh, and _fresh_user_mode_id_token's
+# transient creds. Each refresh does `keystore.set("pending", RT_new)` then
+# `keystore.promote_pending()` — a non-atomic multi-step keyring sequence. If
+# two refreshes interleave it, `current` can end up holding a refresh token
+# that securetoken already rotated away (Firebase invalidates the prior
+# refresh_token when it mints a new one) → INVALID_REFRESH_TOKEN → spurious
+# RevokedError + keystore wipe + re-pair prompt. Serializing the whole
+# read→POST→set→promote sequence behind one shared lock makes rotation atomic
+# across all refreshers in the process.
+_REFRESH_LOCK = threading.Lock()
 
 # Refresh proactively a few minutes before expiry to absorb clock skew + the
 # round-trip latency to securetoken.googleapis.com. Per PairingRecipe §3.3.
@@ -102,6 +118,23 @@ class RefreshTokenCredentials(google.auth.credentials.Credentials):
     # -- google.auth.credentials.Credentials interface ------------------------
 
     def refresh(self, request: Any) -> None:  # noqa: ARG002 - signature dictated by base class
+        # #720: capture the pre-wait token, then serialize behind the shared
+        # lock. COALESCE — if another refresh on THIS credential already
+        # replaced the token while we waited for the lock, reuse it instead of
+        # firing a redundant securetoken POST + keystore rotation. Both
+        # google-auth's expiry refresh and the 403 self-heal want "the newest
+        # token", so coalescing is correct for both and collapses a burst of
+        # concurrent heals (emit_event fires thousands of times/run) into a
+        # single rotation.
+        prev_token = self.token
+        with _REFRESH_LOCK:
+            if self.token is not None and self.token != prev_token:
+                return
+            self._refresh_locked()
+
+    def _refresh_locked(self) -> None:
+        """The actual securetoken exchange + keystore rotation. MUST be called
+        with `_REFRESH_LOCK` held (see refresh())."""
         refresh_token = keystore.get("current", self._install_uuid)
         if not refresh_token:
             raise RevokedError("no refresh token in keystore")
