@@ -32789,6 +32789,13 @@ async def run_server(port=8000):
             # queue docs on next dequeue.
             rehydrated = 0
             orphaned = 0
+            if WORKER_ID == 1:
+                # #724 item 3: surface the flag state at boot so a validation run
+                # can confirm BOTH that the new code is loaded (this line exists)
+                # AND whether sharer-tree rehydration is armed — removes the
+                # PowerShell-`set`-didn't-take ambiguity.
+                log(f"[rehydration] ENABLE_SHARER_REHYDRATION="
+                    f"{'on' if os.environ.get('ENABLE_SHARER_REHYDRATION') == '1' else 'off'}", "INFO")
             if WORKER_ID != 1:
                 log(f"[rehydration] worker {WORKER_ID}: skipping Firestore rehydration (worker-1-only)", "INFO")
             try:
