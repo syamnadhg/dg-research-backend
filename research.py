@@ -3372,6 +3372,29 @@ def load_device_id():
     return None
 
 
+def _sharer_rehydration_enabled() -> bool:
+    """#724 item 3 / #725 item 6: sharer-tree rehydration is armed by EITHER
+    the `ENABLE_SHARER_REHYDRATION=1` environment variable OR a
+    `research_config.json` entry `{"enableSharerRehydration": true}`.
+
+    The config-file fallback exists because a Windows User-scope env var did
+    NOT propagate to the relaunched daemon (the supervisor that respawns the
+    worker inherited the OLD process environment, so the boot log kept
+    reporting `=off`). The JSON file is re-read from disk on every boot, so a
+    flag flipped there always takes effect on the next worker start. Reads via
+    the same `Path` + `json` path used for `deviceId` — fully cross-platform
+    (Windows / Linux / macOS); no shell-specific env quoting involved."""
+    if os.environ.get("ENABLE_SHARER_REHYDRATION") == "1":
+        return True
+    try:
+        if RESEARCH_CONFIG_PATH.exists():
+            cfg = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+            return bool(cfg.get("enableSharerRehydration"))
+    except Exception:
+        pass
+    return False
+
+
 def load_poll_secret() -> str | None:
     """Track D — the 256-bit pollSecret for the BE-only path-key under which
     the FE claim Cloud Function writes the customToken. Lives in
@@ -27685,12 +27708,85 @@ def detect_resume_phase(queue_dir):
     return 0, "Starting from Phase 0 (Init)"
 
 
+# ── Browser-crash recovery (#725) ───────────────────────────────────────────
+# Max CONSECUTIVE silent browser-crash auto-retries before run_pipeline
+# escalates to a user-facing Retry/Skip card. 2 silent retries = 3 total
+# browser launches before we involve the human. Threaded through run_pipeline's
+# `_crash_retries` param (NOT _runtime, which `reset()`s per run).
+BROWSER_CRASH_MAX_RETRIES = 2
+
+
+def _is_browser_close_error(exc) -> bool:
+    """True when `exc` is a Chromium/patchright "the page or browser went away"
+    failure — the user closed the window, an OOM kill, a profile-lock fight, or
+    a driver EPIPE. Reuses the SAME string set the navigate() retry path keys
+    on (see ~research.py:15975). These strings originate in the CDP driver, not
+    the OS, so they read identically on Windows / Linux / macOS — the
+    classification is fully cross-platform. `TargetClosedError` is matched by
+    type name so a future message-wording change still classifies."""
+    msg = (str(exc) or "").lower()
+    tname = type(exc).__name__.lower()
+    return (
+        "target page" in msg
+        or "page, context" in msg
+        or "context or browser has been closed" in msg
+        or "browser has been closed" in msg
+        or "bring_to_front" in msg
+        or "targetclosed" in tname
+    )
+
+
+def _plan_pipeline_auto_retry(queue_dir, resume_dir, failure_kind, crash_retries):
+    """SINGLE source of truth for run_pipeline's post-failure auto-retry
+    decision. Returns (will_retry: bool, phase: int, is_browser_crash: bool).
+
+    Called TWICE per failed run with identical inputs: once inside the
+    top-level `except` (to decide whether to SUPPRESS the user-facing card
+    while a silent retry is incoming — per the "silent self-heal" rule), and
+    once in the post-`finally` block (to actually recurse). It's a pure
+    function of on-disk state (delivery.json status, .stop/.pause sentinels,
+    detect_resume_phase) plus the threaded crash counter; the only thing the
+    `finally` mutates between the two calls is `browser.close()`, which touches
+    no queue_dir files — so the two evaluations always agree (no divergence
+    where we'd hide the card but then NOT retry, or vice-versa)."""
+    is_crash = (failure_kind == "browser_crash")
+    if not queue_dir:
+        return (False, 0, is_crash)
+    # Gate 1 — retry budget. A NORMAL (non-crash) failure gets ONE shot: the
+    # first run has resume_dir=None, the recursion sets it, so a second normal
+    # failure surfaces the card. A browser crash bypasses that gate but is
+    # capped at BROWSER_CRASH_MAX_RETRIES consecutive silent retries.
+    crash_budget_ok = crash_retries < BROWSER_CRASH_MAX_RETRIES
+    if not ((not resume_dir) or (is_crash and crash_budget_ok)):
+        return (False, 0, is_crash)
+    # Gate 2 — terminal/intentional states never auto-retry.
+    try:
+        d_path = queue_dir / "delivery.json"
+        d_status = json.loads(d_path.read_text(encoding="utf-8")).get("status") if d_path.exists() else ""
+    except Exception:
+        d_status = ""
+    if d_status in ("completed", "stopped", "paused"):
+        return (False, 0, is_crash)
+    if (queue_dir / ".stop").exists() or (queue_dir / ".pause").exists():
+        return (False, 0, is_crash)
+    # Gate 3 — phase eligibility. Phase 5 = BE done (FE owns P5); >4 = nothing
+    # to retry. A browser crash can surface at phase 0/1 (brief not yet written
+    # → detect_resume_phase returns 0), which the legacy `1 < phase` gate
+    # EXCLUDED — that was the #725 bug (a phase-1 Chrome-close never retried).
+    # Include phases 0-4 for crashes; keep the conservative 2-4 window for
+    # normal one-shot retries (a blind retry of a phase-0/1 setup/brief failure
+    # rarely helps and is better surfaced to the user).
+    phase, _ = detect_resume_phase(queue_dir)
+    eligible = (1 < phase <= 4) or (is_crash and 0 <= phase <= 4)
+    return (eligible, phase, is_crash)
+
+
 # ── Main Pipeline ─────────────────────────────────────────────────────────────
 
 async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        api_key=None, email=None, resume_dir=None, config=None,
                        run_id=None, uid=None, research_id=None, brief_text="",
-                       user_sources=None, user_links=None):
+                       user_sources=None, user_links=None, _crash_retries=0):
     """Run the full pipeline. Supports resume from a previous queue directory.
 
     brief_text (2026-04): inline brief content passed from the frontend when
@@ -28430,6 +28526,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # paths below re-create the Browser and re-assign this ref.
     global _active_browser_ref
     _active_browser_ref = browser
+    # #725: snapshotted in the except (BEFORE the finally's _runtime.reset()
+    # wipes last_failure_kind) and read by the post-finally auto-retry block.
+    # Pre-initialized so the clean-exit path (no exception) reads "".
+    _captured_failure_kind = ""
     try:
         # ══════════════════════ PHASE 0: Preflight ══════════════════════
         # Phase 0 does real work now: launch browser, verify each platform's
@@ -30684,12 +30784,59 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 last_phase = rp
         except Exception:
             pass
-        fail_phase(
-            phase=last_phase,
-            error="Something went wrong",
-            reason="The run hit an unexpected error and stopped. Retry to start this step again, or Skip it.",
-            agent=None,
-        )
+        # ── #725: browser-crash classification + silent self-heal ──
+        # A mid-run Chrome death (window closed, OOM, profile-lock fight,
+        # driver EPIPE) lands here as a TargetClosedError-class exception. A
+        # deep poll-loop site may already have tagged last_failure_kind, but
+        # crashes that raise straight out of navigate()/bring_to_front() never
+        # reach that site — so classify from the exception itself here too.
+        # This is the catch-all that makes the recovery phase-agnostic.
+        if _is_browser_close_error(e):
+            _runtime.last_failure_kind = "browser_crash"
+        # Capture the kind NOW — the finally below calls _runtime.reset(),
+        # which clears last_failure_kind BEFORE the post-finally auto-retry
+        # block runs. (This is the latent half of the #725 bug: even the
+        # poll-loop's browser_crash tag was being wiped before it was read.)
+        _captured_failure_kind = getattr(_runtime, "last_failure_kind", "") or ""
+        # Will the post-finally block silently re-run this from checkpoint? If
+        # so, SUPPRESS the user-facing card — the silent-self-heal rule says we
+        # only show Retry/Skip AFTER auto-retries are exhausted. Same predicate
+        # the auto-retry block uses, so the two never disagree.
+        # queue_dir is assigned (both resume + new-run branches) well before
+        # the `try`, so it's always bound here.
+        _will_silent_retry, _, _ = _plan_pipeline_auto_retry(
+            queue_dir, resume_dir, _captured_failure_kind, _crash_retries)
+        if _will_silent_retry:
+            _att = _crash_retries + 1
+            log(f"Browser crash at phase {last_phase} (attempt {_att}/"
+                f"{BROWSER_CRASH_MAX_RETRIES + 1}) — auto-retrying from "
+                f"checkpoint, no card shown", "WARN")
+        else:
+            # Auto-retries exhausted (or a non-recoverable terminal failure):
+            # escalate to a user-facing card. Route Retry through the PROVEN
+            # resume engine (resume_from_checkpoint → the always-alive
+            # start-listener re-enqueues with resume_dir) rather than the
+            # retry_phase command — by the time the user clicks, run_pipeline
+            # has returned and teardown_firestore_run() has unsubscribed the
+            # per-run command listener, so a retry_phase write would dead-end
+            # (#725). resume_from_checkpoint is the SAME command the device-/
+            # process-restart recovery banner uses, so both recovery paths
+            # converge on one engine. Skip → discard (client-side clear),
+            # mirroring that banner's Discard.
+            fail_phase(
+                phase=last_phase,
+                error="The run kept hitting errors",
+                reason="We tried to recover a couple of times and it didn't "
+                       "take. Retry to start again from the last checkpoint, "
+                       "or Skip to stop here.",
+                agent=None,
+                actions=[
+                    {"id": "retry", "label": "Retry", "style": "primary",
+                     "command": {"action": "resume_from_checkpoint"}},
+                    {"id": "skip", "label": "Skip", "style": "default",
+                     "command": {"action": "discard_restart_prompt"}},
+                ],
+            )
     finally:
         # New pause semantics: browser is closed by pause_and_close_browser when pause fires.
         # Here we just ensure cleanup on stop/complete/error — don't double-close if already closed.
@@ -30714,8 +30861,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # crashes that recover via auto-retry) where the next pipeline
         # creates a fresh Browser instance.
         _active_browser_ref = None
-        _runtime.reset()
-        teardown_firestore_run()
+        # #725: wrap reset + teardown defensively. The post-`finally`
+        # auto-retry block (below) is now load-bearing for crash recovery —
+        # if anything here threw (e.g. _fb_listener.unsubscribe() raising on a
+        # half-torn-down channel) the exception would propagate OUT of the
+        # finally and skip the auto-retry entirely, orphaning a recoverable
+        # crash with no card and no retry. Each cleanup step is isolated so a
+        # failure in one can't suppress the others OR the retry.
+        try:
+            _runtime.reset()
+        except Exception as _re:
+            log(f"runtime reset error (non-fatal): {_re}", "WARN")
+        try:
+            teardown_firestore_run()
+        except Exception as _te:
+            log(f"firestore teardown error (non-fatal): {_te}", "WARN")
         # Clear the active-run global so subsequent device commands
         # (e.g. `clear_local_storage`) don't preserve a stale dir from
         # the just-finished run. Without this reset, the global keeps
@@ -30724,47 +30884,42 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         global _tracks_dir
         _tracks_dir = None
 
-    # Auto-retry from checkpoint if pipeline failed mid-way
-    # Skip if: completed, stopped (terminal), or paused (intentional freeze)
+    # Auto-retry from checkpoint if pipeline failed mid-way (#725).
     #
-    # Two retry policies:
-    #   - One-shot retry on the initial run (resume_dir is None at entry).
-    #     The recursion sets resume_dir, so a second failure of any kind
-    #     normally surfaces a [Retry, Skip] alert.
-    #   - Browser-crash retry is always-auto: bypass the resume_dir gate
-    #     so a recursive crash also auto-retries. Outer worker 5h ceiling
-    #     is the safety net against infinite chrome-death loops.
-    _kind = getattr(_runtime, "last_failure_kind", "") or ""
-    _is_browser_crash = (_kind == "browser_crash")
-    if queue_dir and (not resume_dir or _is_browser_crash):
-        try:
-            d_path = queue_dir / "delivery.json"
-            d_status = json.loads(d_path.read_text(encoding="utf-8")).get("status") if d_path.exists() else ""
-        except Exception:
-            d_status = ""
-        if d_status not in ("completed", "stopped", "paused") \
-                and not (queue_dir / ".stop").exists() \
-                and not (queue_dir / ".pause").exists():
-            phase, _ = detect_resume_phase(queue_dir)
-            # Phase 5 means BE finished P4 — FE owns Phase 5, no BE auto-retry
-            # needed. The supervised-rehydrate auto-resume + manual Resume
-            # paths both call run_pipeline which re-emits phase_complete
-            # phase=4 to retrigger FE-P5. Cap at 4 so the auto-retry only
-            # fires for actual BE-recoverable work (mid-phase crashes).
-            if 1 < phase <= 4:
-                _why = "browser-crash" if _is_browser_crash else f"failed at phase {phase}"
-                log(f"Pipeline {_why} — auto-retrying from checkpoint...", "WARN")
-                await asyncio.sleep(5)
-                # Forward uid/research_id/run_id so the retry rebinds its
-                # Firestore command listener (cancel/config/retry from FE).
-                # Without these, setup_firestore_run is skipped (line ~16169
-                # `if uid:`) and the FE's Stop button writes to a Firestore
-                # commands subcollection no one is listening to — the BE
-                # keeps running orphaned while the FE shows "stopped".
-                await run_pipeline(topic=topic, email=email, verbose=verbose,
-                                   api_key=api_key, resume_dir=str(queue_dir),
-                                   config=config,
-                                   run_id=run_id, uid=uid, research_id=research_id)
+    # The decision is made by _plan_pipeline_auto_retry — the SAME predicate
+    # the except handler above consulted to suppress the user-facing card, so
+    # "we hid the card" and "we retried" can never disagree. Retry policies it
+    # encodes:
+    #   - One-shot retry on the initial run (resume_dir is None at entry); the
+    #     recursion sets resume_dir, so a second NORMAL failure surfaces the
+    #     escalation card instead of looping.
+    #   - Browser-crash retry bypasses that gate and fires across phases 0-4
+    #     (the legacy `1 < phase` gate excluded the phase-0/1 Chrome-close that
+    #     was the reported bug), capped at BROWSER_CRASH_MAX_RETRIES consecutive
+    #     attempts via the `_crash_retries` counter threaded through the param.
+    #
+    # _captured_failure_kind was snapshotted in the except BEFORE the finally's
+    # _runtime.reset() wiped last_failure_kind (pre-initialized "" for the
+    # clean-exit path).
+    _will_retry, _retry_phase, _is_browser_crash = _plan_pipeline_auto_retry(
+        queue_dir, resume_dir, _captured_failure_kind or "", _crash_retries)
+    if _will_retry:
+        _why = "browser-crash" if _is_browser_crash else f"failed at phase {_retry_phase}"
+        log(f"Pipeline {_why} — auto-retrying from checkpoint "
+            f"(crash_retries={_crash_retries})...", "WARN")
+        await asyncio.sleep(5)
+        # Forward uid/research_id/run_id so the retry rebinds its Firestore
+        # command listener (cancel/config/retry from FE). Without these,
+        # setup_firestore_run is skipped and the FE's Stop button writes to a
+        # commands subcollection no one is listening to — the BE keeps running
+        # orphaned while the FE shows "stopped". `_crash_retries` increments
+        # ONLY for browser crashes (a normal one-shot retry keeps it at 0 so a
+        # later crash on the resumed run still gets its full budget).
+        await run_pipeline(topic=topic, email=email, verbose=verbose,
+                           api_key=api_key, resume_dir=str(queue_dir),
+                           config=config,
+                           run_id=run_id, uid=uid, research_id=research_id,
+                           _crash_retries=(_crash_retries + 1 if _is_browser_crash else _crash_retries))
 
 
 # ── Server Mode (Web App API) ────────────────────────────────────────────────
@@ -32790,12 +32945,15 @@ async def run_server(port=8000):
             rehydrated = 0
             orphaned = 0
             if WORKER_ID == 1:
-                # #724 item 3: surface the flag state at boot so a validation run
-                # can confirm BOTH that the new code is loaded (this line exists)
-                # AND whether sharer-tree rehydration is armed — removes the
-                # PowerShell-`set`-didn't-take ambiguity.
-                log(f"[rehydration] ENABLE_SHARER_REHYDRATION="
-                    f"{'on' if os.environ.get('ENABLE_SHARER_REHYDRATION') == '1' else 'off'}", "INFO")
+                # #724 item 3 / #725 item 6: surface the flag state at boot so a
+                # validation run can confirm BOTH that the new code is loaded
+                # (this line exists) AND whether sharer-tree rehydration is armed
+                # — removes the PowerShell-`set`-didn't-take ambiguity. Reads
+                # env OR research_config.json (the env var didn't propagate to
+                # the relaunched daemon; the JSON fallback always does).
+                log(f"[rehydration] sharer-rehydration="
+                    f"{'on' if _sharer_rehydration_enabled() else 'off'} "
+                    f"(env={os.environ.get('ENABLE_SHARER_REHYDRATION') or 'unset'})", "INFO")
             if WORKER_ID != 1:
                 log(f"[rehydration] worker {WORKER_ID}: skipping Firestore rehydration (worker-1-only)", "INFO")
             try:
@@ -33007,14 +33165,14 @@ async def run_server(port=8000):
                 # A SHARER-submitted run lives in users/{sharer}/researches and
                 # was never marked paused_backend_restart on reconnect — it
                 # stayed frozen "ongoing" (manual Resume still worked, no passive
-                # recovery / no supervised auto-resume). When
-                # ENABLE_SHARER_REHYDRATION is set, also scan each sharer tree via
-                # _rehydrate_ongoing_for_tree (which mirrors the owner block above
-                # — sibling-lock guard + supervised auto-resume + paused mark;
-                # KEEP THE TWO IN SYNC, or migrate the owner path to the helper
-                # once this is validated). Per-sharer failures are isolated; the
-                # owner recovery already ran regardless.
-                if os.environ.get("ENABLE_SHARER_REHYDRATION") == "1":
+                # recovery / no supervised auto-resume). When sharer-rehydration
+                # is armed (env var OR research_config.json), also scan each
+                # sharer tree via _rehydrate_ongoing_for_tree (which mirrors the
+                # owner block above — sibling-lock guard + supervised auto-resume
+                # + paused mark; KEEP THE TWO IN SYNC, or migrate the owner path
+                # to the helper once this is validated). Per-sharer failures are
+                # isolated; the owner recovery already ran regardless.
+                if _sharer_rehydration_enabled():
                     _sharers: "list[str]" = []
                     try:
                         _dev_id = load_device_id()
@@ -33040,7 +33198,7 @@ async def run_server(port=8000):
                         except Exception as _she:
                             log(f"[rehydrate:sharers] tree {_sharer_uid[:12]}… scan failed ({_she}) — skipping", "WARN")
                     if _sharers:
-                        log(f"[rehydrate:sharers] scanned {len(_sharers)} sharer tree(s) (ENABLE_SHARER_REHYDRATION on)")
+                        log(f"[rehydrate:sharers] scanned {len(_sharers)} sharer tree(s) (sharer-rehydration armed)")
                 if rehydrated or orphaned:
                     log(f"Queue rehydration: auto-resumed {rehydrated} supervised run(s), marked {orphaned} as paused_backend_restart")
             except _SkipRehydration:
