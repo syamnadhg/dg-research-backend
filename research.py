@@ -3642,7 +3642,14 @@ async def _heartbeat_loop():
                     _heartbeat_failures = 0
         except Exception as e:
             _heartbeat_failures += 1
-            log(f"[heartbeat] write failed (consecutive={_heartbeat_failures}): {e}", "WARN")
+            # #738: the dominant failure is asyncio.TimeoutError, whose str()
+            # is "" — render a real detail so the WARN isn't blank (these are
+            # slow-write timeouts, not auth errors; now distinguishable in
+            # log sweeps).
+            _hb_detail = ("write timed out after 10s"
+                          if isinstance(e, asyncio.TimeoutError)
+                          else (str(e) or repr(e) or type(e).__name__))
+            log(f"[heartbeat] write failed (consecutive={_heartbeat_failures}): {_hb_detail}", "WARN")
             # Hand recovery to _firebase_reconnect_loop instead of reiniting
             # inline. #717: the old inline reinit was UNREACHABLE after the
             # first failed rebuild — it lived in THIS except block, but once
@@ -10224,7 +10231,18 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
 
         # Primary: try publishing via the (now correctly-selected) artifact panel
         last_stage = "publish_dom"
+        # #735: publish_open_claude_artifact resets browser._claude_publish_cua_used
+        # at entry and sets it True iff its own CUA fallback runs — so reading it
+        # right after the call tells us whether a CUA pass already happened here
+        # (covers the path where it returns a claude.ai URL that fails the
+        # claude.site public gate below, which would otherwise let Step 4b fire
+        # a redundant second CUA pass).
         published_url = await publish_open_claude_artifact(page, browser, cua_client, verbose=verbose)
+        if getattr(browser, "_claude_publish_cua_used", False):
+            # #735: publish_open ran its OWN CUA pass — count it so the caller's
+            # Step 4b doesn't double it (notably when it returned a claude.ai
+            # URL that fails the claude.site public gate below).
+            cua_attempted = True
         if published_url and 'claude.' in published_url:
             url = published_url
         else:
@@ -14685,43 +14703,58 @@ async def _count_claude_artifacts(page):
                 '[aria-label*="attachment" i], [aria-label*="file " i]'
             ) || _looksLikeFile(el);
             const isInAssistant = (el) => !!el.closest('.font-claude-message');
-            let total = 0;
+            // #736: build the SAME candidate array _click_claude_artifact
+            // indexes into, so count == click's clickable-card count and the
+            // caller's target index (count-1) is always valid. Previously count
+            // used Math.max-across-selectors + UNCONDITIONALLY folded in the
+            // Boom!/Research-complete callout button + skipped click's
+            // visibility/dialog filter — so at count==5 it over-reported by 1,
+            // target_idx=4 fell out of click's filtered range, and a needless
+            // CUA fallback fired on every 5-artifact run.
+            let cards = [];
             // Pass 1: prefer matches inside assistant message scope.
             for (const sel of selectors) {
                 const found = Array.from(document.querySelectorAll(sel))
                     .filter(el => isInAssistant(el) && !isUserOrAttachment(el));
-                if (found.length > 0) { total = Math.max(total, found.length); }
+                if (found.length > 0) { cards = found; break; }
             }
-            // Pass 2: only run when assistant-scoped lookup returned nothing
-            // (covers Claude UI variants without .font-claude-message
-            // wrappers). Still strips user-message + attachment matches.
-            if (total === 0) {
+            // Pass 2: broad scan if assistant scope returned nothing.
+            if (!cards.length) {
                 for (const sel of selectors) {
                     const found = Array.from(document.querySelectorAll(sel))
                         .filter(el => !isUserOrAttachment(el));
-                    if (found.length > 0) { total = Math.max(total, found.length); }
+                    if (found.length > 0) { cards = found; break; }
                 }
             }
-            // Text-content fallback: any clickable element matching the
-            // legacy "Research complete · N sources · Xm Ys" marker OR the
-            // 2026-05+ Boom! ready callout. Scope to .font-claude-message
-            // and strip user/attachment matches.
-            const textHits = Array.from(document.querySelectorAll(
-                '.font-claude-message button, .font-claude-message [role="button"]'
-            )).filter(el => !isUserOrAttachment(el))
-              .filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || '')
-                         || /\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(el.textContent || ''));
-            total = Math.max(total, textHits.length);
-            // Legacy fallback: document-like inline cards in assistant messages.
-            if (total === 0) {
-                const cards = Array.from(document.querySelectorAll(
-                    '.font-claude-message button[class*="block"], ' +
-                    '.font-claude-message [class*="artifact"], ' +
-                    '[data-is-streaming] button[class*="w-full"]'
-                )).filter(el => !isUserOrAttachment(el));
-                total = cards.length;
+            // Text-content fallback ONLY when nothing else matched (mirrors
+            // click) — the Boom!/Research-complete callout must NOT inflate the
+            // count when real artifact cards already exist.
+            if (!cards.length) {
+                const textHits = Array.from(document.querySelectorAll(
+                    '.font-claude-message button, .font-claude-message [role="button"]'
+                )).filter(el => !isUserOrAttachment(el))
+                  .filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || '')
+                             || /\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(el.textContent || ''));
+                if (textHits.length > 0) cards = textHits;
             }
-            return total;
+            // Legacy fallback: document-like inline cards in assistant messages
+            // (same selector set as click — note: NOT the [data-is-streaming]
+            // variant, which click omits).
+            if (!cards.length) {
+                cards = Array.from(document.querySelectorAll(
+                    '.font-claude-message button[class*="block"], ' +
+                    '.font-claude-message [class*="artifact"]'
+                )).filter(el => !isUserOrAttachment(el));
+            }
+            // Same visibility + dialog-modal filter _click_claude_artifact
+            // applies, so the counted set == the clickable set.
+            cards = cards.filter(c => {
+                const r = c.getBoundingClientRect();
+                if (r.width < 20 || r.height < 20) return false;
+                if (c.closest('[role="dialog"], [aria-modal="true"]')) return false;
+                return true;
+            });
+            return cards.length;
         }""")
     except Exception as e:
         log(f"Artifact count failed: {e}", "WARN")
@@ -18254,6 +18287,16 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                 if link_res and getattr(link_res, "cua_attempted", False):
                     inner_cua_attempted = True
             except asyncio.TimeoutError:
+                # #735: a 90s timeout means the inline extractor (which runs CUA
+                # internally — both Gemini and Claude) was almost certainly
+                # mid-CUA-pass, so suppress Step 4b's redundant CUA pass for
+                # BOTH agents. Intentional: this is exactly the double-CUA the
+                # inner_cua_attempted guard above exists to prevent (incl. the
+                # Gemini share-dialog tab-spam). We never got a link_res to read
+                # cua_attempted from. Worst case on a rare pure-DOM stall: we
+                # skip a best-effort fallback and use the conversation URL —
+                # acceptable (Step 4b is best-effort and never gates the run).
+                inner_cua_attempted = True
                 log(f"[{name}] Inline share-link timed out (90s) "
                     f"— falling back to conversation URL silently", "INFO")
             except Exception as _e:
@@ -22701,6 +22744,15 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
 async def publish_open_claude_artifact(page, browser, cua_client, verbose=False):
     """Publish the currently-open Claude artifact and return its public URL.
     Call this AFTER extract_claude_response while the artifact panel is still open."""
+    # #735: per-invocation reset of the CUA-used signal, so the value any caller
+    # reads after this returns reflects THIS call only — never a stale flag set
+    # by an EARLIER publish_open (e.g. the T2 published-page extraction tier,
+    # which doesn't reset). This is the authoritative reset; doing it here means
+    # no caller has to remember to. Set True below iff the CUA fallback runs.
+    try:
+        browser._claude_publish_cua_used = False
+    except Exception:
+        pass
     try:
         # A1 (2026-05-01): wait up to 12s for the publish/share button to
         # mount before falling through to JS evaluate. Without this, the
@@ -22801,6 +22853,14 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
 
     # CUA fallback for publishing
     if cua_client:
+        # #735: signal to extract_share_link_claude that a CUA pass ran HERE,
+        # so its caller's Step 4b doesn't fire a redundant second CUA pass when
+        # this returns a claude.ai (non-claude.site) URL that fails the public
+        # share gate.
+        try:
+            browser._claude_publish_cua_used = True
+        except Exception:
+            pass
         result = await agent_loop(cua_client, browser,
             PROMPT_PUBLISH_CLAUDE_ARTIFACT,
             "Publish the artifact that's currently open in the right panel. "
@@ -23230,7 +23290,10 @@ async def setup_chatgpt_dr(page) -> bool:
                 log("[setup_chatgpt_dr] Step 2 menu-item dump: " + json.dumps(dump))
             except Exception as _de:
                 log(f"[setup_chatgpt_dr] Step 2 dump failed: {_de}", "WARN")
-            log("[setup_chatgpt_dr] Step 2 FAIL: 'Deep research' menu item not found — menu opened but option missing", "WARN")
+            # #739: DOM menu-item miss is expected (selectors rotated) and the
+            # CUA fallback enables Deep Research every time — INFO, not a WARN
+            # (the diagnostic dump above still pins the rotated selector).
+            log("[setup_chatgpt_dr] Step 2: DOM 'Deep research' menu item not found (selectors rotated) — CUA fallback will enable DR", "INFO")
             return False
         log("[setup_chatgpt_dr] Step 2 OK: clicked Deep research menu option")
         await asyncio.sleep(1.5)
@@ -24153,8 +24216,11 @@ async def setup_claude_dr(page) -> bool:
                     }));
                 }""")
                 log(f"[setup_claude_dr] Step 3A composer-button dump (fix selector from this): {json.dumps(_btn_dump, ensure_ascii=False)}", "WARN")
-            except Exception:
-                pass
+            except Exception as _de:
+                # #739: this dump was silently swallowed, so the selector-
+                # rotation diagnostic it was meant to provide never appeared —
+                # surface WHY it failed so the DOM path can finally self-heal.
+                log(f"[setup_claude_dr] Step 3A composer-button dump failed: {_de}", "WARN")
         research_enabled = False
         if tools_opened:
             # State-aware + accept label variations ("Research", "Research
@@ -24187,7 +24253,13 @@ async def setup_claude_dr(page) -> bool:
         if research_enabled:
             log("[setup_claude_dr] Step 3B OK: Research tool toggled on")
         else:
-            log("[setup_claude_dr] Step 3B FAIL: Research tool item not found in tools menu — will run in chat mode, NOT research", "WARN")
+            # #739: DOM tools-menu path failing here is EXPECTED (selectors
+            # rotated) and is the designed trigger for the CUA tier-3 fallback,
+            # which enables Research every time — so this is INFO, not a WARN
+            # claiming "chat mode" (that wording was factually wrong and
+            # manufactured false-alarm sweep findings). A genuine all-layers
+            # failure is reported separately by CUA validation.
+            log("[setup_claude_dr] Step 3B: DOM Research toggle not found (selectors rotated) — CUA fallback will enable Research", "INFO")
 
         # Focus the input so the brief paste/attach lands cleanly.
         for sel in ['div[contenteditable="true"]', '[aria-label*="message"]', '.ProseMirror']:
@@ -25713,8 +25785,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="generating",
                            progress="ChatGPT DR submitted — verifying via round-robin polling")
                 await inject_agent_observer(chatgpt_page, "chatgpt")
+            elif _controls.is_stop():
+                # #737: a user Stop during the setup/chat-mode pause returns
+                # (page, False). Don't mislabel a clean cancellation as a hard
+                # agent failure — no red fail_agent banner, no 'errored' status.
+                log("[2A] ChatGPT setup ended on user stop — clean cancel, no failure banner", "INFO")
             else:
-                log("[2A] ChatGPT failed after 2 attempts", "ERROR")
+                log("[2A] ChatGPT setup failed", "ERROR")
                 # Mark as terminally failed so the round-robin doesn't sit on it
                 # forever waiting for events that will never arrive.
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
@@ -25781,8 +25858,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 emit_event("agent_progress", phase=2, agent="claude", status="generating",
                            progress="Claude DR submitted — verifying via round-robin polling")
                 await inject_agent_observer(claude_page, "claude")
+            elif _controls.is_stop():
+                # #737: a user Stop during the setup/chat-mode pause returns
+                # (page, False). Don't mislabel a clean cancellation as a hard
+                # agent failure — no red fail_agent banner, no 'errored' status.
+                log("[2B] Claude setup ended on user stop — clean cancel, no failure banner", "INFO")
             else:
-                log("[2B] Claude failed after 2 attempts", "ERROR")
+                log("[2B] Claude setup failed", "ERROR")
                 emit_event("agent_progress", phase=2, agent="claude", status="failed",
                            progress="Claude setup/paste failed — agent did not start.")
                 fail_agent("claude", "Claude didn't start",
