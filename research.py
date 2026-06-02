@@ -3258,12 +3258,22 @@ def _grpc_write_with_heal(op, *, what: str):
                      "write-side payload clause; force-refresh CANNOT fix, re-pair")
         else:
             cause = "token+config deviceId AGREE — deviceOwnership / doc-deviceId mismatch"
+        # #728: this is a SELF-HEALING retry — on basically every run's first
+        # user-tree write the freshly-minted/cached synth token lags the
+        # deviceId-claim propagation (most often the `queued→ongoing` flip's
+        # transactional READ racing deviceMemberOf on a fresh doc; see
+        # firestore.rules:175-203 #723), the force-refresh re-mints, and the
+        # retry below succeeds. Logging it at WARN every time was misleading
+        # noise (it reads as a problem when it self-heals). Log the heal ATTEMPT
+        # at INFO; a genuinely UNHEALED denial still surfaces — the retry-failed
+        # branch increments the structural counter (ERROR at the latch) and the
+        # caller's own try/except logs the degrade.
         log(
-            f"[grpc-heal] {what}: synth-user 403. token.deviceId={tok_did!r} "
-            f"ownerUid={before.get('ownerUid')!r} | config deviceId={cfg_did!r} | "
-            f"likely cause: {cause} | after force-refresh deviceId={healed_did!r}. "
-            f"Retrying once.",
-            "WARN",
+            f"[grpc-heal] {what}: synth-user 403 — re-minting token + retrying once "
+            f"(self-heal). token.deviceId={tok_did!r} ownerUid={before.get('ownerUid')!r} "
+            f"| config deviceId={cfg_did!r} | likely cause: {cause} | after "
+            f"force-refresh deviceId={healed_did!r}.",
+            "INFO",
         )
         try:
             result = op()  # retry with the freshly-minted token
@@ -5715,8 +5725,11 @@ def start_firestore_start_listener(job_queue, loop):
                 email = data.get("email") or ""
                 # Flip Firestore status to "ongoing" so the FE drops the alert
                 # banner immediately (the listener race below is harmless —
-                # _safe_enqueue's whitelist accepts ongoing).
-                _update_research_doc(target_uid, target_rid, {"status": "ongoing"})
+                # _safe_enqueue's whitelist accepts ongoing). #728: re-stamp
+                # assignedWorker = the worker resuming it (this process), so a
+                # later restart's rehydration keeps the affinity correct.
+                _update_research_doc(target_uid, target_rid,
+                                     {"status": "ongoing", "assignedWorker": WORKER_ID})
                 # Delete the queue doc — Firestore's onSnapshot replays it
                 # otherwise, double-enqueueing on every BE restart.
                 try: doc.reference.delete()
@@ -6258,7 +6271,16 @@ def start_firestore_start_listener(job_queue, loop):
                 # mirror on the doc; wiping it at every fresh start guarantees a
                 # cold chat-open never paints a decision the run has moved past.
                 from google.cloud.firestore import DELETE_FIELD as _DF_START
+                # #728: stamp the worker that is about to RUN this pipeline. Each
+                # worker runs on its OWN browser profile (_profile_dir(WORKER_ID))
+                # = its own logged-in ChatGPT/Gemini/Claude/NotebookLM accounts.
+                # On a BE restart, worker-1's rehydration uses this to avoid
+                # auto-resuming a run onto the WRONG worker's profile (the
+                # "worker-1 funnel"). The researches update rule has no field
+                # whitelist (firestore.rules:206 deviceUpdatingFor), so it rides
+                # the same write that already sets backendRunId/status.
                 status_payload = {"backendRunId": run_id, "status": "ongoing",
+                                  "assignedWorker": WORKER_ID,
                                   "pendingDecision": _DF_START}
             # Write run_id + initial status back to the research doc.
             # `_update_research_doc` returns False on failure (logs WARN);
@@ -6386,7 +6408,8 @@ _exit_scheduled = False
 _active_browser_ref = None  # type: Optional["Browser"]
 
 
-def _safe_enqueue(job_queue, job, source: str) -> bool:
+def _safe_enqueue(job_queue, job, source: str,
+                  allowed_statuses: "tuple[str, ...]" = ("queued", "ongoing", "paused_backend_restart")) -> bool:
     """Existence-validate + status-whitelist check before put_nowait.
 
     Returns True if the job entered the queue, False if it was skipped.
@@ -6397,6 +6420,16 @@ def _safe_enqueue(job_queue, job, source: str) -> bool:
     helper consolidates the same logic for all paths and adds a
     status-whitelist (queued / ongoing / paused_backend_restart) so a
     cancelled or completed research can't get re-enqueued either.
+
+    #728: `allowed_statuses` lets a caller TIGHTEN the whitelist. The default
+    keeps the original 3-set (the resume / start-listener paths legitimately
+    re-enqueue a paused_backend_restart run). The BOOT disk-restore passes
+    ("queued", "ongoing") — it must NOT silently relaunch a run that worker-1's
+    rehydration just marked paused_backend_restart (intentionally awaiting a
+    user Resume). Firestore is the shared cross-worker source of truth here, so
+    this also closes the multi-worker double-enqueue: worker-2's per-process
+    disk-restore can't re-fire a run worker-1 already parked, even though
+    worker-2's local `_rehydrated_rids` set never saw it.
     """
     rid = (job or {}).get("research_id") or ""
     uid_v = (job or {}).get("uid") or ""
@@ -6438,8 +6471,8 @@ def _safe_enqueue(job_queue, job, source: str) -> bool:
             log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… no longer exists in Firestore", "INFO")
             return False
         status = (snap.to_dict() or {}).get("status")
-        if status not in ("queued", "ongoing", "paused_backend_restart"):
-            log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not enqueueable)", "INFO")
+        if status not in allowed_statuses:
+            log(f"[safe_enqueue:{source}] skipped — research {rid[:24]}… status={status} (not in {allowed_statuses})", "INFO")
             return False
     except Exception as e:
         # Track D synth-device-user can't read `users/{ownerUid}/
@@ -31547,8 +31580,33 @@ async def _rehydrate_ongoing_for_tree(tree_uid: str, owner_uid: str, rehydrated_
                             # subcollection — expected.
                             pass
 
+                # #728 worker-affinity: each worker runs on its OWN browser
+                # profile (_profile_dir(WORKER_ID)) = its own logged-in
+                # ChatGPT/Gemini/Claude/NotebookLM accounts. Auto-resuming a run
+                # that a DIFFERENT worker was on would re-open it on THIS worker's
+                # (wrong) profile/account. Rehydration is worker-1-only, so only
+                # auto-resume runs this worker owns (assignedWorker == WORKER_ID)
+                # or that predate the field / were never stamped (None/"" → legacy
+                # or owner default → worker-1). A run owned by another worker
+                # falls through to the paused_backend_restart mark (safe: a Resume
+                # re-routes via claim) rather than being funneled onto worker-1's
+                # profile. That worker's OWN disk-restore (per-worker pending_queue
+                # snapshot) can still auto-recover it on the correct profile when
+                # the snapshot is intact — and _safe_enqueue's status read then
+                # sees paused_backend_restart and defers, so they don't both fire.
+                _assigned = data.get("assignedWorker")
+                _affinity_ok = _assigned in (None, "", WORKER_ID)
                 auto_resumed = False
-                if is_supervised:
+                if is_supervised and not _affinity_ok:
+                    log(
+                        f"[rehydrate] {research_id[:24]}… supervised but "
+                        f"assignedWorker={_assigned} != worker {WORKER_ID} — NOT "
+                        f"funneling onto this profile; marking paused_backend_restart "
+                        f"(its own worker's disk-restore / a Resume recovers it on "
+                        f"the correct profile)",
+                        "INFO",
+                    )
+                if is_supervised and _affinity_ok:
                     run_id = data.get("backendRunId") or ""
                     if run_id:
                         queue_dir = Path(__file__).parent / "queues" / run_id
@@ -33561,15 +33619,22 @@ async def run_server(port=8000):
                     disk_jobs.append(j)
                 # Funnel each disk-restored job through _safe_enqueue
                 # (Q7) — it does the same Firestore existence check the
-                # Q1 inline loop did, plus a status-whitelist (queued /
-                # ongoing / paused_backend_restart). Fail-closed posture
-                # is preserved (helper skips on missing/error/no-firebase
+                # Q1 inline loop did, plus a status-whitelist. Fail-closed
+                # posture is preserved (helper skips on missing/error/no-firebase
                 # rather than re-fire). The skipped-count is rolled up;
                 # per-job reasons are in the helper's own logs.
+                # #728: TIGHTER whitelist for the boot disk-restore —
+                # ("queued","ongoing") EXCLUDING paused_backend_restart. A run
+                # worker-1's rehydration just marked paused_backend_restart is
+                # intentionally awaiting a user Resume; auto-relaunching it from a
+                # stale per-worker disk snapshot would double-handle it (and on a
+                # sibling worker whose `_rehydrated_rids` never saw it, this is the
+                # only cross-worker guard). Genuinely-ongoing runs still restore.
                 restored = 0
                 skipped = 0
                 for j in disk_jobs:
-                    if _safe_enqueue(_job_queue, j, source="disk-restore"):
+                    if _safe_enqueue(_job_queue, j, source="disk-restore",
+                                     allowed_statuses=("queued", "ongoing")):
                         restored += 1
                     else:
                         skipped += 1
