@@ -55,19 +55,61 @@ def test_step1b_no_legacy_any_opus_4x_fallback():
 # ── #744 — re-click loop / P2-stuck fixes ─────────────────────────────
 
 
-def test_step1_skips_dropdown_when_model_already_4_8():
-    """#744: setup_claude_dr must read the model-selector TRIGGER first and
-    SKIP opening the dropdown when the model is already Opus >= 4.8. Opening it
-    unconditionally was the re-click loop that wedged P2 (the picker couldn't
-    see the already-selected option, returned False, and left the dropdown open)."""
+def test_step1_does_not_repick_already_correct_model():
+    """#744/#745: setup_claude_dr reads the model-selector TRIGGER first and,
+    when it already shows Opus >= 4.8, must NOT re-pick the model — re-clicking a
+    correct option was the loop that wedged P2. The model PICK (the _pick_opus_js
+    poll) must be gated behind `if not model_ok:`. (#745 reopened the popover for
+    the Effort/Thinking knobs, so the OLD "skip the whole dropdown" contract no
+    longer holds — only the model PICK is skipped, never re-clicked.)"""
     src = inspect.getsource(research.setup_claude_dr)
     assert "model_trigger_ver" in src, (
-        "Step 1 must read the model-selector trigger version before deciding "
-        "whether to open the dropdown (#744)."
+        "Step 1 must read the model-selector trigger version first (#744)."
     )
-    assert "model_trigger_ver >= 4.8" in src and "skipping model dropdown" in src, (
-        "when the trigger already shows Opus >= 4.8, Step 1 must skip the "
-        "dropdown entirely (#744)."
+    assert "model_ok" in src and "model_trigger_ver >= 4.8" in src, (
+        "Step 1 must derive model_ok from the trigger version (#744)."
+    )
+    assert ("not re-picked" in src) or ("NOT re-picking" in src), (
+        "an already-correct model must be recorded but NOT re-picked (#744)."
+    )
+    # The model-pick poll must run ONLY when the model is not already correct.
+    pick_idx = src.find("opus_selected = await page.evaluate(_pick_opus_js)")
+    assert pick_idx != -1, "the _pick_opus_js poll must still exist."
+    guard_idx = src.rfind("if not model_ok:", 0, pick_idx)
+    assert guard_idx != -1, (
+        "the model-pick poll must be guarded by `if not model_ok:` so a correct "
+        "model is never re-clicked (#744)."
+    )
+
+
+def test_step1_sets_effort_and_thinking_via_dom():
+    """#745: Effort=Max + the Thinking toggle are now set via DOM (not left to
+    CUA, whose screenshots collapsed the submenu). The model popover opens ONCE
+    regardless of model correctness (branch on dropdown_clicked, NOT model_ok),
+    the Effort submenu is opened to reach the toggle, and the toggle is matched
+    by its REAL label "thinking" (the old page-wide "adaptive thinking" search
+    missed it because the label changed AND it ran on a collapsed submenu)."""
+    src = inspect.getsource(research.setup_claude_dr)
+    # The popover open + knob-setting branch on dropdown_clicked, not model_ok,
+    # so Effort/Thinking are set even when the model is already Opus 4.8.
+    assert "if dropdown_clicked:" in src, (
+        "Step 1A must open the popover and branch on dropdown_clicked so the "
+        "Effort/Thinking knobs run regardless of model correctness (#745)."
+    )
+    assert "_think = await page.evaluate" in src, (
+        "a dedicated Thinking-toggle step (_think) must exist (#745)."
+    )
+    assert "t === 'thinking'" in src, (
+        "the Thinking toggle must be matched by its real label 'thinking', not "
+        "only the stale 'adaptive thinking' (#745)."
+    )
+    # The Effort submenu must be opened BEFORE toggling Thinking (selecting an
+    # effort radio can collapse the submenu the toggle lives in).
+    eff_idx = src.find("_eff_opened = await page.evaluate")
+    think_idx = src.find("_think = await page.evaluate")
+    assert eff_idx != -1 and eff_idx < think_idx, (
+        "the Effort submenu (Step 1C) must open before the Thinking toggle so "
+        "the toggle is reachable (#745)."
     )
 
 

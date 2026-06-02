@@ -24112,35 +24112,40 @@ async def setup_gemini_dr(page) -> bool:
 
 
 async def setup_claude_dr(page) -> bool:
-    """Enable Claude Opus 4.8 + Max Effort + Adaptive Thinking + Research
-    tool via direct Playwright selectors. As of 2026-05-28 the claude.ai UI
-    splits these across the model popover + the tools menu:
+    """Enable Claude Opus 4.8 + Max Effort + Thinking + Research tool via
+    direct Playwright selectors. As of 2026-05-28 the claude.ai UI splits
+    these across the model popover + the tools menu:
         1. Model dropdown        → Opus 4.8
         2. Effort submenu        → Max          (inside the model popover)
-        3. Adaptive Thinking     → on (toggle)  (inside the model popover)
+        3. Thinking toggle       → on           (inside the Effort submenu)
         4. Research tool         → on (inside the "+" tools menu)
-    Steps 2 + 3 are quality knobs (best-effort: WARN on miss). Correctness
-    gates are the model + Research tool — those hard-return False on miss.
-    The CUA fallback lives one layer up in setup_agent + validate_setup_with_cua
-    so this routine can fail fast without fighting the DOM."""
+    The model popover is opened ONCE per call: the model PICK runs only when
+    the trigger isn't already Opus >= 4.8 (#744 — never re-click a correct
+    model), but the Effort=Max + Thinking=on knobs are set via DOM on every
+    call (#745 — the user wanted these done seamlessly by DOM rather than CUA,
+    whose screenshots kept collapsing the Effort submenu). Effort/Thinking are
+    quality knobs (best-effort: WARN on miss). Correctness gates are the model
+    + Research tool — those hard-return False on miss. The CUA fallback lives
+    one layer up in setup_agent + validate_setup_with_cua so this routine can
+    fail fast without fighting the DOM."""
     try:
         await asyncio.sleep(2)
 
-        # ── Step 1: ensure the model is Opus >= 4.8 ───────────────────
-        # B1/B2 fix (2026-06-01 #744, backend.log 22:37/22:39): the model
-        # selector TRIGGER button already shows the current model (e.g.
-        # "Opus 4.8 Max" — the default for this account). The OLD code
-        # opened the dropdown UNCONDITIONALLY; when the model was already
-        # >= 4.8 that was both pointless AND harmful — Step 1B's picker
-        # couldn't see the already-selected option (it renders as a
-        # role="menuitemradio"/div the old item selector missed, and a
-        # fixed-position popover is filtered out by offsetParent), so it
-        # returned False, LEFT THE DROPDOWN OPEN over the composer, and
-        # bailed before the Research step. On the just-before-send
-        # re-activation that became a re-click loop that wedged P2 (the
-        # exact bug the user saw: "clicking the model selector repeatedly
-        # inspite of choosing the right model and tool"). Fix: read the
-        # trigger first; only open + pick when NOT already >= 4.8.
+        # ── Step 1: model = Opus >= 4.8, Effort = Max, Thinking toggle ON ──
+        # (#744) Read the model-selector TRIGGER first — it shows BOTH the
+        # current model AND its effort, e.g. "Opus 4.8 Max". NEVER re-pick an
+        # already-correct model (re-clicking a correct option was the loop that
+        # wedged P2: "clicking the model selector repeatedly inspite of choosing
+        # the right model and tool").
+        # (#745, 2026-06-02) The Thinking toggle is NOT on the trigger — it
+        # lives inside the Effort submenu of the model popover — so we still
+        # open the popover ONCE to set Effort=Max + Thinking ON via DOM. The
+        # user asked for this to be done seamlessly by DOM ("like gemini");
+        # CUA's screenshots kept collapsing the Effort submenu. The model PICK
+        # (Step 1B) is the only sub-step gated to "not already >= 4.8" — opening
+        # the popover to set the quality knobs is safe (we always Escape after,
+        # and we never re-click a correct model option, so the #744 loop can't
+        # recur).
         model_trigger_ver = await page.evaluate("""() => {
             const verOf = t => { const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i); return m ? parseFloat(m[1]) : null; };
             const vis = el => el.getClientRects().length > 0;   // fixed-position triggers have offsetParent === null
@@ -24152,110 +24157,109 @@ async def setup_claude_dr(page) -> bool:
             for (const b of btns) { const v = verOf(b.textContent); if (v !== null && (best === null || v > best)) best = v; }
             return best;
         }""")
+        model_ok = isinstance(model_trigger_ver, (int, float)) and model_trigger_ver >= 4.8
         opus_selected = None
-        if isinstance(model_trigger_ver, (int, float)) and model_trigger_ver >= 4.8:
-            # Model already correct — DO NOT open the dropdown (that was the
-            # re-click bug). Effort/Adaptive are quality knobs the CUA
-            # validate layer confirms; the account default already shows Max.
-            opus_selected = f"Opus {model_trigger_ver} (already selected — dropdown skipped)"
-            log(f"[setup_claude_dr] Step 1 OK: model already Opus {model_trigger_ver} (trigger) — skipping model dropdown")
-        else:
-            # ── Step 1A: open the model dropdown ───────────────────────
-            dropdown_clicked = await page.evaluate("""() => {
-                const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
-                // Model selector button shows the currently-selected model name.
-                // Priority: already-Opus > Sonnet > any button with "claude"
-                let dropdown = btns.find(b => (b.textContent || '').toLowerCase().includes('opus'));
-                if (!dropdown) dropdown = btns.find(b => {
-                    const t = (b.textContent || '').toLowerCase();
-                    return t.includes('sonnet') || t.includes('haiku') || t.includes('claude');
-                });
-                if (dropdown) { dropdown.click(); return true; }
-                return false;
-            }""")
-            if not dropdown_clicked:
-                log("[setup_claude_dr] Step 1A FAIL: model dropdown button not found — selector list likely stale", "WARN")
-                return False
-            log("[setup_claude_dr] Step 1A OK: opened model dropdown")
-            await asyncio.sleep(0.8)
-            # Step 1B: pick the STRONGEST Opus (>= 4.8) from the OPEN popover.
-            # Two prod failures (2026-05-28, backend.log 48681/49653) had this
-            # land on "Opus 4.7 Extra" instead of "Opus 4.8 Max":
-            #   (1) the model-selector TRIGGER button (which shows the CURRENT
-            #       model, e.g. "Opus 4.7 Extra") was in the candidate set, and
-            #   (2) when the 4.8 menu item hadn't rendered by the 0.8s mark, the
-            #       old "any Opus 4.x" priority grabbed that trigger's 4.7.
-            # Fixes: (a) scope candidates to the OPEN popover (role=menu/listbox/
-            # dialog) so the composer trigger button is excluded; (b) version-gate
-            # to >= 4.8 so we NEVER downgrade to 4.7/4.6/... even if 4.8 is slow;
-            # (c) poll for the option to appear. If only sub-4.8 Opus exists,
-            # return null so the CUA fallback (Opus-4.8 prompt) handles it rather
-            # than silently selecting 4.7. Future-proof: picks the highest version.
-            # 2026-06-01 (#744): broadened the item selector — the option can be
-            # a role="menuitemradio"/div (the #709 lesson), and a fixed-position
-            # popover is filtered by offsetParent, so visibility uses
-            # getClientRects(). Without this Step 1B couldn't see the options.
-            _pick_opus_js = """() => {
-                const vis = el => el.getClientRects().length > 0;
-                const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
-                    .filter(vis);
-                const roots = menus.length ? menus : [document.body];
-                const seen = new Set();
-                const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
-                    .filter(el => vis(el) && !seen.has(el) && seen.add(el));
-                const verOf = t => {
-                    const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
-                    return m ? parseFloat(m[1]) : null;
-                };
-                // Prefer leaf menu items over wrapper containers at the same
-                // version (shorter text = more specific element).
-                let best = null, bestV = -1, bestLen = Infinity;
-                for (const el of items) {
-                    const t = (el.textContent || '').trim();
-                    const v = verOf(t);
-                    if (v === null || v < 4.8) continue;   // only Opus >= 4.8 — never downgrade
-                    if (v > bestV || (v === bestV && t.length < bestLen)) {
-                        best = el; bestV = v; bestLen = t.length;
-                    }
-                }
-                if (best) { best.click(); return best.textContent.trim().slice(0, 60); }
-                return null;
-            }"""
-            for _attempt in range(8):
-                opus_selected = await page.evaluate(_pick_opus_js)
-                if opus_selected:
-                    break
-                await asyncio.sleep(0.4)
-            if opus_selected:
-                log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected}")
-            else:
-                log("[setup_claude_dr] Step 1B FAIL: Opus >= 4.8 option not found in popover after polling — rollout/A-B difference or 4.8 retired?", "WARN")
-                # Never strand an OPEN dropdown over the composer (the bug
-                # screenshot) — dismiss it before bailing to the CUA fallback.
-                try:
-                    await page.keyboard.press("Escape")
-                    await asyncio.sleep(0.3)
-                except Exception:
-                    pass
-                return False
-            await asyncio.sleep(0.6)
+        if model_ok:
+            # Model already correct — record it but DO NOT re-pick (the #744
+            # re-click loop). We still open the popover below for Effort/Thinking.
+            opus_selected = f"Opus {model_trigger_ver} (trigger — not re-picked)"
+            log(f"[setup_claude_dr] Step 1 OK: model already Opus {model_trigger_ver} (trigger) — NOT re-picking (#744)")
 
-            # ── Step 1C: set Effort = Max ──────────────────────────────
+        # Step 1B picker (used only when the model is < 4.8). Scopes to the OPEN
+        # popover so the trigger button (showing the current model) is excluded;
+        # version-gates to >= 4.8 so it NEVER downgrades to 4.7; sees
+        # role="menuitemradio"/div options and uses getClientRects() so a
+        # fixed-position popover isn't filtered by offsetParent (#708/#744).
+        _pick_opus_js = """() => {
+            const vis = el => el.getClientRects().length > 0;
+            const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
+                .filter(vis);
+            const roots = menus.length ? menus : [document.body];
+            const seen = new Set();
+            const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
+                .filter(el => vis(el) && !seen.has(el) && seen.add(el));
+            const verOf = t => {
+                const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
+                return m ? parseFloat(m[1]) : null;
+            };
+            // Prefer leaf menu items over wrapper containers at the same
+            // version (shorter text = more specific element).
+            let best = null, bestV = -1, bestLen = Infinity;
+            for (const el of items) {
+                const t = (el.textContent || '').trim();
+                const v = verOf(t);
+                if (v === null || v < 4.8) continue;   // only Opus >= 4.8 — never downgrade
+                if (v > bestV || (v === bestV && t.length < bestLen)) {
+                    best = el; bestV = v; bestLen = t.length;
+                }
+            }
+            if (best) { best.click(); return best.textContent.trim().slice(0, 60); }
+            return null;
+        }"""
+
+        # ── Step 1A: open the model popover ONCE (model pick if needed +
+        #              ALWAYS to reach the Effort submenu / Thinking toggle) ──
+        dropdown_clicked = await page.evaluate("""() => {
+            const btns = [...document.querySelectorAll('button, [role="button"]')]
+                .filter(b => b.getClientRects().length > 0 && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'));
+            // The model-selector trigger shows the currently-selected model name.
+            let trigger = btns.find(b => (b.textContent || '').toLowerCase().includes('opus'));
+            if (!trigger) trigger = btns.find(b => {
+                const t = (b.textContent || '').toLowerCase();
+                return t.includes('sonnet') || t.includes('haiku') || t.includes('claude');
+            });
+            if (trigger) { trigger.click(); return true; }
+            return false;
+        }""")
+        if dropdown_clicked:
+            log("[setup_claude_dr] Step 1A OK: opened model popover")
+            await asyncio.sleep(0.8)
+            # ── Step 1B: pick the strongest Opus (>= 4.8) — ONLY when the
+            #              model isn't already correct (no re-click, #744) ──
+            if not model_ok:
+                try:
+                    for _attempt in range(8):
+                        opus_selected = await page.evaluate(_pick_opus_js)
+                        if opus_selected:
+                            break
+                        await asyncio.sleep(0.4)
+                except Exception as _pe:
+                    # A page.evaluate timeout/error during the poll must NOT
+                    # propagate with the popover still open (R1) — fall into the
+                    # FAIL branch below, which Escapes before returning False.
+                    log(f"[setup_claude_dr] Step 1B poll errored ({_pe}) — dismissing popover", "WARN")
+                    opus_selected = None
+                if opus_selected:
+                    log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected}")
+                else:
+                    log("[setup_claude_dr] Step 1B FAIL: Opus >= 4.8 option not found in popover after polling — rollout/A-B difference or 4.8 retired?", "WARN")
+                    # Never strand an OPEN dropdown over the composer (the bug
+                    # screenshot) — dismiss it before bailing to the CUA fallback.
+                    try:
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+                    return False
+                await asyncio.sleep(0.6)
+
+            # ── Step 1C: open the Effort submenu ───────────────────────
             # 2026-05-28: claude.ai split the old single "Opus 4.7 Adaptive"
             # option into Model (Opus 4.8) + an Effort submenu (Low/Medium/
-            # High/Extra/Max) + an Adaptive-thinking toggle — all inside the
-            # model popover, which STAYS open after picking a model. So we
-            # open the Effort submenu and pick Max WITHOUT dismissing first.
-            # Best-effort: Effort/Adaptive are quality knobs, not correctness
-            # gates, so a miss here only WARNs — the CUA validate layer
-            # (PROMPT_VALIDATE_CLAUDE_SETUP) is the real backstop.
+            # High/Extra/Max) that ALSO holds the "Thinking" toggle. We open it
+            # to reach BOTH Max and the Thinking toggle, and set Thinking BEFORE
+            # picking Max (selecting an effort radio can collapse the submenu —
+            # which is exactly why the old page-wide Adaptive-Thinking search
+            # ran on a closed submenu and never found the toggle). Best-effort:
+            # Effort/Thinking are quality knobs, not correctness gates, so a
+            # miss here only WARNs — the CUA validate layer is the backstop.
             try:
                 _eff_opened = await page.evaluate("""() => {
                     const els = [...document.querySelectorAll('[role="menuitem"], button, [role="option"], li')]
-                        .filter(el => el.offsetParent !== null);
+                        .filter(el => el.getClientRects().length > 0);
                     // The Effort row shows its current value + a submenu chevron.
                     const trigger = els.find(el => {
-                        const t = (el.textContent || '').trim().toLowerCase();
+                        const t = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                         return t === 'effort' || t.startsWith('effort');
                     });
                     if (trigger) { trigger.click(); return true; }
@@ -24263,63 +24267,88 @@ async def setup_claude_dr(page) -> bool:
                 }""")
                 if _eff_opened:
                     await asyncio.sleep(0.5)
+                    # ── Step 1D: toggle "Thinking" ON (inside the submenu) ──
+                    # #745: the toggle is labeled "Thinking" (NOT "Adaptive
+                    # Thinking" — that old label is why the page-wide search
+                    # missed it) and lives in the just-opened Effort submenu.
+                    # State-aware: only click when it reads off.
+                    _think = await page.evaluate("""() => {
+                        const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        const vis = el => el.getClientRects().length > 0;
+                        const isThinking = el => {
+                            const t = norm(el.textContent), a = norm(el.getAttribute('aria-label'));
+                            return t === 'thinking' || a === 'thinking' || a.startsWith('thinking') ||
+                                   t.startsWith('adaptive thinking') || a.startsWith('adaptive thinking') ||
+                                   t.startsWith('extended thinking');
+                        };
+                        const isOn = el => el.getAttribute('aria-checked') === 'true' ||
+                                           el.getAttribute('aria-pressed') === 'true' ||
+                                           el.dataset.state === 'checked' || el.dataset.state === 'on';
+                        const all = [...document.querySelectorAll('[role="switch"], [role="checkbox"], [role="menuitemcheckbox"], button, label, div')].filter(vis);
+                        // Prefer an explicit switch/checkbox whose OWN label is "Thinking".
+                        let sw = all.find(el => {
+                            const r = el.getAttribute('role');
+                            return (r === 'switch' || r === 'checkbox' || r === 'menuitemcheckbox') && isThinking(el);
+                        });
+                        // Else: a "Thinking"-labelled row that CONTAINS a switch.
+                        if (!sw) {
+                            const row = all.find(el => {
+                                const t = norm(el.textContent);
+                                return (t === 'thinking' || t.startsWith('thinking') || t.includes('think for more complex')) &&
+                                       el.querySelector('[role="switch"], [role="checkbox"], button');
+                            });
+                            if (row) sw = row.querySelector('[role="switch"], [role="checkbox"], button');
+                        }
+                        if (!sw) return { found: false };
+                        if (!isOn(sw)) { sw.click(); return { found: true, toggled: true }; }
+                        return { found: true, toggled: false };
+                    }""")
+                    if not _think.get("found"):
+                        log("[setup_claude_dr] Step 1D WARN: 'Thinking' toggle not found in Effort submenu — UI moved/relabelled it", "WARN")
+                    else:
+                        log(f"[setup_claude_dr] Step 1D OK: Thinking {'just enabled' if _think.get('toggled') else 'already on'}")
+                    await asyncio.sleep(0.3)
+                    # ── Step 1C': set Effort = Max (state-aware) ──
                     _eff_set = await page.evaluate("""() => {
-                        const items = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, li')]
-                            .filter(el => el.offsetParent !== null);
-                        // Exact-match the trimmed label so we don't catch the
-                        // "Higher effort means…" helper text or a "Max Effort" blurb.
-                        let pick = items.find(el => (el.textContent || '').trim().toLowerCase() === 'max');
-                        if (!pick) pick = items.find(el => (el.textContent || '').trim().toLowerCase() === 'max effort');
-                        if (pick) { pick.click(); return pick.textContent.trim().slice(0, 40); }
-                        return null;
+                        const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        const items = [...document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], button, li')]
+                            .filter(el => el.getClientRects().length > 0);
+                        // Exact-match "max" so we don't catch "Higher effort means…"
+                        // helper text or a "Max Effort" blurb. Skip if already Max.
+                        let pick = items.find(el => norm(el.textContent) === 'max');
+                        if (!pick) pick = items.find(el => norm(el.textContent) === 'max effort');
+                        if (!pick) return null;
+                        const already = pick.getAttribute('aria-checked') === 'true' ||
+                                        pick.dataset.state === 'checked' || pick.dataset.state === 'on';
+                        if (!already) pick.click();
+                        return already ? 'max (already)' : 'max';
                     }""")
                     if _eff_set:
-                        log(f"[setup_claude_dr] Step 1C OK: Effort set to '{_eff_set}'")
+                        log(f"[setup_claude_dr] Step 1C OK: Effort '{_eff_set}'")
                     else:
-                        log("[setup_claude_dr] Step 1C WARN: Effort submenu opened but 'Max' not found — CUA validate will fix", "WARN")
+                        log("[setup_claude_dr] Step 1C WARN: 'Max' effort not found in submenu — CUA validate will fix", "WARN")
                 else:
                     log("[setup_claude_dr] Step 1C WARN: Effort control not found (older UI / popover closed?) — CUA validate will fix", "WARN")
             except Exception as _ee:
-                log(f"[setup_claude_dr] Step 1C errored: {_ee}", "WARN")
-            await asyncio.sleep(0.4)
-
-            # ── Step 1D: toggle Adaptive Thinking ON ───────────────────
-            # Now a toggle inside the same model/effort popover (was a
-            # separate composer control pre-2026-05-28). State-aware: only
-            # click when not already on. Page-wide search so it works whether
-            # the popover is open or the toggle lives elsewhere in a variant.
-            adaptive_state = await page.evaluate("""() => {
-                const els = [...document.querySelectorAll(
-                    'button, [role="switch"], [role="checkbox"], [role="menuitem"], [role="option"], label'
-                )].filter(el => el.offsetParent !== null);
-                const matches = els.filter(el => {
-                    const t = (el.textContent || '').trim().toLowerCase();
-                    const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                    return t === 'adaptive thinking' ||
-                           a === 'adaptive thinking' ||
-                           t.startsWith('adaptive thinking') ||
-                           a.startsWith('adaptive thinking');
-                });
-                if (!matches.length) return { found: false };
-                const el = matches[0];
-                const checked = el.getAttribute('aria-checked') === 'true' ||
-                                 el.getAttribute('aria-pressed') === 'true' ||
-                                 el.dataset.state === 'checked' || el.dataset.state === 'on';
-                if (!checked) { el.click(); return { found: true, toggled: true, label: el.textContent.trim() }; }
-                return { found: true, toggled: false, label: el.textContent.trim() };
-            }""")
-            if not adaptive_state.get("found"):
-                log("[setup_claude_dr] Step 1D WARN: Adaptive Thinking toggle not found — UI may have shipped under a new label", "WARN")
-            else:
-                log(f"[setup_claude_dr] Step 1D OK: Adaptive Thinking {'just enabled' if adaptive_state.get('toggled') else 'already on'} "
-                    f"(label='{adaptive_state.get('label')}')")
-            await asyncio.sleep(0.4)
+                log(f"[setup_claude_dr] Step 1C/1D errored: {_ee}", "WARN")
+            await asyncio.sleep(0.3)
             # Dismiss the model popover so the tools menu + input are clickable.
             try:
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
+        else:
+            # Couldn't open the popover. If the model is already >= 4.8 the run
+            # is still correct (model is the only hard gate here); the Effort/
+            # Thinking quality knobs fall to the CUA validate layer. If the model
+            # is NOT >= 4.8 and we can't even open the picker, the selector list
+            # is stale — fail fast to the CUA fallback.
+            if model_ok:
+                log("[setup_claude_dr] Step 1A WARN: couldn't open model popover to set Effort/Thinking — model already Opus >= 4.8; CUA validate will confirm the quality knobs", "WARN")
+            else:
+                log("[setup_claude_dr] Step 1A FAIL: model popover button not found — selector list likely stale", "WARN")
+                return False
 
         # ── Step 3: open tools menu and enable Research ────────────────
         # Precise selectors first — the old `button[aria-label*="+"]`
@@ -24474,6 +24503,16 @@ async def setup_claude_dr(page) -> bool:
         return bool(opus_selected) and bool(research_enabled)
     except Exception as e:
         log(f"[setup_claude_dr] {e}", "WARN")
+        # #744 invariant: NEVER strand an open model popover over the composer
+        # (it would trigger the re-click loop on pre-send re-activation). Any
+        # exception anywhere above — including a page.evaluate timeout during
+        # the Step 1B poll, which propagates past the inner Escape paths — must
+        # still dismiss a possibly-open popover. Escape is a harmless no-op when
+        # nothing is open.
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
         return False
 
 
@@ -29917,7 +29956,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 brief_artifact = BriefArtifact(text=brief_text, url=_in_app_brief_url)
                 log(f"BriefArtifact (from file): {brief_artifact.chars} chars, "
                     f"{len(brief_artifact.sections)} sections")
-                _p1_links = [{"label": "Read brief", "url": _in_app_brief_url, "verified": True, "primary": True}]
+                # #746: label MUST match the FE reopen-hydration backfill's
+                # `Read ${HYDRATE_TYPE_LABELS.brief} report` = "Read Brief report"
+                # (usePipeline.ts). When they differ, a phone/cold reopen replays
+                # this phase_complete link ("Read brief") AND the backfill
+                # synthesizes its own ("Read Brief report") for the SAME
+                # /documents?open=…:brief URL — the FE (label,url) dedup can't
+                # collapse them, so the P1 brief renders TWICE. P2 never had this
+                # bug precisely because its BE + backfill labels already matched.
+                _p1_links = [{"label": "Read Brief report", "url": _in_app_brief_url, "verified": True, "primary": True}]
                 save_checkpoint(queue_dir, 1, topic=topic, brief_url=_in_app_brief_url)
                 save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
                 emit_event("phase_complete", phase=1,
@@ -29952,7 +29999,15 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _in_app_brief_url = f"/documents?open={_fb_research_id}:brief" if _fb_research_id else "/documents"
                 brief_artifact = BriefArtifact(text=brief_text, url=_in_app_brief_url)
                 log(f"BriefArtifact: {brief_artifact.chars} chars, {len(brief_artifact.sections)} sections")
-                _p1_links = [{"label": "Read brief", "url": _in_app_brief_url, "verified": True, "primary": True}]
+                # #746: label MUST match the FE reopen-hydration backfill's
+                # `Read ${HYDRATE_TYPE_LABELS.brief} report` = "Read Brief report"
+                # (usePipeline.ts). When they differ, a phone/cold reopen replays
+                # this phase_complete link ("Read brief") AND the backfill
+                # synthesizes its own ("Read Brief report") for the SAME
+                # /documents?open=…:brief URL — the FE (label,url) dedup can't
+                # collapse them, so the P1 brief renders TWICE. P2 never had this
+                # bug precisely because its BE + backfill labels already matched.
+                _p1_links = [{"label": "Read Brief report", "url": _in_app_brief_url, "verified": True, "primary": True}]
                 save_checkpoint(queue_dir, 1, topic=topic, brief_url=_in_app_brief_url)
                 update_delivery(brief_url=_in_app_brief_url)
                 save_meta(queue_dir, topic, 1, summary=brief_text[:200].strip())
