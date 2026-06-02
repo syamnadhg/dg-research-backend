@@ -6967,6 +6967,72 @@ def _fire_fe_p4_trigger(uid, research_id):
     return False
 
 
+def _post_fe_p4p5_trigger(uid, research_id):
+    """Option C (#742): drive P4 (YouTube) + P5 (Doc/email) autonomously so a
+    run completes even when the chat app is never opened.
+
+    Two cooperating parts:
+      1) Write the `needsFeTrigger` marker synchronously (via
+         _fire_fe_p4_trigger) — the long-standing FE catch-up backstop AND the
+         safe fallback if the autonomous POST below can't run. This uses the
+         worker's module-global Firestore context, so it MUST run here in the
+         worker thread, never the background thread.
+      2) Additionally POST {FE_BASE_URL}/api/uploadYouTube authenticated with
+         the synth-device user's OWN fresh ID token; the route authorizes the
+         device->research binding (authorizeSynthForResearch) and runs P4 then
+         chains P5 server-side on Cloud Run. We hit ONLY uploadYouTube (it owns
+         the P5 chain) to avoid a double P5. casRouteP4 dedups this against the
+         FE catch-up, so the two triggers coexist safely.
+
+    The POST runs in a detached daemon thread with a long timeout: the encode +
+    resumable upload can take minutes and the route processes inline while the
+    connection is open, so we must neither block the worker (it has a queue to
+    drain) nor disconnect early (a client-disconnect can abort the route
+    mid-encode). On any POST failure the marker — already written — ensures the
+    FE catch-up still runs on next chat-open. Best-effort; never raises."""
+    # (1) marker backstop — synchronous, worker context (module globals valid).
+    _fire_fe_p4_trigger(uid, research_id)
+    if not uid or not research_id:
+        return False
+    # (2) autonomous server-to-server trigger.
+    id_token = _fresh_user_mode_id_token()
+    if not id_token:
+        log("FE trigger: no synth id-token (creds revoked?) — needsFeTrigger marker only", "INFO")
+        return False
+
+    def _drive():
+        try:
+            import requests as _requests
+            from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+            _resp = _requests.post(
+                f"{_FE_BASE_URL}/api/uploadYouTube",
+                headers={"Authorization": f"Bearer {id_token}"},
+                json={"research_id": research_id, "ownerUid": uid},
+                timeout=3600,  # match the route's Cloud Run maxDuration (long podcast encode + upload)
+            )
+            if _resp.status_code in (200, 202):
+                log(f"FE trigger: BE-driven P4/P5 dispatched ✓ (HTTP {_resp.status_code}) rid={research_id[:8]}…")
+            else:
+                log(
+                    f"FE trigger: BE-driven P4/P5 HTTP {_resp.status_code} "
+                    f"({_resp.text[:160]}) — FE catch-up covers via marker",
+                    "WARN",
+                )
+        except Exception as _e:
+            log(f"FE trigger: BE-driven P4/P5 dispatch failed ({_e}) — FE catch-up covers via marker", "WARN")
+
+    try:
+        import threading as _threading
+        _threading.Thread(
+            target=_drive,
+            name=f"fe-p4p5-{research_id[:8]}",
+            daemon=True,
+        ).start()
+    except Exception as _e:
+        log(f"FE trigger: could not spawn BE-driven dispatch thread ({_e}) — marker only", "WARN")
+    return True
+
+
 # #722 Bug A: save_meta() rebuilds the whole agents map + phases array and
 # propagates them with `.update({"agents": …, "phases": …})` — a whole-FIELD
 # REPLACE, not a recursive merge — which WIPES the per-agent/per-phase
@@ -28112,7 +28178,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # leave the chain dangling on the FE listener (which may not
             # be alive when this resume path runs from the daemon-loop).
             try:
-                _fire_fe_p4_trigger(_fb_uid, _fb_research_id)
+                _post_fe_p4p5_trigger(_fb_uid, _fb_research_id)
             except Exception as _trig_err:
                 log(f"FE trigger dispatch failed on resume (non-fatal): {_trig_err}", "WARN")
             return
@@ -30939,7 +31005,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # isn't open. Cloud Tasks owns delivery + retries; the call below
         # is a fast unary RPC (~50ms typical) — no thread held.
         try:
-            _fire_fe_p4_trigger(_fb_uid, _fb_research_id)
+            _post_fe_p4p5_trigger(_fb_uid, _fb_research_id)
         except Exception as _trig_err:
             log(f"FE trigger dispatch failed (non-fatal): {_trig_err}", "WARN")
         log(f"\n{'='*60}")
