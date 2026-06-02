@@ -53,16 +53,18 @@ def test_A_cua_pro_tier_call_crosschecks_chatgpt_on_free():
     assert "_chatgpt_dom_tier(page)" in src
 
 
-# ── B: P1 brief stuck-DOM reload + re-extract ─────────────────────────────────
-def test_B_run_phase1_reloads_and_reextracts_on_short_brief():
+# ── B: P1 brief short-extract recovery ────────────────────────────────────────
+# SUPERSEDED by #752 — see tests/test_e2e_p1p2_fixes_752.py. The #751 reload was
+# the WRONG remedy (a reload COLLAPSES the canvas, making the extract shorter):
+# the brief lives in an un-opened ChatGPT canvas, so the recovery must OPEN the
+# canvas (re-extract WITH browser+cua so Tier-1 runs), not reload. This test now
+# guards the corrected contract so the harmful reload can't creep back.
+def test_B_run_phase1_recovers_short_brief_without_reload():
     src = inspect.getsource(research.run_phase1)
-    assert "brief_len < 500" in src, "reload-recovery guard threshold missing"
-    assert "browser.page.reload" in src, (
-        "run_phase1 no longer reloads to clear a stuck DOM before failing"
-    )
-    # Re-extraction happens after the reload and can replace the short brief.
-    assert src.count("extract_chatgpt_response(browser.page)") >= 2, (
-        "expected an initial extract AND a post-reload re-extract"
+    assert "brief_len < 500" in src, "short-brief recovery guard threshold missing"
+    assert "browser.page.reload" not in src, (
+        "run_phase1 reloads on a short brief again — that collapses the canvas "
+        "and made the extract WORSE (#752 removed it)"
     )
     assert "_reextract" in src and "_re_len > brief_len" in src
 

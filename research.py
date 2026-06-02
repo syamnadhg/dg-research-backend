@@ -22231,7 +22231,8 @@ async def _run_with_clipboard_hijack(
                 pass
 
 
-async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
+async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False,
+                                   allow_cua_hijack=True):
     """Extract ChatGPT response — 3 Wayland-safe tiers (rewritten 2026-05-14).
 
     Per-agent extraction model is intentionally divergent (the PR body's
@@ -22262,7 +22263,14 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
               + iframe-aware install). Wayland-safe.
 
     Phase 1 (brief extraction) calls with browser=None / cua_client=None
-    so Tier 1 + Tier 3 gate off — Tier 2 HTML→MD is its sole path.
+    so Tier 1 + Tier 3 gate off — Tier 2 HTML→MD is its sole path. Its
+    short-brief recovery (#752) re-calls WITH browser+cua but passes
+    allow_cua_hijack=False: Tier 1 (artifact-targeted canvas-open download)
+    and Tier 2 (canvas DOM) are safe to re-run, but Tier 3 — a whole-page
+    Ctrl+A/copy — must NOT run for the brief, because there is usually no
+    "research report document" artifact at P1 and the hijack would capture
+    the chat thread (the user's topic prompt + ChatGPT's preamble) and pass
+    the length-only acceptance, poisoning the brief fed to all P2 agents.
 
     ChatGPT Deep Research outputs a document/artifact card, not regular chat text."""
     await asyncio.sleep(2)
@@ -22358,7 +22366,11 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     # when no page-side setData fires. Iframe-aware install covers the
     # DR canvas sandbox iframe. Helper timeout_ms = 200000 sits ABOVE
     # the inner asyncio.wait_for(180.0) so the inner cap fires first.
-    if browser and cua_client:
+    # allow_cua_hijack gate (#752): the P1 brief recovery disables this tier
+    # — a whole-page Ctrl+A copy can grab the chat thread (no report artifact
+    # exists yet at P1) and the length-only acceptance would let it poison the
+    # brief. P2 callers leave it True (default), so P2 behaviour is unchanged.
+    if browser and cua_client and allow_cua_hijack:
         async def _cgpt_t3_trigger():
             await browser.switch_to_page(page)
             await asyncio.wait_for(
@@ -23453,27 +23465,39 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
 
     brief_len = len(brief_text or "")
 
-    # #751 (2026-06-02): stuck-browser recovery. On the roadmap E2E the page
-    # wedged at end-of-generation — the Tier-2 HTML→MD scrape stayed flat on a
-    # 201-char stale snippet, the "Stop" button persisted (DOM detector
-    # false-positive "generating" for 12 min), and when the CUA safety-net
-    # finally ruled the response COMPLETE the extractor still read the stale/
-    # empty DOM → the run declared "no brief generated" although the brief had
-    # finished in the UI. P1 extraction is Tier-2-DOM-only (browser/cua gated
-    # off), so a frozen DOM has NO fallback. Reload the conversation ONCE to
-    # force a fresh render, then re-scrape BEFORE any short/empty guard fires.
-    # Bounded (single reload, only when the first extract is short) so a healthy
-    # run pays nothing; if the re-extract is still short the existing guards
-    # below handle the genuinely-short/absent case.
-    if brief_len < 500:
+    # #752 (2026-06-02): short-brief recovery — supersedes the #751 reload,
+    # which made things WORSE. ROOT CAUSE (logs 05:05:28 + 06:31:01): the first
+    # extract above runs extract_chatgpt_response WITHOUT browser/cua_client, so
+    # ONLY Tier-2 DOM HTML→MD runs (Tier 1 + Tier 3 gate off). The DOM scrape
+    # DID return a short string (294/474 chars — ChatGPT's "I've written the
+    # brief in the canvas →" preamble), but Tier-2's acceptance gate is
+    # `len(md) > 2000`, so that short scrape was DISCARDED → the function
+    # returned "" ("All extraction methods failed (canvas may not have opened)")
+    # → false "no brief generated" although the brief HAD finished — rendered in
+    # a canvas/artifact card that didn't auto-open (294-char preamble ≪ a real
+    # 2-5k brief). The #751 reload did not help — a reload COLLAPSES the canvas
+    # back to closed (143 < 294 after reload). The fix is to OPEN the canvas:
+    # re-run WITH browser+cua so Tier 1 ("close panel → open canvas → Export to
+    # Markdown", an artifact-targeted download) + Tier 2 (canvas DOM) run.
+    # CRITICAL: pass allow_cua_hijack=False so Tier 3 (whole-page Ctrl+A copy)
+    # stays OFF — at P1 there is no report artifact, so the hijack would capture
+    # the chat thread and the length-only `_re_len > brief_len` guard would let
+    # it poison the brief sent to all P2 agents (adversarial-review blocker).
+    # Bounded (single retry, only when the DOM-only extract is short) so a
+    # healthy inline brief pays nothing; the `_re_len > brief_len` guard discards
+    # an empty re-extract, the extractor's own _is_sources_not_document /
+    # _looks_like_nav_sidebar guards reject wrong-shape artifacts, and the
+    # short/absent guards below still handle a genuinely-short brief.
+    if brief_len < 500 and cua_client is not None:
         try:
-            log(f"Phase 1: first extract short ({brief_len} chars) — reloading to clear a possibly-stuck DOM and re-extracting", "WARN")
-            await browser.page.reload(wait_until="domcontentloaded")
-            await asyncio.sleep(5.0)
-            _reextract = await extract_chatgpt_response(browser.page)
+            log(f"Phase 1: DOM-only extract short ({brief_len} chars) — brief likely in an "
+                f"un-opened canvas; re-extracting with the CUA canvas-open ladder (no whole-page hijack)", "WARN")
+            _reextract = await extract_chatgpt_response(
+                browser.page, browser=browser, cua_client=cua_client, label="ChatGPT",
+                verbose=verbose, allow_cua_hijack=False)
             _re_len = len(_reextract or "")
             if _re_len > brief_len:
-                log(f"Phase 1: re-extract after reload recovered {_re_len} chars (was {brief_len}) — stuck DOM cleared")
+                log(f"Phase 1: CUA canvas re-extract recovered {_re_len} chars (was {brief_len}) — canvas opened")
                 brief_text = _reextract
                 brief_len = _re_len
                 try:
@@ -23481,9 +23505,9 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 except Exception:
                     pass
             else:
-                log(f"Phase 1: re-extract after reload still {_re_len} chars — brief may be genuinely short/absent", "WARN")
+                log(f"Phase 1: CUA canvas re-extract still {_re_len} chars — brief may be genuinely short/absent", "WARN")
         except Exception as _re_exc:
-            log(f"Phase 1: reload+re-extract failed ({_re_exc}) — proceeding with original extract", "WARN")
+            log(f"Phase 1: CUA canvas re-extract failed ({_re_exc}) — proceeding with original extract", "WARN")
 
     # Brief-short guard: DR briefs are typically 2-5k chars. Under 500 while
     # we were expecting >1000 usually means ChatGPT errored or the extractor
@@ -26099,21 +26123,47 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 "user_acknowledged_chat": False,
             }
 
-    # Brief ready — now click Send
-    await asyncio.sleep(1)
+    # Brief ready — now click Send.
+    # #752 (2026-06-02): POLL for an ENABLED send button instead of checking
+    # once. ROOT CAUSE (backend-2.log 06:35:24→06:35:25): the send button is
+    # transiently DISABLED for several seconds after the composer is filled —
+    # most often because the attached brief FILE is still uploading/processing
+    # (an upload spinner sits on the file chip), and/or because the just-before-
+    # send ensure_deep_mode_active() above can re-invoke setup_chatgpt_dr and
+    # briefly reset/blur the composer. The old code checked the selectors
+    # exactly ONCE, ~1s after typing — finding the button disabled it logged
+    # "Playwright can't find Send" and fell to the slow, non-deterministic CUA
+    # fallback whose 90s decision wait left the typed brief sitting unsent in the
+    # composer (the "stuck stale, text in the chat box" the user reported; CUA
+    # only barely recovered at 06:37:08). Polling clicks the instant the composer
+    # is ready (healthy paste/Gemini case fires on the FIRST iteration —
+    # behaviour unchanged) and otherwise waits out the disabled window. Bounded
+    # at ~20s, after which the JS + CUA fallbacks below still run as before. (The
+    # downstream verify_chatgpt_generating gate in run_phase2 2A remains the
+    # backstop if an enabled-but-intercepted click ever no-ops.)
+    _send_sels = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]',
+                  'button[aria-label="Send"]', 'button[aria-label="Send message"]',
+                  'button[aria-label="Send Message"]', 'button[aria-label="Submit"]']
     sent = False
-    for sel in ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]',
-                'button[aria-label="Send"]', 'button[aria-label="Send message"]',
-                'button[aria-label="Send Message"]', 'button[aria-label="Submit"]']:
-        try:
-            btn = await page.query_selector(sel)
-            if btn and await btn.is_enabled():
-                await btn.click()
-                log(f"[{label}] Send clicked ✓")
-                sent = True
-                break
-        except Exception:
-            continue
+    await asyncio.sleep(1)
+    _send_waited = 0.0
+    _send_deadline = 20.0
+    while not sent:
+        for sel in _send_sels:
+            try:
+                btn = await page.query_selector(sel)
+                if btn and await btn.is_enabled():
+                    await btn.click()
+                    log(f"[{label}] Send clicked ✓"
+                        + (f" (after {_send_waited:.0f}s wait for enable)" if _send_waited >= 1.5 else ""))
+                    sent = True
+                    break
+            except Exception:
+                continue
+        if sent or _send_waited >= _send_deadline:
+            break
+        await asyncio.sleep(1.5)
+        _send_waited += 1.5
     if not sent:
         try:
             sent = await page.evaluate("""() => {
