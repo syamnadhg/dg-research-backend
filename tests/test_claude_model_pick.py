@@ -50,3 +50,49 @@ def test_step1b_no_legacy_any_opus_4x_fallback():
         "the unconditional 'any Opus' fallback must be removed — it could "
         "select Opus 4.7 (#708)."
     )
+
+
+# ── #744 — re-click loop / P2-stuck fixes ─────────────────────────────
+
+
+def test_step1_skips_dropdown_when_model_already_4_8():
+    """#744: setup_claude_dr must read the model-selector TRIGGER first and
+    SKIP opening the dropdown when the model is already Opus >= 4.8. Opening it
+    unconditionally was the re-click loop that wedged P2 (the picker couldn't
+    see the already-selected option, returned False, and left the dropdown open)."""
+    src = inspect.getsource(research.setup_claude_dr)
+    assert "model_trigger_ver" in src, (
+        "Step 1 must read the model-selector trigger version before deciding "
+        "whether to open the dropdown (#744)."
+    )
+    assert "model_trigger_ver >= 4.8" in src and "skipping model dropdown" in src, (
+        "when the trigger already shows Opus >= 4.8, Step 1 must skip the "
+        "dropdown entirely (#744)."
+    )
+
+
+def test_step1b_escapes_before_bailing():
+    """#744: a Step 1B miss must dismiss the OPEN popover (Escape) before
+    returning False — never strand an open dropdown over the composer."""
+    src = inspect.getsource(research.setup_claude_dr)
+    # The fail path between the FAIL log and `return False` must press Escape.
+    fail_idx = src.find("Step 1B FAIL")
+    assert fail_idx != -1
+    tail = src[fail_idx:fail_idx + 700]
+    assert 'press("Escape")' in tail and "return False" in tail, (
+        "Step 1B FAIL must Escape the dropdown before `return False` (#744)."
+    )
+
+
+def test_step1b_selector_handles_menuitemradio_and_fixed_popover():
+    """#744: the option picker must see role=menuitemradio/div options (the
+    #709 lesson) and use getClientRects() so a fixed-position popover (whose
+    offsetParent is null) is not filtered out."""
+    src = inspect.getsource(research.setup_claude_dr)
+    assert "menuitemradio" in src, (
+        "the picker must include role=menuitemradio options (#744)."
+    )
+    assert "getClientRects()" in src, (
+        "the picker/trigger-read must use getClientRects() for visibility so "
+        "fixed-position popovers aren't filtered by offsetParent (#744)."
+    )

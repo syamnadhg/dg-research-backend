@@ -278,33 +278,26 @@ ABSOLUTELY FORBIDDEN:
 
 PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + """
 
-Your task: Verify Claude is correctly configured for Research (Opus 4.8 + Max effort + Adaptive thinking + Research mode), and fix it if not.
+Your task: Verify Claude is ready for Deep Research and fix ONLY what is wrong. The ONE thing that matters is the Research tool — everything else is secondary.
 
-Check visually (screenshot):
-1. Does the model selector show "Opus 4.8" with Effort = Max and Adaptive thinking ON? (Older UI may show a single "Opus 4.7 Adaptive" — that's acceptable if 4.8/Effort aren't offered.)
-2. Is the "Research" mode/tool enabled (usually indicated by a highlighted icon/badge near input)?
-3. Is the input area focused / ready for pasting?
-4. Are there any attachments already visible? If YES, that's a leftover — click the X to remove them.
+Read the composer. Do NOT open the model popover unless step 1 explicitly tells you to.
+1. MODEL: the model-selector button (bottom of the composer) shows the current model. If it reads "Opus 4.8" — or any "Opus 4.x" — the model is FINE; do nothing to it. That button ALSO shows the effort (e.g. "Max") right on it. DO NOT open the model popover, and DO NOT try to expand the "Effort" or "Adaptive thinking" submenu — those are quality knobs, NOT requirements, and clicking a submenu that won't expand only wastes turns. ONLY touch the model if the button shows Sonnet/Haiku with no Opus at all: then open it once, pick "Opus 4.8", and close it.
+2. RESEARCH TOOL (the priority — this is what actually matters): is "Research" / "Deep research" enabled near the composer (an active/highlighted pill or chip, or a checkmark beside "Research" in the "+" tools menu)? If you cannot tell from the current view, open the "+" / tools menu and look. If Research is OFF, turn it ON. If it is already ON, leave it.
+3. ATTACHMENTS: if a stale attachment is already visible in the composer, click its X to remove it.
+4. Click the input area to focus it.
 
-If model is Opus 4.8 (Max effort + Adaptive thinking) + Research mode is on + input is focused + NO stale attachments:
-  → Say "setup verified" and STOP immediately.
-
-Otherwise:
-  → If model is wrong: click model selector → pick "Opus 4.8", then set Effort = Max and Adaptive thinking ON in the same popover (or pick "Opus 4.7 Adaptive" on older UI).
-  → If Research mode is off: click "+" or tools menu → enable "Research".
-  → If stale attachments exist: click the X/remove button on each to clear them.
-  → Click input area to focus.
-  → Say "setup fixed" and STOP.
-
-If unavailable:
-  → Say "setup failed: <specific reason>" and STOP.
+Decision:
+  → If the Research tool is ON (model shows Opus, input focused, no stale attachments): say "setup verified" and STOP.
+  → If you turned Research ON, removed an attachment, or fixed the model: say "setup fixed" and STOP.
+  → If the Research tool is genuinely unavailable after checking the "+"/tools menu: say "setup failed: research tool not found" and STOP.
 
 ABSOLUTELY FORBIDDEN:
 - DO NOT type any text.
 - DO NOT paste any text.
 - DO NOT send any message.
 - DO NOT compose prompts.
-- DO NOT attach any new files."""
+- DO NOT attach any new files.
+- DO NOT open the model popover or chase the Effort/Adaptive submenu when the model button already shows Opus."""
 
 
 PROMPT_CLICK_SEND = SYSTEM_BASE + """

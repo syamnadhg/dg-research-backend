@@ -61,3 +61,41 @@ def test_gemini_validate_prompt_requires_placeholder():
         "the prompt must tell the CUA a merely-visible chip is NOT proof of "
         "active Deep Research (#709)."
     )
+
+
+# ── #744 — the Claude gate honors a POSITIVE CUA confirmation only ────
+
+
+def test_validate_setup_returns_ok_and_confirmed_tuple():
+    """#744: validate_setup_with_cua must return (ok, confirmed). `confirmed`
+    is True ONLY on a positive verified/fixed verdict — an ambiguous or errored
+    validation is ok=True (don't block) but confirmed=False (no proof DR is on)."""
+    src = inspect.getsource(research.validate_setup_with_cua)
+    assert "return True, True" in src, (
+        "a positive verified/fixed verdict must return (ok=True, confirmed=True) (#744)."
+    )
+    assert "return False, False" in src, (
+        "an explicit 'failed' verdict must return (ok=False, confirmed=False) (#744)."
+    )
+    # Ambiguous AND error paths must be ok-but-not-confirmed.
+    assert src.count("return True, False") >= 2, (
+        "ambiguous and error paths must return (ok=True, confirmed=False) so they "
+        "never count as proof Deep Research is on (#744)."
+    )
+
+
+def test_claude_gate_keys_on_positive_confirmation_not_loose_ok():
+    """#744: the Claude chat-mode gate must OR the POSITIVE `cua_confirmed`
+    signal, NOT the loose `cua_ok` (which is also True on ambiguous/error and
+    would let a real chat-mode degradation slip through silently, #709)."""
+    mod_src = inspect.getsource(research)
+    assert 'cua_ok, cua_confirmed = await validate_setup_with_cua(' in mod_src, (
+        "the call site must unpack the (ok, confirmed) tuple (#744)."
+    )
+    assert ('research_ok = bool((mode_state or {}).get("researchOn")) '
+            "or bool(cua_confirmed)") in mod_src, (
+        "the Claude gate must OR the positive cua_confirmed, not researchOn alone (#744)."
+    )
+    assert 'or bool(cua_ok)' not in mod_src, (
+        "the gate must NOT key on the loose cua_ok (True on ambiguous/error) (#744)."
+    )

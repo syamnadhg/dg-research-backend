@@ -9036,6 +9036,77 @@ async def _probe_cua_available(cua_client) -> None:
 _PRO_TIER_PLATFORMS = frozenset({"chatgpt", "claude", "gemini"})
 
 
+async def _gemini_dom_tier(page) -> str:
+    """Full-document DOM read of Gemini's subscription tier → 'pro'|'free'|'unsure'.
+
+    #743 (2026-06-01): the vision Pro-check screenshots only the composer
+    viewport, where an Advanced account looks IDENTICAL to free — after
+    Deep-Research setup the composer reads "Gemini" + Flash with no Advanced
+    badge (the badge lives in the collapsed left sidebar / account chip; the
+    user had to manually open the sidebar before the bot could see it). That
+    composer view matches the prompt's FREE signals, so vision confidently —
+    and wrongly — returns "free" on a paid account, forcing a manual Retry
+    (it hit BOTH workers). The DOM, unlike a viewport screenshot, can read the
+    off-screen sidebar/banner text.
+
+    Cost asymmetry drives the policy: a false 'free' WEDGES the run behind a
+    manual decision card; a false 'pro' only means a free run goes unflagged
+    (silent, acceptable). So we bias HARD toward Pro — only a VISIBLE upsell
+    CTA ("Get/Try/Upgrade … Gemini Advanced") declares 'free'; a current-plan
+    Advanced/Ultra marker (NOT an upsell) declares 'pro'; anything else is
+    'unsure' and the caller fails open. Never raises. Always logs the candidate
+    signals so the next E2E can pin exact selectors (the Step 3A dump pattern)."""
+    try:
+        res = await page.evaluate("""() => {
+            const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+            const vis = el => el.getClientRects().length > 0;
+            const clickables = [...document.querySelectorAll('button, a, [role="button"], [role="link"]')].filter(vis);
+            // FREE: a prominent upsell CTA. Match the VERB so a plain "Gemini
+            // Advanced" plan label on a PAID account isn't read as an upsell.
+            const upsellRe = /\\b(get|try|upgrade|subscribe|unlock)\\b.{0,24}(gemini advanced|advanced|google ai|pro plan)/i;
+            const upsell = clickables.find(el => upsellRe.test(norm(el.textContent)) || upsellRe.test(norm(el.getAttribute('aria-label'))));
+            // PRO: a current-plan marker that is NOT itself an upsell CTA.
+            const proRe = /(gemini advanced|google ai pro|google ai ultra|gemini ultra|2\\.5 pro|deep think)/i;
+            const verbRe = /\\b(get|try|upgrade|subscribe|unlock)\\b/i;
+            const proMark = [...document.querySelectorAll('*')].filter(vis).find(el => {
+                const t = norm(el.textContent);
+                if (!t || t.length > 28) return false;          // a short label/chip, not a paragraph
+                const m = t.match(proRe);
+                if (!m) return false;
+                // The marker must DOMINATE the element's text — a chip/badge
+                // ("Gemini Advanced"), not a sentence that merely mentions it
+                // ("Using Gemini Advanced for better analysis"). Caps the
+                // non-marker remainder so a prose false-positive can't read as
+                // a current-plan label.
+                if (t.length - m[0].length > 8) return false;
+                if (verbRe.test(t)) return false;               // exclude upsell CTAs
+                return true;
+            });
+            const dump = clickables
+                .filter(el => /advanced|upgrade|ultra|google ai|get gemini/i.test(norm(el.textContent) + ' ' + norm(el.getAttribute('aria-label'))))
+                .slice(0, 8)
+                .map(el => (norm(el.textContent) || norm(el.getAttribute('aria-label'))).slice(0, 44));
+            return { upsell: !!upsell, proMark: !!proMark,
+                     upsellText: upsell ? (norm(upsell.textContent) || norm(upsell.getAttribute('aria-label'))).slice(0, 50) : '',
+                     proText: proMark ? norm(proMark.textContent).slice(0, 50) : '',
+                     dump };
+        }""")
+    except Exception as e:
+        log(f"[pro_tier:gemini] DOM tier read failed: {e}", "INFO")
+        return "unsure"
+    if not isinstance(res, dict):
+        return "unsure"
+    log(f"[pro_tier:gemini] DOM tier signals: upsell={res.get('upsell')} ({res.get('upsellText')!r}) "
+        f"proMark={res.get('proMark')} ({res.get('proText')!r}) candidates={res.get('dump')}", "INFO")
+    # Bias to Pro: a current-plan Advanced/Ultra marker wins outright; only a
+    # clear upsell CTA (with NO pro marker) declares free.
+    if res.get("proMark"):
+        return "pro"
+    if res.get("upsell"):
+        return "free"
+    return "unsure"
+
+
 async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = False) -> str:
     """Single-screenshot Pro/Free verdict for ChatGPT/Claude/Gemini.
 
@@ -9096,6 +9167,25 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
         if verdict.startswith("pro"):
             return "pro"
         if verdict.startswith("free"):
+            # #743 (2026-06-01): a Gemini "free" verdict is NOT trusted on its
+            # own. The Advanced badge is off-screen (sidebar), so the composer
+            # screenshot the model just judged matches the FREE signals even on
+            # a paid account — a heavy re-read of the SAME blind shot wouldn't
+            # help. Cross-check the DOM (which CAN read the off-screen
+            # sidebar/banner) and FAIL OPEN: only a clear upsell CTA confirms
+            # genuine free; otherwise assume Pro and DON'T raise the alert.
+            # ChatGPT/Claude are unaffected — their Pro/Opus badge is on-screen
+            # and reads reliably (logs show "Pro detected ✓").
+            if pname == "gemini":
+                dom = await _gemini_dom_tier(page)
+                if dom == "pro":
+                    log("[pro_tier:gemini] vision said FREE but DOM shows an Advanced/Pro marker — trusting DOM (pro)", "INFO")
+                    return "pro"
+                if dom == "free":
+                    log("[pro_tier:gemini] vision FREE + DOM upsell CTA present — confirmed free", "INFO")
+                    return "free"
+                log("[pro_tier:gemini] vision said FREE but DOM has no upsell CTA (badge is off-screen) — failing open, assuming Pro (no alert)", "INFO")
+                return "unsure"
             return "free"
         # #724 item 2: an ambiguous LIGHT-model verdict gets one escalated
         # re-read on the heavy model (Opus 4.8) before we fall back to fail-open
@@ -24036,20 +24126,56 @@ async def setup_claude_dr(page) -> bool:
     try:
         await asyncio.sleep(2)
 
-        # ── Step 1: open model dropdown and pick Opus 4.8 ─────────────
-        dropdown_clicked = await page.evaluate("""() => {
-            const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
-            // Model selector button shows the currently-selected model name.
-            // Priority: already-Opus > Sonnet > any button with "claude"
-            let dropdown = btns.find(b => (b.textContent || '').toLowerCase().includes('opus'));
-            if (!dropdown) dropdown = btns.find(b => {
-                const t = (b.textContent || '').toLowerCase();
-                return t.includes('sonnet') || t.includes('haiku') || t.includes('claude');
-            });
-            if (dropdown) { dropdown.click(); return true; }
-            return false;
+        # ── Step 1: ensure the model is Opus >= 4.8 ───────────────────
+        # B1/B2 fix (2026-06-01 #744, backend.log 22:37/22:39): the model
+        # selector TRIGGER button already shows the current model (e.g.
+        # "Opus 4.8 Max" — the default for this account). The OLD code
+        # opened the dropdown UNCONDITIONALLY; when the model was already
+        # >= 4.8 that was both pointless AND harmful — Step 1B's picker
+        # couldn't see the already-selected option (it renders as a
+        # role="menuitemradio"/div the old item selector missed, and a
+        # fixed-position popover is filtered out by offsetParent), so it
+        # returned False, LEFT THE DROPDOWN OPEN over the composer, and
+        # bailed before the Research step. On the just-before-send
+        # re-activation that became a re-click loop that wedged P2 (the
+        # exact bug the user saw: "clicking the model selector repeatedly
+        # inspite of choosing the right model and tool"). Fix: read the
+        # trigger first; only open + pick when NOT already >= 4.8.
+        model_trigger_ver = await page.evaluate("""() => {
+            const verOf = t => { const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i); return m ? parseFloat(m[1]) : null; };
+            const vis = el => el.getClientRects().length > 0;   // fixed-position triggers have offsetParent === null
+            // The trigger lives OUTSIDE any open popover — exclude menu/
+            // listbox/dialog descendants so a stale option can't be read.
+            const btns = [...document.querySelectorAll('button, [role="button"]')]
+                .filter(b => vis(b) && !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'));
+            let best = null;
+            for (const b of btns) { const v = verOf(b.textContent); if (v !== null && (best === null || v > best)) best = v; }
+            return best;
         }""")
-        if dropdown_clicked:
+        opus_selected = None
+        if isinstance(model_trigger_ver, (int, float)) and model_trigger_ver >= 4.8:
+            # Model already correct — DO NOT open the dropdown (that was the
+            # re-click bug). Effort/Adaptive are quality knobs the CUA
+            # validate layer confirms; the account default already shows Max.
+            opus_selected = f"Opus {model_trigger_ver} (already selected — dropdown skipped)"
+            log(f"[setup_claude_dr] Step 1 OK: model already Opus {model_trigger_ver} (trigger) — skipping model dropdown")
+        else:
+            # ── Step 1A: open the model dropdown ───────────────────────
+            dropdown_clicked = await page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent !== null);
+                // Model selector button shows the currently-selected model name.
+                // Priority: already-Opus > Sonnet > any button with "claude"
+                let dropdown = btns.find(b => (b.textContent || '').toLowerCase().includes('opus'));
+                if (!dropdown) dropdown = btns.find(b => {
+                    const t = (b.textContent || '').toLowerCase();
+                    return t.includes('sonnet') || t.includes('haiku') || t.includes('claude');
+                });
+                if (dropdown) { dropdown.click(); return true; }
+                return false;
+            }""")
+            if not dropdown_clicked:
+                log("[setup_claude_dr] Step 1A FAIL: model dropdown button not found — selector list likely stale", "WARN")
+                return False
             log("[setup_claude_dr] Step 1A OK: opened model dropdown")
             await asyncio.sleep(0.8)
             # Step 1B: pick the STRONGEST Opus (>= 4.8) from the OPEN popover.
@@ -24065,13 +24191,18 @@ async def setup_claude_dr(page) -> bool:
             # (c) poll for the option to appear. If only sub-4.8 Opus exists,
             # return null so the CUA fallback (Opus-4.8 prompt) handles it rather
             # than silently selecting 4.7. Future-proof: picks the highest version.
+            # 2026-06-01 (#744): broadened the item selector — the option can be
+            # a role="menuitemradio"/div (the #709 lesson), and a fixed-position
+            # popover is filtered by offsetParent, so visibility uses
+            # getClientRects(). Without this Step 1B couldn't see the options.
             _pick_opus_js = """() => {
+                const vis = el => el.getClientRects().length > 0;
                 const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
-                    .filter(m => m.offsetParent !== null);
+                    .filter(vis);
                 const roots = menus.length ? menus : [document.body];
                 const seen = new Set();
-                const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="option"], button, a, li')])
-                    .filter(el => el.offsetParent !== null && !seen.has(el) && seen.add(el));
+                const items = roots.flatMap(m => [...m.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], button, a, li, div, span')])
+                    .filter(el => vis(el) && !seen.has(el) && seen.add(el));
                 const verOf = t => {
                     const m = (t || '').match(/opus[^0-9]*([0-9]+(?:\\.[0-9]+)?)/i);
                     return m ? parseFloat(m[1]) : null;
@@ -24087,10 +24218,9 @@ async def setup_claude_dr(page) -> bool:
                         best = el; bestV = v; bestLen = t.length;
                     }
                 }
-                if (best) { best.click(); return best.textContent.trim(); }
+                if (best) { best.click(); return best.textContent.trim().slice(0, 60); }
                 return null;
             }"""
-            opus_selected = None
             for _attempt in range(8):
                 opus_selected = await page.evaluate(_pick_opus_js)
                 if opus_selected:
@@ -24100,6 +24230,13 @@ async def setup_claude_dr(page) -> bool:
                 log(f"[setup_claude_dr] Step 1B OK: selected {opus_selected}")
             else:
                 log("[setup_claude_dr] Step 1B FAIL: Opus >= 4.8 option not found in popover after polling — rollout/A-B difference or 4.8 retired?", "WARN")
+                # Never strand an OPEN dropdown over the composer (the bug
+                # screenshot) — dismiss it before bailing to the CUA fallback.
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
                 return False
             await asyncio.sleep(0.6)
 
@@ -24183,9 +24320,6 @@ async def setup_claude_dr(page) -> bool:
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-        else:
-            log("[setup_claude_dr] Step 1A FAIL: model dropdown button not found — selector list likely stale", "WARN")
-            return False
 
         # ── Step 3: open tools menu and enable Research ────────────────
         # Precise selectors first — the old `button[aria-label*="+"]`
@@ -24346,7 +24480,17 @@ async def setup_claude_dr(page) -> bool:
 async def validate_setup_with_cua(browser, cua_client, page, platform, label, verbose=False):
     """Extra validation layer: CUA looks at the screen and confirms the intended
     options (Deep Research / Extended / Research tool) are actually active. If not,
-    CUA tries to fix. Returns True if 'verified' or 'fixed', False otherwise."""
+    CUA tries to fix.
+
+    Returns a (ok, confirmed) tuple:
+      - ok        — False ONLY on an explicit "failed" verdict. True otherwise
+                    (verified/fixed/ambiguous/error) so a soft/uncertain
+                    validation never blocks the pipeline (unchanged contract).
+      - confirmed — True ONLY when CUA POSITIVELY said "verified"/"fixed".
+                    #744: the chat-mode gate keys on `confirmed`, NOT `ok` —
+                    an ambiguous or errored validation (ok=True, confirmed=False)
+                    must NOT be treated as proof Deep Research is on, or a real
+                    chat-mode degradation could slip through silently (#709)."""
     validator_map = {
         "chatgpt": PROMPT_VALIDATE_CHATGPT_SETUP,
         "gemini": PROMPT_VALIDATE_GEMINI_SETUP,
@@ -24360,7 +24504,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())
     if not sys_prompt:
-        return True  # Unknown platform — skip
+        return True, False  # Unknown platform — skip (not a positive confirmation)
     try:
         await browser.switch_to_page(page)
         result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
@@ -24368,16 +24512,16 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         text = (result.get("text") or "").lower()
         if "verified" in text or "fixed" in text:
             log(f"[{label}] CUA validation: {text[:120]}")
-            return True
+            return True, True
         if "failed" in text:
             log(f"[{label}] CUA validation FAILED: {text[:160]}", "WARN")
-            return False
-        # Ambiguous — treat as pass but log
+            return False, False
+        # Ambiguous — don't block the pipeline, but this is NOT a confirmation.
         log(f"[{label}] CUA validation ambiguous: {text[:120]}", "WARN")
-        return True
+        return True, False
     except Exception as e:
         log(f"[{label}] CUA validation error: {e}", "WARN")
-        return True  # Don't block pipeline on validator error
+        return True, False  # Don't block pipeline on validator error (but not confirmed)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -24774,6 +24918,36 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
                 state = await page.evaluate(_claude_state_js)
                 log(f"[{label}] Claude mode post-re-activate: "
                     f"extended={state.get('hasExtended')}, research={state.get('researchOn')}", "INFO")
+                # #744 self-documenting dump: when researchOn STILL reads False
+                # the detector's attribute keys (aria-pressed/data-state/active)
+                # likely don't match claude.ai's current Research pill. The
+                # gate now falls back to the positive CUA confirmation
+                # (cua_confirmed) so this is no longer fatal — but dump the
+                # composer's research-ish
+                # elements so the NEXT E2E pins the real "on" selector for a
+                # clean DOM fix (mirrors the Step 3A composer-button dump).
+                if not state.get("researchOn"):
+                    try:
+                        _rdump = await page.evaluate("""() => {
+                            const ce = document.querySelector('div[contenteditable="true"], .ProseMirror, [role="textbox"]');
+                            let scope = ce;
+                            for (let i = 0; i < 6 && scope && scope.parentElement; i++) scope = scope.parentElement;
+                            const root = scope || document.body;
+                            return [...root.querySelectorAll('button, [role="button"], [role="switch"], [role="checkbox"]')]
+                                .filter(b => b.getClientRects().length > 0)
+                                .filter(b => /research/i.test((b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')))
+                                .slice(0, 12)
+                                .map(b => ({
+                                    t: (b.textContent || '').trim().slice(0, 24),
+                                    al: (b.getAttribute('aria-label') || '').slice(0, 32),
+                                    pressed: b.getAttribute('aria-pressed') || '',
+                                    state: b.getAttribute('data-state') || '',
+                                    cls: (b.className || '').toString().slice(0, 48),
+                                }));
+                        }""")
+                        log(f"[{label}] #744 Research-pill dump (fix detector from this): {json.dumps(_rdump, ensure_ascii=False)}", "INFO")
+                    except Exception as _rde:
+                        log(f"[{label}] #744 Research-pill dump failed: {_rde}", "INFO")
             ok = bool(state.get("hasExtended") and state.get("researchOn"))
             return {"platform": "claude", "active": ok,
                     "hasExtended": bool(state.get("hasExtended")),
@@ -25471,9 +25645,11 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         result = await agent_loop(cua_client, browser, prompt_system, prompt_user,
             model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
-    # LAYER 2: CUA visual validation — confirms options are ACTUALLY active
+    # LAYER 2: CUA visual validation — confirms options are ACTUALLY active.
+    # cua_confirmed is True ONLY on a positive "verified"/"fixed" verdict (NOT
+    # ambiguous/error); the chat-mode gate below keys on it (#744).
     log(f"[{label}] CUA validating setup state...")
-    cua_ok = await validate_setup_with_cua(browser, cua_client, page, platform, label, verbose)
+    cua_ok, cua_confirmed = await validate_setup_with_cua(browser, cua_client, page, platform, label, verbose)
     if not cua_ok:
         log(f"[{label}] CUA validation failed — proceeding anyway but agent may misbehave", "WARN")
 
@@ -25576,7 +25752,20 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         # Per-platform "is Deep Research actually active?" signal. Claude
         # carries an explicit researchOn flag; ChatGPT/Gemini report `active`.
         if platform_l == "claude":
-            research_ok = bool((mode_state or {}).get("researchOn"))
+            # #744 (2026-06-01): also honor the Layer-2 CUA visual
+            # confirmation. The DOM researchOn read is brittle (the Research
+            # pill renders without the aria-pressed/data-state attributes the
+            # detector keys on), so a TRUE Research-on state false-negatived
+            # → the gate wedged P2 with a chat-mode alert even though Research
+            # was on (backend.log 22:39:47). The gate's own contract is "fire
+            # only when Layer 1 + Layer 2 + re-activation ALL failed"; OR-ing
+            # the Layer-2 confirmation makes the code match that contract.
+            # IMPORTANT: key on `cua_confirmed` (a POSITIVE "verified"/"fixed"
+            # verdict), NOT the looser `cua_ok` — `cua_ok` is also True on an
+            # ambiguous/errored validation, and trusting that would let a real
+            # chat-mode degradation slip through silently (#709). A positive
+            # visual confirmation is authoritative over the brittle DOM read.
+            research_ok = bool((mode_state or {}).get("researchOn")) or bool(cua_confirmed)
         else:
             research_ok = bool((mode_state or {}).get("active"))
         if not research_ok:
