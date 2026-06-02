@@ -9140,6 +9140,84 @@ async def _gemini_dom_tier(page) -> str:
     return "unsure"
 
 
+async def _chatgpt_dom_tier(page) -> str:
+    """Full-document DOM read of ChatGPT's subscription tier → 'pro'|'free'|'unsure'.
+
+    #751 (2026-06-02): parity with [_gemini_dom_tier]. The E2E proved ChatGPT
+    hits the SAME false-'free' as Gemini did in #743 — the viewport screenshot
+    the vision model judges can miss the current-plan marker, which lives in the
+    top model-selector button / account chip that isn't reliably in frame the
+    instant the shot is taken. So vision reads a paid account's bare composer as
+    'free' and fires a pro_required card (it hit BOTH workers; the user had to
+    manually open the model menu, where Pro showed instantly selected, before
+    CUA could see it). The DOM can read those off-screen/top-of-page markers.
+
+    Same cost-asymmetry policy as Gemini: a false 'free' WEDGES the run behind a
+    decision card; a false 'pro' only means a free run goes unflagged (silent,
+    acceptable). So bias HARD toward Pro — only a VISIBLE upsell CTA ('Upgrade
+    to Plus/Pro/Go', 'Get ChatGPT Plus') declares 'free'; a current-plan
+    Pro/Plus marker (NOT an upsell) declares 'pro'; anything else is 'unsure'
+    and the caller fails open. Never raises. Logs the candidate signals so the
+    next E2E can pin exact selectors."""
+    try:
+        res = await page.evaluate("""() => {
+            const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+            const vis = el => el.getClientRects().length > 0;
+            const clickables = [...document.querySelectorAll('button, a, [role="button"], [role="link"], [role="menuitem"]')].filter(vis);
+            // FREE: a prominent paid-tier upsell CTA (verb + plan noun) — so a
+            // plain "ChatGPT Plus" current-plan chip is NOT read as an upsell.
+            const upsellRe = /\\b(upgrade|subscribe|get|try)\\b.{0,24}\\b(chatgpt )?(plus|pro|go|team)\\b/i;
+            const upsell = clickables.find(el => upsellRe.test(norm(el.textContent)) || upsellRe.test(norm(el.getAttribute('aria-label'))));
+            // PRO: a current-plan marker that is NOT itself an upsell CTA.
+            const proRe = /(chatgpt pro|chatgpt plus|pro plan|plus plan|team plan|extended pro)/i;
+            const verbRe = /\\b(upgrade|subscribe|get|try)\\b/i;
+            const proMark = [...document.querySelectorAll('*')].filter(vis).find(el => {
+                const t = norm(el.textContent);
+                if (!t || t.length > 28) return false;          // a short chip/label, not a paragraph
+                const m = t.match(proRe);
+                if (!m) return false;
+                if (t.length - m[0].length > 8) return false;   // marker must DOMINATE the text
+                if (verbRe.test(t)) return false;               // exclude upsell CTAs
+                return true;
+            });
+            // Extra PRO source: the top model-selector trigger. On a Pro account
+            // with the Pro model picked it reads e.g. "Pro" / "Extended Pro" —
+            // read its OWN text with word boundaries so "Improve"/"product" miss.
+            let modelPro = false;
+            const mtrig = clickables.find(b => {
+                const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                const tid = (b.getAttribute('data-testid') || '').toLowerCase();
+                return tid.includes('model') || a.includes('model');
+            });
+            if (mtrig) {
+                const mt = norm(mtrig.textContent).toLowerCase();
+                if (/\\b(pro|plus)\\b/.test(mt) && !verbRe.test(mt)) modelPro = true;
+            }
+            const dump = clickables
+                .filter(el => /upgrade|plus|\\bpro\\b|\\bgo\\b|plan|model/i.test(norm(el.textContent) + ' ' + norm(el.getAttribute('aria-label'))))
+                .slice(0, 8)
+                .map(el => (norm(el.textContent) || norm(el.getAttribute('aria-label'))).slice(0, 44));
+            return { upsell: !!upsell, proMark: !!proMark, modelPro,
+                     upsellText: upsell ? (norm(upsell.textContent) || norm(upsell.getAttribute('aria-label'))).slice(0, 50) : '',
+                     proText: proMark ? norm(proMark.textContent).slice(0, 50) : '',
+                     dump };
+        }""")
+    except Exception as e:
+        log(f"[pro_tier:chatgpt] DOM tier read failed: {e}", "INFO")
+        return "unsure"
+    if not isinstance(res, dict):
+        return "unsure"
+    log(f"[pro_tier:chatgpt] DOM tier signals: upsell={res.get('upsell')} ({res.get('upsellText')!r}) "
+        f"proMark={res.get('proMark')} modelPro={res.get('modelPro')} ({res.get('proText')!r}) candidates={res.get('dump')}", "INFO")
+    # Bias to Pro: a current-plan Pro/Plus marker (chip or model trigger) wins
+    # outright; only a clear upsell CTA (with NO pro marker) declares free.
+    if res.get("proMark") or res.get("modelPro"):
+        return "pro"
+    if res.get("upsell"):
+        return "free"
+    return "unsure"
+
+
 async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = False) -> str:
     """Single-screenshot Pro/Free verdict for ChatGPT/Claude/Gemini.
 
@@ -9200,24 +9278,26 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
         if verdict.startswith("pro"):
             return "pro"
         if verdict.startswith("free"):
-            # #743 (2026-06-01): a Gemini "free" verdict is NOT trusted on its
-            # own. The Advanced badge is off-screen (sidebar), so the composer
-            # screenshot the model just judged matches the FREE signals even on
-            # a paid account — a heavy re-read of the SAME blind shot wouldn't
-            # help. Cross-check the DOM (which CAN read the off-screen
-            # sidebar/banner) and FAIL OPEN: only a clear upsell CTA confirms
-            # genuine free; otherwise assume Pro and DON'T raise the alert.
-            # ChatGPT/Claude are unaffected — their Pro/Opus badge is on-screen
-            # and reads reliably (logs show "Pro detected ✓").
-            if pname == "gemini":
-                dom = await _gemini_dom_tier(page)
+            # A vision "free" verdict is NOT trusted on its own for Gemini (#743)
+            # OR ChatGPT (#751). The current-plan marker is off-screen — Gemini's
+            # Advanced badge lives in the collapsed sidebar; ChatGPT's Pro/Plus
+            # marker lives in the top model-selector button — so the composer
+            # screenshot the model just judged matches the FREE signals even on a
+            # paid account, and a heavy re-read of the SAME blind shot wouldn't
+            # help. Cross-check the DOM (which CAN read those off-screen markers)
+            # and FAIL OPEN: only a clear upsell CTA confirms genuine free;
+            # otherwise assume Pro and DON'T raise the pro_required card. Claude's
+            # Opus badge is on-screen and reads reliably, so it still trusts the
+            # vision 'free' (logs show "Pro detected ✓").
+            if pname in ("gemini", "chatgpt"):
+                dom = await (_gemini_dom_tier(page) if pname == "gemini" else _chatgpt_dom_tier(page))
                 if dom == "pro":
-                    log("[pro_tier:gemini] vision said FREE but DOM shows an Advanced/Pro marker — trusting DOM (pro)", "INFO")
+                    log(f"[pro_tier:{pname}] vision said FREE but DOM shows a current-plan Pro marker — trusting DOM (pro)", "INFO")
                     return "pro"
                 if dom == "free":
-                    log("[pro_tier:gemini] vision FREE + DOM upsell CTA present — confirmed free", "INFO")
+                    log(f"[pro_tier:{pname}] vision FREE + DOM upsell CTA present — confirmed free", "INFO")
                     return "free"
-                log("[pro_tier:gemini] vision said FREE but DOM has no upsell CTA (badge is off-screen) — failing open, assuming Pro (no alert)", "INFO")
+                log(f"[pro_tier:{pname}] vision said FREE but DOM has no upsell CTA (marker off-screen) — failing open, assuming Pro (no alert)", "INFO")
                 return "unsure"
             return "free"
         # #724 item 2: an ambiguous LIGHT-model verdict gets one escalated
@@ -11216,8 +11296,15 @@ def emit_event(event_type, phase=None, agent=None, **data):
         # (single pause_event) — no unrelated skip fires while one is pending;
         # a config-disabled-agent skip at phase start finds no pending decision
         # and is a harmless no-op.
+        # #751 (2026-06-02): phase_restart added — a user clicking Retry on a
+        # pipeline_error card resolves the decision via await_phase_decision and
+        # emits phase_restart, but NOT pipeline_resumed, so the durable
+        # pendingDecision mirror was never cleared → the snag card re-surfaced on
+        # the next Firestore snapshot even after the run moved on. Decisions are
+        # serialized (one pause blocks the coroutine), so a restart can only
+        # resolve the single pending decision — clearing here is always correct.
         if event_type in ("pipeline_resumed", "pipeline_stopped",
-                          "agent_skipped", "phase_skipped"):
+                          "agent_skipped", "phase_skipped", "phase_restart"):
             _clear_pending_decision()
     except Exception:
         pass
@@ -23365,6 +23452,39 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     chat_url = await browser.current_url()
 
     brief_len = len(brief_text or "")
+
+    # #751 (2026-06-02): stuck-browser recovery. On the roadmap E2E the page
+    # wedged at end-of-generation — the Tier-2 HTML→MD scrape stayed flat on a
+    # 201-char stale snippet, the "Stop" button persisted (DOM detector
+    # false-positive "generating" for 12 min), and when the CUA safety-net
+    # finally ruled the response COMPLETE the extractor still read the stale/
+    # empty DOM → the run declared "no brief generated" although the brief had
+    # finished in the UI. P1 extraction is Tier-2-DOM-only (browser/cua gated
+    # off), so a frozen DOM has NO fallback. Reload the conversation ONCE to
+    # force a fresh render, then re-scrape BEFORE any short/empty guard fires.
+    # Bounded (single reload, only when the first extract is short) so a healthy
+    # run pays nothing; if the re-extract is still short the existing guards
+    # below handle the genuinely-short/absent case.
+    if brief_len < 500:
+        try:
+            log(f"Phase 1: first extract short ({brief_len} chars) — reloading to clear a possibly-stuck DOM and re-extracting", "WARN")
+            await browser.page.reload(wait_until="domcontentloaded")
+            await asyncio.sleep(5.0)
+            _reextract = await extract_chatgpt_response(browser.page)
+            _re_len = len(_reextract or "")
+            if _re_len > brief_len:
+                log(f"Phase 1: re-extract after reload recovered {_re_len} chars (was {brief_len}) — stuck DOM cleared")
+                brief_text = _reextract
+                brief_len = _re_len
+                try:
+                    chat_url = await browser.current_url()
+                except Exception:
+                    pass
+            else:
+                log(f"Phase 1: re-extract after reload still {_re_len} chars — brief may be genuinely short/absent", "WARN")
+        except Exception as _re_exc:
+            log(f"Phase 1: reload+re-extract failed ({_re_exc}) — proceeding with original extract", "WARN")
+
     # Brief-short guard: DR briefs are typically 2-5k chars. Under 500 while
     # we were expecting >1000 usually means ChatGPT errored or the extractor
     # grabbed the wrong element. Warn (not error) so the frontend can offer
@@ -24389,7 +24509,15 @@ async def setup_claude_dr(page) -> bool:
                 log(f"[setup_claude_dr] Step 1C/1D errored: {_ee}", "WARN")
             await asyncio.sleep(0.3)
             # Dismiss the model popover so the tools menu + input are clickable.
+            # #751 (2026-06-02): a SINGLE Escape closed only the inner Effort
+            # submenu (opened in Step 1C), leaving the PARENT model popover open
+            # over the composer — the #745 restructure added the nested submenu
+            # but kept the single Escape. Press TWICE: the 1st closes the submenu
+            # (if still open), the 2nd closes the model popover. An Escape with
+            # nothing open is a harmless no-op, so this is safe on every path here.
             try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.2)
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(0.3)
             except Exception:
@@ -24510,23 +24638,55 @@ async def setup_claude_dr(page) -> bool:
         if tools_opened:
             # State-aware + accept label variations ("Research", "Research
             # tool", "Deep research"). Only clicks when not already on.
+            # #751 (2026-06-02): Step 3B failed on 100% of runs ("Research toggle
+            # not found (selectors rotated)") → CUA recovered it every time. Root
+            # cause: the role list omitted role="menuitemcheckbox" (the standard
+            # ARIA role for a toggle menu-item, which is what claude.ai now uses
+            # for Research), and the text match wasn't whitespace-normalized.
+            # Broaden the roles + normalize, and add the row-CONTAINS-a-switch
+            # fallback (same pattern as the Thinking toggle in Step 1D) so a
+            # Research row that wraps its toggle is still handled. State-aware:
+            # only clicks when not already on.
             research_enabled = await page.evaluate("""() => {
+                const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const vis = el => el.offsetParent !== null;
+                const isResearch = el => {
+                    const t = norm(el.textContent), a = norm(el.getAttribute('aria-label'));
+                    // EXACT labels only for the direct match — a prefix like
+                    // /^research\\b/ would also catch "Research history" /
+                    // "Research projects" nav rows and toggle the wrong thing
+                    // (#751 review blocker). The row fallback below handles a
+                    // Research TOOL row that carries a description suffix.
+                    const hit = s => s === 'research' || s === 'research tool' ||
+                                     s === 'deep research' || s === 'research mode';
+                    return hit(t) || hit(a);
+                };
+                const isOn = el => el.getAttribute('aria-checked') === 'true' ||
+                                   el.getAttribute('aria-pressed') === 'true' ||
+                                   el.dataset.state === 'checked' || el.dataset.state === 'on';
                 const items = [...document.querySelectorAll(
-                    '[role="menuitem"], button, [role="switch"], [role="checkbox"], label'
-                )].filter(el => el.offsetParent !== null);
-                const target = items.find(el => {
-                    const t = (el.textContent || '').trim().toLowerCase();
-                    const a = (el.getAttribute('aria-label') || '').toLowerCase();
-                    return t === 'research' || a === 'research' ||
-                           t === 'research tool' || a === 'research tool' ||
-                           t === 'deep research' || a === 'deep research' ||
-                           t.startsWith('research ') || a.startsWith('research ');
-                });
+                    '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], button, [role="switch"], [role="checkbox"], label'
+                )].filter(vis);
+                // Direct: the Research item / toggle itself.
+                let target = items.find(isResearch);
+                // Fallback: a "Research"-labelled row that CONTAINS a switch.
+                if (!target) {
+                    const row = items.find(el => {
+                        const t = norm(el.textContent);
+                        // A "Research"-labelled row that CONTAINS a switch — but
+                        // NOT a "Research history"/"Research projects"-style nav
+                        // row (#751 review: exclude known non-tool segments so a
+                        // prefix match can't toggle the wrong control).
+                        const looksResearchTool =
+                            (/^research\\b/.test(t) || t.includes('deep research')) &&
+                            !/\\b(history|projects|settings|memory|past|recent)\\b/.test(t);
+                        return looksResearchTool &&
+                               el.querySelector('[role="switch"], [role="checkbox"], button');
+                    });
+                    if (row) target = row.querySelector('[role="switch"], [role="checkbox"], button') || row;
+                }
                 if (!target) return false;
-                const checked = target.getAttribute('aria-checked') === 'true' ||
-                                 target.getAttribute('aria-pressed') === 'true' ||
-                                 target.dataset.state === 'checked' || target.dataset.state === 'on';
-                if (!checked) target.click();
+                if (!isOn(target)) target.click();
                 return true;
             }""")
             await asyncio.sleep(0.4)

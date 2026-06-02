@@ -107,10 +107,27 @@ def test_gemini_pro_verdict_skips_dom_crosscheck():
     assert page.evals == 0
 
 
-def test_chatgpt_free_is_unaffected_by_gemini_failopen():
-    # Non-Gemini: a vision "free" returns 'free' directly with NO DOM cross-
-    # check — ChatGPT's Pro badge is on-screen, so its verdict is trusted.
+def test_chatgpt_free_with_no_dom_signal_fails_open():
+    # #751 (2026-06-02): ChatGPT now gets the SAME DOM cross-check as Gemini.
+    # A paid account whose Pro marker is off-screen (vision says "free") finds
+    # no upsell CTA in the DOM → 'unsure' (fail open, NO pro_required alert).
+    # This is the exact false-alarm the user hit on the 2026-06-02 E2E.
     result, page = _run("chatgpt", ["free"], _NO_SIGNAL)
+    assert result == "unsure"
+    assert page.evals == 1  # the DOM cross-check ran for chatgpt too
+
+
+def test_chatgpt_free_with_dom_upsell_is_free():
+    # Genuine free ChatGPT account: vision "free" + a clear upsell CTA in the
+    # DOM → 'free' (the alert is real).
+    result, _ = _run("chatgpt", ["free"], _UPSELL)
+    assert result == "free"
+
+
+def test_claude_free_is_unaffected_by_failopen():
+    # Claude's Opus badge is on-screen and reads reliably, so a vision "free"
+    # is still trusted directly with NO DOM cross-check.
+    result, page = _run("claude", ["free"], _NO_SIGNAL)
     assert result == "free"
     assert page.evals == 0
 

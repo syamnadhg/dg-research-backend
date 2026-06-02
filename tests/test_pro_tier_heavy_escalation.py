@@ -45,16 +45,27 @@ class _FakeClient:
 
 
 class _FakePage:
-    def __init__(self):
+    def __init__(self, dom_tier=None):
         self.shots = 0
+        self.evals = 0
+        # Default = no DOM signal (no upsell, no pro marker) so the #751 ChatGPT
+        # DOM cross-check on a vision-"free" verdict fails OPEN to 'unsure'.
+        self._dom_tier = dom_tier or {
+            "upsell": False, "proMark": False, "modelPro": False,
+            "upsellText": "", "proText": "", "dump": [],
+        }
 
     async def screenshot(self, **kw):
         self.shots += 1
         return b"FAKE_PNG_BYTES"
 
+    async def evaluate(self, js, *a):
+        self.evals += 1
+        return dict(self._dom_tier)
 
-def _run(verdicts, heavy=False):
-    page = _FakePage()
+
+def _run(verdicts, heavy=False, dom_tier=None):
+    page = _FakePage(dom_tier)
     client = _FakeClient(verdicts)
     result = asyncio.run(research._cua_pro_tier_call(page, "chatgpt", client, heavy=heavy))
     return result, client.messages.calls, page.shots
@@ -78,8 +89,25 @@ def test_clear_pro_does_not_escalate():
     assert shots == 1
 
 
-def test_clear_free_does_not_escalate():
+def test_clear_free_does_not_escalate_to_heavy():
+    # #751: a clear ChatGPT "free" no longer escalates to the HEAVY vision model
+    # (still ONE messages.create call) — but it now diverts to the DOM
+    # cross-check, which with no upsell CTA fails OPEN to 'unsure' (no false
+    # pro_required alert). The heavy-escalation contract this file guards is
+    # intact: free never triggers a 2nd vision call.
     result, calls, _ = _run(["free tier"])
+    assert result == "unsure"
+    assert len(calls) == 1
+
+
+def test_clear_free_with_dom_upsell_is_free():
+    # A genuine free account (vision "free" + DOM upsell CTA) still returns
+    # 'free' without any heavy escalation.
+    result, calls, _ = _run(
+        ["free tier"],
+        dom_tier={"upsell": True, "proMark": False, "modelPro": False,
+                  "upsellText": "Upgrade to ChatGPT Plus", "proText": "", "dump": []},
+    )
     assert result == "free"
     assert len(calls) == 1
 
