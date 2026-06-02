@@ -18152,6 +18152,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # functions don't have a matching diag helper. Doesn't
                 # block the CUA call if the diag eval fails.
                 _verify_fn_name = getattr(verify_fn, "__name__", "")
+                _diag_reason = ""  # #755: kept in scope for the stop-button veto below
                 if _verify_fn_name == "verify_chatgpt_generating":
                     try:
                         _diag_reason = await _verify_chatgpt_generating_diag(page)
@@ -18224,6 +18225,36 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     _sn_verdict = _classify_completion_verdict(_sn_text)
                     _sn_is_complete = (_sn_verdict == "complete")
                     _sn_is_generating = (_sn_verdict == "generating")
+                    # #755 — DETERMINISTIC stop-button VETO over the fuzzy CUA read.
+                    # The safety-net only fires because the DOM detector is signalling
+                    # "generating"; #753 hardened the CUA *text* parse, but when the
+                    # CUA's text is clean-but-wrong ("looks complete, final paragraph
+                    # shown") the classifier returns "complete" and we'd extract an
+                    # in-flight stub. The recurring P1 false-fail (worker-1 09:00/05/10,
+                    # worker-2 09:08/12:05) is ALWAYS the same shape: ChatGPT wedges on
+                    # "Finalizing answer" → ~185-387 chars + a LIVE "Stop answering"
+                    # composer button, and the CUA non-deterministically flips to
+                    # "complete" (it said "still generating" at 09:00/09:05 on the
+                    # IDENTICAL state, then "complete" at 09:10). Every genuine success
+                    # carried >33K chars (06:34=33024, 12:13=68349) via a residual
+                    # css_animation — NOT a stop button. So: a CUA "complete" on a
+                    # response still below a real brief's floor, while the DOM detector
+                    # insists it's generating, is the wedge — never a finished brief.
+                    # Veto it and keep polling; the 20-min stall then surfaces the
+                    # honest Retry card instead of a 0-char false "no brief". (Large
+                    # content is untouched — a near-done big response that races a
+                    # lingering Stop button still reads complete.)
+                    _SAFETY_NET_MIN_BRIEF_LEN = 2000  # the extract accept gate; below it + DOM-generating = a streaming wedge, not a done brief
+                    _hard_stop_signal = _diag_reason.startswith(("stop_composer", "card_stop", "generic_stop_label"))
+                    if _sn_is_complete and last_seen_len < _SAFETY_NET_MIN_BRIEF_LEN:
+                        log(f"[{label}] Safety-net: CUA read 'complete' but only "
+                            f"{last_seen_len} chars (< {_SAFETY_NET_MIN_BRIEF_LEN}) while the DOM detector "
+                            f"still signals generating"
+                            f"{' via a live Stop button [' + _diag_reason + ']' if _hard_stop_signal else ''}"
+                            f" — that's a still-streaming wedge, NOT a finished brief; "
+                            f"vetoing the false-complete and continuing to poll", "WARN")
+                        _sn_is_complete = False
+                        _sn_is_generating = True
                     if _sn_is_complete:
                         _elapsed = int(time.time() - wait_start)
                         log(f"[{label}] Safety-net CUA confirms response complete ✓ "
