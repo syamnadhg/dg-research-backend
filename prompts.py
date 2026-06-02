@@ -12,6 +12,18 @@ SYSTEM_BASE = (
     "POST-ACTION VERIFY: After every click/type, take a screenshot and confirm the screen "
     "changed as expected. If the screen state did NOT change, do NOT repeat the same action — "
     "describe what you see and try a different approach.\n\n"
+    "NEVER-CLICK BUTTONS (hard rule, every task): two buttons in the bottom message "
+    "composer/input bar must NEVER be clicked — clicking them is harmful and never helps:\n"
+    "  • the MICROPHONE / voice-input button (a solid dark circle, sometimes with a "
+    "waveform or mic glyph) — it is never useful for any task here;\n"
+    "  • the STOP / stop-generating button (a solid SQUARE ⬛ or solid FILLED CIRCLE ⏺ that "
+    "REPLACES the send/up-arrow button while a response or research is generating, and can "
+    "also appear on a research/progress card) — clicking it ABORTS the in-progress work and "
+    "is destructive.\n"
+    "These both sit in the bottom composer. The content you actually need (artifact cards, "
+    "reports, source/citation panels) is in the conversation transcript ABOVE the composer — "
+    "click there. Only press the send/up-arrow button when a task explicitly tells you to "
+    "submit a message, and never re-press it once sending/generation has begun.\n\n"
     "BLOCKED-GATE STOP: If you see a CAPTCHA, login wall, 2FA prompt, quota notice, "
     "'Try again later' banner, or any other human-verification gate, IMMEDIATELY say "
     "'blocked: <describe what you see>' and STOP. Do NOT attempt to solve it; the orchestrator "
@@ -1141,9 +1153,16 @@ HARD CONSTRAINTS:
 - DO NOT click `brief.md` or any attachment card. If the only visible
   card is an attachment (e.g. `brief.md`), output "panel: not_found".
 - DO NOT click the LAST artifact card. Only the FIRST.
-- DO NOT click the composer at the bottom.
-- DO NOT click the send button.
+- Research is ACTIVELY GENERATING during this step, so the bottom composer
+  shows a STOP button (a solid square ⬛ / filled circle ⏺ where the send
+  arrow normally is) and a microphone button. DO NOT click ANYTHING in the
+  bottom composer — clicking the STOP button ABORTS the research (the worst
+  possible outcome here) and the microphone does nothing useful. The
+  artifact card you want is ABOVE the composer, in the conversation.
+- DO NOT click the send / up-arrow / stop button.
 - DO NOT click any source link inside an open artifact.
 - DO NOT click "Publish" or "Share".
-- ONE click only.
+- ONE click only — on the FIRST artifact card and nothing else.
+- If you cannot find the first artifact card without clicking the composer,
+  output "panel: not_found" rather than clicking anything risky.
 - Stop after 5 iterations."""
