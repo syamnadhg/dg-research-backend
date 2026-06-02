@@ -17471,6 +17471,72 @@ class _BriefStreamStalled(Exception):
     pass
 
 
+def _classify_completion_verdict(cua_text: str) -> str:
+    """#753 — interpret a safety-net CUA diagnosis of whether a response is
+    done. Returns "complete" or "generating".
+
+    ROOT CAUSE this fixes (logs 05:05/06:31/09:10 worker-1, 05:07/06:34/09:08
+    worker-2): the safety-net CUA prompt's PRIMARY directive is "if a Stop
+    button is visible anywhere, say 'still generating'", and the CUA OBEYED —
+    it reported `Stop button: Yes` while ChatGPT was wedged on "Finalizing
+    answer". But the old inline parse checked `if "response complete" in text`
+    FIRST, which matched the phrase the model echoed from the instruction (or
+    used in a negated/conditional clause "I would NOT say response complete"),
+    so a clearly-still-generating screen was flipped to "complete ✓" → the
+    pipeline extracted an in-flight brief → 0 chars → false "no brief
+    generated". (The old Stop-button fallback was also broken — it looked for
+    'yes' BEFORE 'stop', but the CUA writes "Stop button: Yes".)
+
+    Fix: generating signals (an AFFIRMED Stop button, 'finalizing', 'still
+    generating', a loading indicator) WIN over a bare "response complete"
+    substring, and an ambiguous read defaults to "generating". Cost asymmetry
+    drives the bias — a false "complete" wrecks the run with a misleading
+    failure; a false "generating" merely keeps polling (bounded by the caller's
+    20-min stall surface, and the DOM detector already exits healthy
+    completions without ever reaching the safety net)."""
+    t = (cua_text or "").lower()
+
+    def _affirmed(key: str) -> bool:
+        # `key` is affirmed only when a 'yes' follows it WITHIN ITS OWN CLAUSE,
+        # e.g. "Stop button: Yes" — NOT "Stop button: No" and NOT a 'yes' that
+        # answers a LATER question ("Stop button: No. Is it complete: yes").
+        # Scope the lookahead to the first clause delimiter so an adjacent
+        # affirmative can't leak in (review r1/r2 minor).
+        i = t.find(key)
+        if i == -1:
+            return False
+        window = t[i + len(key): i + len(key) + 30]
+        for delim in (".", ",", ";", "\n", "?", "!"):
+            cut = window.find(delim)
+            if cut != -1:
+                window = window[:cut]
+        return "yes" in window
+
+    generating_phrase = any(p in t for p in (
+        "still generating", "finalizing", "finalising", "still processing",
+        "needs click", "in progress", "still researching", "still working",
+        "working on", "still loading", "still running",
+        # incomplete / negated-done
+        "not complete", "isn't complete", "is not complete", "incomplete",
+        "hasn't finished", "has not finished", "not finished", "not yet",
+        # hedges — an uncertain read must NOT count as done (cost asymmetry)
+        "cannot tell", "can't tell", "can not tell", "not sure", "unsure",
+        "might be", "hard to tell", "unclear",
+    ))
+    stop_visible = _affirmed("stop button") or _affirmed("stop:") or _affirmed("stop icon")
+    loading_visible = _affirmed("loading") or _affirmed("animation") or _affirmed("spinner")
+    if generating_phrase or stop_visible or loading_visible:
+        return "generating"
+    # Only reached when NO generating signal is present. The canonical complete
+    # phrase the prompt instructs is "response complete"; the others are safe
+    # declaratives ("the response is complete", "fully visible").
+    if any(p in t for p in ("response complete", "response visible",
+                            "is complete", "fully visible", "completed")):
+        return "complete"
+    # Ambiguous — never early-exit on a fuzzy verdict; keep polling.
+    return "generating"
+
+
 async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                           browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
@@ -17517,6 +17583,16 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     # so it doesn't collide with the verify-False path.
     SAFETY_NET_CUA_SEC = 300
     safety_net_cua_asked = False
+    # #753: the safety-net's re-check cadence is tracked HERE, decoupled from
+    # stall_window_start. A confirmed-"generating" verdict used to reset
+    # stall_window_start to re-arm the safety-net — but the multi-signal stall
+    # surface reads the SAME timer, so on a persistent "Finalizing answer" wedge
+    # the stall window oscillated 0→300→0 and the 20-min _BriefStreamStalled
+    # card never fired (the run fell through to the 60-min soft-warn instead).
+    # Re-arming on this separate clock lets the safety-net re-check ~every
+    # SAFETY_NET_CUA_SEC while the stall window keeps accumulating to its 20-min
+    # threshold.
+    _safety_net_next_check = 0.0
 
     # 2026-05-06 (Stream 2 D2): no inner wall-clock cap. The outer
     # _await_phase_with_active_deadline at the call site is the sole
@@ -17988,7 +18064,17 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 diag_text = (diag.get("text") or "").lower()
                 cua_checked = True
 
-                # Parse CUA response: look for the deterministic conclusion phrase
+                # Parse CUA response: look for the deterministic conclusion phrase.
+                # NOTE (#753): this verify-False sibling keeps its greedy
+                # "response complete" check + inverted Stop-button fallback + an
+                # assume-complete default. That is SAFE *only* because this path
+                # does NOT early-return on `is_complete` — it falls through to the
+                # DOM re-verify below (`still = await verify_fn(page); if not
+                # still: return True`), which blocks a wrong "complete" while the
+                # Stop button is still up. Do NOT add an early `return True` here
+                # without first routing this through _classify_completion_verdict
+                # (the safety-net's hardened parser) — otherwise the #753 bug
+                # reappears in this twin.
                 is_generating = False
                 is_complete = False
                 if "response complete" in diag_text:
@@ -18007,7 +18093,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     elif has_response:
                         is_complete = True
                     else:
-                        is_complete = True  # Default: if unclear, assume complete (don't get stuck)
+                        is_complete = True  # Default: if unclear, assume complete (don't get stuck) — SAFE only via the verify_fn re-check below
 
                 if is_generating:
                     log(f"[{label}] CUA says still generating — continuing poll")
@@ -18047,6 +18133,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             if (browser and cua_client
                     and stall_window_start is not None
                     and (time.time() - stall_window_start) > SAFETY_NET_CUA_SEC
+                    and time.time() >= _safety_net_next_check
                     and not safety_net_cua_asked):
                 safety_net_cua_asked = True
                 _flat_sec = int(time.time() - stall_window_start)
@@ -18089,37 +18176,17 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         f"falling back to existing 20m stall surface", "WARN")
                     # Don't reset stall_window_start; existing stall path fires
                 else:
-                    _sn_text = (_sn_diag.get("text") or "").lower()
-                    # Parse mirrors the existing CUA-after-verify-fail block
-                    # (research.py:~15698-15717). Default to "still generating"
-                    # on ambiguous reads so we DON'T early-exit on a false-done.
-                    # (The verify-False CUA path defaults to "complete" because
-                    # DOM already says done; here DOM says generating + content
-                    # flat — keeping it open is safer.)
-                    _sn_is_generating = False
-                    _sn_is_complete = False
-                    if "response complete" in _sn_text:
-                        _sn_is_complete = True
-                    elif "still generating" in _sn_text:
-                        _sn_is_generating = True
-                    elif "needs click" in _sn_text:
-                        _sn_is_generating = True
-                    else:
-                        _sn_has_stop = ("stop" in _sn_text and "yes" in _sn_text.split("stop")[0][-30:])
-                        _sn_has_loading = ("loading" in _sn_text and "yes" in _sn_text.split("loading")[0][-30:])
-                        _sn_has_response = (("completed" in _sn_text or "response visible" in _sn_text)
-                                            and "yes" in _sn_text)
-                        if _sn_has_stop or _sn_has_loading:
-                            _sn_is_generating = True
-                        elif _sn_has_response:
-                            _sn_is_complete = True
-                        else:
-                            # AMBIGUOUS — keep waiting (opposite of verify-False
-                            # path's default). Content was flat but CUA didn't
-                            # give a clear read; better to fall to the 20m
-                            # stall surface than risk extracting an in-flight
-                            # response.
-                            _sn_is_generating = True
+                    _sn_text = (_sn_diag.get("text") or "")
+                    # #753: a visible Stop button / 'finalizing' / loading
+                    # indicator WINS over a bare "response complete" substring
+                    # (which the model echoes from the prompt or negates),
+                    # ambiguous → keep waiting. See _classify_completion_verdict
+                    # for the full root-cause writeup — this replaced an inline
+                    # parse that flipped a "Stop button: Yes" verdict to
+                    # "complete" and made the pipeline extract an in-flight brief.
+                    _sn_verdict = _classify_completion_verdict(_sn_text)
+                    _sn_is_complete = (_sn_verdict == "complete")
+                    _sn_is_generating = (_sn_verdict == "generating")
                     if _sn_is_complete:
                         _elapsed = int(time.time() - wait_start)
                         log(f"[{label}] Safety-net CUA confirms response complete ✓ "
@@ -18127,13 +18194,17 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         return True
                     if _sn_is_generating:
                         log(f"[{label}] Safety-net CUA confirms still generating — "
-                            f"reset stall window, continue poll")
-                        # Reset flat-window so the safety-net doesn't loop-fire
-                        # every poll. The next 5 min of true flatness will
-                        # re-arm it; if content actually grows in the
-                        # meantime the regular stall_window_start gets
-                        # cleared by the growth-detection branch above.
-                        stall_window_start = time.time()
+                            f"re-arm safety-net (stall window UNTOUCHED), continue poll")
+                        # #753: do NOT reset stall_window_start — the stall
+                        # surface reads it, and resetting made the 20-min
+                        # _BriefStreamStalled card unreachable on a persistent
+                        # wedge. Re-arm the safety-net on its OWN cadence so it
+                        # re-checks ~every SAFETY_NET_CUA_SEC (in case a DOM
+                        # false-positive later clarifies to complete) WHILE the
+                        # stall window keeps accumulating. If content actually
+                        # grows, the growth-detection branch above clears
+                        # stall_window_start and resets safety_net_cua_asked.
+                        _safety_net_next_check = time.time() + SAFETY_NET_CUA_SEC
                         safety_net_cua_asked = False
 
             # Stall surface: detector still says "running" but ALL three
