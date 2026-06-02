@@ -12714,6 +12714,14 @@ async def _narrator_loop(phase: int):
         for hours. The downgrade is logged once via _gemini_err_logged
         so operator sees when narration is running on Haiku."""
         nonlocal _gemini_err_logged
+        # Defensive: Anthropic rejects an empty user turn with a 400
+        # ("messages.0: user messages must have non-empty content"); Gemini
+        # tolerates it. Every current caller passes a non-empty user_msg, so
+        # this guard is INERT today — it exists so a future caller can never
+        # again silently collapse the Haiku cross-vendor hedge (and with it
+        # the whole Tier-2/3 fallback chain) down to a canned template.
+        if not (user_msg and user_msg.strip()):
+            user_msg = "Narrate the current pipeline moment in one present-tense sentence."
         if _USE_GEMINI:
             # Gemini Flash primary. Thinking disabled — narration needs a
             # one-line summary, not reasoning, and thinking eats the
@@ -12843,8 +12851,23 @@ async def _narrator_loop(phase: int):
             "If you cannot produce a clean sentence, output the literal token "
             "SKIP and nothing else; a deterministic template will replace it."
         )
+        # Pass a concise, NON-EMPTY user nudge (not "") so the Haiku
+        # cross-vendor hedge works too: Anthropic 400s on empty user
+        # content ("messages.0: user messages must have non-empty
+        # content") while Gemini tolerates it. An empty user_msg here
+        # silently collapsed Tier-3 → Haiku to a canned Tier-4 template
+        # whenever Gemini was down (frequent on flaky networks — see the
+        # recurring SSLError/ReadTimeout in backend.log), which is the
+        # "stale/shallow" narration users still saw during sparse-data
+        # windows (P1 extended-thinking, P2 planning gaps). The rich
+        # timeline/elapsed/host context already lives in fb_system; this
+        # is just a non-empty user turn so BOTH brains accept the call.
+        fb_user = (
+            f"Narrate what the {akey.upper()} agent is doing right now, "
+            f"at minute {elapsed_min:.1f} of its run. One present-tense sentence."
+        )
         fb_text, fb_status = await asyncio.to_thread(
-            _call_narrator, fb_system, "", 200
+            _call_narrator, fb_system, fb_user, 200
         )
         if fb_status >= 400 or not fb_text:
             return ""
