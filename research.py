@@ -16143,13 +16143,23 @@ async def execute_action(browser, action, params):
 
 async def agent_loop(client, browser, system_prompt, user_message,
                      model=CUA_MODEL, max_iterations=30, verbose=False,
-                     phase=None, agent_name=None, target_page=None):
+                     phase=None, agent_name=None, target_page=None,
+                     abort_event=None):
     """CUA agent loop — proven from original research.py.
 
     target_page (optional): Playwright Page reference. When provided, every
     screenshot re-anchors to this tab via bring_to_front. Prevents the
     "Claude polls screenshotted Gemini's tab" race when another async path
     swaps browser.page between iterations.
+
+    abort_event (optional): asyncio.Event the caller sets to make the loop
+    stop deterministically (#732). Checked at the top of every iteration AND
+    before each tool_use is dispatched, so once it fires the loop issues NO
+    further clicks — even mid-turn. Used by _extract_via_cua_download to halt
+    CUA the moment the first download lands (a plain task .cancel() is
+    unreliable here because the synchronous Anthropic call freezes the event
+    loop, delaying both the download event and the cancel). Returns
+    status="aborted" when it trips.
     """
     async def _anchored_screenshot():
         if target_page is not None:
@@ -16181,6 +16191,11 @@ async def agent_loop(client, browser, system_prompt, user_message,
             await _controls.wait_if_paused()
             if _controls.is_stop():
                 return {"status": "stopped", "text": last_text}
+        # Caller early-exit (#732): a download already landed — stop before
+        # issuing another click (the menu doesn't visibly close, so CUA would
+        # otherwise re-click and trigger duplicate downloads).
+        if abort_event is not None and abort_event.is_set():
+            return {"status": "aborted", "text": last_text}
 
         if verbose: log(f"Iteration {iteration}/{max_iterations}")
         try:
@@ -16252,6 +16267,11 @@ async def agent_loop(client, browser, system_prompt, user_message,
 
         tool_results = []
         for tb in tool_uses:
+            # #732: stop before dispatching another action once the abort
+            # fired (the first download was captured) — closes the same-turn
+            # re-click window that the per-iteration check above can't.
+            if abort_event is not None and abort_event.is_set():
+                break
             act = tb.input.get("action", "")
             # Stuck detection
             sig = f"{act}:{tb.input.get('coordinate', '')}"
@@ -16288,6 +16308,9 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 emit_event("cua_action", phase=phase, agent=agent_name,
                     action=act, description=last_text[:200] if last_text else f"Action: {act}",
                     iteration=iteration)
+        # #732: a download captured mid-turn → return now, before another loop.
+        if abort_event is not None and abort_event.is_set():
+            return {"status": "aborted", "text": last_text}
         messages.append({"role": "user", "content": tool_results})
 
     return {"status": "max_iterations", "text": last_text}
@@ -21506,49 +21529,106 @@ async def _extract_via_cua_download(
 
     download = None
     cua_completed = False
+    # Idempotency (#732): CUA is a vision agent, and Claude's artifact
+    # "Download as Markdown" menu item does NOT visibly close after a click,
+    # so the agent concludes the click "didn't register" and re-clicks —
+    # observed up to 6× in prod (backend.log 14:36), each click a real .md
+    # download. (Stuck-detection didn't help: it keys on action+coordinate
+    # and CUA's repeat clicks drift by a pixel or two.) The old
+    # expect_download captured only the FIRST file but let agent_loop keep
+    # running — and clicking. Fix: capture via an explicit listener that sets
+    # _dl_event on the first file, and pass _dl_event into agent_loop as its
+    # abort signal — the loop checks it every iteration AND before each tool
+    # dispatch, so it issues NO further clicks once a file lands (deterministic
+    # even though the sync Anthropic call freezes the loop between turns). A
+    # task .cancel() is kept as a backstop; any straggler is deleted in finally.
+    _extra_downloads = []
+    _dl_event = asyncio.Event()
+
+    def _capture_download(dl):
+        nonlocal download
+        if download is None:
+            download = dl
+            _dl_event.set()
+        else:
+            _extra_downloads.append(dl)
+
+    page.on("download", _capture_download)
+    loop_task = None
+    dl_task = None
     try:
-        # Wrap the entire CUA loop in expect_download. The download event
-        # fires WHENEVER CUA clicks the final menu item — could be early
-        # in the iteration budget. expect_download buffers and waits up to
-        # download_timeout_ms after the `async with` body exits, which
-        # gives a small post-loop grace window for an in-flight download.
+        # Run the CUA loop and the first-download wait concurrently. The loop
+        # self-bounds at cua_timeout_s (asyncio.wait_for); download_timeout_ms
+        # is only a backstop on the race coordinator.
+        loop_task = asyncio.ensure_future(
+            asyncio.wait_for(
+                agent_loop(
+                    cua_client, browser,
+                    cua_prompt, cua_user_msg,
+                    model=CUA_MODEL,
+                    max_iterations=max_iterations,
+                    verbose=verbose,
+                    target_page=page,
+                    abort_event=_dl_event,
+                ),
+                timeout=cua_timeout_s,
+            )
+        )
+        dl_task = asyncio.ensure_future(_dl_event.wait())
         try:
-            async with page.expect_download(timeout=download_timeout_ms) as dl_info:
-                try:
-                    await asyncio.wait_for(
-                        agent_loop(
-                            cua_client, browser,
-                            cua_prompt, cua_user_msg,
-                            model=CUA_MODEL,
-                            max_iterations=max_iterations,
-                            verbose=verbose,
-                            target_page=page,
-                        ),
-                        timeout=cua_timeout_s,
-                    )
-                    cua_completed = True
-                except asyncio.TimeoutError:
-                    # CUA hit its wall-clock cap. expect_download may still
-                    # fire if the final click happened just before timeout
-                    # — let the `async with` exit wait for it.
-                    log(f"[{label}] CUA download: CUA timed out after {cua_timeout_s}s", "WARN")
-                except Exception as e:
-                    log(f"[{label}] CUA download: CUA raised: {e}", "WARN")
-            download = await dl_info.value
+            await asyncio.wait(
+                {loop_task, dl_task},
+                timeout=download_timeout_ms / 1000.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except Exception:
+            pass
+
+        # Download landed first → stop CUA before it can re-click the menu
+        # item and trigger duplicate downloads.
+        if _dl_event.is_set() and not loop_task.done():
+            loop_task.cancel()
+
+        # Settle the loop task (consume its result/exception so it isn't
+        # reported as never-retrieved). A cancel here is the SUCCESS path —
+        # we already captured the file.
+        try:
+            await loop_task
+            cua_completed = True
+        except asyncio.CancelledError:
+            pass
+        except asyncio.TimeoutError:
+            log(f"[{label}] CUA download: CUA timed out after {cua_timeout_s}s", "WARN")
         except Exception as e:
-            _msg = str(e).split("\n")[0][:200]
+            log(f"[{label}] CUA download: CUA raised: {e}", "WARN")
+
+        # CUA finished/timed out without a download yet — give a short grace
+        # window for an in-flight file (mirrors the old expect_download
+        # post-body grace).
+        if download is None:
+            try:
+                await asyncio.wait_for(_dl_event.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                pass
+
+        if download is None:
             log(f"[{label}] CUA download: no download event within "
-                f"{download_timeout_ms}ms ({_msg})", "WARN")
+                f"{download_timeout_ms}ms (cua_completed={cua_completed})", "WARN")
             return ""
 
-        # Read the captured file.
+        # Read the captured file off-thread — a research report can be 100KB+
+        # and a sync read would block the event loop (codebase to_thread norm).
         try:
             path = await download.path()
             if not path:
                 log(f"[{label}] CUA download: download.path() returned None", "WARN")
                 return ""
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
+
+            def _read_md(p):
+                with open(p, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read()
+
+            content = await asyncio.to_thread(_read_md, path)
         except Exception as e:
             log(f"[{label}] CUA download: file read failed: {e}", "WARN")
             return ""
@@ -21561,7 +21641,26 @@ async def _extract_via_cua_download(
             f"(cua_completed={cua_completed})")
         return content
     finally:
-        # Best-effort cleanup of Playwright's temp file.
+        # Detach the listener so it can't fire on a later phase's download
+        # (e.g. the NotebookLM audio handler) or leak across runs.
+        try:
+            page.remove_listener("download", _capture_download)
+        except Exception:
+            pass
+        # Cancel the download waiter if it never fired (avoid a dangling task).
+        if dl_task is not None and not dl_task.done():
+            dl_task.cancel()
+        # Stop the CUA loop on EVERY exit path (incl. an outer cancel of this
+        # coroutine), so a still-running agent_loop can't keep clicking.
+        if loop_task is not None and not loop_task.done():
+            loop_task.cancel()
+        # Best-effort cleanup of Playwright temp files — the captured file
+        # plus any duplicate downloads CUA triggered before we stopped it.
+        for _extra in _extra_downloads:
+            try:
+                await _extra.delete()
+            except Exception:
+                pass
         if download is not None:
             try:
                 await download.delete()
