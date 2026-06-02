@@ -17529,9 +17529,19 @@ def _classify_completion_verdict(cua_text: str) -> str:
         return "generating"
     # Only reached when NO generating signal is present. The canonical complete
     # phrase the prompt instructs is "response complete"; the others are safe
-    # declaratives ("the response is complete", "fully visible").
+    # declaratives. NOTE (review r2): do NOT use a bare "completed" — it matches
+    # stale activity-card step labels like "completed 47 sources" / "completed
+    # 3 steps" and would read as done. Require a response/render-scoped phrase.
+    # "thought for X min Y sec" is ChatGPT's thinking-time summary — it renders
+    # ONLY once the model has finished thinking, so (with no stop/finalizing
+    # signal present, which the override above already excludes) it is a strong
+    # DONE marker for the brief.
     if any(p in t for p in ("response complete", "response visible",
-                            "is complete", "fully visible", "completed")):
+                            "is complete", "fully visible", "fully rendered",
+                            "completed rendering", "finished rendering",
+                            "done rendering", "report is complete",
+                            "brief is complete", "report complete",
+                            "thought for")):
         return "complete"
     # Ambiguous — never early-exit on a fuzzy verdict; keep polling.
     return "generating"
@@ -18164,16 +18174,43 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     await asyncio.sleep(0.4)
                 except Exception:
                     pass
+                # #753 enrichment: don't decide on a single bottom-of-page
+                # glance — SCROLL the latest response and weigh both negative
+                # (stop/finalizing) and POSITIVE (rendered report, artifact
+                # card, sources) signals. A stop button / 'Finalizing answer' /
+                # loading indicator OVERRIDES everything (→ still generating),
+                # so a half-rendered finalizing screen can't read as done. The
+                # no-click guard is critical: this inspector must never touch
+                # the Stop button (that would kill an in-flight brief).
                 _sn_diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
-                    "Look at the BOTTOM of the chat (composer / end of response). "
-                    "Is there a Stop button visible? Is there a loading animation or 'Researching...' indicator? "
-                    "If a Stop button is visible anywhere, say 'still generating'. "
-                    "Only say 'response complete' if there is NO stop button AND the final paragraph of the response is visible.",
-                    model=CUA_MODEL, max_iterations=3, verbose=verbose)
-                if _sn_diag.get("status") == "error":
-                    log(f"[{label}] Safety-net CUA unavailable "
-                        f"({(_sn_diag.get('text') or '')[:80]}) — "
-                        f"falling back to existing 20m stall surface", "WARN")
+                    "You are checking whether a ChatGPT Deep Research BRIEF has finished generating. "
+                    "Scroll through the latest assistant response from top to bottom and observe — do NOT click anything. "
+                    "FIRST look for signs it is STILL GENERATING: a Stop button (filled square) in the composer; "
+                    "a 'Finalizing answer', 'Researching…', or 'Thinking' status; a loading spinner or animation. "
+                    "If ANY of those are present, say exactly 'still generating' — this OVERRIDES everything else, "
+                    "even if some text already looks rendered. "
+                    "ONLY when NONE of those are present, look for COMPLETION TRACES: the STRONGEST is a "
+                    "'Thought for X min Y sec' label at the TOP of the latest response, just above the research "
+                    "content — it appears ONLY once ChatGPT has finished thinking, so scroll up to the start of the "
+                    "latest answer to check for it. Other traces: a fully rendered report/brief, a document or canvas "
+                    "card, a sources/citations list, a clearly-finished final paragraph. "
+                    "Say exactly 'response complete' only if there is NO stop button, NO finalizing/loading indicator, "
+                    "AND a finished response is visible (ideally with the 'Thought for …' header). "
+                    "If you are unsure, say 'still generating'. "
+                    "Remember: observe only — never click the Stop button or any control.",
+                    model=CUA_MODEL, max_iterations=5, verbose=verbose)
+                # #753 (review r2): treat 'max_iterations' like 'error'. When
+                # agent_loop exhausts its turns it returns only the LAST text
+                # block — possibly mid-reasoning, not the CONCLUSION — which
+                # could carry a stray 'completed'/'is complete' with no
+                # generating signal and be misread as done. Skip the verdict
+                # this tick and keep polling; the stall surface stays the
+                # backstop. A clean read returns status='done' well under 5
+                # turns, so this only guards the rare exhausted case.
+                if _sn_diag.get("status") in ("error", "max_iterations"):
+                    log(f"[{label}] Safety-net CUA inconclusive "
+                        f"(status={_sn_diag.get('status')}: {(_sn_diag.get('text') or '')[:60]}) — "
+                        f"keep polling, 20m stall surface remains the backstop", "WARN")
                     # Don't reset stall_window_start; existing stall path fires
                 else:
                     _sn_text = (_sn_diag.get("text") or "")
@@ -22302,8 +22339,7 @@ async def _run_with_clipboard_hijack(
                 pass
 
 
-async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False,
-                                   allow_cua_hijack=True):
+async def extract_chatgpt_response(page, browser=None, cua_client=None, label="ChatGPT", verbose=False):
     """Extract ChatGPT response — 3 Wayland-safe tiers (rewritten 2026-05-14).
 
     Per-agent extraction model is intentionally divergent (the PR body's
@@ -22333,17 +22369,14 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
       Tier 3: CUA Copy + JS clipboard hijack (Ctrl+A/C with getSelection
               + iframe-aware install). Wayland-safe.
 
-    Phase 1 (brief extraction) calls with browser=None / cua_client=None
-    so Tier 1 + Tier 3 gate off — Tier 2 HTML→MD is its sole path. Its
-    short-brief recovery (#752) re-calls WITH browser+cua but passes
-    allow_cua_hijack=False: Tier 1 (artifact-targeted canvas-open download)
-    and Tier 2 (canvas DOM) are safe to re-run, but Tier 3 — a whole-page
-    Ctrl+A/copy — must NOT run for the brief, because there is usually no
-    "research report document" artifact at P1 and the hijack would capture
-    the chat thread (the user's topic prompt + ChatGPT's preamble) and pass
-    the length-only acceptance, poisoning the brief fed to all P2 agents.
+    Phase 1 (brief extraction) calls with browser=None / cua_client=None so
+    Tier 1 + Tier 3 gate off — Tier 2 HTML→MD is its SOLE path (the brief is
+    inline extended-thinking text: no result panel / download button / canvas
+    for a CUA tier to act on, so HTML→MD is both correct and sufficient there;
+    P1's own extraction-fail auto-retry in run_phase1 re-pulls via HTML→MD).
 
-    ChatGPT Deep Research outputs a document/artifact card, not regular chat text."""
+    ChatGPT Deep Research (P2) outputs a document/artifact card, not regular
+    chat text — which is why P2 passes browser+cua to enable Tier 1/3."""
     await asyncio.sleep(2)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await asyncio.sleep(1)
@@ -22437,11 +22470,9 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     # when no page-side setData fires. Iframe-aware install covers the
     # DR canvas sandbox iframe. Helper timeout_ms = 200000 sits ABOVE
     # the inner asyncio.wait_for(180.0) so the inner cap fires first.
-    # allow_cua_hijack gate (#752): the P1 brief recovery disables this tier
-    # — a whole-page Ctrl+A copy can grab the chat thread (no report artifact
-    # exists yet at P1) and the length-only acceptance would let it poison the
-    # brief. P2 callers leave it True (default), so P2 behaviour is unchanged.
-    if browser and cua_client and allow_cua_hijack:
+    # Gated on browser+cua (P2 only). P1 never reaches here — it calls with
+    # browser=None/cua_client=None, so Tier 3 is off for the brief.
+    if browser and cua_client:
         async def _cgpt_t3_trigger():
             await browser.switch_to_page(page)
             await asyncio.wait_for(
@@ -23536,49 +23567,60 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
 
     brief_len = len(brief_text or "")
 
-    # #752 (2026-06-02): short-brief recovery — supersedes the #751 reload,
-    # which made things WORSE. ROOT CAUSE (logs 05:05:28 + 06:31:01): the first
-    # extract above runs extract_chatgpt_response WITHOUT browser/cua_client, so
-    # ONLY Tier-2 DOM HTML→MD runs (Tier 1 + Tier 3 gate off). The DOM scrape
-    # DID return a short string (294/474 chars — ChatGPT's "I've written the
-    # brief in the canvas →" preamble), but Tier-2's acceptance gate is
-    # `len(md) > 2000`, so that short scrape was DISCARDED → the function
-    # returned "" ("All extraction methods failed (canvas may not have opened)")
-    # → false "no brief generated" although the brief HAD finished — rendered in
-    # a canvas/artifact card that didn't auto-open (294-char preamble ≪ a real
-    # 2-5k brief). The #751 reload did not help — a reload COLLAPSES the canvas
-    # back to closed (143 < 294 after reload). The fix is to OPEN the canvas:
-    # re-run WITH browser+cua so Tier 1 ("close panel → open canvas → Export to
-    # Markdown", an artifact-targeted download) + Tier 2 (canvas DOM) run.
-    # CRITICAL: pass allow_cua_hijack=False so Tier 3 (whole-page Ctrl+A copy)
-    # stays OFF — at P1 there is no report artifact, so the hijack would capture
-    # the chat thread and the length-only `_re_len > brief_len` guard would let
-    # it poison the brief sent to all P2 agents (adversarial-review blocker).
-    # Bounded (single retry, only when the DOM-only extract is short) so a
-    # healthy inline brief pays nothing; the `_re_len > brief_len` guard discards
-    # an empty re-extract, the extractor's own _is_sources_not_document /
-    # _looks_like_nav_sidebar guards reject wrong-shape artifacts, and the
-    # short/absent guards below still handle a genuinely-short brief.
-    if brief_len < 500 and cua_client is not None:
+    # #754 (2026-06-02): EXTRACTION-FAIL auto-retry. The P1 brief is inline
+    # extended-thinking text — there is NO result panel / download button for it
+    # — so the #752 canvas-open re-extract had nothing to act on (it fired 4×
+    # in E2E across 05:05/06:31/09:08/09:10 and recovered a brief ZERO times).
+    # Removed. HTML→MD is P1's only sensible extractor.
+    #
+    # This handles a DIFFERENT case from a failed brief: the brief GENERATED
+    # fine (completed=True) but the HTML→MD pull came back empty — a transient
+    # DOM-render / selector miss, not a wedge. Re-pull HTML→MD up to
+    # P1_EXTRACT_RETRY_MAX times, P1_EXTRACT_RETRY_GAP_SEC apart, and STOP the
+    # instant real text appears. Strictly gated:
+    #   • completed   → only when generation genuinely finished (a FAILED brief
+    #                   is the stall path's job: poll_until_done raises
+    #                   _BriefStreamStalled → user alert to retry the whole run;
+    #                   we must NOT auto-retry extraction there).
+    #   • brief_len<100 → only on an EMPTY pull (a short-but-present brief is
+    #                   handled by the brief-short guard below — not a retry).
+    # So it never fires on success and never on a wedge — no false retries.
+    P1_EXTRACT_RETRY_MAX = 2
+    P1_EXTRACT_RETRY_GAP_SEC = 180  # 3 min between pulls — let a slow DOM settle
+    _extract_attempt = 0
+    while completed and brief_len < 100 and _extract_attempt < P1_EXTRACT_RETRY_MAX:
+        if _controls.is_stop():
+            log("Phase 1: stop requested during extraction-retry — aborting")
+            return None
+        _extract_attempt += 1
+        log(f"Phase 1: brief generated but extraction empty ({brief_len} chars) — "
+            f"re-pulling HTML→MD in {P1_EXTRACT_RETRY_GAP_SEC // 60} min "
+            f"(attempt {_extract_attempt}/{P1_EXTRACT_RETRY_MAX})", "WARN")
+        # Stop-aware wait: poll is_stop every few seconds so a Stop during the
+        # 3-min gap is honored promptly (not after the full sleep + another pull).
+        _waited = 0.0
+        while _waited < P1_EXTRACT_RETRY_GAP_SEC and not _controls.is_stop():
+            await asyncio.sleep(min(5.0, P1_EXTRACT_RETRY_GAP_SEC - _waited))
+            _waited += 5.0
+        if _controls.is_stop():
+            log("Phase 1: stop requested during extraction-retry wait — aborting")
+            return None
         try:
-            log(f"Phase 1: DOM-only extract short ({brief_len} chars) — brief likely in an "
-                f"un-opened canvas; re-extracting with the CUA canvas-open ladder (no whole-page hijack)", "WARN")
-            _reextract = await extract_chatgpt_response(
-                browser.page, browser=browser, cua_client=cua_client, label="ChatGPT",
-                verbose=verbose, allow_cua_hijack=False)
-            _re_len = len(_reextract or "")
-            if _re_len > brief_len:
-                log(f"Phase 1: CUA canvas re-extract recovered {_re_len} chars (was {brief_len}) — canvas opened")
-                brief_text = _reextract
-                brief_len = _re_len
-                try:
-                    chat_url = await browser.current_url()
-                except Exception:
-                    pass
-            else:
-                log(f"Phase 1: CUA canvas re-extract still {_re_len} chars — brief may be genuinely short/absent", "WARN")
+            _retry_text = await extract_chatgpt_response(browser.page)
         except Exception as _re_exc:
-            log(f"Phase 1: CUA canvas re-extract failed ({_re_exc}) — proceeding with original extract", "WARN")
+            log(f"Phase 1: extraction re-pull errored ({_re_exc}) — "
+                f"{'retrying' if _extract_attempt < P1_EXTRACT_RETRY_MAX else 'giving up'}", "WARN")
+            _retry_text = ""
+        _retry_len = len(_retry_text or "")
+        if _retry_len > brief_len:
+            log(f"Phase 1: extraction re-pull recovered {_retry_len} chars (was {brief_len})")
+            brief_text = _retry_text
+            brief_len = _retry_len
+            try:
+                chat_url = await browser.current_url()
+            except Exception:
+                pass
+        # Loop condition re-checks brief_len<100 → exits the moment text appears.
 
     # Brief-short guard: DR briefs are typically 2-5k chars. Under 500 while
     # we were expecting >1000 usually means ChatGPT errored or the extractor

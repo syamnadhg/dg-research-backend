@@ -5,14 +5,13 @@ Source-inspection guards (the hot code lives in big async browser-driving
 functions that aren't unit-callable without a live browser/CUA, matching the
 existing convention in this suite — see test_e2e_p1p2_fixes_751.py).
 
-ISSUE 1 (P1 canvas extraction) — the ChatGPT brief renders inside a canvas /
-artifact card that did NOT auto-open. P1 calls extract_chatgpt_response WITHOUT
-browser/cua_client, so only the Tier-2 DOM HTML→MD scrape runs (Tier 1 — the CUA
-flow that physically OPENS the canvas and Exports to Markdown — and Tier 3 are
-gated off). The closed canvas yields only the short inline preamble (294/474
-chars) → "" → false "no brief generated". The #751 reload made it WORSE (a
-reload collapses the canvas: 143 < 294 chars). FIX: when the DOM-only extract is
-short, re-extract WITH browser+cua so the Tier-1 canvas-open ladder runs.
+ISSUE 1 (P1 canvas extraction) — SUPERSEDED by #754
+(tests/test_p1_extract_retry_754.py). The canvas-open re-extract this section
+guarded never recovered a brief in practice (the P1 brief is inline
+extended-thinking text — no result panel / download button — so there is no
+canvas to open; it fired 4× in E2E and recovered 0 briefs). #754 removed it and
+the allow_cua_hijack flag, leaving P1 on HTML→MD with an extraction-fail
+auto-retry. Those tests were deleted to avoid asserting removed behaviour.
 
 ISSUE 2 (P2 ChatGPT send) — after a brief FILE is attached the send button stays
 DISABLED for several seconds while the upload processes. The old code checked the
@@ -27,76 +26,18 @@ import inspect
 import research
 
 
-# ── ISSUE 1: P1 canvas-open re-extract (supersedes the #751 reload) ───────────
-def test_1_phase1_reextracts_with_cua_canvas_ladder_on_short_brief():
+# ── ISSUE 1: P1 canvas-open re-extract — REMOVED by #754 ──────────────────────
+# The canvas-open re-extract + allow_cua_hijack flag were removed (never
+# recovered a brief; P1 has no canvas). Guards for the replacement (HTML→MD
+# extraction-fail auto-retry) live in tests/test_p1_extract_retry_754.py.
+def test_1_canvas_reextract_and_hijack_flag_fully_removed():
     src = inspect.getsource(research.run_phase1)
-    # Recovery is gated to a short DOM-only extract AND an available CUA client.
-    assert "brief_len < 500 and cua_client is not None" in src, (
-        "short-brief CUA re-extract guard missing/changed"
+    assert "allow_cua_hijack" not in src, "P1 still references the removed allow_cua_hijack flag"
+    assert "canvas-open ladder" not in src, "P1 still references the removed canvas-open re-extract"
+    import inspect as _i
+    assert "allow_cua_hijack" not in str(_i.signature(research.extract_chatgpt_response)), (
+        "extract_chatgpt_response still carries the vestigial allow_cua_hijack param"
     )
-    # The re-extract must pass browser+cua so Tier-1 (open canvas → Export MD)
-    # actually runs — that is the whole point of the fix.
-    assert "extract_chatgpt_response(" in src
-    assert "browser=browser" in src and "cua_client=cua_client" in src, (
-        "the short-brief re-extract no longer passes browser+cua — Tier-1 "
-        "canvas-open won't run and the closed-canvas brief stays unreadable"
-    )
-
-
-def test_1_phase1_reextract_disables_whole_page_hijack():
-    # Adversarial-review blocker (r4-2): the P1 re-extract MUST pass
-    # allow_cua_hijack=False so Tier-3 (whole-page Ctrl+A copy) stays off — at
-    # P1 there's no report artifact, so the hijack would capture the chat thread
-    # and the length-only guard would let it poison the brief sent to P2.
-    src = inspect.getsource(research.run_phase1)
-    assert "allow_cua_hijack=False" in src, (
-        "P1 re-extract no longer disables Tier-3 — a whole-page hijack can "
-        "poison the brief"
-    )
-
-
-def test_1_extractor_tier3_gated_on_allow_cua_hijack():
-    # The Tier-3 block must honour the allow_cua_hijack flag; default True keeps
-    # P2 behaviour unchanged.
-    sig = inspect.signature(research.extract_chatgpt_response)
-    assert "allow_cua_hijack" in sig.parameters, "extractor lost the kill-switch param"
-    assert sig.parameters["allow_cua_hijack"].default is True, (
-        "allow_cua_hijack default must stay True so the many P2 callers are "
-        "unaffected"
-    )
-    src = inspect.getsource(research.extract_chatgpt_response)
-    assert "if browser and cua_client and allow_cua_hijack:" in src, (
-        "Tier-3 (clipboard hijack) is no longer gated on allow_cua_hijack"
-    )
-
-
-def test_1_phase1_no_longer_reloads_the_page():
-    # A reload collapses the canvas (made the extract shorter); it must be gone.
-    src = inspect.getsource(research.run_phase1)
-    assert "browser.page.reload" not in src, (
-        "run_phase1 reloads again — that collapses the ChatGPT canvas and "
-        "regresses #752"
-    )
-
-
-def test_1_phase1_reextract_only_replaces_when_strictly_longer():
-    # Guard: a still-empty/wrong re-extract must NOT overwrite the original
-    # (no regression vs. the genuinely-short/absent case).
-    src = inspect.getsource(research.run_phase1)
-    assert "_re_len > brief_len" in src
-    # And the whole recovery is wrapped so a CUA failure is non-fatal.
-    block = src.split("brief_len < 500 and cua_client is not None", 1)[1][:1400]
-    assert "try:" in block and "except Exception" in block, (
-        "the CUA re-extract isn't exception-guarded — a CUA error would crash P1"
-    )
-
-
-def test_1_extractor_tier1_opens_canvas_only_with_browser_and_cua():
-    # The mechanism the fix relies on: Tier-1 (canvas-open CUA download) is
-    # gated behind `if browser and cua_client`. Passing them re-enables it.
-    src = inspect.getsource(research.extract_chatgpt_response)
-    assert "if browser and cua_client:" in src
-    assert "canvas may not have opened" in src  # the exact false-fail log we cure
 
 
 # ── ISSUE 2: P2 send-button enable poll ───────────────────────────────────────

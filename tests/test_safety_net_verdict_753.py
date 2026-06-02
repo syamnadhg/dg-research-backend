@@ -113,6 +113,27 @@ def test_completed_declarative_is_complete():
     assert _v("No stop button. The response has completed rendering.") == "complete"
 
 
+def test_thought_for_header_is_complete():
+    # #754: "Thought for X min Y sec" at the top of the response is a strong
+    # ChatGPT done-marker (renders only after thinking finishes).
+    assert _v("No stop button. 'Thought for 4 min 32 sec' is shown above the "
+              "brief, which is fully rendered.") == "complete"
+
+
+def test_thought_for_with_stop_button_is_generating():
+    # Override: even with the 'Thought for …' header, a STILL-VISIBLE stop
+    # button means the answer is still streaming → generating.
+    assert _v("Stop button: Yes. 'Thought for 2 min' is shown but text is "
+              "still streaming.") == "generating"
+
+
+def test_completed_n_sources_activity_label_is_not_complete():
+    # review r2 / Fix A: a stale activity-step label like "completed 47 sources"
+    # must NOT read as done (bare "completed" was dropped from the signals).
+    assert _v("No stop button visible. Activity shows: completed 47 sources, "
+              "completed 3 steps.") == "generating"
+
+
 # ── Guard: the 20-min stall surface stays reachable (timer decouple) ──────────
 def test_generating_does_not_reset_stall_window():
     # #753 review (major): a confirmed-"generating" safety-net verdict must NOT
@@ -129,6 +150,38 @@ def test_generating_does_not_reset_stall_window():
     )
     assert "_safety_net_next_check" in gen_branch, (
         "safety-net re-arm no longer uses its decoupled cadence timer"
+    )
+
+
+# ── Guard: the safety-net CUA check scrolls + weighs completion traces ────────
+def test_safety_net_check_scrolls_and_weighs_completion_traces():
+    import inspect
+    src = inspect.getsource(research.poll_until_done)
+    # Enriched #753 check: scroll the response, look for POSITIVE completion
+    # traces, keep stop/finalizing as an OVERRIDE, and NEVER click (so the
+    # inspector can't kill an in-flight brief by hitting Stop).
+    assert "Scroll through the latest assistant response" in src
+    assert "COMPLETION TRACES" in src
+    assert "OVERRIDES everything else" in src
+    assert ("do NOT click anything" in src or "never click the Stop button" in src), (
+        "the safety-net inspector lost its no-click guard — it could click Stop "
+        "and terminate generation"
+    )
+    # More scroll room for the inspection than the old single-glance check.
+    block = src.split("COMPLETION TRACES", 1)[1][:1400]
+    assert "max_iterations=5" in block, "safety-net inspector didn't get more scroll iterations"
+    # #754: the prompt points the CUA at the 'Thought for …' top-of-response marker.
+    assert "Thought for" in block, "safety-net prompt no longer cites the 'Thought for …' done-marker"
+
+
+def test_safety_net_treats_max_iterations_like_error():
+    # review r2 / Fix B: an exhausted CUA inspection returns mid-reasoning text;
+    # don't classify it — skip the verdict and keep polling (stall stays backstop).
+    import inspect
+    src = inspect.getsource(research.poll_until_done)
+    assert 'get("status") in ("error", "max_iterations")' in src, (
+        "the safety-net no longer skips the verdict on an exhausted (max_iterations) "
+        "CUA read — mid-reasoning text could be misclassified as complete"
     )
 
 

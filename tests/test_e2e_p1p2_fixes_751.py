@@ -60,13 +60,16 @@ def test_A_cua_pro_tier_call_crosschecks_chatgpt_on_free():
 # canvas (re-extract WITH browser+cua so Tier-1 runs), not reload. This test now
 # guards the corrected contract so the harmful reload can't creep back.
 def test_B_run_phase1_recovers_short_brief_without_reload():
+    # #751-B's reload was the wrong remedy and is gone; #752's canvas re-extract
+    # is also gone (#754 — P1 has no canvas). The durable invariant guarded here:
+    # run_phase1 NEVER reloads the page to recover a brief (a reload collapses
+    # the ChatGPT view and made the extract worse). The current extraction-fail
+    # recovery (HTML→MD auto-retry) is covered by test_p1_extract_retry_754.py.
     src = inspect.getsource(research.run_phase1)
-    assert "brief_len < 500" in src, "short-brief recovery guard threshold missing"
     assert "browser.page.reload" not in src, (
-        "run_phase1 reloads on a short brief again — that collapses the canvas "
-        "and made the extract WORSE (#752 removed it)"
+        "run_phase1 reloads to recover a brief again — that collapses the "
+        "ChatGPT view and regressed extraction (removed in #752/#754)"
     )
-    assert "_reextract" in src and "_re_len > brief_len" in src
 
 
 # ── C: Claude Research-tool selector broadened ────────────────────────────────
