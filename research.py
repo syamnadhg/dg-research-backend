@@ -9269,7 +9269,14 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
             const hasPro = /\\b(pro|plus)\\b/.test(trig) && !verbRe.test(trig);
             const hasInstant = /\\b(instant|auto|fast|standard)\\b/.test(trig);
             return { trigText: trigText.slice(0, 50), hasExtended, hasPro, hasInstant,
-                     extText: extMark ? norm(extMark.textContent).slice(0, 40) : '' };
+                     extText: extMark ? norm(extMark.textContent).slice(0, 40) : '',
+                     // #766: dump the marker's tag + class so the next E2E can
+                     // pin a CSS selector for the 'Extended Pro' pill (the
+                     // confirm itself is a text scan, validated working in the
+                     // 2026-06-03 E2Es — both workers returned 'extended').
+                     extTag: extMark ? (extMark.tagName || '').toLowerCase() : '',
+                     extCls: extMark ? norm((extMark.className && extMark.className.toString)
+                         ? extMark.className.toString() : '').slice(0, 80) : '' };
         }""")
     except Exception as e:
         log(f"[p1:extended_pro_confirm] DOM read failed: {e}", "INFO")
@@ -9277,7 +9284,8 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
     if not isinstance(res, dict):
         return "unsure"
     log(f"[p1:extended_pro_confirm] trig={res.get('trigText')!r} "
-        f"extended={res.get('hasExtended')} ({res.get('extText')!r}) "
+        f"extended={res.get('hasExtended')} ({res.get('extText')!r} "
+        f"<{res.get('extTag')} class={res.get('extCls')!r}>) "
         f"pro={res.get('hasPro')} instant={res.get('hasInstant')}", "INFO")
     # Asymmetric: an Extended/Pro marker wins outright (proceed). Only a non-Pro
     # mode active WITH no Pro/Extended marker is a real downgrade.
@@ -27843,13 +27851,17 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # invariant degrades from fail_phase to log-warn — share-link extract
     # uses a notebook-level API that doesn't depend on card count.
     if audio_done and audio_path:
+        # #767 (2026-06-03): the auto-delete cleanup
+        # (_cleanup_nlm_keep_requested_audio) is NO LONGER CALLED — it actively
+        # clicked Delete on cards, which violates the hard no-delete constraint
+        # (NotebookLM is detect-and-fail_phase only, never delete a card). It was
+        # a silent no-op anyway (its own broken selectors matched nothing); and
+        # now that the dup-count guards actually work, a duplicate is caught and
+        # surfaced upstream (pre-flight / post-generate / mid-poll fail_phase)
+        # BEFORE we reach here — so there is exactly one audio to keep and
+        # nothing to remove. This block is now a READ-ONLY invariant check.
         try:
-            cleanup = await _cleanup_nlm_keep_requested_audio(browser.page, podcast_length)
-            log(f"[Phase3] NLM strict-keep cleanup ({podcast_length}): {cleanup}")
-        except Exception as _ce:
-            log(f"[Phase3] NLM cleanup failed: {_ce}", "WARN")
-        try:
-            await asyncio.sleep(2)  # let DOM settle after deletes
+            await asyncio.sleep(2)  # let the panel settle after the download
             dd_count = await _count_nlm_deep_dive_cards(browser.page)
             total_count = await _count_nlm_audio_cards(browser.page)
             log(f"[Phase3] Post-cleanup inventory ({podcast_length}): {dd_count} Deep Dive / {total_count} total audio card(s)")
@@ -27857,16 +27869,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 # #757-B capture: audio is done + downloaded, so a single complete
                 # card must exist — 0 means the counter missed it. Dump (read-only).
                 await _dump_nlm_audio_dom(browser.page, "post-cleanup")
-            # Length-aware invariant (2026-05-14):
-            #   "long"    → expect 1 Deep Dive + 1 total
-            #   "default" → cleanup skipped (indistinguishable), accept any total ≥ 1
-            #   "short"   → expect 0 Deep Dive + 1 total (Brief, not Deep Dive)
-            if podcast_length == "long":
-                _ok = (dd_count == 1 and total_count == 1)
-            elif podcast_length == "short":
-                _ok = (dd_count == 0 and total_count == 1)
-            else:
-                _ok = (total_count >= 1)
+            # Invariant (#767, 2026-06-03): demoted to TOTAL-count-only. The new
+            # NLM markup no longer surfaces a "Deep Dive" label in the artifact
+            # title, so dd_count is unreliable (telemetry only) — gating on it
+            # would WARN on every healthy long run. The real failure mode is a
+            # DUPLICATE (total > 1), which the pre-flight / post-generate /
+            # mid-poll fail_phase guards already catch upstream (we only reach
+            # here on a single completed+downloaded audio). Format + length are
+            # enforced upstream by make_prompt_audio_generate. Expect exactly one
+            # audio card for every length; a miss (0) or stray extra (>1) is a
+            # WARN — non-blocking, since the audio is already on disk and the
+            # share-link extract uses a notebook-level API independent of count.
+            _ok = (total_count == 1)
             if not _ok:
                 log(f"[Phase3] Post-cleanup invariant warning ({podcast_length}): {dd_count} Deep Dive + {total_count} total — proceeding with share-link extract anyway since audio is already on disk", "WARN")
         except Exception as _ie:
@@ -28043,41 +28057,36 @@ async def _check_audio_generating(page):
 
 
 async def _check_audio_complete_dom(page) -> bool:
-    """Detect a completed NLM audio overview by reading the card's own DOM.
-    Returns True only when an audio card has a present <audio> element AND
-    no progress indicators AND no generating-related text. Used as a
-    DOM-first check before CUA — avoids the page-wide-chrome false
-    negatives where CUA reports "still generating" because some unrelated
-    NLM panel still shows a spinner while the audio itself is done.
+    """Detect a completed NLM audio overview by reading the Studio panel DOM.
+    Returns True only when a generated audio card is present AND the
+    "Generating Audio Overview" placeholder is gone. Used as a DOM-first
+    check before CUA — avoids the page-wide-chrome false negatives where CUA
+    reports "still generating" because some unrelated NLM panel still shows a
+    spinner while the audio itself is done.
+
+    Markup pinned from the #757-B dom-dump (2026-06-03): the OLD selectors
+    gated on a present <audio> element + [role=progressbar] inside a
+    [role=article]/[class*=audio-card] card — NONE of which exist in the live
+    panel, so this DOM-complete check could NEVER fire (CUA carried completion
+    detection alone). The real panel renders a "Generating Audio Overview…"
+    placeholder in .artifact-library-container while in flight (with NO
+    artifact-library-item yet), then an <artifact-library-item> bearing the
+    "audio_magic_eraser" icon ligature + the real title once done.
     """
     try:
         return await page.evaluate("""() => {
-            const panel = document.querySelector(
-                '[aria-label*="Studio" i], [data-testid*="studio" i], aside'
-            ) || document.body;
-            const candidates = panel.querySelectorAll(
-                '[role="article"], [role="listitem"], '
-                + '[class*="audio-card"], [class*="AudioCard"], '
-                + '[data-testid*="audio"], [data-testid*="overview-item"]'
-            );
-            for (const el of candidates) {
+            // Still generating → the placeholder is present and no audio card
+            // has materialized. Cross-checks _check_audio_generating's
+            // body-wide read but scoped to the artifact container.
+            const cont = document.querySelector(
+                'artifact-library, .artifact-library-container') || document.body;
+            const contText = (cont.innerText || cont.textContent || '');
+            if (/generating audio overview/i.test(contText)) return false;
+            // Done → at least one visible audio artifact-library-item.
+            const items = document.querySelectorAll('artifact-library-item');
+            for (const el of items) {
                 if (el.offsetParent === null) continue;
-                const t = (el.innerText || '').toLowerCase();
-                const isAudio = t.includes('audio overview')
-                    || t.includes('conversation') || t.includes('discussion')
-                    || t.includes('podcast');
-                const isConfigTile = t.includes('customize');
-                if (!isAudio || isConfigTile) continue;
-                const hasAudioEl = !!el.querySelector('audio');
-                if (!hasAudioEl) continue;
-                const isBusy = el.getAttribute('aria-busy') === 'true'
-                    || !!el.querySelector('[role="progressbar"]')
-                    || !!el.querySelector('[aria-busy="true"]');
-                const hasGeneratingText = t.includes('generating')
-                    || t.includes('creating audio') || t.includes('preparing audio')
-                    || t.includes('loading') || t.includes('in progress');
-                if (isBusy || hasGeneratingText) continue;
-                return true;
+                if ((el.innerText || el.textContent || '').includes('audio_magic_eraser')) return true;
             }
             return false;
         }""") or False
@@ -28213,16 +28222,23 @@ def _nlm_notebook_id(url: str) -> str:
         return ""
 
 
-# ── Audio-card invariant helpers (2026-05-02) ──────────────────────────────
-# Pure read helpers used to enforce the "exactly one Long + Deep Dive
-# audio overview" invariant without ever clicking or deleting. Pair with
-# the pre-flight check before agent_loop and the post-generate check
-# after wait_until_verified — both fail_phase loud if the count is wrong,
-# letting the user clean up manually (per the no-delete constraint).
+# ── Audio-card invariant helpers (2026-05-02; selectors repaired #767 2026-06-03) ──
+# Pure READ helpers used to enforce "exactly one audio overview" without ever
+# clicking or deleting. Pair with the pre-flight check before agent_loop and the
+# post-generate / mid-poll checks — all fail_phase loud if the count is wrong,
+# letting the user clean up manually (per the hard no-delete constraint).
 #
-# DOM selectors mirror _cleanup_nlm_default_audio so all three functions
-# count the same cards. If NotebookLM ships a Studio redesign that breaks
-# the selectors, all three break together and the failure is consistent.
+# All three count the SAME population — visible <artifact-library-item> elements
+# whose text carries the "audio_magic_eraser" Material-icon ligature — pinned
+# from the #757-B dom-dump (2026-06-03). The OLD guessed selectors
+# ([role=article]/[class*=audio-card]/[data-testid*=audio] + an <audio> element +
+# [role=progressbar]) matched NOTHING in the live Studio panel, so every count
+# read 0 and every dup-guard was a dead no-op. If NotebookLM ships a Studio
+# redesign that drops the artifact-library-item tag or the audio_magic_eraser
+# ligature (e.g. re-renders the icon as an SVG / CSS ::before, where the literal
+# string leaves both innerText AND textContent), all three break together and
+# revert to 0 — fail-OPEN (healthy runs proceed, dups slip) — and the read-only
+# _dump_nlm_audio_dom on the zero-path is the canary to re-pin them.
 
 async def _count_nlm_audio_cards(page) -> int:
     """Count visible audio-overview cards in the NLM Studio panel.
@@ -28232,28 +28248,26 @@ async def _count_nlm_audio_cards(page) -> int:
     """
     try:
         return await page.evaluate("""() => {
-            const panel = document.querySelector(
-                '[aria-label*="Studio" i], [data-testid*="studio" i], aside'
-            ) || document.body;
-            const candidates = panel.querySelectorAll(
-                '[role="article"], [role="listitem"], '
-                + '[class*="audio-card"], [class*="AudioCard"], '
-                + '[data-testid*="audio"], [data-testid*="overview-item"]'
-            );
+            // Real NLM Studio markup (pinned from the #757-B dom-dump,
+            // 2026-06-03): a generated audio is an <artifact-library-item>
+            // whose text carries the "audio_magic_eraser" Material-icon
+            // ligature. The "Audio Overview" CREATE button is a
+            // <basic-create-artifact-button> (NOT an artifact-library-item),
+            // so scoping the count to artifact-library-item structurally
+            // excludes it — even though its text ALSO contains
+            // "audio_magic_eraser". Other artifact types (study guide, mind
+            // map, …) are artifact-library-item too but carry a DIFFERENT icon
+            // ligature, so the audio_magic_eraser check keeps the count
+            // audio-only. The OLD selectors
+            // ([role=article]/[class*=audio-card]/[data-testid*=audio]) matched
+            // NOTHING in the live panel — every count read 0, so every dup-guard
+            // was a dead no-op (#757-B).
+            const items = document.querySelectorAll('artifact-library-item');
             let count = 0;
-            candidates.forEach((el) => {
+            items.forEach((el) => {
                 if (el.offsetParent === null) return;
-                const t = (el.innerText || '').toLowerCase();
-                const isAudio = t.includes('audio overview')
-                    || t.includes('conversation') || t.includes('discussion')
-                    || t.includes('podcast');
-                // Exclude the configuration TILE — the offering UI that
-                // contains the "Customize" link/button. Its innerText
-                // also matches "audio overview" but it's not a generated
-                // entry. Real generated cards (in-flight or done) do not
-                // render the word "customize" in their visible text.
-                const isConfigTile = t.includes('customize');
-                if (isAudio && !isConfigTile) count++;
+                const t = (el.innerText || el.textContent || '');
+                if (t.includes('audio_magic_eraser')) count++;
             });
             return count;
         }""") or 0
@@ -28262,35 +28276,24 @@ async def _count_nlm_audio_cards(page) -> int:
 
 
 async def _count_nlm_deep_dive_cards(page) -> int:
-    """Count visible Deep Dive audio cards specifically.
+    """Count visible Deep Dive audio cards specifically (TELEMETRY ONLY).
 
-    Distinct from _count_nlm_audio_cards — this only counts entries whose
-    innerText contains 'deep dive', matching what the user explicitly
-    asked for (Format=Deep Dive, Length=Long). Used by the post-completion
-    invariant log to confirm we ended up with the right kind of audio.
+    Lockstep with _count_nlm_audio_cards (artifact-library-item + the
+    audio_magic_eraser ligature), additionally requiring the card text to name
+    "deep dive". CAVEAT (#767, 2026-06-03): the new NLM artifact title is the
+    generated topic (e.g. "The Genetic Tragedy of Golden Retrievers"), NOT a
+    "Deep Dive" label — so this typically reads 0 even on a real Deep Dive. It
+    is kept for the post-cleanup LOG line only; the invariant no longer gates on
+    it (Format + Length are enforced upstream by make_prompt_audio_generate).
     """
     try:
         return await page.evaluate("""() => {
-            const panel = document.querySelector(
-                '[aria-label*="Studio" i], [data-testid*="studio" i], aside'
-            ) || document.body;
-            const candidates = panel.querySelectorAll(
-                '[role="article"], [role="listitem"], '
-                + '[class*="audio-card"], [class*="AudioCard"], '
-                + '[data-testid*="audio"], [data-testid*="overview-item"]'
-            );
+            const items = document.querySelectorAll('artifact-library-item');
             let count = 0;
-            candidates.forEach((el) => {
+            items.forEach((el) => {
                 if (el.offsetParent === null) return;
-                const t = (el.innerText || '').toLowerCase();
-                const isAudio = t.includes('audio overview')
-                    || t.includes('conversation') || t.includes('discussion')
-                    || t.includes('podcast');
-                // Same configuration-tile filter as _count_nlm_audio_cards
-                // — keep both helpers in lockstep so they count the same
-                // population of cards.
-                const isConfigTile = t.includes('customize');
-                if (isAudio && !isConfigTile && t.includes('deep dive')) count++;
+                const t = (el.innerText || el.textContent || '');
+                if (t.includes('audio_magic_eraser') && /deep dive/i.test(t)) count++;
             });
             return count;
         }""") or 0
@@ -28299,7 +28302,17 @@ async def _count_nlm_deep_dive_cards(page) -> int:
 
 
 async def _cleanup_nlm_keep_requested_audio(page, podcast_length: str = "long") -> dict:
-    """Strict-keep cleanup. Identifies the SINGLE NLM Studio audio card
+    """⚠️ DEAD / UNCALLED since #767 (2026-06-03) — DO NOT RE-WIRE. This
+    function actively clicks Delete on Studio cards, which VIOLATES the hard
+    NotebookLM no-delete constraint (detect-and-fail_phase only, never delete a
+    card). It was already a silent no-op (its selectors never matched live NLM);
+    duplicate handling is now owned by the working dup-count fail_phase guards
+    (pre-flight / post-generate / mid-poll). Retained only as reference for the
+    old length-aware keep logic; slated for full removal under #771 (prod-grade
+    cleanup). If you ever need NLM dedup, it MUST be detect-and-surface, never a
+    delete.
+
+    Strict-keep cleanup. Identifies the SINGLE NLM Studio audio card
     that matches the user-requested `podcast_length` and deletes every
     other audio card around it. If the keep target is missing or
     ambiguous, deletes NOTHING and reports the skip reason — the caller
