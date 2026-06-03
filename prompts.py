@@ -750,9 +750,9 @@ Steps (do them in order, do not skip):
 
 5. {step5}
 
-6. Click the Generate button inside the customize panel EXACTLY ONCE. Do not click it a second time, do not retry, do not click any other Generate-like button on the page.
+6. Click the Generate button inside the customize panel EXACTLY ONCE. This is the FINAL click of the entire task. Do not click it a second time, do not retry, do not click any other Generate-like button on the page.
 
-7. Say exactly: "generating" once a progress indicator appears for the new audio.
+7. STOP — do not click ANYTHING after that Generate click. Not the Audio Overview card, not its title / thumbnail / play area, not a "verify" / "open" / "play" control, not anywhere on a tile, and not any NEW button that appears ON the just-created / generating card (e.g. "Interactive mode", "Join", "Customize", "Share", a play button) — nothing. This OVERRIDES the general "post-action verify" habit: a single click on the card body or any audio tile here fires a SECOND, unwanted DEFAULT audio, and that duplicate cannot be undone (it is a failure). To confirm it started, just READ the screenshot you already have (you may take at most ONE more screenshot — but NEVER a click). The instant a loading / "Generating…" / progress indicator appears for the new audio, respond with ONLY the word: generating — as plain text — and STOP.
 
 If at any point you realize you've clicked the wrong thing and a default/unwanted audio has started generating, say exactly: "abort: misclick — default audio fired" and STOP. Do not try to click "stop" or "delete" — leave the page as-is and report."""
 
@@ -760,42 +760,13 @@ If at any point you realize you've clicked the wrong thing and a default/unwante
 # Backward-compat alias: existing imports of PROMPT_AUDIO_GENERATE keep the
 # previous "long" behavior. The Phase 3 audio call now uses
 # make_prompt_audio_generate(podcast_length) explicitly.
-PROMPT_AUDIO_GENERATE = SYSTEM_BASE + """
-
-Your task: Generate EXACTLY ONE audio overview with FORMAT="Deep Dive" and LENGTH="Long". Anything else is a failure.
-
-CRITICAL — NEVER CLICK THESE (any one of these creates an unwanted default audio):
-- The "Audio Overview" card body itself
-- The card's headline / title text
-- The card's thumbnail / play-icon area
-- Any "Generate" / "Create" button on the card BEFORE you've opened the customize panel
-- An existing audio entry that's already in the Studio panel (its play button, its row)
-
-You may ONLY click:
-- The gear / settings icon, "Customize" link, or three-dot menu on the Audio Overview card.
-- Inside the customize panel: the Format dropdown, the Length dropdown, and the final Generate button.
-
-Steps (do them in order, do not skip):
-
-1. Confirm all sources are checked in the Sources panel ("Select all" if present).
-
-2. SCAN the Studio panel and COUNT how many audio entries are visible right now.
-   - If the count is 0 → continue.
-   - If the count is ≥ 1 → say exactly: "abort: audio already present" and STOP. Do not click anything else.
-
-3. Find the Audio Overview card's gear / Customize / three-dot affordance and click ONLY that.
-   - If you cannot find a clear gear/Customize/three-dot control, say exactly: "abort: no customize affordance" and STOP. Do not click the card body as a fallback.
-
-4. WAIT for the customize panel to open. Confirm you can see BOTH a Format selector AND a Length selector before any next click.
-   - If the panel doesn't open or the dropdowns aren't visible, say exactly: "abort: customize did not open" and STOP.
-
-5. Set FORMAT = "Deep Dive" and LENGTH = "Long". Both must be set explicitly — do not leave defaults.
-
-6. Click the Generate button inside the customize panel EXACTLY ONCE. Do not click it a second time, do not retry, do not click any other Generate-like button on the page.
-
-7. Say exactly: "generating" once a progress indicator appears for the new audio.
-
-If at any point you realize you've clicked the wrong thing and a default/unwanted audio has started generating, say exactly: "abort: misclick — default audio fired" and STOP. Do not try to click "stop" or "delete" — leave the page as-is and report."""
+# #757 (2026-06-02): delegate to the factory instead of a divergent literal
+# block. The old copy carried a stale, non-terminal step 7 ("Say exactly:
+# generating", no STOP / no no-click-after-Generate override) — a latent
+# footgun that would have re-introduced the duplicate-audio misclick for any
+# importer of this alias. Pointing it at the factory keeps the "long" behavior
+# AND inherits the terminal-Generate hardening automatically.
+PROMPT_AUDIO_GENERATE = make_prompt_audio_generate("long")
 
 # Per-variant target descriptors used by the audio CHECK + DOWNLOAD prompt
 # factories below. Mirrors _PROMPT_AUDIO_GENERATE_VARIANTS so the
@@ -832,6 +803,14 @@ def make_prompt_audio_check(podcast_length: str = "long") -> str:
     return SYSTEM_BASE + f"""
 
 Check if the NotebookLM audio overview has FINISHED generating.
+
+This is a READ-ONLY check — do NOT click ANYTHING on this page. Not the audio
+overview card, not its title / thumbnail / play control, not any audio entry in
+the Studio panel, nothing. A single click on an audio card here fires
+NotebookLM's one-click DEFAULT audio = an unwanted DUPLICATE that cannot be
+undone (a failure). You are only OBSERVING — there is no action to verify, so the
+general "post-action verify" habit does NOT apply. Just LOOK at the screenshot
+and report.
 
 Look ONLY at the audio overview CARD inside the Studio panel — {v['card_desc']}.
 IGNORE other panel chrome, sidebars, banners, source-list spinners, or

@@ -27238,6 +27238,17 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 f"Generate ONE audio overview. Select all sources, set "
                 f"{_human_desc}, click Generate ONCE. Say 'generating' when started."
             )
+            # #757 (2026-06-02): keep max_iterations at 15 — do NOT lower it to
+            # "kill" the duplicate. The duplicate is a card-body misclick on the
+            # iteration RIGHT AFTER Generate (logged at iter ~4), so any cap ≥ 4
+            # can't stop it; the real fix is the terminal "STOP — no clicks after
+            # Generate" prompt (prompts.py make_prompt_audio_generate step 7),
+            # which exits the loop at `not tool_uses` the moment CUA says
+            # "generating". 15 only bites on a stuck run, and the long-variant
+            # customize flow (sources→count→gear→panel→format-dropdown→select→
+            # length-dropdown→select→Generate) can legitimately need ~10 iters —
+            # capping at 6 would truncate a valid run BEFORE Generate and produce
+            # NO audio at all, a worse failure than a detectable duplicate.
             _ag_result = await agent_loop(cua_client, browser, _prompt, _task_str,
                 model=CUA_MODEL, max_iterations=15, verbose=verbose)
         finally:
@@ -27296,9 +27307,19 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     if _reuse_existing:
         verified = True
     else:
+        # #757 (2026-06-02): do NOT hand wait_until_verified a cua_client here.
+        # Its Phase-3 escalation (retry 7) runs PROMPT_FIX_ISSUE — "click any
+        # needed buttons" — and on a notebook the only button it can find to
+        # "fix" a not-yet-detected audio is the Audio Overview card body, which
+        # fires NLM's one-click DEFAULT audio = the exact duplicate we're
+        # killing. Fix B already guarded the reuse path; the non-reuse path was
+        # the remaining open vector. The code-side _check_audio_generating DOM
+        # check + the download poll loop below are the authoritative backstops,
+        # so a missed verify here only WARNs (harmless) — it never needs CUA to
+        # click anything.
         verified = await wait_until_verified(
             lambda page: _check_audio_generating(page),
-            browser.page, "Phase3-audio", browser=browser, cua_client=cua_client,
+            browser.page, "Phase3-audio", browser=browser, cua_client=None,
             max_retries=10, interval=5, verbose=verbose)
 
     if not verified:
