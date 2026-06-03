@@ -69,6 +69,7 @@ Queue ordering and per-doc position numbers stay coherent across cross-account, 
 **Where each phase runs:**
 - Phases 0-3 run **BE-side** (Python daemon on user's PC — needs the local browser for ChatGPT / Gemini / Claude / NotebookLM).
 - Phases 4-5 run **FE-side** (Firebase App Hosting / Cloud Run — Data API + Resend, no browser needed). FE-P4 fires off BE's `phase_complete:3` (or `phase_skipped:3` for the no-audio path), then chains directly into FE-P5 on success or fast-path skip. BE exits cleanly after P3 with `delivery.status="completed"`; the user-visible `research.status` stays "ongoing" until FE-P5's `markFeP5Completed` flips it to "completed".
+- **BE-driven P4/P5 (autonomous, #742 / BE `79d943f`)** — the live `phase_complete:3` event is one trigger, **not the only one**. So a run finishes even when the chat app never opens, after P3 the BE also calls `_post_fe_p4p5_trigger(uid, research_id)` (research.py:7003) from a detached daemon thread: it writes a `needsFeTrigger` marker AND POSTs `{FE_BASE_URL}/api/uploadYouTube {research_id, ownerUid}`, authenticated with the synth-device user's own fresh ID token; the route runs P4 then chains P5. `casRouteP4` dedups this against the live-event FE catch-up so both triggers coexist.
 
 ---
 
@@ -261,10 +262,8 @@ Stored in `{queue_dir}/config.json`:
 | POST | `/api/runs` | Start new pipeline `{topic, email?, config?}` → `{id, status}` |
 | GET | `/api/runs` | List all runs |
 | GET | `/api/runs/{id}` | Get run details (meta, checkpoint, delivery) |
-| GET | `/api/runs/{id}/events?offset=N` | Get events since offset |
 | GET | `/api/runs/{id}/documents/{type}` | Get document content (brief/chatgpt/gemini/claude/consolidated) |
 | GET | `/api/runs/{id}/audio/{filename}` | Stream audio file |
-| WS | `/ws/{id}` | Real-time event stream |
 | POST | `/api/runs/{id}/stop` | Stop pipeline |
 | POST | `/api/runs/{id}/pause` | Pause pipeline |
 | POST | `/api/runs/{id}/resume` | Resume from checkpoint `{config?}` |
@@ -273,6 +272,8 @@ Stored in `{queue_dir}/config.json`:
 | PATCH | `/api/runs/{id}/config` | Update pipeline config mid-run |
 | DELETE | `/api/runs/{id}` | Delete a run |
 | GET | `/api/queue` | Queue status |
+
+*(GET /api/runs/{id}/events and WS /ws/{id} were removed 2026-04-29 — Firestore pipeline_events is the exclusive FE event transport.)*
 
 ---
 
