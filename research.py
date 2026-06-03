@@ -9218,6 +9218,78 @@ async def _chatgpt_dom_tier(page) -> str:
     return "unsure"
 
 
+async def _chatgpt_extended_pro_confirm(page) -> str:
+    """Read-only DOM confirm that ChatGPT actually stuck on Pro + Extended
+    Thinking after the Phase-1 selector ran → 'extended'|'pro'|'downgrade'|'unsure'.
+
+    #759 (2026-06-02): Phase 1 infers Pro+Extended success purely from the CUA
+    selector's prose (the "no 'no pro' in the verdict" break). If the picker
+    silently reverted to Instant/Auto — or never applied Extended Thinking — the
+    brief is generated on a far shallower model with no signal at all. This is
+    the post-select DOM cross-check the user asked for.
+
+    FAIL-OPEN by design: only a CONFIRMED downgrade — a non-Pro thinking mode
+    active (Instant/Auto/Fast) AND no Pro/Extended marker anywhere — returns
+    'downgrade'. 'extended' / 'pro' / 'unsure' all mean "proceed". The caller
+    does at most ONE silent re-run on 'downgrade' — never a pro_required card,
+    pause, or badge (this is a quality knob like Claude's Effort/Thinking,
+    WARN-only). Never raises. Logs the candidate marker text so the next E2E can
+    pin the exact 'Extended Pro' pill selector.
+
+    Excludes [role=menu|listbox|dialog] descendants so an OPEN model-picker
+    listing 'Instant'/'Pro'/'Auto' OPTIONS can't be misread as the active mode
+    (mirrors the Claude model-trigger read)."""
+    try:
+        res = await page.evaluate("""() => {
+            const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+            const vis = el => el.getClientRects().length > 0;
+            const inOverlay = el => !!el.closest('[role="menu"], [role="listbox"], [role="dialog"]');
+            const verbRe = /\\b(upgrade|subscribe|get|try)\\b/i;
+            const extRe = /extended\\s*pro/i;
+            // The model / thinking-mode trigger button (NOT the menu items).
+            const clickables = [...document.querySelectorAll('button, [role="button"]')]
+                .filter(el => vis(el) && !inOverlay(el));
+            const mtrig = clickables.find(b => {
+                const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                const tid = (b.getAttribute('data-testid') || '').toLowerCase();
+                return tid.includes('model') || a.includes('model');
+            });
+            const trigText = mtrig ? norm(mtrig.textContent) : '';
+            const trig = trigText.toLowerCase();
+            // 'Extended Pro' marker anywhere in the page chrome (a short chip/pill,
+            // not a paragraph, not inside an open menu/overlay).
+            const extMark = [...document.querySelectorAll('*')]
+                .filter(el => vis(el) && !inOverlay(el))
+                .find(el => {
+                    const t = norm(el.textContent);
+                    if (!t || t.length > 24) return false;
+                    return extRe.test(t);
+                });
+            const hasExtended = extRe.test(trigText) || !!extMark;
+            const hasPro = /\\b(pro|plus)\\b/.test(trig) && !verbRe.test(trig);
+            const hasInstant = /\\b(instant|auto|fast|standard)\\b/.test(trig);
+            return { trigText: trigText.slice(0, 50), hasExtended, hasPro, hasInstant,
+                     extText: extMark ? norm(extMark.textContent).slice(0, 40) : '' };
+        }""")
+    except Exception as e:
+        log(f"[p1:extended_pro_confirm] DOM read failed: {e}", "INFO")
+        return "unsure"
+    if not isinstance(res, dict):
+        return "unsure"
+    log(f"[p1:extended_pro_confirm] trig={res.get('trigText')!r} "
+        f"extended={res.get('hasExtended')} ({res.get('extText')!r}) "
+        f"pro={res.get('hasPro')} instant={res.get('hasInstant')}", "INFO")
+    # Asymmetric: an Extended/Pro marker wins outright (proceed). Only a non-Pro
+    # mode active WITH no Pro/Extended marker is a real downgrade.
+    if res.get("hasExtended"):
+        return "extended"
+    if res.get("hasPro"):
+        return "pro"
+    if res.get("hasInstant"):
+        return "downgrade"
+    return "unsure"
+
+
 async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = False) -> str:
     """Single-screenshot Pro/Free verdict for ChatGPT/Claude/Gemini.
 
@@ -23388,6 +23460,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         # silently swallowing a genuine no-Pro.
         _pro_silent_retries = 0
         _PRO_SILENT_RETRY_MAX = 2
+        _pro_select_claimed = False  # #759: only DOM-confirm when CUA claimed Pro
         while True:
             log("Selecting Pro + Extended Thinking...")
             emit_event("agent_progress", phase=1, agent="chatgpt",
@@ -23405,6 +23478,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 result = {"text": "no pro available (cua_timeout)"}
             last = (result.get("text") or "").lower()
             if not ("no pro" in last or "not available" in last):
+                _pro_select_claimed = True  # #759: CUA claims Pro selected
                 break  # Pro selected — exit the retry loop
             # Backstop: Phase 0 normally catches Pro-Free downgrade and pauses
             # for the alert. This branch fires only when:
@@ -23458,6 +23532,40 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             emit_event("pipeline_resumed", phase=1,
                        reason="continue_with_free" if chose_free else "resume")
             break
+
+    # #759 (2026-06-02): post-select DOM confirm that Pro + Extended Thinking
+    # actually STUCK (vs a silent revert to Instant/Auto). Runs only when the CUA
+    # selector CLAIMED success — never on a user-opted-Free path. FAIL-OPEN: only
+    # a confirmed downgrade does ONE silent re-run of the selector; everything
+    # else proceeds. No card/pause/badge — this is a quality knob (like Claude's
+    # Effort/Thinking), WARN-only.
+    if cua_client and _pro_select_claimed:
+        try:
+            _epc = await _chatgpt_extended_pro_confirm(browser.page)
+        except Exception:
+            _epc = "unsure"
+        if _epc == "downgrade":
+            log("[Phase1] Post-select confirm: ChatGPT shows a non-Pro thinking "
+                "mode (Instant/Auto) with no Extended-Pro marker — silently "
+                "re-running the Pro+Extended selector ONCE", "WARN")
+            try:
+                await asyncio.wait_for(
+                    agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
+                        "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
+                        model=CUA_MODEL, max_iterations=15, verbose=verbose),
+                    timeout=180.0,
+                )
+            except Exception as _epc_e:
+                log(f"[Phase1] Extended-Pro re-run did not complete "
+                    f"({type(_epc_e).__name__}) — proceeding (fail-open)", "INFO")
+            # Re-confirm once for the log trail only; proceed regardless.
+            try:
+                _epc2 = await _chatgpt_extended_pro_confirm(browser.page)
+                log(f"[Phase1] Post re-run Extended-Pro confirm: {_epc2}", "INFO")
+            except Exception:
+                pass
+        else:
+            log(f"[Phase1] Post-select Extended-Pro confirm: {_epc} (proceeding)", "INFO")
 
     # Attach PDFs
     _pdf_total = len(pdf_paths) if pdf_paths else 0

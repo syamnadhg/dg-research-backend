@@ -104,7 +104,7 @@ UNSURE — mixed/hidden signals, or you cannot tell from this screenshot"""
 
 PROMPT_SELECT_PRO = SYSTEM_BASE + """
 
-Task: Select ChatGPT Pro (or "GPT-5 Pro" / "Pro mode") in the model selector. If an Extended Thinking toggle is visible, enable it. Do NOT type a message. When Pro is confirmed selected, say "Pro mode selected"."""
+Task: Select ChatGPT Pro (or "GPT-5 Pro" / "Pro mode") in the model selector. If an Extended Thinking toggle is visible, enable it. Do NOT type a message. After Pro is selected, make sure the model-selector menu/popover is CLOSED (it usually closes itself on selection; if it's still open, press Escape or click empty space once) so it can't sit over the message composer. When Pro is confirmed selected and the picker is closed, say "Pro mode selected"."""
 
 PROMPT_SUBMIT_FALLBACK = SYSTEM_BASE + """
 
