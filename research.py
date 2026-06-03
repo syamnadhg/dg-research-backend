@@ -27547,6 +27547,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     await asyncio.sleep(5)
     post_gen_cards = await _count_nlm_audio_cards(browser.page)
     log(f"[Phase3] Post-generate inventory: {post_gen_cards} audio card(s)")
+    if post_gen_cards == 0:
+        # #757-B capture: a card should exist right after Generate — 0 means the
+        # counter selectors missed a live (in-flight) card. Dump it (read-only).
+        await _dump_nlm_audio_dom(browser.page, "post-generate")
     if post_gen_cards > 1:
         # 2026-05-14: length-aware cleanup instruction. The misclick-fired
         # auto-default is NLM's current default settings, which depends
@@ -27685,6 +27689,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         diag_text = (diag.get("text") or "").lower()
 
         if "audio complete" in diag_text:
+            if not dom_complete:
+                # #757-B capture: CUA confirms complete but _check_audio_complete_dom
+                # missed it — dump the COMPLETE-card markup (read-only) to pin it.
+                await _dump_nlm_audio_dom(browser.page, "cua-complete-dom-missed")
             log("Audio generation complete ✓ (CUA-detected)")
             audio_done = True
             break
@@ -27845,6 +27853,10 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             dd_count = await _count_nlm_deep_dive_cards(browser.page)
             total_count = await _count_nlm_audio_cards(browser.page)
             log(f"[Phase3] Post-cleanup inventory ({podcast_length}): {dd_count} Deep Dive / {total_count} total audio card(s)")
+            if total_count == 0:
+                # #757-B capture: audio is done + downloaded, so a single complete
+                # card must exist — 0 means the counter missed it. Dump (read-only).
+                await _dump_nlm_audio_dom(browser.page, "post-cleanup")
             # Length-aware invariant (2026-05-14):
             #   "long"    → expect 1 Deep Dive + 1 total
             #   "default" → cleanup skipped (indistinguishable), accept any total ≥ 1
@@ -28071,6 +28083,121 @@ async def _check_audio_complete_dom(page) -> bool:
         }""") or False
     except Exception:
         return False
+
+
+async def _dump_nlm_audio_dom(page, ctx: str) -> None:
+    """#757-B capture (READ-ONLY — never clicks): when _count_nlm_audio_cards
+    reads 0 at a point where a card MUST exist (post-generate / CUA-complete /
+    post-cleanup), dump the live NotebookLM Studio-panel DOM structure so the
+    counter selectors (_count_nlm_audio_cards / _check_audio_complete_dom) can be
+    pinned from REAL markup instead of the current guessed selectors that never
+    match live NLM (every count=0 → all dup-guards are dead no-ops). Fires ONLY
+    on the anomalous-zero path, so a healthy run never logs it. Bounded output,
+    fully exception-safe, WARN so it surfaces. Grep the next E2E for
+    '[#757-B dom-dump'. This is the sole blocker on repairing the counters.
+    """
+    try:
+        dump = await page.evaluate(r"""() => {
+            const trunc = (s, n) => (s == null ? '' : s.toString())
+                .replace(/\s+/g, ' ').trim().slice(0, n);
+            const attrsOf = (el) => {
+                const o = {};
+                for (const a of (el.attributes || [])) {
+                    if (a.name === 'class' || a.name === 'style') continue;
+                    if (a.name === 'id' || a.name === 'role'
+                        || a.name.indexOf('data-') === 0
+                        || a.name.indexOf('aria-') === 0) {
+                        o[a.name] = trunc(a.value, 40);
+                    }
+                }
+                return o;
+            };
+            const brief = (el) => el ? {
+                tag: (el.tagName || '').toLowerCase(),
+                cls: trunc((el.className && el.className.toString)
+                    ? el.className.toString() : '', 80),
+                attrs: attrsOf(el),
+            } : null;
+            // What the CURRENT (broken) selectors actually see — should be 0.
+            const curPanel = document.querySelector(
+                '[aria-label*="Studio" i], [data-testid*="studio" i], aside');
+            const curCand = (curPanel || document.body).querySelectorAll(
+                '[role="article"], [role="listitem"], [class*="audio-card"], '
+                + '[class*="AudioCard"], [data-testid*="audio"], '
+                + '[data-testid*="overview-item"]');
+            // Find the real audio card(s) by CONTENT / structure, doc-wide, and
+            // record each one's ancestor chain so the true container selectors
+            // (class / data-testid / role) are visible.
+            const kw = /(audio overview|deep dive|conversation|discussion|podcast)/i;
+            const seen = new Set();
+            const picked = [];
+            const add = (el) => {
+                if (!el || seen.has(el) || el.offsetParent === null) return;
+                seen.add(el); picked.push(el);
+            };
+            // Cheap DIRECT global selectors first (no per-element subtree scans).
+            document.querySelectorAll('audio, [role="progressbar"]').forEach((node) => {
+                if (picked.length >= 6) return;
+                let c = node;                                      // climb to a visible container
+                for (let i = 0; i < 4 && c && c.offsetParent === null; i++) c = c.parentElement;
+                add(c || node);
+            });
+            // Keyword scan — regex on text ONLY (O(n); no querySelector per element).
+            if (picked.length < 6) {
+                for (const el of document.querySelectorAll('*')) {
+                    if (picked.length >= 6) break;
+                    if (el.offsetParent === null) continue;        // visible only
+                    const txt = trunc(el.textContent, 200);
+                    if (txt.length < 120 && kw.test(txt)) add(el); // a label, not prose
+                }
+            }
+            // Subtree checks (querySelector) run on the <= 6 kept anchors only.
+            const anchors = picked.slice(0, 6).map((el) => {
+                const chain = [];
+                let p = el;
+                for (let i = 0; i < 7 && p && p !== document.body; i++) {
+                    chain.push(brief(p));
+                    p = p.parentElement;
+                }
+                // A keyword anchor is usually a leaf TITLE node whose OWN subtree
+                // holds neither <audio> nor the progress bar (those are siblings
+                // under the card container) — so its self-level hasAudioEl/isProg
+                // read false even on a complete card. Climb to the nearest
+                // ancestor (incl self) that actually contains one, and report THAT
+                // as cardEl so the true card container + state are unambiguous.
+                let cardEl = el;
+                for (let i = 0; i < 7 && cardEl && cardEl !== document.body; i++) {
+                    if (cardEl.querySelector('audio')
+                        || cardEl.querySelector('[role="progressbar"]')) break;
+                    cardEl = cardEl.parentElement;
+                }
+                const cardHasAudio = !!(cardEl && cardEl.querySelector('audio'));
+                const cardProg = !!(cardEl && cardEl.querySelector('[role="progressbar"]'));
+                return {
+                    text: trunc(el.textContent, 60),
+                    hasAudioEl: !!el.querySelector('audio'),       // leaf-anchor only
+                    isProg: el.getAttribute('role') === 'progressbar'
+                        || !!el.querySelector('[role="progressbar"]'),
+                    self: brief(el),
+                    // climbed card container — the load-bearing fields for pinning
+                    cardEl: (cardEl && cardHasAudio) || cardProg ? brief(cardEl) : null,
+                    cardHasAudioEl: cardHasAudio,
+                    cardIsProg: cardProg,
+                    chain,
+                };
+            });
+            return JSON.stringify({
+                url: trunc(location.href, 90),
+                curPanelTag: curPanel ? (curPanel.tagName || '').toLowerCase() : null,
+                curPanelAttrs: curPanel ? attrsOf(curPanel) : null,
+                curSelectorMatches: curCand.length,
+                anchorsFound: anchors.length,
+                anchors,
+            });
+        }""")
+        log(f"[Phase3][#757-B dom-dump:{ctx}] {dump}", "WARN")
+    except Exception as _e:
+        log(f"[Phase3][#757-B dom-dump:{ctx}] capture failed: {_e}", "WARN")
 
 
 def _nlm_notebook_id(url: str) -> str:
