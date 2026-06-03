@@ -26702,7 +26702,27 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         _start_wait_max_sec = 10 * 60
         _loop_start = time.time()
         _last_plan_emit = 0.0
+        # #755 (2026-06-02): Gemini sometimes fails to draft the research plan
+        # (shows "...something went wrong" + a Regenerate/Retry button instead of
+        # "Start research"). Auto-click that retry, bounded, so the plan re-drafts
+        # and the loop can then click "Start research" — instead of dwelling the
+        # full 10 min and escalating to a needless human alert.
+        _regen_count = 0
+        _GEMINI_MAX_PLAN_REGEN = 3
+        _GEMINI_REGEN_COOLDOWN_SEC = 45   # space attempts so a slow-but-healthy
+        _last_regen_at = 0.0              # re-draft can't burn the 3-cap
+        _regen_cap_emitted = False
+        _logged_stall_diag = False
         while time.time() - _loop_start < _start_wait_max_sec:
+            # #755: stop/pause-aware — a 10-min plan wait must honor Stop/Pause.
+            if _controls.is_stop():
+                log("[2D] Stop requested during plan wait — exiting loop", "INFO")
+                break
+            if _controls.is_pause():
+                await _controls.wait_if_paused()
+                if _controls.is_stop():
+                    break
+            _elapsed = int(time.time() - _loop_start)
             # 1. Check Start-research button on Gemini and click if present
             try:
                 await browser.switch_to_page(gemini_page)
@@ -26721,6 +26741,82 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     break
             except Exception:
                 pass
+
+            # 1b. (#755) No "Start research" yet — if Gemini is in a plan-FAIL
+            # state, auto-click its Regenerate/Retry (bounded + stop-aware) so the
+            # plan re-drafts. _try_inpage_retry_on_research_fail only clicks when
+            # the page actually shows failure text AND finds a retry-labeled
+            # button in the assistant area, so a healthy "still drafting" plan is
+            # never touched. The 30s loop sleep below spaces successive attempts
+            # so each re-draft has time to produce a plan (or a fresh failure).
+            if (not start_clicked and _regen_count < _GEMINI_MAX_PLAN_REGEN
+                    and not _controls.is_stop()
+                    and (time.time() - _last_regen_at) > _GEMINI_REGEN_COOLDOWN_SEC):
+                try:
+                    _regened = await _try_inpage_retry_on_research_fail(
+                        gemini_page, "gemini", "2D-plan", max_wait_s=4)
+                except Exception:
+                    _regened = False
+                if _regened:
+                    _regen_count += 1
+                    _last_regen_at = time.time()
+                    log(f"[2D] Gemini plan failed — auto-clicked Regenerate "
+                        f"{_regen_count}/{_GEMINI_MAX_PLAN_REGEN}; re-drafting plan, "
+                        f"will re-check for 'Start research'", "INFO")
+                    try:
+                        emit_event("agent_progress", phase=2, agent="gemini",
+                                   status="generating",
+                                   progress=(f"Gemini plan hit an error — retrying "
+                                             f"({_regen_count}/{_GEMINI_MAX_PLAN_REGEN})…"))
+                    except Exception:
+                        pass
+                elif not _logged_stall_diag and _elapsed > 90:
+                    # No labeled Retry was clickable but we're stuck past 90s with
+                    # no "Start research". Capture the assistant-area buttons ONCE
+                    # (read-only) so a future E2E can pin the icon-only Regenerate
+                    # selector for the silent-stall case. We do NOT blind-click —
+                    # clicking an unidentified control risks a destructive misclick.
+                    try:
+                        _cands = await gemini_page.evaluate("""() => {
+                            const scope = document.querySelector(
+                                'message-content, model-response, .response-container, main') || document.body;
+                            const out = [];
+                            for (const b of scope.querySelectorAll('button, [role="button"]')) {
+                                const r = b.getBoundingClientRect();
+                                if (r.width < 8 || r.height < 8) continue;
+                                out.push({
+                                    aria: (b.getAttribute('aria-label') || '').slice(0, 40),
+                                    title: (b.getAttribute('title') || '').slice(0, 40),
+                                    cls: ((b.className && b.className.toString) ? b.className.toString() : '').slice(0, 60),
+                                    svg: !!b.querySelector('svg'),
+                                    txt: (b.textContent || '').trim().slice(0, 30),
+                                });
+                                if (out.length >= 12) break;
+                            }
+                            return JSON.stringify(out);
+                        }""")
+                        log(f"[2D] Gemini plan stall diag @ {_elapsed}s (no labeled "
+                            f"Retry found, no 'Start research'): {_cands}", "WARN")
+                    except Exception:
+                        pass
+                    _logged_stall_diag = True
+
+            # 1c. (#755) Auto-regenerate exhausted but still no plan — surface it
+            # ONCE so the eventual not-verified outcome reads as a known repeated
+            # failure in the FE, not a silent stall (the user previously had to
+            # retry by hand ~3×). We keep polling until the window/CUA fallback.
+            if (not start_clicked and _regen_count >= _GEMINI_MAX_PLAN_REGEN
+                    and not _regen_cap_emitted and not _controls.is_stop()):
+                _regen_cap_emitted = True
+                log(f"[2D] Gemini plan auto-regenerate exhausted ({_regen_count} tries) "
+                    f"— still no 'Start research'; will keep polling then escalate", "WARN")
+                try:
+                    emit_event("agent_progress", phase=2, agent="gemini",
+                               status="generating",
+                               progress=(f"Gemini's plan keeps failing — retried "
+                                         f"{_regen_count}× and still waiting…"))
+                except Exception:
+                    pass
 
             # 2. Emit a Gemini planning heartbeat every ~60s so the frontend
             # knows Gemini is still drafting the plan. No rotation — we do
@@ -26744,12 +26840,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 except Exception:
                     pass
 
-            _elapsed = int(time.time() - _loop_start)
             log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
             await asyncio.sleep(30)
 
-        # CUA fallback for Start research
-        if not start_clicked:
+        # CUA fallback for Start research. #755: skip on Stop — agent_loop would
+        # just return status='stopped' immediately and the round-robin is itself
+        # stop-aware, so there's no point spending CUA iterations here.
+        if not start_clicked and not _controls.is_stop():
             log("[2D] JS couldn't find button — CUA clicking 'Start research'")
             await browser.switch_to_page(gemini_page)
             fix = await agent_loop(cua_client, browser,
@@ -26762,9 +26859,15 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2D] CUA clicked 'Start research' ✓")
                 await asyncio.sleep(5)
 
-        # Verify Gemini is actually researching
-        verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2D",
-            browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
+        # Verify Gemini is actually researching. #755: on Stop, skip the ~45s
+        # DOM-verify retry churn — record not-verified and let the stop-aware
+        # round-robin unwind cleanly.
+        if _controls.is_stop():
+            log("[2D] Stop requested — skipping Gemini verify", "INFO")
+            verified_b = False
+        else:
+            verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2D",
+                browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
         # Record when research actually started (after "Start research" click)
         # so the round-robin doesn't check for completion prematurely
         agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url,
