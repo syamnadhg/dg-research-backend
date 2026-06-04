@@ -7626,6 +7626,17 @@ def _start_command_listener(uid, research_id, loop):
                     _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent_hard, _ag)
                     loop.call_soon_threadsafe(_controls.request_resume)
+                    # #777: retract any durable "Hit a snag" pendingDecision mirror
+                    # the instant the user clicks Retry. The agent-retry path resolves
+                    # the decision via request_retry_agent_hard + request_resume +
+                    # await_agent_decision()=="retry" — it emits NO pipeline_resumed /
+                    # phase_restart event, so the central clear seam (~11387) never
+                    # fired and the snag card lingered until the run advanced PAST the
+                    # phase (FE staleness guard nulled it on docPhase>pd.phase). This
+                    # ONE chokepoint covers EVERY Phase-2 fail_agent→retry site
+                    # (re-auth, missing-artifact, empty-response, stuck, extraction).
+                    # Idempotent DELETE_FIELD; harmless if no decision was pending.
+                    loop.call_soon_threadsafe(_clear_pending_decision)
                     if _agent_pre_failed:
                         # Drop the pre-fail skip marker so the hard-retry path
                         # doesn't see Gemini as still-skipped.
@@ -7642,6 +7653,8 @@ def _start_command_listener(uid, research_id, loop):
                     _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent, _ag)
                     loop.call_soon_threadsafe(_controls.request_resume)
+                    # #777: see hard-branch note — retract the snag mirror on Retry.
+                    loop.call_soon_threadsafe(_clear_pending_decision)
                     log(f"Command received: RETRY_AGENT agent={_ag} mode=soft")
                 else:
                     log("Command received: RETRY_AGENT rejected — no agent", "WARN")
@@ -18465,14 +18478,41 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             await asyncio.sleep(2)
         if not start_clicked and cua_client:
             await browser.switch_to_page(new_page)
-            fix = await agent_loop(cua_client, browser,
+            # agent_loop CLICK dismisses the plan-FAIL screen; return text unused (#776).
+            await agent_loop(cua_client, browser,
                 PROMPT_GEMINI_START_RESEARCH,
                 "Click the 'Start research' button to begin the deep research.",
                 model=CUA_MODEL, max_iterations=10, verbose=verbose)
-            if "click" in (fix.get("text") or "").lower():
-                start_clicked = True
+            # #776: confirm the click via the DOM, not the CUA narration (see the
+            # 2D note) — re-poll the deterministic JS after the CUA returns so a
+            # post-Retry re-draft's fresh "Start research" button is actually
+            # clicked, instead of inferring success from prose like "clicked retry".
+            for _i in range(24):   # ~120s — covers a slow post-Retry re-draft
+                if _controls.is_stop():
+                    break
+                try:
+                    _rb = await new_page.evaluate("""() => {
+                        const btns = document.querySelectorAll('button');
+                        for (const b of btns) {
+                            const txt = b.textContent.trim().toLowerCase();
+                            if (txt.includes('start research')) { b.click(); return true; }
+                        }
+                        return false;
+                    }""")
+                except Exception:
+                    _rb = False
+                if _rb:
+                    start_clicked = True
+                    await asyncio.sleep(5)
+                    break
                 await asyncio.sleep(5)
 
+        # #776: don't let the spinner-based verify stamp a not-yet-started run as
+        # researching when "Start research" was never confirmed-clicked. Returning
+        # verified=False keeps the tab in the round-robin (it doesn't drop a
+        # not-verified agent) so the wall-clock cap can surface an honest failure.
+        if not start_clicked:
+            return (new_page, False)
         verified = await wait_until_verified(
             verify_gemini_generating, new_page, "2B-retry",
             browser=browser, cua_client=cua_client,
@@ -20966,29 +21006,49 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         f"returned no content — surfacing user decision", "WARN")
                     p["flat_history"] = []
                     p["done_marker_first_at"] = 0.0
-                    if p["extraction_attempts"] >= 1:
-                        fail_agent(agent_key,
-                                   f"Couldn't read {name}'s report",
-                                   (f"{name} finished but we couldn't pull its results. "
-                                    "Retry to try again, or Skip it."))
-                        decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
-                        log(f"[{name}] Extraction-failed decision: {decision}")
-                        if decision == "retry":
-                            p["extraction_attempts"] = 0
-                            p["flat_history"] = []
-                            continue
-                        if decision == "skip":
-                            results[name] = {"status": "skipped_by_user",
-                                             "text": "", "url": "",
-                                             "page": p["page"],
-                                             "elapsed_sec": int(elapsed)}
-                            del pending[name]
-                            emit_event("agent_skipped", phase=2, agent=agent_key,
-                                       reason="extraction_failure_skip")
-                            # status="skipped" auto-persisted by emit_event hook.
-                            continue
-                        if decision == "stop":
-                            break
+                    # #777 (a): Claude's Tier-3 clipboard-hijack extraction can read
+                    # back 0 chars on a GENUINELY-complete report (clipboard not yet
+                    # populated / focus race — log shows "captured 0 chars … lens=[0,0]"),
+                    # and when the WHOLE ladder comes back empty the E4/DGOPS-7366
+                    # guardrail assumption (a real transient is caught INSIDE the
+                    # ladder) doesn't hold → it surfaced a false "Hit a snag" on a
+                    # successful run. Give Claude ONE silent re-extraction first: the
+                    # done_marker_first_at / flat_history reset above makes the next
+                    # ticks re-confirm the artifact is still complete, THEN re-run
+                    # extract_and_record_agent (re-open canvas / re-copy) — far cheaper
+                    # than the user's manual hard re-run and it recovers the transient
+                    # clipboard read. ChatGPT/Gemini stay at attempt-1 (cap 1) → their
+                    # behavior is byte-identical. A 2nd consecutive empty read for
+                    # Claude (genuinely unreadable) still escalates to the user.
+                    _empty_extract_cap = 2 if name == "Claude" else 1
+                    if p["extraction_attempts"] < _empty_extract_cap:
+                        log(f"[{name}] Empty extraction (attempt "
+                            f"{p['extraction_attempts']}/{_empty_extract_cap}) on a "
+                            f"confirmed-complete report — silent re-extraction before "
+                            f"alerting (transient clipboard/focus race)", "INFO")
+                        continue
+                    fail_agent(agent_key,
+                               f"Couldn't read {name}'s report",
+                               (f"{name} finished but we couldn't pull its results. "
+                                "Retry to try again, or Skip it."))
+                    decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
+                    log(f"[{name}] Extraction-failed decision: {decision}")
+                    if decision == "retry":
+                        p["extraction_attempts"] = 0
+                        p["flat_history"] = []
+                        continue
+                    if decision == "skip":
+                        results[name] = {"status": "skipped_by_user",
+                                         "text": "", "url": "",
+                                         "page": p["page"],
+                                         "elapsed_sec": int(elapsed)}
+                        del pending[name]
+                        emit_event("agent_skipped", phase=2, agent=agent_key,
+                                   reason="extraction_failure_skip")
+                        # status="skipped" auto-persisted by emit_event hook.
+                        continue
+                    if decision == "stop":
+                        break
                     continue
 
             # Check completion — CUA-primary fallback (only if Playwright was
@@ -22463,8 +22523,11 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         scrape is the deterministic fallback when CUA can't drive the menu)
       - Claude (`extract_claude_response`, research.py:16640): two-mode —
         3 tiers in Deep Research artifact-aware mode (T1 CUA-download →
-        T2 publish + HTML→MD on claude.site → T3 CUA + clipboard hijack;
-        collapsed from a 4-tier ladder on 2026-05-13). Targets the LAST
+        T2 HTML→MD of the open artifact panel → T3 CUA + clipboard hijack;
+        publish moved OUT of T2 to the end share-link step on 2026-06-03 so
+        Claude matches ChatGPT/Gemini's DOM-scrape fallback — was T2 publish
+        + claude.site HTML→MD, collapsed from a 4-tier ladder 2026-05-13).
+        Targets the LAST
         artifact since DR produces 2 (tracking checklist + final report).
         Chat-mode branch has its own Tier 1/2 (HTML→MD primary, Copy
         hijack fallback) — fires when Research wasn't enabled and the
@@ -23101,6 +23164,7 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         # normal mount, gives slow renders up to 8s before falling
         # through to CUA. Forgiving — if panel never mounts, T3's own
         # navigate preamble still has a shot.
+        _panel_open = True
         try:
             await page.wait_for_selector(
                 'aside [class*="markdown"], aside .prose, '
@@ -23108,7 +23172,50 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 '[class*="artifact-panel"] .prose',
                 timeout=8000)
         except Exception:
+            _panel_open = False
             await asyncio.sleep(1.5)
+
+        # #777 ROOT FIX: the DOM pre-click (_click_claude_artifact) sometimes
+        # reports success but matched a WRONG element (research-tracking card /
+        # context-menu trigger — see the comment at ~23130) so the final-report
+        # panel never actually opened. The CUA open above only ran on `not
+        # clicked`, so a FALSE-success pre-click SKIPPED it → Tier 1's Download
+        # menu, Tier 2's Publish button, and Tier 3's Ctrl+A all run against a
+        # closed/empty panel and ALL return empty (the 2026-06-03 false "Hit a
+        # snag": T1 "no download event within 165s", T2 "Publish never mounted",
+        # T3 "captured 0 chars lens=[0,0]" — while a user hard-retry opened the
+        # panel cleanly and T1 pulled 45k chars). If the panel content never
+        # mounted, open it via the CUA NOW — regardless of `clicked` — so the
+        # tiers (esp. the reliable T1 .md download) run against an open report.
+        if not _panel_open and browser and cua_client and not chat_mode:
+            log(f"[{label}] Artifact panel content not mounted after click — CUA "
+                f"fallback to open the final report before running extraction tiers", "WARN")
+            try:
+                await asyncio.wait_for(
+                    agent_loop(cua_client, browser,
+                        PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                        f"There are {artifact_count} artifact(s) in this conversation. "
+                        f"Open the LAST (bottom) artifact card — that's the final "
+                        f"research report — so its panel is visible on the right.",
+                        model=CUA_MODEL, max_iterations=8,
+                        verbose=verbose, target_page=page),
+                    timeout=120.0)
+                await asyncio.sleep(1.5)
+                # Re-confirm the panel content mounted (best-effort; tiers still try regardless).
+                try:
+                    await page.wait_for_selector(
+                        'aside [class*="markdown"], aside .prose, '
+                        '[class*="artifact-panel"] [class*="markdown"], '
+                        '[class*="artifact-panel"] .prose',
+                        timeout=8000)
+                    log(f"[{label}] CUA panel-open recovery: final-report panel now mounted ✓")
+                except Exception:
+                    log(f"[{label}] CUA panel-open recovery ran but panel still not "
+                        f"detected — tiers will still attempt extraction", "WARN")
+            except asyncio.TimeoutError:
+                log(f"[{label}] CUA panel-open recovery timed out after 120s", "WARN")
+            except Exception as _pe:
+                log(f"[{label}] CUA panel-open recovery raised: {_pe}", "WARN")
 
         # 2026-05-13 ARCHITECTURE: collapsed from 4-tier ladder (panel-
         # reader + publish + html-md + copy-hijack + CUA-OS-clipboard)
@@ -23154,32 +23261,51 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                     log(f"[{label}] Extracted via T1 CUA download (.md): {len(md_dl)} chars")
                     return md_dl
 
-        # ── Tier 2: publish + claude.site full-page HTML→MD ──
-        # Publish artifact + open the resulting claude.site URL in a
-        # new tab + HTML→MD scrape on the clean DOM. Zero chat/nav/
-        # iframe chrome. New tab keeps main-page state intact.
-        # Idempotent across calls.
-        md_pub = await _extract_claude_via_published_page(
-            page, browser, cua_client, label, verbose=verbose,
-        )
-        if md_pub and len(md_pub) > 500:
-            if _is_sources_not_document(md_pub, platform="claude"):
-                log(f"[{label}] T2 published-page wrong-artifact "
-                    f"({len(md_pub)} chars) — falling to Tier 3", "WARN")
-            elif _looks_like_nav_sidebar(md_pub):
-                log(f"[{label}] T2 published-page looks-like-nav-sidebar "
-                    f"({len(md_pub)} chars) — falling to Tier 3", "WARN")
+        # ── Tier 2: HTML→MD of the OPEN artifact panel ──
+        # #777 (2026-06-03, user-directed): Claude's T2 used to PUBLISH the
+        # artifact to claude.site and HTML→MD-scrape that page — the ONLY
+        # extractor that published mid-extraction (ChatGPT T2 and Gemini T1 both
+        # DOM-scrape the open panel directly). Publishing is heavier + flakier
+        # ("Publish/Share button never mounted within 12s" in the 2026-06-03
+        # false-snag run) and the artifact is ALSO published independently by the
+        # end-of-pipeline share-link step (extract_share_link_claude), so the
+        # mid-extraction publish was redundant. T2 is now a plain HTML→MD of the
+        # OPEN artifact panel — the same panel the panel-open recovery above
+        # guarantees is mounted — scoped to the artifact/complementary side-panel
+        # containers (NOT chat). Cheap, deterministic, Wayland-safe. Publishing
+        # stays ONLY in the share-link step. The ladder is now consistent across
+        # all three agents: CUA-download → HTML→MD-of-panel → clipboard-hijack.
+        md_dom = await _extract_html_to_md(page, [
+            'aside [class*="markdown"]',
+            'aside .prose',
+            'aside [class*="prose"]',
+            '[class*="artifact-panel"] [class*="markdown"]',
+            '[class*="artifact-panel"] .prose',
+            '[class*="artifact-panel"] [class*="prose"]',
+            '[role="complementary"] [class*="markdown"]',
+            '[role="complementary"] .prose',
+        ], label)
+        # Floor = 2000 to match Gemini's sibling DOM-scrape tier (research.py
+        # ~22824): a DOM panel scrape can catch a sparse PARTIAL render that is
+        # NEITHER a checklist nor a nav-sidebar (so both reject guards miss it).
+        # Genuine Claude DR reports are >5000 chars, so a 2000 floor rejects a
+        # truncated panel while accepting every real report; a short-but-real doc
+        # (rare) still gets a shot at T3's CUA copy below. T1 (.md download) and
+        # T3 (clipboard hijack) keep their 500 floor — a downloaded file / clean
+        # CUA copy is authoritative even when short; a raw DOM scrape is not.
+        if md_dom and len(md_dom) > 2000:
+            if _is_sources_not_document(md_dom, platform="claude"):
+                log(f"[{label}] T2 HTML→MD wrong-artifact "
+                    f"({len(md_dom)} chars) — falling to Tier 3", "WARN")
+            elif _looks_like_nav_sidebar(md_dom):
+                log(f"[{label}] T2 HTML→MD looks-like-nav-sidebar "
+                    f"({len(md_dom)} chars) — falling to Tier 3", "WARN")
             else:
-                log(f"[{label}] Extracted via T2 published-page HTML→MD: {len(md_pub)} chars")
-                return md_pub
-        # If T2 fired but didn't return content, the publish-confirm
-        # dialog may still be mounted on the main page. Dismiss with
-        # Escape so dialog content doesn't bleed into T3 state.
-        try:
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.4)
-        except Exception:
-            pass
+                log(f"[{label}] Extracted via T2 HTML→MD (artifact panel): {len(md_dom)} chars")
+                return md_dom
+        elif md_dom:
+            log(f"[{label}] T2 HTML→MD returned {len(md_dom)} chars (below 2000-char "
+                f"floor — likely a partial render or wrong panel) — falling to Tier 3", "WARN")
 
         # ── Tier 3 (LAST RESORT, Wayland-safe): CUA + clipboard hijack ──
         # _run_with_clipboard_hijack installs the JS hook before CUA's
@@ -26959,27 +27085,102 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
             await asyncio.sleep(30)
 
-        # CUA fallback for Start research. #755: skip on Stop — agent_loop would
-        # just return status='stopped' immediately and the round-robin is itself
-        # stop-aware, so there's no point spending CUA iterations here.
+        # CUA recovery for "Start research" (#776 + #755). #755: skip on Stop —
+        # agent_loop would just return status='stopped' and the round-robin is
+        # itself stop-aware. The 10-min loop above exited without a click, which on
+        # a plan-FAIL screen means Gemini showed "…something went wrong" with an
+        # ICON-ONLY Regenerate/Retry control the in-page JS selector can't match
+        # (only the CUA's vision can click it). Per user spec (2026-06-03): KEEP
+        # retrying the plan via the CUA, wait ~2 min after each retry for the plan
+        # to re-draft, and the instant a real "Start research" button renders,
+        # click it via deterministic JS — then verify + hand back to the
+        # round-robin. Bounded so a permanently-failing plan still escalates
+        # honestly (verified_b=False below) instead of dwelling forever.
         if not start_clicked and not _controls.is_stop():
-            log("[2D] JS couldn't find button — CUA clicking 'Start research'")
-            await browser.switch_to_page(gemini_page)
-            fix = await agent_loop(cua_client, browser,
-                PROMPT_GEMINI_START_RESEARCH,
-                "Click the 'Start research' button to begin the deep research.",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
-            fix_text = (fix.get("text") or "").lower()
-            if "click" in fix_text:
-                start_clicked = True
-                log("[2D] CUA clicked 'Start research' ✓")
-                await asyncio.sleep(5)
+            _FALLBACK_MAX_REGEN = 3   # CUA-driven re-draft attempts (the in-loop #755 path already tried 3 via JS)
+            log(f"[2D] No 'Start research' after {_start_wait_max_sec}s — CUA recovery: "
+                f"retry the plan (≤{_FALLBACK_MAX_REGEN}×) until 'Start research' appears, then click it")
+            _click_start_js = """() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const txt = b.textContent.trim().toLowerCase();
+                    if (txt.includes('start research')) { b.click(); return true; }
+                }
+                return false;
+            }"""
+            for _regen_attempt in range(_FALLBACK_MAX_REGEN):
+                if _controls.is_stop():
+                    break
+                # 1. The plan may already expose a Start-research button (a prior
+                #    re-draft just succeeded, or it was simply slow) — click it.
+                try:
+                    await browser.switch_to_page(gemini_page)
+                    _sr = await gemini_page.evaluate(_click_start_js)
+                except Exception:
+                    _sr = False
+                if _sr:
+                    start_clicked = True
+                    log("[2D] CUA recovery: clicked 'Start research' via JS ✓")
+                    await asyncio.sleep(5)
+                    break
+                # 2. No Start-research → the plan is in a FAIL state. CUA clicks the
+                #    Regenerate/Retry control (or Start research if it IS there).
+                #    Return text intentionally unused — #776 confirms via the DOM,
+                #    never by parsing the CUA's narration.
+                log(f"[2D] CUA recovery: plan not ready — CUA retrying the plan "
+                    f"(attempt {_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})")
+                await browser.switch_to_page(gemini_page)
+                await agent_loop(cua_client, browser,
+                    PROMPT_GEMINI_START_RESEARCH,
+                    "If a 'Start research' button is visible, click it. Otherwise the "
+                    "research plan failed to generate (you may see an error such as "
+                    "'something went wrong') — click the Retry / Regenerate button to "
+                    "re-draft the plan. Do NOT type anything.",
+                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                try:
+                    emit_event("agent_progress", phase=2, agent="gemini", status="generating",
+                               progress=(f"Gemini's plan didn't start — retrying "
+                                         f"({_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})…"))
+                except Exception:
+                    pass
+                # 3. Wait ~2 min for the re-draft, polling for "Start research"
+                #    every ~5s and clicking it the instant it renders.
+                for _i in range(24):   # ~120s
+                    if _controls.is_stop():
+                        break
+                    try:
+                        await browser.switch_to_page(gemini_page)
+                        _sr2 = await gemini_page.evaluate(_click_start_js)
+                    except Exception:
+                        _sr2 = False
+                    if _sr2:
+                        start_clicked = True
+                        log("[2D] CUA recovery: 'Start research' appeared after re-draft — clicked ✓")
+                        await asyncio.sleep(5)
+                        break
+                    await asyncio.sleep(5)
+                if start_clicked:
+                    break
+            if not start_clicked:
+                log(f"[2D] CUA recovery exhausted ({_FALLBACK_MAX_REGEN} attempts) — "
+                    f"plan never produced a clickable 'Start research'", "WARN")
 
         # Verify Gemini is actually researching. #755: on Stop, skip the ~45s
         # DOM-verify retry churn — record not-verified and let the stop-aware
-        # round-robin unwind cleanly.
+        # round-robin unwind cleanly. #776: ALSO skip verify when "Start research"
+        # was never CONFIRMED-clicked — verify_gemini_generating green-lights on a
+        # stop button / running CSS animation and CANNOT distinguish "drafting the
+        # plan" from "running the research", so without a confirmed click it would
+        # falsely stamp a not-yet-started run as researching (+ research_started_at).
+        # No confirmed click ⇒ not running; the round-robin keeps the tab (it does
+        # NOT drop a not-verified agent — see ~19298) and the wall-clock cap
+        # surfaces an honest fail_agent if the plan never starts.
         if _controls.is_stop():
             log("[2D] Stop requested — skipping Gemini verify", "INFO")
+            verified_b = False
+        elif not start_clicked:
+            log("[2D] 'Start research' never confirmed-clicked — not marking Gemini "
+                "as researching (avoids a false 'running' on a stale/failed plan)", "WARN")
             verified_b = False
         else:
             verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2D",
