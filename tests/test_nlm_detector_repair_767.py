@@ -79,11 +79,14 @@ def test_deep_dive_count_in_lockstep_with_new_markup():
 
 def test_post_cleanup_invariant_is_total_count_only():
     # dd_count is unreliable in the new markup (the title no longer says "Deep
-    # Dive"), so the invariant must NOT gate on it — only total_count == 1.
+    # Dive"), so the invariant must NOT gate on it. #778 (2026-06-03) further
+    # relaxed it to total_count >= 1: a duplicate (total > 1) is no longer a
+    # failure (the resilient download picker already targeted the right card),
+    # so the only anomaly left is total_count == 0 (a counter miss).
     p3 = _src(research.run_phase3_audio)
-    assert "_ok = (total_count == 1)" in p3, (
-        "the post-cleanup invariant should be total-count-only (#767) — gating "
-        "on dd_count would WARN on every healthy long run"
+    assert "_ok = (total_count >= 1)" in p3, (
+        "the post-cleanup invariant should be total-count >= 1 (#778) — a "
+        "tolerated duplicate is healthy, only a 0-count counter miss warns"
     )
     assert "dd_count == 1 and total_count == 1" not in p3, (
         "the old dd_count-based invariant is still present"
@@ -97,13 +100,25 @@ def test_active_deleter_is_not_called_in_phase3():
     assert "await _cleanup_nlm_keep_requested_audio(" not in p3, (
         "the auto-delete cleanup is CALLED again — it clicks Delete on cards, "
         "violating the hard NotebookLM no-delete constraint. Duplicate handling "
-        "must be detect-and-fail_phase only."
+        "must be detect-and-surface (now detect-and-download), never delete."
     )
 
 
-def test_dup_guards_fail_phase_never_delete():
-    # The three dup-count guards must surface via fail_phase, not delete.
+def test_dup_count_guards_present_demoted_never_delete():
+    # #778 (2026-06-03): the dup-count DETECTION is kept (telemetry + the
+    # resilient-download trigger) at all three sites, but the fail_phase that
+    # WEDGED the no-audio retry loop on an unclearable, no-delete state is
+    # REMOVED. The guards now log+continue; the resilient picker downloads the
+    # right card. Still NEVER delete.
     p3 = _src(research.run_phase3_audio)
     assert "existing_cards >= 2" in p3 and "post_gen_cards > 1" in p3 and "_live_cards > 1" in p3, (
-        "a dup-count fail_phase guard (pre-flight / post-generate / mid-poll) is missing"
+        "a dup-count detection site (pre-flight / post-generate / mid-poll) is missing"
     )
+    # The user-facing dup fail_phase copy must be gone (it was the wedge).
+    for gone in ("Two audio overviews were created",
+                 "Extra audio in your notebook",
+                 "Old audio in your notebook"):
+        assert gone not in p3, (
+            f"a dup fail_phase ({gone!r}) is still present — #778 demotes the "
+            f"dup-count guards to log+continue so they never wedge the retry loop"
+        )

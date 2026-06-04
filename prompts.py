@@ -706,10 +706,21 @@ _PROMPT_AUDIO_GENERATE_VARIANTS = {
 }
 
 
-def make_prompt_audio_generate(podcast_length: str = "long") -> str:
+def make_prompt_audio_generate(podcast_length: str = "long",
+                               panel_already_open: bool = False) -> str:
     """Build PROMPT_AUDIO_GENERATE with the requested length variant.
     Falls back to "long" for any unknown value so a misconfig can't break
-    audio generation entirely."""
+    audio generation entirely.
+
+    #778 (2026-06-03): `panel_already_open` — set True when the caller has
+    ALREADY DOM-clicked the Audio Overview *Customise* arrow to open the
+    customize panel (the deterministic dup-kill: the arrow, never the card
+    body). The model then skips the open-step (steps 3-4 — the historical
+    card-body misclick vector) and goes straight to confirming the Format
+    selector + setting Format/Length + the terminal Generate. With the default
+    (False) the prompt is BYTE-IDENTICAL to the prior full-CUA flow (the
+    fail-open path when the DOM arrow-click can't find its target), so the
+    #757-A terminal-Generate hardening + its tests are unchanged."""
     v = _PROMPT_AUDIO_GENERATE_VARIANTS.get(podcast_length) or _PROMPT_AUDIO_GENERATE_VARIANTS["long"]
     fmt = v["format"]
     length = v["length"]
@@ -719,7 +730,7 @@ def make_prompt_audio_generate(podcast_length: str = "long") -> str:
         + (f' and LENGTH="{length}"' if podcast_length != "short" else "")
         + ". Anything else is a failure."
     )
-    return SYSTEM_BASE + f"""
+    _body = SYSTEM_BASE + f"""
 
 {header}
 
@@ -755,6 +766,34 @@ Steps (do them in order, do not skip):
 7. STOP — do not click ANYTHING after that Generate click. Not the Audio Overview card, not its title / thumbnail / play area, not a "verify" / "open" / "play" control, not anywhere on a tile, and not any NEW button that appears ON the just-created / generating card (e.g. "Interactive mode", "Join", "Customize", "Share", a play button) — nothing. This OVERRIDES the general "post-action verify" habit: a single click on the card body or any audio tile here fires a SECOND, unwanted DEFAULT audio, and that duplicate cannot be undone (it is a failure). To confirm it started, just READ the screenshot you already have (you may take at most ONE more screenshot — but NEVER a click). The instant a loading / "Generating…" / progress indicator appears for the new audio, respond with ONLY the word: generating — as plain text — and STOP.
 
 If at any point you realize you've clicked the wrong thing and a default/unwanted audio has started generating, say exactly: "abort: misclick — default audio fired" and STOP. Do not try to click "stop" or "delete" — leave the page as-is and report."""
+
+    if panel_already_open:
+        # #778: the caller already DOM-clicked the Customise ARROW, so the
+        # customize panel is open. Neutralize steps 3-4 (the open-step is the
+        # card-body misclick vector) — the model must NOT re-click the card,
+        # its gear, or its arrow (re-clicking closes the panel OR fires NLM's
+        # one-click default = a duplicate). It goes straight to Format/Length +
+        # the terminal Generate. Injected right after the header so the
+        # CRITICAL no-click list + steps 5-7 (terminal Generate) stay intact.
+        _panel_note = (
+            "ALREADY DONE FOR YOU — THE CUSTOMIZE PANEL IS OPEN: We have already "
+            "clicked the Audio Overview *Customise* arrow for you, so the customize "
+            "panel is OPEN. Steps 1-4 below are therefore already satisfied: do NOT "
+            "click the \"Audio Overview\" card body, its title, thumbnail, gear, or "
+            "arrow again — re-clicking it CLOSES the panel or fires NotebookLM's "
+            "one-click DEFAULT audio (an unwanted duplicate). Go STRAIGHT to step 5: "
+            "confirm the Format selector is visible in the open panel, set "
+            "Format/Length, then click Generate ONCE (step 6) and STOP (step 7). "
+            "ONLY if the Format selector is NOT visible (the panel didn't actually "
+            "open) may you look for the Customise gear/arrow — and even then click "
+            "ONLY that control, NEVER the card body."
+        )
+        _body = _body.replace(
+            "CRITICAL — NEVER CLICK THESE",
+            _panel_note + "\n\nCRITICAL — NEVER CLICK THESE",
+            1,
+        )
+    return _body
 
 
 # Backward-compat alias: existing imports of PROMPT_AUDIO_GENERATE keep the
@@ -825,12 +864,22 @@ On the audio overview card only:
 CRITICAL: Say "audio complete" as soon as the audio CARD itself is finished. A spinner on a different card, panel, or banner does NOT count — only the audio card's own state matters."""
 
 
-def make_prompt_audio_download(podcast_length: str = "long") -> str:
+def make_prompt_audio_download(podcast_length: str = "long",
+                               target_ordinal: int | None = None) -> str:
     """Build the audio-download prompt with the right length-specific target
     description so CUA downloads the SAME card the generate step produced
-    (not the hardcoded Long + Deep Dive)."""
+    (not the hardcoded Long + Deep Dive).
+
+    #778 (2026-06-03): `target_ordinal` — when a duplicate slipped past
+    prevention and >1 audio entry is visible, the read-only picker
+    (_pick_nlm_audio_card) resolves WHICH entry (1-based, top-down DOM order)
+    is the user-requested one and passes it here so the download targets that
+    exact card. Duration is NOT in the card text, so the picker uses format +
+    DOM order; this prompt restates the ordinal as the authoritative target.
+    With the default (None — the happy single-card path) the prompt is
+    BYTE-IDENTICAL to the prior version."""
     v = _PROMPT_AUDIO_TARGET_VARIANTS.get(podcast_length) or _PROMPT_AUDIO_TARGET_VARIANTS["long"]
-    return SYSTEM_BASE + f"""
+    _body = SYSTEM_BASE + f"""
 
 Download {v['card_desc']}.
 
@@ -851,6 +900,20 @@ Steps:
 3. Click Download. Say "downloaded" when the download begins.
 
 {v['ambiguity_rule']}"""
+
+    if target_ordinal:
+        _ord_note = (
+            f"MULTIPLE AUDIO ENTRIES EXIST — download ONLY entry #{target_ordinal} "
+            f"counting from the TOP of the Studio panel (1 = the topmost / first "
+            f"audio overview, 2 = the next one down, and so on). Entry "
+            f"#{target_ordinal} is {v['card_desc']}. Do NOT download any other "
+            f"entry. If you cannot tell which row is #{target_ordinal}, fall back "
+            f"to {v['match_hint']}."
+        )
+        # Insert the authoritative ordinal right before the Steps so it overrides
+        # the generic match-by-label guidance above.
+        _body = _body.replace("Steps:", _ord_note + "\n\nSteps:", 1)
+    return _body
 
 
 # Backward-compat aliases — keep the previous "long" behavior for any

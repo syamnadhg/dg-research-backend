@@ -36,10 +36,12 @@ def _phase2_src():
 
 
 def _2d_loop():
-    # Scope to the [2D] plan-wait loop: from its init to the CUA fallback.
+    # Scope to the [2D] plan-wait loop: from its init to the CUA recovery.
+    # (#776/#755 renamed the boundary comment "CUA fallback" → "CUA recovery";
+    # this marker tracks the live comment.)
     src = _phase2_src()
     return src.split("start_clicked = False", 1)[1].split(
-        "# CUA fallback for Start research", 1)[0]
+        '# CUA recovery for "Start research"', 1)[0]
 
 
 def test_regen_is_bounded():
@@ -114,7 +116,7 @@ def test_post_loop_skips_cua_and_verify_on_stop():
     # After the loop, a Stop must skip the CUA Start-research fallback AND the
     # ~45s DOM-verify churn (both would just no-op/fail on a stopped run).
     src = _phase2_src()
-    post = src.split("# CUA fallback for Start research", 1)[1].split(
+    post = src.split('# CUA recovery for "Start research"', 1)[1].split(
         "# ── Verify all launched agents", 1)[0]
     assert "not _controls.is_stop()" in post, (
         "the post-loop CUA Start-research fallback no longer skips on Stop"

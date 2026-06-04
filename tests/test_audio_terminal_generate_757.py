@@ -154,7 +154,9 @@ def test_generate_loop_keeps_max_iterations_15():
     # truncates a valid run → no audio). Guard the decision.
     src = _phase3_src()
     # The generate agent_loop call uses the long-form make_prompt_audio_generate.
-    gen_call = src.split("make_prompt_audio_generate(podcast_length)", 1)[1].split(
+    # #778 added a panel_already_open kwarg to the call, so split on the prefix
+    # (no closing paren) to stay tolerant of extra kwargs.
+    gen_call = src.split("make_prompt_audio_generate(podcast_length", 1)[1].split(
         "stop_narration_ticker", 1)[0]
     assert "max_iterations=15" in gen_call, (
         "the audio-generate agent_loop max_iterations changed from 15 — lowering "

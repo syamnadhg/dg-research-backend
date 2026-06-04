@@ -8407,9 +8407,16 @@ class PipelineControls:
             return True
         return False
 
-    async def interruptible_sleep(self, seconds, check_interval=10):
+    async def interruptible_sleep(self, seconds, check_interval=10, skip_phase=None):
         """Sleep in small increments, checking stop/pause every check_interval seconds.
-        Returns 'stop' if stopped, 'pause' if paused, None if sleep completed normally."""
+        Returns 'stop' if stopped, 'pause' if paused, None if sleep completed normally.
+
+        #778 (2026-06-03): `skip_phase` — when set to a phase number, also returns
+        'skip' as soon as the user issues SKIP_PHASE(N) (the phase lands in
+        self.skipped_phases) during the wait. Default None preserves the prior
+        behavior for every existing caller (no 'skip' return). Used by the P3
+        no-audio auto-retry loop so a Skip click breaks the 5-min wait instead of
+        being ignored until the wait elapses."""
         elapsed = 0
         while elapsed < seconds:
             chunk = min(check_interval, seconds - elapsed)
@@ -8419,6 +8426,12 @@ class PipelineControls:
                 return "stop"
             if self.pause_event.is_set():
                 return "pause"
+            if skip_phase is not None:
+                try:
+                    if int(skip_phase) in self.skipped_phases:
+                        return "skip"
+                except (TypeError, ValueError):
+                    pass
         return None
 
 
@@ -27605,31 +27618,41 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     already_generating = await _check_audio_generating(browser.page)
     log(f"[Phase3] Pre-flight inventory: {existing_cards} audio card(s), generating={already_generating}")
 
+    # #778 (2026-06-03): counter-independent GENERATION POLICY — no fail_phase,
+    # no delete. The NotebookLM notebook is created FRESH for THIS run (Phase 3
+    # step a), so any audio card present here is this run's own (a prior
+    # attempt's) — never a foreign orphan the user must delete. Decision table:
+    #   >= 2 cards   → a duplicate slipped past prevention. Do NOT generate
+    #                  (a 3rd would compound it); reuse-path → poll + download
+    #                  the requested one via the resilient picker.
+    #                  (WAS: fail_phase "Extra audio" → wedged the retry loop on
+    #                   a state the user couldn't clear without deleting.)
+    #   == 1 card    → reuse it (download only, never generate) regardless of
+    #                  prefer_existing_audio. On a per-run notebook the lone
+    #                  card is this run's own. (WAS: fail_phase "Old audio" on
+    #                  the non-retry path.)
+    #   == 0, retry  → a no-audio auto-retry with nothing to reuse. Do NOT
+    #                  regenerate — DOWNLOAD-ONLY retry policy bounds
+    #                  accumulation (each generate would spawn another card).
+    #                  Return so the bounded loop falls back to notebook-only.
+    #   == 0, fresh  → generate once (the else branch below).
+    # The dup-count guards downstream (post-generate / mid-poll) are likewise
+    # demoted to log+continue; the resilient download picker targets the right
+    # card. This is the user's hard rule: never fail on a dup — always download
+    # the right audio — and NEVER delete.
     if existing_cards >= 2:
-        fail_phase(3,
-                   "Extra audio in your notebook",
-                   f"Your NotebookLM notebook already has {existing_cards} audio overviews. Open it, delete the extras, then Retry.",
-                   agent="notebooklm",
-                   can_retry=True)
+        log(f"[Phase3] Pre-flight: {existing_cards} audio cards present — a duplicate "
+            f"exists; NOT generating, will poll + download the requested one via the "
+            f"resilient picker (no-delete)", "WARN")
+        _reuse_existing = True
+    elif existing_cards == 1:
+        log("[Phase3] Pre-flight: 1 audio card already present — reusing it "
+            "(download only, no Generate)")
+        _reuse_existing = True
+    elif prefer_existing_audio:
+        log("[Phase3] Retry with 0 audio cards — NOT regenerating (download-only "
+            "retry policy bounds accumulation); audio unavailable this attempt", "WARN")
         return {"audio_path": None}
-
-    if existing_cards == 1 and not already_generating:
-        if prefer_existing_audio:
-            # Fix B (2026-05-27): on a no-audio auto-retry the single
-            # completed card is THIS run's own audio — a prior attempt
-            # generated it but the download drifted/failed. It is NOT a
-            # foreign orphan, so reuse it: skip Generate and go straight to
-            # the (Fix-A re-anchored) download. Re-running the full generate
-            # path here would re-trip this very guard and never download.
-            log("[Phase3] Retry: 1 existing audio card is THIS run's — reusing it (skip Generate, download only)")
-            _reuse_existing = True
-        else:
-            fail_phase(3,
-                       "Old audio in your notebook",
-                       "Your NotebookLM notebook already has an audio overview. Open it, delete that entry, then Retry.",
-                       agent="notebooklm",
-                       can_retry=True)
-            return {"audio_path": None}
 
     if _reuse_existing:
         # Do NOT click Generate. The poll loop's first DOM check
@@ -27653,8 +27676,39 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             f"Configuring audio overview ({_human_desc}) and clicking Generate",
             interval=20)
         try:
-            _prompt = make_prompt_audio_generate(podcast_length)
+            # #778 PREVENTION (the deterministic dup-kill): DOM-click the
+            # Customise ARROW to open the customize panel WITHOUT ever clicking
+            # the card body. The card BODY fires NotebookLM's one-click DEFAULT
+            # audio = the duplicate; the CUA agent, hunting for the
+            # open-affordance, was the one occasionally hitting the body. With
+            # the arrow DOM-clicked first, CUA starts from an already-open panel
+            # (panel_already_open=True) and only touches Format/Length + the
+            # terminal Generate — far from the body. Fail-open: if the arrow
+            # can't be found, panel_already_open=False runs the unchanged full
+            # CUA flow (its #757-A body-misclick guardrails hold). All calls
+            # here are exception-safe, but keeping them inside the try means the
+            # narration ticker's finally always stops it.
+            _panel_opened = await _open_nlm_audio_customize(browser.page)
+            if _panel_opened:
+                log("[Phase3] Customize panel opened via DOM arrow-click ✓ (no card-body click)")
+                await asyncio.sleep(1.5)  # let the panel render before CUA looks
+                # One-time-per-process READ-ONLY canary: dump the OPEN customize
+                # panel so the next E2E can pin the (un-supplied) Generate +
+                # length controls AND confirm the arrow opened the right panel.
+                # Gated so a healthy run logs it at most once per worker process.
+                if "customize-open" not in _NLM_CANARY_STATE:
+                    _NLM_CANARY_STATE.add("customize-open")
+                    await _dump_nlm_audio_dom(browser.page, "customize-open")
+            else:
+                log("[Phase3] DOM arrow-click didn't find the Customise control — "
+                    "CUA will open customize itself (fail-open)", "WARN")
+            _prompt = make_prompt_audio_generate(podcast_length,
+                                                 panel_already_open=_panel_opened)
             _task_str = (
+                f"The Audio Overview customize panel is already OPEN. Set "
+                f"{_human_desc} in that panel, then click Generate ONCE. Say "
+                f"'generating' when started. Do NOT click the audio card body."
+            ) if _panel_opened else (
                 f"Generate ONE audio overview. Select all sources, set "
                 f"{_human_desc}, click Generate ONCE. Say 'generating' when started."
             )
@@ -27686,26 +27740,25 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # dual-audio panel for the full audio window.
         _ag_text = (_ag_result.get("text") or "").lower() if isinstance(_ag_result, dict) else ""
         if "abort:" in _ag_text:
-            # Race vs. pre-flight: the inventory at :19454 saw 0 cards, but
-            # CUA arrived and saw an entry already present. Most likely a
-            # left-over from a prior run that the pre-flight missed due to
-            # panel-render lag — surface a distinct message so the user
-            # knows to clean up the panel.
-            if "audio already present" in _ag_text:
-                fail_phase(
-                    3,
-                    "Audio already in your notebook",
-                    "Your NotebookLM notebook already has an audio overview. "
-                    "Open it, delete it, then Retry.",
-                    agent="notebooklm",
-                    can_retry=True,
-                )
+            _reason_phrase = _ag_text.split("abort:", 1)[1].split("\n", 1)[0].strip()[:160]
+            # #778 (2026-06-03): dup-related aborts no longer fail_phase. Both
+            # "audio already present" (a card rendered between the pre-flight
+            # count=0 and CUA's own count — panel-render lag) and "misclick —
+            # default audio fired" mean an audio card EXISTS. Per the hard
+            # no-delete + never-fail-on-dup policy, fall through to the poll loop
+            # — the resilient download picker resolves the requested card. Only
+            # GENUINE setup failures (no customize affordance / panel never
+            # opened → generation didn't start, so polling can't succeed) still
+            # surface a Retry.
+            if ("audio already present" in _ag_text
+                    or "misclick" in _ag_text
+                    or "default audio" in _ag_text):
+                log(f"[Phase3] CUA abort '{_reason_phrase}' indicates an audio card "
+                    f"exists — proceeding to poll + download it (no-delete, no-fail)", "WARN")
             else:
-                # Other abort phrases: no_customize_affordance,
-                # customize_did_not_open, misclick_default_fired. Log the
-                # verbatim phrase (the card stays plain) so the cause is
-                # obvious in backend.log.
-                _reason_phrase = _ag_text.split("abort:", 1)[1].split("\n", 1)[0].strip()[:160]
+                # no_customize_affordance / customize_did_not_open: generation
+                # never started. Log the verbatim phrase (the card stays plain)
+                # and surface a Retry.
                 log(f"[Phase3] Audio generation aborted by CUA: {_reason_phrase}", "ERROR")
                 fail_phase(
                     3,
@@ -27716,7 +27769,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                     agent="notebooklm",
                     can_retry=True,
                 )
-            return {"audio_path": None}
+                return {"audio_path": None}
 
     # Verify it started. Fix B (2026-05-27): on the reuse path the card is
     # ALREADY complete, so "verify generation started" is both meaningless
@@ -27761,23 +27814,16 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # counter selectors missed a live (in-flight) card. Dump it (read-only).
         await _dump_nlm_audio_dom(browser.page, "post-generate")
     if post_gen_cards > 1:
-        # 2026-05-14: length-aware cleanup instruction. The misclick-fired
-        # auto-default is NLM's current default settings, which depends
-        # on the user's last customize — so we can't promise which one it
-        # is. We CAN promise which one the user wanted (from podcast_length)
-        # and tell the user to keep that one.
-        _kept = {
-            "short": "Brief (~3–5 min, not Deep Dive)",
-            "default": "Deep Dive · Default (~10–15 min)",
-            "long": "Deep Dive · Long (~20–30 min)",
-        }.get(podcast_length, "Deep Dive · Long (~20–30 min)")
-        fail_phase(3,
-                   "Two audio overviews were created",
-                   f"NotebookLM made an extra audio by mistake. Open the notebook, "
-                   f"keep the '{_kept}' one, delete the other, then Retry.",
-                   agent="notebooklm",
-                   can_retry=True)
-        return {"audio_path": None}
+        # #778 (2026-06-03): a duplicate slipped past prevention (the DOM
+        # arrow-click). Per the hard NO-DELETE constraint we do not delete — and
+        # we no longer fail_phase here. The old fail_phase wedged the no-audio
+        # retry loop on a state the user couldn't clear without deleting (and
+        # Skip was ignored), which is exactly the bug being fixed. LOG and
+        # CONTINUE: the resilient download picker (_pick_nlm_audio_card) targets
+        # the user-requested card by format + DOM order at download time.
+        log(f"[Phase3] Post-generate: {post_gen_cards} audio cards (duplicate) — "
+            f"continuing; resilient download will target the requested one "
+            f"(no-delete, no-fail)", "WARN")
 
     # Minimum 2 minute wait — audio generation typically starts within 1-2 min;
     # waiting 5 min was burning slack for no reason. First poll at 2 min is
@@ -27801,6 +27847,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # is the sole audio ceiling.
     log("Polling for audio completion (every 3 min with refresh; outer soft-warn handles ceiling)...")
     poll_start = time.time()
+    _dup_logged = False  # #778: surface the mid-poll duplicate at most once per run
 
     while True:
         # ── Stop/Pause check per cycle ──
@@ -27859,23 +27906,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # check on the first poll when the card is still pending.
         if (time.time() - poll_start) >= 180:
             _live_cards = await _count_nlm_audio_cards(browser.page)
-            if _live_cards > 1:
-                log(f"[Phase3] Mid-poll duplicate detected: {_live_cards} audio card(s) visible — failing phase so user can clean up", "ERROR")
-                # 2026-05-14: length-aware operator instruction.
-                _kept = {
-                    "short": "Brief (~3–5 min, not Deep Dive)",
-                    "default": "Deep Dive · Default (~10–15 min)",
-                    "long": "Deep Dive · Long (~20–30 min)",
-                }.get(podcast_length, "Deep Dive · Long (~20–30 min)")
-                fail_phase(
-                    3,
-                    "Two audio overviews were created",
-                    f"NotebookLM made an extra audio by mistake. Open the notebook, "
-                    f"keep the '{_kept}' one, delete the other, then Retry.",
-                    agent="notebooklm",
-                    can_retry=True,
-                )
-                return {"audio_path": None}
+            if _live_cards > 1 and not _dup_logged:
+                # #778 (2026-06-03): a duplicate is visible mid-poll. NO-DELETE
+                # + never-fail-on-dup: do NOT fail_phase (the old behavior wedged
+                # the no-audio retry loop on an unclearable state and Skip was
+                # ignored). Log ONCE and keep polling — the resilient download
+                # picker (_pick_nlm_audio_card) targets the requested card by
+                # format + DOM order. Logged once so a long audio window doesn't
+                # repeat the same WARN every poll cycle.
+                _dup_logged = True
+                log(f"[Phase3] Mid-poll: {_live_cards} audio cards (duplicate) — "
+                    f"continuing; resilient download will target the requested one "
+                    f"(no-delete, no-fail)", "WARN")
 
         # DOM-first: read the audio card directly. Avoids CUA's
         # page-wide-chrome confusion where unrelated NLM panel
@@ -27960,6 +28002,28 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             except Exception as _ra_e:
                 log(f"[Phase3] Download re-anchor navigate failed: {_ra_e}", "WARN")
 
+        # #778 (2026-06-03): resilient download target selection. After the
+        # Fix-A re-anchor, READ (never click) which audio card is the
+        # user-requested one. On the happy single-card path the ordinal is
+        # omitted → the download prompt is byte-identical to before. When a
+        # duplicate slipped past prevention the picker resolves the target by
+        # format + DOM order (duration is absent from the card) and the prompt
+        # is told to download ONLY that entry — so a dup never blocks delivery.
+        _pick = await _pick_nlm_audio_card(browser.page, podcast_length)
+        _target_ord = _pick.get("target_ordinal") if _pick.get("count", 0) > 1 else None
+        log(f"[Phase3] Download target: ordinal={_pick.get('target_ordinal')}/"
+            f"{_pick.get('count')} (ambiguous={_pick.get('ambiguous')}, "
+            f"{_pick.get('reason', '')})"
+            + ("" if _target_ord else " — single card, default download"))
+        # Cross-check guard: audio_done=True should mean a card is complete, but
+        # the CUA-visual completion path can break the poll loop while cards are
+        # still in-flight. If the picker found cards yet none is complete, WARN —
+        # the download is best-effort; an empty grab routes to the bounded
+        # no-audio retry loop (which is now Skip-aware). Never blocks delivery.
+        if _pick.get("count", 0) > 0 and not _pick.get("complete", True):
+            log(f"[Phase3] Download picker found no COMPLETE card "
+                f"({_pick.get('count')} in-flight) — best-effort download, may recover via retry", "WARN")
+
         # Use Playwright download event to capture the file reliably
         download_future = asyncio.get_event_loop().create_future()
 
@@ -27992,7 +28056,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # / Long Deep Dive), not the hardcoded Long + Deep Dive that
             # would either not exist (short) or pick the wrong card if a
             # parallel Deep Dive misclick existed (default).
-            _dl_result = await agent_loop(cua_client, browser, make_prompt_audio_download(podcast_length),
+            _dl_result = await agent_loop(cua_client, browser,
+                make_prompt_audio_download(podcast_length, target_ordinal=_target_ord),
                 "Download the audio file.", model=CUA_MODEL, max_iterations=8, verbose=verbose)
             # Fix A (2026-05-27): the download agent_loop return was previously
             # ignored, so the new "abort: not on notebook" guard would be
@@ -28058,30 +28123,27 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # (NotebookLM is detect-and-fail_phase only, never delete a card). It was
         # a silent no-op anyway (its own broken selectors matched nothing); and
         # now that the dup-count guards actually work, a duplicate is caught and
-        # surfaced upstream (pre-flight / post-generate / mid-poll fail_phase)
-        # BEFORE we reach here — so there is exactly one audio to keep and
-        # nothing to remove. This block is now a READ-ONLY invariant check.
+        # surfaced upstream (pre-flight / post-generate / mid-poll) BEFORE we
+        # reach here. This block is now a READ-ONLY invariant check.
         try:
             await asyncio.sleep(2)  # let the panel settle after the download
             dd_count = await _count_nlm_deep_dive_cards(browser.page)
             total_count = await _count_nlm_audio_cards(browser.page)
             log(f"[Phase3] Post-cleanup inventory ({podcast_length}): {dd_count} Deep Dive / {total_count} total audio card(s)")
             if total_count == 0:
-                # #757-B capture: audio is done + downloaded, so a single complete
-                # card must exist — 0 means the counter missed it. Dump (read-only).
+                # #757-B capture: audio is done + downloaded, so a complete card
+                # must exist — 0 means the counter missed it. Dump (read-only).
                 await _dump_nlm_audio_dom(browser.page, "post-cleanup")
-            # Invariant (#767, 2026-06-03): demoted to TOTAL-count-only. The new
-            # NLM markup no longer surfaces a "Deep Dive" label in the artifact
-            # title, so dd_count is unreliable (telemetry only) — gating on it
-            # would WARN on every healthy long run. The real failure mode is a
-            # DUPLICATE (total > 1), which the pre-flight / post-generate /
-            # mid-poll fail_phase guards already catch upstream (we only reach
-            # here on a single completed+downloaded audio). Format + length are
-            # enforced upstream by make_prompt_audio_generate. Expect exactly one
-            # audio card for every length; a miss (0) or stray extra (>1) is a
-            # WARN — non-blocking, since the audio is already on disk and the
-            # share-link extract uses a notebook-level API independent of count.
-            _ok = (total_count == 1)
+            # Invariant (#767 → relaxed #778, 2026-06-03): TOTAL-count, and now
+            # >= 1 (was == 1). The new NLM markup no longer surfaces a "Deep
+            # Dive" label, so dd_count is telemetry-only. Under #778 a DUPLICATE
+            # (total > 1) is NO LONGER a failure: the dup-count guards are
+            # demoted to log+continue and the resilient download picker already
+            # targeted the requested card — the right audio is on disk. So the
+            # only anomaly worth a WARN here is total_count == 0 (the counter
+            # missed a card that must exist), which the read-only dump above
+            # captures. >= 1 (including a tolerated dup) is healthy.
+            _ok = (total_count >= 1)
             if not _ok:
                 log(f"[Phase3] Post-cleanup invariant warning ({podcast_length}): {dd_count} Deep Dive + {total_count} total — proceeding with share-link extract anyway since audio is already on disk", "WARN")
         except Exception as _ie:
@@ -28500,6 +28562,168 @@ async def _count_nlm_deep_dive_cards(page) -> int:
         }""") or 0
     except Exception:
         return 0
+
+
+# #778 (2026-06-03): one-time-per-process canary gate. The customize-open DOM
+# dump fires on the FIRST fresh-run Generate after a worker (re)start to confirm
+# the arrow-click actually opened the panel + capture the (un-pinned) length /
+# Generate controls — without spamming a WARN on every healthy run.
+_NLM_CANARY_STATE: set = set()
+
+
+async def _open_nlm_audio_customize(page) -> bool:
+    """#778 PREVENTION (the deterministic dup-kill): DOM-click the Audio
+    Overview *Customise* ARROW to open the customize panel WITHOUT ever clicking
+    the card body. Clicking the card BODY fires NotebookLM's one-click DEFAULT
+    audio = the unwanted duplicate (the confirmed dup source — the CUA agent,
+    hunting for the open-affordance, would sometimes hit the body instead of the
+    arrow). The arrow is a SEPARATE control, pinned from the user's console dump
+    (2026-06-03): `button[aria-label="Customise Audio Overview"]` (British
+    spelling; also bears data-edit-button-type="1" + class "edit", nested in
+    `basic-create-artifact-button > div[aria-label="Audio Overview"]`).
+
+    Defensive selector chain (most→least specific), spelling/locale-tolerant.
+    Clicks the FIRST visible match. Returns True if a click landed (the caller
+    still lets the CUA prompt confirm the panel actually opened — its step 5
+    re-finds the gear if not), False if no arrow was found (caller falls open to
+    the full CUA flow, whose own #757-A guardrails forbid the card body).
+
+    READ-ONLY except for the single arrow .click(): never touches the card body,
+    never opens a menu, never deletes.
+    """
+    try:
+        return await page.evaluate(r"""() => {
+            const isVis = (el) => el && el.offsetParent !== null;
+            const sels = [
+                'button[aria-label="Customise Audio Overview"]',
+                'button[aria-label="Customize Audio Overview"]',
+                'basic-create-artifact-button button[data-edit-button-type="1"]',
+                'basic-create-artifact-button button.edit',
+            ];
+            for (const s of sels) {
+                const el = document.querySelector(s);
+                if (isVis(el)) { el.click(); return true; }
+            }
+            // Spelling/locale-tolerant fallback: a BUTTON (never the card body)
+            // whose aria-label names a custom* audio control. Covers
+            // "Customise"/"Customize" and minor future label tweaks.
+            const btns = document.querySelectorAll(
+                'basic-create-artifact-button button[aria-label], button[aria-label]');
+            for (const b of btns) {
+                if (!isVis(b)) continue;
+                const lab = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (lab.indexOf('ustom') !== -1 && lab.indexOf('udio') !== -1) {
+                    b.click(); return true;
+                }
+            }
+            return false;
+        }""") or False
+    except Exception:
+        return False
+
+
+async def _pick_nlm_audio_card(page, podcast_length: str = "long") -> dict:
+    """#778 RESILIENT DOWNLOAD (the guaranteed net): READ-ONLY picker that
+    chooses WHICH audio card to download when more than one is visible (a
+    duplicate slipped past prevention). NEVER clicks, NEVER opens a menu, NEVER
+    deletes (the hard no-delete constraint). Scopes to the SAME population as
+    _count_nlm_audio_cards — visible <artifact-library-item> carrying the
+    "audio_magic_eraser" Material-icon ligature.
+
+    Duration is NOT in the card text (confirmed user dump 2026-06-03: a completed
+    card reads "audio_magic_eraser <Title> Deep dive · N sources · <ago> ..." —
+    no MM:SS / "N min" token), so the pick uses FORMAT (Brief vs Deep dive, which
+    IS in the text) + DOM order:
+      - short        → the first BRIEF card (text lacks "deep dive"); falls back
+                       to the first complete card if no Brief label is present.
+      - long/default → the LAST complete Deep-dive card. The misclick default
+                       fires FIRST (so completes first) → the user-requested
+                       length is typically the LATER card. Best-effort;
+                       ambiguous=True whenever >1 Deep-dive card exists (they are
+                       indistinguishable by text).
+
+    Returns {count, target_ordinal (1-based, top-down DOM order), complete,
+    ambiguous, reason, snippet}. Best-effort and exception-safe: on any
+    uncertainty it STILL returns a usable ordinal (never raises, never blocks the
+    download) — Part A prevention is the real guarantee; this is the safety net.
+    """
+    try:
+        info = await page.evaluate(r"""() => {
+            const items = Array.from(document.querySelectorAll('artifact-library-item'))
+                .filter((el) => el.offsetParent !== null
+                    && ((el.innerText || el.textContent || '').includes('audio_magic_eraser')));
+            const cards = items.map((el, i) => {
+                const t = (el.innerText || el.textContent || '');
+                const low = t.toLowerCase();
+                return {
+                    ordinal: i + 1,                                   // 1-based DOM order
+                    isDeepDive: low.indexOf('deep dive') !== -1,
+                    isBrief: low.indexOf('brief') !== -1,
+                    // in-flight cards still show the "Generating Audio Overview…"
+                    // text; a completed card does not.
+                    generating: /generating audio overview/i.test(t),
+                    snippet: t.replace(/\s+/g, ' ').trim().slice(0, 80),
+                };
+            });
+            return { count: cards.length, cards };
+        }""")
+    except Exception as _e:
+        return {"count": 0, "target_ordinal": 1, "complete": False,
+                "ambiguous": False, "reason": f"evaluate_failed:{type(_e).__name__}",
+                "snippet": ""}
+
+    info = info or {}
+    cards = info.get("cards") or []
+    count = info.get("count", len(cards))
+    if not cards:
+        return {"count": 0, "target_ordinal": 1, "complete": False,
+                "ambiguous": False, "reason": "no_cards", "snippet": ""}
+
+    # #778 cross-check hardening: select ONLY from COMPLETE cards whenever any
+    # complete card exists, so the picker can NEVER target an in-flight card —
+    # even if a future NLM markup change starts rendering generating cards as
+    # artifact-library-items (today they render as a separate "Generating Audio
+    # Overview…" placeholder with no item, so this is belt-and-suspenders). Only
+    # when NOTHING is complete (a CUA-visual false-complete broke the poll loop
+    # early) do we fall back to all cards, flagged complete=False so the caller
+    # can WARN — the download will then best-effort and, if it grabs nothing,
+    # the bounded no-audio retry loop recovers.
+    complete_cards = [c for c in cards if not c.get("generating")]
+    cpool = complete_cards or cards
+    _all_generating = not complete_cards
+    length = (podcast_length or "long").lower()
+
+    if length == "short":
+        # Prefer an explicit "Brief" card; else any non-Deep-Dive card (the
+        # Brief can render before its label); else the first card. The requested
+        # short audio is Brief and the misclick default is Deep Dive, so
+        # excluding Deep Dive isolates the Brief.
+        explicit_brief = [c for c in cpool if c.get("isBrief")]
+        non_dd = [c for c in cpool if not c.get("isDeepDive")]
+        cand = explicit_brief or non_dd or cpool
+        target = cand[0]
+        reason = ("short→explicit Brief card" if explicit_brief
+                  else "short→first non-deep-dive card" if non_dd
+                  else "short→first card (no Brief label found)")
+    else:
+        # long/default → the LAST complete Deep-dive card. The dominant residual
+        # dup vector (a fail-open CUA body-misclick during the OPEN step) fires
+        # the default FIRST, so the user-requested card completes LATER → last.
+        # Best-effort + ambiguous when >1 (text can't distinguish two Deep
+        # Dives); worst case streams a valid complete Deep-dive podcast.
+        deep = [c for c in cpool if c.get("isDeepDive")]
+        cand = deep or cpool
+        target = cand[-1]
+        reason = f"{length}→last deep-dive card"
+
+    return {
+        "count": count,
+        "target_ordinal": target["ordinal"],
+        "complete": not target.get("generating", False),
+        "ambiguous": bool(len(cand) > 1 or count > 1),
+        "reason": (reason + " [all-generating: no complete card yet]") if _all_generating else reason,
+        "snippet": target.get("snippet", ""),
+    }
 
 
 async def _cleanup_nlm_keep_requested_audio(page, podcast_length: str = "long") -> dict:
@@ -32065,6 +32289,19 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 if _controls.is_stop():
                     log("Phase 3: stop requested during no-audio handling — aborting", "INFO")
                     return
+                # #778 SKIP FIX: honor a user SKIP_PHASE(3) issued DURING this
+                # no-audio retry loop. Pre-fix the loop only checked is_stop +
+                # _p3_audio_user_skipped, so a Skip click — which adds 3 (and,
+                # via the skip_phase handler's cascade, 4) to skipped_phases —
+                # was IGNORED and the loop kept auto-retrying for the full bound
+                # (the user's "skip didn't work"). Treat it as a clean skip:
+                # notebook-link-only + cascade P4 off.
+                if 3 in _controls.skipped_phases:
+                    log("Phase 3: user skipped during no-audio handling — continuing with notebook link only", "INFO")
+                    emit_event("phase_skipped", phase=3, reason="user_skip_during_audio_auto_retry")
+                    _p3_audio_user_skipped = True
+                    _controls.skipped_phases.add(4)
+                    break
                 if _audio_auto_retries >= _AUDIO_MAX_AUTO_RETRIES:
                     # Exhausted auto-retries → graceful, non-blocking fallback:
                     # continue with notebook-link-only. P5 still delivers the
@@ -32095,12 +32332,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 emit_event("agent_progress", phase=3, agent="notebooklm", status="downloading",
                            progress=f"Audio not captured yet — retrying ({_audio_auto_retries}/{_AUDIO_MAX_AUTO_RETRIES}) in {_wait_min} min…")
 
-                # 5-min interval wait — interruptible so Stop/Pause are honored
-                # (the wait must never become an unbounded human hang).
-                _interrupt = await _controls.interruptible_sleep(_AUDIO_RETRY_INTERVAL_SEC, check_interval=10)
+                # 5-min interval wait — interruptible so Stop/Pause/Skip are
+                # honored (the wait must never become an unbounded human hang).
+                # #778: skip_phase=3 so a Skip click breaks the wait immediately
+                # instead of being ignored until the full 5 min elapses.
+                _interrupt = await _controls.interruptible_sleep(
+                    _AUDIO_RETRY_INTERVAL_SEC, check_interval=10, skip_phase=3)
                 if _interrupt == "stop":
                     log("Phase 3: stop during no-audio retry wait — aborting", "INFO")
                     return
+                if _interrupt == "skip":
+                    # #778 SKIP FIX: a Skip click landed mid-wait — break the
+                    # 5-min sleep now → notebook-link-only + cascade P4 off.
+                    log("Phase 3: user skipped during no-audio retry wait — continuing with notebook link only", "INFO")
+                    emit_event("phase_skipped", phase=3, reason="user_skip_during_audio_auto_retry")
+                    _p3_audio_user_skipped = True
+                    _controls.skipped_phases.add(4)
+                    break
                 if _interrupt == "pause":
                     emit_event("pipeline_paused", phase=3)
                     await _controls.wait_if_paused()

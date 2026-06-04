@@ -118,9 +118,13 @@ def test_dumps_are_gated_on_the_anomalous_zero_path():
 
 def test_preflight_baseline_never_dumps():
     # Pre-flight runs on an empty notebook where 0 is CORRECT — dumping there
-    # would fire on every healthy run. The dump must live only AFTER generate.
+    # would fire on every healthy run. The pre-flight COUNT/decision block (from
+    # the inventory log up to the generate dispatch `if _reuse_existing:`) must
+    # never dump. (#778 added a deliberate read-only `customize-open` canary in
+    # the GENERATE branch, after the dispatch + behind a once-per-process gate —
+    # that is NOT the pre-flight baseline, so the boundary ends at the dispatch.)
     src = _p3_src()
-    preflight = src.split("Pre-flight inventory", 1)[1].split("Post-generate inventory", 1)[0]
+    preflight = src.split("Pre-flight inventory", 1)[1].split("if _reuse_existing:", 1)[0]
     assert "_dump_nlm_audio_dom(" not in preflight, (
         "a DOM dump was added to the pre-flight baseline — it would spam every "
         "healthy run (0 cards is the normal empty-notebook state there)"
