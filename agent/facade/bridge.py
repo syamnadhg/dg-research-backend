@@ -1,0 +1,833 @@
+"""The Super Agent host bridge — a loopback HTTP server.
+
+It is the always-up local process that OWNS the account session: it is the ONLY
+process that ever refreshes the token or touches Firestore, so the single-owner
+invariant holds and an out-of-band CLI refresh can never strand it. The host
+CLI and the chat skill both call it over HTTP — they never refresh themselves.
+
+  * serves the Google sign-in page and captures the account session (`/login`),
+  * holds the live ``AccountSession`` in memory and refreshes it,
+  * exposes the account operations: /status /researches /devices /research.
+
+Bound to 127.0.0.1 only; every request is Host- and (for writes) Origin-checked.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import secrets
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
+
+from . import __version__, config, devicelogin, prefs, runview
+from .devicelogin import DeviceLoginError
+from .firestore_rest import FirestoreError, FirestoreRest
+from .session import AccountSession, CustomTokenError, RevokedError
+
+log = logging.getLogger(__name__)
+
+_WEB_DIR = Path(__file__).parent / "web"
+
+_ICON_FILES = frozenset({"chatgpt.png", "claude.png", "notebooklm.png"})
+
+_DEFAULT_AGENTS = ["chatgpt", "gemini", "claude"]
+
+# Upper bound on how long the bridge will keep a remote-login flow alive, no
+# matter what TTL the broker reports (defense against an unbounded expiresIn).
+_REMOTE_MAX_TTL_SECONDS = 900
+
+# A run id must be a single Firestore document-id segment. Validated at the URL
+# boundary so a crafted rid (../, %2f, embedded /) can never be interpolated into
+# a Firestore path and steer a request out of the caller's own tree. Admits our
+# agent-<hex> ids and Firestore push ids ([A-Za-z0-9_-]).
+_RID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# These JSON bodies are tiny (topic / deviceId / a token). Cap how much we'll
+# buffer so a lying/oversized Content-Length can't pin a worker thread reading
+# into memory before the Host/Origin checks even run.
+_MAX_BODY_BYTES = 1 << 20  # 1 MiB
+
+
+def _new_research_fields(
+    topic: str, device_id: str, uid: str, cfg: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The research (chat) doc a fresh agent run creates.
+
+    Mirrors enough of the web app's fresh-chat shape (research-app/web
+    saveResearch / usePipeline) that it renders as a normal chat immediately —
+    phase 0, the platform list, empty doc/audio arrays — rather than a sparse
+    placeholder. The BE backfills the rest as the pipeline runs.
+    """
+    now_ms = int(time.time() * 1000)
+    agents = cfg.get("agents") if isinstance(cfg, dict) else None
+    if isinstance(agents, dict):
+        platforms = [a for a in _DEFAULT_AGENTS if agents.get(a, True)]
+    else:
+        platforms = list(_DEFAULT_AGENTS)
+    fields: dict[str, Any] = {
+        "topic": topic,
+        "title": topic,
+        "summary": "",
+        "status": "queued",
+        "phase": 0,
+        "deviceId": device_id,
+        "submittedBy": uid,
+        "viaAgent": True,
+        "platforms": platforms,
+        "documents": [],
+        "audios": [],
+        "createdAt": now_ms,
+        "updatedAt": now_ms,
+    }
+    if cfg:
+        fields["pipelineConfig"] = cfg
+    return fields
+
+
+class RemoteFlow:
+    """A pending remote-login (device-flow) attempt, §11a.
+
+    Holds the broker handle (``poll_token`` — kept server-side, never returned
+    to the chat client) plus the user-facing ``code``/``verify_url`` and a
+    coarse lifecycle ``state``: pending → connected | expired | error.
+    """
+
+    def __init__(self, poll_token: str, code: str, verify_url: str, expires_at: float) -> None:
+        self.poll_token = poll_token
+        self.code = code
+        self.verify_url = verify_url
+        self.expires_at = expires_at  # epoch seconds
+        self.state = "pending"
+        self.error = ""
+
+
+class BridgeState:
+    """Shared, thread-safe bridge state."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._session: AccountSession | None = AccountSession.load()
+        # CSRF nonce embedded in the sign-in page and required back on the
+        # callback. The LOAD-BEARING anti-session-fixation control is the Origin
+        # allow-list (_origin_ok) + the Host allow-list (_host_ok); this nonce
+        # is a secondary guard (a normal cross-origin page can't read it because
+        # /login/config carries no CORS headers). It is rotated after every
+        # successful capture so a leaked value can't be replayed.
+        self.login_token: str = secrets.token_urlsafe(32)
+        # Pending remote-login flow + a dedicated lock so a poll's network call
+        # serializes polls (no double-redeem of the one-shot custom token)
+        # without blocking /status or other reads.
+        self._remote: RemoteFlow | None = None
+        self.remote_lock = threading.Lock()
+
+    @property
+    def session(self) -> AccountSession | None:
+        with self._lock:
+            return self._session
+
+    def set_session(self, sess: AccountSession | None) -> None:
+        with self._lock:
+            self._session = sess
+
+    def rotate_login_token(self) -> None:
+        with self._lock:
+            self.login_token = secrets.token_urlsafe(32)
+
+    @property
+    def remote(self) -> RemoteFlow | None:
+        with self._lock:
+            return self._remote
+
+    def set_remote(self, flow: RemoteFlow | None) -> None:
+        with self._lock:
+            self._remote = flow
+
+
+def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = f"SuperAgentBridge/{__version__}"
+
+        # ── helpers ──
+        def _json(self, code: int, body: Any) -> None:
+            data = json.dumps(body).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _text(self, code: int, body: str, ctype: str = "text/plain") -> None:
+            data = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _read_json(self) -> dict[str, Any]:
+            # Parse the body already drained at do_POST entry (see do_POST).
+            raw = getattr(self, "_body", b"")
+            if not raw:
+                return {}
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+            return data if isinstance(data, dict) else {}
+
+        def log_message(self, fmt: str, *args: Any) -> None:  # quieter logging
+            log.debug("bridge %s - %s", self.address_string(), fmt % args)
+
+        def _allowed_authorities(self) -> tuple[str, str]:
+            port = self.server.server_address[1]
+            return (f"localhost:{port}", f"127.0.0.1:{port}")
+
+        def _host_ok(self) -> bool:
+            """Reject any request whose Host isn't our loopback authority.
+
+            Closes DNS-rebinding: a rebound hostname (evil.com -> 127.0.0.1)
+            would carry Host: evil.com:port and is refused on EVERY route, so a
+            rebind page can't even read /login/config or /status.
+            """
+            return self.headers.get("Host", "") in self._allowed_authorities()
+
+        def _origin_ok(self) -> bool:
+            """Reject cross-origin browser writes. Absent Origin (host CLI) is OK.
+
+            Derived from the ACTUAL bound port so our own sign-in page (same
+            port) is accepted while a cross-origin attacker is rejected.
+            """
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True
+            return origin in tuple(f"http://{a}" for a in self._allowed_authorities())
+
+        def _account(self) -> tuple[AccountSession, FirestoreRest] | None:
+            """Return (session, firestore-client) or send 401 and return None."""
+            sess = state.session
+            if sess is None:
+                self._json(401, {"error": "not signed in — run /login"})
+                return None
+            return sess, FirestoreRest(sess.id_token)
+
+        def _firestore_502(self, e: FirestoreError) -> None:
+            """Upstream Firestore failure → log the detail, hand the client a
+            fixed message (never echo the resolved path / upstream body back)."""
+            log.warning("firestore error: %s", e)
+            self._json(502, {"error": "could not reach the research store — try again"})
+
+        # ── routes ──
+        def do_GET(self) -> None:  # noqa: N802 - http.server API
+            if not self._host_ok():
+                self._json(403, {"error": "bad host"})
+                return
+            path = self.path.split("?", 1)[0]
+            if path == "/healthz":
+                self._json(200, {"ok": True, "version": __version__,
+                                 "authed": state.session is not None})
+            elif path == "/login":
+                html = (_WEB_DIR / "login.html").read_text(encoding="utf-8")
+                self._text(200, html, "text/html; charset=utf-8")
+            elif path == "/login/config":
+                cfg = config.web_config()
+                cfg["loginToken"] = state.login_token
+                self._json(200, cfg)
+            elif path == "/status":
+                self._status()
+            elif path == "/researches":
+                self._researches()
+            elif path == "/devices":
+                self._devices()
+            elif path == "/device":
+                self._device_current()
+            elif path == "/updates":
+                self._updates()
+            elif path.startswith("/research/"):
+                self._research_status(path[len("/research/"):])
+            elif path.startswith("/icons/"):
+                self._icon(path)
+            else:
+                self._json(404, {"error": "not found"})
+
+        def do_POST(self) -> None:  # noqa: N802 - http.server API
+            # Drain the request body up-front, BEFORE any early return — an
+            # undrained body when the connection closes triggers a TCP RST that
+            # the client sees as ConnectionAborted (Windows WinError 10053). Some
+            # routes (cancel/logout/poll) take no body; clients (sr.py) may still
+            # send "{}". Handlers parse this via _read_json (reads self._body).
+            try:
+                clen = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                clen = 0
+            if clen > _MAX_BODY_BYTES:
+                # Drain-and-discard in bounded chunks (no multi-MB buffer; a lying
+                # length can't pin a worker on a huge in-memory read) then refuse —
+                # draining keeps the 413 response clean (no TCP RST).
+                remaining = clen
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                self._json(413, {"error": "request body too large"})
+                return
+            self._body = self.rfile.read(clen) if clen > 0 else b""
+            if not self._host_ok():
+                self._json(403, {"error": "bad host"})
+                return
+            if not self._origin_ok():
+                self._json(403, {"error": "cross-origin POST rejected"})
+                return
+            path = self.path.split("?", 1)[0]
+            if path == "/login/callback":
+                self._login_callback()
+            elif path == "/login/remote/start":
+                self._login_remote_start()
+            elif path == "/login/remote/poll":
+                self._login_remote_poll()
+            elif path == "/logout":
+                self._logout()
+            elif path == "/device/select":
+                self._device_select()
+            elif path == "/research":
+                self._research()
+            elif path.startswith("/research/") and path.endswith("/cancel"):
+                self._research_cancel(path[len("/research/"):-len("/cancel")])
+            elif path.startswith("/research/") and path.endswith("/skip"):
+                self._research_skip(path[len("/research/"):-len("/skip")])
+            elif path == "/shutdown":
+                self._shutdown()
+            else:
+                self._json(404, {"error": "not found"})
+
+        # ── handlers ──
+        def _login_callback(self) -> None:
+            body = self._read_json()
+            if not secrets.compare_digest(str(body.get("loginToken", "")), state.login_token):
+                self._json(403, {"error": "bad or missing login token"})
+                return
+            rt = body.get("refreshToken")
+            uid = body.get("uid")
+            if not rt or not uid:
+                self._json(400, {"error": "missing refreshToken/uid"})
+                return
+            try:
+                sess = AccountSession.from_capture(
+                    refresh_token=rt,
+                    id_token=body.get("idToken", ""),
+                    uid=uid,
+                    email=body.get("email", ""),
+                    expires_in=int(body.get("expiresIn", 3600) or 3600),
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                log.exception("login capture failed")
+                self._json(500, {"error": f"capture failed: {e}"})
+                return
+            state.set_session(sess)
+            state.rotate_login_token()  # one-shot: the captured nonce can't be replayed
+            log.info("account session captured (local page) for %s", sess.email or sess.uid)
+            self._json(200, {"ok": True, "uid": sess.uid, "email": sess.email})
+
+        # ── remote login (device flow, §11a) ──
+        def _remote_payload(self, flow: RemoteFlow) -> dict[str, Any]:
+            """Public flow status — never includes poll_token or the custom token."""
+            sess = state.session
+            out: dict[str, Any] = {
+                "state": flow.state,
+                "authed": sess is not None,
+                "code": flow.code,
+                "verifyUrl": flow.verify_url,
+            }
+            if flow.state == "connected" and sess is not None:
+                out["email"] = sess.email
+                out["uid"] = sess.uid
+            if flow.error:
+                out["error"] = flow.error
+            return out
+
+        def _login_remote_start(self) -> None:
+            body = self._read_json()
+            try:
+                flow = devicelogin.start(
+                    label=str(body.get("label", "")), runtime=str(body.get("runtime", ""))
+                )
+            except DeviceLoginError as e:
+                # Log the detail; hand the client a fixed, non-reflective message
+                # (don't echo an upstream/proxy body back through the chat).
+                log.warning("remote login start failed: %s", e)
+                self._json(502, {"error": "could not reach the sign-in service — try again"})
+                return
+            # Clamp the FE-supplied TTL so the bridge's own polling window is
+            # bounded no matter what the broker claims.
+            ttl = max(1, min(int(flow["expiresIn"]), _REMOTE_MAX_TTL_SECONDS))
+            rf = RemoteFlow(
+                poll_token=flow["pollToken"],
+                code=flow["code"],
+                verify_url=flow["verifyUrl"],
+                expires_at=time.time() + ttl,
+            )
+            # Take remote_lock so a start can't swap the flow out from under an
+            # in-flight poll (and vice-versa); start/poll are mutually exclusive.
+            with state.remote_lock:
+                state.set_remote(rf)
+            log.info("remote login started — code shown to user, expires in %ss", ttl)
+            self._json(200, {"code": flow["code"], "verifyUrl": flow["verifyUrl"], "expiresIn": ttl})
+
+        def _login_remote_poll(self) -> None:
+            # Hold remote_lock across the whole transition: it serializes polls so
+            # two in-flight requests can't double-redeem the one-shot custom token,
+            # and (paired with _login_remote_start taking the same lock) guarantees
+            # we operate on the current flow, not one a concurrent start superseded.
+            with state.remote_lock:
+                flow = state.remote
+                if flow is None:
+                    self._json(400, {"error": "no remote login in progress — POST /login/remote/start first"})
+                    return
+                if flow.state in ("connected", "expired", "error"):
+                    self._json(200, self._remote_payload(flow))  # terminal — just report
+                    return
+                if time.time() >= flow.expires_at:
+                    flow.state = "expired"
+                    self._json(200, self._remote_payload(flow))
+                    return
+                try:
+                    res = devicelogin.poll_once(flow.poll_token)
+                except DeviceLoginError as e:
+                    # Transient transport blip — stay pending, keep polling. Log the
+                    # detail; the client gets a fixed message, not the upstream body.
+                    log.debug("remote poll transient error: %s", e)
+                    payload = self._remote_payload(flow)
+                    payload["transient"] = "sign-in service temporarily unreachable"
+                    self._json(200, payload)
+                    return
+                status = res.get("status")
+                if status == devicelogin.APPROVED:
+                    try:
+                        sess = AccountSession.from_custom_token(res["customToken"])
+                    except CustomTokenError as e:
+                        flow.state = "error"
+                        flow.error = "sign-in could not be completed"  # non-reflective
+                        log.warning("remote login custom-token exchange failed: %s", e)
+                        self._json(200, self._remote_payload(flow))
+                        return
+                    state.set_session(sess)
+                    flow.state = "connected"
+                    log.info("remote login connected as %s", sess.email or sess.uid)
+                elif status == devicelogin.EXPIRED:
+                    flow.state = "expired"
+                    log.info("remote login expired before approval")
+                self._json(200, self._remote_payload(flow))
+
+        def _status(self) -> None:
+            sess = state.session
+            if sess is None:
+                self._json(200, {"authed": False})
+                return
+            self._json(200, {"authed": True, "uid": sess.uid, "email": sess.email})
+
+        def _icon(self, path: str) -> None:
+            # Serve the bundled brand PNGs for the sign-in page's phase row.
+            name = path.rsplit("/", 1)[-1]
+            if name not in _ICON_FILES:
+                self._json(404, {"error": "not found"})
+                return
+            f = _WEB_DIR / "icons" / name
+            if not f.exists():
+                self._json(404, {"error": "not found"})
+                return
+            data = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _logout(self) -> None:
+            sess = state.session
+            if sess is not None:
+                sess.logout()
+            state.set_session(None)
+            # The device selection belongs to the account being logged out — drop
+            # it so a later (possibly different) account doesn't inherit a stale
+            # target it can't reach.
+            prefs.clear_selected_device()
+            self._json(200, {"ok": True})
+
+        def _researches(self) -> None:
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                rows = fs.list_researches(sess.uid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            self._json(200, {"researches": rows})
+
+        def _decorate_devices(self, devs: list[dict[str, Any]], uid: str, selected: str | None):
+            """Add the authoritative owned/selected flags the client can't infer.
+
+            `owned` is computed against THIS session's uid (the CLI/skill route
+            through the bridge and can't see sess.uid) — owner vs shared-to.
+            """
+            for d in devs:
+                d["owned"] = d.get("ownerUid") == uid
+                d["selected"] = d.get("id") == selected and selected is not None
+            return devs
+
+        def _devices(self) -> None:
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                devs = fs.list_devices(sess.uid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            selected = prefs.get_selected_device(sess.uid)
+            self._decorate_devices(devs, sess.uid, selected)
+            self._json(200, {"devices": devs, "selectedDeviceId": selected})
+
+        def _device_current(self) -> None:
+            """The currently-selected target device (decorated), or null."""
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            selected = prefs.get_selected_device(sess.uid)
+            if not selected:
+                self._json(200, {"device": None, "selectedDeviceId": None})
+                return
+            try:
+                devs = fs.list_devices(sess.uid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            self._decorate_devices(devs, sess.uid, selected)
+            match = next((d for d in devs if d.get("id") == selected), None)
+            # Selection persisted but no longer reachable (un-shared/removed):
+            # report it as stale rather than pretending it's live.
+            self._json(200, {"device": match, "selectedDeviceId": selected,
+                             "stale": match is None})
+
+        def _device_select(self) -> None:
+            body = self._read_json()
+            device_id = (body.get("deviceId") or "").strip()
+            if not device_id:
+                self._json(400, {"error": "deviceId is required"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                devs = fs.list_devices(sess.uid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            match = next((d for d in devs if d.get("id") == device_id), None)
+            if match is None:
+                # Don't persist a device this account can't reach.
+                self._json(404, {"error": "device not reachable by this account"})
+                return
+            prefs.set_selected_device(device_id, sess.uid)
+            self._decorate_devices([match], sess.uid, device_id)
+            log.info("selected device %s", device_id)
+            self._json(200, {"ok": True, "device": match})
+
+        def _resolve_device(self, body: dict[str, Any], sess: AccountSession,
+                            fs: FirestoreRest) -> str | None:
+            """Resolve the target device for a run: explicit body.deviceId →
+            persisted selection (re-validated reachable) → the sole reachable
+            device. Sends an error and returns None when it can't resolve (so the
+            caller just returns)."""
+            device_id = (body.get("deviceId") or "").strip()
+            if device_id:
+                return device_id  # explicit wins; membership enforced at enqueue
+            # No explicit device — list once to validate the selection / auto-pick.
+            try:
+                devs = fs.list_devices(sess.uid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return None
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return None
+            ids = {d.get("id") for d in devs}
+            selected = prefs.get_selected_device(sess.uid)
+            if selected:
+                if selected in ids:
+                    return selected
+                self._json(409, {"error": "selected device no longer reachable — re-select with /device"})
+                return None
+            if len(devs) == 1:
+                did = devs[0].get("id")
+                if did:
+                    return did
+            if not devs:
+                self._json(400, {"error": "no devices reachable by this account"})
+                return None
+            self._json(400, {"error": "no device selected — choose one with /device"})
+            return None
+
+        def _research(self) -> None:
+            body = self._read_json()
+            topic = (body.get("topic") or "").strip()
+            if not topic:
+                self._json(400, {"error": "topic is required"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            device_id = self._resolve_device(body, sess, fs)
+            if device_id is None:
+                return  # _resolve_device already sent the error
+            rid = "agent-" + uuid.uuid4().hex[:16]
+            cfg = body.get("config") if isinstance(body.get("config"), dict) else None
+            try:
+                fs.upsert_research(sess.uid, rid, _new_research_fields(topic, device_id, sess.uid, cfg))
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            try:
+                qid = fs.enqueue_start(
+                    device_id, uid=sess.uid, research_id=rid,
+                    topic=topic, email=sess.email, config_obj=cfg or {},
+                )
+            except (RevokedError, FirestoreError) as e:
+                # The chat doc is already created; the enqueue failed (e.g. the
+                # device isn't a member / went away). Best-effort delete so we
+                # don't leave an orphan chat with no run behind it.
+                try:
+                    fs.delete_research(sess.uid, rid)
+                except Exception:
+                    log.debug("orphan research %s cleanup failed", rid)
+                if isinstance(e, RevokedError):
+                    self._json(401, {"error": "session revoked — run /login again"})
+                else:
+                    self._firestore_502(e)
+                return
+            log.info("enqueued run %s on device %s", rid, device_id)
+            self._json(200, {"runId": rid, "queueId": qid, "deviceId": device_id})
+
+        def _research_status(self, rid: str) -> None:
+            """Point-in-time status of one run (the chat /status). Streaming is P4."""
+            rid = rid.strip("/")
+            if not _RID_RE.match(rid):
+                self._json(404, {"error": "run not found"})  # rejects ../, %2f, etc.
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                doc = fs.get_research(sess.uid, rid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            if doc is None:
+                self._json(404, {"error": "run not found"})
+                return
+            # `events` = the flattened, ordered per-phase links a streamer dedups
+            # by kind (the raw `links` map is also returned for full fidelity).
+            self._json(200, {"research": doc, "events": runview.flatten_links(doc.get("links"))})
+
+        def _updates(self) -> None:
+            """Account-wide streaming snapshot: recent runs + their current
+            flattened links, for a cron to diff per (runId, kind). ?active=1
+            restricts to in-flight runs; ?limit=N bounds the window (default 20)."""
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            qs = parse_qs(urlsplit(self.path).query)
+            active_only = qs.get("active", ["0"])[0] in ("1", "true", "yes")
+            try:
+                limit = max(1, min(int(qs.get("limit", ["20"])[0]), 50))
+            except ValueError:
+                limit = 20
+            try:
+                rows = fs.list_researches(sess.uid, page_size=limit)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            # NOTE: the active filter is applied AFTER the newest-`limit` window,
+            # so active=1 scans only the newest `limit` runs. That's fine in
+            # practice — runs are createdAt-desc and an in-flight run is among the
+            # newest — but a long-buried still-active run could fall outside it.
+            runs = []
+            for r in rows:
+                status = r.get("status")
+                if active_only and status not in ("queued", "ongoing"):
+                    continue
+                runs.append({
+                    "runId": r.get("id"),
+                    "title": r.get("title") or r.get("topic"),
+                    "topic": r.get("topic"),
+                    "status": status,
+                    "phase": r.get("phase"),
+                    "updatedAt": r.get("updatedAt"),
+                    "links": runview.flatten_links(r.get("links")),
+                })
+            self._json(200, {"runs": runs})
+
+        def _research_cancel(self, rid: str) -> None:
+            """Cancel a run (the chat /cancel): one action:"cancel" to the run's
+            device queue — the BE drops it if queued, or stops it if running."""
+            rid = rid.strip("/")
+            if not _RID_RE.match(rid):
+                self._json(404, {"error": "run not found"})  # rejects ../, %2f, etc.
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                doc = fs.get_research(sess.uid, rid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            if doc is None:
+                self._json(404, {"error": "run not found"})
+                return
+            device_id = (doc.get("deviceId") or "").strip()
+            if not device_id:
+                self._json(409, {"error": "run has no device — nothing to cancel"})
+                return
+            try:
+                qid = fs.enqueue_cancel(device_id, uid=sess.uid, research_id=rid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            log.info("cancel requested for run %s on device %s", rid, device_id)
+            self._json(200, {"ok": True, "runId": rid, "queueId": qid, "deviceId": device_id})
+
+        def _research_skip(self, rid: str) -> None:
+            """Skip phases of a run (the chat /skip). Writes pipelineConfig so the
+            BE's reload_config overlay applies it at the next phase boundary:
+            phases 1 (Brief) / 3 (Podcast) → skippedPhases (additive); 4 → video
+            off; 5 → email off. Phases 0/2 aren't whole-phase-skippable → 400."""
+            rid = rid.strip("/")
+            if not _RID_RE.match(rid):
+                self._json(404, {"error": "run not found"})
+                return
+            body = self._read_json()
+            raw = body.get("phases")
+            if not isinstance(raw, list):
+                self._json(400, {"error": "phases (a list of phase numbers) is required"})
+                return
+            # Only genuine integers (JSON true/1.0 are not phase numbers — bool is
+            # an int subclass, so exclude it explicitly).
+            phases = {p for p in raw if isinstance(p, int) and not isinstance(p, bool)
+                      and p in (1, 3, 4, 5)}
+            if not phases:
+                self._json(400, {"error": "no skippable phases — choose 1=brief, 3=podcast, 4=video, 5=report"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                doc = fs.get_research(sess.uid, rid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            if doc is None:
+                self._json(404, {"error": "run not found"})
+                return
+            pc = doc.get("pipelineConfig") if isinstance(doc.get("pipelineConfig"), dict) else {}
+            updates: dict[str, Any] = {}
+            phase_skips = phases & {1, 3}
+            if phase_skips:
+                raw_sp = pc.get("skippedPhases")
+                existing = ({int(x) for x in raw_sp
+                             if isinstance(x, (int, float)) and not isinstance(x, bool)}
+                            if isinstance(raw_sp, list) else set())
+                updates["skippedPhases"] = sorted(existing | phase_skips)
+            if 4 in phases:
+                updates["videoEnabled"] = False
+            if 5 in phases:
+                updates["emailEnabled"] = False
+            try:
+                fs.patch_pipeline_config(sess.uid, rid, updates)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            log.info("skip requested for run %s: phases %s", rid, sorted(phases))
+            self._json(200, {"ok": True, "runId": rid, "skipped": sorted(phases)})
+
+        def _shutdown(self) -> None:
+            """Stop the bridge (the host `agent stop`). Loopback + Host/Origin
+            gated like every write. Shutdown runs in a separate thread because
+            ThreadingHTTPServer.shutdown() must not be called from a request
+            thread's own serve loop — we respond first, then stop serving."""
+            log.info("shutdown requested")
+            self._json(200, {"ok": True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    return Handler
+
+
+def serve(host: str | None = None, port: int | None = None) -> None:
+    """Start the bridge and serve forever (blocking)."""
+    host = host or config.BRIDGE_HOST
+    port = port or config.BRIDGE_PORT
+    state = BridgeState()
+    httpd = ThreadingHTTPServer((host, port), _make_handler(state))
+    authed = state.session is not None
+    log.info("Super Agent bridge on http://%s:%d (authed=%s)", host, port, authed)
+    print(f"Super Agent bridge listening on http://{host}:{port}")
+    print(f"  sign in:  {config.login_origin()}/login   (local page; or remote via chat /login)")
+    print(f"  status:   {config.bridge_origin()}/status")
+    print(f"  log:      {config.log_path()}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.shutdown()

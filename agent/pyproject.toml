@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "super-agent-facade"
+version = "0.0.1"
+description = "Super Agent bridge — account-authed Super Research client for chat runtimes (Hermes / OpenClaw)"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "keyring>=24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+agent = "facade.cli:main"
+
+[tool.setuptools]
+packages = ["facade"]
+
+[tool.setuptools.package-data]
+facade = ["web/*.html", "web/icons/*.png", "skill/SKILL.md", "skill/scripts/*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

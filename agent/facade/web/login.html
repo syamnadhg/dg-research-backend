@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Super Agent — Connect</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <!-- Apply the saved theme before paint to avoid a flash. -->
+  <script>
+    try { document.documentElement.setAttribute("data-theme", localStorage.getItem("super-agent-theme") || "dark"); } catch (e) {}
+  </script>
+  <style>
+    /* ── Super Research dark theme tokens (mirrors research-app globals.css) ── */
+    :root {
+      --bg: #050a15; --surface: #0a0f1e; --surface-2: #111b33; --surface-3: #182444;
+      --border: #1a2540; --border-hover: #253556;
+      --text: #f1f5f9; --text-2: #94a3b8; --text-3: #4b5c78;
+      --accent: #3b82f6; --indigo: #6366f1; --violet: #8b5cf6;
+      --ambient-1: rgba(59,130,246,0.10); --ambient-2: rgba(139,92,246,0.08);
+      --wm-rest: 0.06;
+      --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    /* ── Light theme (mirrors the app's [data-theme="light"]) ── */
+    :root[data-theme="light"] {
+      --bg: #f5f7fa; --surface: #ffffff; --surface-2: #f0f1f5; --surface-3: #e5e7ec;
+      --border: #e0e2e8; --border-hover: #c8ccd4;
+      --text: #1a1a2e; --text-2: #4a4a5e; --text-3: #7a7a8e;
+      --ambient-1: rgba(59,130,246,0.07); --ambient-2: rgba(139,92,246,0.06);
+      --wm-rest: 0.05;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: var(--font); background: var(--bg); color: var(--text);
+      -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+      display: flex; align-items: center; justify-content: center; min-height: 100vh;
+      padding: 24px; position: relative; overflow: hidden;
+      transition: background .25s ease, color .25s ease;
+    }
+    body::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none;
+      background:
+        radial-gradient(60% 50% at 50% 0%, var(--ambient-1), transparent 70%),
+        radial-gradient(50% 40% at 80% 100%, var(--ambient-2), transparent 70%);
+    }
+
+    @keyframes superGradient { 0%{background-position:0% 50%} 50%{background-position:200% 50%} 100%{background-position:0% 50%} }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Runtime watermark (Hermes / OpenClaw) — settled behind the card,
+         subtle at rest, warms + glows once connected. ── */
+    .rt-watermark { position: fixed; inset: 0; z-index: 0; pointer-events: none; display: flex; align-items: center; justify-content: center; }
+    .rt-watermark svg {
+      width: 330px; height: 330px; color: var(--text); opacity: var(--wm-rest);
+      transition: opacity 1s ease, color 1s ease, filter 1s ease;
+    }
+    .rt-watermark.connected svg {
+      opacity: 0.18; color: var(--rt-glow, #6366f1);
+      animation: rtGlow 4.5s ease-in-out infinite;
+    }
+    @keyframes rtGlow {
+      0%, 100% { filter: drop-shadow(0 0 12px var(--rt-glow, #6366f1)); }
+      50%       { filter: drop-shadow(0 0 26px var(--rt-glow, #6366f1)); }
+    }
+
+    /* ── Theme toggle (top-right; matches the app's subtle icon buttons) ── */
+    .theme-toggle {
+      position: fixed; top: 16px; right: 16px; z-index: 20;
+      width: 38px; height: 38px; padding: 0; border-radius: 11px;
+      display: flex; align-items: center; justify-content: center; cursor: pointer;
+      background: var(--surface); border: 1px solid var(--border); color: var(--text-2);
+      box-shadow: 0 4px 14px rgba(0,0,0,0.25); transition: border-color .15s ease, color .15s ease, background .15s ease;
+    }
+    .theme-toggle:hover { border-color: var(--border-hover); color: var(--text); }
+    .theme-toggle svg { width: 17px; height: 17px; }
+
+    .card {
+      position: relative; z-index: 1; width: 380px; max-width: 100%;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 20px; padding: 30px 30px 24px;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.45), 0 2px 8px rgba(0,0,0,0.3);
+      transition: background .25s ease, border-color .25s ease;
+    }
+
+    /* ── Wordmark ── */
+    .wordmark { text-align: center; font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
+    .wordmark .super {
+      background-image: linear-gradient(90deg, #3b82f6, #6366f1, #8b5cf6, #3b82f6);
+      background-size: 200% 100%; -webkit-background-clip: text; background-clip: text;
+      color: transparent; animation: superGradient 8s ease-in-out infinite;
+    }
+    .wordmark .agent { color: var(--text); }
+    .kicker { text-align: center; margin-top: 6px; font-size: 10px; font-weight: 600; letter-spacing: 0.18em; text-transform: uppercase; color: var(--text-3); }
+    .lede { text-align: center; margin: 16px 4px 0; font-size: 13px; line-height: 1.5; color: var(--text-2); }
+    .scope { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 10px 0 22px; font-size: 11px; color: var(--text-3); }
+    .scope svg { width: 12px; height: 12px; flex: 0 0 auto; }
+
+    /* ── Buttons / inputs ── */
+    button {
+      width: 100%; padding: 12px 16px; border: 0; border-radius: 12px; cursor: pointer;
+      font-family: var(--font); font-size: 14px; font-weight: 600;
+      display: flex; align-items: center; justify-content: center; gap: 10px;
+      transition: transform .12s ease, background .15s ease, opacity .15s ease;
+    }
+    button:active { transform: scale(0.985); }
+    button:disabled { opacity: .55; cursor: default; }
+    /* Google button stays dark in both themes — matches the app's bg-gray-900 button. */
+    .btn-google { background: #0f1730; color: #f1f5f9; border: 1px solid #253556; }
+    .btn-google:hover:not(:disabled) { background: #131d3a; border-color: #2f4170; }
+    .btn-verify { background: linear-gradient(135deg, #3b82f6, #6366f1); color: #fff; box-shadow: 0 6px 16px rgba(59,130,246,0.3); }
+
+    input {
+      width: 100%; padding: 13px; border-radius: 12px; margin-bottom: 12px;
+      border: 1px solid var(--border-hover); background: var(--surface-2);
+      color: var(--text); font-family: var(--font); font-size: 20px; letter-spacing: 8px;
+      text-align: center; outline: none;
+    }
+    input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
+    input::placeholder { color: var(--text-3); letter-spacing: 8px; }
+
+    /* ── Phase row (the real pipeline icons, below the button) ── */
+    .phase-row {
+      position: relative; display: flex; align-items: center; justify-content: center;
+      gap: 8px; margin-top: 18px;
+    }
+    .phase-row::before {
+      content: ""; position: absolute; left: 16px; right: 16px; top: 50%; height: 1px;
+      background: var(--border-hover); z-index: 0;
+    }
+    .ph {
+      position: relative; z-index: 1; width: 30px; height: 30px; border-radius: 9px;
+      display: flex; align-items: center; justify-content: center;
+      background: var(--surface-2); border: 1px solid var(--border);
+    }
+    .ph svg, .ph img { width: 17px; height: 17px; display: block; }
+    .ph img { border-radius: 4px; object-fit: cover; }
+    :root[data-theme="dark"] .ph.nlm img { filter: invert(1) brightness(0.85); }
+    .phase-cap { text-align: center; margin-top: 9px; font-size: 10px; letter-spacing: 0.04em; color: var(--text-3); }
+
+    .hidden { display: none; }
+    .status { margin-top: 16px; min-height: 18px; font-size: 12.5px; text-align: center; line-height: 1.45; }
+    .status.ok { color: #16a34a; } .status.err { color: #ef4444; } .status.muted { color: var(--text-2); }
+    :root[data-theme="dark"] .status.ok { color: #4ade80; }
+    :root[data-theme="dark"] .status.err { color: #f87171; }
+    .spinner { width: 13px; height: 13px; border: 2px solid rgba(148,163,184,.3); border-top-color: var(--accent); border-radius: 50%; display: inline-block; animation: spin .7s linear infinite; vertical-align: -2px; margin-right: 6px; }
+
+    .foot { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); text-align: center; font-size: 10.5px; color: var(--text-3); display: flex; align-items: center; justify-content: center; gap: 6px; }
+    .foot svg { width: 11px; height: 11px; }
+  </style>
+</head>
+<body>
+  <div id="rt-watermark" class="rt-watermark" aria-hidden="true"></div>
+
+  <button id="theme-toggle" class="theme-toggle" aria-label="Toggle light / dark theme"></button>
+
+  <div class="card">
+    <div class="wordmark"><span class="super">Super</span> <span class="agent">Agent</span></div>
+    <div class="kicker">Research Agent · Connect</div>
+
+    <p class="lede">Sign in with your Super Research account to connect your agent.</p>
+    <div class="scope">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      Research-only · runs on your existing devices · shows up as chats
+    </div>
+
+    <div id="step-google">
+      <button id="btn-google" class="btn-google">
+        <svg width="17" height="17" viewBox="0 0 18 18" aria-hidden="true">
+          <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 01-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z" fill="#4285F4"/>
+          <path d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 009 18z" fill="#34A853"/>
+          <path d="M3.964 10.71A5.41 5.41 0 013.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.997 8.997 0 000 9c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
+          <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
+        </svg>
+        Sign in with Google
+      </button>
+
+      <!-- The real research pipeline: Brief → ChatGPT · Gemini · Claude → NotebookLM → YouTube → Report -->
+      <div class="phase-row" aria-label="Research pipeline">
+        <span class="ph" title="Research brief">
+          <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="3" width="16" height="18" rx="2.5" stroke="#3b82f6" stroke-width="1.5" fill="#3b82f6" fill-opacity="0.08"/><rect x="8" y="1" width="8" height="4" rx="1.5" fill="#3b82f6" opacity="0.2" stroke="#3b82f6" stroke-width="1.2"/><line x1="8" y1="10" x2="16" y2="10" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round"/><line x1="8" y1="13.5" x2="14" y2="13.5" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round" opacity="0.7"/><line x1="8" y1="17" x2="11" y2="17" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round" opacity="0.5"/><circle cx="17.5" cy="5.5" r="1" fill="#6366f1" opacity="0.7"/></svg>
+        </span>
+        <span class="ph" title="ChatGPT"><img src="/icons/chatgpt.png" alt="" /></span>
+        <span class="ph" title="Gemini">
+          <svg viewBox="0 0 28 28"><defs><linearGradient id="grad-gem" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1A73E8"/><stop offset="50%" stop-color="#8E75B2"/><stop offset="100%" stop-color="#D93025"/></linearGradient></defs><path d="M14 2C15.5 9 19 12.5 26 14C19 15.5 15.5 19 14 26C12.5 19 9 15.5 2 14C9 12.5 12.5 9 14 2Z" fill="url(#grad-gem)"/></svg>
+        </span>
+        <span class="ph" title="Claude"><img src="/icons/claude.png" alt="" /></span>
+        <span class="ph nlm" title="NotebookLM"><img src="/icons/notebooklm.png" alt="" /></span>
+        <span class="ph" title="YouTube">
+          <svg viewBox="0 0 28 28"><rect width="28" height="20" y="4" rx="5" fill="#FF0000"/><polygon points="11,9 11,19 20,14" fill="white"/></svg>
+        </span>
+        <span class="ph" title="Report">
+          <svg viewBox="0 0 28 28"><path d="M6 2h10l8 8v16a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2z" fill="#4285F4"/><path d="M16 2v8h8" fill="#A1C2FA"/><line x1="8" y1="15" x2="20" y2="15" stroke="white" stroke-width="1" opacity="0.6"/><line x1="8" y1="18" x2="16" y2="18" stroke="white" stroke-width="1" opacity="0.6"/><line x1="8" y1="21" x2="18" y2="21" stroke="white" stroke-width="1" opacity="0.6"/></svg>
+        </span>
+      </div>
+      <div class="phase-cap">Brief · 3 research agents · audio · video · report</div>
+    </div>
+
+    <div id="step-totp" class="hidden">
+      <p class="status muted" style="margin:0 0 12px">Enter the 6-digit code from your authenticator app.</p>
+      <input id="totp-code" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="one-time-code" />
+      <button id="btn-totp" class="btn-verify">Verify</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div class="foot">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      This window talks only to your local Super Agent bridge.
+    </div>
+  </div>
+
+  <!-- Theme toggle + runtime watermark (independent of the Firebase module). -->
+  <script>
+    (function () {
+      const root = document.documentElement;
+      const btn = document.getElementById("theme-toggle");
+      const SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
+      const MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+      function render() {
+        const dark = root.getAttribute("data-theme") !== "light";
+        btn.innerHTML = dark ? SUN : MOON;
+        btn.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      }
+      render();
+      btn.addEventListener("click", function () {
+        const next = root.getAttribute("data-theme") === "light" ? "dark" : "light";
+        root.setAttribute("data-theme", next);
+        try { localStorage.setItem("super-agent-theme", next); } catch (e) {}
+        render();
+      });
+    })();
+
+    // Runtime watermark — the symbol of the runtime being connected (Hermes /
+    // OpenClaw), set by ?runtime=… (which `agent connect` will pass). With no
+    // runtime, nothing shows. It glows once connected (see /status check below).
+    (function () {
+      const wm = document.getElementById("rt-watermark");
+      if (!wm) return;
+      // Hermes — staff of Hermes / caduceus (winged staff + entwined snakes).
+      const HERMES = '<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="50" cy="14" r="3.5"/><line x1="50" y1="18" x2="50" y2="90"/><path d="M50 28 C 42 24 32 24 22 30 C 32 30 38 32 44 36"/><path d="M50 28 C 58 24 68 24 78 30 C 68 30 62 32 56 36"/><path d="M50 34 C 40 40 40 50 50 56 C 60 62 60 72 50 78"/><path d="M50 34 C 60 40 60 50 50 56 C 40 62 40 72 50 78"/></svg>';
+      // OpenClaw — an open pincer / claw.
+      const OPENCLAW = '<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 84 C 30 70 40 64 48 60"/><path d="M48 60 C 40 46 48 32 66 30 C 58 38 58 48 64 56"/><path d="M48 60 C 56 70 72 72 86 64 C 76 60 70 56 64 56"/><circle cx="48" cy="60" r="2.5"/></svg>';
+      const MAP = { hermes: { svg: HERMES, glow: "#3b82f6" }, openclaw: { svg: OPENCLAW, glow: "#8b5cf6" } };
+      let rt = "";
+      try { rt = (new URLSearchParams(location.search).get("runtime") || "").toLowerCase(); } catch (e) {}
+      const pick = MAP[rt];
+      if (pick) { wm.innerHTML = pick.svg; wm.style.setProperty("--rt-glow", pick.glow); }
+    })();
+
+    function markConnected() {
+      const wm = document.getElementById("rt-watermark");
+      if (wm) wm.classList.add("connected");
+    }
+    window.__markConnected = markConnected;
+  </script>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+    import {
+      getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult,
+      getMultiFactorResolver, TotpMultiFactorGenerator,
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+    const statusEl = document.getElementById("status");
+    const stepGoogle = document.getElementById("step-google");
+    const stepTotp = document.getElementById("step-totp");
+    const btnGoogle = document.getElementById("btn-google");
+    const btnTotp = document.getElementById("btn-totp");
+
+    const setStatus = (msg, cls = "") => { statusEl.innerHTML = msg; statusEl.className = "status " + cls; };
+    const busy = (msg) => setStatus('<span class="spinner"></span>' + msg, "muted");
+    const provider = () => new GoogleAuthProvider();
+
+    let auth, resolver = null, loginToken = "";
+
+    function showTotpStep() {
+      stepGoogle.classList.add("hidden");
+      stepTotp.classList.remove("hidden");
+      setStatus("Two-factor required.", "muted");
+    }
+    function backToGoogle() {
+      resolver = null;
+      stepTotp.classList.add("hidden");
+      stepGoogle.classList.remove("hidden");
+      btnGoogle.disabled = false;
+    }
+    function handleMaybeMfa(e) {
+      if (e && e.code === "auth/multi-factor-auth-required") {
+        resolver = getMultiFactorResolver(auth, e);
+        const totp = resolver.hints.find((h) => h.factorId === TotpMultiFactorGenerator.FACTOR_ID);
+        if (!totp) { setStatus("This account uses a non-TOTP second factor, not yet supported here. Tell your operator.", "err"); return true; }
+        showTotpStep();
+        return true;
+      }
+      return false;
+    }
+
+    async function init() {
+      const cfg = await (await fetch("/login/config")).json();
+      loginToken = cfg.loginToken || "";
+      auth = getAuth(initializeApp(cfg));
+      // Reflect the live connection state (so a reload shows the glow).
+      try {
+        const s = await (await fetch("/status")).json();
+        if (s && s.authed) {
+          setStatus("✓ Connected as " + (s.email || s.uid) + ". You can close this window.", "ok");
+          window.__markConnected();
+        }
+      } catch (e) {}
+      // Complete a redirect-based sign-in if we came back from one.
+      try {
+        const result = await getRedirectResult(auth);
+        if (result && result.user) { await deliver(result.user); }
+      } catch (e) {
+        if (!handleMaybeMfa(e)) setStatus("Sign-in failed: " + (e?.code || e?.message || e), "err");
+      }
+    }
+
+    async function deliver(user) {
+      busy("Connecting your agent…");
+      const idToken = await user.getIdToken();
+      const res = await user.getIdTokenResult();
+      const expiresIn = Math.max(60, Math.floor((new Date(res.expirationTime).getTime() - Date.now()) / 1000));
+      const resp = await fetch("/login/callback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          loginToken,
+          refreshToken: user.refreshToken,
+          idToken, uid: user.uid, email: user.email || "", expiresIn,
+        }),
+      });
+      if (!resp.ok) { setStatus("Bridge rejected the session: " + (await resp.text()), "err"); return; }
+      setStatus("✓ Connected as " + (user.email || user.uid) + ". You can close this window.", "ok");
+      btnGoogle.disabled = true; btnTotp.disabled = true;
+      window.__markConnected();  // runtime symbol warms + glows
+    }
+
+    btnGoogle.addEventListener("click", async () => {
+      btnGoogle.disabled = true;
+      busy("Opening Google sign-in…");
+      try {
+        const result = await signInWithPopup(auth, provider());
+        await deliver(result.user);
+      } catch (e) {
+        const code = e && e.code;
+        if (handleMaybeMfa(e)) {
+          return;
+        } else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
+          setStatus("");
+          btnGoogle.disabled = false;
+        } else if (code === "auth/popup-blocked") {
+          busy("Popup blocked — redirecting to Google…");
+          await signInWithRedirect(auth, provider());
+        } else {
+          setStatus("Sign-in failed: " + (code || e?.message || e), "err");
+          btnGoogle.disabled = false;
+        }
+      }
+    });
+
+    btnTotp.addEventListener("click", async () => {
+      const code = document.getElementById("totp-code").value.trim();
+      if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code.", "err"); return; }
+      btnTotp.disabled = true;
+      busy("Verifying…");
+      try {
+        const totp = resolver.hints.find((h) => h.factorId === TotpMultiFactorGenerator.FACTOR_ID);
+        const assertion = TotpMultiFactorGenerator.assertionForSignIn(totp.uid, code);
+        const cred = await resolver.resolveSignIn(assertion);
+        await deliver(cred.user);
+      } catch (e) {
+        if (e && e.code === "auth/invalid-verification-code") {
+          setStatus("Wrong code — try again.", "err");
+          btnTotp.disabled = false;
+        } else {
+          setStatus("Two-factor session expired — start again.", "err");
+          backToGoogle();
+        }
+      }
+    });
+
+    init().catch((e) => setStatus("Could not load config: " + e, "err"));
+  </script>
+</body>
+</html>

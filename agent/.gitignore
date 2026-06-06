@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local secrets / session (never commit) — belt-and-braces; the real store
+# lives in ~/.super-agent, not in-repo, but guard against accidents.
+.super-agent/
+*.session.json
+session.json
+
+# Logs (the bridge log lives in ~/.super-agent, outside the repo; guard anyway)
+*.log

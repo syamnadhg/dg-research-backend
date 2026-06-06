@@ -1,0 +1,64 @@
+"""Non-secret prefs store (selected device)."""
+
+from facade import config, prefs
+
+
+def _isolate(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "store_dir", lambda: tmp_path)
+
+
+def test_empty_when_absent(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    assert prefs.load() == {}
+    assert prefs.get_selected_device("u1") is None
+
+
+def test_set_get_clear_roundtrip(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    prefs.set_selected_device("dev-1", "u1")
+    assert prefs.get_selected_device("u1") == "dev-1"
+    prefs.set_selected_device("dev-2", "u1")  # overwrite
+    assert prefs.get_selected_device("u1") == "dev-2"
+    prefs.clear_selected_device()
+    assert prefs.get_selected_device("u1") is None
+    # clearing again is a no-op, not an error
+    prefs.clear_selected_device()
+
+
+def test_selection_is_uid_bound(monkeypatch, tmp_path):
+    # The core isolation property: account B never inherits account A's selection,
+    # even with no intervening logout (the file just persists across the swap).
+    _isolate(monkeypatch, tmp_path)
+    prefs.set_selected_device("dev-A", "uidA")
+    assert prefs.get_selected_device("uidA") == "dev-A"
+    assert prefs.get_selected_device("uidB") is None  # different account → invisible
+
+
+def test_legacy_selection_without_uid_ignored(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    prefs.save({"selectedDeviceId": "dev-old"})  # pre-uid-binding shape
+    assert prefs.get_selected_device("u1") is None
+
+
+def test_runtime_roundtrip(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    assert prefs.get_runtime() is None
+    prefs.set_runtime("hermes")
+    assert prefs.get_runtime() == "hermes"
+    # runtime is independent of the (uid-bound) device selection
+    prefs.set_selected_device("dev-1", "u1")
+    assert prefs.get_runtime() == "hermes" and prefs.get_selected_device("u1") == "dev-1"
+
+
+def test_corrupt_file_treated_as_empty(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    (tmp_path / "prefs.json").write_text("{not json", encoding="utf-8")
+    assert prefs.load() == {}
+
+
+def test_preserves_other_keys(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    prefs.save({"someOtherKey": 7})
+    prefs.set_selected_device("dev-9", "u1")
+    data = prefs.load()
+    assert data["someOtherKey"] == 7 and data["selectedDeviceId"] == "dev-9"
