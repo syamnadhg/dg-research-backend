@@ -113,8 +113,8 @@ def cmd_login(args) -> int:
     if code != 200:
         return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
     return _emit(body, args.json, [
-        f"Open  {body.get('verifyUrl')}  and enter code:  {body.get('code')}",
-        "(Sign in to Super Research on your phone, then tap Approve.)",
+        f"Open this link and sign in:  {body.get('verifyUrl')}",
+        "(Sign in to Super Research on your phone, then tap Approve & connect.)",
         "Then run:  login-wait",
     ])
 
@@ -127,7 +127,7 @@ def cmd_login_wait(args) -> int:
     msg = {
         "connected": f"✓ Connected as {body.get('email') or body.get('uid')}.",
         "pending": "… still waiting for approval — run login-wait again.",
-        "expired": "✗ The code expired — run login again.",
+        "expired": "✗ The sign-in link expired — run login again.",
         "error": f"✗ Sign-in failed: {body.get('error', 'unknown')}",
     }.get(state, f"state: {state}")
     return _emit(body, args.json, [msg])

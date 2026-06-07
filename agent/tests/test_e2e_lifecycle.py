@@ -114,9 +114,9 @@ def test_full_chat_lifecycle(live, capsys):
     assert sr.main(["status-account"]) == 0
     assert "Not signed in" in capsys.readouterr().out
 
-    # 2. /login → shows a code + link
+    # 2. /login → shows the sign-in link (no code typed — it's embedded in the link)
     assert sr.main(["login"]) == 0
-    assert "AB-12" in capsys.readouterr().out
+    assert "connect-agent" in capsys.readouterr().out
 
     # 3. approve completes on the next poll → connected
     assert sr.main(["login-wait"]) == 0

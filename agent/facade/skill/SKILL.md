@@ -29,7 +29,7 @@ user the host bridge isn't running and stop.
 
 | User says | Run | Then |
 |---|---|---|
-| `/login` | `sr.py login` | Relay the code + link. Tell them to approve on their phone, then run `sr.py login-wait` (repeat every few seconds while it says "still waiting"). |
+| `/login` | `sr.py login` | Relay the sign-in link. Tell them to open it, sign in on their phone, and tap **Approve & connect** — then run `sr.py login-wait` (repeat every few seconds while it says "still waiting"). |
 | `/logout` | `sr.py logout` | Relay. |
 | `/device` (list) | `sr.py devices` | Relay the list. To switch: `sr.py device-use <id>`. |
 | `/device use <id>` | `sr.py device-use <id>` | Relay. |

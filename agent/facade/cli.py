@@ -126,8 +126,8 @@ def _login_remote(args: argparse.Namespace) -> int:
         print(f"{_NO} couldn't start remote sign-in: {res[1] if res else 'no response'}")
         return 1
     out = res[1]
-    print(f"Open  {out.get('verifyUrl')}  and enter code:  {out.get('code')}")
-    print("(Sign in to Super Research on your phone, then tap Approve.)")
+    print(f"Open this link and sign in:  {out.get('verifyUrl')}")
+    print("(Sign in to Super Research on your phone, then tap Approve & connect.)")
     print("Waiting for approval… (Ctrl-C to stop)")
     deadline = time.monotonic() + float(out.get("expiresIn", 600) or 600)
     interval = config.REMOTE_POLL_INTERVAL_SECONDS
@@ -143,13 +143,13 @@ def _login_remote(args: argparse.Namespace) -> int:
                 print(f"{_OK} Connected as {st.get('email') or st.get('uid')}.  Try:  agent verify")
                 return 0
             if state == "expired":
-                print(f"{_NO} Code expired before approval. Run:  agent login --remote")
+                print(f"{_NO} Sign-in link expired before approval. Run:  agent login --remote")
                 return 1
             if state == "error":
                 print(f"{_NO} Sign-in failed: {st.get('error', 'unknown error')}")
                 return 1
     except KeyboardInterrupt:
-        print("\nStopped waiting. The code may still be valid; re-run to resume.")
+        print("\nStopped waiting. The link may still be valid; re-run to resume.")
         return 1
     print(f"{_NO} Timed out waiting for approval. Run:  agent login --remote")
     return 1
