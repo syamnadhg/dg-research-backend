@@ -1,261 +1,436 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Super Agent — Connect</title>
+  <title>Super Research — Authenticate</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Match the app: Inter as the default sans font (Tailwind preflight would otherwise force a system stack). -->
+  <script>
+    tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter','ui-sans-serif','system-ui','-apple-system','Segoe UI','Roboto','sans-serif'] } } } };
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <!-- Apply the saved theme before paint to avoid a flash. -->
+  <!-- Follow the app's login theme (set from the app's settings page). Default light. -->
   <script>
-    try { document.documentElement.setAttribute("data-theme", localStorage.getItem("super-agent-theme") || "dark"); } catch (e) {}
+    try { document.documentElement.setAttribute("data-login-theme", localStorage.getItem("dg-login-theme") === "Dark" ? "dark" : "light"); } catch (e) {}
   </script>
   <style>
-    /* ── Super Research dark theme tokens (mirrors research-app globals.css) ── */
-    :root {
-      --bg: #050a15; --surface: #0a0f1e; --surface-2: #111b33; --surface-3: #182444;
-      --border: #1a2540; --border-hover: #253556;
-      --text: #f1f5f9; --text-2: #94a3b8; --text-3: #4b5c78;
-      --accent: #3b82f6; --indigo: #6366f1; --violet: #8b5cf6;
-      --ambient-1: rgba(59,130,246,0.10); --ambient-2: rgba(139,92,246,0.08);
-      --wm-rest: 0.06;
-      --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    }
-    /* ── Light theme (mirrors the app's [data-theme="light"]) ── */
-    :root[data-theme="light"] {
-      --bg: #f5f7fa; --surface: #ffffff; --surface-2: #f0f1f5; --surface-3: #e5e7ec;
-      --border: #e0e2e8; --border-hover: #c8ccd4;
-      --text: #1a1a2e; --text-2: #4a4a5e; --text-3: #7a7a8e;
-      --ambient-1: rgba(59,130,246,0.07); --ambient-2: rgba(139,92,246,0.06);
-      --wm-rest: 0.05;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; }
-    body {
-      font-family: var(--font); background: var(--bg); color: var(--text);
-      -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
-      display: flex; align-items: center; justify-content: center; min-height: 100vh;
-      padding: 24px; position: relative; overflow: hidden;
-      transition: background .25s ease, color .25s ease;
-    }
-    body::before {
-      content: ""; position: absolute; inset: 0; pointer-events: none;
-      background:
-        radial-gradient(60% 50% at 50% 0%, var(--ambient-1), transparent 70%),
-        radial-gradient(50% 40% at 80% 100%, var(--ambient-2), transparent 70%);
-    }
+    :root { --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font-family: var(--font); }
+    body { font-family: var(--font); }
 
     @keyframes superGradient { 0%{background-position:0% 50%} 50%{background-position:200% 50%} 100%{background-position:0% 50%} }
     @keyframes spin { to { transform: rotate(360deg); } }
-
-    /* ── Runtime watermark (Hermes / OpenClaw) — settled behind the card,
-         subtle at rest, warms + glows once connected. ── */
-    .rt-watermark { position: fixed; inset: 0; z-index: 0; pointer-events: none; display: flex; align-items: center; justify-content: center; }
-    .rt-watermark svg {
-      width: 330px; height: 330px; color: var(--text); opacity: var(--wm-rest);
-      transition: opacity 1s ease, color 1s ease, filter 1s ease;
-    }
-    .rt-watermark.connected svg {
-      opacity: 0.18; color: var(--rt-glow, #6366f1);
-      animation: rtGlow 4.5s ease-in-out infinite;
-    }
     @keyframes rtGlow {
       0%, 100% { filter: drop-shadow(0 0 12px var(--rt-glow, #6366f1)); }
-      50%       { filter: drop-shadow(0 0 26px var(--rt-glow, #6366f1)); }
+      50%      { filter: drop-shadow(0 0 26px var(--rt-glow, #6366f1)); }
     }
 
-    /* ── Theme toggle (top-right; matches the app's subtle icon buttons) ── */
-    .theme-toggle {
-      position: fixed; top: 16px; right: 16px; z-index: 20;
-      width: 38px; height: 38px; padding: 0; border-radius: 11px;
-      display: flex; align-items: center; justify-content: center; cursor: pointer;
-      background: var(--surface); border: 1px solid var(--border); color: var(--text-2);
-      box-shadow: 0 4px 14px rgba(0,0,0,0.25); transition: border-color .15s ease, color .15s ease, background .15s ease;
-    }
-    .theme-toggle:hover { border-color: var(--border-hover); color: var(--text); }
-    .theme-toggle svg { width: 17px; height: 17px; }
+    /* Page background lives on <html> so the fixed watermark (behind the
+       transparent scroll root) shows through. */
+    html[data-login-theme="light"] { background: #f5f7fa; }
+    html[data-login-theme="dark"]  { background: #050a15; }
+    body { background: transparent; }
+    .login-root { background: transparent; }
 
-    .card {
-      position: relative; z-index: 1; width: 380px; max-width: 100%;
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 20px; padding: 30px 30px 24px;
-      box-shadow: 0 24px 60px rgba(0,0,0,0.45), 0 2px 8px rgba(0,0,0,0.3);
-      transition: background .25s ease, border-color .25s ease;
-    }
+    /* ── Scoped dark-theme overrides — navy palette, mirrors research-app LoginScreen ── */
+    [data-login-theme="dark"].login-root .bg-white { background-color: #0a0f1e !important; }
+    [data-login-theme="dark"].login-root .bg-gray-50 { background-color: #111b33 !important; }
+    [data-login-theme="dark"].login-root .bg-gray-100 { background-color: #182444 !important; }
+    [data-login-theme="dark"].login-root .bg-blue-50 { background-color: rgba(59,130,246,0.14) !important; }
+    [data-login-theme="dark"].login-root .bg-purple-50 { background-color: rgba(139,92,246,0.14) !important; }
+    [data-login-theme="dark"].login-root .border-gray-100 { border-color: #1e2a4a !important; }
+    [data-login-theme="dark"].login-root .border-gray-200 { border-color: #25335a !important; }
+    [data-login-theme="dark"].login-root .border-gray-300 { border-color: #2d3d68 !important; }
+    [data-login-theme="dark"].login-root .border-blue-100 { border-color: rgba(59,130,246,0.3) !important; }
+    [data-login-theme="dark"].login-root .border-purple-100 { border-color: rgba(139,92,246,0.3) !important; }
+    [data-login-theme="dark"].login-root .text-gray-900 { color: #f2f5fb !important; }
+    [data-login-theme="dark"].login-root .text-gray-800 { color: #dde3ee !important; }
+    [data-login-theme="dark"].login-root .text-gray-700 { color: #c4ccdd !important; }
+    [data-login-theme="dark"].login-root .text-gray-600 { color: #9aa5bd !important; }
+    [data-login-theme="dark"].login-root .text-gray-500 { color: #7b87a3 !important; }
+    [data-login-theme="dark"].login-root .text-gray-400 { color: #5e6a86 !important; }
+    [data-login-theme="dark"].login-root .hover\:text-gray-900:hover { color: #f2f5fb !important; }
+    [data-login-theme="dark"].login-root .hover\:text-gray-700:hover { color: #c4ccdd !important; }
+    [data-login-theme="dark"].login-root .hover\:border-gray-300:hover { border-color: #2d3d68 !important; }
+    [data-login-theme="dark"].login-root .hover\:shadow-md:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.5) !important; }
+    [data-login-theme="dark"] .nlm-icon { filter: invert(1) brightness(0.85); }
 
-    /* ── Wordmark ── */
-    .wordmark { text-align: center; font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
-    .wordmark .super {
-      background-image: linear-gradient(90deg, #3b82f6, #6366f1, #8b5cf6, #3b82f6);
-      background-size: 200% 100%; -webkit-background-clip: text; background-clip: text;
-      color: transparent; animation: superGradient 8s ease-in-out infinite;
-    }
-    .wordmark .agent { color: var(--text); }
-    .kicker { text-align: center; margin-top: 6px; font-size: 10px; font-weight: 600; letter-spacing: 0.18em; text-transform: uppercase; color: var(--text-3); }
-    .lede { text-align: center; margin: 16px 4px 0; font-size: 13px; line-height: 1.5; color: var(--text-2); }
-    .scope { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 10px 0 22px; font-size: 11px; color: var(--text-3); }
-    .scope svg { width: 12px; height: 12px; flex: 0 0 auto; }
+    /* ── Runtime watermark (Hermes / OpenClaw) — always behind the page, subtle, glows once authenticated ── */
+    .rt-watermark { position: fixed; inset: 0; z-index: 0; pointer-events: none; display: flex; align-items: center; justify-content: center; }
+    /* Scales with the viewport so it fills the background on any screen size. */
+    .rt-watermark svg { width: min(82vmin, 820px); height: min(82vmin, 820px); color: #475569; opacity: 0.05; transition: opacity 1s ease, color 1s ease, filter 1s ease; }
+    html[data-login-theme="dark"] .rt-watermark svg { color: #93a3b8; opacity: 0.06; }
+    .rt-watermark.connected svg { opacity: 0.14; color: var(--rt-glow, #6366f1); animation: rtGlow 4.5s ease-in-out infinite; }
 
-    /* ── Buttons / inputs ── */
-    button {
-      width: 100%; padding: 12px 16px; border: 0; border-radius: 12px; cursor: pointer;
-      font-family: var(--font); font-size: 14px; font-weight: 600;
-      display: flex; align-items: center; justify-content: center; gap: 10px;
-      transition: transform .12s ease, background .15s ease, opacity .15s ease;
-    }
-    button:active { transform: scale(0.985); }
-    button:disabled { opacity: .55; cursor: default; }
-    /* Google button stays dark in both themes — matches the app's bg-gray-900 button. */
-    .btn-google { background: #0f1730; color: #f1f5f9; border: 1px solid #253556; }
-    .btn-google:hover:not(:disabled) { background: #131d3a; border-color: #2f4170; }
-    .btn-verify { background: linear-gradient(135deg, #3b82f6, #6366f1); color: #fff; box-shadow: 0 6px 16px rgba(59,130,246,0.3); }
+    /* ── Channels row (Accessible from) — icon-only, subtle ── */
+    .channels { display: flex; align-items: center; justify-content: center; gap: 14px; }
+    .channels .ch-cap { font-size: 11px; letter-spacing: 0.05em; color: #9aa5bd; }
+    .channels .ch { color: #9aa5bd; display: inline-flex; transition: color .15s ease; }
+    [data-login-theme="dark"] .channels .ch { color: #5e6a86; }
+    .channels .ch svg { width: 18px; height: 18px; display: block; }
+    .channels .ch:hover { color: #3b82f6; }
 
-    input {
-      width: 100%; padding: 13px; border-radius: 12px; margin-bottom: 12px;
-      border: 1px solid var(--border-hover); background: var(--surface-2);
-      color: var(--text); font-family: var(--font); font-size: 20px; letter-spacing: 8px;
-      text-align: center; outline: none;
-    }
-    input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
-    input::placeholder { color: var(--text-3); letter-spacing: 8px; }
+    .spinner { width: 13px; height: 13px; border: 2px solid rgba(148,163,184,.3); border-top-color: #3b82f6; border-radius: 50%; display: inline-block; animation: spin .7s linear infinite; vertical-align: -2px; margin-right: 6px; }
+    /* Expand panels — class-driven (the parallel phase's inline max-height:0 used to override this). */
+    .card-details, .pp-details { overflow: hidden; max-height: 0; opacity: 0; transition: max-height .3s ease, opacity .2s ease; }
+    [data-card].expanded .card-details, .pp.expanded .pp-details { max-height: 400px; opacity: 1; }
+    [data-card] .chevron, .pp .chevron { transition: transform .2s ease; }
+    [data-card].expanded .chevron, .pp.expanded .chevron { transform: rotate(180deg); }
 
-    /* ── Phase row (the real pipeline icons, below the button) ── */
-    .phase-row {
-      position: relative; display: flex; align-items: center; justify-content: center;
-      gap: 8px; margin-top: 18px;
+    /* Timeline rows — fully self-contained (no Tailwind dep for layout).
+       Phone (<768px): vertical STACK → [number][full-width card], no zigzag (best
+       readability). PC (>=768px): WIDE zigzag tiles in a roomier 980px container.
+       Selectors target the existing 3-child structure (card / dot-col(.flex) /
+       empty-spacer) so it works whether or not Tailwind's classes resolve. */
+    .phase-row { display: flex; align-items: flex-start; column-gap: 12px; margin-bottom: 16px; }
+    .phase-row > div:empty { display: none; }                              /* drop the empty spacer */
+    .phase-row > div.flex { order: -1; flex: 0 0 auto; }                   /* number/dot column → left */
+    .phase-row > div:not(.flex):not(:empty) { flex: 1 1 auto; min-width: 0; } /* card → fills the row */
+    /* Header + how-it-works share the timeline's width so the title aligns with the tiles. */
+    .sr-wide { max-width: 672px; margin-left: auto; margin-right: auto; }
+    @media (min-width: 768px) {
+      #timeline, .sr-wide { max-width: 980px; }
+      .phase-row { display: grid; column-gap: 28px; margin-bottom: 30px; align-items: start; }
+      .phase-row.left, .phase-row.right { grid-template-columns: 1fr 44px 1fr; }
+      .phase-row > div.flex { order: 0; }                                  /* grid uses DOM order */
+      /* CRITICAL: re-show the spacer on PC. The phone rule hides it; if left
+         hidden, the 3-col grid collapses to 2 items and the RIGHT-side card gets
+         auto-placed into the 44px center column (crushed — the bug in the shot). */
+      .phase-row > div:empty { display: block; }
     }
-    .phase-row::before {
-      content: ""; position: absolute; left: 16px; right: 16px; top: 50%; height: 1px;
-      background: var(--border-hover); z-index: 0;
-    }
-    .ph {
-      position: relative; z-index: 1; width: 30px; height: 30px; border-radius: 9px;
-      display: flex; align-items: center; justify-content: center;
-      background: var(--surface-2); border: 1px solid var(--border);
-    }
-    .ph svg, .ph img { width: 17px; height: 17px; display: block; }
-    .ph img { border-radius: 4px; object-fit: cover; }
-    :root[data-theme="dark"] .ph.nlm img { filter: invert(1) brightness(0.85); }
-    .phase-cap { text-align: center; margin-top: 9px; font-size: 10px; letter-spacing: 0.04em; color: var(--text-3); }
-
-    .hidden { display: none; }
-    .status { margin-top: 16px; min-height: 18px; font-size: 12.5px; text-align: center; line-height: 1.45; }
-    .status.ok { color: #16a34a; } .status.err { color: #ef4444; } .status.muted { color: var(--text-2); }
-    :root[data-theme="dark"] .status.ok { color: #4ade80; }
-    :root[data-theme="dark"] .status.err { color: #f87171; }
-    .spinner { width: 13px; height: 13px; border: 2px solid rgba(148,163,184,.3); border-top-color: var(--accent); border-radius: 50%; display: inline-block; animation: spin .7s linear infinite; vertical-align: -2px; margin-right: 6px; }
-
-    .foot { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); text-align: center; font-size: 10.5px; color: var(--text-3); display: flex; align-items: center; justify-content: center; gap: 6px; }
-    .foot svg { width: 11px; height: 11px; }
   </style>
 </head>
 <body>
   <div id="rt-watermark" class="rt-watermark" aria-hidden="true"></div>
 
-  <button id="theme-toggle" class="theme-toggle" aria-label="Toggle light / dark theme"></button>
-
-  <div class="card">
-    <div class="wordmark"><span class="super">Super</span> <span class="agent">Agent</span></div>
-    <div class="kicker">Research Agent · Connect</div>
-
-    <p class="lede">Sign in with your Super Research account to connect your agent.</p>
-    <div class="scope">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-      Research-only · runs on your existing devices · shows up as chats
+  <div id="login-root" class="login-root fixed inset-0 overflow-y-auto" data-login-theme="light" style="-webkit-overflow-scrolling:touch">
+    <!-- Scroll dot — positioned via JS as you scroll the timeline. -->
+    <div id="scroll-dot" class="absolute left-1/2 z-0 pointer-events-none opacity-0" style="margin-left:-5px;transition:opacity .3s">
+      <div class="w-2.5 h-2.5 rounded-full" style="background:#3b82f6;box-shadow:0 0 6px rgba(59,130,246,0.4),0 0 12px rgba(59,130,246,0.15)"></div>
     </div>
 
-    <div id="step-google">
-      <button id="btn-google" class="btn-google">
-        <svg width="17" height="17" viewBox="0 0 18 18" aria-hidden="true">
-          <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 01-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z" fill="#4285F4"/>
-          <path d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 009 18z" fill="#34A853"/>
-          <path d="M3.964 10.71A5.41 5.41 0 013.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.997 8.997 0 000 9c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
-          <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
-        </svg>
-        Sign in with Google
-      </button>
-
-      <!-- The real research pipeline: Brief → ChatGPT · Gemini · Claude → NotebookLM → YouTube → Report -->
-      <div class="phase-row" aria-label="Research pipeline">
-        <span class="ph" title="Research brief">
-          <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="3" width="16" height="18" rx="2.5" stroke="#3b82f6" stroke-width="1.5" fill="#3b82f6" fill-opacity="0.08"/><rect x="8" y="1" width="8" height="4" rx="1.5" fill="#3b82f6" opacity="0.2" stroke="#3b82f6" stroke-width="1.2"/><line x1="8" y1="10" x2="16" y2="10" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round"/><line x1="8" y1="13.5" x2="14" y2="13.5" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round" opacity="0.7"/><line x1="8" y1="17" x2="11" y2="17" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round" opacity="0.5"/><circle cx="17.5" cy="5.5" r="1" fill="#6366f1" opacity="0.7"/></svg>
-        </span>
-        <span class="ph" title="ChatGPT"><img src="/icons/chatgpt.png" alt="" /></span>
-        <span class="ph" title="Gemini">
-          <svg viewBox="0 0 28 28"><defs><linearGradient id="grad-gem" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1A73E8"/><stop offset="50%" stop-color="#8E75B2"/><stop offset="100%" stop-color="#D93025"/></linearGradient></defs><path d="M14 2C15.5 9 19 12.5 26 14C19 15.5 15.5 19 14 26C12.5 19 9 15.5 2 14C9 12.5 12.5 9 14 2Z" fill="url(#grad-gem)"/></svg>
-        </span>
-        <span class="ph" title="Claude"><img src="/icons/claude.png" alt="" /></span>
-        <span class="ph nlm" title="NotebookLM"><img src="/icons/notebooklm.png" alt="" /></span>
-        <span class="ph" title="YouTube">
-          <svg viewBox="0 0 28 28"><rect width="28" height="20" y="4" rx="5" fill="#FF0000"/><polygon points="11,9 11,19 20,14" fill="white"/></svg>
-        </span>
-        <span class="ph" title="Report">
-          <svg viewBox="0 0 28 28"><path d="M6 2h10l8 8v16a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2z" fill="#4285F4"/><path d="M16 2v8h8" fill="#A1C2FA"/><line x1="8" y1="15" x2="20" y2="15" stroke="white" stroke-width="1" opacity="0.6"/><line x1="8" y1="18" x2="16" y2="18" stroke="white" stroke-width="1" opacity="0.6"/><line x1="8" y1="21" x2="18" y2="21" stroke="white" stroke-width="1" opacity="0.6"/></svg>
-        </span>
+    <div class="relative z-10">
+      <!-- Header — title + Authenticate button -->
+      <div class="px-5 pt-6 sm:pt-8 pb-2 sr-wide flex items-center justify-between">
+        <h1 class="text-[18px] sm:text-[20px] font-bold tracking-tight">
+          <span class="bg-clip-text text-transparent" style="background-image:linear-gradient(90deg,#3b82f6,#6366f1,#8b5cf6,#3b82f6);background-size:200% 100%;animation:superGradient 8s ease-in-out infinite">Super</span>
+          <span class="text-gray-900">Research</span>
+        </h1>
+        <button data-auth class="flex items-center gap-2 px-4 py-2 rounded-xl bg-gray-900 text-white text-[12px] font-medium hover:bg-gray-800 transition-colors shadow-sm" style="background:#0f1730">
+          <svg width="14" height="14" viewBox="0 0 18 18" aria-hidden="true">
+            <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 01-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z" fill="#4285F4"/>
+            <path d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 009 18z" fill="#34A853"/>
+            <path d="M3.964 10.71A5.41 5.41 0 013.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.997 8.997 0 000 9c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
+            <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
+          </svg>
+          Authenticate
+        </button>
       </div>
-      <div class="phase-cap">Brief · 3 research agents · audio · video · report</div>
-    </div>
 
-    <div id="step-totp" class="hidden">
-      <p class="status muted" style="margin:0 0 12px">Enter the 6-digit code from your authenticator app.</p>
-      <input id="totp-code" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="one-time-code" />
-      <button id="btn-totp" class="btn-verify">Verify</button>
-    </div>
+      <!-- Tagline -->
+      <div class="px-5 pb-4 max-w-md mx-auto text-center sm:text-left">
+        <p class="text-[13px] sm:text-[14px] text-gray-500 leading-relaxed">
+          Submit a research topic and receive a comprehensive report with the highest quality insights from the best AI research agents.
+        </p>
+      </div>
 
-    <div id="status" class="status"></div>
+      <!-- How it works -->
+      <div class="sr-wide px-5 mt-4 mb-4 text-center">
+        <p class="text-[10px] sm:text-[11px] font-semibold uppercase tracking-wider text-gray-400">How it works</p>
+        <p class="text-[12px] text-gray-400 mt-0.5">6 automated steps — tap any card for details</p>
+      </div>
 
-    <div class="foot">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-      This window talks only to your local Super Agent bridge.
+      <!-- Pipeline timeline — STATIC markup (mirrors the app's PhaseCards) so Tailwind styles it on load -->
+      <div id="timeline" class="px-3 sm:px-5 pb-4 max-w-2xl mx-auto relative">
+        <div class="absolute left-1/2 top-0 bottom-0 w-px -translate-x-1/2 pointer-events-none z-0">
+          <div class="w-full h-full" style="background:linear-gradient(180deg,transparent,rgba(59,130,246,0.08),rgba(139,92,246,0.08),rgba(59,130,246,0.08),transparent)"></div>
+        </div>
+
+        <!-- Phase 0 (left) -->
+        <div class="phase-row left">
+          <div>
+            <div data-card data-glow-card class="bg-white rounded-xl border border-gray-200 p-4 sm:p-5 cursor-pointer hover:shadow-md hover:border-gray-300 relative z-10" style="transition:box-shadow .4s ease,transform .4s ease">
+              <div class="flex items-start justify-between gap-2 mb-2"><h3 class="text-[14px] sm:text-[15px] font-semibold text-gray-900 leading-tight">Submit Your Topic</h3><svg class="chevron w-4 h-4 text-gray-400 flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+              <p class="text-[12px] sm:text-[13px] leading-relaxed text-gray-500 mb-3">Enter a high-level research topic. It will be automatically converted into a structured research plan.</p>
+              <div class="flex flex-wrap items-center gap-1"><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Any Topic</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Instant</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-purple-50 text-purple-600 border border-purple-100">Instant</span></div>
+              <div class="card-details"><div class="mt-3 pt-3 border-t border-gray-100"><ul class="space-y-1"><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Type any research topic — broad or specific</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Customize which steps and agents to include</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Pipeline starts automatically</li></ul></div></div>
+            </div>
+          </div>
+          <div class="flex flex-col items-center pt-2 sm:pt-4"><div class="w-7 h-7 sm:w-9 sm:h-9 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-[9px] sm:text-xs shadow-sm flex-shrink-0">0</div><div class="w-px flex-1 bg-gradient-to-b from-blue-200 to-transparent min-h-[16px]"></div></div>
+          <div></div>
+        </div>
+
+        <!-- Phase 1 (right) -->
+        <div class="phase-row right">
+          <div></div>
+          <div class="flex flex-col items-center pt-2 sm:pt-4"><div class="w-7 h-7 sm:w-9 sm:h-9 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-[9px] sm:text-xs shadow-sm flex-shrink-0">1</div><div class="w-px flex-1 bg-gradient-to-b from-blue-200 to-transparent min-h-[16px]"></div></div>
+          <div>
+            <div data-card data-glow-card class="bg-white rounded-xl border border-gray-200 p-4 sm:p-5 cursor-pointer hover:shadow-md hover:border-gray-300 relative z-10" style="transition:box-shadow .4s ease,transform .4s ease">
+              <div class="flex items-start justify-between gap-2 mb-2"><h3 class="text-[14px] sm:text-[15px] font-semibold text-gray-900 leading-tight">Research Brief</h3><svg class="chevron w-4 h-4 text-gray-400 flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+              <p class="text-[12px] sm:text-[13px] leading-relaxed text-gray-500 mb-3">Your high-level topic is converted into a detailed research brief that guides the best research agents on the market.</p>
+              <div class="flex items-center gap-1.5 mb-2.5"><div class="relative w-6 h-6 rounded-md bg-gray-50 border border-gray-200 flex items-center justify-center"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><rect x="4" y="3" width="16" height="18" rx="2.5" stroke="#3b82f6" stroke-width="1.5" fill="#3b82f6" fill-opacity="0.08"/><rect x="8" y="1" width="8" height="4" rx="1.5" fill="#3b82f6" opacity="0.2" stroke="#3b82f6" stroke-width="1.2"/><line x1="8" y1="10" x2="16" y2="10" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round"/><line x1="8" y1="13.5" x2="14" y2="13.5" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round" opacity="0.7"/><line x1="8" y1="17" x2="11" y2="17" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round" opacity="0.5"/><circle cx="17.5" cy="5.5" r="1" fill="#6366f1" opacity="0.7"/></svg><div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:#3b82f6"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div></div></div>
+              <div class="flex flex-wrap items-center gap-1"><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">AI-Powered</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Deep Analysis</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-purple-50 text-purple-600 border border-purple-100">10–25 min</span></div>
+              <div class="mt-3 p-3 rounded-lg bg-gray-900 font-mono text-[10px] leading-relaxed"><span style="color:rgba(52,211,153,0.7)">&gt; </span><span style="color:#7dd3fc" class="type" data-text="Please create a detailed research report brief for a deep research agent that covers this topic: [YOUR_TOPIC]. Be as thorough as you can."></span></div>
+              <div class="card-details"><div class="mt-3 pt-3 border-t border-gray-100"><ul class="space-y-1"><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Submit any research topic — broad or specific</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>AI generates a comprehensive research plan</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Brief drives all three research agents</li></ul></div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Phase 2 (parallel) -->
+        <div class="pp mb-6 sm:mb-8 relative">
+          <div class="text-center mb-4">
+            <div class="w-7 h-7 sm:w-9 sm:h-9 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-[9px] sm:text-xs mx-auto mb-2 shadow-sm">2</div>
+            <h3 class="text-[15px] sm:text-[16px] font-bold text-gray-900 mb-1">Parallel Deep Research</h3>
+            <p class="text-[12px] sm:text-[13px] max-w-md mx-auto mb-2 text-gray-500">Three leading AI research agents work simultaneously on your topic. Total time equals the slowest — not the sum.</p>
+            <div class="flex items-center justify-center gap-2"><span class="px-1.5 py-px rounded text-[9px] font-medium bg-purple-50 text-purple-600 border border-purple-100">15–45 min</span><button class="pp-toggle inline-flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-medium bg-gray-100 text-gray-500 hover:text-gray-700 transition-colors">Details <svg class="chevron w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></button></div>
+          </div>
+          <div class="flex justify-center gap-3 max-w-md mx-auto px-2">
+            <div data-glow-card class="bg-white border border-gray-200 rounded-xl p-3 sm:p-4 text-center flex-1 min-w-0 hover:shadow-md relative z-10" style="transition:box-shadow .4s ease,transform .4s ease"><div class="relative w-10 h-10 sm:w-11 sm:h-11 mx-auto mb-1.5 rounded-lg flex items-center justify-center" style="background:#10a37f0d;border:1px solid #10a37f20"><img src="/icons/chatgpt.png" alt="" class="rounded-[4px]" style="width:20px;height:20px;object-fit:cover"/><div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:#10a37f"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div></div><h4 class="text-[11px] sm:text-[12px] font-semibold text-gray-800 truncate">ChatGPT</h4><p class="text-[9px] text-gray-400 leading-tight hidden sm:block">Deep Research + Web</p></div>
+            <div data-glow-card class="bg-white border border-gray-200 rounded-xl p-3 sm:p-4 text-center flex-1 min-w-0 hover:shadow-md relative z-10" style="transition:box-shadow .4s ease,transform .4s ease"><div class="relative w-10 h-10 sm:w-11 sm:h-11 mx-auto mb-1.5 rounded-lg flex items-center justify-center" style="background:#7d6a9e0d;border:1px solid #7d6a9e20"><svg width="20" height="20" viewBox="0 0 28 28"><defs><linearGradient id="gemP" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1A73E8"/><stop offset="50%" stop-color="#8E75B2"/><stop offset="100%" stop-color="#D93025"/></linearGradient></defs><path d="M14 2C15.5 9 19 12.5 26 14C19 15.5 15.5 19 14 26C12.5 19 9 15.5 2 14C9 12.5 12.5 9 14 2Z" fill="url(#gemP)"/></svg><div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:#7d6a9e"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div></div><h4 class="text-[11px] sm:text-[12px] font-semibold text-gray-800 truncate">Gemini</h4><p class="text-[9px] text-gray-400 leading-tight hidden sm:block">Advanced Research</p></div>
+            <div data-glow-card class="bg-white border border-gray-200 rounded-xl p-3 sm:p-4 text-center flex-1 min-w-0 hover:shadow-md relative z-10" style="transition:box-shadow .4s ease,transform .4s ease"><div class="relative w-10 h-10 sm:w-11 sm:h-11 mx-auto mb-1.5 rounded-lg flex items-center justify-center" style="background:#D977060d;border:1px solid #D9770620"><img src="/icons/claude.png" alt="" class="rounded-[4px]" style="width:20px;height:20px;object-fit:cover;display:block"/><div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:#D97706"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div></div><h4 class="text-[11px] sm:text-[12px] font-semibold text-gray-800 truncate">Claude</h4><p class="text-[9px] text-gray-400 leading-tight hidden sm:block">Extended Thinking</p></div>
+          </div>
+          <div class="pp-details max-w-md mx-auto"><div class="mt-3 p-4 bg-gray-50 border border-gray-100 rounded-xl"><ul class="space-y-1"><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Three agents research your topic independently</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Each produces a comprehensive report with sources</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>If one agent fails, the others continue</li></ul></div></div>
+        </div>
+
+        <!-- Phase 3 (left) -->
+        <div class="phase-row left">
+          <div>
+            <div data-card data-glow-card class="bg-white rounded-xl border border-gray-200 p-4 sm:p-5 cursor-pointer hover:shadow-md hover:border-gray-300 relative z-10" style="transition:box-shadow .4s ease,transform .4s ease">
+              <div class="flex items-start justify-between gap-2 mb-2"><h3 class="text-[14px] sm:text-[15px] font-semibold text-gray-900 leading-tight">Synthesis &amp; Podcast</h3><svg class="chevron w-4 h-4 text-gray-400 flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+              <p class="text-[12px] sm:text-[13px] leading-relaxed text-gray-500 mb-3">All research reports are synthesized together. A podcast-style audio overview is generated for easy listening.</p>
+              <div class="flex items-center gap-1.5 mb-2.5"><div class="relative w-6 h-6 rounded-md bg-gray-50 border border-gray-200 flex items-center justify-center"><img src="/icons/notebooklm.png" alt="" class="rounded-[3px] nlm-icon" style="width:14px;height:14px;object-fit:cover"/><div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:#8B5CF6"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div></div></div>
+              <div class="flex flex-wrap items-center gap-1"><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Synthesis</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Audio Overview</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-purple-50 text-purple-600 border border-purple-100">10–20 min</span></div>
+              <div class="card-details"><div class="mt-3 pt-3 border-t border-gray-100"><ul class="space-y-1"><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Reports combined into a single knowledge base</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Podcast-style audio discussion generated</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Covers key findings from all perspectives</li></ul></div></div>
+            </div>
+          </div>
+          <div class="flex flex-col items-center pt-2 sm:pt-4"><div class="w-7 h-7 sm:w-9 sm:h-9 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-[9px] sm:text-xs shadow-sm flex-shrink-0">3</div><div class="w-px flex-1 bg-gradient-to-b from-blue-200 to-transparent min-h-[16px]"></div></div>
+          <div></div>
+        </div>
+
+        <!-- Phase 4 (right) -->
+        <div class="phase-row right">
+          <div></div>
+          <div class="flex flex-col items-center pt-2 sm:pt-4"><div class="w-7 h-7 sm:w-9 sm:h-9 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-[9px] sm:text-xs shadow-sm flex-shrink-0">4</div><div class="w-px flex-1 bg-gradient-to-b from-blue-200 to-transparent min-h-[16px]"></div></div>
+          <div>
+            <div data-card data-glow-card class="bg-white rounded-xl border border-gray-200 p-4 sm:p-5 cursor-pointer hover:shadow-md hover:border-gray-300 relative z-10" style="transition:box-shadow .4s ease,transform .4s ease">
+              <div class="flex items-start justify-between gap-2 mb-2"><h3 class="text-[14px] sm:text-[15px] font-semibold text-gray-900 leading-tight">Video &amp; Upload</h3><svg class="chevron w-4 h-4 text-gray-400 flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+              <p class="text-[12px] sm:text-[13px] leading-relaxed text-gray-500 mb-3">Your research podcast is converted into a video and uploaded for easy sharing and playback.</p>
+              <div class="flex items-center gap-1.5 mb-2.5"><div class="relative w-6 h-6 rounded-md bg-gray-50 border border-gray-200 flex items-center justify-center"><svg width="14" height="14" viewBox="0 0 28 28"><rect width="28" height="20" y="4" rx="5" fill="#FF0000"/><polygon points="11,9 11,19 20,14" fill="white"/></svg><div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:#FF0000"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div></div></div>
+              <div class="flex flex-wrap items-center gap-1"><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Video</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Shareable</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-purple-50 text-purple-600 border border-purple-100">5–10 min</span></div>
+              <div class="card-details"><div class="mt-3 pt-3 border-t border-gray-100"><ul class="space-y-1"><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Audio converted to shareable video format</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Uploaded as unlisted for privacy</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Link included in your final report</li></ul></div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Phase 5 (left) -->
+        <div class="phase-row left">
+          <div>
+            <div data-card data-glow-card class="bg-white rounded-xl border border-gray-200 p-4 sm:p-5 cursor-pointer hover:shadow-md hover:border-gray-300 relative z-10" style="transition:box-shadow .4s ease,transform .4s ease">
+              <div class="flex items-start justify-between gap-2 mb-2"><h3 class="text-[14px] sm:text-[15px] font-semibold text-gray-900 leading-tight">Report &amp; Notification</h3><svg class="chevron w-4 h-4 text-gray-400 flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+              <p class="text-[12px] sm:text-[13px] leading-relaxed text-gray-500 mb-3">You receive a comprehensive report with the highest quality insights, along with a podcast and links to every agent used.</p>
+              <div class="flex items-center gap-1.5 mb-2.5"><div class="relative w-6 h-6 rounded-md bg-gray-50 border border-gray-200 flex items-center justify-center"><svg width="14" height="14" viewBox="0 0 28 28"><path d="M6 2h10l8 8v16a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2z" fill="#4285F4"/><path d="M16 2v8h8" fill="#A1C2FA"/><line x1="8" y1="15" x2="20" y2="15" stroke="white" stroke-width="1" opacity="0.6"/><line x1="8" y1="18" x2="16" y2="18" stroke="white" stroke-width="1" opacity="0.6"/><line x1="8" y1="21" x2="18" y2="21" stroke="white" stroke-width="1" opacity="0.6"/></svg><div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:#4285F4"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div></div><div class="relative w-6 h-6 rounded-md bg-gray-50 border border-gray-200 flex items-center justify-center"><svg width="14" height="14" viewBox="0 0 28 28"><rect x="2" y="5" width="24" height="18" rx="3" fill="white" stroke="#EA4335" stroke-width="1"/><path d="M3 7l11 7.5L25 7" stroke="#EA4335" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg><div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:#EA4335"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div></div></div>
+              <div class="flex flex-wrap items-center gap-1"><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Report</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">Email</span><span class="px-1.5 py-px rounded text-[9px] font-medium bg-purple-50 text-purple-600 border border-purple-100">2–5 min</span></div>
+              <div class="card-details"><div class="mt-3 pt-3 border-t border-gray-100"><ul class="space-y-1"><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Google Doc hub with all findings and links</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Email notification with report + podcast</li><li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>Links to each agent for follow-up questions</li></ul></div></div>
+            </div>
+          </div>
+          <div class="flex flex-col items-center pt-2 sm:pt-4"><div class="w-7 h-7 sm:w-9 sm:h-9 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-[9px] sm:text-xs shadow-sm flex-shrink-0">5</div><div class="w-px flex-1 bg-gradient-to-b from-blue-200 to-transparent min-h-[16px]"></div></div>
+          <div></div>
+        </div>
+      </div>
+
+      <!-- Bottom Authenticate card -->
+      <div class="px-5 pb-6 pt-2 max-w-sm mx-auto">
+        <div data-glow-card class="rounded-2xl border border-gray-200 p-6 text-center bg-white" style="transition:box-shadow .4s ease,transform .4s ease">
+          <h2 class="text-[16px] font-bold text-gray-900 mb-1">Start Your Research</h2>
+          <p class="text-[11px] text-gray-500 mb-4">One topic. Three AI agents. Complete research package.</p>
+          <button data-auth class="w-full flex items-center justify-center gap-3 px-6 py-3 rounded-xl bg-gray-900 text-white font-medium text-[14px] hover:bg-gray-800 cursor-pointer transition-colors" style="background:#0f1730">
+            <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+              <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 01-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z" fill="#4285F4"/>
+              <path d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 009 18z" fill="#34A853"/>
+              <path d="M3.964 10.71A5.41 5.41 0 013.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.997 8.997 0 000 9c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
+              <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
+            </svg>
+            <span data-auth-label>Authenticate</span>
+          </button>
+
+          <!-- TOTP MFA step (hidden until needed) -->
+          <div id="step-totp" class="hidden mt-4">
+            <p class="text-[11px] text-gray-500 mb-2">Enter the 6-digit code from your authenticator app.</p>
+            <input id="totp-code" inputmode="numeric" maxlength="6" placeholder="------" autocomplete="one-time-code"
+              class="w-full text-center tracking-[8px] text-[18px] py-2.5 rounded-xl border border-gray-300 bg-gray-50 text-gray-900 outline-none" />
+            <button id="btn-totp" class="w-full mt-2 px-6 py-2.5 rounded-xl text-white font-medium text-[13px]" style="background:linear-gradient(135deg,#3b82f6,#6366f1)">Verify</button>
+          </div>
+
+          <div id="status" class="text-[12px] mt-3 leading-relaxed min-h-[18px]"></div>
+
+          <p class="text-[11px] text-gray-400 mt-3 leading-relaxed">
+            For pipeline setup, use:
+            <a href="https://github.com/dg-eng/super-research-backend" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 text-gray-600 hover:text-gray-900 font-medium transition-colors">
+              <svg width="14" height="14" viewBox="0 0 98 96" class="flex-shrink-0" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M48.854 0C21.839 0 0 22 0 49.217c0 21.756 13.993 40.172 33.405 46.69 2.427.49 3.316-1.059 3.316-2.362 0-1.141-.08-5.052-.08-9.127-13.59 2.934-16.42-5.867-16.42-5.867-2.184-5.704-5.42-7.17-5.42-7.17-4.448-3.015.324-3.015.324-3.015 4.934.326 7.523 5.052 7.523 5.052 4.367 7.496 11.404 5.378 14.235 4.074.404-3.178 1.699-5.378 3.074-6.6-10.839-1.141-22.243-5.378-22.243-24.283 0-5.378 1.94-9.778 5.014-13.2-.485-1.222-2.184-6.275.486-13.038 0 0 4.125-1.304 13.426 5.052a46.97 46.97 0 0 1 12.214-1.63c4.125 0 8.33.571 12.213 1.63 9.302-6.356 13.427-5.052 13.427-5.052 2.67 6.763.97 11.816.485 13.038 3.155 3.422 5.015 7.822 5.015 13.2 0 18.905-11.404 23.06-22.324 24.283 1.78 1.548 3.316 4.481 3.316 9.126 0 6.6-.08 11.897-.08 13.526 0 1.304.89 2.853 3.316 2.364 19.412-6.52 33.405-24.935 33.405-46.691C97.707 22 75.788 0 48.854 0z"/></svg>
+              GitHub
+            </a>
+          </p>
+        </div>
+      </div>
+
+      <!-- Accessible from — the channels your agent is reachable on (via your Hermes runtime) -->
+      <div class="px-5 pb-12 pt-1 max-w-sm mx-auto">
+        <div class="channels" aria-label="Accessible from">
+          <span class="ch-cap">Accessible from</span>
+          <span class="ch" title="WhatsApp"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.04 2c-5.46 0-9.91 4.45-9.91 9.91 0 1.75.46 3.45 1.32 4.95L2 22l5.25-1.38a9.9 9.9 0 0 0 4.79 1.22h.01c5.46 0 9.91-4.45 9.91-9.91S17.5 2 12.04 2zm0 18.15a8.2 8.2 0 0 1-4.19-1.15l-.3-.18-3.12.82.83-3.04-.2-.31a8.2 8.2 0 0 1-1.26-4.39c0-4.54 3.7-8.23 8.24-8.23a8.18 8.18 0 0 1 8.23 8.24c0 4.54-3.69 8.23-8.23 8.23zm4.52-6.16c-.25-.12-1.47-.72-1.69-.81-.23-.08-.39-.12-.56.13-.16.25-.64.81-.78.97-.14.16-.29.18-.54.06-.25-.12-1.05-.39-1.99-1.23-.74-.66-1.23-1.47-1.38-1.72-.14-.25-.02-.38.11-.51.11-.11.25-.29.37-.43.12-.14.16-.25.25-.41.08-.16.04-.31-.02-.43-.06-.12-.56-1.34-.76-1.84-.2-.48-.4-.42-.56-.43h-.48c-.16 0-.43.06-.66.31-.22.25-.86.85-.86 2.07 0 1.22.89 2.4 1.01 2.56.12.16 1.75 2.67 4.23 3.74.59.26 1.05.41 1.41.52.59.19 1.13.16 1.56.1.48-.07 1.47-.6 1.68-1.18.21-.58.21-1.07.14-1.18-.06-.1-.22-.16-.47-.28z"/></svg></span>
+          <span class="ch" title="Telegram"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21.94 4.3 18.6 19.2c-.25 1.1-.9 1.37-1.83.85l-5.05-3.72-2.44 2.35c-.27.27-.5.5-1.02.5l.36-5.14L17.99 6.1c.4-.36-.09-.56-.62-.2L6.61 12.73l-4.95-1.55c-1.08-.34-1.1-1.08.23-1.6L20.55 2.7c.9-.34 1.68.2 1.39 1.6z"/></svg></span>
+          <span class="ch" title="iMessage"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 5.94 2 10.8c0 2.77 1.46 5.24 3.74 6.86-.15 1.2-.6 2.36-1.3 3.34-.1.15-.02.35.16.36 1.6.06 3.18-.5 4.42-1.5.95.27 1.96.42 2.98.42 5.52 0 10-3.94 10-8.8S17.52 2 12 2z"/></svg></span>
+          <span class="ch" title="Twilio voice (call)"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.62 10.79c1.44 2.83 3.76 5.15 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1C10.07 21 3 13.93 3 5c0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/></svg></span>
+        </div>
+      </div>
     </div>
   </div>
 
-  <!-- Theme toggle + runtime watermark (independent of the Firebase module). -->
+  <!-- ── Icons + phases + timeline render (mirrors the app's LoginScreen) ── -->
   <script>
-    (function () {
-      const root = document.documentElement;
-      const btn = document.getElementById("theme-toggle");
-      const SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
-      const MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-      function render() {
-        const dark = root.getAttribute("data-theme") !== "light";
-        btn.innerHTML = dark ? SUN : MOON;
-        btn.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
-      }
-      render();
-      btn.addEventListener("click", function () {
-        const next = root.getAttribute("data-theme") === "light" ? "dark" : "light";
-        root.setAttribute("data-theme", next);
-        try { localStorage.setItem("super-agent-theme", next); } catch (e) {}
-        render();
-      });
-    })();
+    const ICON = {
+      brief: (s) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none"><rect x="4" y="3" width="16" height="18" rx="2.5" stroke="#3b82f6" stroke-width="1.5" fill="#3b82f6" fill-opacity="0.08"/><rect x="8" y="1" width="8" height="4" rx="1.5" fill="#3b82f6" opacity="0.2" stroke="#3b82f6" stroke-width="1.2"/><line x1="8" y1="10" x2="16" y2="10" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round"/><line x1="8" y1="13.5" x2="14" y2="13.5" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round" opacity="0.7"/><line x1="8" y1="17" x2="11" y2="17" stroke="#3b82f6" stroke-width="1.3" stroke-linecap="round" opacity="0.5"/><circle cx="17.5" cy="5.5" r="1" fill="#6366f1" opacity="0.7"/></svg>`,
+      chatgpt: (s) => `<img src="/icons/chatgpt.png" alt="ChatGPT" style="width:${s}px;height:${s}px;object-fit:cover" class="rounded-[4px]"/>`,
+      gemini: (s) => `<svg width="${s}" height="${s}" viewBox="0 0 28 28"><defs><linearGradient id="gem${s}" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1A73E8"/><stop offset="50%" stop-color="#8E75B2"/><stop offset="100%" stop-color="#D93025"/></linearGradient></defs><path d="M14 2C15.5 9 19 12.5 26 14C19 15.5 15.5 19 14 26C12.5 19 9 15.5 2 14C9 12.5 12.5 9 14 2Z" fill="url(#gem${s})"/></svg>`,
+      claude: (s) => `<img src="/icons/claude.png" alt="Claude" style="width:${s}px;height:${s}px;object-fit:cover;display:block" class="rounded-[4px]"/>`,
+      notebooklm: (s) => `<img src="/icons/notebooklm.png" alt="NotebookLM" style="width:${s}px;height:${s}px;object-fit:cover" class="rounded-[3px] nlm-icon"/>`,
+      youtube: (s) => `<svg width="${s}" height="${s}" viewBox="0 0 28 28"><rect width="28" height="20" y="4" rx="5" fill="#FF0000"/><polygon points="11,9 11,19 20,14" fill="white"/></svg>`,
+      gdocs: (s) => `<svg width="${s}" height="${s}" viewBox="0 0 28 28"><path d="M6 2h10l8 8v16a2 2 0 01-2 2H6a2 2 0 01-2-2V4a2 2 0 012-2z" fill="#4285F4"/><path d="M16 2v8h8" fill="#A1C2FA"/><line x1="8" y1="15" x2="20" y2="15" stroke="white" stroke-width="1" opacity="0.6"/><line x1="8" y1="18" x2="16" y2="18" stroke="white" stroke-width="1" opacity="0.6"/><line x1="8" y1="21" x2="18" y2="21" stroke="white" stroke-width="1" opacity="0.6"/></svg>`,
+      gmail: (s) => `<svg width="${s}" height="${s}" viewBox="0 0 28 28"><rect x="2" y="5" width="24" height="18" rx="3" fill="white" stroke="#EA4335" stroke-width="1"/><path d="M3 7l11 7.5L25 7" stroke="#EA4335" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+    };
+    const CHECK = `<div class="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full flex items-center justify-center" style="background:%C"><svg width="5" height="5" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2L6.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></div>`;
 
-    // Runtime watermark — the symbol of the runtime being connected (Hermes /
-    // OpenClaw), set by ?runtime=… (which `agent connect` will pass). With no
-    // runtime, nothing shows. It glows once connected (see /status check below).
-    (function () {
-      const wm = document.getElementById("rt-watermark");
-      if (!wm) return;
-      // Hermes — staff of Hermes / caduceus (winged staff + entwined snakes).
-      const HERMES = '<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="50" cy="14" r="3.5"/><line x1="50" y1="18" x2="50" y2="90"/><path d="M50 28 C 42 24 32 24 22 30 C 32 30 38 32 44 36"/><path d="M50 28 C 58 24 68 24 78 30 C 68 30 62 32 56 36"/><path d="M50 34 C 40 40 40 50 50 56 C 60 62 60 72 50 78"/><path d="M50 34 C 60 40 60 50 50 56 C 40 62 40 72 50 78"/></svg>';
-      // OpenClaw — an open pincer / claw.
-      const OPENCLAW = '<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 84 C 30 70 40 64 48 60"/><path d="M48 60 C 40 46 48 32 66 30 C 58 38 58 48 64 56"/><path d="M48 60 C 56 70 72 72 86 64 C 76 60 70 56 64 56"/><circle cx="48" cy="60" r="2.5"/></svg>';
-      const MAP = { hermes: { svg: HERMES, glow: "#3b82f6" }, openclaw: { svg: OPENCLAW, glow: "#8b5cf6" } };
-      let rt = "";
-      try { rt = (new URLSearchParams(location.search).get("runtime") || "").toLowerCase(); } catch (e) {}
-      const pick = MAP[rt];
-      if (pick) { wm.innerHTML = pick.svg; wm.style.setProperty("--rt-glow", pick.glow); }
-    })();
+    const phases = [
+      { id:0, title:"Submit Your Topic", duration:"Instant", description:"Enter a high-level research topic. It will be automatically converted into a structured research plan.", tags:["Any Topic","Instant"], services:[], details:["Type any research topic — broad or specific","Customize which steps and agents to include","Pipeline starts automatically"] },
+      { id:1, title:"Research Brief", duration:"10–25 min", description:"Your high-level topic is converted into a detailed research brief that guides the best research agents on the market.", tags:["AI-Powered","Deep Analysis"], services:[{icon:"brief",label:"Brief",color:"#3b82f6"}], prompt:"Please create a detailed research report brief for a deep research agent that covers this topic: [YOUR_TOPIC]. Be as thorough as you can.", details:["Submit any research topic — broad or specific","AI generates a comprehensive research plan","Brief drives all three research agents"] },
+      { id:2, title:"Parallel Deep Research", duration:"15–45 min", description:"Three leading AI research agents work simultaneously on your topic. Total time equals the slowest — not the sum.", tags:["3 Agents","Parallel"], agents:[{name:"ChatGPT",sub:"Deep Research + Web",color:"#10a37f",icon:"chatgpt"},{name:"Gemini",sub:"Advanced Research",color:"#7d6a9e",icon:"gemini"},{name:"Claude",sub:"Extended Thinking",color:"#D97706",icon:"claude"}], details:["Three agents research your topic independently","Each produces a comprehensive report with sources","If one agent fails, the others continue"] },
+      { id:3, title:"Synthesis & Podcast", duration:"10–20 min", description:"All research reports are synthesized together. A podcast-style audio overview is generated for easy listening.", tags:["Synthesis","Audio Overview"], services:[{icon:"notebooklm",label:"NotebookLM",color:"#8B5CF6"}], details:["Reports combined into a single knowledge base","Podcast-style audio discussion generated","Covers key findings from all perspectives"] },
+      { id:4, title:"Video & Upload", duration:"5–10 min", description:"Your research podcast is converted into a video and uploaded for easy sharing and playback.", tags:["Video","Shareable"], services:[{icon:"youtube",label:"YouTube",color:"#FF0000"}], details:["Audio converted to shareable video format","Uploaded as unlisted for privacy","Link included in your final report"] },
+      { id:5, title:"Report & Notification", duration:"2–5 min", description:"You receive a comprehensive report with the highest quality insights, along with a podcast and links to every agent used.", tags:["Report","Email"], services:[{icon:"gdocs",label:"Report",color:"#4285F4"},{icon:"gmail",label:"Email",color:"#EA4335"}], details:["Google Doc hub with all findings and links","Email notification with report + podcast","Links to each agent for follow-up questions"] },
+    ];
 
-    function markConnected() {
-      const wm = document.getElementById("rt-watermark");
-      if (wm) wm.classList.add("connected");
+    const esc = (t) => String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    function tagsHTML(p) {
+      let h = '<div class="flex flex-wrap items-center gap-1">';
+      for (const t of p.tags) h += `<span class="px-1.5 py-px rounded text-[9px] font-medium bg-blue-50 text-blue-600 border border-blue-100">${esc(t)}</span>`;
+      h += `<span class="px-1.5 py-px rounded text-[9px] font-medium bg-purple-50 text-purple-600 border border-purple-100">${esc(p.duration)}</span></div>`;
+      return h;
     }
-    window.__markConnected = markConnected;
+    function detailsHTML(p) {
+      let h = '<div class="card-details"><div class="mt-3 pt-3 border-t border-gray-100"><ul class="space-y-1">';
+      for (const d of p.details) h += `<li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>${esc(d)}</li>`;
+      return h + '</ul></div></div>';
+    }
+    const chevron = `<svg class="chevron w-4 h-4 text-gray-400 flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>`;
+    function cardContent(p) {
+      let svc = "";
+      if (p.services && p.services.length) {
+        svc = '<div class="flex items-center gap-1.5 mb-2.5">';
+        for (const s of p.services) svc += `<div class="relative w-6 h-6 rounded-md bg-gray-50 border border-gray-200 flex items-center justify-center">${ICON[s.icon](14)}${CHECK.replace("%C", s.color||"#3b82f6")}</div>`;
+        svc += '</div>';
+      }
+      let pr = "";
+      if (p.prompt) pr = `<div class="mt-3 p-3 rounded-lg bg-gray-900 font-mono text-[10px] leading-relaxed"><span style="color:rgba(52,211,153,0.7)">&gt; </span><span style="color:#7dd3fc" class="type" data-text="${esc(p.prompt)}"></span></div>`;
+      return `<div data-card class="bg-white rounded-xl border border-gray-200 p-4 sm:p-5 cursor-pointer hover:shadow-md hover:border-gray-300 relative z-10" data-glow-card style="transition:box-shadow .4s ease,transform .4s ease">
+        <div class="flex items-start justify-between gap-2 mb-2"><h3 class="text-[14px] sm:text-[15px] font-semibold text-gray-900 leading-tight">${esc(p.title)}</h3>${chevron}</div>
+        <p class="text-[12px] sm:text-[13px] leading-relaxed text-gray-500 mb-3">${esc(p.description)}</p>
+        ${svc}${tagsHTML(p)}${pr}${detailsHTML(p)}</div>`;
+    }
+    function phaseCard(p, index) {
+      const isLeft = index % 2 === 0;
+      const dot = `<div class="flex flex-col items-center pt-2 sm:pt-4"><div class="w-7 h-7 sm:w-9 sm:h-9 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-[9px] sm:text-xs shadow-sm flex-shrink-0">${p.id}</div><div class="w-px flex-1 bg-gradient-to-b from-blue-200 to-transparent min-h-[16px]"></div></div>`;
+      const cols = isLeft ? "grid-cols-[1fr_28px_minmax(0,0.3fr)] sm:grid-cols-[1fr_48px_1fr]" : "grid-cols-[minmax(0,0.3fr)_28px_1fr] sm:grid-cols-[1fr_48px_1fr]";
+      return `<div class="grid gap-x-2 sm:gap-x-5 mb-6 sm:mb-8 items-start ${cols}">${isLeft ? `<div>${cardContent(p)}</div>` : '<div></div>'}${dot}${!isLeft ? `<div>${cardContent(p)}</div>` : '<div></div>'}</div>`;
+    }
+    function parallelPhase() {
+      const p = phases.find(x => x.id === 2);
+      let cards = '<div class="flex justify-center gap-3 max-w-md mx-auto px-2">';
+      for (const a of p.agents) cards += `<div data-glow-card class="bg-white border border-gray-200 rounded-xl p-3 sm:p-4 text-center flex-1 min-w-0 hover:shadow-md relative z-10" style="transition:box-shadow .4s ease,transform .4s ease"><div class="relative w-10 h-10 sm:w-11 sm:h-11 mx-auto mb-1.5 rounded-lg flex items-center justify-center" style="background:${a.color}0d;border:1px solid ${a.color}20">${ICON[a.icon](20)}${CHECK.replace("%C", a.color)}</div><h4 class="text-[11px] sm:text-[12px] font-semibold text-gray-800 truncate">${esc(a.name)}</h4><p class="text-[9px] text-gray-400 leading-tight hidden sm:block">${esc(a.sub)}</p></div>`;
+      cards += '</div>';
+      return `<div class="pp mb-6 sm:mb-8 relative"><div class="text-center mb-4"><div class="w-7 h-7 sm:w-9 sm:h-9 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white font-bold text-[9px] sm:text-xs mx-auto mb-2 shadow-sm">2</div><h3 class="text-[15px] sm:text-[16px] font-bold text-gray-900 mb-1">${esc(p.title)}</h3><p class="text-[12px] sm:text-[13px] max-w-md mx-auto mb-2 text-gray-500">${esc(p.description)}</p><div class="flex items-center justify-center gap-2"><span class="px-1.5 py-px rounded text-[9px] font-medium bg-purple-50 text-purple-600 border border-purple-100">${esc(p.duration)}</span><button class="pp-toggle inline-flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-medium bg-gray-100 text-gray-500 hover:text-gray-700 transition-colors">Details ${chevron}</button></div></div>${cards}<div class="pp-details overflow-hidden max-w-md mx-auto" style="max-height:0;opacity:0;transition:max-height .25s ease,opacity .2s ease"><div class="mt-3 p-4 bg-gray-50 border border-gray-100 rounded-xl"><ul class="space-y-1">${p.details.map(d => `<li class="flex items-start gap-2 text-[10px] sm:text-[11px] text-gray-500 leading-relaxed"><span class="w-1 h-1 rounded-full bg-blue-400 mt-1.5 flex-shrink-0"></span>${esc(d)}</li>`).join("")}</ul></div></div></div>`;
+    }
+    // The timeline is STATIC HTML now (above) — Tailwind styles it on load. Just wire interactions.
+    (function timelineInteractions() {
+      const tl = document.getElementById("timeline");
+      tl.querySelectorAll("[data-card]").forEach(c => c.addEventListener("click", () => c.classList.toggle("expanded")));
+      tl.querySelectorAll(".pp-toggle").forEach(b => b.addEventListener("click", () => b.closest(".pp").classList.toggle("expanded")));
+      const io = new IntersectionObserver((entries) => {
+        entries.forEach(e => {
+          if (!e.isIntersecting || e.target.dataset.done) return;
+          e.target.dataset.done = "1";
+          const text = e.target.dataset.text || ""; let i = 0;
+          const t = setInterval(() => { i++; e.target.textContent = text.slice(0, i); if (i >= text.length) clearInterval(t); }, 20);
+        });
+      }, { threshold: 0.3 });
+      tl.querySelectorAll(".type").forEach(t => io.observe(t));
+    })();
   </script>
 
+  <!-- ── Theme toggle + runtime watermark ── -->
+  <script>
+    // Follow the app's login theme (set from the app's settings page). Same-origin
+    // gets live updates; the local fallback defaults to the app default (light).
+    (function () {
+      const root = document.getElementById("login-root");
+      function read() { try { return localStorage.getItem("dg-login-theme") === "Dark" ? "dark" : "light"; } catch (e) { return "light"; } }
+      function apply(t) { root.setAttribute("data-login-theme", t); document.documentElement.setAttribute("data-login-theme", t); }
+      apply(read());
+      window.addEventListener("dg-login-theme-changed", () => apply(read()));
+      window.addEventListener("storage", (e) => { if (e.key === "dg-login-theme") apply(read()); });
+    })();
+
+    (function () {
+      const wm = document.getElementById("rt-watermark");
+      const HERMES = '<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="50" cy="14" r="3.5"/><line x1="50" y1="18" x2="50" y2="90"/><path d="M50 28 C 42 24 32 24 22 30 C 32 30 38 32 44 36"/><path d="M50 28 C 58 24 68 24 78 30 C 68 30 62 32 56 36"/><path d="M50 34 C 40 40 40 50 50 56 C 60 62 60 72 50 78"/><path d="M50 34 C 60 40 60 50 50 56 C 40 62 40 72 50 78"/></svg>';
+      const OPENCLAW = '<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 84 C 30 70 40 64 48 60"/><path d="M48 60 C 40 46 48 32 66 30 C 58 38 58 48 64 56"/><path d="M48 60 C 56 70 72 72 86 64 C 76 60 70 56 64 56"/><circle cx="48" cy="60" r="2.5"/></svg>';
+      const MAP = { hermes: { svg: HERMES, glow: "#3b82f6" }, openclaw: { svg: OPENCLAW, glow: "#8b5cf6" } };
+      function set(name) { const p = MAP[(name || "").toLowerCase()]; if (p) { wm.innerHTML = p.svg; wm.style.setProperty("--rt-glow", p.glow); return true; } return false; }
+      let explicit = false;
+      try { if (set(new URLSearchParams(location.search).get("runtime") || "")) explicit = true; } catch (e) {}
+      if (!explicit) set("hermes");  // always show a symbol (Hermes by default)
+      window.__setRuntime = function (name) { if (!explicit) set(name); };  // bridge reflects the connected runtime
+    })();
+    window.__markConnected = function () { const wm = document.getElementById("rt-watermark"); if (wm) wm.classList.add("connected"); };
+  </script>
+
+  <!-- ── Scroll-dot (mirrors the app's timeline dot + card depth) ── -->
+  <script>
+    (function () {
+      const scroller = document.getElementById("login-root");
+      const dot = document.getElementById("scroll-dot");
+      if (!scroller || !dot) return;
+      let raf;
+      function tick() {
+        const cards = Array.from(scroller.querySelectorAll("[data-glow-card]"));
+        if (!cards.length) return;
+        const firstRect = cards[0].getBoundingClientRect();
+        const lastRect = cards[cards.length - 1].getBoundingClientRect();
+        const screenStart = firstRect.top, screenEnd = lastRect.top, screenRange = screenEnd - screenStart;
+        const maxScroll = scroller.scrollHeight - scroller.clientHeight;
+        if (maxScroll <= 0) return;
+        const scrollPct = scroller.scrollTop / maxScroll;
+        const dotScreenY = screenStart + scrollPct * screenRange;
+        dot.style.top = (dotScreenY + scroller.scrollTop) + "px";
+        dot.style.transform = "translate(-50%,0)";
+        dot.style.opacity = (dotScreenY >= firstRect.top - 20 && dotScreenY <= lastRect.top + 20) ? "1" : "0";
+        cards.forEach(card => {
+          const r = card.getBoundingClientRect(); const mid = r.top + r.height / 2;
+          const dist = Math.abs(dotScreenY - mid); const threshold = Math.max(r.height, 100);
+          const prox = Math.max(0, 1 - dist / threshold);
+          if (prox > 0.05) { const s = prox * 8; card.style.boxShadow = `0 ${s}px ${s*2.5}px rgba(0,0,0,${(0.03+prox*0.05).toFixed(3)})`; card.style.transform = `translateY(${(-prox*1.5).toFixed(1)}px)`; }
+          else { card.style.boxShadow = ""; card.style.transform = ""; }
+        });
+      }
+      scroller.addEventListener("scroll", () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(tick); }, { passive: true });
+      requestAnimationFrame(tick);
+    })();
+  </script>
+
+  <!-- ── Firebase auth (Google sign-in → bridge), dup-account detection, TOTP MFA ── -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
     import {
@@ -264,34 +439,25 @@
     } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
     const statusEl = document.getElementById("status");
-    const stepGoogle = document.getElementById("step-google");
     const stepTotp = document.getElementById("step-totp");
-    const btnGoogle = document.getElementById("btn-google");
     const btnTotp = document.getElementById("btn-totp");
-
-    const setStatus = (msg, cls = "") => { statusEl.innerHTML = msg; statusEl.className = "status " + cls; };
-    const busy = (msg) => setStatus('<span class="spinner"></span>' + msg, "muted");
+    const authBtns = Array.from(document.querySelectorAll("[data-auth]"));
+    const setStatus = (msg, kind = "") => {
+      const color = kind === "ok" ? "#16a34a" : kind === "err" ? "#ef4444" : "#7b87a3";
+      statusEl.innerHTML = msg; statusEl.style.color = color;
+    };
+    const busy = (m) => setStatus('<span class="spinner"></span>' + m);
     const provider = () => new GoogleAuthProvider();
+    const disableAuth = (v) => authBtns.forEach(b => { b.disabled = v; b.style.opacity = v ? .55 : 1; });
 
-    let auth, resolver = null, loginToken = "";
+    let auth, resolver = null, loginToken = "", authedUid = "", authedEmail = "";
 
-    function showTotpStep() {
-      stepGoogle.classList.add("hidden");
-      stepTotp.classList.remove("hidden");
-      setStatus("Two-factor required.", "muted");
-    }
-    function backToGoogle() {
-      resolver = null;
-      stepTotp.classList.add("hidden");
-      stepGoogle.classList.remove("hidden");
-      btnGoogle.disabled = false;
-    }
     function handleMaybeMfa(e) {
       if (e && e.code === "auth/multi-factor-auth-required") {
         resolver = getMultiFactorResolver(auth, e);
         const totp = resolver.hints.find((h) => h.factorId === TotpMultiFactorGenerator.FACTOR_ID);
-        if (!totp) { setStatus("This account uses a non-TOTP second factor, not yet supported here. Tell your operator.", "err"); return true; }
-        showTotpStep();
+        if (!totp) { setStatus("This account uses a non-TOTP second factor, not yet supported here.", "err"); return true; }
+        stepTotp.classList.remove("hidden"); setStatus("Two-factor required.");
         return true;
       }
       return false;
@@ -300,85 +466,64 @@
     async function init() {
       const cfg = await (await fetch("/login/config")).json();
       loginToken = cfg.loginToken || "";
+      if (cfg.runtime) window.__setRuntime(cfg.runtime);  // reflect the connected runtime's symbol
       auth = getAuth(initializeApp(cfg));
-      // Reflect the live connection state (so a reload shows the glow).
       try {
         const s = await (await fetch("/status")).json();
         if (s && s.authed) {
-          setStatus("✓ Connected as " + (s.email || s.uid) + ". You can close this window.", "ok");
+          authedUid = s.uid || ""; authedEmail = s.email || "";
+          setStatus("✓ Authenticated as " + (s.email || s.uid) + ". You can close this window.", "ok");
           window.__markConnected();
         }
       } catch (e) {}
-      // Complete a redirect-based sign-in if we came back from one.
-      try {
-        const result = await getRedirectResult(auth);
-        if (result && result.user) { await deliver(result.user); }
-      } catch (e) {
-        if (!handleMaybeMfa(e)) setStatus("Sign-in failed: " + (e?.code || e?.message || e), "err");
-      }
+      try { const r = await getRedirectResult(auth); if (r && r.user) await deliver(r.user); }
+      catch (e) { if (!handleMaybeMfa(e)) setStatus("Authentication failed: " + (e?.code || e?.message || e), "err"); }
     }
 
     async function deliver(user) {
-      busy("Connecting your agent…");
+      // Same account already authenticated on this bridge → tell the user, don't re-capture.
+      if (authedUid && user.uid === authedUid) {
+        setStatus("This account has already been authenticated.", "ok");
+        window.__markConnected(); disableAuth(true); return;
+      }
+      busy("Authenticating your agent…");
       const idToken = await user.getIdToken();
       const res = await user.getIdTokenResult();
       const expiresIn = Math.max(60, Math.floor((new Date(res.expirationTime).getTime() - Date.now()) / 1000));
       const resp = await fetch("/login/callback", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          loginToken,
-          refreshToken: user.refreshToken,
-          idToken, uid: user.uid, email: user.email || "", expiresIn,
-        }),
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ loginToken, refreshToken: user.refreshToken, idToken, uid: user.uid, email: user.email || "", expiresIn }),
       });
       if (!resp.ok) { setStatus("Bridge rejected the session: " + (await resp.text()), "err"); return; }
-      setStatus("✓ Connected as " + (user.email || user.uid) + ". You can close this window.", "ok");
-      btnGoogle.disabled = true; btnTotp.disabled = true;
-      window.__markConnected();  // runtime symbol warms + glows
+      authedUid = user.uid; authedEmail = user.email || "";
+      setStatus("✓ Authenticated as " + (user.email || user.uid) + ". You can close this window.", "ok");
+      disableAuth(true); window.__markConnected();
     }
 
-    btnGoogle.addEventListener("click", async () => {
-      btnGoogle.disabled = true;
-      busy("Opening Google sign-in…");
-      try {
-        const result = await signInWithPopup(auth, provider());
-        await deliver(result.user);
-      } catch (e) {
+    async function startAuth() {
+      disableAuth(true); busy("Opening Google sign-in…");
+      try { const result = await signInWithPopup(auth, provider()); await deliver(result.user); }
+      catch (e) {
         const code = e && e.code;
-        if (handleMaybeMfa(e)) {
-          return;
-        } else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
-          setStatus("");
-          btnGoogle.disabled = false;
-        } else if (code === "auth/popup-blocked") {
-          busy("Popup blocked — redirecting to Google…");
-          await signInWithRedirect(auth, provider());
-        } else {
-          setStatus("Sign-in failed: " + (code || e?.message || e), "err");
-          btnGoogle.disabled = false;
-        }
+        if (handleMaybeMfa(e)) return;
+        else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") { setStatus(""); disableAuth(false); }
+        else if (code === "auth/popup-blocked") { busy("Popup blocked — redirecting to Google…"); await signInWithRedirect(auth, provider()); }
+        else { setStatus("Authentication failed: " + (code || e?.message || e), "err"); disableAuth(false); }
       }
-    });
+    }
+    authBtns.forEach(b => b.addEventListener("click", startAuth));
 
     btnTotp.addEventListener("click", async () => {
       const code = document.getElementById("totp-code").value.trim();
       if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code.", "err"); return; }
-      btnTotp.disabled = true;
-      busy("Verifying…");
+      btnTotp.disabled = true; busy("Verifying…");
       try {
         const totp = resolver.hints.find((h) => h.factorId === TotpMultiFactorGenerator.FACTOR_ID);
-        const assertion = TotpMultiFactorGenerator.assertionForSignIn(totp.uid, code);
-        const cred = await resolver.resolveSignIn(assertion);
+        const cred = await resolver.resolveSignIn(TotpMultiFactorGenerator.assertionForSignIn(totp.uid, code));
         await deliver(cred.user);
       } catch (e) {
-        if (e && e.code === "auth/invalid-verification-code") {
-          setStatus("Wrong code — try again.", "err");
-          btnTotp.disabled = false;
-        } else {
-          setStatus("Two-factor session expired — start again.", "err");
-          backToGoogle();
-        }
+        if (e && e.code === "auth/invalid-verification-code") { setStatus("Wrong code — try again.", "err"); btnTotp.disabled = false; }
+        else { setStatus("Two-factor session expired — start again.", "err"); stepTotp.classList.add("hidden"); disableAuth(false); }
       }
     });
 
