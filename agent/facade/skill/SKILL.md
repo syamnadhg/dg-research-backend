@@ -4,7 +4,7 @@ description: >-
   Run Super Research from chat. Use when the user asks to research a topic, run
   a deep-research report, generate a brief / podcast / audio overview / video on
   a subject, or to check, track, list, or cancel a Super Research run — or types
-  /login, /logout, /device, /research, /status, /cancel, or /help. Drives the
+  /login, /logout, /device, /research, /status, /podcast, /cancel, or /help. Drives the
   user's own Super Research account (research-only) on their existing devices;
   every run shows up in their web app as a normal chat.
 ---
@@ -35,6 +35,7 @@ user the host bridge isn't running and stop.
 | `/device use <id>` | `sr.py device-use <id>` | Relay. |
 | `/research <topic>` | `sr.py research "<topic>"` | Relay the run id, then **stream** (below). |
 | `/status [id]` | `sr.py status [id]` | Relay status + links. |
+| `/podcast [id]` | `sr.py podcast [id]` | It prints a local **file path**. **Attach that file as a native audio / voice message** titled with the run's title — do **not** paste the path (or any URL) into chat. No id = the most recent run. If it says the audio isn't ready, relay that and try again later. |
 | `/skip <id> <phases>` | `sr.py skip <id> <phases>` | Offer the skippable phases (Brief=1, Podcast=3, Video=4, Report=5), then run it. Takes effect when each phase is reached. |
 | `/cancel <id>` | `sr.py cancel <id>` | **Confirm with the user first**, then run it. |
 | `/help` | — | Summarize these commands. |

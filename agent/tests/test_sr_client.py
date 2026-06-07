@@ -111,6 +111,27 @@ def test_research_then_status(bridge_port, capsys):
     assert "Tesla 2025" in capsys.readouterr().out
 
 
+def test_podcast(bridge_port, monkeypatch, capsys):
+    FakeFS.researches["agent-p"] = {
+        "id": "agent-p", "title": "My Podcast Run", "status": "completed",
+        "links": {"audio_file": {"url": "https://firebasestorage.googleapis.com/v0/b/x/o/"
+                                        "audio%2Fu%2Fr%2Fov.m4a?alt=media&token=zzz", "phase": 3}},
+    }
+    monkeypatch.setattr(bridge, "_download_podcast_audio",
+                        lambda url, dest_dir, rid: (dest_dir / f"{rid}.m4a", 2048))
+    assert sr.main(["podcast", "agent-p"]) == 0
+    out = capsys.readouterr().out
+    assert "Podcast ready" in out and "My Podcast Run" in out
+    assert "agent-p.m4a" in out
+    assert "token=" not in out  # no tokenized URL leaks into chat
+
+
+def test_podcast_not_ready(bridge_port, capsys):
+    FakeFS.researches["agent-q"] = {"id": "agent-q", "status": "ongoing", "links": {}}
+    assert sr.main(["podcast", "agent-q"]) == 1  # 409 → non-zero exit
+    assert "isn't ready" in capsys.readouterr().out
+
+
 def test_updates_json(bridge_port, capsys):
     sr.main(["research", "Topic A"])
     capsys.readouterr()

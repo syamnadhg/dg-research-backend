@@ -83,6 +83,9 @@ def live(monkeypatch, mock_fe):
     monkeypatch.setattr(bridge.prefs, "set_selected_device", lambda d, uid: sel.__setitem__("v", d))
     monkeypatch.setattr(bridge.prefs, "clear_selected_device", lambda: sel.__setitem__("v", None))
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
+    # /podcast downloads host-side; fake it so the live HTTP test does no network.
+    monkeypatch.setattr(bridge, "_download_podcast_audio",
+                        lambda url, dest_dir, rid: (dest_dir / f"{rid}.m4a", 1234))
 
     # mock FE broker: start → approve immediately → custom-token exchange
     idt = make_jwt({"user_id": "u1", "email": "you@x.y"})
@@ -145,6 +148,16 @@ def test_full_chat_lifecycle(live, capsys):
     assert sr.main(["--json", "updates"]) == 0
     import json
     assert any(r["runId"] == rid for r in json.loads(capsys.readouterr().out)["runs"])
+
+    # 9b. /podcast → the run's audio resolves to a local file to send as native audio
+    FakeFS.researches[rid]["links"] = {
+        "audio_file": {"url": "https://firebasestorage.googleapis.com/v0/b/x/o/"
+                              "audio%2Fu1%2Fr%2Fov.m4a?alt=media&token=tok", "phase": 3}
+    }
+    assert sr.main(["podcast", rid]) == 0
+    pod_out = capsys.readouterr().out
+    assert "Podcast ready" in pod_out and f"{rid}.m4a" in pod_out
+    assert "token=" not in pod_out  # the Storage download token never reaches chat
 
     # 10. /skip → tunes the run config
     assert sr.main(["skip", rid, "video", "report"]) == 0

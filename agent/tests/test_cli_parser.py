@@ -69,6 +69,13 @@ def test_runs_parses():
     assert cli.build_parser().parse_args(["runs"]).func is cli.cmd_runs
 
 
+def test_podcast_id_is_optional():
+    a = cli.build_parser().parse_args(["podcast"])
+    assert a.func is cli.cmd_podcast and a.runId is None
+    b = cli.build_parser().parse_args(["podcast", "agent-x"])
+    assert b.runId == "agent-x"
+
+
 def test_watch_id_is_optional():
     a = cli.build_parser().parse_args(["watch"])
     assert a.func is cli.cmd_watch and a.runId is None

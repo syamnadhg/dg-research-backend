@@ -14,6 +14,7 @@ Bound to 127.0.0.1 only; every request is Host- and (for writes) Origin-checked.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -25,6 +26,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
+
+import requests
 
 from . import __version__, config, devicelogin, prefs, runview
 from .devicelogin import DeviceLoginError
@@ -53,6 +56,29 @@ _RID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # buffer so a lying/oversized Content-Length can't pin a worker thread reading
 # into memory before the Host/Origin checks even run.
 _MAX_BODY_BYTES = 1 << 20  # 1 MiB
+
+# Podcast audio (the chat /podcast → a native audio FILE the runtime attaches).
+# The audio is downloaded host-side to ~/.super-agent/podcasts and only the LOCAL
+# PATH is handed back — the long-lived Storage download token never leaves the
+# host (it is not in the response, so it can't land in chat history).
+_PODCAST_DIR_NAME = "podcasts"
+_PODCAST_MAX_BYTES = 200 * 1024 * 1024  # 200 MiB — generous for a long audio overview
+_PODCAST_MAX_AGE_SECONDS = 24 * 60 * 60  # prune cached audio older than a day
+_AUDIO_EXT_MIME = {
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+}
+# Strip only filesystem-hostile chars (Windows-reserved + control); keep unicode
+# letters/digits so a non-Latin run title still yields a meaningful filename.
+_FILENAME_BAD_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+# The fetch target is read from the (account-scoped) research doc, so this is at
+# most self-SSRF — but we still gate the host-side download to the expected
+# Firebase/GCS Storage hosts (and refuse redirects) as defense-in-depth.
+_ALLOWED_AUDIO_HOSTS = frozenset({"firebasestorage.googleapis.com", "storage.googleapis.com"})
+_ALLOWED_AUDIO_HOST_SUFFIXES = (".storage.googleapis.com",)
 
 
 def _new_research_fields(
@@ -89,6 +115,116 @@ def _new_research_fields(
     if cfg:
         fields["pipelineConfig"] = cfg
     return fields
+
+
+def _audio_file_url(links: Any) -> str:
+    """The DIRECT podcast media URL — ``links.audio_file`` (a public Storage .m4a).
+
+    NOT ``links.audio`` / ``links.notebooklm``: those hold the NotebookLM notebook
+    WEB PAGE, not a media file (verified against research.py + firestore.ts).
+    Tolerant of object-valued ({url,…}) and bare-string link entries.
+    """
+    if not isinstance(links, dict):
+        return ""
+    v = links.get("audio_file")
+    if isinstance(v, dict):
+        url = v.get("url")
+        return url if isinstance(url, str) else ""
+    return v if isinstance(v, str) else ""
+
+
+def _audio_ext_and_mime(url: str) -> tuple[str, str]:
+    """Pick a file extension + MIME for a podcast audio URL.
+
+    The Storage object name carries the real extension before the query string
+    (…/audio_overview.m4a?alt=media&token=…); default to .m4a (NotebookLM's Audio
+    Overview format) when none is recognizable.
+    """
+    path = urlsplit(url).path.lower()
+    for ext, mime in _AUDIO_EXT_MIME.items():
+        if path.endswith(ext):
+            return ext, mime
+    return ".m4a", _AUDIO_EXT_MIME[".m4a"]
+
+
+def _safe_filename(title: str, ext: str) -> str:
+    """A human, filesystem-safe audio filename from the run title — the name the
+    user sees on the forwarded audio message. Keeps unicode letters/digits and
+    strips only Windows-reserved / control characters."""
+    cleaned = _FILENAME_BAD_RE.sub("", " ".join((title or "").split())).strip(" .")
+    return (cleaned[:80] or "Podcast") + ext
+
+
+def _is_allowed_audio_url(url: str) -> bool:
+    """True only for an https Firebase/GCS Storage URL. The audio URL comes from
+    the (account-scoped) research doc, so a doctored value is at most self-SSRF —
+    but the host-side fetch is still gated to the expected Storage hosts."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        return False
+    host = parts.hostname.lower()
+    return host in _ALLOWED_AUDIO_HOSTS or host.endswith(_ALLOWED_AUDIO_HOST_SUFFIXES)
+
+
+def _prune_podcast_dir(dest_dir: Path, *, keep_name: str) -> None:
+    """Bound the on-disk podcast cache: drop any file older than
+    ``_PODCAST_MAX_AGE_SECONDS`` (age-only — pruning by run prefix could delete a
+    concurrent download's just-finished file). Best-effort — never raises."""
+    now = time.time()
+    try:
+        entries = list(dest_dir.iterdir())
+    except OSError:
+        return
+    for p in entries:
+        try:
+            # Never touch the keep file or an in-flight .part.
+            if p.name == keep_name or p.suffix == ".part" or not p.is_file():
+                continue
+            if (now - p.stat().st_mtime) > _PODCAST_MAX_AGE_SECONDS:
+                p.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def _download_podcast_audio(url: str, dest_dir: Path, rid: str) -> tuple[Path, int]:
+    """Download a public Storage audio URL to ``dest_dir``; return (path, size).
+
+    Cached by (rid, hash-of-url): the URL fully determines the bytes, so an
+    identical URL is an instant cache hit and a regenerated audio (new URL)
+    writes a fresh file. Streams to a ``.part`` temp then renames, so a partial
+    download is never served. Raises ``ValueError`` if the URL host isn't an
+    allowed Storage host or the response exceeds the size cap, and
+    ``requests.RequestException`` on a transport failure.
+    """
+    if not _is_allowed_audio_url(url):
+        raise ValueError("audio url host not allowed")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ext, _ = _audio_ext_and_mime(url)
+    tag = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+    final = dest_dir / f"{rid}-{tag}{ext}"
+    if final.exists() and final.stat().st_size > 0:
+        return final, final.stat().st_size  # cache hit — same URL ⇒ same bytes
+    _prune_podcast_dir(dest_dir, keep_name=final.name)
+    # A per-attempt unique .part so two concurrent downloads of the SAME run
+    # never write the same temp file (each atomically renames onto `final`).
+    tmp = final.with_name(f"{final.name}.{uuid.uuid4().hex[:8]}.part")
+    size = 0
+    try:
+        with requests.get(url, stream=True, timeout=30, allow_redirects=False) as resp:
+            resp.raise_for_status()
+            with open(tmp, "wb") as fh:
+                for chunk in resp.iter_content(65536):
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    if size > _PODCAST_MAX_BYTES:
+                        raise ValueError("podcast audio exceeds the size cap")
+                    fh.write(chunk)
+        tmp.replace(final)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # never leave a partial .part behind
+        raise
+    return final, size
 
 
 class RemoteFlow:
@@ -169,6 +305,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            # The sign-in page is read fresh from disk per request; never let the
+            # browser serve a stale cached copy while we iterate on it.
+            self.send_header("Cache-Control", "no-store, max-age=0")
             self.end_headers()
             self.wfile.write(data)
 
@@ -239,6 +378,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             elif path == "/login/config":
                 cfg = config.web_config()
                 cfg["loginToken"] = state.login_token
+                cfg["runtime"] = prefs.get_runtime() or ""  # glow the connected runtime's symbol
                 self._json(200, cfg)
             elif path == "/status":
                 self._status()
@@ -250,6 +390,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._device_current()
             elif path == "/updates":
                 self._updates()
+            elif path.startswith("/research/") and path.endswith("/podcast"):
+                self._research_podcast(path[len("/research/"):-len("/podcast")])
             elif path.startswith("/research/"):
                 self._research_status(path[len("/research/"):])
             elif path.startswith("/icons/"):
@@ -661,6 +803,67 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # `events` = the flattened, ordered per-phase links a streamer dedups
             # by kind (the raw `links` map is also returned for full fidelity).
             self._json(200, {"research": doc, "events": runview.flatten_links(doc.get("links"))})
+
+        def _research_podcast(self, rid: str) -> None:
+            """Resolve a run's NotebookLM audio → a local FILE the runtime sends as
+            a native, forwardable audio message (the chat /podcast).
+
+            Native-audio delivery is FILE-based on purpose: every chat channel can
+            attach a local file, and (unlike handing back the URL) the long-lived
+            Storage download token never leaves the host — it is not in the
+            response, so it can't leak into chat history. sr.py stays loopback-only;
+            the bridge (which already owns the network + the session) does the fetch.
+            """
+            rid = rid.strip("/")
+            if not _RID_RE.match(rid):
+                self._json(404, {"error": "run not found"})  # rejects ../, %2f, etc.
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                doc = fs.get_research(sess.uid, rid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            if doc is None:
+                self._json(404, {"error": "run not found"})
+                return
+            audio_url = _audio_file_url(doc.get("links"))
+            if not audio_url:
+                # No media file yet: tell apart "still cooking" from "this run will
+                # never make one" (audio phase skipped / already terminal).
+                if runview.is_terminal(doc.get("status")):
+                    self._json(409, {"error": "this run has no podcast audio (the audio phase didn't produce one)"})
+                else:
+                    self._json(409, {"error": "the podcast audio isn't ready yet — try again once the audio phase finishes"})
+                return
+            title = doc.get("title") or doc.get("topic") or rid
+            ext, mime = _audio_ext_and_mime(audio_url)
+            try:
+                path, size = _download_podcast_audio(
+                    audio_url, config.store_dir() / _PODCAST_DIR_NAME, rid
+                )
+            except (requests.RequestException, ValueError, OSError) as e:
+                # Never log `e`: a requests error message embeds the full tokenized
+                # Storage URL (…?alt=media&token=…). Log only the exception type.
+                log.warning("podcast download failed for %s (%s)", rid, type(e).__name__)
+                self._json(502, {"error": "couldn't fetch the podcast audio — try again"})
+                return
+            log.info("podcast audio ready for %s (%d bytes)", rid, size)
+            self._json(200, {
+                "ready": True,
+                "runId": rid,
+                "title": title,
+                "localPath": str(path),
+                "filename": _safe_filename(title, ext),
+                "mime": mime,
+                "sizeBytes": size,
+            })
 
         def _updates(self) -> None:
             """Account-wide streaming snapshot: recent runs + their current

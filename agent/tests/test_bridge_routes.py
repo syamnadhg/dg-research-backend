@@ -4,7 +4,9 @@ The bridge is the single owner of the session; these routes are what the CLI
 and skill call instead of refreshing the token themselves.
 """
 
+import os
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -17,12 +19,17 @@ from facade import bridge
 class FakeFS:
     last_enqueue = None
     last_upsert = None
+    research_doc = None  # what get_research returns (set per podcast test)
 
     def __init__(self, _token_provider):
         pass
 
     def list_researches(self, uid):
         return [{"id": "r1", "title": "Alpha", "status": "completed"}]
+
+    def get_research(self, uid, rid):
+        d = FakeFS.research_doc
+        return dict(d) if d else None
 
     def list_devices(self, uid):
         return [{"id": "dev1", "name": "PC", "ownerUid": uid}]
@@ -40,6 +47,7 @@ class FakeFS:
 
 @pytest.fixture()
 def live(monkeypatch):
+    FakeFS.research_doc = None
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
     # Isolate the device-selection pref from the real ~/.super-agent/prefs.json.
     sel = {"v": None}
@@ -95,6 +103,76 @@ def test_research_requires_topic(live):
     assert requests.post(base + "/research", json={"topic": "x"}).status_code == 200
 
 
+_M4A = ("https://firebasestorage.googleapis.com/v0/b/x/o/"
+        "audio%2Fu1%2Fr%2Faudio_overview.m4a?alt=media&token=secret-abc")
+
+
+def test_podcast_route_downloads_and_hides_token(live, monkeypatch):
+    base, _ = live
+    FakeFS.research_doc = {
+        "id": "agent-1", "title": "Tesla 2025 Outlook", "status": "completed",
+        "links": {
+            "audio": {"url": "https://notebooklm.google.com/notebook/abc", "label": "Audio Overview"},
+            "audio_file": {"url": _M4A, "label": "Podcast Audio (Storage)", "phase": 3},
+        },
+    }
+    captured = {}
+
+    def fake_dl(url, dest_dir, rid):
+        captured["url"] = url
+        return (dest_dir / f"{rid}-deadbeef.m4a", 4096)
+
+    monkeypatch.setattr(bridge, "_download_podcast_audio", fake_dl)
+    r = requests.get(base + "/research/agent-1/podcast")
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ready"] is True and out["sizeBytes"] == 4096
+    assert out["title"] == "Tesla 2025 Outlook"
+    assert out["filename"] == "Tesla 2025 Outlook.m4a"  # human filename from the title
+    assert out["mime"] == "audio/mp4"
+    assert out["localPath"].endswith("agent-1-deadbeef.m4a")
+    # it resolved links.audio_file (the media file), NOT links.audio (the NLM page)
+    assert "audio_overview.m4a" in captured["url"]
+    # the long-lived Storage download token NEVER leaves the host
+    assert "token=" not in r.text and "audioUrl" not in out
+
+
+def test_podcast_not_ready_409(live):
+    base, _ = live
+    FakeFS.research_doc = {"id": "agent-2", "status": "ongoing", "links": {}}
+    r = requests.get(base + "/research/agent-2/podcast")
+    assert r.status_code == 409
+    assert "isn't ready" in r.json()["error"]
+
+
+def test_podcast_terminal_without_audio_409(live):
+    base, _ = live
+    FakeFS.research_doc = {"id": "agent-3", "status": "completed", "links": {}}
+    r = requests.get(base + "/research/agent-3/podcast")
+    assert r.status_code == 409
+    assert "no podcast audio" in r.json()["error"]
+
+
+def test_podcast_missing_run_404(live):
+    base, _ = live
+    FakeFS.research_doc = None
+    assert requests.get(base + "/research/agent-zzz/podcast").status_code == 404
+
+
+def test_podcast_download_failure_502(live, monkeypatch):
+    base, _ = live
+    FakeFS.research_doc = {"id": "agent-4", "status": "completed",
+                           "links": {"audio_file": {"url": _M4A}}}
+
+    def boom(url, dest_dir, rid):
+        raise requests.RequestException("network down")
+
+    monkeypatch.setattr(bridge, "_download_podcast_audio", boom)
+    r = requests.get(base + "/research/agent-4/podcast")
+    assert r.status_code == 502
+    assert "couldn't fetch" in r.json()["error"]
+
+
 def test_account_routes_401_when_not_signed_in(monkeypatch):
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
     state = bridge.BridgeState()
@@ -108,3 +186,97 @@ def test_account_routes_401_when_not_signed_in(monkeypatch):
         assert requests.post(base + "/research", json={"topic": "t", "deviceId": "d"}).status_code == 401
     finally:
         httpd.shutdown()
+
+
+# ── podcast download helper + pure helpers (no HTTP server) ──────────────────
+
+class _FakeResp:
+    """A minimal stand-in for a streaming requests.Response."""
+    def __init__(self, chunks, ok=True):
+        self._chunks, self._ok = chunks, ok
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        if not self._ok:
+            raise requests.HTTPError("boom")
+
+    def iter_content(self, _n):
+        return iter(self._chunks)
+
+
+def test_download_podcast_audio_streams_and_caches(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_get(url, stream=True, timeout=30, allow_redirects=False):
+        calls["n"] += 1
+        return _FakeResp([b"abc", b"defg"])
+
+    monkeypatch.setattr(bridge.requests, "get", fake_get)
+    p, size = bridge._download_podcast_audio(_M4A, tmp_path, "agent-1")
+    assert p.exists() and size == 7 and p.read_bytes() == b"abcdefg"
+    assert p.name.startswith("agent-1-") and p.name.endswith(".m4a")
+    assert not list(tmp_path.glob("*.part"))  # temp renamed away
+    # an identical URL is a cache hit — no second download
+    p2, size2 = bridge._download_podcast_audio(_M4A, tmp_path, "agent-1")
+    assert p2 == p and size2 == 7 and calls["n"] == 1
+
+
+def test_download_podcast_audio_size_cap_cleans_partial(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "_PODCAST_MAX_BYTES", 4)
+    monkeypatch.setattr(bridge.requests, "get",
+                        lambda url, stream=True, timeout=30, allow_redirects=False: _FakeResp([b"aa", b"bb", b"cc"]))
+    with pytest.raises(ValueError):
+        bridge._download_podcast_audio(_M4A, tmp_path, "agent-x")
+    assert not list(tmp_path.glob("*"))  # neither the final nor the .part survives
+
+
+def test_download_podcast_audio_rejects_foreign_host(tmp_path, monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(bridge.requests, "get",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    for bad in ("http://169.254.169.254/latest/meta-data/",   # internal, and not https
+                "https://evil.example.com/x.m4a",             # not a Storage host
+                "http://firebasestorage.googleapis.com/x.m4a"):  # right host, wrong scheme
+        with pytest.raises(ValueError):
+            bridge._download_podcast_audio(bad, tmp_path, "agent-x")
+    assert called["n"] == 0  # rejected before any network fetch
+
+
+def test_prune_age_only_keeps_recent_siblings(tmp_path):
+    keep = tmp_path / "agent-1-newhash.m4a"
+    sibling = tmp_path / "agent-1-oldhash.m4a"  # same run, different url — must SURVIVE
+    aged = tmp_path / "agent-2-x.m4a"           # stale by age — must be pruned
+    for f in (keep, sibling, aged):
+        f.write_bytes(b"x")
+    past = time.time() - bridge._PODCAST_MAX_AGE_SECONDS - 10
+    os.utime(aged, (past, past))
+    bridge._prune_podcast_dir(tmp_path, keep_name=keep.name)
+    assert keep.exists() and sibling.exists()  # recent files (incl. same-run) survive
+    assert not aged.exists()                    # only the aged-out file is pruned
+
+
+def test_audio_file_url_prefers_media_not_page():
+    assert bridge._audio_file_url({"audio_file": {"url": _M4A}}) == _M4A
+    assert bridge._audio_file_url({"audio_file": _M4A}) == _M4A  # bare string tolerated
+    # only the NotebookLM PAGE kinds present → no media url
+    assert bridge._audio_file_url({"audio": {"url": "https://notebooklm.google.com/notebook/x"}}) == ""
+    assert bridge._audio_file_url(None) == ""
+
+
+def test_audio_ext_and_mime():
+    assert bridge._audio_ext_and_mime(_M4A) == (".m4a", "audio/mp4")
+    assert bridge._audio_ext_and_mime("https://x/y/z.mp3?token=1") == (".mp3", "audio/mpeg")
+    assert bridge._audio_ext_and_mime("https://x/y/no-ext?alt=media") == (".m4a", "audio/mp4")
+
+
+def test_safe_filename():
+    assert bridge._safe_filename("Tesla 2025: Outlook", ".m4a") == "Tesla 2025 Outlook.m4a"  # ':' stripped
+    assert bridge._safe_filename("a/b\\c:d?", ".m4a") == "abcd.m4a"  # reserved chars stripped
+    assert bridge._safe_filename("日本語のタイトル", ".m4a") == "日本語のタイトル.m4a"  # unicode preserved
+    assert bridge._safe_filename("", ".m4a") == "Podcast.m4a"
+    assert bridge._safe_filename("   ", ".mp3") == "Podcast.mp3"

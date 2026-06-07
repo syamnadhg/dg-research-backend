@@ -408,6 +408,38 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_podcast(args: argparse.Namespace) -> int:
+    """Get a run's audio as a local file (chat /podcast). Prints the path the
+    runtime would attach as a native audio message; no id = the most recent run."""
+    if not _bridge_up():
+        print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
+        return 1
+    rid = args.runId
+    if not rid:
+        rr = _bridge_get("/updates?limit=20")
+        if rr is None or rr[0] != 200:
+            print(f"{_NO} couldn't find a run: {_err(rr)}")
+            return 1
+        runs = rr[1].get("runs", [])
+        if not runs:
+            print("No runs yet.")
+            return 0
+        # Prefer the newest run that already HAS audio (a late-phase artifact)
+        # over the newest active run, which usually has none yet.
+        with_audio = [r for r in runs
+                      if any(lk.get("kind") == "audio_file" for lk in r.get("links", []))]
+        rid = (with_audio[0] if with_audio else runs[0]).get("runId")
+    # The bridge downloads the audio file (can take a few seconds) → longer wait.
+    res = _bridge_get(f"/research/{rid}/podcast", timeout=180.0)
+    if res is None or res[0] != 200:
+        print(f"{_NO} {_err(res)}")
+        return 1
+    out = res[1]
+    print(f"{_OK} Podcast “{out.get('title')}” → {out.get('localPath')}")
+    print(f"     {out.get('sizeBytes', 0):,} bytes · {out.get('mime')} · send as a native audio message")
+    return 0
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Stream a run's per-phase links to the console until it finishes.
 
@@ -582,6 +614,11 @@ def build_parser() -> argparse.ArgumentParser:
     rn = sub.add_parser("run", parents=[common], help="show a run's status (no id = most recent)")
     rn.add_argument("runId", nargs="?", help="run id (default: most recent)")
     rn.set_defaults(func=cmd_run)
+
+    pod = sub.add_parser("podcast", parents=[common],
+                         help="get a run's audio as a local file (no id = most recent)")
+    pod.add_argument("runId", nargs="?", help="run id (default: most recent)")
+    pod.set_defaults(func=cmd_podcast)
 
     wt = sub.add_parser("watch", parents=[common],
                         help="stream a run's per-phase links until it finishes")

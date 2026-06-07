@@ -17,6 +17,7 @@ Commands (mirror the chat slash commands):
   device-use <id>  choose the device runs go to
   research <topic> start a run (--device <id> to override the selected device)
   status [id]      a run's progress + links (no id = most recent)
+  podcast [id]     download a run's audio → a local file to send as native audio
   updates          active runs + their current links (for the streaming cron)
   cancel <id>      stop a run
   logout           clear the account session
@@ -53,14 +54,15 @@ def _base() -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def _request(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+def _request(method: str, path: str, body: dict | None = None,
+             timeout: float | None = None) -> tuple[int, dict]:
     url = _base() + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or _TIMEOUT) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
@@ -73,8 +75,8 @@ def _request(method: str, path: str, body: dict | None = None) -> tuple[int, dic
         return 0, {"error": f"bridge unreachable ({e.reason}) — is `agent serve` running?"}
 
 
-def _get(path: str) -> tuple[int, dict]:
-    return _request("GET", path)
+def _get(path: str, timeout: float | None = None) -> tuple[int, dict]:
+    return _request("GET", path, timeout=timeout)
 
 
 def _post(path: str, body: dict | None = None) -> tuple[int, dict]:
@@ -209,6 +211,35 @@ def cmd_status(args) -> int:
     return _emit(body, args.json, lines)
 
 
+def cmd_podcast(args) -> int:
+    rid = args.runId
+    if not rid:
+        code, body = _get("/updates?limit=20")
+        if code != 200:
+            return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+        runs = body.get("runs", [])
+        if not runs:
+            return _emit(body, args.json, ["No runs yet."])
+        # The podcast audio is a late-phase artifact — prefer the newest run that
+        # already HAS audio over the newest active run (which usually has none yet).
+        with_audio = [r for r in runs
+                      if any(lk.get("kind") == "audio_file" for lk in r.get("links", []))]
+        rid = (with_audio[0] if with_audio else runs[0]).get("runId")
+    # The bridge downloads the audio to a local file (a long audio overview can
+    # take a few seconds) → allow more time than the default request timeout.
+    code, body = _get(f"/research/{urllib.parse.quote(rid, safe='')}/podcast", timeout=180)
+    if code != 200:
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    title = body.get("title") or "Podcast"
+    name = body.get("filename") or f"{title}.m4a"
+    return _emit(body, args.json, [
+        f"🎧 Podcast ready: “{title}”",
+        f"Send this file as a native audio / voice message named “{name}” "
+        "(attach the file — don’t paste the path):",
+        f"  {body.get('localPath')}",
+    ])
+
+
 def cmd_updates(args) -> int:
     path = "/updates?active=1" if args.active else "/updates"
     code, body = _get(path)
@@ -284,6 +315,10 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="a run's progress (no id = most recent)")
     st.add_argument("runId", nargs="?")
     st.set_defaults(func=cmd_status)
+
+    pod = sub.add_parser("podcast", help="a run's audio as a local file to send as native audio")
+    pod.add_argument("runId", nargs="?")
+    pod.set_defaults(func=cmd_podcast)
 
     up = sub.add_parser("updates", help="active runs + current links (streaming cron)")
     up.add_argument("--active", action="store_true")
