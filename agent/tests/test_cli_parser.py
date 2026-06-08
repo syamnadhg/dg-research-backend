@@ -36,6 +36,13 @@ def test_login_defaults_local():
     assert ns.remote is False
 
 
+def test_disconnect_parses_optional_runtime():
+    a = cli.build_parser().parse_args(["disconnect"])
+    assert a.func is cli.cmd_disconnect and a.runtime is None
+    b = cli.build_parser().parse_args(["disconnect", "openclaw"])
+    assert b.func is cli.cmd_disconnect and b.runtime == "openclaw"
+
+
 def test_device_bare_lists():
     ns = cli.build_parser().parse_args(["device"])
     assert ns.func is cli.cmd_device and ns.device_command is None

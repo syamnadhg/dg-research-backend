@@ -21,6 +21,7 @@ class RecFS:
     doc = None  # what get_agent_session returns (a dict or None)
     upserts: list = []
     deletes: list = []
+    uninstalls: list = []  # runtimes connect.uninstall was called with (revoke path)
     get_raises = None  # set to an Exception instance to raise on get
     upsert_raises = None
 
@@ -49,12 +50,16 @@ def wired(monkeypatch):
     RecFS.doc = None
     RecFS.upserts = []
     RecFS.deletes = []
+    RecFS.uninstalls = []
     RecFS.get_raises = None
     RecFS.upsert_raises = None
     monkeypatch.setattr(bridge, "FirestoreRest", RecFS)
     monkeypatch.setattr(bridge.prefs, "get_or_create_install_id", lambda: "iid-1")
     monkeypatch.setattr(bridge.prefs, "get_label", lambda: "Super Agent")
     monkeypatch.setattr(bridge.prefs, "get_runtime", lambda: "hermes")
+    # Record (don't perform) the skill uninstall so tests never touch a real
+    # runtime dir; assert WHEN it fires (app revoke) vs not (logout / token revoke).
+    monkeypatch.setattr(bridge.connect, "uninstall", lambda rt, **kw: (RecFS.uninstalls.append(rt) or True))
     cleared = {"v": False}
     monkeypatch.setattr(bridge.prefs, "clear_selected_device", lambda: cleared.__setitem__("v", True))
     return cleared
@@ -140,6 +145,7 @@ def test_heartbeat_revoked_self_logs_out_and_leaves_row(wired):
     assert sess._logged_out["v"] is True  # token blanked
     assert wired["v"] is True  # device selection cleared
     assert RecFS.deletes == []  # revoke LEAVES the row (only a clean /logout deletes)
+    assert RecFS.uninstalls == ["hermes"]  # app revoke ALSO uninstalls the skill
 
 
 def test_heartbeat_recreates_missing_doc_fully(wired):
@@ -165,6 +171,29 @@ def test_heartbeat_token_revoked_self_logs_out(wired):
     st, _sess = _state()
     bridge._heartbeat_once(st)
     assert st.session is None  # the account token itself was rejected → self-logout
+    # A token-level revoke (e.g. "sign out everywhere") is NOT an app agent-revoke
+    # — keep the skill installed; the user may just re-login.
+    assert RecFS.uninstalls == []
+
+
+def test_heartbeat_revoke_with_reconnect_swap_does_not_uninstall(wired, monkeypatch):
+    # The app revoked session A, but a reconnect swapped in session B (clearing
+    # revoked) before the tick's _self_logout — the CAS must skip teardown AND the
+    # skill must NOT be uninstalled (the agent is freshly, legitimately connected).
+    RecFS.doc = {"revoked": True}
+    st, _sess_a = _state()
+    sess_b = SimpleNamespace(uid="u1", email="e@x.y", id_token=lambda force=False: "tok",
+                             logout=lambda: (_ for _ in ()).throw(AssertionError("B logged out!")))
+    real_get = RecFS.get_agent_session
+
+    def get_then_swap(self, uid, sid):
+        st.set_session(sess_b)  # reconnect lands right after the revoked read
+        return real_get(self, uid, sid)
+
+    monkeypatch.setattr(RecFS, "get_agent_session", get_then_swap)
+    bridge._heartbeat_once(st)
+    assert st.session is sess_b  # B survived the CAS
+    assert RecFS.uninstalls == []  # CAS skipped → no uninstall
 
 
 def test_heartbeat_skips_when_signed_out(wired):
@@ -185,6 +214,7 @@ def test_startup_honors_pending_revoke(wired):
     assert st.session is None  # honored the revoke — did NOT re-attach
     # crucially, it never wrote a revoked:False (no un-revoke)
     assert all(u["fields"].get("revoked") is not False for u in RecFS.upserts)
+    assert RecFS.uninstalls == ["hermes"]  # a revoke honored on restart also uninstalls
 
 
 def test_startup_rearms_when_not_revoked(wired):

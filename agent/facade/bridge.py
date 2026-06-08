@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 
-from . import __version__, config, devicelogin, prefs, runview
+from . import __version__, config, connect, devicelogin, prefs, runview
 from .devicelogin import DeviceLoginError
 from .firestore_rest import FirestoreError, FirestoreRest
 from .session import AccountSession, CustomTokenError, RevokedError
@@ -359,23 +359,42 @@ def _write_agent_session_connected(sess: AccountSession, *, clear_revoked: bool)
         log.warning("agent session connect-write failed (non-fatal): %s", type(e).__name__)
 
 
-def _self_logout(state: BridgeState, sess: AccountSession | None) -> None:
+def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
     """In-memory teardown shared by the /logout route and the revoke-consult.
 
     Compare-and-swap on ``sess``: tears down ONLY if it is still the live session
     (so a heartbeat deciding to self-logout against the OLD session can't undo a
-    reconnect that swapped a NEW one in). Clears the live session + the account-
+    reconnect that swapped a NEW one in). Returns True iff it actually tore down —
+    the revoke path gates the skill-uninstall on this so it never uninstalls when
+    a concurrent reconnect won the CAS. Clears the live session + the account-
     bound device selection. Does NOT touch the agentSessions doc — the route
     deletes it (clean logout), while the revoke path leaves the ``revoked: true``
     row in place so the app shows the disconnect and a re-login can clear it.
     """
     if sess is None:
         prefs.clear_selected_device()
-        return
+        return False
     if not state.clear_session_if(sess):
-        return  # a concurrent reconnect already swapped the session in — leave it
+        return False  # a concurrent reconnect already swapped the session in — leave it
     sess.logout()
     prefs.clear_selected_device()
+    return True
+
+
+def _uninstall_skill_on_revoke() -> None:
+    """App Revoke = sign out + UNINSTALL the skill from the runtime, so the agent
+    is fully torn down (re-adding is then a deliberate `agent connect`). Only the
+    explicit app revoke does this — a clean /logout or a token-level RevokedError
+    keeps the skill installed. Best-effort + bounded to the recorded runtime's
+    own skill dir; a failure must never break the self-logout."""
+    rt = prefs.get_runtime()
+    if not rt:
+        return
+    try:
+        if connect.uninstall(rt):
+            log.info("revoke: uninstalled the %s skill bundle", rt)
+    except Exception as e:
+        log.warning("revoke: skill uninstall failed (non-fatal): %s", type(e).__name__)
 
 
 def _arm_agent_session_on_start(state: BridgeState) -> None:
@@ -397,8 +416,9 @@ def _arm_agent_session_on_start(state: BridgeState) -> None:
         log.warning("startup agent-session check failed (non-fatal): %s", type(e).__name__)
         doc = None
     if isinstance(doc, dict) and doc.get("revoked") is True:
-        log.info("startup: agent was revoked while the bridge was down — honoring revoke")
-        _self_logout(state, sess)
+        log.info("startup: agent was revoked while the bridge was down — honoring revoke + uninstall")
+        if _self_logout(state, sess):
+            _uninstall_skill_on_revoke()
         return
     _write_agent_session_connected(sess, clear_revoked=False)
 
@@ -427,8 +447,9 @@ def _heartbeat_once(state: BridgeState) -> None:
         log.debug("heartbeat read transient failure: %s", type(e).__name__)
         return
     if isinstance(doc, dict) and doc.get("revoked") is True:
-        log.info("agent session %s revoked from the app — self-logout", sid)
-        _self_logout(state, sess)
+        log.info("agent session %s revoked from the app — self-logout + uninstall", sid)
+        if _self_logout(state, sess):
+            _uninstall_skill_on_revoke()
         return
     # A concurrent /logout or reconnect may have swapped the session out from
     # under us between the GET and here — don't write (would resurrect a just-

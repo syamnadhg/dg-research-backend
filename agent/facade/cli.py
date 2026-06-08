@@ -98,6 +98,42 @@ def cmd_connect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_disconnect(args: argparse.Namespace) -> int:
+    """Remove the Super Research skill from a chat runtime (inverse of connect).
+
+    The account session is left alone — use `agent logout` to sign out. The app's
+    Revoke button does BOTH (sign out + uninstall) host-side; this is the local
+    CLI twin for just the uninstall.
+    """
+    runtime = args.runtime
+    targets = [runtime] if runtime else (
+        [prefs.get_runtime()] if prefs.get_runtime() else connect.detect_runtimes()
+    )
+    targets = [t for t in targets if t]
+    if not targets:
+        print(f"{_NO} No runtime detected (~/.hermes or ~/.openclaw). "
+              f"Specify one:  agent disconnect {{{'|'.join(connect.RUNTIMES)}}}")
+        return 1
+    removed_any = False
+    for rt in targets:
+        if rt not in connect.RUNTIMES:
+            print(f"{_NO} Unknown runtime '{rt}'. Choose: {', '.join(connect.RUNTIMES)}")
+            return 1
+        try:
+            removed = connect.uninstall(rt, dest=Path(args.dest) if args.dest else None)
+        except OSError as e:
+            print(f"{_NO} uninstall failed: {e}")
+            return 1
+        if removed:
+            print(f"{_OK} Removed the Super Research skill from {rt}.")
+            removed_any = True
+        else:
+            print(f"No Super Research skill was installed for {rt}.")
+    if removed_any:
+        print("Re-add any time with:  agent connect")
+    return 0
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Start it first:  agent serve")
@@ -593,6 +629,12 @@ def build_parser() -> argparse.ArgumentParser:
     cn.add_argument("runtime", nargs="?", help="hermes or openclaw (auto-detected if omitted)")
     cn.add_argument("--dest", help="explicit install dir (default: the runtime's skills dir)")
     cn.set_defaults(func=cmd_connect)
+
+    dc = sub.add_parser("disconnect", parents=[common],
+                        help="remove the SR skill from a runtime (inverse of connect; account untouched)")
+    dc.add_argument("runtime", nargs="?", help="hermes or openclaw (defaults to the connected one)")
+    dc.add_argument("--dest", help="explicit install dir (default: the runtime's skills dir)")
+    dc.set_defaults(func=cmd_disconnect)
 
     sub.add_parser("serve", parents=[common], help="start the host bridge (blocking)").set_defaults(func=cmd_serve)
     lg = sub.add_parser("login", parents=[common],

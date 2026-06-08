@@ -56,3 +56,33 @@ def test_bundle_ships_in_package():
     src = connect.skill_src_dir()
     assert (src / "SKILL.md").is_file()
     assert (src / "scripts" / "sr.py").is_file()
+
+
+def test_uninstall_removes_the_bundle(tmp_path):
+    dest = tmp_path / "sr"
+    connect.install("hermes", dest=dest)
+    assert connect.verify(dest)
+    assert connect.uninstall("hermes", dest=dest) is True  # removed
+    assert not dest.exists()
+
+
+def test_uninstall_is_idempotent(tmp_path):
+    dest = tmp_path / "sr"
+    assert connect.uninstall("hermes", dest=dest) is False  # nothing there → no-op
+    connect.install("hermes", dest=dest)
+    assert connect.uninstall("hermes", dest=dest) is True
+    assert connect.uninstall("hermes", dest=dest) is False  # second time → no-op
+
+
+def test_uninstall_unknown_runtime_raises(tmp_path):
+    with pytest.raises(ValueError):
+        connect.uninstall("nope", dest=tmp_path / "x")
+
+
+def test_install_then_uninstall_roundtrip_at_runtime_path(tmp_path):
+    # End-to-end at the real runtime-relative path (under a fake home).
+    connect.install("hermes", home=tmp_path)
+    target = connect.runtime_dest("hermes", home=tmp_path)
+    assert connect.verify(target)
+    assert connect.uninstall("hermes", home=tmp_path) is True
+    assert not target.exists()
