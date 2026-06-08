@@ -285,6 +285,184 @@ class BridgeState:
         with self._lock:
             self._remote = flow
 
+    def is_current(self, sess: AccountSession) -> bool:
+        """True iff `sess` is still the live session (identity, lock-guarded)."""
+        with self._lock:
+            return self._session is sess
+
+    def clear_session_if(self, sess: AccountSession) -> bool:
+        """Compare-and-swap teardown: clear the session ONLY if it is still
+        `sess`. Returns True if it cleared. This closes the revoke-vs-reconnect
+        race — a heartbeat that decided to self-logout based on the OLD session's
+        revoked read must not tear down a NEW session a concurrent reconnect
+        swapped in (which legitimately cleared revoked)."""
+        with self._lock:
+            if self._session is sess:
+                self._session = None
+                return True
+            return False
+
+
+# ── Agent session (#790): the renamable identity row in the app's "Shared with"
+# popup, plus the heartbeat that proves the agent is live and the revoke-consult
+# that lets a user disconnect it from the app. The doc lives at
+# users/{uid}/agentSessions/{installId}; the bridge writes it AS THE ACCOUNT USER
+# (owner branch), so the FE reading its own rows and this write share one
+# owner-only rules line (mirrors users/{uid}/sessions). ────────────────────────
+
+
+def _write_agent_session_connected(sess: AccountSession, *, clear_revoked: bool) -> None:
+    """Create/refresh the agent-session doc.
+
+    Best-effort: a Firestore failure here must NEVER block the login response —
+    the live session is already set in memory. GET-first so an FE rename of the
+    label survives a reconnect (we only stamp the default label when the doc has
+    none).
+
+    ``clear_revoked`` is the load-bearing authorization gate. Set it True ONLY on
+    an explicit human sign-in (the two /login handlers) — that is the sole event
+    permitted to un-revoke a previously-revoked agent. On any AUTOMATIC re-arm
+    (serve() startup after restart, the heartbeat's missing-doc re-create) pass
+    False: we then OMIT the ``revoked`` field entirely, preserving whatever the
+    user set (so a revoke that landed while the bridge was down is NOT silently
+    undone by a restart).
+    """
+    try:
+        sid = prefs.get_or_create_install_id()
+        fs = FirestoreRest(sess.id_token)
+        label = ""
+        try:
+            existing = fs.get_agent_session(sess.uid, sid)
+        except Exception:
+            existing = None
+        if isinstance(existing, dict):
+            lv = existing.get("label")
+            if isinstance(lv, str) and lv:
+                label = lv
+        if not label:
+            label = prefs.get_label()
+        now_ms = int(time.time() * 1000)
+        fields: dict[str, Any] = {
+            "label": label,
+            "runtime": prefs.get_runtime() or "",
+            "email": sess.email or "",
+            "connectedAt": now_ms,
+            "lastSeenAt": now_ms,
+        }
+        if clear_revoked:
+            # Only an explicit human sign-in clears the flag (masked merge, so
+            # omitting it on the automatic paths leaves the stored value intact).
+            fields["revoked"] = False
+        fs.upsert_agent_session(sess.uid, sid, fields)
+        log.info("agent session %s connected for %s", sid, sess.email or sess.uid)
+    except Exception as e:  # never logs the exception value (token-leak safe)
+        log.warning("agent session connect-write failed (non-fatal): %s", type(e).__name__)
+
+
+def _self_logout(state: BridgeState, sess: AccountSession | None) -> None:
+    """In-memory teardown shared by the /logout route and the revoke-consult.
+
+    Compare-and-swap on ``sess``: tears down ONLY if it is still the live session
+    (so a heartbeat deciding to self-logout against the OLD session can't undo a
+    reconnect that swapped a NEW one in). Clears the live session + the account-
+    bound device selection. Does NOT touch the agentSessions doc — the route
+    deletes it (clean logout), while the revoke path leaves the ``revoked: true``
+    row in place so the app shows the disconnect and a re-login can clear it.
+    """
+    if sess is None:
+        prefs.clear_selected_device()
+        return
+    if not state.clear_session_if(sess):
+        return  # a concurrent reconnect already swapped the session in — leave it
+    sess.logout()
+    prefs.clear_selected_device()
+
+
+def _arm_agent_session_on_start(state: BridgeState) -> None:
+    """At serve() startup with a session rehydrated from disk: honor a revoke
+    that landed while the bridge was DOWN, otherwise re-arm the row.
+
+    A restart is an AUTOMATIC reconnect (no human present), so it must not
+    un-revoke. If the stored row is already revoked, self-logout (the bridge does
+    not re-attach); else (re)write the row WITHOUT clearing revoked.
+    """
+    sess = state.session
+    if sess is None:
+        return
+    try:
+        doc = FirestoreRest(sess.id_token).get_agent_session(
+            sess.uid, prefs.get_or_create_install_id()
+        )
+    except Exception as e:
+        log.warning("startup agent-session check failed (non-fatal): %s", type(e).__name__)
+        doc = None
+    if isinstance(doc, dict) and doc.get("revoked") is True:
+        log.info("startup: agent was revoked while the bridge was down — honoring revoke")
+        _self_logout(state, sess)
+        return
+    _write_agent_session_connected(sess, clear_revoked=False)
+
+
+def _heartbeat_once(state: BridgeState) -> None:
+    """One heartbeat tick: consult ``revoked`` then bump ``lastSeenAt``.
+
+    Transient Firestore/network errors are swallowed and the loop keeps running
+    (silent self-heal); only a definitive ``revoked == true`` — or a token-level
+    RevokedError (the account's refresh token itself was rejected) — triggers the
+    self-logout. The reads/writes also keep the account token warm (refresh is
+    otherwise purely lazy/on-demand).
+    """
+    sess = state.session
+    if sess is None:
+        return
+    sid = prefs.get_or_create_install_id()
+    try:
+        fs = FirestoreRest(sess.id_token)
+        doc = fs.get_agent_session(sess.uid, sid)
+    except RevokedError:
+        log.info("heartbeat: account token revoked — self-logout")
+        _self_logout(state, sess)
+        return
+    except Exception as e:
+        log.debug("heartbeat read transient failure: %s", type(e).__name__)
+        return
+    if isinstance(doc, dict) and doc.get("revoked") is True:
+        log.info("agent session %s revoked from the app — self-logout", sid)
+        _self_logout(state, sess)
+        return
+    # A concurrent /logout or reconnect may have swapped the session out from
+    # under us between the GET and here — don't write (would resurrect a just-
+    # deleted row, or stamp lastSeenAt onto a different account's row).
+    if not state.is_current(sess):
+        return
+    if doc is None:
+        # The connect-write never landed (or the row was cleared out-of-band):
+        # re-create it FULLY so the agent shows up — never resurrect a bare row,
+        # and never un-revoke (clear_revoked=False).
+        _write_agent_session_connected(sess, clear_revoked=False)
+        return
+    try:
+        fs.upsert_agent_session(sess.uid, sid, {"lastSeenAt": int(time.time() * 1000)})
+    except RevokedError:
+        log.info("heartbeat: account token revoked — self-logout")
+        _self_logout(state, sess)
+    except Exception as e:
+        log.debug("heartbeat write transient failure: %s", type(e).__name__)
+
+
+def _heartbeat_loop(state: BridgeState, stop: threading.Event) -> None:
+    """The single background tick. First fire after one interval (the connect
+    handlers + serve() startup already wrote the doc, so the agent row appears
+    immediately — the loop only sustains liveness + consults `revoked`)."""
+    interval = config.HEARTBEAT_INTERVAL_SECONDS
+    if interval <= 0:  # guard a misconfigured env from a Firestore-hammering busy loop
+        interval = 60.0
+    while not stop.wait(interval):
+        try:
+            _heartbeat_once(state)
+        except Exception as e:  # defensive — a tick must never kill the thread
+            log.debug("heartbeat tick error: %s", type(e).__name__)
+
 
 def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
@@ -475,6 +653,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return
             state.set_session(sess)
             state.rotate_login_token()  # one-shot: the captured nonce can't be replayed
+            # #790 identity row — explicit human sign-in, so clear any prior revoke.
+            _write_agent_session_connected(sess, clear_revoked=True)
             log.info("account session captured (local page) for %s", sess.email or sess.uid)
             self._json(200, {"ok": True, "uid": sess.uid, "email": sess.email})
 
@@ -562,6 +742,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                         return
                     state.set_session(sess)
                     flow.state = "connected"
+                    # #790 identity row — explicit human sign-in, so clear any prior revoke.
+                    _write_agent_session_connected(sess, clear_revoked=True)
                     log.info("remote login connected as %s", sess.email or sess.uid)
                 elif status == devicelogin.EXPIRED:
                     flow.state = "expired"
@@ -596,12 +778,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
         def _logout(self) -> None:
             sess = state.session
             if sess is not None:
-                sess.logout()
-            state.set_session(None)
+                # Delete the #790 agent-session row BEFORE sess.logout() blanks
+                # the token (we still need to mint one for the DELETE). Best-
+                # effort — a failure just leaves a row that goes stale and the
+                # app hides it. A clean logout removes the row entirely (unlike
+                # the revoke path, which leaves a revoked row in place).
+                try:
+                    FirestoreRest(sess.id_token).delete_agent_session(
+                        sess.uid, prefs.get_or_create_install_id()
+                    )
+                except Exception as e:
+                    log.debug("agent session delete on logout failed (non-fatal): %s", type(e).__name__)
             # The device selection belongs to the account being logged out — drop
             # it so a later (possibly different) account doesn't inherit a stale
             # target it can't reach.
-            prefs.clear_selected_device()
+            _self_logout(state, sess)
             self._json(200, {"ok": True})
 
         def _researches(self) -> None:
@@ -1023,6 +1214,20 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     state = BridgeState()
     httpd = ThreadingHTTPServer((host, port), _make_handler(state))
     authed = state.session is not None
+    # If we restarted with a live session (rehydrated via AccountSession.load(),
+    # which doesn't fire either connect handler), re-arm the #790 agent row — but
+    # HONOR a revoke that landed while the bridge was down (a restart is an
+    # automatic reconnect, not a human sign-in, so it must NOT un-revoke).
+    if authed:
+        _arm_agent_session_on_start(state)
+    # ONE background heartbeat thread (the single periodic owner-process tick):
+    # bumps lastSeenAt + consults `revoked` to self-logout. daemon so it dies
+    # with the process; stop event makes shutdown deterministic.
+    hb_stop = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop, args=(state, hb_stop), name="agent-heartbeat", daemon=True
+    )
+    hb_thread.start()
     log.info("Super Agent bridge on http://%s:%d (authed=%s)", host, port, authed)
     print(f"Super Agent bridge listening on http://{host}:{port}")
     print(f"  sign in:  {config.login_origin()}/login   (local page; or remote via chat /login)")
@@ -1033,4 +1238,5 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        hb_stop.set()
         httpd.shutdown()

@@ -18,6 +18,7 @@ import os
 import stat
 import tempfile
 import threading
+import uuid
 from typing import Any
 
 from . import config
@@ -27,6 +28,13 @@ log = logging.getLogger(__name__)
 _SELECTED_DEVICE = "selectedDeviceId"
 _SELECTED_UID = "selectedUid"
 _RUNTIME = "runtime"
+_INSTALL_ID = "installId"
+_LABEL = "agentLabel"
+
+# Default display name for the agent session in the app's "Shared with" popup;
+# renamable from the FE (the rename writes the label onto the agentSessions doc,
+# and the bridge preserves an FE rename across reconnects — see bridge.py).
+_DEFAULT_LABEL = "Super Agent"
 
 # Serialize read-modify-write so concurrent bridge worker threads don't clobber.
 _lock = threading.Lock()
@@ -116,4 +124,39 @@ def set_runtime(runtime: str) -> None:
     with _lock:
         prefs = load()
         prefs[_RUNTIME] = runtime
+        save(prefs)
+
+
+def get_or_create_install_id() -> str:
+    """A STABLE per-install id, minted once and persisted in prefs.json.
+
+    Used as the ``users/{uid}/agentSessions/{id}`` doc id so the agent shows as
+    one stable row in the app's "Shared with" popup. It lives in prefs (NOT the
+    keyring store blob, which `store.clear()` wipes on /logout) precisely so the
+    id survives logout/login and bridge restarts — re-login overwrites the same
+    row rather than accreting a new one. It is account-agnostic (one per host
+    install): pills follow the run's uid, so this id only identifies the agent,
+    never the account.
+    """
+    with _lock:
+        prefs = load()
+        iid = prefs.get(_INSTALL_ID)
+        if isinstance(iid, str) and iid:
+            return iid
+        iid = uuid.uuid4().hex
+        prefs[_INSTALL_ID] = iid
+        save(prefs)
+        return iid
+
+
+def get_label() -> str:
+    """The agent's display label for the "Shared with" popup (default "Super Agent")."""
+    v = load().get(_LABEL)
+    return v if isinstance(v, str) and v else _DEFAULT_LABEL
+
+
+def set_label(label: str) -> None:
+    with _lock:
+        prefs = load()
+        prefs[_LABEL] = label
         save(prefs)

@@ -20,9 +20,22 @@ class FakeFS:
     last_enqueue = None
     last_upsert = None
     research_doc = None  # what get_research returns (set per podcast test)
+    agent_session_doc = None  # what get_agent_session returns
+    agent_upserts: list = []
+    agent_deletes: list = []
 
     def __init__(self, _token_provider):
         pass
+
+    def get_agent_session(self, uid, sid):
+        d = FakeFS.agent_session_doc
+        return dict(d) if d else None
+
+    def upsert_agent_session(self, uid, sid, fields):
+        FakeFS.agent_upserts.append({"uid": uid, "sid": sid, "fields": fields})
+
+    def delete_agent_session(self, uid, sid):
+        FakeFS.agent_deletes.append({"uid": uid, "sid": sid})
 
     def list_researches(self, uid):
         return [{"id": "r1", "title": "Alpha", "status": "completed"}]
@@ -48,14 +61,20 @@ class FakeFS:
 @pytest.fixture()
 def live(monkeypatch):
     FakeFS.research_doc = None
+    FakeFS.agent_session_doc = None
+    FakeFS.agent_upserts = []
+    FakeFS.agent_deletes = []
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
+    monkeypatch.setattr(bridge.prefs, "get_or_create_install_id", lambda: "iid-test")
     # Isolate the device-selection pref from the real ~/.super-agent/prefs.json.
     sel = {"v": None}
     monkeypatch.setattr(bridge.prefs, "get_selected_device", lambda uid: sel["v"])
     monkeypatch.setattr(bridge.prefs, "set_selected_device", lambda d, uid: sel.__setitem__("v", d))
     monkeypatch.setattr(bridge.prefs, "clear_selected_device", lambda: sel.__setitem__("v", None))
     state = bridge.BridgeState()
-    state.set_session(SimpleNamespace(uid="u1", email="e@x.y", id_token=lambda force=False: "tok"))
+    state.set_session(SimpleNamespace(
+        uid="u1", email="e@x.y", id_token=lambda force=False: "tok", logout=lambda: None,
+    ))
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._make_handler(state))
     port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -186,6 +205,16 @@ def test_account_routes_401_when_not_signed_in(monkeypatch):
         assert requests.post(base + "/research", json={"topic": "t", "deviceId": "d"}).status_code == 401
     finally:
         httpd.shutdown()
+
+
+def test_logout_deletes_agent_session_then_clears(live):
+    base, state = live
+    r = requests.post(base + "/logout")
+    assert r.status_code == 200
+    # #790: a clean logout REMOVES the agent identity row entirely (vs the
+    # revoke path, which leaves a revoked row), and only THEN tears down session.
+    assert FakeFS.agent_deletes == [{"uid": "u1", "sid": "iid-test"}]
+    assert state.session is None
 
 
 # ── podcast download helper + pure helpers (no HTTP server) ──────────────────

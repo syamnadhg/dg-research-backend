@@ -10,6 +10,23 @@ from facade import bridge
 from facade import store as store_mod
 
 
+class _AgentFakeFS:
+    """No-op Firestore so the #790 connect-write fires WITHOUT real network
+    (these tests exercise CSRF, not the agent row)."""
+
+    def __init__(self, _tp):
+        pass
+
+    def get_agent_session(self, uid, sid):
+        return None
+
+    def upsert_agent_session(self, uid, sid, fields):
+        pass
+
+    def delete_agent_session(self, uid, sid):
+        pass
+
+
 @pytest.fixture()
 def live_bridge(monkeypatch):
     # In-memory store so nothing touches the real ~/.super-agent / keyring.
@@ -17,6 +34,10 @@ def live_bridge(monkeypatch):
     monkeypatch.setattr(store_mod, "load", lambda: mem.get("blob"))
     monkeypatch.setattr(store_mod, "save", lambda blob: mem.__setitem__("blob", dict(blob)))
     monkeypatch.setattr(store_mod, "clear", lambda: mem.pop("blob", None))
+    # The /login/callback now writes the #790 agent-session row — keep it
+    # network-free and off the real prefs file.
+    monkeypatch.setattr(bridge, "FirestoreRest", _AgentFakeFS)
+    monkeypatch.setattr(bridge.prefs, "get_or_create_install_id", lambda: "iid-test")
 
     state = bridge.BridgeState()
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._make_handler(state))

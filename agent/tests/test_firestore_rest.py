@@ -214,3 +214,50 @@ def test_enqueue_cancel_payload():
     assert body["submittedBy"] == {"stringValue": "u1"} and body["uid"] == {"stringValue": "u1"}
     assert "timestamp" in body and "submittedAt" in body
     assert "/devices/dev9/queue" in calls[0]["url"]
+
+
+# ── agentSessions (#790) ─────────────────────────────────────────────────────
+
+def test_upsert_agent_session_masked_merge():
+    calls = []
+
+    def fake_send(method, url, token, json_body):
+        calls.append({"method": method, "url": url, "body": json_body})
+        return _Resp(200, {})
+
+    c = FirestoreRest(lambda force=False: "tok")
+    c._send = fake_send  # type: ignore[method-assign]
+    # a heartbeat touches ONLY lastSeenAt — the mask must not name siblings, so a
+    # masked merge can't clobber label/runtime/connectedAt.
+    c.upsert_agent_session("u1", "iid-9", {"lastSeenAt": 1234})
+    call = calls[0]
+    assert call["method"] == "PATCH"
+    assert "/users/u1/agentSessions/iid-9?" in call["url"]
+    assert "updateMask.fieldPaths=lastSeenAt" in call["url"]
+    assert "updateMask.fieldPaths=label" not in call["url"]
+    assert call["body"]["fields"]["lastSeenAt"] == {"integerValue": "1234"}
+
+
+def test_get_agent_session_none_on_404():
+    c = FirestoreRest(lambda force=False: "tok")
+    c._send = lambda *a, **k: _Resp(404)  # type: ignore[method-assign]
+    assert c.get_agent_session("u1", "missing") is None
+
+
+def test_get_agent_session_decodes_revoked():
+    c = FirestoreRest(lambda force=False: "tok")
+    c._send = lambda *a, **k: _Resp(200, {  # type: ignore[method-assign]
+        "name": ".../agentSessions/iid-9",
+        "fields": {"label": {"stringValue": "Super Agent"}, "revoked": {"booleanValue": True}},
+    })
+    row = c.get_agent_session("u1", "iid-9")
+    assert row == {"label": "Super Agent", "revoked": True, "id": "iid-9"}
+
+
+def test_delete_agent_session_url():
+    calls = []
+    c = FirestoreRest(lambda force=False: "tok")
+    c._send = lambda m, u, t, b: calls.append((m, u)) or _Resp(200, {})  # type: ignore[method-assign]
+    c.delete_agent_session("u1", "iid-9")
+    assert calls[0][0] == "DELETE"
+    assert calls[0][1].endswith("/users/u1/agentSessions/iid-9")

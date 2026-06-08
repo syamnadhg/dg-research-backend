@@ -67,10 +67,24 @@ class FakeFS:
     def patch_pipeline_config(self, uid, rid, pc_updates):
         FakeFS.last_pc_patch = {"rid": rid, "updates": pc_updates}
 
+    # #790 agent-session lifecycle (connect-write + logout-delete in the arc)
+    agent_sessions: dict = {}
+
+    def get_agent_session(self, uid, sid):
+        d = FakeFS.agent_sessions.get(sid)
+        return dict(d) if d else None
+
+    def upsert_agent_session(self, uid, sid, fields):
+        FakeFS.agent_sessions[sid] = {**FakeFS.agent_sessions.get(sid, {}), **fields}
+
+    def delete_agent_session(self, uid, sid):
+        FakeFS.agent_sessions.pop(sid, None)
+
 
 @pytest.fixture()
 def live(monkeypatch, mock_fe):
     FakeFS.researches = {}
+    FakeFS.agent_sessions = {}
     FakeFS.last_rid = FakeFS.last_cancel = FakeFS.last_pc_patch = None
 
     # in-memory secret store + prefs (no real ~/.super-agent / keyring)
@@ -125,6 +139,10 @@ def test_full_chat_lifecycle(live, capsys):
     assert sr.main(["login-wait"]) == 0
     assert "Connected as you@x.y" in capsys.readouterr().out
     assert state.session is not None and state.session.uid == "u1"
+    # #790: connecting wrote the agent identity row (default label, not revoked)
+    assert len(FakeFS.agent_sessions) == 1
+    _row = next(iter(FakeFS.agent_sessions.values()))
+    assert _row["label"] == "Super Agent" and _row["revoked"] is False
 
     # 4. signed in now
     assert sr.main(["status-account"]) == 0
@@ -169,8 +187,9 @@ def test_full_chat_lifecycle(live, capsys):
     assert FakeFS.last_cancel == rid
     capsys.readouterr()
 
-    # 12. /logout → signed out again
+    # 12. /logout → signed out again, and the agent row is removed (#790)
     assert sr.main(["logout"]) == 0
     assert state.session is None
+    assert FakeFS.agent_sessions == {}
     assert sr.main(["status-account"]) == 0
     assert "Not signed in" in capsys.readouterr().out

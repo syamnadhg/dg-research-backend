@@ -62,3 +62,23 @@ def test_preserves_other_keys(monkeypatch, tmp_path):
     prefs.set_selected_device("dev-9", "u1")
     data = prefs.load()
     assert data["someOtherKey"] == 7 and data["selectedDeviceId"] == "dev-9"
+
+
+def test_install_id_is_stable(monkeypatch, tmp_path):
+    # The #790 agentSessions doc id: minted once, then stable across calls — so
+    # re-login overwrites the SAME agent row rather than accreting new ones.
+    _isolate(monkeypatch, tmp_path)
+    iid = prefs.get_or_create_install_id()
+    assert iid and prefs.get_or_create_install_id() == iid
+    # ...and it survives a "logout" (prefs persist; only the keyring blob is wiped)
+    assert prefs.load()["installId"] == iid
+
+
+def test_label_default_and_rename(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    assert prefs.get_label() == "Super Agent"  # default
+    prefs.set_label("Sammy's Agent")
+    assert prefs.get_label() == "Sammy's Agent"
+    # an empty/blank label falls back to the default — never an empty row label
+    prefs.save({**prefs.load(), "agentLabel": ""})
+    assert prefs.get_label() == "Super Agent"

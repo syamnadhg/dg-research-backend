@@ -20,6 +20,7 @@ from pathlib import Path
 import requests
 
 from . import __version__, autostart, bridge, config, connect, logsetup, prefs, runview
+from .firestore_rest import FirestoreRest
 from .session import AccountSession
 
 log = logging.getLogger(__name__)
@@ -174,10 +175,23 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 def cmd_logout(_args: argparse.Namespace) -> int:
     # Tell the bridge (if up) AND clear the store directly, so logout works
-    # whether or not the bridge is running. Neither path refreshes the token.
-    _bridge_post("/logout")
+    # whether or not the bridge is running.
+    res = _bridge_post("/logout")
     sess = AccountSession.load()
     if sess:
+        # #790: the bridge's /logout deletes the agent-session row. If the bridge
+        # is DOWN (res is None), do that delete here ourselves BEFORE logout()
+        # blanks the token — otherwise the row would orphan (no token could ever
+        # mint to delete it) and linger as a stale agent until it ages out in the
+        # app. Safe re: the single-owner invariant: the bridge is down, so this
+        # one-off token mint can't race a live refresher. Best-effort.
+        if res is None:
+            try:
+                FirestoreRest(sess.id_token).delete_agent_session(
+                    sess.uid, prefs.get_or_create_install_id()
+                )
+            except Exception:
+                pass  # network/auth blip — the app hides it via lastSeenAt staleness
         sess.logout()
     prefs.clear_selected_device()  # also drop the target-device pref (bridge-down path)
     print("Logged out — account session cleared.")

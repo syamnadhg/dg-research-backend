@@ -9,6 +9,19 @@ from typing import Any
 
 import pytest
 
+from facade import config
+
+
+@pytest.fixture(autouse=True)
+def _isolate_prefs_dir(monkeypatch, tmp_path):
+    """Point ``config.store_dir()`` at a per-test tmp so prefs.json — including
+    the #790 agent install id (minted lazily by get_or_create_install_id) — never
+    touches the real ~/.super-agent. prefs.py resolves the dir dynamically, so
+    this isolates it; store.py freezes its own paths at import and its tests
+    override those module attrs directly, so they're unaffected. test_prefs
+    re-sets store_dir itself (same effect)."""
+    monkeypatch.setattr(config, "store_dir", lambda: tmp_path)
+
 
 class _FEHandler(BaseHTTPRequestHandler):
     """A scriptable stand-in for the SR web app's remote-login broker routes."""

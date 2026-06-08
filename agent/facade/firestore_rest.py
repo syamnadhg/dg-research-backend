@@ -1,18 +1,23 @@
 """Minimal Firestore REST client, scoped to the account session.
 
-Reimplements just the four operations the bridge needs, over the Firestore
-REST API with the account's ID token as a Bearer credential — so this package
-needs no google-cloud-firestore dependency and stays decoupled from the BE.
+Reimplements just the operations the bridge needs, over the Firestore REST API
+with the account's ID token as a Bearer credential — so this package needs no
+google-cloud-firestore dependency and stays decoupled from the BE.
 
-Every write here is something a normal account client is already allowed to do
-under the existing firestore.rules (verified 2026-06-04):
+Every call here authenticates AS THE ACCOUNT USER (request.auth.uid == the
+tree's userId — the owner branch), the same identity research-app/web/src/lib/
+firestore.ts uses from the browser:
   * read   users/{uid}/researches          (owner of the tree)
   * read   devices where member             (ownerUid == uid OR uid in sharedWith)
   * upsert users/{uid}/researches/{rid}     (owner of the tree)
   * create devices/{deviceId}/queue/{auto}  (isDeviceMember && submittedBy == uid)
+  * upsert/get/delete users/{uid}/agentSessions/{id}   (owner of the tree, #790)
 
-No rules change is required; this mirrors what research-app/web/src/lib/
-firestore.ts does from the browser.
+The first four need NO rules change. The agentSessions ops (#790) require ONE
+owner-only match block in firestore.rules — a verbatim mirror of the existing
+users/{uid}/sessions block (rules v2 does not inherit the parent users/{uid}
+allow to subcollections). The owner-only rule covers BOTH this bridge write
+(bridge == the user) and the FE reading its own agent rows.
 """
 
 from __future__ import annotations
@@ -165,6 +170,23 @@ class FirestoreRest:
         row["id"] = doc_id(body.get("name", ""))
         return row
 
+    def get_agent_session(self, uid: str, sid: str) -> dict[str, Any] | None:
+        """Read the agent-session doc (#790), or None if absent/deleted.
+
+        The bridge's heartbeat reads this to consult ``revoked`` — a user who
+        taps Revoke on the agent row in the app's "Shared with" popup sets
+        ``revoked: true`` here, and the bridge self-logs-out on the next tick.
+        allow_missing=True so a not-yet-created / already-deleted session reads
+        as None (treated as not-revoked / session-gone), never an error.
+        """
+        url = f"{config.FIRESTORE_BASE}/users/{uid}/agentSessions/{sid}"
+        body = self._request("GET", url, allow_missing=True)
+        if not body:
+            return None
+        row = fields_to_dict(body)
+        row["id"] = doc_id(body.get("name", ""))
+        return row
+
     def list_devices(self, uid: str) -> list[dict[str, Any]]:
         """List devices the account can reach: owned ∪ shared-to.
 
@@ -216,6 +238,26 @@ class FirestoreRest:
         absent doc is a no-op on the REST API.
         """
         url = f"{config.FIRESTORE_BASE}/users/{uid}/researches/{rid}"
+        self._request("DELETE", url)
+
+    def upsert_agent_session(self, uid: str, sid: str, fields: dict[str, Any]) -> None:
+        """Create/merge the agent-session doc (#790) under the user's tree.
+
+        A masked PATCH so passing only ``{"lastSeenAt": now}`` touches the
+        heartbeat WITHOUT clobbering siblings (label/runtime/connectedAt) — the
+        same idempotent create-or-merge idiom as upsert_research. The doc id is
+        the host install id (prefs.get_or_create_install_id), so re-login
+        overwrites the same row rather than accreting a new one.
+        """
+        mask = "&".join(f"updateMask.fieldPaths={k}" for k in fields)
+        url = f"{config.FIRESTORE_BASE}/users/{uid}/agentSessions/{sid}?{mask}"
+        self._request(
+            "PATCH", url, json_body={"fields": {k: to_value(v) for k, v in fields.items()}}
+        )
+
+    def delete_agent_session(self, uid: str, sid: str) -> None:
+        """Delete the agent-session doc on a clean /logout (#790). Idempotent."""
+        url = f"{config.FIRESTORE_BASE}/users/{uid}/agentSessions/{sid}"
         self._request("DELETE", url)
 
     def enqueue_start(

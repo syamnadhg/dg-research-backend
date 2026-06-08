@@ -79,6 +79,14 @@ STREAM_POLL_INTERVAL_SECONDS: float = float(
     os.environ.get("SUPER_AGENT_STREAM_POLL_INTERVAL", "5")
 )
 
+# How often the bridge's background heartbeat thread bumps the agentSessions
+# doc's lastSeenAt (which doubles as keeping the account token warm) and reads
+# back the `revoked` flag to self-logout if the user revoked the agent from the
+# app's "Shared with" popup. Overridable so E2E/unit tests can drive it fast.
+HEARTBEAT_INTERVAL_SECONDS: float = float(
+    os.environ.get("SUPER_AGENT_HEARTBEAT_INTERVAL", "60")
+)
+
 
 def bridge_origin() -> str:
     """Origin the host CLI / skill use to call the bridge (reliable IPv4)."""
