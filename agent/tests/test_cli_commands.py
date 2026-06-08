@@ -6,6 +6,8 @@ All deps are module-level imports in facade.cli, so everything is monkeypatched
 in-place — no HTTP server, no real runtime dirs, no schtasks.
 """
 
+import contextlib
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +23,7 @@ def _ns(**kw):
 def test_disconnect_pairs_dedups_detect_and_prefs(monkeypatch):
     home = Path("C:/Users/me")
     monkeypatch.setattr(cli.connect, "detect_targets",
-                        lambda: [connect.Target("hermes", "windows", home)])
+                        lambda: [connect.Target("hermes", "local",home)])
     monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
     monkeypatch.setattr(cli.prefs, "get_runtime_home", lambda: str(home))
     pairs = cli._disconnect_pairs(None, None)
@@ -40,7 +42,7 @@ def test_disconnect_pairs_recovers_unmounted_wsl_from_prefs(monkeypatch):
 
 def test_disconnect_pairs_explicit_filters_both_sources(monkeypatch):
     monkeypatch.setattr(cli.connect, "detect_targets",
-                        lambda: [connect.Target("hermes", "windows", Path("C:/h")),
+                        lambda: [connect.Target("hermes", "local",Path("C:/h")),
                                  connect.Target("openclaw", "wsl", Path("/o"), distro="U")])
     monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "openclaw")
     monkeypatch.setattr(cli.prefs, "get_runtime_home", lambda: "/o")
@@ -144,7 +146,7 @@ def test_cmd_disconnect_removes_skill_and_signs_out(monkeypatch):
     home = Path("C:/Users/me")
     removed = []
     monkeypatch.setattr(cli.connect, "detect_targets",
-                        lambda: [connect.Target("hermes", "windows", home)])
+                        lambda: [connect.Target("hermes", "local",home)])
     monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
     monkeypatch.setattr(cli.prefs, "get_runtime_home", lambda: str(home))
     monkeypatch.setattr(cli.connect, "uninstall",
@@ -154,3 +156,162 @@ def test_cmd_disconnect_removes_skill_and_signs_out(monkeypatch):
     assert cli.cmd_disconnect(_ns()) == 0
     assert removed == [("hermes", home)]  # step 1 removed the skill at the right home
     assert logged_out["v"] is True  # step 2 signed out
+
+
+# ── reachability: _ensure_reachable / _ensure_wsl_networking ──────────────────
+
+def test_ensure_reachable_local_is_noop_ok(monkeypatch, capsys):
+    # A co-located (local) runtime shares the bridge's loopback — no WSL path.
+    calls = []
+    monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: calls.append("wsl"))
+    cli._ensure_reachable(connect.Target("hermes", "local", Path("C:/Users/me")))
+    assert calls == []
+    assert "loopback" in capsys.readouterr().out.lower()
+
+
+def test_ensure_reachable_wsl_delegates(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: calls.append("wsl"))
+    cli._ensure_reachable(connect.Target("openclaw", "wsl", Path("/o"), distro="U"))
+    assert calls == ["wsl"]
+
+
+def test_ensure_wsl_networking_already_on_skips_write(monkeypatch):
+    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: True)
+    wrote = []
+    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
+                        lambda *a, **k: wrote.append(1) or (True, Path("x")))
+    cli._ensure_wsl_networking()
+    assert wrote == []  # already mirrored → nothing to write, no restart nudge
+
+
+def test_ensure_wsl_networking_decline_write_does_nothing(monkeypatch):
+    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)  # decline the write
+    wrote = []
+    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
+                        lambda *a, **k: wrote.append(1) or (True, Path("x")))
+    cli._ensure_wsl_networking()
+    assert wrote == []
+
+
+def test_ensure_wsl_networking_write_then_decline_restart(monkeypatch):
+    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    answers = iter([True, False])  # Y write, N shutdown
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
+    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
+                        lambda *a, **k: (True, Path("C:/Users/me/.wslconfig")))
+    shut = []
+    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: shut.append(1) or (True, ""))
+    cli._ensure_wsl_networking()
+    assert shut == []  # declined → we never shut WSL down out from under the user
+
+
+def test_ensure_wsl_networking_write_then_accept_restart(monkeypatch):
+    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    answers = iter([True, True])  # Y write, Y shutdown
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
+    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
+                        lambda *a, **k: (True, Path("C:/Users/me/.wslconfig")))
+    shut = []
+    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: shut.append(1) or (True, ""))
+    cli._ensure_wsl_networking()
+    assert shut == [1]  # accepted → wsl --shutdown invoked
+
+
+def test_ensure_wsl_networking_write_failure_is_handled(monkeypatch, capsys):
+    # The OSError path (couldn't write .wslconfig) must degrade gracefully and
+    # never reach the restart offer.
+    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)  # accept the write
+    def _boom(*a, **k):
+        raise OSError("Access is denied")
+    monkeypatch.setattr(cli.connect, "enable_mirrored_networking", _boom)
+    shut = []
+    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: shut.append(1) or (True, ""))
+    cli._ensure_wsl_networking()
+    assert "Couldn't write" in capsys.readouterr().out
+    assert shut == []  # returned before offering the restart
+
+
+def test_ensure_wsl_networking_shutdown_failure_is_handled(monkeypatch, capsys):
+    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    answers = iter([True, True])  # Y write, Y shutdown
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
+    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
+                        lambda *a, **k: (True, Path("C:/Users/me/.wslconfig")))
+    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: (False, "wsl.exe not found"))
+    cli._ensure_wsl_networking()
+    assert "Couldn't run wsl --shutdown" in capsys.readouterr().out
+
+
+def test_ensure_wsl_networking_already_configured_unapplied(monkeypatch, capsys):
+    # enable_mirrored_networking can return changed=False (value already present) —
+    # the message must say "Already set", not falsely claim a fresh enable.
+    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    answers = iter([True, False])  # Y write, N shutdown
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
+    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
+                        lambda *a, **k: (False, Path("C:/Users/me/.wslconfig")))
+    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: (True, ""))
+    cli._ensure_wsl_networking()
+    assert "Already set" in capsys.readouterr().out
+
+
+# ── cmd_status runtime-location rendering ─────────────────────────────────────
+# (capture via redirect_stdout: capsys flakes on the branded multi-line header
+#  output for some of these, while redirect_stdout captures it deterministically.)
+
+def _status_out(monkeypatch, *, loc, distro="Ubuntu-24.04"):
+    monkeypatch.setattr(cli, "_bridge_get", lambda *a, **k: None)  # bridge down (simplest)
+    monkeypatch.setattr(cli.AccountSession, "load", staticmethod(lambda: None))
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
+    monkeypatch.setattr(cli.prefs, "get_runtime_location", lambda: loc)
+    monkeypatch.setattr(cli.prefs, "get_runtime_distro", lambda: distro)
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: False)
+    monkeypatch.setattr(cli.connect, "host_os_label", lambda: "TestOS")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_status(_ns())
+    return buf.getvalue()
+
+
+def _runtime_line(out):
+    return next(line for line in out.splitlines() if "Runtime:" in line)
+
+
+def test_cmd_status_renders_wsl_location(monkeypatch):
+    assert "Runtime: hermes · WSL · Ubuntu-24.04" in _status_out(monkeypatch, loc="wsl")
+
+
+def test_cmd_status_renders_local_as_host(monkeypatch):
+    line = _runtime_line(_status_out(monkeypatch, loc="local"))
+    assert "hermes · TestOS" in line and "WSL" not in line
+
+
+def test_cmd_status_renders_no_location(monkeypatch):
+    line = _runtime_line(_status_out(monkeypatch, loc=None))
+    assert "hermes" in line and "·" not in line  # no host/WSL suffix when unknown
+
+
+# ── cmd_home (bare `agent` / `--agent` smart entry) ───────────────────────────
+
+def test_cmd_home_when_set_up_shows_status(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    routed = []
+    monkeypatch.setattr(cli, "cmd_status", lambda args: routed.append("status") or 0)
+    monkeypatch.setattr(cli, "cmd_connect", lambda args: routed.append("connect") or 0)
+    assert cli.cmd_home(_ns()) == 0
+    assert routed == ["status"]
+
+
+def test_cmd_home_when_fresh_runs_connect(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: None)  # nothing connected yet
+    routed = []
+    monkeypatch.setattr(cli, "cmd_status", lambda args: routed.append("status") or 0)
+    monkeypatch.setattr(cli, "cmd_connect", lambda args: routed.append("connect") or 0)
+    ns = SimpleNamespace(verbose=False)  # bare namespace lacks runtime/dest
+    assert cli.cmd_home(ns) == 0
+    assert routed == ["connect"]
+    assert ns.runtime is None and ns.dest is None  # cmd_home supplied the omitted defaults

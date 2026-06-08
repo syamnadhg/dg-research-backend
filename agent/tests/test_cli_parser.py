@@ -120,3 +120,16 @@ def test_autostart_subcommand_removed():
     # `autostart` was renamed to resurrect/retire — the old verb is gone.
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["autostart", "install"])
+
+
+def test_bare_invocation_defaults_to_home():
+    # Bare `agent` / `--agent` (no subcommand) is allowed and routes to the smart
+    # entry rather than erroring on a missing required subcommand.
+    ns = cli.build_parser().parse_args([])
+    assert ns.func is cli.cmd_home
+    assert getattr(ns, "command", None) is None
+
+
+def test_subcommand_overrides_home_default():
+    # A chosen subcommand's func must win over the bare-entry default.
+    assert cli.build_parser().parse_args(["status"]).func is cli.cmd_status

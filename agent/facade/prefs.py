@@ -29,8 +29,8 @@ _SELECTED_DEVICE = "selectedDeviceId"
 _SELECTED_UID = "selectedUid"
 _RUNTIME = "runtime"
 _RUNTIME_HOME = "runtimeHome"          # where the skill was installed (str path)
-_RUNTIME_LOCATION = "runtimeLocation"  # "windows" | "wsl"
-_RUNTIME_DISTRO = "runtimeDistro"      # WSL distro name (None on Windows)
+_RUNTIME_LOCATION = "runtimeLocation"  # "local" (this host) | "wsl"
+_RUNTIME_DISTRO = "runtimeDistro"      # WSL distro name (None for a local install)
 _INSTALL_ID = "installId"
 _LABEL = "agentLabel"
 
@@ -155,7 +155,11 @@ def get_runtime_home() -> str | None:
 
 def get_runtime_location() -> str | None:
     v = load().get(_RUNTIME_LOCATION)
-    return v if isinstance(v, str) and v else None
+    if not (isinstance(v, str) and v):
+        return None
+    # Migrate the pre-rename value: native installs were once "windows", now
+    # "local" (host-agnostic). Normalize on read so old prefs.json files behave.
+    return "local" if v == "windows" else v
 
 
 def get_runtime_distro() -> str | None:

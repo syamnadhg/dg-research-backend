@@ -39826,15 +39826,18 @@ def run_doctor():
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Super Agent (chat-runtime bridge) — `python research.py agent <…>`.
+    # Super Agent (chat-runtime bridge) — `python research.py agent <…>`
+    # (or the flag-style alias `--agent`, consistent with --pair/--serve). Bare
+    # `agent` / `--agent` with no subcommand is fine — the package defaults to a
+    # smart entry (status if set up, else connect).
     # The agent is an isolated sub-package under agent/ (its own deps + its own
     # process; it imports NOTHING from this file and this file never imports it).
     # We only FRONT it here so it's invoked consistently with the rest of the
-    # CLI. Everything after `agent` is forwarded verbatim to the package (run
+    # CLI. Everything after the verb is forwarded verbatim to the package (run
     # from agent/ so `-m facade` resolves), intercepted before argparse so the
     # agent's own subcommands/flags pass straight through. (A research topic of
     # literally "agent" is shadowed — phrase it differently, e.g. "AI agents".)
-    if len(sys.argv) > 1 and sys.argv[1] == "agent":
+    if len(sys.argv) > 1 and sys.argv[1] in ("agent", "--agent"):
         agent_dir = Path(__file__).resolve().parent / "agent"
         if not (agent_dir / "facade" / "__main__.py").exists():
             print("Super Agent package not found at agent/ — incomplete checkout?")
@@ -39848,7 +39851,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Multi-Agent Deep Research Pipeline",
-        epilog="Chat-runtime (Hermes / OpenClaw) commands:  python research.py agent --help",
+        epilog="Chat-runtime (Hermes / OpenClaw) commands:  python research.py agent --help"
+               "   (bare  agent  /  --agent  → smart entry: status or connect)",
     )
     parser.add_argument("topic", nargs="?", help="Research topic")
     parser.add_argument("--pdf", action="append", default=[], help="PDF to attach (Phase 1)")

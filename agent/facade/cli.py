@@ -110,16 +110,17 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
     # ── [1/4] Detect ────────────────────────────────────────────────────────
     b.step(1, 4, "Detect runtime")
+    b.dim(f"Bridge runs here · {connect.host_os_label()}  (alongside the Super Research backend).")
     targets = connect.detect_targets()
     if explicit:
         matches = [t for t in targets if t.runtime == explicit]
         if matches:
             targets = matches
         else:
-            # Honor the explicit choice even if undetected — install at the
-            # Windows default path (creates the dirs).
-            targets = [connect.Target(explicit, "windows", Path.home())]
-            b.dim(f"{explicit} not detected — will install at the default Windows path.")
+            # Honor the explicit choice even if undetected — install at this
+            # host's default home (creates the dirs).
+            targets = [connect.Target(explicit, "local", Path.home())]
+            b.dim(f"{explicit} not detected — will install at the default path on this host.")
     if not targets:
         b.no("No chat runtime found (looked for ~/.hermes, ~/.openclaw on Windows and in WSL).")
         b.dim("Install Hermes or OpenClaw first, then re-run:  python research.py agent connect")
@@ -192,17 +193,9 @@ def _connect_go_live(chosen: connect.Target, target: Path) -> int:
         b.dim("  python research.py agent resurrect   (background + on login)")
         b.dim("  python research.py agent serve       (foreground, this terminal)")
 
-    # WSL runtime → the loopback bridge is only reachable with mirrored networking.
-    if chosen.location == "wsl":
-        print()
-        mirrored = connect.mirrored_networking_enabled()
-        if mirrored:
-            b.ok("WSL mirrored networking is on — your WSL chat can reach the bridge.")
-        else:
-            b.warn("WSL runtime: the bridge runs here on Windows; your WSL chat reaches it")
-            b.dim("  over loopback ONLY with WSL mirrored networking enabled.")
-            b.dim("  Enable it:  add  networkingMode=mirrored  under [wsl2] in  %USERPROFILE%\\.wslconfig,")
-            b.dim("              then  wsl --shutdown.   Verify with:  python research.py agent doctor")
+    # Make sure the chosen runtime can actually reach the loopback bridge.
+    print()
+    _ensure_reachable(chosen)
 
     print()
     b.line(b.c(branding._BOLD + branding._ACCENT, "Connected.")
@@ -213,6 +206,62 @@ def _connect_go_live(chosen: connect.Target, target: Path) -> int:
         ("python research.py agent disconnect", "remove the skill + sign out"),
     ])
     return 0
+
+
+def _ensure_reachable(target: connect.Target) -> None:
+    """Make sure the chosen runtime can reach the bridge over loopback.
+
+    One rule, every platform: the runtime must share the bridge's loopback.
+      • co-located (same OS as the bridge) → shares loopback, nothing to do.
+      • WSL runtime + Windows bridge → separate net namespace → offer the
+        mirrored-networking auto-fix.
+    (A runtime on a *different machine* can't reach a loopback-only bridge at all
+    — unsupported by design; detect_targets only ever finds local/WSL installs.)"""
+    if target.location == "wsl":
+        _ensure_wsl_networking()
+        return
+    label = connect.RUNTIME_META[target.runtime]["label"]
+    b.ok(f"{label} is on this {connect.host_os_label()} host — it reaches the bridge "
+         "over loopback. No network setup needed.")
+
+
+def _ensure_wsl_networking() -> None:
+    """WSL runtime prerequisite: the bridge runs on Windows and binds loopback, so
+    a WSL chat reaches it ONLY with WSL "mirrored" networking. If it's off, offer
+    to write it into %USERPROFILE%\\.wslconfig (Y), then — since the change needs a
+    WSL restart — offer to run `wsl --shutdown` (default NO: it closes every WSL
+    session, including the runtime just connected). Consent-gated, never silent."""
+    if connect.mirrored_networking_enabled():
+        b.ok("WSL mirrored networking is on — your WSL chat can reach the bridge.")
+        return
+    b.warn("WSL chat reaches this Windows bridge over loopback ONLY with mirrored networking.")
+    if not b.confirm("Enable it now? (writes  %USERPROFILE%\\.wslconfig )", default=True):
+        b.dim("Skipped. Enable later: add  networkingMode=mirrored  under [wsl2] in")
+        b.dim("  %USERPROFILE%\\.wslconfig , then  wsl --shutdown   (or re-run agent connect).")
+        return
+    try:
+        changed, path = connect.enable_mirrored_networking()
+    except OSError as e:
+        b.no(f"Couldn't write .wslconfig: {e}")
+        b.dim("Add  networkingMode=mirrored  under [wsl2] manually, then  wsl --shutdown .")
+        return
+    b.ok(f"{'Enabled' if changed else 'Already set'} networkingMode=mirrored   ({path})")
+    if not changed:
+        # Configured but a prior enable hasn't been applied yet — still nudge the
+        # restart (mirrored_networking_enabled() read False to get us here).
+        b.dim("Configured already; WSL just needs to restart to apply it.")
+    else:
+        b.dim("WSL must restart for this to take effect.")
+    if b.confirm("Run  wsl --shutdown  now? (closes all WSL sessions)", default=False):
+        ok, msg = connect.wsl_shutdown()
+        if ok:
+            b.ok("WSL is shutting down — it comes back with mirrored networking on next use.")
+            b.dim("Relaunch your chat runtime in WSL, then sign in with  /sr-login .")
+        else:
+            b.warn(f"Couldn't run wsl --shutdown: {msg}")
+            b.dim("Run it yourself, then verify:  python research.py agent doctor")
+    else:
+        b.dim("Run  wsl --shutdown  yourself, then verify:  python research.py agent doctor")
 
 
 def _disconnect_pairs(explicit: str | None,
@@ -413,7 +462,8 @@ def cmd_status(_args: argparse.Namespace) -> int:
     rt = prefs.get_runtime()
     if rt:
         loc = prefs.get_runtime_location()
-        where = f" · WSL · {prefs.get_runtime_distro()}" if loc == "wsl" else (" · Windows" if loc else "")
+        where = (f" · WSL · {prefs.get_runtime_distro()}" if loc == "wsl"
+                 else (f" · {connect.host_os_label()}" if loc else ""))
         b.dim(f"Runtime: {rt}{where}")
     if autostart.is_installed():
         b.ok(f"Autostart: pinned to login ({autostart.TASK_NAME})")
@@ -536,8 +586,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         else:
             _doctor_row("wsl net", False,
                         "not mirrored — WSL chat can't reach the loopback bridge", warn_only=True)
-            b.dim("           add  networkingMode=mirrored  under [wsl2] in  %USERPROFILE%\\.wslconfig,")
-            b.dim("           then  wsl --shutdown")
+            b.dim("           fix:  python research.py agent connect   (offers to enable it for you)")
 
     health = _bridge_get("/healthz")
     if health is None:
@@ -846,6 +895,21 @@ def cmd_stop(_args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_home(args: argparse.Namespace) -> int:
+    """Bare `agent` / `--agent` (no subcommand): smart entry — show status when the
+    agent is already set up (bridge up OR a runtime connected), else drop straight
+    into the interactive connect flow so a first run onboards you."""
+    if _bridge_up() or prefs.get_runtime():
+        return cmd_status(args)
+    # cmd_connect reads args.runtime/.dest; the bare namespace lacks them (they're
+    # defined only on the `connect` subparser) — supply the omitted defaults.
+    if not hasattr(args, "runtime"):
+        args.runtime = None
+    if not hasattr(args, "dest"):
+        args.dest = None
+    return cmd_connect(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     # -v/--verbose must work both before and after the subcommand
     # (agent -v serve  ==  agent serve -v). argparse stores a sub-parser flag and
@@ -860,7 +924,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", dest="verbose_global", action="store_true",
                    help="verbose (DEBUG) logging (also accepted after the subcommand)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = p.add_subparsers(dest="command", required=True)
+    # Bare `agent` (no subcommand) is allowed → cmd_home (smart entry). A chosen
+    # subcommand's own set_defaults(func=…) overrides this default.
+    p.set_defaults(func=cmd_home)
+    sub = p.add_subparsers(dest="command")
 
     cn = sub.add_parser("connect", parents=[common],
                         help="connect a chat runtime — branded flow: install the skill "

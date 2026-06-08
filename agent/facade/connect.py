@@ -46,14 +46,20 @@ RUNTIME_META: dict[str, dict] = {
 WSL_DISTRO_ENV = "SUPER_AGENT_WSL_DISTRO"
 
 
+def host_os_label() -> str:
+    """Human label for the OS this bridge runs on (it co-locates with the
+    backend). A "local" runtime install lives on this same host by definition."""
+    return {"win32": "Windows", "darwin": "macOS"}.get(sys.platform, "Linux")
+
+
 @dataclass(frozen=True)
 class Target:
     """A concrete place to install the skill: a runtime + the home that holds it."""
 
     runtime: str           # "hermes" | "openclaw"
-    location: str          # "windows" | "wsl"
+    location: str          # "local" (this host, shares the bridge's loopback) | "wsl"
     home: Path             # the home dir containing .hermes / .openclaw
-    distro: str | None = None  # WSL distro name (None on Windows)
+    distro: str | None = None  # WSL distro name (None for a local install)
 
     @property
     def dest(self) -> Path:
@@ -61,7 +67,9 @@ class Target:
 
     @property
     def where(self) -> str:
-        return f"WSL · {self.distro}" if self.location == "wsl" else "Windows"
+        # "local" renders as the actual host OS (Windows/Linux/macOS) — a local
+        # target is, by construction, found under this host's home.
+        return f"WSL · {self.distro}" if self.location == "wsl" else host_os_label()
 
 
 def skill_src_dir() -> Path:
@@ -163,7 +171,7 @@ def detect_targets(home: Path | None = None, *, include_wsl: bool = True) -> lis
     """Every place a runtime is found — Windows-local first, then WSL distros."""
     base = home or Path.home()
     targets: list[Target] = [
-        Target(rt, "windows", base)
+        Target(rt, "local", base)
         for rt, rel in RUNTIMES.items()
         if (base / rel.parts[0]).exists()
     ]
@@ -212,6 +220,77 @@ def mirrored_networking_enabled(home: Path | None = None) -> bool | None:
         return networking_mode(p.read_text(encoding="utf-8-sig", errors="ignore")) == "mirrored"
     except OSError:
         return None
+
+
+def enable_mirrored_networking(home: Path | None = None, *, mode: str = "mirrored") -> tuple[bool, Path]:
+    """Idempotently set ``[wsl2] networkingMode=<mode>`` in .wslconfig.
+
+    Surgical + non-destructive: an existing ``[wsl2]`` section keeps its other
+    keys (memory/swap/…) and comments; only the networkingMode line is added or
+    rewritten. With no ``[wsl2]`` section a new one is appended; with no file at
+    all one is created. Returns ``(changed, path)`` — ``changed`` is False when
+    the value was already ``<mode>`` (so the caller can skip the "restart WSL"
+    nudge). Reads utf-8-sig (BOM-tolerant — see ``mirrored_networking_enabled``)
+    and writes plain utf-8.
+    """
+    p = wslconfig_path(home)
+    try:
+        text = p.read_text(encoding="utf-8-sig", errors="ignore") if p.exists() else ""
+    except OSError:
+        text = ""
+    if networking_mode(text) == mode:
+        return (False, p)
+
+    out: list[str] = []
+    in_wsl2 = False
+    wrote = False
+    saw_wsl2 = False
+    line = f"networkingMode={mode}"
+    for raw in text.splitlines():
+        stripped = raw.split("#", 1)[0].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            # Leaving a [wsl2] block we never wrote into → drop the key in first.
+            if in_wsl2 and not wrote:
+                out.append(line)
+                wrote = True
+            in_wsl2 = stripped[1:-1].strip().lower() == "wsl2"
+            saw_wsl2 = saw_wsl2 or in_wsl2
+            out.append(raw)
+            continue
+        if in_wsl2 and not wrote and "=" in stripped and \
+                stripped.split("=", 1)[0].strip().lower() == "networkingmode":
+            out.append(line)   # rewrite an existing (e.g. nat) value
+            wrote = True
+            continue
+        out.append(raw)
+    if in_wsl2 and not wrote:        # file ended inside [wsl2]
+        out.append(line)
+        wrote = True
+    if not saw_wsl2:                 # no [wsl2] anywhere → append a fresh section
+        if out and out[-1].strip():
+            out.append("")
+        out.extend(["[wsl2]", line])
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return (True, p)
+
+
+def wsl_shutdown() -> tuple[bool, str]:
+    """Run ``wsl --shutdown`` (Windows only) so a networkingMode change takes
+    effect. Returns ``(ok, message)``; ok is False off-Windows or on failure."""
+    if sys.platform != "win32":
+        return (False, "Windows-only")
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    try:
+        r = subprocess.run(["wsl.exe", "--shutdown"], capture_output=True,
+                           timeout=60, creationflags=no_window)
+    except (OSError, subprocess.SubprocessError) as e:
+        return (False, str(e))
+    if r.returncode == 0:
+        return (True, "")
+    err = (r.stderr or b"").decode("utf-16-le", errors="ignore").strip()
+    return (False, err or f"exit {r.returncode}")
 
 
 # ── install / uninstall ──────────────────────────────────────────────────────

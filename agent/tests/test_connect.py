@@ -88,35 +88,45 @@ def test_install_then_uninstall_roundtrip_at_runtime_path(tmp_path):
     assert not target.exists()
 
 
-# ── Target + detect_targets (Windows-local) ──────────────────────────────────
+# ── Target + detect_targets (local + WSL) ────────────────────────────────────
 
-def test_target_dest_and_where():
+def test_host_os_label(monkeypatch):
+    for plat, label in (("win32", "Windows"), ("darwin", "macOS"), ("linux", "Linux")):
+        monkeypatch.setattr(connect.sys, "platform", plat)
+        assert connect.host_os_label() == label
+
+
+def test_target_dest_and_where(monkeypatch):
     from pathlib import Path
 
-    win = connect.Target("hermes", "windows", Path("C:/Users/x"))
-    assert win.dest == Path("C:/Users/x") / connect.RUNTIMES["hermes"]
-    assert win.where == "Windows"
+    # A "local" install renders as the actual host OS (not hardcoded Windows).
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    loc = connect.Target("hermes", "local", Path("/home/x"))
+    assert loc.dest == Path("/home/x") / connect.RUNTIMES["hermes"]
+    assert loc.where == "Linux"
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    assert connect.Target("hermes", "local", Path("C:/Users/x")).where == "Windows"
     wsl = connect.Target("openclaw", "wsl", Path("/h/u"), distro="Ubuntu-24.04")
-    assert wsl.where == "WSL · Ubuntu-24.04"
+    assert wsl.where == "WSL · Ubuntu-24.04"  # distro shown regardless of host
 
 
-def test_detect_targets_windows_local(tmp_path):
+def test_detect_targets_local(tmp_path):
     assert connect.detect_targets(home=tmp_path, include_wsl=False) == []
     (tmp_path / ".hermes").mkdir()
     targets = connect.detect_targets(home=tmp_path, include_wsl=False)
     assert len(targets) == 1
-    assert targets[0].runtime == "hermes" and targets[0].location == "windows"
+    assert targets[0].runtime == "hermes" and targets[0].location == "local"
     assert targets[0].home == tmp_path
 
 
 def test_detect_targets_default_includes_wsl_branch(tmp_path, monkeypatch):
     # Default include_wsl=True path must call the WSL branch and return cleanly
-    # (Windows-local targets only) when no WSL distro is present — no crash/hang.
+    # (local targets only) when no WSL distro is present — no crash/hang.
     monkeypatch.setattr(connect, "wsl_distros", lambda: [])
     (tmp_path / ".openclaw").mkdir()
     targets = connect.detect_targets(home=tmp_path)  # default include_wsl=True
     assert [t.runtime for t in targets] == ["openclaw"]
-    assert all(t.location == "windows" for t in targets)
+    assert all(t.location == "local" for t in targets)
 
 
 def test_detect_wsl_targets_off_windows_guard(monkeypatch):
@@ -187,3 +197,70 @@ def test_mirrored_networking_enabled(tmp_path):
     assert connect.mirrored_networking_enabled(home=tmp_path) is True
     (tmp_path / ".wslconfig").write_text("[wsl2]\nnetworkingMode=nat\n", encoding="utf-8")
     assert connect.mirrored_networking_enabled(home=tmp_path) is False
+
+
+# ── enable_mirrored_networking (the writer) ──────────────────────────────────
+
+def test_enable_creates_file_when_absent(tmp_path):
+    changed, p = connect.enable_mirrored_networking(home=tmp_path)
+    assert changed is True
+    assert p == tmp_path / ".wslconfig"
+    assert connect.mirrored_networking_enabled(home=tmp_path) is True
+    assert "[wsl2]" in p.read_text(encoding="utf-8")
+
+
+def test_enable_preserves_existing_keys(tmp_path):
+    (tmp_path / ".wslconfig").write_text(
+        "[wsl2]\nmemory=13GB\nswap=4GB\n", encoding="utf-8")
+    changed, p = connect.enable_mirrored_networking(home=tmp_path)
+    assert changed is True
+    body = p.read_text(encoding="utf-8")
+    # other keys survive AND the new key landed inside [wsl2]
+    assert "memory=13GB" in body and "swap=4GB" in body
+    assert connect.networking_mode(body) == "mirrored"
+
+
+def test_enable_is_idempotent(tmp_path):
+    (tmp_path / ".wslconfig").write_text(
+        "[wsl2]\nnetworkingMode=mirrored\n", encoding="utf-8")
+    changed, _ = connect.enable_mirrored_networking(home=tmp_path)
+    assert changed is False  # already mirrored → no rewrite, no false "restart WSL"
+
+
+def test_enable_rewrites_nat_value(tmp_path):
+    (tmp_path / ".wslconfig").write_text(
+        "[wsl2]\nnetworkingMode=nat\nmemory=8GB\n", encoding="utf-8")
+    changed, p = connect.enable_mirrored_networking(home=tmp_path)
+    assert changed is True
+    body = p.read_text(encoding="utf-8")
+    assert connect.networking_mode(body) == "mirrored"
+    assert "networkingMode=nat" not in body  # the nat line was replaced, not duplicated
+    assert body.count("networkingMode") == 1
+    assert "memory=8GB" in body
+
+
+def test_enable_appends_section_when_no_wsl2(tmp_path):
+    (tmp_path / ".wslconfig").write_text(
+        "[experimental]\nsparseVhd=true\n", encoding="utf-8")
+    changed, p = connect.enable_mirrored_networking(home=tmp_path)
+    assert changed is True
+    body = p.read_text(encoding="utf-8")
+    assert "[experimental]" in body and "sparseVhd=true" in body  # untouched
+    assert connect.networking_mode(body) == "mirrored"  # new [wsl2] section added
+
+
+def test_enable_tolerates_bom(tmp_path):
+    # Notepad-style UTF-8 BOM must not break the section match / produce a dup.
+    (tmp_path / ".wslconfig").write_bytes(
+        b"\xef\xbb\xbf[wsl2]\nmemory=4GB\n")
+    changed, p = connect.enable_mirrored_networking(home=tmp_path)
+    assert changed is True
+    body = p.read_text(encoding="utf-8")
+    assert connect.networking_mode(body) == "mirrored"
+    assert body.count("[wsl2]") == 1  # didn't append a second section
+
+
+def test_wsl_shutdown_off_windows_guard(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    ok, msg = connect.wsl_shutdown()
+    assert ok is False and "Windows-only" in msg
