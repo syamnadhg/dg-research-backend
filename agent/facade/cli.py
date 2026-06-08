@@ -19,7 +19,8 @@ from pathlib import Path
 
 import requests
 
-from . import __version__, autostart, bridge, config, connect, logsetup, prefs, runview
+from . import __version__, autostart, branding, bridge, config, connect, logsetup, prefs, runview
+from . import branding as b
 from .firestore_rest import FirestoreRest
 from .session import AccountSession
 
@@ -27,6 +28,12 @@ log = logging.getLogger(__name__)
 
 _OK = "✓"  # ✓
 _NO = "✗"  # ✗
+
+
+def _runtime_mark(target: connect.Target) -> str:
+    """Branded chip for a detected runtime (icon + brand-tinted name + where)."""
+    meta = connect.RUNTIME_META[target.runtime]
+    return b.brand_mark(meta["icon"], meta["rgb"], meta["label"], f"· {target.where}")
 
 
 def _bridge_get(path: str, timeout: float = 10.0) -> tuple[int, dict] | None:
@@ -61,82 +68,272 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # The long-running bridge writes the durable operational log; short CLI
     # commands stay console-only (configured in main()).
     logsetup.configure(verbose=getattr(args, "verbose", False), to_file=True)
+    # Foreground serve — nudge toward the always-up background mode unless it's
+    # already pinned. (When autostart launches serve windowless this is a no-op:
+    # the task exists, so is_installed() is True and the tip is skipped.)
+    if not autostart.is_installed():
+        b.dim("Tip: keep it always-up (background + on login)  →  "
+              "python research.py agent resurrect")
     bridge.serve()
     return 0
 
 
-def cmd_connect(args: argparse.Namespace) -> int:
-    """Install the Super Research skill into a chat runtime (Hermes / OpenClaw)."""
-    runtime = args.runtime
-    if not runtime:
-        found = connect.detect_runtimes()
-        if len(found) == 1:
-            runtime = found[0]
-        elif not found:
-            print(f"{_NO} No runtime detected (~/.hermes or ~/.openclaw).")
-            print(f"    Specify one:  agent connect {{{'|'.join(connect.RUNTIMES)}}}")
-            return 1
-        else:
-            print(f"{_NO} Multiple runtimes found ({', '.join(found)}) — specify one:")
-            print("    agent connect <runtime>")
-            return 1
-    if runtime not in connect.RUNTIMES:
-        print(f"{_NO} Unknown runtime '{runtime}'. Choose: {', '.join(connect.RUNTIMES)}")
-        return 1
+def _pick_target(targets: list[connect.Target]) -> connect.Target | None:
+    """Numbered picker (consistent with --pair, not an arrow-TUI). Returns None on
+    cancel (Ctrl-C / EOF / out-of-range / non-numeric) so the caller aborts
+    cleanly rather than silently installing into a runtime the user didn't pick."""
+    for i, t in enumerate(targets, 1):
+        print(f"     {b.c(branding._ACCENT + branding._BOLD, str(i))}  {_runtime_mark(t)}")
+    ans = b.ask("Pick a runtime [1]:", cancel_on_interrupt=True)
+    if ans is None:           # Ctrl-C / EOF → cancel, do not pick a default
+        return None
+    if ans == "":             # bare Enter → accept the [1] default
+        ans = "1"
     try:
-        target = connect.install(runtime, dest=Path(args.dest) if args.dest else None)
+        idx = int(ans)
+    except ValueError:
+        return None
+    return targets[idx - 1] if 1 <= idx <= len(targets) else None
+
+
+def cmd_connect(args: argparse.Namespace) -> int:
+    """Connect a chat runtime (Hermes / OpenClaw): install the Super Research
+    skill where the runtime lives (Windows or WSL), then optionally pin the
+    background bridge. Branded, interactive 4-step flow."""
+    b.header("nexus", "link Super Research to chat", tagline_color=branding._BOLD + branding._ACCENT)
+    b.step_arc(["Detect", "Choose", "Install", "Go live"])
+
+    explicit = args.runtime
+    if explicit and explicit not in connect.RUNTIMES:
+        b.no(f"Unknown runtime '{explicit}'. Choose: {', '.join(connect.RUNTIMES)}")
+        return 1
+
+    # ── [1/4] Detect ────────────────────────────────────────────────────────
+    b.step(1, 4, "Detect runtime")
+    targets = connect.detect_targets()
+    if explicit:
+        matches = [t for t in targets if t.runtime == explicit]
+        if matches:
+            targets = matches
+        else:
+            # Honor the explicit choice even if undetected — install at the
+            # Windows default path (creates the dirs).
+            targets = [connect.Target(explicit, "windows", Path.home())]
+            b.dim(f"{explicit} not detected — will install at the default Windows path.")
+    if not targets:
+        b.no("No chat runtime found (looked for ~/.hermes, ~/.openclaw on Windows and in WSL).")
+        b.dim("Install Hermes or OpenClaw first, then re-run:  python research.py agent connect")
+        return 1
+    for t in targets:
+        b.ok(f"Found {_runtime_mark(t)}")
+
+    # ── [2/4] Choose ──────────────────────────────────────────────────────────
+    b.step(2, 4, "Choose")
+    if len(targets) == 1:
+        chosen = targets[0]
+        b.dim(f"Using {_runtime_mark(chosen)}")
+    else:
+        chosen = _pick_target(targets)
+        if chosen is None:
+            b.dim("Cancelled — nothing was changed.")
+            return 1
+        b.ok(f"Selected {_runtime_mark(chosen)}")
+
+    # ── [3/4] Install the skill ───────────────────────────────────────────────
+    b.step(3, 4, "Install the skill")
+    dest_override = Path(args.dest) if args.dest else None
+    existing = dest_override or chosen.dest
+    if connect.verify(existing):
+        b.dim(f"A Super Research skill is already installed at:\n     {existing}")
+        if not b.confirm("Reinstall (refresh to the latest)?", default=False):
+            b.dim("Kept the existing skill.")
+            _record_runtime(chosen)
+            return _connect_go_live(chosen, existing)
+    try:
+        target = connect.install(chosen.runtime, dest=dest_override, home=chosen.home)
     except OSError as e:
-        print(f"{_NO} install failed: {e}")
+        b.no(f"Install failed: {e}")
         return 1
     if not connect.verify(target):
-        print(f"{_NO} install verification failed at {target}")
+        b.no(f"Install verification failed at {target}")
         return 1
-    prefs.set_runtime(runtime)
-    print(f"{_OK} Super Research skill installed for {runtime}:")
-    print(f"     {target}")
-    print("Next: start the bridge (agent serve), then run /sr-login in your chat.")
+    _record_runtime(chosen)
+    b.ok("Skill installed")
+    b.dim(f"  {target}")
+
+    return _connect_go_live(chosen, target)
+
+
+def _record_runtime(chosen: connect.Target) -> None:
+    """Persist the connected runtime + WHERE it landed, so revoke/disconnect can
+    target a WSL install precisely."""
+    prefs.set_runtime(chosen.runtime, home=str(chosen.home),
+                      location=chosen.location, distro=chosen.distro)
+
+
+def _connect_go_live(chosen: connect.Target, target: Path) -> int:
+    """Step [4/4]: optionally pin + start the bridge, then the closing card."""
+    b.step(4, 4, "Go live")
+    b.dim("The bridge holds your account session and connects this PC to chat.")
+    if b.confirm("Run it in the background now + on every login?", default=True):
+        ok, out = autostart.install()
+        if ok:
+            started, serr = autostart.start_detached()
+            if started:
+                b.ok("Bridge pinned to login + started in the background.")
+            else:
+                b.warn(f"Pinned to login, but couldn't start it now: {serr}")
+                b.dim("It starts at your next login (or run: python research.py agent serve).")
+        else:
+            b.warn(f"Couldn't pin autostart: {out}")
+            b.dim("Start it yourself:  python research.py agent serve")
+    else:
+        b.dim("Skipped background autostart. When you're ready:")
+        b.dim("  python research.py agent resurrect   (background + on login)")
+        b.dim("  python research.py agent serve       (foreground, this terminal)")
+
+    # WSL runtime → the loopback bridge is only reachable with mirrored networking.
+    if chosen.location == "wsl":
+        print()
+        mirrored = connect.mirrored_networking_enabled()
+        if mirrored:
+            b.ok("WSL mirrored networking is on — your WSL chat can reach the bridge.")
+        else:
+            b.warn("WSL runtime: the bridge runs here on Windows; your WSL chat reaches it")
+            b.dim("  over loopback ONLY with WSL mirrored networking enabled.")
+            b.dim("  Enable it:  add  networkingMode=mirrored  under [wsl2] in  %USERPROFILE%\\.wslconfig,")
+            b.dim("              then  wsl --shutdown.   Verify with:  python research.py agent doctor")
+
+    print()
+    b.line(b.c(branding._BOLD + branding._ACCENT, "Connected.")
+           + b.c(branding._DIM, "  Sign in from chat with  /sr-login  (or run agent login)."))
+    b.next_actions([
+        ("python research.py agent login", "sign in your Super Research account"),
+        ("python research.py agent status", "check the bridge + session"),
+        ("python research.py agent disconnect", "remove the skill + sign out"),
+    ])
     return 0
 
 
-def cmd_disconnect(args: argparse.Namespace) -> int:
-    """Remove the Super Research skill from a chat runtime (inverse of connect).
+def _disconnect_pairs(explicit: str | None,
+                      dest_override: Path | None) -> list[tuple[str, Path | None]]:
+    """The (runtime, home) pairs `disconnect` should clean.
 
-    The account session is left alone — use `agent logout` to sign out. The app's
-    Revoke button does BOTH (sign out + uninstall) host-side; this is the local
-    CLI twin for just the uninstall.
-    """
-    runtime = args.runtime
-    targets = [runtime] if runtime else (
-        [prefs.get_runtime()] if prefs.get_runtime() else connect.detect_runtimes()
-    )
-    targets = [t for t in targets if t]
-    if not targets:
-        print(f"{_NO} No runtime detected (~/.hermes or ~/.openclaw). "
-              f"Specify one:  agent disconnect {{{'|'.join(connect.RUNTIMES)}}}")
+    With ``--dest`` it's a single explicit dir. Otherwise: every detected install
+    (Windows + WSL), plus the prefs-recorded install (covers a WSL home that
+    isn't currently mounted/detected), deduped. ``home=None`` means the Windows
+    default path."""
+    if dest_override:
+        rt = explicit or prefs.get_runtime() or next(iter(connect.RUNTIMES))
+        return [(rt, None)]
+    pairs: list[tuple[str, Path | None]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(rt: str, home: Path | None) -> None:
+        key = (rt, str(home) if home else "")
+        if key not in seen:
+            seen.add(key)
+            pairs.append((rt, home))
+
+    for t in connect.detect_targets():
+        if explicit and t.runtime != explicit:
+            continue
+        _add(t.runtime, t.home)
+    rec_rt, rec_home = prefs.get_runtime(), prefs.get_runtime_home()
+    if rec_rt and rec_rt in connect.RUNTIMES and (not explicit or rec_rt == explicit):
+        _add(rec_rt, Path(rec_home) if rec_home else None)
+    return pairs
+
+
+def cmd_disconnect(args: argparse.Namespace) -> int:
+    """Full teardown — the CLI twin of the app's Revoke: remove the skill from
+    the runtime AND sign out. (A session with no skill is dead weight, so the two
+    go together.) The background bridge is left installed — use `agent retire` to
+    also stop + unpin it."""
+    b.header("solvo", "disconnect from chat", tagline_color=branding._BOLD + branding._RED)
+    explicit = args.runtime
+    if explicit and explicit not in connect.RUNTIMES:
+        b.no(f"Unknown runtime '{explicit}'. Choose: {', '.join(connect.RUNTIMES)}")
         return 1
+    dest_override = Path(args.dest) if args.dest else None
+
+    # ── [1/2] Remove the skill ────────────────────────────────────────────────
+    b.step(1, 2, "Remove the skill")
     removed_any = False
-    for rt in targets:
-        if rt not in connect.RUNTIMES:
-            print(f"{_NO} Unknown runtime '{rt}'. Choose: {', '.join(connect.RUNTIMES)}")
-            return 1
+    for rt, home in _disconnect_pairs(explicit, dest_override):
         try:
-            removed = connect.uninstall(rt, dest=Path(args.dest) if args.dest else None)
-        except OSError as e:
-            print(f"{_NO} uninstall failed: {e}")
-            return 1
+            removed = connect.uninstall(rt, dest=dest_override, home=home)
+        except (OSError, ValueError) as e:
+            b.warn(f"{rt}: couldn't remove skill ({e})")
+            continue
         if removed:
-            print(f"{_OK} Removed the Super Research skill from {rt}.")
+            where = f"  ({home})" if home else ""
+            b.ok(f"Removed the Super Research skill from {rt}{where}")
             removed_any = True
-        else:
-            print(f"No Super Research skill was installed for {rt}.")
-    if removed_any:
-        print("Re-add any time with:  agent connect")
+    if not removed_any:
+        b.dim("No Super Research skill was installed (nothing to remove).")
+
+    # ── [2/2] Sign out ────────────────────────────────────────────────────────
+    b.step(2, 2, "Sign out")
+    if _logout_session():
+        b.ok("Signed out — account session cleared.")
+    else:
+        b.dim("No account session was signed in.")
+
+    b.next_actions([
+        ("python research.py agent connect", "reconnect a runtime"),
+        ("python research.py agent retire", "also stop + unpin the background bridge"),
+    ])
+    return 0
+
+
+def cmd_resurrect(args: argparse.Namespace) -> int:
+    """Pin the bridge to logon + start it windowless now (the agent twin of the
+    backend `--resurrect`)."""
+    b.header("resurgam", "rise + run on every login", tagline_color=branding._BOLD + branding._BRIGHT)
+    ok, out = autostart.install()
+    if not ok:
+        b.no(f"Couldn't pin autostart: {out}")
+        return 1
+    b.ok(f"Pinned to login (Scheduled Task {autostart.TASK_NAME})")
+    started, serr = autostart.start_detached()
+    if started:
+        b.ok("Bridge started in the background (windowless)")
+    else:
+        b.warn(f"Pinned, but couldn't start it now: {serr}")
+        b.dim("It starts at your next login (or run: python research.py agent serve).")
+    b.next_actions([
+        ("python research.py agent status", "check the bridge + session"),
+        ("python research.py agent retire", "stop + unpin the background bridge"),
+    ])
+    return 0
+
+
+def cmd_retire(args: argparse.Namespace) -> int:
+    """Stop the background bridge + remove the logon pin (the agent twin of the
+    backend `--retire`). The account session + skill are left alone."""
+    b.header("requiescat", "rest — no longer on login", tagline_color=branding._BOLD + branding._RED)
+    # Stop a running bridge first (best-effort; None = already down).
+    if _bridge_post("/shutdown") is not None:
+        b.ok("Bridge stopping")
+    ok, out = autostart.uninstall()
+    if ok:
+        b.ok("Autostart removed — the bridge will not start on login")
+    elif "cannot find" in (out or "").lower() or "does not exist" in (out or "").lower():
+        b.dim("No autostart was installed.")
+    else:
+        b.warn(f"Autostart teardown: {out or 'unknown'}")
+    b.dim("Your account session + the chat skill are untouched "
+          "(use agent disconnect to remove those).")
     return 0
 
 
 def cmd_login(args: argparse.Namespace) -> int:
+    b.header("ianua", "sign in your account", tagline_color=branding._BOLD + branding._ACCENT)
+    print()
     if not _bridge_up():
-        print(f"{_NO} Bridge isn't running. Start it first:  agent serve")
+        b.no("Bridge isn't running.  Start it:  python research.py agent serve  "
+             "(or: agent resurrect)")
         return 1
     if getattr(args, "remote", False):
         return _login_remote(args)
@@ -144,12 +341,13 @@ def cmd_login(args: argparse.Namespace) -> int:
     runtime = prefs.get_runtime()
     if runtime:
         url += f"?runtime={runtime}"  # glow the connected runtime's watermark
-    print(f"Opening {url} — sign in with your Super Research Google account.")
-    print("(Your agent is research-only; it can never control devices.)")
+    b.line(f"Opening {url}")
+    b.dim("Sign in with your Super Research Google account.")
+    b.dim("Your agent is research-only; it can never control devices.")
     try:
         webbrowser.open(url)
     except Exception:
-        print(f"Couldn't open a browser automatically — visit {url} manually.")
+        b.warn(f"Couldn't open a browser automatically — visit {url} manually.")
     return 0
 
 
@@ -160,12 +358,12 @@ def _login_remote(args: argparse.Namespace) -> int:
                        {"runtime": (getattr(args, "runtime", "") or prefs.get_runtime() or ""),
                         "label": getattr(args, "label", "") or ""})
     if res is None or res[0] != 200:
-        print(f"{_NO} couldn't start remote sign-in: {res[1] if res else 'no response'}")
+        b.no(f"Couldn't start remote sign-in: {res[1] if res else 'no response'}")
         return 1
     out = res[1]
-    print(f"Open this link and sign in:  {out.get('verifyUrl')}")
-    print("(Sign in to Super Research on your phone, then tap Approve & connect.)")
-    print("Waiting for approval… (Ctrl-C to stop)")
+    b.line(f"Open this link and sign in:  {out.get('verifyUrl')}")
+    b.dim("Sign in to Super Research on your phone, then tap Approve & connect.")
+    b.dim("Waiting for approval… (Ctrl-C to stop)")
     deadline = time.monotonic() + float(out.get("expiresIn", 600) or 600)
     interval = config.REMOTE_POLL_INTERVAL_SECONDS
     try:
@@ -177,59 +375,86 @@ def _login_remote(args: argparse.Namespace) -> int:
             st = pr[1]
             state = st.get("state")
             if state == "connected":
-                print(f"{_OK} Connected as {st.get('email') or st.get('uid')}.  Try:  agent verify")
+                b.ok(f"Connected as {st.get('email') or st.get('uid')}.  Try:  agent verify")
                 return 0
             if state == "expired":
-                print(f"{_NO} Sign-in link expired before approval. Run:  agent login --remote")
+                b.no("Sign-in link expired before approval. Run:  agent login --remote")
                 return 1
             if state == "error":
-                print(f"{_NO} Sign-in failed: {st.get('error', 'unknown error')}")
+                b.no(f"Sign-in failed: {st.get('error', 'unknown error')}")
                 return 1
     except KeyboardInterrupt:
-        print("\nStopped waiting. The link may still be valid; re-run to resume.")
+        b.dim("\n  Stopped waiting. The link may still be valid; re-run to resume.")
         return 1
-    print(f"{_NO} Timed out waiting for approval. Run:  agent login --remote")
+    b.no("Timed out waiting for approval. Run:  agent login --remote")
     return 1
 
 
 def cmd_status(_args: argparse.Namespace) -> int:
+    b.header("status", "bridge + session", tagline_color=branding._BOLD + branding._ACCENT)
+    print()
     res = _bridge_get("/status")
-    if res is None:
+    bridge_up = res is not None
+    if bridge_up:
+        b.ok("Bridge: up")
+        st = res[1]
+        if st.get("authed"):
+            b.ok(f"Account: signed in as {st.get('email') or st.get('uid')}")
+        else:
+            b.warn("Account: not signed in  →  python research.py agent login")
+    else:
+        b.no("Bridge: not running  →  python research.py agent serve  (or: agent resurrect)")
         sess = AccountSession.load()
         if sess:
-            print(f"Bridge: not running.  Stored session: {sess.email or sess.uid}")
+            b.dim(f"Account: stored session for {sess.email or sess.uid} (start the bridge to validate)")
         else:
-            print("Bridge: not running.  No stored session.")
-        return 1
-    _, st = res
-    if st.get("authed"):
-        print(f"Bridge: up.  Signed in as {st.get('email') or st.get('uid')}")
+            b.dim("Account: no stored session")
+
+    rt = prefs.get_runtime()
+    if rt:
+        loc = prefs.get_runtime_location()
+        where = f" · WSL · {prefs.get_runtime_distro()}" if loc == "wsl" else (" · Windows" if loc else "")
+        b.dim(f"Runtime: {rt}{where}")
+    if autostart.is_installed():
+        b.ok(f"Autostart: pinned to login ({autostart.TASK_NAME})")
     else:
-        print("Bridge: up.  Not signed in — run:  agent login")
-    return 0
+        b.dim("Autostart: not pinned  →  python research.py agent resurrect")
+    print()
+    return 0 if bridge_up else 1
+
+
+def _logout_session() -> bool:
+    """Sign out: tell the bridge (if up) AND clear the local store, so it works
+    whether or not the bridge is running. Returns True if a session was present.
+    Shared by `agent logout` (sign-out only) and `agent disconnect` (full
+    teardown)."""
+    # Load BEFORE POSTing /logout: the bridge clears the store synchronously
+    # before it responds, so a post-/logout load would always read empty — the
+    # caller would then misreport "no session" even when one was just signed out.
+    sess = AccountSession.load()
+    existed = sess is not None
+    res = _bridge_post("/logout")
+    # #790: the agent-session row must be deleted on logout. When the bridge is UP
+    # its /logout handler already did the delete + store.clear() before replying,
+    # so there's nothing local to do. When the bridge is DOWN (res is None) we do
+    # it ourselves: delete the row BEFORE logout() blanks the token (else the row
+    # orphans — no token could ever mint to delete it — and lingers as a stale
+    # agent until it ages out in the app). Safe re: the single-owner invariant:
+    # the bridge is down, so this one-off token mint can't race a live refresher.
+    if existed and res is None:
+        try:
+            FirestoreRest(sess.id_token).delete_agent_session(
+                sess.uid, prefs.get_or_create_install_id()
+            )
+        except Exception:
+            pass  # network/auth blip — the app hides it via lastSeenAt staleness
+        sess.logout()
+    prefs.clear_selected_device()  # also drop the target-device pref (bridge-down path)
+    return existed
 
 
 def cmd_logout(_args: argparse.Namespace) -> int:
-    # Tell the bridge (if up) AND clear the store directly, so logout works
-    # whether or not the bridge is running.
-    res = _bridge_post("/logout")
-    sess = AccountSession.load()
-    if sess:
-        # #790: the bridge's /logout deletes the agent-session row. If the bridge
-        # is DOWN (res is None), do that delete here ourselves BEFORE logout()
-        # blanks the token — otherwise the row would orphan (no token could ever
-        # mint to delete it) and linger as a stale agent until it ages out in the
-        # app. Safe re: the single-owner invariant: the bridge is down, so this
-        # one-off token mint can't race a live refresher. Best-effort.
-        if res is None:
-            try:
-                FirestoreRest(sess.id_token).delete_agent_session(
-                    sess.uid, prefs.get_or_create_install_id()
-                )
-            except Exception:
-                pass  # network/auth blip — the app hides it via lastSeenAt staleness
-        sess.logout()
-    prefs.clear_selected_device()  # also drop the target-device pref (bridge-down path)
+    _logout_session()
     print("Logged out — account session cleared.")
     return 0
 
@@ -269,43 +494,68 @@ def cmd_device(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_doctor(_args: argparse.Namespace) -> int:
-    print(f"Super Agent doctor (facade v{__version__})\n")
+def _doctor_row(label: str, ok_flag: bool, detail: str, warn_only: bool = False) -> None:
+    mark = (branding.MARK_OK if ok_flag else (branding.MARK_WARN if warn_only else branding.MARK_NO))
+    color = branding._OK if ok_flag else (branding._WARN if warn_only else branding._RED)
+    print(f"  {b.c(color, mark)}  {label.ljust(10)}{detail}")
 
-    print(f"  python:   {_OK} {sys.version.split()[0]}")
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    b.header("medicus", "diagnose + connect", tagline_color=branding._BOLD + branding._ACCENT)
+    print(f"\n  {b.c(branding._DIM, f'facade v{__version__}')}\n")
+
+    _doctor_row("python", True, sys.version.split()[0])
     for mod in ("requests", "keyring"):
         try:
             __import__(mod)
-            print(f"  {mod}:{' ' * (9 - len(mod))}{_OK} importable")
+            _doctor_row(mod, True, "importable")
         except Exception as e:
-            print(f"  {mod}:{' ' * (9 - len(mod))}{_NO} {e}")
+            _doctor_row(mod, False, str(e))
 
     try:
         requests.get("https://securetoken.googleapis.com", timeout=5)
-        print(f"  google:   {_OK} reachable")
+        _doctor_row("google", True, "reachable")
     except requests.RequestException as e:
-        print(f"  google:   {_NO} {e}")
+        _doctor_row("google", False, str(e))
 
     # The remote-login broker (SR web app). Any HTTP response = reachable.
     try:
         requests.get(config.FE_BASE, timeout=5)
-        print(f"  sr web:   {_OK} reachable ({config.FE_BASE})")
+        _doctor_row("sr web", True, f"reachable ({config.FE_BASE})")
     except requests.RequestException as e:
-        print(f"  sr web:   {_NO} {config.FE_BASE} — {e}")
+        _doctor_row("sr web", False, f"{config.FE_BASE} — {e}")
+
+    # WSL mirrored networking — only relevant when a WSL runtime is in play, but
+    # surfaced whenever WSL is present (a WSL chat can't reach the loopback bridge
+    # without it). Reads %USERPROFILE%\.wslconfig (no need to start WSL).
+    distros = connect.wsl_distros()
+    if distros or prefs.get_runtime_location() == "wsl":
+        mirrored = connect.mirrored_networking_enabled()
+        if mirrored:
+            _doctor_row("wsl net", True, "mirrored — WSL chat can reach the bridge")
+        else:
+            _doctor_row("wsl net", False,
+                        "not mirrored — WSL chat can't reach the loopback bridge", warn_only=True)
+            b.dim("           add  networkingMode=mirrored  under [wsl2] in  %USERPROFILE%\\.wslconfig,")
+            b.dim("           then  wsl --shutdown")
 
     health = _bridge_get("/healthz")
     if health is None:
-        print(f"  bridge:   {_NO} down (run: agent serve)")
+        _doctor_row("bridge", False, "down (run: python research.py agent serve)")
         sess = AccountSession.load()
-        print(f"  account:  {'stored session present — start the bridge to validate' if sess else 'not signed in'}")
+        _doctor_row("account", bool(sess),
+                    "stored session present — start the bridge to validate" if sess
+                    else "not signed in", warn_only=bool(sess))
+        print()
         return 1
-    print(f"  bridge:   {_OK} up")
+    _doctor_row("bridge", True, "up")
     res = _bridge_get("/status")
     st = res[1] if res else {}
     if st.get("authed"):
-        print(f"  account:  {_OK} {st.get('email') or st.get('uid')}")
+        _doctor_row("account", True, str(st.get("email") or st.get("uid")))
     else:
-        print(f"  account:  {_NO} not signed in (run: agent login)")
+        _doctor_row("account", False, "not signed in (run: python research.py agent login)")
+    print()
     return 0
 
 
@@ -596,18 +846,6 @@ def cmd_stop(_args: argparse.Namespace) -> int:
     return 1
 
 
-def cmd_autostart(args: argparse.Namespace) -> int:
-    """Install / remove / check the logon autostart (Windows Scheduled Task)."""
-    action = args.action
-    fn = {"install": autostart.install, "uninstall": autostart.uninstall,
-          "status": autostart.status}[action]
-    ok, out = fn()
-    mark = _OK if ok else _NO
-    verb = {"install": "installed", "uninstall": "removed", "status": "status"}[action]
-    print(f"{mark} autostart {verb}" + (f":\n{out}" if out else ""))
-    return 0 if ok else 1
-
-
 def build_parser() -> argparse.ArgumentParser:
     # -v/--verbose must work both before and after the subcommand
     # (agent -v serve  ==  agent serve -v). argparse stores a sub-parser flag and
@@ -625,14 +863,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     cn = sub.add_parser("connect", parents=[common],
-                        help="install the SR skill into a chat runtime (hermes/openclaw)")
+                        help="connect a chat runtime — branded flow: install the skill "
+                             "(Windows or WSL) + optionally pin the bridge")
     cn.add_argument("runtime", nargs="?", help="hermes or openclaw (auto-detected if omitted)")
     cn.add_argument("--dest", help="explicit install dir (default: the runtime's skills dir)")
     cn.set_defaults(func=cmd_connect)
 
     dc = sub.add_parser("disconnect", parents=[common],
-                        help="remove the SR skill from a runtime (inverse of connect; account untouched)")
-    dc.add_argument("runtime", nargs="?", help="hermes or openclaw (defaults to the connected one)")
+                        help="full teardown — remove the skill from the runtime AND sign out "
+                             "(the app's Revoke twin)")
+    dc.add_argument("runtime", nargs="?", help="hermes or openclaw (defaults to every connected one)")
     dc.add_argument("--dest", help="explicit install dir (default: the runtime's skills dir)")
     dc.set_defaults(func=cmd_disconnect)
 
@@ -693,10 +933,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stop", parents=[common], help="stop the running host bridge").set_defaults(func=cmd_stop)
 
-    au = sub.add_parser("autostart", parents=[common],
-                        help="manage logon autostart (Windows Scheduled Task)")
-    au.add_argument("action", choices=["install", "uninstall", "status"])
-    au.set_defaults(func=cmd_autostart)
+    sub.add_parser("resurrect", parents=[common],
+                   help="run the bridge in the background + on every login (windowless)"
+                   ).set_defaults(func=cmd_resurrect)
+    sub.add_parser("retire", parents=[common],
+                   help="stop the background bridge + remove the login pin"
+                   ).set_defaults(func=cmd_retire)
 
     v = sub.add_parser("verify", parents=[common],
                        help="P0 gate proof: read researches + list devices (+ optional enqueue)")

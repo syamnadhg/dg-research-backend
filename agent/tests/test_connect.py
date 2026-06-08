@@ -86,3 +86,104 @@ def test_install_then_uninstall_roundtrip_at_runtime_path(tmp_path):
     assert connect.verify(target)
     assert connect.uninstall("hermes", home=tmp_path) is True
     assert not target.exists()
+
+
+# ── Target + detect_targets (Windows-local) ──────────────────────────────────
+
+def test_target_dest_and_where():
+    from pathlib import Path
+
+    win = connect.Target("hermes", "windows", Path("C:/Users/x"))
+    assert win.dest == Path("C:/Users/x") / connect.RUNTIMES["hermes"]
+    assert win.where == "Windows"
+    wsl = connect.Target("openclaw", "wsl", Path("/h/u"), distro="Ubuntu-24.04")
+    assert wsl.where == "WSL · Ubuntu-24.04"
+
+
+def test_detect_targets_windows_local(tmp_path):
+    assert connect.detect_targets(home=tmp_path, include_wsl=False) == []
+    (tmp_path / ".hermes").mkdir()
+    targets = connect.detect_targets(home=tmp_path, include_wsl=False)
+    assert len(targets) == 1
+    assert targets[0].runtime == "hermes" and targets[0].location == "windows"
+    assert targets[0].home == tmp_path
+
+
+def test_detect_targets_default_includes_wsl_branch(tmp_path, monkeypatch):
+    # Default include_wsl=True path must call the WSL branch and return cleanly
+    # (Windows-local targets only) when no WSL distro is present — no crash/hang.
+    monkeypatch.setattr(connect, "wsl_distros", lambda: [])
+    (tmp_path / ".openclaw").mkdir()
+    targets = connect.detect_targets(home=tmp_path)  # default include_wsl=True
+    assert [t.runtime for t in targets] == ["openclaw"]
+    assert all(t.location == "windows" for t in targets)
+
+
+def test_detect_wsl_targets_off_windows_guard(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    assert connect.detect_wsl_targets() == []  # distros=None off-Windows → []
+
+
+# ── WSL detection (injected distro list + fake UNC root) ─────────────────────
+
+def test_wsl_user_homes_lists_home_dirs_and_root(tmp_path):
+    (tmp_path / "home" / "alice").mkdir(parents=True)
+    (tmp_path / "home" / "bob").mkdir(parents=True)
+    (tmp_path / "root").mkdir()
+    homes = connect.wsl_user_homes("Ubuntu", root=tmp_path)
+    names = {p.name for p in homes}
+    assert names == {"alice", "bob", "root"}
+
+
+def test_detect_wsl_targets_finds_runtime(tmp_path):
+    # Fake WSL tree: /home/alice/.openclaw exists.
+    (tmp_path / "home" / "alice" / ".openclaw").mkdir(parents=True)
+    targets = connect.detect_wsl_targets(distros=["Ubuntu-24.04"], root_for=lambda d: tmp_path)
+    assert len(targets) == 1
+    t = targets[0]
+    assert t.runtime == "openclaw" and t.location == "wsl" and t.distro == "Ubuntu-24.04"
+    assert t.home == tmp_path / "home" / "alice"
+    # dest is the standard relative skill path under the WSL home
+    assert t.dest == t.home / connect.RUNTIMES["openclaw"]
+
+
+def test_detect_wsl_targets_empty_when_no_runtime(tmp_path):
+    (tmp_path / "home" / "alice").mkdir(parents=True)  # home exists, no runtime
+    assert connect.detect_wsl_targets(distros=["U"], root_for=lambda d: tmp_path) == []
+
+
+def test_install_into_wsl_target_home(tmp_path):
+    # A WSL target's home behaves like any other home for install/uninstall.
+    (tmp_path / "home" / "alice" / ".openclaw").mkdir(parents=True)
+    t = connect.detect_wsl_targets(distros=["U"], root_for=lambda d: tmp_path)[0]
+    connect.install(t.runtime, home=t.home)
+    assert connect.verify(t.dest)
+
+
+def test_wsl_distros_honors_env_override(monkeypatch):
+    monkeypatch.setenv(connect.WSL_DISTRO_ENV, "Ubuntu-24.04, Debian ,")
+    assert connect.wsl_distros() == ["Ubuntu-24.04", "Debian"]
+
+
+# ── .wslconfig mirrored-networking parser ────────────────────────────────────
+
+def test_networking_mode_parses_mirrored():
+    text = "[wsl2]\nmemory=13GB\nnetworkingMode=mirrored\n"
+    assert connect.networking_mode(text) == "mirrored"
+
+
+def test_networking_mode_ignores_other_sections_and_comments():
+    text = "[experimental]\nnetworkingMode=nat\n[wsl2]\n# networkingMode=nat\nswap=4GB\n"
+    assert connect.networking_mode(text) is None  # only commented under [wsl2]
+
+
+def test_networking_mode_case_insensitive():
+    assert connect.networking_mode("[WSL2]\nNetworkingMode = Mirrored\n") == "mirrored"
+
+
+def test_mirrored_networking_enabled(tmp_path):
+    assert connect.mirrored_networking_enabled(home=tmp_path) is None  # no .wslconfig
+    (tmp_path / ".wslconfig").write_text("[wsl2]\nnetworkingMode=mirrored\n", encoding="utf-8")
+    assert connect.mirrored_networking_enabled(home=tmp_path) is True
+    (tmp_path / ".wslconfig").write_text("[wsl2]\nnetworkingMode=nat\n", encoding="utf-8")
+    assert connect.mirrored_networking_enabled(home=tmp_path) is False

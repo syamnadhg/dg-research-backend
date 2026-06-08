@@ -50,6 +50,26 @@ def test_runtime_roundtrip(monkeypatch, tmp_path):
     assert prefs.get_runtime() == "hermes" and prefs.get_selected_device("u1") == "dev-1"
 
 
+def test_runtime_records_wsl_install_location(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    assert prefs.get_runtime_home() is None
+    prefs.set_runtime("openclaw", home=r"\\wsl.localhost\Ubuntu-24.04\home\me",
+                      location="wsl", distro="Ubuntu-24.04")
+    assert prefs.get_runtime() == "openclaw"
+    assert prefs.get_runtime_home() == r"\\wsl.localhost\Ubuntu-24.04\home\me"
+    assert prefs.get_runtime_location() == "wsl"
+    assert prefs.get_runtime_distro() == "Ubuntu-24.04"
+
+
+def test_runtime_windows_clears_stale_distro(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    prefs.set_runtime("openclaw", home=r"\\wsl.localhost\U\home\me", location="wsl", distro="U")
+    # Re-connecting to a Windows-local runtime must not inherit the WSL distro.
+    prefs.set_runtime("hermes", home="C:\\Users\\me", location="windows")
+    assert prefs.get_runtime_location() == "windows"
+    assert prefs.get_runtime_distro() is None
+
+
 def test_corrupt_file_treated_as_empty(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path)
     (tmp_path / "prefs.json").write_text("{not json", encoding="utf-8")

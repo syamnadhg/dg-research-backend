@@ -36431,6 +36431,7 @@ async def _continue_pair_stages_2_to_5(
             _render_next_actions([
                 ("python research.py --retire", "disable On Startup"),
                 ("python research.py --unpair", "fully disconnect this machine"),
+                ("python research.py agent connect", "drive Super Research from chat (Hermes / OpenClaw)"),
             ])
         else:
             print(f"  {_c(_BOLD + _ACCENT, '  The bond is forged.')}  {_c(_DIM, 'Start the backend in this terminal to accept jobs:')}")
@@ -36446,6 +36447,7 @@ async def _continue_pair_stages_2_to_5(
             _render_next_actions([
                 ("python research.py --resurrect", "enable On Startup (auto-start in background)"),
                 ("python research.py --unpair", "fully disconnect this machine"),
+                ("python research.py agent connect", "drive Super Research from chat (Hermes / OpenClaw)"),
             ])
     else:
         print()
@@ -39458,17 +39460,23 @@ def run_commands_help():
 
     _section("Agent — drive Super Research from chat (Hermes / OpenClaw)", [
         ("python research.py agent connect [hermes|openclaw]",
-         "Install the Super Research skill into a chat runtime (auto-detects if omitted)"),
+         "Connect a chat runtime — branded 4-step flow (detects Windows + WSL; auto if omitted)"),
+        ("python research.py agent resurrect",
+         "Run the bridge in the background + on every login (windowless)"),
+        ("python research.py agent retire",
+         "Stop the background bridge + remove the login pin (session + skill untouched)"),
         ("python research.py agent serve",
-         "Start the agent bridge — holds your account session; keep it running"),
+         "Run the bridge in the foreground (this terminal) — holds your account session"),
         ("python research.py agent login",
          "Sign the agent in (add --remote to approve from your phone)"),
+        ("python research.py agent status",
+         "Bridge + session + autostart + runtime at a glance"),
         ("python research.py agent doctor",
-         "Agent bridge health + connectivity check"),
+         "Health + connectivity check (incl. WSL mirrored-networking prerequisite)"),
         ("python research.py agent disconnect",
-         "Remove the skill from the runtime (your account session is left alone)"),
+         "Full teardown — remove the skill from the runtime AND sign out (the app's Revoke twin)"),
         ("python research.py agent --help",
-         "Full agent command list (status / device / research / watch / skip / cancel / stop …)"),
+         "Full agent command list (device / research / watch / skip / cancel / stop …)"),
     ])
 
     _section("Advanced", [

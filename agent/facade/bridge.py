@@ -390,8 +390,13 @@ def _uninstall_skill_on_revoke() -> None:
     rt = prefs.get_runtime()
     if not rt:
         return
+    # Target the home the skill was actually installed under — for a WSL runtime
+    # that's a \\wsl.localhost UNC path, NOT the Windows home. (Older connects
+    # that didn't record a home fall back to the Windows default.)
+    home = prefs.get_runtime_home()
+    kwargs = {"home": Path(home)} if home else {}
     try:
-        if connect.uninstall(rt):
+        if connect.uninstall(rt, **kwargs):
             log.info("revoke: uninstalled the %s skill bundle", rt)
     except Exception as e:
         log.warning("revoke: skill uninstall failed (non-fatal): %s", type(e).__name__)
@@ -1233,7 +1238,20 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     host = host or config.BRIDGE_HOST
     port = port or config.BRIDGE_PORT
     state = BridgeState()
-    httpd = ThreadingHTTPServer((host, port), _make_handler(state))
+    # Idempotent start. The detached bridge from `agent connect`/`resurrect` can
+    # still be alive when the ONLOGON Scheduled Task re-fires (a log-off/log-on
+    # without a full reboot). Binding the port is the atomic ownership check: if
+    # it's already taken, exit cleanly BEFORE arming the #790 agent row or the
+    # heartbeat, so we never get two owners racing one account session (the
+    # single-owner-refresher invariant). BridgeState() above is a read-only
+    # session load, so constructing it on the loser is harmless.
+    try:
+        httpd = ThreadingHTTPServer((host, port), _make_handler(state))
+    except OSError as e:
+        log.info("bridge port %s:%d already in use (%s) — another bridge is running; exiting",
+                 host, port, e)
+        print(f"Super Agent bridge already running on http://{host}:{port} — nothing to start.")
+        return
     authed = state.session is not None
     # If we restarted with a live session (rehydrated via AccountSession.load(),
     # which doesn't fire either connect handler), re-arm the #790 agent row — but

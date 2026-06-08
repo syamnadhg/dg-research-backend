@@ -22,6 +22,7 @@ class RecFS:
     upserts: list = []
     deletes: list = []
     uninstalls: list = []  # runtimes connect.uninstall was called with (revoke path)
+    uninstall_homes: list = []  # the home= kwarg forwarded each time (WSL UNC vs None)
     get_raises = None  # set to an Exception instance to raise on get
     upsert_raises = None
 
@@ -51,6 +52,7 @@ def wired(monkeypatch):
     RecFS.upserts = []
     RecFS.deletes = []
     RecFS.uninstalls = []
+    RecFS.uninstall_homes = []
     RecFS.get_raises = None
     RecFS.upsert_raises = None
     monkeypatch.setattr(bridge, "FirestoreRest", RecFS)
@@ -58,8 +60,11 @@ def wired(monkeypatch):
     monkeypatch.setattr(bridge.prefs, "get_label", lambda: "Super Agent")
     monkeypatch.setattr(bridge.prefs, "get_runtime", lambda: "hermes")
     # Record (don't perform) the skill uninstall so tests never touch a real
-    # runtime dir; assert WHEN it fires (app revoke) vs not (logout / token revoke).
-    monkeypatch.setattr(bridge.connect, "uninstall", lambda rt, **kw: (RecFS.uninstalls.append(rt) or True))
+    # runtime dir; assert WHEN it fires (app revoke) vs not (logout / token revoke)
+    # AND the home= kwarg forwarded (so a WSL install under a UNC home is removed).
+    monkeypatch.setattr(bridge.connect, "uninstall",
+                        lambda rt, **kw: (RecFS.uninstalls.append(rt)
+                                          or RecFS.uninstall_homes.append(kw.get("home")) or True))
     cleared = {"v": False}
     monkeypatch.setattr(bridge.prefs, "clear_selected_device", lambda: cleared.__setitem__("v", True))
     return cleared
@@ -146,6 +151,29 @@ def test_heartbeat_revoked_self_logs_out_and_leaves_row(wired):
     assert wired["v"] is True  # device selection cleared
     assert RecFS.deletes == []  # revoke LEAVES the row (only a clean /logout deletes)
     assert RecFS.uninstalls == ["hermes"]  # app revoke ALSO uninstalls the skill
+
+
+def test_revoke_uninstall_forwards_recorded_wsl_home(wired, monkeypatch):
+    # The bridge.py change: revoke must remove a WSL install under its recorded
+    # \\wsl.localhost UNC home, not just the Windows default path.
+    from pathlib import Path
+    unc = r"\\wsl.localhost\Ubuntu-24.04\home\me"
+    monkeypatch.setattr(bridge.prefs, "get_runtime_home", lambda: unc)
+    RecFS.doc = {"revoked": True}
+    st, _sess = _state()
+    bridge._heartbeat_once(st)
+    assert RecFS.uninstalls == ["hermes"]
+    assert RecFS.uninstall_homes == [Path(unc)]  # home= forwarded to connect.uninstall
+
+
+def test_revoke_uninstall_windows_default_when_no_home(wired, monkeypatch):
+    # No recorded home (older connect) → no home kwarg → Windows-default path.
+    monkeypatch.setattr(bridge.prefs, "get_runtime_home", lambda: None)
+    RecFS.doc = {"revoked": True}
+    st, _sess = _state()
+    bridge._heartbeat_once(st)
+    assert RecFS.uninstalls == ["hermes"]
+    assert RecFS.uninstall_homes == [None]
 
 
 def test_heartbeat_recreates_missing_doc_fully(wired):

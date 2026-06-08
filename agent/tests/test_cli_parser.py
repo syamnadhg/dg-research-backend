@@ -111,8 +111,12 @@ def test_stop_parses():
     assert cli.build_parser().parse_args(["stop"]).func is cli.cmd_stop
 
 
-def test_autostart_action_required_and_validated():
-    ns = cli.build_parser().parse_args(["autostart", "install"])
-    assert ns.func is cli.cmd_autostart and ns.action == "install"
+def test_resurrect_and_retire_parse():
+    assert cli.build_parser().parse_args(["resurrect"]).func is cli.cmd_resurrect
+    assert cli.build_parser().parse_args(["retire"]).func is cli.cmd_retire
+
+
+def test_autostart_subcommand_removed():
+    # `autostart` was renamed to resurrect/retire — the old verb is gone.
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["autostart", "frobnicate"])
+        cli.build_parser().parse_args(["autostart", "install"])

@@ -28,6 +28,9 @@ log = logging.getLogger(__name__)
 _SELECTED_DEVICE = "selectedDeviceId"
 _SELECTED_UID = "selectedUid"
 _RUNTIME = "runtime"
+_RUNTIME_HOME = "runtimeHome"          # where the skill was installed (str path)
+_RUNTIME_LOCATION = "runtimeLocation"  # "windows" | "wsl"
+_RUNTIME_DISTRO = "runtimeDistro"      # WSL distro name (None on Windows)
 _INSTALL_ID = "installId"
 _LABEL = "agentLabel"
 
@@ -120,11 +123,44 @@ def get_runtime() -> str | None:
     return v if isinstance(v, str) and v else None
 
 
-def set_runtime(runtime: str) -> None:
+def set_runtime(runtime: str, *, home: str | None = None,
+                location: str | None = None, distro: str | None = None) -> None:
+    """Record the connected runtime and (optionally) WHERE its skill was
+    installed. The home/location/distro let the bridge's revoke-consult and
+    `agent disconnect` remove a WSL install precisely (the skill lives under a
+    \\\\wsl.localhost UNC home, not the Windows home). Passing only ``runtime``
+    keeps the back-compat behavior."""
     with _lock:
         prefs = load()
         prefs[_RUNTIME] = runtime
+        if home is not None:
+            prefs[_RUNTIME_HOME] = home
+        if location is not None:
+            prefs[_RUNTIME_LOCATION] = location
+        # distro is meaningful only for WSL; clear it for a Windows install so a
+        # later Windows connect doesn't inherit a stale distro from a WSL one.
+        if location == "wsl" and distro:
+            prefs[_RUNTIME_DISTRO] = distro
+        elif location is not None:
+            prefs.pop(_RUNTIME_DISTRO, None)
         save(prefs)
+
+
+def get_runtime_home() -> str | None:
+    """The home dir the skill was installed under (a \\\\wsl.localhost UNC path
+    for a WSL install), or None for an older/Windows-default connect."""
+    v = load().get(_RUNTIME_HOME)
+    return v if isinstance(v, str) and v else None
+
+
+def get_runtime_location() -> str | None:
+    v = load().get(_RUNTIME_LOCATION)
+    return v if isinstance(v, str) and v else None
+
+
+def get_runtime_distro() -> str | None:
+    v = load().get(_RUNTIME_DISTRO)
+    return v if isinstance(v, str) and v else None
 
 
 def get_or_create_install_id() -> str:

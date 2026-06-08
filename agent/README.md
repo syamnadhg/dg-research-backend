@@ -73,26 +73,42 @@ with slash commands:
 
 ```sh
 cd research-automate
-python research.py agent connect    # auto-detects ~/.hermes or ~/.openclaw (or: ... connect hermes)
-python research.py agent serve      # start the always-up host bridge
+python research.py agent connect    # branded 4-step flow; detects Windows + WSL runtimes
+# step 4 offers to run the bridge in the background now + on every login
 # then in chat:  /sr-login → approve on your phone → /sr-research <topic>
 ```
 
-`agent connect` copies a small, dependency-free skill (a `SKILL.md` + a
-`scripts/sr.py` client that calls the bridge over loopback) into the runtime's
-skills dir. The skill exposes `/sr-login` `/sr-logout` `/sr-device` `/sr-research`
-`/sr-status` `/sr-podcast` `/sr-skip` `/sr-cancel` `/superresearch` (welcome / help)
-— research-only; it can never control devices. (The commands are `sr-` prefixed
-so they don't collide with the runtime's own `/login`, `/status`, `/help`, …)
+`agent connect` is an interactive, branded flow — **Detect → Choose → Install →
+Go live** — that finds your chat runtime on **Windows** (`~/.hermes`,
+`~/.openclaw`) *and* inside **WSL** (`\\wsl.localhost\<distro>\home\<user>\…`),
+lets you pick when more than one is found, copies a small dependency-free skill
+(a `SKILL.md` + a `scripts/sr.py` client that calls the bridge over loopback)
+into the runtime's skills dir, and offers to pin the always-up bridge. The skill
+exposes `/sr-login` `/sr-logout` `/sr-device` `/sr-research` `/sr-status`
+`/sr-podcast` `/sr-skip` `/sr-cancel` `/superresearch` (welcome / help) —
+research-only; it can never control devices. (The commands are `sr-` prefixed so
+they don't collide with the runtime's own `/login`, `/status`, `/help`, …)
 
-**Keep it always-up.** Install a logon autostart so the bridge returns after a
-reboot (Windows Scheduled Task); the account session + device selection persist,
-so a restart resumes without re-login:
+> **WSL runtime?** The bridge runs here on Windows and binds loopback only, so a
+> WSL chat reaches it **only with WSL mirrored networking** — add
+> `networkingMode=mirrored` under `[wsl2]` in `%USERPROFILE%\.wslconfig`, then
+> `wsl --shutdown`. `agent doctor` checks this for you.
+
+**Keep it always-up.** `resurrect` pins a windowless logon autostart (Windows
+Scheduled Task) **and** starts the bridge now, so it returns after a reboot; the
+account session + device selection persist, so a restart resumes without
+re-login. `retire` is the inverse.
 
 ```sh
-agent autostart install     # (uninstall / status too)
-agent stop                  # stop the running bridge
+agent resurrect    # background + on every login (windowless); starts it now too
+agent retire       # stop the background bridge + remove the logon pin
+agent serve        # foreground (this terminal) instead of background
+agent stop         # stop the running bridge
 ```
+
+**Disconnect.** `agent disconnect` is a full teardown — it removes the skill from
+the runtime **and** signs out (the CLI twin of the app's **Revoke**). Use
+`agent retire` as well if you also want the background bridge gone.
 
 ## P0 — connect + prove the plane
 
