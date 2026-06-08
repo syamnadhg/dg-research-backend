@@ -27,13 +27,34 @@ This package is a **separate process** and never touches the existing app:
   docs where you're a member. No rules change, no keystore change, no queue /
   claim / pipeline change.
 
-## Install (editable)
+## Install
+
+Everything lives in **this directory** (`research-automate/agent/`) — install
+from here. Requires **Python 3.11+**. Only two runtime deps: `requests` +
+`keyring`.
 
 ```sh
-pip install -e .[dev]
+cd research-automate/agent
+pip install -e .          # installs the deps AND the `agent` command
 ```
 
-This exposes the `agent` command.
+`-e` is an **editable install**: pip links to this source tree instead of
+copying it, so (a) the `agent` command lands on your PATH and (b) code edits
+take effect with no reinstall. The `.` means "the package in this dir" (it reads
+`pyproject.toml`, the canonical dependency list). Once installed, `agent` runs
+from anywhere — the rest of this README uses it.
+
+**Alternatives:**
+
+```sh
+pip install -e .[dev]              # same, plus the test deps (pytest, ruff)
+pip install -r requirements.txt    # deps ONLY → then run via:  python -m facade <cmd>
+pip install -r requirements-dev.txt
+```
+
+> `requirements.txt` mirrors `pyproject.toml` for convenience, but it installs
+> the libraries only — to get the `agent` command itself you need
+> `pip install -e .` (or use `python -m facade <cmd>` instead).
 
 ## Use it from chat (Hermes / OpenClaw)
 

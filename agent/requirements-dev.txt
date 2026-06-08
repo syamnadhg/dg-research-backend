@@ -1,0 +1,10 @@
+# Super Agent bridge — development / test dependencies (mirrors pyproject [dev]).
+#
+#   Preferred:  pip install -e .[dev]
+#   Or:         pip install -r requirements-dev.txt
+#
+# Run the suite:  python -m pytest -q     Lint:  ruff check facade/ tests/
+
+-r requirements.txt
+pytest>=8
+ruff>=0.5
