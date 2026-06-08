@@ -1,7 +1,7 @@
 # research-facade — the Super Agent bridge
 
 Lets a chat runtime (Hermes / OpenClaw) drive **Super Research** as a *headless
-session of your account*. You sign in once with Google (`/login`); the bridge
+session of your account*. You sign in once with Google (`/sr-login`); the bridge
 then enqueues research runs on your account's existing devices, and every run
 shows up in the web app like a normal chat.
 
@@ -43,13 +43,15 @@ with slash commands:
 ```sh
 agent connect            # auto-detects ~/.hermes or ~/.openclaw (or: agent connect hermes)
 agent serve              # start the always-up host bridge
-# then in chat:  /login → approve on your phone → /research <topic>
+# then in chat:  /sr-login → approve on your phone → /sr-research <topic>
 ```
 
 `agent connect` copies a small, dependency-free skill (a `SKILL.md` + a
 `scripts/sr.py` client that calls the bridge over loopback) into the runtime's
-skills dir. The skill exposes `/login` `/logout` `/device` `/research` `/status`
-`/skip` `/cancel` `/help` — research-only; it can never control devices.
+skills dir. The skill exposes `/sr-login` `/sr-logout` `/sr-device` `/sr-research`
+`/sr-status` `/sr-podcast` `/sr-skip` `/sr-cancel` `/superresearch` (welcome / help)
+— research-only; it can never control devices. (The commands are `sr-` prefixed
+so they don't collide with the runtime's own `/login`, `/status`, `/help`, …)
 
 **Keep it always-up.** Install a logon autostart so the bridge returns after a
 reboot (Windows Scheduled Task); the account session + device selection persist,
@@ -104,7 +106,7 @@ agent device                 # list (→ marks the selected one; (owned)/(shared
 agent device use <deviceId>  # switch the target device
 ```
 
-`agent research`/`/research` resolves the device as: an explicit id → your
+`agent research`/`/sr-research` resolves the device as: an explicit id → your
 selection → the sole reachable device → an error asking you to pick one.
 
 **Run, track, cancel.**

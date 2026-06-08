@@ -94,7 +94,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
     prefs.set_runtime(runtime)
     print(f"{_OK} Super Research skill installed for {runtime}:")
     print(f"     {target}")
-    print("Next: start the bridge (agent serve), then run /login in your chat.")
+    print("Next: start the bridge (agent serve), then run /sr-login in your chat.")
     return 0
 
 
@@ -391,7 +391,7 @@ def _print_run(r: dict) -> None:
 
 
 def cmd_research(args: argparse.Namespace) -> int:
-    """Start a run (chat /research). Returns a run id immediately."""
+    """Start a run (chat /sr-research). Returns a run id immediately."""
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
         return 1
@@ -416,7 +416,7 @@ def cmd_research(args: argparse.Namespace) -> int:
 
 
 def cmd_runs(args: argparse.Namespace) -> int:
-    """List recent runs (chat /status with no id lists; here we list)."""
+    """List recent runs (chat /sr-status with no id lists; here we list)."""
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
         return 1
@@ -435,7 +435,7 @@ def cmd_runs(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Show one run's status (chat /status [id]). No id → the most recent run."""
+    """Show one run's status (chat /sr-status [id]). No id → the most recent run."""
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
         return 1
@@ -459,7 +459,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_podcast(args: argparse.Namespace) -> int:
-    """Get a run's audio as a local file (chat /podcast). Prints the path the
+    """Get a run's audio as a local file (chat /sr-podcast). Prints the path the
     runtime would attach as a native audio message; no id = the most recent run."""
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
@@ -545,7 +545,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
-    """Cancel a run (chat /cancel <id>)."""
+    """Cancel a run (chat /sr-cancel <id>)."""
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
         return 1
@@ -561,7 +561,7 @@ _SKIP_NAMES = {"brief": 1, "podcast": 3, "audio": 3, "video": 4, "youtube": 4, "
 
 
 def cmd_skip(args: argparse.Namespace) -> int:
-    """Skip phases of a run (chat /skip). Accepts phase numbers or names
+    """Skip phases of a run (chat /sr-skip). Accepts phase numbers or names
     (brief=1, podcast=3, video=4, report=5)."""
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")

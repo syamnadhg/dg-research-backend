@@ -40,7 +40,7 @@ spend); run them once after `agent login`:
 
 1. `agent connect <runtime>` → skill lands in the runtime's skills dir.
 2. `agent serve` → bridge up; `agent doctor` all-green.
-3. `agent login` (or chat `/login`) → real Google sign-in → connected.
+3. `agent login` (or chat `/sr-login`) → real Google sign-in → connected.
 4. `agent device` → real devices listed; `agent device use <id>`.
 5. **The one live enqueue:** `agent research "<topic>" --no-video --no-email`
    (light smoke; skips P4 video to spare YouTube quota) → returns a run id <1s.

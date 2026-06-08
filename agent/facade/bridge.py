@@ -57,7 +57,7 @@ _RID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # into memory before the Host/Origin checks even run.
 _MAX_BODY_BYTES = 1 << 20  # 1 MiB
 
-# Podcast audio (the chat /podcast → a native audio FILE the runtime attaches).
+# Podcast audio (the chat /sr-podcast → a native audio FILE the runtime attaches).
 # The audio is downloaded host-side to ~/.super-agent/podcasts and only the LOCAL
 # PATH is handed back — the long-lived Storage download token never leaves the
 # host (it is not in the response, so it can't land in chat history).
@@ -992,7 +992,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             self._json(200, {"runId": rid, "queueId": qid, "deviceId": device_id})
 
         def _research_status(self, rid: str) -> None:
-            """Point-in-time status of one run (the chat /status). Streaming is P4."""
+            """Point-in-time status of one run (the chat /sr-status). Streaming is P4."""
             rid = rid.strip("/")
             if not _RID_RE.match(rid):
                 self._json(404, {"error": "run not found"})  # rejects ../, %2f, etc.
@@ -1018,7 +1018,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
         def _research_podcast(self, rid: str) -> None:
             """Resolve a run's NotebookLM audio → a local FILE the runtime sends as
-            a native, forwardable audio message (the chat /podcast).
+            a native, forwardable audio message (the chat /sr-podcast).
 
             Native-audio delivery is FILE-based on purpose: every chat channel can
             attach a local file, and (unlike handing back the URL) the long-lived
@@ -1120,7 +1120,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             self._json(200, {"runs": runs})
 
         def _research_cancel(self, rid: str) -> None:
-            """Cancel a run (the chat /cancel): one action:"cancel" to the run's
+            """Cancel a run (the chat /sr-cancel): one action:"cancel" to the run's
             device queue — the BE drops it if queued, or stops it if running."""
             rid = rid.strip("/")
             if not _RID_RE.match(rid):
@@ -1157,7 +1157,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             self._json(200, {"ok": True, "runId": rid, "queueId": qid, "deviceId": device_id})
 
         def _research_skip(self, rid: str) -> None:
-            """Skip phases of a run (the chat /skip). Writes pipelineConfig so the
+            """Skip phases of a run (the chat /sr-skip). Writes pipelineConfig so the
             BE's reload_config overlay applies it at the next phase boundary:
             phases 1 (Brief) / 3 (Podcast) → skippedPhases (additive); 4 → video
             off; 5 → email off. Phases 0/2 aren't whole-phase-skippable → 400."""
@@ -1251,7 +1251,7 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     hb_thread.start()
     log.info("Super Agent bridge on http://%s:%d (authed=%s)", host, port, authed)
     print(f"Super Agent bridge listening on http://{host}:{port}")
-    print(f"  sign in:  {config.login_origin()}/login   (local page; or remote via chat /login)")
+    print(f"  sign in:  {config.login_origin()}/login   (local page; or remote via chat /sr-login)")
     print(f"  status:   {config.bridge_origin()}/status")
     print(f"  log:      {config.log_path()}")
     try:
