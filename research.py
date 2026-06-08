@@ -39456,6 +39456,21 @@ def run_commands_help():
          "Same as --unpair, but ALSO wipes browser-profile*/ dirs + pair-time API keys + stale worker-state files + resets workerCount"),
     ])
 
+    _section("Agent — drive Super Research from chat (Hermes / OpenClaw)", [
+        ("python research.py agent connect [hermes|openclaw]",
+         "Install the Super Research skill into a chat runtime (auto-detects if omitted)"),
+        ("python research.py agent serve",
+         "Start the agent bridge — holds your account session; keep it running"),
+        ("python research.py agent login",
+         "Sign the agent in (add --remote to approve from your phone)"),
+        ("python research.py agent doctor",
+         "Agent bridge health + connectivity check"),
+        ("python research.py agent disconnect",
+         "Remove the skill from the runtime (your account session is left alone)"),
+        ("python research.py agent --help",
+         "Full agent command list (status / device / research / watch / skip / cancel / stop …)"),
+    ])
+
     _section("Advanced", [
         ("python research.py --brief-file <path>",
          "Skip Phase 1 — start from an existing brief.md"),
@@ -39803,7 +39818,30 @@ def run_doctor():
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-Agent Deep Research Pipeline")
+    # Super Agent (chat-runtime bridge) — `python research.py agent <…>`.
+    # The agent is an isolated sub-package under agent/ (its own deps + its own
+    # process; it imports NOTHING from this file and this file never imports it).
+    # We only FRONT it here so it's invoked consistently with the rest of the
+    # CLI. Everything after `agent` is forwarded verbatim to the package (run
+    # from agent/ so `-m facade` resolves), intercepted before argparse so the
+    # agent's own subcommands/flags pass straight through. (A research topic of
+    # literally "agent" is shadowed — phrase it differently, e.g. "AI agents".)
+    if len(sys.argv) > 1 and sys.argv[1] == "agent":
+        agent_dir = Path(__file__).resolve().parent / "agent"
+        if not (agent_dir / "facade" / "__main__.py").exists():
+            print("Super Agent package not found at agent/ — incomplete checkout?")
+            raise SystemExit(2)
+        try:
+            rc = subprocess.call([sys.executable, "-m", "facade", *sys.argv[2:]],
+                                 cwd=str(agent_dir))
+        except KeyboardInterrupt:
+            rc = 130
+        raise SystemExit(rc)
+
+    parser = argparse.ArgumentParser(
+        description="Multi-Agent Deep Research Pipeline",
+        epilog="Chat-runtime (Hermes / OpenClaw) commands:  python research.py agent --help",
+    )
     parser.add_argument("topic", nargs="?", help="Research topic")
     parser.add_argument("--pdf", action="append", default=[], help="PDF to attach (Phase 1)")
     parser.add_argument("--brief-file", "-b", help="Existing brief file (skip Phase 1)")

@@ -79,6 +79,23 @@ That's it. Three commands to a hands-off always-on backend — plus `--retire` t
 > - Steps 1 (install) and 2's API-key prep can run in parallel.
 > - You're **blocked** on a web-app account before `--pair` Stage 1 finishes (paste the 8-char code into Account → Add Device).
 
+## Drive it from chat — Super Agent (Hermes / OpenClaw)
+
+Run Super Research from a chat runtime instead of the terminal — every run still
+shows up in the web app as a normal chat. It's just another `research.py`
+command (no extra install — the two deps are already in `requirements.txt`):
+
+```bash
+python research.py agent connect      # install the skill into your runtime (auto-detects hermes/openclaw)
+python research.py agent serve        # start the bridge that holds your account session (keep running)
+# then, in chat:  /superresearch  →  /sr-login  →  /sr-research <topic>
+```
+
+The agent is **research-only** — it runs / tracks / cancels research on your
+existing devices but can never add, remove, pair, or share them (that stays
+owner-only in the web app). Full command list: `python research.py agent
+--help`. How it works + the chat slash commands: **[`agent/README.md`](agent/README.md)**.
+
 ## Pairing model (no JSON keys to copy around)
 
 The backend authenticates as a per-device **synthetic Firebase user**

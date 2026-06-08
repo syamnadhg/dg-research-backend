@@ -1,17 +1,14 @@
 # Super Agent bridge — runtime dependencies (Python 3.11+).
 #
-# pyproject.toml is the CANONICAL dependency list; this file mirrors its runtime
-# deps for convenience. Two ways to use it:
+# NORMAL PATH: you do NOT need this file. Run the agent as a backend command —
+#     python research.py agent <command>
+# — its two deps already ship in the backend's ../requirements.txt.
 #
-#   Recommended — installs the deps AND the `agent` command (entry point):
-#       pip install -e .
+# This file is only for running the agent STANDALONE in a fresh venv (without
+# the backend installed), e.g.:
+#     pip install -r requirements.txt   &&   python -m facade <command>
 #
-#   Deps only — then invoke via the module instead of the `agent` command:
-#       pip install -r requirements.txt
-#       python -m facade <command>        # e.g. python -m facade serve
-#
-# (requirements.txt alone does NOT create the `agent` command — that needs the
-#  package install above.)
+# pyproject.toml is the canonical dependency source; this mirrors its runtime deps.
 
 requests>=2.31
 keyring>=24

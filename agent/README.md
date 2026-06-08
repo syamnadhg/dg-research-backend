@@ -1,4 +1,4 @@
-# research-facade — the Super Agent bridge
+# Super Agent — drive Super Research from chat (Hermes / OpenClaw)
 
 Lets a chat runtime (Hermes / OpenClaw) drive **Super Research** as a *headless
 session of your account*. You sign in once with Google (`/sr-login`); the bridge
@@ -27,34 +27,44 @@ This package is a **separate process** and never touches the existing app:
   docs where you're a member. No rules change, no keystore change, no queue /
   claim / pipeline change.
 
-## Install
+## Running it (no install)
 
-Everything lives in **this directory** (`research-automate/agent/`) — install
-from here. Requires **Python 3.11+**. Only two runtime deps: `requests` +
-`keyring`.
+Run the agent as a **`research.py` command** — same front door as the rest of
+the backend, from the repo root, **no install and no editable mode**:
+
+```sh
+cd research-automate
+python research.py agent <command>      # e.g. agent connect / agent serve / agent login
+python research.py agent --help         # the full command list
+```
+
+The agent's only deps (`requests`, `keyring`) already ship in the backend's
+`requirements.txt`, so once the backend is set up (`pip install -r
+requirements.txt`) there is **nothing extra to install**. Requires **Python
+3.11+**.
+
+> **Throughout this README, `agent <command>` is shorthand for
+> `python research.py agent <command>`.**
+
+The code itself lives in this isolated sub-package (`research-automate/agent/`,
+its own process + its own two deps); `research.py` only *fronts* it so it's
+invoked consistently — it never imports the package.
+
+<details><summary>Optional — a bare <code>agent</code> command / dev setup</summary>
+
+If you'd rather type a bare `agent` (outside the backend) or run the tests:
 
 ```sh
 cd research-automate/agent
-pip install -e .          # installs the deps AND the `agent` command
-```
-
-`-e` is an **editable install**: pip links to this source tree instead of
-copying it, so (a) the `agent` command lands on your PATH and (b) code edits
-take effect with no reinstall. The `.` means "the package in this dir" (it reads
-`pyproject.toml`, the canonical dependency list). Once installed, `agent` runs
-from anywhere — the rest of this README uses it.
-
-**Alternatives:**
-
-```sh
-pip install -e .[dev]              # same, plus the test deps (pytest, ruff)
-pip install -r requirements.txt    # deps ONLY → then run via:  python -m facade <cmd>
+pip install .                      # adds a standalone `agent` command (entry point)
+python -m facade <command>         # or run module-style, no install
+pip install .[dev]                 # + test deps (pytest, ruff)
 pip install -r requirements-dev.txt
 ```
 
-> `requirements.txt` mirrors `pyproject.toml` for convenience, but it installs
-> the libraries only — to get the `agent` command itself you need
-> `pip install -e .` (or use `python -m facade <cmd>` instead).
+`requirements.txt` / `requirements-dev.txt` here mirror `pyproject.toml` for a
+fresh venv. The `python research.py agent` path above needs none of this.
+</details>
 
 ## Use it from chat (Hermes / OpenClaw)
 
@@ -62,8 +72,9 @@ Install the Super Research skill into your chat runtime, then drive everything
 with slash commands:
 
 ```sh
-agent connect            # auto-detects ~/.hermes or ~/.openclaw (or: agent connect hermes)
-agent serve              # start the always-up host bridge
+cd research-automate
+python research.py agent connect    # auto-detects ~/.hermes or ~/.openclaw (or: ... connect hermes)
+python research.py agent serve      # start the always-up host bridge
 # then in chat:  /sr-login → approve on your phone → /sr-research <topic>
 ```
 
