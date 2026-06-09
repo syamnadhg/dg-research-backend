@@ -1233,6 +1233,34 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def _port_holder_is_bridge(host: str, port: int) -> bool:
+    """Probe http://host:port/healthz and return True only if the responder is
+    actually a Super Agent bridge (its /healthz returns {"ok": true, "version": …}).
+    Lets serve() tell a benign 'another bridge already running' apart from a FOREIGN
+    process squatting the port (possible under WSL mirrored networking). Stdlib
+    only.
+
+    Retries briefly: when our bind just failed, the holder may be a sibling bridge
+    still coming up (idempotent ONLOGON re-fire / restart) that hasn't started
+    answering /healthz yet — a single timed-out probe would wrongly brand it a
+    foreign squatter. A few attempts give a real bridge time to respond; a holder
+    that never returns the marker is treated as foreign."""
+    import json as _json
+    import time as _time
+    import urllib.request
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=2) as r:
+                data = _json.loads(r.read().decode("utf-8", "ignore"))
+            if isinstance(data, dict) and data.get("ok") is True and "version" in data:
+                return True
+        except Exception:
+            pass
+        if attempt < 2:
+            _time.sleep(0.5)
+    return False
+
+
 def serve(host: str | None = None, port: int | None = None) -> None:
     """Start the bridge and serve forever (blocking)."""
     host = host or config.BRIDGE_HOST
@@ -1248,9 +1276,18 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     try:
         httpd = ThreadingHTTPServer((host, port), _make_handler(state))
     except OSError as e:
-        log.info("bridge port %s:%d already in use (%s) — another bridge is running; exiting",
-                 host, port, e)
-        print(f"Super Agent bridge already running on http://{host}:{port} — nothing to start.")
+        # Port taken. Distinguish a benign already-running bridge (idempotent
+        # re-fire) from a FOREIGN process squatting the port — the latter would
+        # otherwise be silently mis-reported as "already running" and leave the
+        # bridge mysteriously unreachable (esp. under WSL mirrored networking).
+        if _port_holder_is_bridge(host, port):
+            log.info("bridge port %s:%d already serving a bridge — nothing to start", host, port)
+            print(f"Super Agent bridge already running on http://{host}:{port} — nothing to start.")
+        else:
+            log.warning("bridge port %s:%d held by a NON-bridge process (%s)", host, port, e)
+            print(f"Port {port} is held by another process that isn't a Super Agent bridge.")
+            print("  Free it, or set SUPER_AGENT_BRIDGE_PORT to another port, then retry.")
+            print(f"  (find the holder:  netstat -ano | findstr :{port} )")
         return
     authed = state.session is not None
     # If we restarted with a live session (rehydrated via AccountSession.load(),

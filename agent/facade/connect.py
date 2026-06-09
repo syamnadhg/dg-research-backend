@@ -52,6 +52,25 @@ def host_os_label() -> str:
     return {"win32": "Windows", "darwin": "macOS"}.get(sys.platform, "Linux")
 
 
+def looks_containerized() -> bool:
+    """Best-effort: is THIS bridge host running inside a container (Linux signals
+    only)? Advisory — used to caveat the co-located "reaches loopback" claim,
+    because a runtime in a SEPARATE network namespace can't reach a container's
+    loopback. Never raises; False off-Linux / on any read failure."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        if Path("/.dockerenv").exists():
+            return True
+        cg = Path("/proc/1/cgroup")
+        if cg.exists():
+            text = cg.read_text(errors="ignore")
+            return any(k in text for k in ("docker", "containerd", "lxc", "kubepods"))
+    except OSError:
+        pass
+    return False
+
+
 @dataclass(frozen=True)
 class Target:
     """A concrete place to install the skill: a runtime + the home that holds it."""
@@ -362,21 +381,40 @@ def install(runtime: str, *, dest: Path | None = None, home: Path | None = None)
     shutil.copy2(src / "SKILL.md", target / "SKILL.md")
     for f in (src / "scripts").glob("*.py"):
         shutil.copy2(f, scripts / f.name)
+    _normalize_modes(target)
     return target
+
+
+def _normalize_modes(target: Path) -> None:
+    """Best-effort 0644 on the copied skill files. copy2 carries the SOURCE mode
+    (Windows ACL bits) onto POSIX/WSL, which can leave odd permissions on a
+    multi-user host; normalize to plain readable files (no +x — sr.py runs via
+    `python`). Never raises (a WSL 9p / UNC mount can reject chmod)."""
+    for p in (target / "SKILL.md", *(target / "scripts").glob("*")):
+        try:
+            p.chmod(0o644)
+        except OSError:
+            pass
+
+
+# The skill dir leaf — both runtimes install to .../research/super-research, so a
+# resolved uninstall target should end in this. Guards a mistyped --dest.
+_SKILL_LEAF = "super-research"
 
 
 def uninstall(runtime: str, *, dest: Path | None = None, home: Path | None = None) -> bool:
     """Remove the skill bundle from ``runtime``'s skills dir (inverse of install).
 
-    Idempotent — returns True if a skill dir was removed, False if nothing was
-    there. Bounded to the ``super-research`` skill dir we own (the same path
-    install() populates) — never a parent/shared dir. Used by `agent disconnect`
-    and by the bridge's revoke-consult (app Revoke = sign out + uninstall).
+    Idempotent — returns True if a skill dir was removed, False otherwise. Bounded
+    to the ``super-research`` skill dir we own: it only rmtrees a target whose leaf
+    is that name OR that VERIFIES as our bundle (SKILL.md + scripts/sr.py), so a
+    mistyped ``--dest`` pointing at an unrelated dir is refused, never deleted.
+    Used by `agent disconnect` and the bridge's revoke-consult (app Revoke).
     """
     if runtime not in RUNTIMES:
         raise ValueError(f"unknown runtime: {runtime}")
     target = dest or runtime_dest(runtime, home)
-    if target.exists():
+    if target.exists() and (target.name == _SKILL_LEAF or verify(target)):
         shutil.rmtree(target)
         return True
     return False

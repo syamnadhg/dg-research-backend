@@ -79,6 +79,48 @@ def test_uninstall_unknown_runtime_raises(tmp_path):
         connect.uninstall("nope", dest=tmp_path / "x")
 
 
+def test_uninstall_refuses_non_skill_custom_dest(tmp_path):
+    # A mistyped --dest pointing at an unrelated (e.g. runtime config) dir must NOT
+    # be rmtree'd — it isn't named super-research and doesn't verify as our skill.
+    victim = tmp_path / "runtime-config"
+    victim.mkdir()
+    (victim / "important.json").write_text("{}", encoding="utf-8")
+    assert connect.uninstall("hermes", dest=victim) is False
+    assert victim.exists() and (victim / "important.json").exists()
+
+
+def test_uninstall_removes_verified_custom_dest(tmp_path):
+    # A custom-named dest that IS our skill (verifies) is still removable.
+    dest = tmp_path / "weird-name"
+    connect.install("hermes", dest=dest)
+    assert connect.verify(dest)
+    assert connect.uninstall("hermes", dest=dest) is True
+    assert not dest.exists()
+
+
+def test_uninstall_removes_super_research_leaf_even_if_partial(tmp_path):
+    # The standard 'super-research' leaf is cleaned even when half-installed.
+    dest = tmp_path / "super-research"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("x", encoding="utf-8")  # no scripts/sr.py → verify False
+    assert connect.verify(dest) is False
+    assert connect.uninstall("hermes", dest=dest) is True
+    assert not dest.exists()
+
+
+def test_looks_containerized_false_off_linux(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    assert connect.looks_containerized() is False
+    monkeypatch.setattr(connect.sys, "platform", "darwin")
+    assert connect.looks_containerized() is False
+
+
+def test_looks_containerized_false_without_markers(monkeypatch):
+    # Mocked-linux on a host with no /.dockerenv or /proc/1/cgroup → False (best-effort).
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    assert connect.looks_containerized() is False
+
+
 def test_install_then_uninstall_roundtrip_at_runtime_path(tmp_path):
     # End-to-end at the real runtime-relative path (under a fake home).
     connect.install("hermes", home=tmp_path)

@@ -160,13 +160,25 @@ def test_cmd_disconnect_removes_skill_and_signs_out(monkeypatch):
 
 # ── reachability: _ensure_reachable / _ensure_wsl_networking ──────────────────
 
-def test_ensure_reachable_local_is_noop_ok(monkeypatch, capsys):
-    # A co-located (local) runtime shares the bridge's loopback — no WSL path.
+def test_ensure_reachable_local_is_noop_ok(monkeypatch):
+    # A co-located (local) runtime on a non-containerized host shares the bridge's
+    # loopback — no WSL path, just the OK + an honest container caveat.
     calls = []
     monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: calls.append("wsl"))
-    cli._ensure_reachable(connect.Target("hermes", "local", Path("C:/Users/me")))
+    monkeypatch.setattr(cli.connect, "looks_containerized", lambda: False)
+    _, out = _cap(cli._ensure_reachable, connect.Target("hermes", "local", Path("C:/Users/me")))
     assert calls == []
-    assert "loopback" in capsys.readouterr().out.lower()
+    assert "loopback" in out.lower()
+    assert "container" in out.lower()  # honest caveat present, not a bare all-clear
+
+
+def test_ensure_reachable_containerized_host_warns(monkeypatch):
+    # If the bridge host itself looks containerized, don't promise loopback.
+    monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: None)
+    monkeypatch.setattr(cli.connect, "looks_containerized", lambda: True)
+    _, out = _cap(cli._ensure_reachable, connect.Target("hermes", "local", Path("/root")))
+    assert "container" in out.lower()
+    assert "host networking" in out.lower() or "published port" in out.lower()
 
 
 def test_ensure_reachable_wsl_delegates(monkeypatch):
@@ -403,18 +415,19 @@ def test_install_step_already_installed_keep(monkeypatch):
 
 # _startup_step — Windows-only guard (cross-platform), pin, decline, pin-fail.
 
-def test_startup_step_non_windows_is_graceful(monkeypatch):
-    monkeypatch.setattr(cli.autostart, "is_windows", lambda: False)
+def test_startup_step_unsupported_os_is_graceful(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "supported", lambda: False)
     installed = []
     monkeypatch.setattr(cli.autostart, "install", lambda: installed.append(1) or (True, ""))
     rv, out = _cap(cli._startup_step)
     assert rv is False
-    assert installed == []          # never attempts schtasks off-Windows
-    assert "Windows-only" in out and "agent serve" in out
+    assert installed == []          # never attempts to pin on an unsupported OS
+    assert "isn't available" in out and "agent serve" in out
 
 
-def test_startup_step_windows_pins(monkeypatch):
-    monkeypatch.setattr(cli.autostart, "is_windows", lambda: True)
+def test_startup_step_pins_when_supported(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "supported", lambda: True)
+    monkeypatch.setattr(cli.autostart, "kind_label", lambda: "systemd --user service")
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
     monkeypatch.setattr(cli.autostart, "install", lambda: (True, ""))
     monkeypatch.setattr(cli.autostart, "start_detached", lambda: (True, ""))
@@ -422,13 +435,15 @@ def test_startup_step_windows_pins(monkeypatch):
 
 
 def test_startup_step_decline(monkeypatch):
-    monkeypatch.setattr(cli.autostart, "is_windows", lambda: True)
+    monkeypatch.setattr(cli.autostart, "supported", lambda: True)
+    monkeypatch.setattr(cli.autostart, "kind_label", lambda: "Scheduled Task")
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
     assert cli._startup_step() is False
 
 
 def test_startup_step_pin_failure(monkeypatch):
-    monkeypatch.setattr(cli.autostart, "is_windows", lambda: True)
+    monkeypatch.setattr(cli.autostart, "supported", lambda: True)
+    monkeypatch.setattr(cli.autostart, "kind_label", lambda: "Scheduled Task")
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
     monkeypatch.setattr(cli.autostart, "install", lambda: (False, "schtasks denied"))
     assert cli._startup_step() is False
@@ -490,10 +505,28 @@ def test_connect_next_fresh_and_unpinned(monkeypatch):
 def test_ensure_reachable_local_on_linux(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "linux")
     monkeypatch.setattr(connect, "host_os_label", lambda: "Linux")
+    monkeypatch.setattr(cli.connect, "looks_containerized", lambda: False)
     wsl = []
     monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: wsl.append(1))
     _, out = _cap(cli._ensure_reachable, connect.Target("hermes", "local", Path("/home/x")))
     assert wsl == [] and "loopback" in out.lower()
+
+
+def test_bridge_up_requires_version_marker(monkeypatch):
+    # Only a /healthz body carrying the bridge marker counts as "up".
+    monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: (200, {"ok": True, "version": "1"}))
+    assert cli._bridge_up() is True
+    monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: (200, {"hello": "i am not a bridge"}))
+    assert cli._bridge_up() is False   # foreign HTTP server on :9876 is NOT the bridge
+    monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: None)
+    assert cli._bridge_up() is False
+
+
+def test_warn_shared_localhost_flags_bridge_own_port(monkeypatch):
+    # The bridge's own port (config.BRIDGE_PORT) is now scanned + specially tagged.
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {cli.config.BRIDGE_PORT: "55"})
+    _, out = _cap(cli._warn_shared_localhost)
+    assert str(cli.config.BRIDGE_PORT) in out and "the bridge's own port" in out
 
 
 # _bridge_authed — the closing card's 'logged_in' must reflect REAL auth, not

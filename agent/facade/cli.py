@@ -59,7 +59,11 @@ def _bridge_post(path: str, body: dict | None = None, timeout: float = 30.0) -> 
 
 
 def _bridge_up() -> bool:
-    return _bridge_get("/healthz", timeout=3.0) is not None
+    # Validate the /healthz body carries the bridge marker ({ok, version}) — not
+    # just ANY HTTP response — so a foreign server squatting :9876 (possible under
+    # WSL mirrored networking) isn't mistaken for the bridge.
+    res = _bridge_get("/healthz", timeout=3.0)
+    return bool(res and isinstance(res[1], dict) and "version" in res[1])
 
 
 def _bridge_authed() -> bool:
@@ -145,6 +149,9 @@ def cmd_connect(args: argparse.Namespace) -> int:
     if not targets:
         b.no("No chat runtime found (looked for ~/.hermes, ~/.openclaw on this host and in WSL).")
         b.dim("Install Hermes or OpenClaw first, then re-run:  python research.py agent connect")
+        b.dim("A runtime inside a container or a separate VM isn't auto-detected — and a")
+        b.dim("  loopback-only bridge needs host networking / a published port to reach it;")
+        b.dim("  point connect at it explicitly with  --dest <path-to-skills-dir>  if so.")
         return 1
     for t in targets:
         b.ok(f"Found {_runtime_mark(t)}")
@@ -216,15 +223,15 @@ def _install_step(chosen: connect.Target, dest_override: Path | None) -> Path | 
 
 
 def _startup_step() -> bool:
-    """[3/4] Offer to pin + start the windowless background bridge. Returns True if
-    it ends up pinned to startup. Windows-only (Scheduled Task); degrades cleanly
-    elsewhere with a serve/service hint so the flow never dead-ends off-Windows."""
-    b.dim("Pins a windowless background bridge that starts on every login.")
-    if not autostart.is_windows():
-        b.warn(f"Run-on-startup pinning is Windows-only (this host is {connect.host_os_label()}).")
-        b.dim("Start the bridge with:  python research.py agent serve")
-        b.dim("(or wire a systemd / launchd service to run it on boot).")
+    """[3/4] Offer to pin + start the background bridge so it returns after a
+    reboot — a Scheduled Task (Windows), systemd --user unit (Linux), or launchd
+    LaunchAgent (macOS). Returns True if it ends up pinned. Degrades cleanly with a
+    serve hint on an OS where pinning isn't implemented, so the flow never dead-ends."""
+    if not autostart.supported():
+        b.warn(f"Run-on-startup pinning isn't available on this host ({connect.host_os_label()}).")
+        b.dim("Start the bridge yourself:  python research.py agent serve")
         return False
+    b.dim(f"Pins a background bridge that starts on every login (a {autostart.kind_label()}).")
     if not b.confirm("Run on startup? (background, every login)", default=True):
         b.dim("Skipped — start it yourself when ready (see Next).")
         return False
@@ -235,7 +242,7 @@ def _startup_step() -> bool:
         return False
     started, serr = autostart.start_detached()
     if started:
-        b.ok("Pinned to startup + started in the background.")
+        b.ok(f"Pinned to startup ({autostart.kind_label()}) + started in the background.")
     else:
         b.warn(f"Pinned to startup, but couldn't start it now: {serr}")
         b.dim("It starts at your next login (or run: python research.py agent serve).")
@@ -305,8 +312,20 @@ def _ensure_reachable(target: connect.Target) -> None:
         _ensure_wsl_networking()
         return
     label = connect.RUNTIME_META[target.runtime]["label"]
-    b.ok(f"{label} is on this {connect.host_os_label()} host — it reaches the bridge "
-         "over loopback. No network setup needed.")
+    # "local" means same host filesystem — which USUALLY means same network
+    # namespace (shared loopback), but not always: a runtime in a container/VM
+    # that bind-mounts this home looks local yet can't reach the host loopback.
+    # Don't over-promise. If the bridge host itself is containerized, say so plainly.
+    if connect.looks_containerized():
+        b.warn(f"This bridge host looks containerized — its loopback (127.0.0.1:{config.BRIDGE_PORT}) "
+               "is scoped to the container.")
+        b.dim(f"{label} can reach it only if it shares this container's network "
+              "(host networking / a published port).")
+        return
+    b.ok(f"{label} is on this {connect.host_os_label()} host — it shares the bridge's "
+         "loopback, no network setup needed.")
+    b.dim(f"(If {label} actually runs in a container or VM, it needs host networking or a")
+    b.dim(f" published port to reach 127.0.0.1:{config.BRIDGE_PORT} — same-OS alone isn't enough.)")
 
 
 def _warn_shared_localhost() -> None:
@@ -320,12 +339,15 @@ def _warn_shared_localhost() -> None:
     b.dim("    port (a stray Windows :3000 dev server can knock out a WSL chat bridge);")
     b.dim("  • applying it needs  wsl --shutdown , which briefly stops ALL your WSL")
     b.dim("    apps (Hermes / WhatsApp / etc.) — they reconnect afterwards.")
-    owners = connect.windows_port_owners()
+    # Scan the common service ports AND the bridge's OWN port — under mirrored
+    # networking a Windows holder of :9876 would block the bridge's bind too.
+    owners = connect.windows_port_owners(connect.COMMON_SHARED_PORTS + (config.BRIDGE_PORT,))
     if owners:
         b.warn("Windows is already holding these ports — a WSL service can't share them once mirrored:")
         for port, pid in sorted(owners.items()):
+            tag = "  ← the bridge's own port" if port == config.BRIDGE_PORT else ""
             b.dim(f"    • port {port}  →  Windows PID {pid}   "
-                  f"(identify:  tasklist /FI \"PID eq {pid}\")")
+                  f"(identify:  tasklist /FI \"PID eq {pid}\"){tag}")
         b.dim("  If your chat runtime uses one of these, free it on Windows or move that")
         b.dim("  WSL service to another port first.")
 
@@ -447,17 +469,25 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
 
 
 def cmd_resurrect(args: argparse.Namespace) -> int:
-    """Pin the bridge to logon + start it windowless now (the agent twin of the
-    backend `--resurrect`)."""
+    """Pin the bridge to login + start it in the background now (the agent twin of
+    the backend `--resurrect`) — a Scheduled Task (Windows), systemd --user unit
+    (Linux), or launchd LaunchAgent (macOS)."""
     b.header("resurgam", "rise + run on every login", tagline_color=branding._BOLD + branding._BRIGHT)
+    # Graceful on an OS where pinning isn't implemented: don't dead-end — point at
+    # `agent serve` instead of erroring out under a "run on every login" banner.
+    if not autostart.supported():
+        b.warn(f"Run-on-startup pinning isn't available on this host ({connect.host_os_label()}).")
+        b.dim("Run the bridge in this terminal instead:  python research.py agent serve")
+        return 0
     ok, out = autostart.install()
     if not ok:
-        b.no(f"Couldn't pin autostart: {out}")
+        b.no(f"Couldn't pin startup: {out}")
+        b.dim("Run it yourself:  python research.py agent serve")
         return 1
-    b.ok(f"Pinned to login (Scheduled Task {autostart.TASK_NAME})")
+    b.ok(f"Pinned to login ({autostart.kind_label()})")
     started, serr = autostart.start_detached()
     if started:
-        b.ok("Bridge started in the background (windowless)")
+        b.ok("Bridge started in the background")
     else:
         b.warn(f"Pinned, but couldn't start it now: {serr}")
         b.dim("It starts at your next login (or run: python research.py agent serve).")
