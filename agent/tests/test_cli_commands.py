@@ -187,6 +187,7 @@ def test_ensure_wsl_networking_already_on_skips_write(monkeypatch):
 
 def test_ensure_wsl_networking_decline_write_does_nothing(monkeypatch):
     monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)  # decline the write
     wrote = []
     monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
@@ -197,6 +198,7 @@ def test_ensure_wsl_networking_decline_write_does_nothing(monkeypatch):
 
 def test_ensure_wsl_networking_write_then_decline_restart(monkeypatch):
     monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
     answers = iter([True, False])  # Y write, N shutdown
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
     monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
@@ -209,6 +211,7 @@ def test_ensure_wsl_networking_write_then_decline_restart(monkeypatch):
 
 def test_ensure_wsl_networking_write_then_accept_restart(monkeypatch):
     monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
     answers = iter([True, True])  # Y write, Y shutdown
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
     monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
@@ -223,6 +226,7 @@ def test_ensure_wsl_networking_write_failure_is_handled(monkeypatch, capsys):
     # The OSError path (couldn't write .wslconfig) must degrade gracefully and
     # never reach the restart offer.
     monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)  # accept the write
     def _boom(*a, **k):
         raise OSError("Access is denied")
@@ -236,6 +240,7 @@ def test_ensure_wsl_networking_write_failure_is_handled(monkeypatch, capsys):
 
 def test_ensure_wsl_networking_shutdown_failure_is_handled(monkeypatch, capsys):
     monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
     answers = iter([True, True])  # Y write, Y shutdown
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
     monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
@@ -249,6 +254,7 @@ def test_ensure_wsl_networking_already_configured_unapplied(monkeypatch, capsys)
     # enable_mirrored_networking can return changed=False (value already present) —
     # the message must say "Already set", not falsely claim a fresh enable.
     monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
     answers = iter([True, False])  # Y write, N shutdown
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
     monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
@@ -256,6 +262,35 @@ def test_ensure_wsl_networking_already_configured_unapplied(monkeypatch, capsys)
     monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: (True, ""))
     cli._ensure_wsl_networking()
     assert "Already set" in capsys.readouterr().out
+
+
+# _warn_shared_localhost — informed consent + the #225 port-squatter guard.
+
+def test_warn_shared_localhost_flags_windows_port_squatters(monkeypatch):
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {3000: "37292"})
+    _, out = _cap(cli._warn_shared_localhost)
+    assert "shares localhost" in out.lower()      # informed consent
+    assert "3000" in out and "37292" in out        # names the squatter + PID
+    assert "tasklist" in out.lower()               # actionable identify hint
+
+
+def test_warn_shared_localhost_clean_when_no_squatters(monkeypatch):
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
+    _, out = _cap(cli._warn_shared_localhost)
+    assert "shares localhost" in out.lower()       # still warns about the consequence
+    assert "PID" not in out                        # but no squatter list
+
+
+def test_ensure_wsl_networking_breadcrumb_on_enable(monkeypatch):
+    # The post-restart diagnostic breadcrumb (netstat hint) must be emitted.
+    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
+    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
+    answers = iter([True, False])  # Y write, N shutdown
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
+    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
+                        lambda *a, **k: (True, Path("C:/Users/me/.wslconfig")))
+    _, out = _cap(cli._ensure_wsl_networking)
+    assert "netstat -ano" in out and "findstr" in out
 
 
 # ── cmd_status runtime-location rendering ─────────────────────────────────────

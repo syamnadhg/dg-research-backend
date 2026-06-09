@@ -264,3 +264,33 @@ def test_wsl_shutdown_off_windows_guard(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "linux")
     ok, msg = connect.wsl_shutdown()
     assert ok is False and "Windows-only" in msg
+
+
+# ── mirrored-networking port-collision guard (the #225 fortification) ─────────
+
+def test_parse_listening_ports_picks_wanted_tcp_listeners():
+    text = (
+        "\nActive Connections\n\n"
+        "  Proto  Local Address          Foreign Address        State           PID\n"
+        "  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       37292\n"
+        "  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4\n"
+        "  TCP    [::]:8080              [::]:0                 LISTENING       9001\n"
+        "  TCP    127.0.0.1:51000        127.0.0.1:3000        ESTABLISHED     1234\n"
+        "  UDP    0.0.0.0:5353           *:*                                   2222\n"
+    )
+    got = connect._parse_listening_ports(text, {3000, 8080, 9999})
+    # 3000 + 8080 (incl. the [::] form) picked; 445 not wanted; ESTABLISHED/UDP ignored.
+    assert got == {3000: "37292", 8080: "9001"}
+
+
+def test_parse_listening_ports_first_holder_wins():
+    text = (
+        "  TCP    127.0.0.1:3000   0.0.0.0:0   LISTENING   111\n"
+        "  TCP    [::]:3000        [::]:0      LISTENING   222\n"
+    )
+    assert connect._parse_listening_ports(text, {3000}) == {3000: "111"}
+
+
+def test_windows_port_owners_off_windows_is_empty(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    assert connect.windows_port_owners() == {}

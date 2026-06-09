@@ -293,6 +293,51 @@ def wsl_shutdown() -> tuple[bool, str]:
     return (False, err or f"exit {r.returncode}")
 
 
+# ── mirrored-networking port-collision guard ─────────────────────────────────
+# Mirrored networking SHARES localhost between Windows and WSL, so a Windows
+# process holding a port shadows the SAME port inside WSL — that is how a stray
+# Windows :3000 dev server can knock out a WSL chat bridge (the #225 WhatsApp
+# break). These are the ports dev servers / chat-runtime services most often use;
+# `connect` flags any that Windows is already holding before it enables mirrored.
+COMMON_SHARED_PORTS: tuple[int, ...] = (
+    3000, 3001, 3737, 4000, 5000, 5173, 8000, 8080, 8888, 9000,
+)
+
+
+def _parse_listening_ports(netstat_text: str, wanted: set[int]) -> dict[int, str]:
+    """Pure parser for `netstat -ano` output → {port: pid} for LISTENING TCP rows
+    whose local port is in `wanted`. First holder per port wins."""
+    found: dict[int, str] = {}
+    for line in netstat_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == "TCP" and parts[3] == "LISTENING":
+            try:
+                port = int(parts[1].rsplit(":", 1)[1])  # 127.0.0.1:3000 / [::]:3000
+            except (ValueError, IndexError):
+                continue
+            if port in wanted and port not in found:
+                found[port] = parts[4]
+    return found
+
+
+def windows_port_owners(ports: tuple[int, ...] = COMMON_SHARED_PORTS) -> dict[int, str]:
+    """Which of `ports` a Windows process is LISTENING on → {port: pid}. Advisory
+    + best-effort: returns {} off-Windows or on any failure, so it can NEVER break
+    the connect flow. Used to warn that mirrored networking will let these Windows
+    ports shadow the same port inside WSL."""
+    if sys.platform != "win32":
+        return {}
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    try:
+        r = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=10, creationflags=no_window,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return _parse_listening_ports(r.stdout or "", set(ports))
+
+
 # ── install / uninstall ──────────────────────────────────────────────────────
 
 def install(runtime: str, *, dest: Path | None = None, home: Path | None = None) -> Path:

@@ -309,17 +309,40 @@ def _ensure_reachable(target: connect.Target) -> None:
          "over loopback. No network setup needed.")
 
 
+def _warn_shared_localhost() -> None:
+    """Informed consent before enabling mirrored networking: it SHARES localhost
+    between Windows and WSL, so a Windows process on a port blocks a WSL service
+    from that same port (the #225 WhatsApp break), and applying it bounces all WSL
+    apps. Names any common service port a Windows process is already squatting so
+    the user can resolve it BEFORE a WSL chat service silently fails to bind."""
+    b.dim("Heads up — mirrored networking SHARES localhost between Windows and WSL:")
+    b.dim("  • a Windows process on a port then BLOCKS a WSL service from that same")
+    b.dim("    port (a stray Windows :3000 dev server can knock out a WSL chat bridge);")
+    b.dim("  • applying it needs  wsl --shutdown , which briefly stops ALL your WSL")
+    b.dim("    apps (Hermes / WhatsApp / etc.) — they reconnect afterwards.")
+    owners = connect.windows_port_owners()
+    if owners:
+        b.warn("Windows is already holding these ports — a WSL service can't share them once mirrored:")
+        for port, pid in sorted(owners.items()):
+            b.dim(f"    • port {port}  →  Windows PID {pid}   "
+                  f"(identify:  tasklist /FI \"PID eq {pid}\")")
+        b.dim("  If your chat runtime uses one of these, free it on Windows or move that")
+        b.dim("  WSL service to another port first.")
+
+
 def _ensure_wsl_networking() -> None:
     """WSL runtime prerequisite: the bridge runs on Windows and binds loopback, so
-    a WSL chat reaches it ONLY with WSL "mirrored" networking. If it's off, offer
-    to write it into %USERPROFILE%\\.wslconfig (Y), then — since the change needs a
-    WSL restart — offer to run `wsl --shutdown` (default NO: it closes every WSL
-    session, including the runtime just connected). Consent-gated, never silent."""
+    a WSL chat reaches it ONLY with WSL "mirrored" networking. If it's off, WARN
+    about the shared-localhost consequence (+ flag Windows port-squatters), then
+    offer to write it into %USERPROFILE%\\.wslconfig (Y), then — since the change
+    needs a WSL restart — offer to run `wsl --shutdown` (default NO: it closes
+    every WSL session, including the runtime just connected). Consent-gated."""
     if connect.mirrored_networking_enabled():
         b.ok("WSL mirrored networking is on — your WSL chat can reach the bridge.")
         return
     b.warn("WSL chat reaches this Windows bridge over loopback ONLY with mirrored networking.")
-    if not b.confirm("Enable it now? (writes  %USERPROFILE%\\.wslconfig )", default=True):
+    _warn_shared_localhost()
+    if not b.confirm("Enable mirrored networking now? (writes  %USERPROFILE%\\.wslconfig )", default=True):
         b.dim("Skipped. Enable later: add  networkingMode=mirrored  under [wsl2] in")
         b.dim("  %USERPROFILE%\\.wslconfig , then  wsl --shutdown   (or re-run agent connect).")
         return
@@ -346,6 +369,9 @@ def _ensure_wsl_networking() -> None:
             b.dim("Run it yourself, then verify:  python research.py agent doctor")
     else:
         b.dim("Run  wsl --shutdown  yourself, then verify:  python research.py agent doctor")
+    # Diagnostic breadcrumb for the exact #225 failure mode.
+    b.dim("If a WSL chat service doesn't reconnect after the restart, a Windows process may")
+    b.dim("  be holding its port (mirrored shares localhost) — check:  netstat -ano | findstr :<port>")
 
 
 def _disconnect_pairs(explicit: str | None,
