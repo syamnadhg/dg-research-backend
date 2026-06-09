@@ -33,12 +33,12 @@ RUNTIMES: dict[str, Path] = {
     "hermes": Path(".hermes") / "skills" / "research" / "super-research",
 }
 
-# Display metadata for the branded picker. icon = native-color glyph; rgb tints
-# the NAME so both runtimes read as colored brand marks (the user's parity ask):
-#   • OpenClaw — 🦞 (native orange) + orange name
-#   • Hermes   — ⚚ staff-of-Hermes, gold #E0A33A (default until a brand hex lands)
+# Display metadata for the branded picker. rgb tints the NAME (and any vector
+# glyph) so each runtime reads as a colored brand mark matching its symbol's hue:
+#   • OpenClaw — 🦞 (emoji, native red) + RED glowing name
+#   • Hermes   — ⚚ staff-of-Hermes glyph tinted gold #E0A33A + GOLD glowing name
 RUNTIME_META: dict[str, dict] = {
-    "openclaw": {"label": "OpenClaw", "icon": "🦞", "rgb": (232, 115, 46)},
+    "openclaw": {"label": "OpenClaw", "icon": "🦞", "rgb": (231, 76, 60)},
     "hermes": {"label": "Hermes", "icon": "⚚", "rgb": (224, 163, 58)},
 }
 

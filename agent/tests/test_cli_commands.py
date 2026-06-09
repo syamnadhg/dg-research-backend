@@ -294,6 +294,191 @@ def test_cmd_status_renders_no_location(monkeypatch):
     assert "hermes" in line and "·" not in line  # no host/WSL suffix when unknown
 
 
+# ── connect flow helpers ──────────────────────────────────────────────────────
+
+def _t(runtime="hermes", loc="local", home=Path("C:/Users/me"), distro=None):
+    return connect.Target(runtime, loc, home, distro)
+
+
+def _cap(fn, *a, **k):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rv = fn(*a, **k)
+    return rv, buf.getvalue()
+
+
+# _choose_target — single confirms, multiple pick + confirm, cancels.
+
+def test_choose_target_single_confirms(monkeypatch):
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    t = _t()
+    assert cli._choose_target([t]) is t
+
+
+def test_choose_target_single_decline_cancels(monkeypatch):
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
+    assert cli._choose_target([_t()]) is None
+
+
+def test_choose_target_multiple_pick_then_confirm(monkeypatch):
+    monkeypatch.setattr(cli.b, "ask", lambda *a, **k: "2")
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    first, second = _t("hermes"), _t("openclaw", "wsl", Path("/o"), "U")
+    assert cli._choose_target([first, second]) is second
+
+
+def test_choose_target_interrupt_cancels(monkeypatch):
+    monkeypatch.setattr(cli.b, "ask", lambda *a, **k: None)  # Ctrl-C / EOF
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    assert cli._choose_target([_t("hermes"), _t("openclaw")]) is None
+
+
+def test_choose_target_out_of_range_cancels(monkeypatch):
+    monkeypatch.setattr(cli.b, "ask", lambda *a, **k: "9")
+    assert cli._choose_target([_t("hermes"), _t("openclaw")]) is None
+
+
+# _install_step — fresh install, decline-when-absent aborts, keep-existing.
+
+def test_install_step_fresh_install(monkeypatch):
+    seq = iter([False, True])  # not present, then verified after install
+    monkeypatch.setattr(cli.connect, "verify", lambda p: next(seq))
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(cli.connect, "install", lambda rt, **kw: Path("C:/dest"))
+    monkeypatch.setattr(cli, "_record_runtime", lambda c: None)
+    assert cli._install_step(_t(), None) == Path("C:/dest")
+
+
+def test_install_step_decline_when_absent_aborts(monkeypatch):
+    monkeypatch.setattr(cli.connect, "verify", lambda p: False)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)  # decline install
+    called = []
+    monkeypatch.setattr(cli.connect, "install", lambda *a, **k: called.append(1))
+    assert cli._install_step(_t(), None) is None
+    assert called == []  # never installed
+
+
+def test_install_step_already_installed_keep(monkeypatch):
+    monkeypatch.setattr(cli.connect, "verify", lambda p: True)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)  # don't reinstall
+    monkeypatch.setattr(cli, "_record_runtime", lambda c: None)
+    t = _t()
+    assert cli._install_step(t, None) == t.dest
+
+
+# _startup_step — Windows-only guard (cross-platform), pin, decline, pin-fail.
+
+def test_startup_step_non_windows_is_graceful(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "is_windows", lambda: False)
+    installed = []
+    monkeypatch.setattr(cli.autostart, "install", lambda: installed.append(1) or (True, ""))
+    rv, out = _cap(cli._startup_step)
+    assert rv is False
+    assert installed == []          # never attempts schtasks off-Windows
+    assert "Windows-only" in out and "agent serve" in out
+
+
+def test_startup_step_windows_pins(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "is_windows", lambda: True)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(cli.autostart, "install", lambda: (True, ""))
+    monkeypatch.setattr(cli.autostart, "start_detached", lambda: (True, ""))
+    assert cli._startup_step() is True
+
+
+def test_startup_step_decline(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "is_windows", lambda: True)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
+    assert cli._startup_step() is False
+
+
+def test_startup_step_pin_failure(monkeypatch):
+    monkeypatch.setattr(cli.autostart, "is_windows", lambda: True)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(cli.autostart, "install", lambda: (False, "schtasks denied"))
+    assert cli._startup_step() is False
+
+
+# _signin_step — bridge-down, decline, opens browser.
+
+def test_signin_step_bridge_down(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    rv, out = _cap(cli._signin_step)
+    assert rv is False and "start it first" in out.lower()
+
+
+def test_signin_step_decline(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
+    assert cli._signin_step() is False
+
+
+def test_signin_step_opens_browser(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
+    opened = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda u: opened.append(u))
+    assert cli._signin_step() is True
+    assert opened and "/login" in opened[0]
+
+
+# _connect_next — terminal vs chat split, varied by login + startup state.
+
+def test_connect_next_logged_in_and_pinned(monkeypatch):
+    groups = cli._connect_next(logged_in=True, startup_pinned=True)
+    assert [lbl for lbl, _ in groups] == ["in this terminal", "in your chat (Hermes / OpenClaw)"]
+    term = [c for c, _ in groups[0][1]]
+    chat = [c for c, _ in groups[1][1]]
+    assert any(c.endswith("agent logout") for c in term)      # switch account
+    assert not any(c.endswith("agent login") for c in term)
+    assert not any("serve" in c or "resurrect" in c for c in term)  # already pinned
+    assert any(c.endswith("--help") for c in term)            # help always
+    assert "/superresearch" in chat
+    assert "/sr-login" not in chat                            # already signed in
+
+
+def test_connect_next_fresh_and_unpinned(monkeypatch):
+    groups = cli._connect_next(logged_in=False, startup_pinned=False)
+    term = [c for c, _ in groups[0][1]]
+    chat = [c for c, _ in groups[1][1]]
+    assert any(c.endswith("agent login") for c in term)
+    assert not any(c.endswith("agent logout") for c in term)
+    assert any("serve" in c for c in term) and any("resurrect" in c for c in term)
+    assert any(c.endswith("--help") for c in term)            # help always
+    assert "/sr-login" in chat and "/superresearch" in chat
+
+
+# Cross-platform reachability: a co-located (local) runtime on a non-Windows host
+# needs no setup and must NOT touch any WSL machinery.
+
+def test_ensure_reachable_local_on_linux(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    monkeypatch.setattr(connect, "host_os_label", lambda: "Linux")
+    wsl = []
+    monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: wsl.append(1))
+    _, out = _cap(cli._ensure_reachable, connect.Target("hermes", "local", Path("/home/x")))
+    assert wsl == [] and "loopback" in out.lower()
+
+
+# _bridge_authed — the closing card's 'logged_in' must reflect REAL auth, not
+# 'a browser was opened'.
+
+def test_bridge_authed_true(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: (200, {"authed": True, "email": "me@x"}))
+    assert cli._bridge_authed() is True
+
+
+def test_bridge_authed_false_when_not_signed_in(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: (200, {"authed": False}))
+    assert cli._bridge_authed() is False
+
+
+def test_bridge_authed_false_when_bridge_down(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: None)
+    assert cli._bridge_authed() is False
+
+
 # ── cmd_home (bare `agent` / `--agent` smart entry) ───────────────────────────
 
 def test_cmd_home_when_set_up_shows_status(monkeypatch):

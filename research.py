@@ -38402,6 +38402,7 @@ def run_resurrect():
         )
         _render_next_actions([
             ("python research.py --retire", "disable On Startup"),
+            ("python research.py agent connect", "drive Super Research from chat (Hermes / OpenClaw)"),
         ])
         return
 
@@ -38642,6 +38643,7 @@ def run_resurrect():
     )
     _render_next_actions([
         ("python research.py --retire", "disable On Startup"),
+        ("python research.py agent connect", "drive Super Research from chat (Hermes / OpenClaw)"),
     ])
 
 

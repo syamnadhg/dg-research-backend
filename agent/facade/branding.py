@@ -122,11 +122,25 @@ def line(msg: str = "") -> None:
 
 
 def brand_mark(icon: str, color_rgb: tuple[int, int, int], label: str, suffix: str = "") -> str:
-    """A runtime brand chip: native-color icon + brand-tinted name (+ dim suffix).
-    e.g.  🦞  OpenClaw   · WSL · Ubuntu-24.04"""
+    """A runtime brand chip: brand-tinted glyph + brand-tinted glowing name (+ dim
+    suffix). The tint lands on vector glyphs (⚚ → gold); emoji (🦞) ignore ANSI
+    foreground and keep their own native color — which is the intent.
+    e.g.  ⚚  Hermes   · WSL · Ubuntu-24.04"""
+    glyph = c(rgb(*color_rgb), icon)
     name = c(rgb(*color_rgb) + _BOLD, label)
     tail = f"   {c(_DIM, suffix)}" if suffix else ""
-    return f"{icon}  {name}{tail}"
+    return f"{glyph}  {name}{tail}"
+
+
+def channels(items: list[tuple[str, str, tuple[int, int, int]]]) -> None:
+    """A decorative row of the chat channels Super Research reaches, under the
+    header — each a brand-colored glyph + name. (Vector glyphs take the tint;
+    emoji render native.) items = (name, glyph, (r,g,b))."""
+    if not items:
+        return
+    chips = [f"{c(rgb(*col), glyph)} {c(rgb(*col), name)}" for name, glyph, col in items]
+    print()
+    print(f"  {c(_DIM, 'reach it from')}   " + "   ".join(chips))
 
 
 def next_actions(items: list[tuple[str, str]]) -> None:
@@ -140,6 +154,26 @@ def next_actions(items: list[tuple[str, str]]) -> None:
     print(f"  {c(_DIM, 'Next')}")
     for cmd, desc in items:
         print(f"    {c(_ACCENT, ARROW)}  {c(_BOLD, cmd.ljust(width))}   {c(_DIM, desc)}")
+    print()
+
+
+def next_grouped(groups: list[tuple[str, list[tuple[str, str]]]]) -> None:
+    """Closing 'Next' block split into labelled groups — e.g. terminal commands
+    vs in-chat slash commands — so the user can tell them apart. Empty groups are
+    dropped. groups = [(group_label, [(cmd, desc), …]), …]."""
+    groups = [(lbl, items) for lbl, items in groups if items]
+    if not groups:
+        return
+    bar = rule("┈")
+    all_cmds = [cmd for _, items in groups for cmd, _ in items]
+    width = min(max((len(cmd) for cmd in all_cmds), default=0), 40)
+    print()
+    print(f"  {bar}")
+    print(f"  {c(_DIM, 'Next')}")
+    for label, items in groups:
+        print(f"    {c(_BOLD + _ACCENT, label)}")
+        for cmd, desc in items:
+            print(f"      {c(_ACCENT, ARROW)}  {c(_BOLD, cmd.ljust(width))}   {c(_DIM, desc)}")
     print()
 
 
@@ -159,9 +193,13 @@ def ask(prompt: str, default: str = "", *, cancel_on_interrupt: bool = False) ->
 
 
 def confirm(prompt: str, default: bool = True) -> bool:
-    """Yes/No prompt. `default` decides an empty answer and the [Y/n] hint."""
+    """Yes/No prompt. A bare Enter takes `default` (and sets the [Y/n] hint). A
+    Ctrl-C / EOF returns False — an interrupt must NEVER silently proceed as a
+    default 'yes' (e.g. it must not trigger an install or a `wsl --shutdown`)."""
     hint = "[Y/n]" if default else "[y/N]"
-    ans = ask(f"{prompt} {c(_DIM, hint)}").lower()
-    if not ans:
+    ans = ask(f"{prompt} {c(_DIM, hint)}", cancel_on_interrupt=True)
+    if ans is None:        # Ctrl-C / EOF → abort, not the default
+        return False
+    if not ans:            # bare Enter → the default
         return default
-    return ans in ("y", "yes")
+    return ans.lower() in ("y", "yes")

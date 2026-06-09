@@ -62,6 +62,13 @@ def _bridge_up() -> bool:
     return _bridge_get("/healthz", timeout=3.0) is not None
 
 
+def _bridge_authed() -> bool:
+    """Whether the bridge currently holds a signed-in account session (the real
+    auth state, per /status) — not merely 'a sign-in was started'."""
+    res = _bridge_get("/status")
+    return bool(res and res[1].get("authed"))
+
+
 # ── commands ──────────────────────────────────────────────────────────────
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -78,91 +85,100 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _pick_target(targets: list[connect.Target]) -> connect.Target | None:
-    """Numbered picker (consistent with --pair, not an arrow-TUI). Returns None on
-    cancel (Ctrl-C / EOF / out-of-range / non-numeric) so the caller aborts
-    cleanly rather than silently installing into a runtime the user didn't pick."""
-    for i, t in enumerate(targets, 1):
-        print(f"     {b.c(branding._ACCENT + branding._BOLD, str(i))}  {_runtime_mark(t)}")
-    ans = b.ask("Pick a runtime [1]:", cancel_on_interrupt=True)
-    if ans is None:           # Ctrl-C / EOF → cancel, do not pick a default
+# Chat channels Super Research reaches, shown as a row under the header. The
+# vector glyphs (✆ ✈ ☎) take the brand tint; 💬 is an emoji and stays native.
+_CHANNELS = [
+    ("WhatsApp", "✆", (37, 211, 102)),
+    ("Telegram", "✈", (34, 158, 217)),
+    ("iMessage", "💬", (52, 199, 89)),
+    ("Twilio", "☎", (242, 47, 70)),
+]
+
+
+def _choose_target(targets: list[connect.Target]) -> connect.Target | None:
+    """Step 1's chooser: pick a runtime (numbered, when >1) then CONFIRM it with a
+    'Continue with X?' prompt — so even a single detected runtime is an explicit
+    choice. Returns the chosen Target, or None to cancel (Ctrl-C / EOF /
+    out-of-range / a 'no' at the confirm)."""
+    if len(targets) > 1:
+        for i, t in enumerate(targets, 1):
+            print(f"     {b.c(branding._ACCENT + branding._BOLD, str(i))}  {_runtime_mark(t)}")
+        ans = b.ask("Pick a runtime [1]:", cancel_on_interrupt=True)
+        if ans is None:
+            return None
+        try:
+            idx = int(ans or "1")
+        except ValueError:
+            return None
+        if not (1 <= idx <= len(targets)):
+            return None
+        chosen = targets[idx - 1]
+    else:
+        chosen = targets[0]
+    if not b.confirm(f"Continue with {_runtime_mark(chosen)}?", default=True):
         return None
-    if ans == "":             # bare Enter → accept the [1] default
-        ans = "1"
-    try:
-        idx = int(ans)
-    except ValueError:
-        return None
-    return targets[idx - 1] if 1 <= idx <= len(targets) else None
+    return chosen
 
 
 def cmd_connect(args: argparse.Namespace) -> int:
-    """Connect a chat runtime (Hermes / OpenClaw): install the Super Research
-    skill where the runtime lives (Windows or WSL), then optionally pin the
-    background bridge. Branded, interactive 4-step flow."""
+    """Connect a chat runtime (Hermes / OpenClaw): choose it, install the Super
+    Research skill where it lives + make it reachable, optionally pin the
+    background bridge, and optionally sign in. Branded, interactive 4-step flow."""
     b.header("nexus", "link Super Research to chat", tagline_color=branding._BOLD + branding._ACCENT)
-    b.step_arc(["Detect", "Choose", "Install", "Go live"])
+    b.channels(_CHANNELS)
+    b.step_arc(["Detect + choose", "Install", "Run on startup", "Sign in"])
 
     explicit = args.runtime
     if explicit and explicit not in connect.RUNTIMES:
         b.no(f"Unknown runtime '{explicit}'. Choose: {', '.join(connect.RUNTIMES)}")
         return 1
 
-    # ── [1/4] Detect ────────────────────────────────────────────────────────
-    b.step(1, 4, "Detect runtime")
+    # ── [1/4] Detect + choose ────────────────────────────────────────────────
+    b.step(1, 4, "Detect + choose")
     b.dim(f"Bridge runs here · {connect.host_os_label()}  (alongside the Super Research backend).")
     targets = connect.detect_targets()
     if explicit:
         matches = [t for t in targets if t.runtime == explicit]
-        if matches:
-            targets = matches
-        else:
-            # Honor the explicit choice even if undetected — install at this
-            # host's default home (creates the dirs).
-            targets = [connect.Target(explicit, "local", Path.home())]
+        targets = matches or [connect.Target(explicit, "local", Path.home())]
+        if not matches:
             b.dim(f"{explicit} not detected — will install at the default path on this host.")
     if not targets:
-        b.no("No chat runtime found (looked for ~/.hermes, ~/.openclaw on Windows and in WSL).")
+        b.no("No chat runtime found (looked for ~/.hermes, ~/.openclaw on this host and in WSL).")
         b.dim("Install Hermes or OpenClaw first, then re-run:  python research.py agent connect")
         return 1
     for t in targets:
         b.ok(f"Found {_runtime_mark(t)}")
-
-    # ── [2/4] Choose ──────────────────────────────────────────────────────────
-    b.step(2, 4, "Choose")
-    if len(targets) == 1:
-        chosen = targets[0]
-        b.dim(f"Using {_runtime_mark(chosen)}")
-    else:
-        chosen = _pick_target(targets)
-        if chosen is None:
-            b.dim("Cancelled — nothing was changed.")
-            return 1
-        b.ok(f"Selected {_runtime_mark(chosen)}")
-
-    # ── [3/4] Install the skill ───────────────────────────────────────────────
-    b.step(3, 4, "Install the skill")
-    dest_override = Path(args.dest) if args.dest else None
-    existing = dest_override or chosen.dest
-    if connect.verify(existing):
-        b.dim(f"A Super Research skill is already installed at:\n     {existing}")
-        if not b.confirm("Reinstall (refresh to the latest)?", default=False):
-            b.dim("Kept the existing skill.")
-            _record_runtime(chosen)
-            return _connect_go_live(chosen, existing)
-    try:
-        target = connect.install(chosen.runtime, dest=dest_override, home=chosen.home)
-    except OSError as e:
-        b.no(f"Install failed: {e}")
+    chosen = _choose_target(targets)
+    if chosen is None:
+        b.dim("Cancelled — nothing was changed.")
         return 1
-    if not connect.verify(target):
-        b.no(f"Install verification failed at {target}")
-        return 1
-    _record_runtime(chosen)
-    b.ok("Skill installed")
-    b.dim(f"  {target}")
 
-    return _connect_go_live(chosen, target)
+    # ── [2/4] Install the skill + make it reachable ──────────────────────────
+    b.step(2, 4, "Install the skill")
+    target = _install_step(chosen, Path(args.dest) if args.dest else None)
+    if target is None:
+        return 1  # _install_step already printed the reason (declined / failed)
+    # Reachability runs AFTER the copy: a WSL `wsl --shutdown` would unmount
+    # \\wsl.localhost and corrupt an in-flight install.
+    print()
+    _ensure_reachable(chosen)
+
+    # ── [3/4] Run on startup ──────────────────────────────────────────────────
+    b.step(3, 4, "Run on startup")
+    startup_pinned = _startup_step()
+
+    # ── [4/4] Sign in ─────────────────────────────────────────────────────────
+    b.step(4, 4, "Sign in")
+    _signin_step()
+    # Reflect the ACTUAL session state in the closing card — a freshly-opened
+    # browser sign-in isn't complete yet, so only show 'logout' once /status
+    # actually reports authed (e.g. a reconnect while already signed in).
+    logged_in = _bridge_authed()
+
+    print()
+    b.line(b.c(branding._BOLD + branding._ACCENT, "Connected."))
+    b.next_grouped(_connect_next(logged_in=logged_in, startup_pinned=startup_pinned))
+    return 0
 
 
 def _record_runtime(chosen: connect.Target) -> None:
@@ -172,40 +188,108 @@ def _record_runtime(chosen: connect.Target) -> None:
                       location=chosen.location, distro=chosen.distro)
 
 
-def _connect_go_live(chosen: connect.Target, target: Path) -> int:
-    """Step [4/4]: optionally pin + start the bridge, then the closing card."""
-    b.step(4, 4, "Go live")
-    b.dim("The bridge holds your account session and connects this PC to chat.")
-    if b.confirm("Run it in the background now + on every login?", default=True):
-        ok, out = autostart.install()
-        if ok:
-            started, serr = autostart.start_detached()
-            if started:
-                b.ok("Bridge pinned to login + started in the background.")
-            else:
-                b.warn(f"Pinned to login, but couldn't start it now: {serr}")
-                b.dim("It starts at your next login (or run: python research.py agent serve).")
-        else:
-            b.warn(f"Couldn't pin autostart: {out}")
-            b.dim("Start it yourself:  python research.py agent serve")
+def _install_step(chosen: connect.Target, dest_override: Path | None) -> Path | None:
+    """[2/4] Install (or keep) the skill. Returns the installed dir, or None if the
+    user declined an install that isn't already present (→ caller aborts)."""
+    existing = dest_override or chosen.dest
+    if connect.verify(existing):
+        b.dim(f"A Super Research skill is already installed at:\n     {existing}")
+        if not b.confirm("Reinstall (refresh to the latest)?", default=False):
+            b.dim("Kept the existing skill.")
+            _record_runtime(chosen)
+            return existing
+    elif not b.confirm(f"Install the skill into {_runtime_mark(chosen)}?", default=True):
+        b.warn("Skipped — without the skill the chat runtime won't have the /sr- commands.")
+        return None
+    try:
+        target = connect.install(chosen.runtime, dest=dest_override, home=chosen.home)
+    except OSError as e:
+        b.no(f"Install failed: {e}")
+        return None
+    if not connect.verify(target):
+        b.no(f"Install verification failed at {target}")
+        return None
+    _record_runtime(chosen)
+    b.ok("Skill installed")
+    b.dim(f"  {target}")
+    return target
+
+
+def _startup_step() -> bool:
+    """[3/4] Offer to pin + start the windowless background bridge. Returns True if
+    it ends up pinned to startup. Windows-only (Scheduled Task); degrades cleanly
+    elsewhere with a serve/service hint so the flow never dead-ends off-Windows."""
+    b.dim("Pins a windowless background bridge that starts on every login.")
+    if not autostart.is_windows():
+        b.warn(f"Run-on-startup pinning is Windows-only (this host is {connect.host_os_label()}).")
+        b.dim("Start the bridge with:  python research.py agent serve")
+        b.dim("(or wire a systemd / launchd service to run it on boot).")
+        return False
+    if not b.confirm("Run on startup? (background, every login)", default=True):
+        b.dim("Skipped — start it yourself when ready (see Next).")
+        return False
+    ok, out = autostart.install()
+    if not ok:
+        b.warn(f"Couldn't pin startup: {out}")
+        b.dim("Start it yourself:  python research.py agent serve")
+        return False
+    started, serr = autostart.start_detached()
+    if started:
+        b.ok("Pinned to startup + started in the background.")
     else:
-        b.dim("Skipped background autostart. When you're ready:")
-        b.dim("  python research.py agent resurrect   (background + on login)")
-        b.dim("  python research.py agent serve       (foreground, this terminal)")
+        b.warn(f"Pinned to startup, but couldn't start it now: {serr}")
+        b.dim("It starts at your next login (or run: python research.py agent serve).")
+    return True
 
-    # Make sure the chosen runtime can actually reach the loopback bridge.
-    print()
-    _ensure_reachable(chosen)
 
-    print()
-    b.line(b.c(branding._BOLD + branding._ACCENT, "Connected.")
-           + b.c(branding._DIM, "  Sign in from chat with  /sr-login  (or run agent login)."))
-    b.next_actions([
-        ("python research.py agent login", "sign in your Super Research account"),
-        ("python research.py agent status", "check the bridge + session"),
-        ("python research.py agent disconnect", "remove the skill + sign out"),
-    ])
-    return 0
+def _signin_step() -> bool:
+    """[4/4] Optional local-browser sign-in. Returns True if a sign-in was started.
+    Needs the bridge up (it brokers the session); if it isn't, point the user at
+    starting it first rather than failing."""
+    if not _bridge_up():
+        b.dim("Bridge isn't running yet — start it first, then sign in:")
+        b.dim("  python research.py agent serve   (or: agent resurrect)")
+        b.dim("then:  agent login   (or  /sr-login  from your chat).")
+        return False
+    if not b.confirm("Sign in now? (opens a local browser)", default=True):
+        b.dim("Skipped — sign in later with  agent login  or  /sr-login  from your chat.")
+        return False
+    url = config.login_origin() + "/login"
+    runtime = prefs.get_runtime()
+    if runtime:
+        url += f"?runtime={runtime}"  # glow the connected runtime's watermark
+    b.line(f"Opening {url}")
+    b.dim("Sign in with your Super Research Google account (research-only — never device control).")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        b.warn(f"Couldn't open a browser automatically — visit {url} manually.")
+    b.dim("After you approve, confirm with:  agent status")
+    return True
+
+
+def _connect_next(*, logged_in: bool, startup_pinned: bool) -> list[tuple[str, list[tuple[str, str]]]]:
+    """Closing 'Next' actions, split into terminal commands vs in-chat slash
+    commands, and varied by what the user chose (sign-in + startup state)."""
+    p = "python research.py agent "
+    terminal: list[tuple[str, str]] = []
+    if logged_in:
+        terminal.append((p + "logout", "sign out / switch the account the agent uses"))
+    else:
+        terminal.append((p + "login", "sign in your account (local browser)"))
+    if not startup_pinned:
+        terminal.append((p + "serve", "start the bridge in this terminal"))
+        terminal.append((p + "resurrect", "start it + run on startup"))
+    terminal.append((p + "status", "check the bridge + session"))
+    terminal.append((p + "retire", "stop + unpin the startup bridge"))
+    terminal.append((p + "disconnect", "remove the skill + sign out"))
+    terminal.append((p + "--help", "all agent commands"))
+
+    chat: list[tuple[str, str]] = []
+    if not logged_in:
+        chat.append(("/sr-login", "sign in (approve on your phone)"))
+    chat.append(("/superresearch", "welcome + help in chat"))
+    return [("in this terminal", terminal), ("in your chat (Hermes / OpenClaw)", chat)]
 
 
 def _ensure_reachable(target: connect.Target) -> None:
