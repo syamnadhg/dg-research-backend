@@ -251,29 +251,26 @@ def _startup_step() -> bool:
 
 
 def _signin_step() -> bool:
-    """[4/4] Optional local-browser sign-in. Returns True if a sign-in was started.
-    Needs the bridge up (it brokers the session); if it isn't, point the user at
-    starting it first rather than failing."""
+    """[4/4] Optional sign-in on the SR web app (superresearch.io) — the SAME page
+    `/sr login` uses, so it's consistent and works from any device. Blocks until
+    approved, so it returns True only when the account is ACTUALLY signed in. Needs
+    the bridge up (it brokers the session); if it isn't, point at starting it first."""
     if not _bridge_up():
         b.dim("Bridge isn't running yet — start it first, then sign in:")
         b.dim("  python research.py agent serve   (or: agent resurrect)")
-        b.dim("then:  agent login   (or  /sr-login  from your chat).")
+        b.dim("then:  agent login   (or  /sr login  from your chat).")
         return False
-    if not b.confirm("Sign in now? (opens a local browser)", default=True):
-        b.dim("Skipped — sign in later with  agent login  or  /sr-login  from your chat.")
+    if not b.confirm("Sign in now? (opens Super Research in your browser)", default=True):
+        b.dim("Skipped — sign in later with  /sr login  in chat  (or: agent login).")
         return False
-    url = config.login_origin() + "/login"
-    runtime = prefs.get_runtime()
-    if runtime:
-        url += f"?runtime={runtime}"  # glow the connected runtime's watermark
-    b.line(f"Opening {url}")
-    b.dim("Sign in with your Super Research Google account (research-only — never device control).")
-    try:
-        webbrowser.open(url)
-    except Exception:
-        b.warn(f"Couldn't open a browser automatically — visit {url} manually.")
-    b.dim("After you approve, confirm with:  agent status")
-    return True
+    state = _remote_signin(open_browser=True)
+    if state == "connected":
+        return True
+    if state == "start-failed":
+        b.dim("Web sign-in unreachable right now — host-local fallback:  agent login --local")
+    else:
+        b.dim("Finish sign-in later:  /sr login  in chat  (or: agent login).")
+    return False
 
 
 def _connect_next(*, logged_in: bool, startup_pinned: bool) -> list[tuple[str, list[tuple[str, str]]]]:
@@ -527,15 +524,16 @@ def cmd_login(args: argparse.Namespace) -> int:
         b.no("Bridge isn't running.  Start it:  python research.py agent serve  "
              "(or: agent resurrect)")
         return 1
-    if getattr(args, "remote", False):
+    if not getattr(args, "local", False):
+        # Default: sign in on the SR web app (superresearch.io) — same page as /sr login.
         return _login_remote(args)
+    # --local: host-local fallback (the bridge's own page; no SR web app needed).
     url = config.login_origin() + "/login"
     runtime = prefs.get_runtime()
     if runtime:
         url += f"?runtime={runtime}"  # glow the connected runtime's watermark
     b.line(f"Opening {url}")
-    b.dim("Sign in with your Super Research Google account.")
-    b.dim("Your agent is research-only; it can never control devices.")
+    b.dim("Sign in with your Super Research Google account (research-only).")
     try:
         webbrowser.open(url)
     except Exception:
@@ -543,18 +541,26 @@ def cmd_login(args: argparse.Namespace) -> int:
     return 0
 
 
-def _login_remote(args: argparse.Namespace) -> int:
-    """Remote device-flow sign-in (§11a): the bridge brokers via the SR web app;
-    the user approves on their phone. Works without any localhost access."""
+def _remote_signin(*, open_browser: bool, runtime: str = "", label: str = "") -> str:
+    """Shared sign-in via the SR web app (superresearch.io) — the SAME page
+    `/sr login` uses, so sign-in is consistent everywhere and works from any device
+    (no host-local page; approve on phone or this PC). Starts the broker flow, opens
+    the verify link, polls until approved. Returns the final state: 'connected' /
+    'expired' / 'error' / 'timeout' / 'cancelled' / 'start-failed'."""
     res = _bridge_post("/login/remote/start",
-                       {"runtime": (getattr(args, "runtime", "") or prefs.get_runtime() or ""),
-                        "label": getattr(args, "label", "") or ""})
+                       {"runtime": runtime or prefs.get_runtime() or "", "label": label or ""})
     if res is None or res[0] != 200:
-        b.no(f"Couldn't start remote sign-in: {res[1] if res else 'no response'}")
-        return 1
+        b.no(f"Couldn't start sign-in: {_err(res)}")
+        return "start-failed"
     out = res[1]
-    b.line(f"Open this link and sign in:  {out.get('verifyUrl')}")
-    b.dim("Sign in to Super Research on your phone, then tap Approve & connect.")
+    url = out.get("verifyUrl") or ""
+    b.line(f"Sign in here:  {url}")
+    b.dim("Sign in with your Super Research Google account, then tap Approve & connect.")
+    if open_browser and url:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            b.warn("Couldn't open a browser automatically — open the link above.")
     b.dim("Waiting for approval… (Ctrl-C to stop)")
     deadline = time.monotonic() + float(out.get("expiresIn", 600) or 600)
     interval = config.REMOTE_POLL_INTERVAL_SECONDS
@@ -567,18 +573,33 @@ def _login_remote(args: argparse.Namespace) -> int:
             st = pr[1]
             state = st.get("state")
             if state == "connected":
-                b.ok(f"Connected as {st.get('email') or st.get('uid')}.  Try:  agent verify")
-                return 0
+                b.ok(f"Connected as {st.get('email') or st.get('uid')}.")
+                return "connected"
             if state == "expired":
-                b.no("Sign-in link expired before approval. Run:  agent login --remote")
-                return 1
+                b.no("Sign-in link expired before approval.")
+                return "expired"
             if state == "error":
                 b.no(f"Sign-in failed: {st.get('error', 'unknown error')}")
-                return 1
+                return "error"
     except KeyboardInterrupt:
         b.dim("\n  Stopped waiting. The link may still be valid; re-run to resume.")
-        return 1
-    b.no("Timed out waiting for approval. Run:  agent login --remote")
+        return "cancelled"
+    b.no("Timed out waiting for approval.")
+    return "timeout"
+
+
+def _login_remote(args: argparse.Namespace) -> int:
+    """`agent login` (default): sign in on the SR web app (superresearch.io)."""
+    state = _remote_signin(open_browser=True,
+                           runtime=getattr(args, "runtime", "") or "",
+                           label=getattr(args, "label", "") or "")
+    if state == "connected":
+        b.dim("Try:  agent verify")
+        return 0
+    if state in ("expired", "timeout"):
+        b.dim("Re-run:  agent login")
+    elif state == "start-failed":
+        b.dim("Web sign-in unreachable — host-local fallback:  agent login --local")
     return 1
 
 
@@ -1088,9 +1109,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("serve", parents=[common], help="start the host bridge (blocking)").set_defaults(func=cmd_serve)
     lg = sub.add_parser("login", parents=[common],
-                        help="connect your account (local page, or --remote device flow)")
+                        help="sign in your account on the SR web app (or --local for the host page)")
     lg.add_argument("--remote", action="store_true",
-                    help="remote sign-in via the SR web app (approve on your phone)")
+                    help="(default) sign in via the SR web app — approve on phone or this PC")
+    lg.add_argument("--local", action="store_true",
+                    help="sign in on the host's local bridge page instead of the SR web app")
     lg.add_argument("--runtime", help="runtime hint shown on the approval page (hermes/openclaw)")
     lg.add_argument("--label", help="agent label shown on the approval page")
     lg.set_defaults(func=cmd_login)

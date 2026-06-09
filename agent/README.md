@@ -1,7 +1,7 @@
 # Super Agent — drive Super Research from chat (Hermes / OpenClaw)
 
 Lets a chat runtime (Hermes / OpenClaw) drive **Super Research** as a *headless
-session of your account*. You sign in once with Google (`/sr-login`); the bridge
+session of your account*. You sign in once with Google (`/sr login`); the bridge
 then enqueues research runs on your account's existing devices, and every run
 shows up in the web app like a normal chat.
 
@@ -77,7 +77,7 @@ with slash commands:
 cd research-automate
 python research.py agent connect    # branded 4-step flow; detects Windows + WSL runtimes
 # step 4 offers to run the bridge in the background now + on every login
-# then in chat:  /sr-login → approve on your phone → /sr-research <topic>
+# then in chat:  /reload-skills (once) → /sr login → approve on phone → /sr research <topic>
 ```
 
 `agent connect` is an interactive, branded flow — **Detect → Choose → Install →
@@ -85,11 +85,17 @@ Go live** — that finds your chat runtime on **Windows** (`~/.hermes`,
 `~/.openclaw`) *and* inside **WSL** (`\\wsl.localhost\<distro>\home\<user>\…`),
 lets you pick when more than one is found, copies a small dependency-free skill
 (a `SKILL.md` + a `scripts/sr.py` client that calls the bridge over loopback)
-into the runtime's skills dir, and offers to pin the always-up bridge. The skill
-exposes `/sr-login` `/sr-logout` `/sr-device` `/sr-research` `/sr-status`
-`/sr-podcast` `/sr-skip` `/sr-cancel` `/superresearch` (welcome / help) —
-research-only; it can never control devices. (The commands are `sr-` prefixed so
-they don't collide with the runtime's own `/login`, `/status`, `/help`, …)
+into the runtime's skills dir, and offers to pin the always-up bridge.
+
+The runtime registers a skill as a single slash command (`/<skill-name>`), so the
+skill is **`/sr`** and the action follows it: `/sr login`, `/sr research <topic>`,
+`/sr status [id]`, `/sr device [use <id>]`, `/sr podcast [id]`, `/sr skip <id>
+<phases>`, `/sr cancel <id>`, `/sr logout`; a bare **`/sr`** is the welcome / help.
+Natural phrasing works too ("research Tesla 2025", "send me the podcast"). It's
+research-only — it can never control devices.
+
+> **After connecting, run `/reload-skills` once in your chat** (the gateway caches
+> its skill scan) so `/sr` registers without restarting the runtime.
 
 **Reachability — one rule, every platform.** The bridge co-locates with the
 Super Research backend (wherever you run `research.py`) and binds **loopback
@@ -128,7 +134,7 @@ the runtime **and** signs out (the CLI twin of the app's **Revoke**). Use
 
 ```sh
 agent serve            # start the loopback bridge (127.0.0.1:9876)
-agent login            # opens http://localhost:9876/login → sign in with Google
+agent login            # sign in on the SR web app (superresearch.io); --local = host page
 agent status           # → "Signed in as you@…"
 agent doctor           # health + token-refresh + connectivity checks
 agent verify           # reads your researches + lists reachable devices
@@ -152,8 +158,10 @@ agent login --remote --runtime hermes
 #  ✓ Connected as you@…
 ```
 
-The plain `agent login` (local Google page at `http://localhost:9876/login`)
-stays as a host-local fallback for dev / no-phone.
+**`agent login` now defaults to the web app** (`superresearch.io` — the same page as
+`/sr login` from chat + the connect Step 4 "Sign in"), so sign-in is one consistent
+flow everywhere. The local Google page (`http://localhost:9876/login`) is the
+`agent login --local` host-local fallback for dev / no-network.
 
 **Logging.** `agent serve` writes a durable, rotating operational log to
 `~/.super-agent/bridge.log` (request + run-lifecycle lines; never a token).
@@ -168,7 +176,7 @@ agent device                 # list (→ marks the selected one; (owned)/(shared
 agent device use <deviceId>  # switch the target device
 ```
 
-`agent research`/`/sr-research` resolves the device as: an explicit id → your
+`agent research`/`/sr research` resolves the device as: an explicit id → your
 selection → the sole reachable device → an error asking you to pick one.
 
 **Run, track, cancel.**

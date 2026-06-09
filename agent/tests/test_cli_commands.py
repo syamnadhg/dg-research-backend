@@ -449,7 +449,7 @@ def test_startup_step_pin_failure(monkeypatch):
     assert cli._startup_step() is False
 
 
-# _signin_step — bridge-down, decline, opens browser.
+# _signin_step — bridge-down, decline, web-app sign-in (delegates to _remote_signin).
 
 def test_signin_step_bridge_down(monkeypatch):
     monkeypatch.setattr(cli, "_bridge_up", lambda: False)
@@ -460,17 +460,27 @@ def test_signin_step_bridge_down(monkeypatch):
 def test_signin_step_decline(monkeypatch):
     monkeypatch.setattr(cli, "_bridge_up", lambda: True)
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "_remote_signin", lambda **k: "connected")  # must NOT be reached
     assert cli._signin_step() is False
 
 
-def test_signin_step_opens_browser(monkeypatch):
+def test_signin_step_connected_via_web_app(monkeypatch):
+    # Step 4 now uses the SR web app (superresearch.io) flow, not the local page.
     monkeypatch.setattr(cli, "_bridge_up", lambda: True)
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
-    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
-    opened = []
-    monkeypatch.setattr(cli.webbrowser, "open", lambda u: opened.append(u))
+    called = []
+    monkeypatch.setattr(cli, "_remote_signin", lambda **k: called.append(k) or "connected")
     assert cli._signin_step() is True
-    assert opened and "/login" in opened[0]
+    assert called and called[0].get("open_browser") is True
+
+
+def test_signin_step_not_connected_returns_false(monkeypatch):
+    # If the web sign-in doesn't complete (timeout/cancel/start-failed) → False
+    # (so the closing card honestly shows 'login', not 'logout').
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_remote_signin", lambda **k: "timeout")
+    assert cli._signin_step() is False
 
 
 # _connect_next — terminal vs chat split, varied by login + startup state.

@@ -31,9 +31,15 @@ def test_login_remote_flags_parse():
     assert ns.remote is True and ns.runtime == "hermes" and ns.label == "Scout"
 
 
-def test_login_defaults_local():
+def test_login_local_flag_parses():
+    ns = cli.build_parser().parse_args(["login", "--local"])
+    assert ns.local is True
+
+
+def test_login_defaults_to_web_app():
+    # Bare `login` → no --local → cmd_login routes to the SR web app (the default).
     ns = cli.build_parser().parse_args(["login"])
-    assert ns.remote is False
+    assert ns.local is False
 
 
 def test_disconnect_parses_optional_runtime():
