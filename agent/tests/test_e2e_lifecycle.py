@@ -2,8 +2,8 @@
 
 Drives sr.py (loaded as a runtime would) against a LIVE bridge whose remote-login
 broker is a mock FE and whose Firestore is faked — exercising the whole arc a user
-goes through in chat: not-signed-in → /sr-login → approve → /sr-device → /sr-research →
-/sr-status → /updates → /sr-skip → /sr-cancel → /sr-logout. The single live enqueue against a
+goes through in chat: not-signed-in → /sr login → approve → /sr device → /sr research →
+/sr status → updates → /sr skip → /sr cancel → /sr logout. The single live enqueue against a
 real device is the human checkpoint (operator signs in); this proves the wiring.
 """
 

@@ -122,12 +122,13 @@ def line(msg: str = "") -> None:
 
 
 def brand_mark(icon: str, color_rgb: tuple[int, int, int], label: str, suffix: str = "") -> str:
-    """A runtime brand chip: brand-tinted glyph + brand-tinted glowing name (+ dim
-    suffix). The tint lands on vector glyphs (⚚ → gold); emoji (🦞) ignore ANSI
-    foreground and keep their own native color — which is the intent.
+    """A runtime brand chip: a full-glow brand-tinted glyph + a brand-tinted
+    OUTLINE name (the symbol glows, the text doesn't). The tint lands on vector
+    glyphs (⚚ → gold); emoji (🦞) ignore ANSI foreground and keep their own native
+    color — which is the intent.
     e.g.  ⚚  Hermes   · WSL · Ubuntu-24.04"""
-    glyph = c(rgb(*color_rgb), icon)
-    name = c(rgb(*color_rgb) + _BOLD, label)
+    glyph = c(rgb(*color_rgb) + _BOLD, icon)   # symbol: full-on glow (bold + brand color)
+    name = c(rgb(*color_rgb), label)            # name: brand-colored OUTLINE only (not bold)
     tail = f"   {c(_DIM, suffix)}" if suffix else ""
     return f"{glyph}  {name}{tail}"
 

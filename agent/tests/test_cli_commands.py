@@ -484,8 +484,9 @@ def test_connect_next_logged_in_and_pinned(monkeypatch):
     assert not any(c.endswith("agent login") for c in term)
     assert not any("serve" in c or "resurrect" in c for c in term)  # already pinned
     assert any(c.endswith("--help") for c in term)            # help always
-    assert "/superresearch" in chat
-    assert "/sr-login" not in chat                            # already signed in
+    assert "/reload-skills" in chat                           # register the skill
+    assert "/sr" in chat                                       # single-command entry
+    assert "/sr login" not in chat                            # already signed in
 
 
 def test_connect_next_fresh_and_unpinned(monkeypatch):
@@ -496,7 +497,7 @@ def test_connect_next_fresh_and_unpinned(monkeypatch):
     assert not any(c.endswith("agent logout") for c in term)
     assert any("serve" in c for c in term) and any("resurrect" in c for c in term)
     assert any(c.endswith("--help") for c in term)            # help always
-    assert "/sr-login" in chat and "/superresearch" in chat
+    assert "/reload-skills" in chat and "/sr login" in chat and "/sr" in chat
 
 
 # Cross-platform reachability: a co-located (local) runtime on a non-Windows host

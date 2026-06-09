@@ -176,14 +176,15 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
     # ── [4/4] Sign in ─────────────────────────────────────────────────────────
     b.step(4, 4, "Sign in")
-    _signin_step()
-    # Reflect the ACTUAL session state in the closing card — a freshly-opened
-    # browser sign-in isn't complete yet, so only show 'logout' once /status
-    # actually reports authed (e.g. a reconnect while already signed in).
-    logged_in = _bridge_authed()
+    # Show 'logout' (switch account) in the closing card when sign-in was STARTED
+    # here OR the bridge is already authed — never the redundant 'login' the user
+    # just chose to do. (A browser sign-in completes async; choosing it counts.)
+    started = _signin_step()
+    logged_in = started or _bridge_authed()
 
     print()
-    b.line(b.c(branding._BOLD + branding._ACCENT, "Connected."))
+    b.line(b.c(branding._BOLD + branding._ACCENT, "Connected.")
+           + b.c(branding._DIM, "  One more step in chat: run  /reload-skills  so  /sr  registers."))
     b.next_grouped(_connect_next(logged_in=logged_in, startup_pinned=startup_pinned))
     return 0
 
@@ -292,10 +293,12 @@ def _connect_next(*, logged_in: bool, startup_pinned: bool) -> list[tuple[str, l
     terminal.append((p + "disconnect", "remove the skill + sign out"))
     terminal.append((p + "--help", "all agent commands"))
 
-    chat: list[tuple[str, str]] = []
+    chat: list[tuple[str, str]] = [
+        ("/reload-skills", "run ONCE in chat so the new /sr command registers"),
+    ]
     if not logged_in:
-        chat.append(("/sr-login", "sign in (approve on your phone)"))
-    chat.append(("/superresearch", "welcome + help in chat"))
+        chat.append(("/sr login", "sign in (approve on your phone)"))
+    chat.append(("/sr", "welcome + everything you can do"))
     return [("in this terminal", terminal), ("in your chat (Hermes / OpenClaw)", chat)]
 
 

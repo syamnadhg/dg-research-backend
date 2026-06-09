@@ -43,10 +43,10 @@ def test_channels_empty_is_noop():
 def test_next_grouped_prints_labels_and_commands():
     out = _out(b.next_grouped, [
         ("in this terminal", [("python research.py agent status", "check")]),
-        ("in your chat", [("/superresearch", "help")]),
+        ("in your chat", [("/sr", "help")]),
     ])
     assert "in this terminal" in out and "in your chat" in out
-    assert "agent status" in out and "/superresearch" in out
+    assert "agent status" in out and "/sr" in out
 
 
 def test_next_grouped_drops_empty_groups():
