@@ -381,12 +381,13 @@ def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
     return True
 
 
-def _uninstall_skill_on_revoke() -> None:
-    """App Revoke = sign out + UNINSTALL the skill from the runtime, so the agent
-    is fully torn down (re-adding is then a deliberate `agent connect`). Only the
-    explicit app revoke does this — a clean /logout or a token-level RevokedError
-    keeps the skill installed. Best-effort + bounded to the recorded runtime's
-    own skill dir; a failure must never break the self-logout."""
+def _teardown_on_revoke() -> None:
+    """App Revoke = the cloud twin of `agent disconnect`: UNINSTALL the skill from
+    the runtime AND forget the recorded runtime, so the agent is fully torn down and
+    a bare `agent` re-onboards via connect (re-adding is then a deliberate
+    `agent connect`). Only the explicit app revoke does this — a clean /logout or a
+    token-level RevokedError keeps the skill + runtime. Best-effort + bounded to the
+    recorded runtime's own skill dir; a failure must never break the self-logout."""
     rt = prefs.get_runtime()
     if not rt:
         return
@@ -400,6 +401,10 @@ def _uninstall_skill_on_revoke() -> None:
             log.info("revoke: uninstalled the %s skill bundle", rt)
     except Exception as e:
         log.warning("revoke: skill uninstall failed (non-fatal): %s", type(e).__name__)
+    # Forget the runtime too (matches `agent disconnect`): clears the smart-entry
+    # signal so a post-revoke bare `agent` drops into connect, not a stale status
+    # that still claims "Runtime: hermes" with no skill behind it.
+    prefs.clear_runtime()
 
 
 def _arm_agent_session_on_start(state: BridgeState) -> None:
@@ -423,7 +428,7 @@ def _arm_agent_session_on_start(state: BridgeState) -> None:
     if isinstance(doc, dict) and doc.get("revoked") is True:
         log.info("startup: agent was revoked while the bridge was down — honoring revoke + uninstall")
         if _self_logout(state, sess):
-            _uninstall_skill_on_revoke()
+            _teardown_on_revoke()
         return
     _write_agent_session_connected(sess, clear_revoked=False)
 
@@ -454,7 +459,7 @@ def _heartbeat_once(state: BridgeState) -> None:
     if isinstance(doc, dict) and doc.get("revoked") is True:
         log.info("agent session %s revoked from the app — self-logout + uninstall", sid)
         if _self_logout(state, sess):
-            _uninstall_skill_on_revoke()
+            _teardown_on_revoke()
         return
     # A concurrent /logout or reconnect may have swapped the session out from
     # under us between the GET and here — don't write (would resurrect a just-

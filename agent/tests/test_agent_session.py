@@ -23,6 +23,7 @@ class RecFS:
     deletes: list = []
     uninstalls: list = []  # runtimes connect.uninstall was called with (revoke path)
     uninstall_homes: list = []  # the home= kwarg forwarded each time (WSL UNC vs None)
+    runtime_cleared = False  # whether prefs.clear_runtime() fired (app-revoke teardown)
     get_raises = None  # set to an Exception instance to raise on get
     upsert_raises = None
 
@@ -53,12 +54,17 @@ def wired(monkeypatch):
     RecFS.deletes = []
     RecFS.uninstalls = []
     RecFS.uninstall_homes = []
+    RecFS.runtime_cleared = False
     RecFS.get_raises = None
     RecFS.upsert_raises = None
     monkeypatch.setattr(bridge, "FirestoreRest", RecFS)
     monkeypatch.setattr(bridge.prefs, "get_or_create_install_id", lambda: "iid-1")
     monkeypatch.setattr(bridge.prefs, "get_label", lambda: "Super Agent")
     monkeypatch.setattr(bridge.prefs, "get_runtime", lambda: "hermes")
+    # Record (don't perform) the runtime-forget so revoke tests can assert it fires
+    # on app-revoke and NOT on a clean logout / token-level revoke.
+    monkeypatch.setattr(bridge.prefs, "clear_runtime",
+                        lambda: setattr(RecFS, "runtime_cleared", True))
     # Record (don't perform) the skill uninstall so tests never touch a real
     # runtime dir; assert WHEN it fires (app revoke) vs not (logout / token revoke)
     # AND the home= kwarg forwarded (so a WSL install under a UNC home is removed).
@@ -151,6 +157,7 @@ def test_heartbeat_revoked_self_logs_out_and_leaves_row(wired):
     assert wired["v"] is True  # device selection cleared
     assert RecFS.deletes == []  # revoke LEAVES the row (only a clean /logout deletes)
     assert RecFS.uninstalls == ["hermes"]  # app revoke ALSO uninstalls the skill
+    assert RecFS.runtime_cleared is True  # …and forgets the runtime → bare `agent` re-onboards
 
 
 def test_revoke_uninstall_forwards_recorded_wsl_home(wired, monkeypatch):
@@ -200,8 +207,9 @@ def test_heartbeat_token_revoked_self_logs_out(wired):
     bridge._heartbeat_once(st)
     assert st.session is None  # the account token itself was rejected → self-logout
     # A token-level revoke (e.g. "sign out everywhere") is NOT an app agent-revoke
-    # — keep the skill installed; the user may just re-login.
+    # — keep the skill installed + the runtime recorded; the user may just re-login.
     assert RecFS.uninstalls == []
+    assert RecFS.runtime_cleared is False
 
 
 def test_heartbeat_revoke_with_reconnect_swap_does_not_uninstall(wired, monkeypatch):
@@ -222,6 +230,7 @@ def test_heartbeat_revoke_with_reconnect_swap_does_not_uninstall(wired, monkeypa
     bridge._heartbeat_once(st)
     assert st.session is sess_b  # B survived the CAS
     assert RecFS.uninstalls == []  # CAS skipped → no uninstall
+    assert RecFS.runtime_cleared is False  # …and the live reconnect's runtime is kept
 
 
 def test_heartbeat_skips_when_signed_out(wired):
@@ -243,6 +252,7 @@ def test_startup_honors_pending_revoke(wired):
     # crucially, it never wrote a revoked:False (no un-revoke)
     assert all(u["fields"].get("revoked") is not False for u in RecFS.upserts)
     assert RecFS.uninstalls == ["hermes"]  # a revoke honored on restart also uninstalls
+    assert RecFS.runtime_cleared is True  # …and forgets the runtime (full teardown)
 
 
 def test_startup_rearms_when_not_revoked(wired):
