@@ -316,13 +316,21 @@ class FirestoreRest:
         body = {"fields": {"pipelineConfig": {"mapValue": {"fields": inner}}}}
         self._request("PATCH", url, json_body=body)
 
-    def enqueue_cancel(self, device_id: str, *, uid: str, research_id: str) -> str:
+    def enqueue_cancel(self, device_id: str, *, uid: str, research_id: str,
+                       owner_control: str = "") -> str:
         """Write an ``action:"cancel"`` doc to devices/{deviceId}/queue.
 
         Mirrors the web app's cancelQueuedPipeline (firestore.ts): the device's
         start listener matches by researchId and either drops the still-queued
         job or routes a running match to request_stop — so one cancel covers
         both states. Member-permitted (submittedBy == uid). Returns the doc id.
+
+        ``owner_control`` ("stop" | "cancel" | "") rides on the doc as
+        ``ownerControl``. "stop" routes the BE queue listener to a PRESERVE flip
+        (status:"stopped", NO ``cancelled`` → the chat + partial results survive),
+        exactly like the web app's owner-stop of a sharer's run — this is how the
+        graceful chat stop handles a still-QUEUED run. "" keeps the legacy
+        destructive self-cancel (``cancelled:true`` → the FE cascade-deletes).
         """
         now_ms = int(time.time() * 1000)
         payload: dict[str, Any] = {
@@ -333,9 +341,39 @@ class FirestoreRest:
             "timestamp": now_ms,
             "viaAgent": True,
         }
+        if owner_control:
+            payload["ownerControl"] = owner_control
         fields = {k: to_value(v) for k, v in payload.items()}
         fields["submittedAt"] = {"timestampValue": _now_iso()}
         url = f"{config.FIRESTORE_BASE}/devices/{device_id}/queue"
+        body = self._request("POST", url, json_body={"fields": fields})
+        return doc_id(body.get("name", ""))
+
+    def write_command(self, uid: str, research_id: str, action: str, *,
+                      device_id: str, extra: dict[str, Any] | None = None) -> str:
+        """Write a per-run command to users/{uid}/researches/{rid}/commands — the
+        SAME contract the web app's writeCommand uses (firestore.ts). The BE's
+        per-run command listener (research.py _start_command_listener) consumes it.
+
+        ``device_id`` is LOAD-BEARING: the BE listener runs as the device user and
+        the security rule requires the doc's ``deviceId`` to match its device
+        token — a command without it is silently permission-denied and never
+        executes. ``timestamp`` is a wall-clock ms value (NOT a serverTimestamp)
+        so the listener's 30s stale-on-first-snapshot gate compares correctly.
+        Used for the graceful chat stop (action:"stop") + retry/skip from chat.
+        Fields mirror the FE writeCommand exactly so the create rule accepts it.
+        """
+        now_ms = int(time.time() * 1000)
+        payload: dict[str, Any] = {
+            "action": action,
+            "deviceId": device_id,
+            "processed": False,
+            "timestamp": now_ms,
+        }
+        if extra:
+            payload.update(extra)
+        fields = {k: to_value(v) for k, v in payload.items()}
+        url = f"{config.FIRESTORE_BASE}/users/{uid}/researches/{research_id}/commands"
         body = self._request("POST", url, json_body={"fields": fields})
         return doc_id(body.get("name", ""))
 

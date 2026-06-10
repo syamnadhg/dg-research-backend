@@ -9,19 +9,23 @@ It only ever talks to the loopback bridge (127.0.0.1:<port>) that `agent serve`
 runs; it never touches Firestore, tokens, or the network directly. Every
 account action is the bridge's responsibility (single-owner session).
 
-Commands (mirror the chat slash commands):
-  login            start a remote sign-in → prints a code + link to relay
-  login-wait       poll until the sign-in is approved / expires
-  status-account   is the bridge up + signed in?
-  devices          list reachable devices
-  device-use <id>  choose the device runs go to
-  research <topic> start a run (--device <id> to override the selected device)
-  status [id]      a run's progress + links (no id = most recent)
-  podcast [id]     download a run's audio → a local file to send as native audio
-  updates          active runs + their current links (for the streaming cron)
-  cancel <id>      stop a run
-  logout           clear the account session
-  help             this list
+Commands (mirror the chat slash actions). A run is named by its TITLE (a word
+or two from the topic) or run-id; omit it to mean the most recent / active run:
+  login              start a remote sign-in → prints a code + link to relay
+  login-wait         poll until the sign-in is approved / expires
+  status-account     is the bridge up + signed in?
+  devices            list reachable devices
+  device-use <id>    choose the device runs go to
+  research <topic>   start a run (--device <id> to override the selected device)
+  status [run]       a run's progress + links + any blocker (no run = most recent)
+  podcast [run]      download a run's audio → a local file to send as native audio
+  updates            active runs + their links + any that need you (streaming cron)
+  stop [run]         gracefully stop a run, keeping the results so far + the chat
+  retry [run]        resume a run that's waiting on a decision / hit an error
+  skip [phases…]     skip the run's current blocker (no phases) or named phases
+                       (--run <run> to target one; else the latest active run)
+  logout             clear the account session
+  help               this list
 
 Add --json to print the raw bridge response (the streaming cron uses
 `sr.py --json updates`).
@@ -108,6 +112,67 @@ def _fmt_links(events: list) -> list[str]:
     return out
 
 
+# ── run resolution (titles, not ids) ─────────────────────────────────────────
+
+def _fetch_runs(active: bool = False, limit: int = 20) -> tuple[int, dict, list]:
+    """GET /updates → (http_code, body, runs). Runs are newest-first."""
+    code, body = _get("/updates?active=1" if active else f"/updates?limit={limit}")
+    runs = body.get("runs", []) if isinstance(body, dict) else []
+    return code, body, runs
+
+
+def _pick_run(runs: list, arg: str | None, *, prefer_active: bool = False) -> dict | None:
+    """Resolve an optional run arg to a run row. None → newest (active-first when
+    prefer_active); else the newest case-insensitive match on runId / title /
+    topic (runs are newest-first, so the first match is the most recent)."""
+    if not runs:
+        return None
+    if arg:
+        a = arg.strip().lower()
+        for r in runs:  # exact id wins
+            if a == (r.get("runId") or "").lower():
+                return r
+        for r in runs:  # else newest title/topic match
+            if a in (r.get("title") or "").lower() or a in (r.get("topic") or "").lower():
+                return r
+        return None
+    if prefer_active:
+        for r in runs:
+            if r.get("status") in ("queued", "ongoing"):
+                return r
+    return runs[0]
+
+
+def _device_names() -> dict:
+    """{deviceId: friendly name} from /devices (name → hostname → id). Empty on failure."""
+    code, body = _get("/devices")
+    if code != 200 or not isinstance(body, dict):
+        return {}
+    return {d.get("id"): (d.get("name") or d.get("hostname") or d.get("id"))
+            for d in body.get("devices", [])}
+
+
+def _attention_lines(r: dict) -> list[str]:
+    """Chat lines for a run that needs the user (C1). `r` is a run row (/updates)
+    or a full research doc (/research/{id}); both may carry pendingDecision /
+    attention / needsAttention."""
+    pd = r.get("pendingDecision")
+    text = r.get("attention")
+    if not text and isinstance(pd, dict) and pd:
+        text = pd.get("title") or pd.get("message") or pd.get("reason")
+    if not text and not r.get("needsAttention"):
+        return []
+    lines = [f"  ⚠ Needs you: {text or 'a decision is needed'}"]
+    kind = pd.get("kind") if isinstance(pd, dict) else None
+    if kind == "login_required":
+        lines.append("  → sign in on the device, then say: retry")
+    elif kind == "human_verification_required":
+        lines.append("  → finish the check on the device, then say: retry")
+    else:
+        lines.append("  → say “retry” to resume or “skip” to move past it (or open the app)")
+    return lines
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_login(args) -> int:
@@ -185,86 +250,138 @@ def cmd_research(args) -> int:
     code, body = _post("/research", payload)
     if code != 200:
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
+    dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
+    where = f" on {dev}" if dev else ""
     return _emit(body, args.json, [
-        f"🚀 Started “{args.topic}” — run {body.get('runId')} on device {body.get('deviceId')}.",
-        f"Track it:  status {body.get('runId')}",
+        f"🚀 Started “{args.topic}”{where}.",
+        "Say “status” anytime to check progress.",
     ])
 
 
 def cmd_status(args) -> int:
-    rid = args.runId
-    if not rid:
-        code, body = _get("/updates?limit=20")
-        if code != 200:
-            return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
-        runs = body.get("runs", [])
-        if not runs:
-            return _emit(body, args.json, ["No runs yet."])
-        active = [r for r in runs if r.get("status") in ("queued", "ongoing")]
-        rid = (active[0] if active else runs[0]).get("runId")
-    code, body = _get(f"/research/{urllib.parse.quote(rid, safe='')}")
+    code, body, runs = _fetch_runs()
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
-    r = body.get("research", {})
-    lines = [f"“{r.get('title') or r.get('topic') or rid}” — {r.get('status', '?')} (phase {r.get('phase', '?')})"]
-    lines += _fmt_links(body.get("events", []))
-    return _emit(body, args.json, lines)
+    run = _pick_run(runs, args.runId, prefer_active=True)
+    if run is None:
+        which = f"matching “{args.runId}”" if args.runId else "yet"
+        return _emit(body, args.json, [f"No runs {which}."])
+    rid = run.get("runId")
+    code, b2 = _get(f"/research/{urllib.parse.quote(rid, safe='')}")
+    if code != 200:
+        return _emit(b2, args.json, [f"✗ {b2.get('error', code)}"], _fail_code(code))
+    r = b2.get("research", {})
+    title = r.get("title") or r.get("topic") or rid
+    dev = _device_names().get(r.get("deviceId") or "", "")
+    where = f"  ·  {dev}" if dev else ""
+    lines = [f"“{title}” — {r.get('status', '?')} (phase {r.get('phase', '?')}){where}"]
+    lines += _attention_lines(r)
+    lines += _fmt_links(b2.get("events", []))
+    return _emit(b2, args.json, lines)
 
 
 def cmd_podcast(args) -> int:
-    rid = args.runId
-    if not rid:
-        code, body = _get("/updates?limit=20")
-        if code != 200:
-            return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
-        runs = body.get("runs", [])
-        if not runs:
-            return _emit(body, args.json, ["No runs yet."])
+    code, body, runs = _fetch_runs()
+    if code != 200:
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    if args.runId:
+        run = _pick_run(runs, args.runId)
+    else:
         # The podcast audio is a late-phase artifact — prefer the newest run that
         # already HAS audio over the newest active run (which usually has none yet).
         with_audio = [r for r in runs
                       if any(lk.get("kind") == "audio_file" for lk in r.get("links", []))]
-        rid = (with_audio[0] if with_audio else runs[0]).get("runId")
+        run = with_audio[0] if with_audio else (runs[0] if runs else None)
+    if run is None:
+        which = f"matching “{args.runId}”" if args.runId else "yet"
+        return _emit(body, args.json, [f"No runs {which}."])
+    rid = run.get("runId")
     # The bridge downloads the audio to a local file (a long audio overview can
     # take a few seconds) → allow more time than the default request timeout.
-    code, body = _get(f"/research/{urllib.parse.quote(rid, safe='')}/podcast", timeout=180)
+    code, b2 = _get(f"/research/{urllib.parse.quote(rid, safe='')}/podcast", timeout=180)
     if code != 200:
-        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
-    title = body.get("title") or "Podcast"
-    name = body.get("filename") or f"{title}.m4a"
-    return _emit(body, args.json, [
+        return _emit(b2, args.json, [f"✗ {b2.get('error', code)}"], _fail_code(code))
+    title = b2.get("title") or "Podcast"
+    name = b2.get("filename") or f"{title}.m4a"
+    return _emit(b2, args.json, [
         f"🎧 Podcast ready: “{title}”",
         f"Send this file as a native audio / voice message named “{name}” "
         "(attach the file — don’t paste the path):",
-        f"  {body.get('localPath')}",
+        f"  {b2.get('localPath')}",
     ])
 
 
 def cmd_updates(args) -> int:
-    path = "/updates?active=1" if args.active else "/updates"
-    code, body = _get(path)
+    code, body, runs = _fetch_runs(active=args.active)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
-    runs = body.get("runs", [])
     lines = []
     for r in runs:
         lines.append(f"“{r.get('title') or r.get('topic')}” — {r.get('status')} (phase {r.get('phase')})")
+        lines += _attention_lines(r)
         lines += _fmt_links(r.get("links", []))
     return _emit(body, args.json, lines or ["No active runs."])
 
 
-def cmd_cancel(args) -> int:
-    rid = urllib.parse.quote(args.runId, safe="")
-    code, body = _post(f"/research/{rid}/cancel")
+def cmd_stop(args) -> int:
+    """Graceful stop (the chat /sr stop) — keeps the results so far + the chat."""
+    code, body, runs = _fetch_runs()
     if code != 200:
-        return _emit(body, args.json, [f"✗ cancel failed: {body.get('error', code)}"], _fail_code(code))
-    return _emit(body, args.json, [f"✓ Cancel requested for {args.runId}."])
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    run = _pick_run(runs, args.runId, prefer_active=True)
+    if run is None:
+        which = f"matching “{args.runId}”" if args.runId else "to stop"
+        return _emit(body, args.json, [f"No run {which}."], 1)
+    rid = run.get("runId")
+    title = run.get("title") or run.get("topic") or rid
+    code, b2 = _post(f"/research/{urllib.parse.quote(rid, safe='')}/stop")
+    if code != 200:
+        return _emit(b2, args.json, [f"✗ stop failed: {b2.get('error', code)}"], _fail_code(code))
+    if b2.get("alreadyDone"):
+        return _emit(b2, args.json, [f"“{title}” already finished ({b2.get('status')}) — nothing to stop."])
+    return _emit(b2, args.json, [f"✓ Stopping “{title}” — the results so far are kept."])
+
+
+def cmd_retry(args) -> int:
+    """Resume a run that's waiting on a decision / hit an error (C1)."""
+    code, body, runs = _fetch_runs()
+    if code != 200:
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    run = _pick_run(runs, args.runId, prefer_active=True)
+    if run is None:
+        which = f"matching “{args.runId}”" if args.runId else "to retry"
+        return _emit(body, args.json, [f"No run {which}."], 1)
+    rid = run.get("runId")
+    title = run.get("title") or run.get("topic") or rid
+    code, b2 = _post(f"/research/{urllib.parse.quote(rid, safe='')}/resolve", {"intent": "retry"})
+    if code != 200:
+        return _emit(b2, args.json, [f"✗ couldn’t retry “{title}”: {b2.get('error', code)}"], _fail_code(code))
+    return _emit(b2, args.json, [f"↻ Retrying “{title}” — resuming the run."])
 
 
 _SKIP_NAMES = {"brief": 1, "podcast": 3, "audio": 3, "video": 4, "youtube": 4, "report": 5, "email": 5}
 
 
 def cmd_skip(args) -> int:
+    code, body, runs = _fetch_runs()
+    if code != 200:
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    run = _pick_run(runs, args.run or None, prefer_active=True)
+    if run is None:
+        which = f"matching “{args.run}”" if args.run else "to skip in"
+        return _emit(body, args.json, [f"No run {which}."], 1)
+    rid = run.get("runId")
+    title = run.get("title") or run.get("topic") or rid
+    q = urllib.parse.quote(rid, safe="")
+    if not args.phases:
+        # No phases → skip whatever the run is BLOCKED on (resolve the decision).
+        code, b2 = _post(f"/research/{q}/resolve", {"intent": "skip"})
+        if code != 200:
+            return _emit(b2, args.json,
+                         [f"✗ couldn’t skip the blocker on “{title}”: {b2.get('error', code)}"],
+                         _fail_code(code))
+        return _emit(b2, args.json, [f"⏭ Skipping the current blocker on “{title}”."])
+    # Phases given → tune the run's config (skip whole phases when reached).
     phases = []
     for p in args.phases:
         if p.isdigit():
@@ -273,11 +390,10 @@ def cmd_skip(args) -> int:
             phases.append(_SKIP_NAMES[p.lower()])
         else:
             return _emit({}, args.json, [f"✗ unknown phase '{p}' (1/3/4/5 or brief/podcast/video/report)"], 1)
-    rid = urllib.parse.quote(args.runId, safe="")
-    code, body = _post(f"/research/{rid}/skip", {"phases": phases})
+    code, b2 = _post(f"/research/{q}/skip", {"phases": phases})
     if code != 200:
-        return _emit(body, args.json, [f"✗ skip failed: {body.get('error', code)}"], _fail_code(code))
-    return _emit(body, args.json, [f"✓ Will skip phase(s) {body.get('skipped')} when reached."])
+        return _emit(b2, args.json, [f"✗ skip failed: {b2.get('error', code)}"], _fail_code(code))
+    return _emit(b2, args.json, [f"✓ Will skip phase(s) {b2.get('skipped')} of “{title}” when reached."])
 
 
 def cmd_logout(args) -> int:
@@ -324,13 +440,22 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--active", action="store_true")
     up.set_defaults(func=cmd_updates)
 
-    cn = sub.add_parser("cancel", help="cancel a run")
-    cn.add_argument("runId")
-    cn.set_defaults(func=cmd_cancel)
+    # Graceful stop (keeps results + chat). `cancel` is an alias for the same
+    # graceful behavior so an old habit never triggers a destructive delete.
+    for _name, _help in (("stop", "gracefully stop a run (no run = most recent active)"),
+                         ("cancel", "alias for stop (graceful — keeps results + chat)")):
+        sp = sub.add_parser(_name, help=_help)
+        sp.add_argument("runId", nargs="?")
+        sp.set_defaults(func=cmd_stop)
 
-    sk = sub.add_parser("skip", help="skip phases of a run")
-    sk.add_argument("runId")
-    sk.add_argument("phases", nargs="+")
+    rt = sub.add_parser("retry", help="resume a run waiting on a decision / error")
+    rt.add_argument("runId", nargs="?")
+    rt.set_defaults(func=cmd_retry)
+
+    # No phases → skip whatever the run is blocked on; phases → trim those phases.
+    sk = sub.add_parser("skip", help="skip a run's current blocker, or named phases")
+    sk.add_argument("phases", nargs="*")
+    sk.add_argument("--run", default="", help="run title or id (default: newest active run)")
     sk.set_defaults(func=cmd_skip)
 
     sub.add_parser("logout", help="clear the account session").set_defaults(func=cmd_logout)

@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 
-from . import __version__, config, connect, devicelogin, prefs, runview
+from . import __version__, config, devicelogin, prefs, runview
 from .devicelogin import DeviceLoginError
 from .firestore_rest import FirestoreError, FirestoreRest
 from .session import AccountSession, CustomTokenError, RevokedError
@@ -359,17 +359,101 @@ def _write_agent_session_connected(sess: AccountSession, *, clear_revoked: bool)
         log.warning("agent session connect-write failed (non-fatal): %s", type(e).__name__)
 
 
+# Run statuses that need the user to open the app and act (mirror the FE's
+# paused / watchdog cards). Surfaced on /updates so a chat poller can tell the
+# user a run is stuck — see _attention_text. A pendingDecision map on the doc
+# (login/verify/snag card) also counts, regardless of status.
+_ATTENTION_STATUSES = (
+    "errored", "stopped_by_watchdog",
+    "paused_backend_restart", "paused_backend_restart_failed",
+)
+
+
+def _attention_text(r: dict) -> str | None:
+    """A short, human reason a run needs the user — or None if it's fine.
+    Prefers the durable pendingDecision (the snag/login/verify card the BE
+    mirrors onto the research doc), else maps a stuck status to plain words."""
+    pd = r.get("pendingDecision")
+    if isinstance(pd, dict) and pd:
+        return (pd.get("title") or pd.get("message") or pd.get("reason")
+                or "a decision is needed")
+    status = r.get("status")
+    if status == "errored":
+        return "the run hit an error"
+    if status in ("paused_backend_restart", "paused_backend_restart_failed"):
+        return "paused after a backend restart"
+    if status == "stopped_by_watchdog":
+        return "stopped by the watchdog"
+    return None
+
+
+# Per-run command "actions" that resume vs skip a blocked run (the FE decision
+# card writes these verbatim) — used to classify a pendingDecision's own actions.
+_RESUME_ACTIONS = frozenset({
+    "retry_phase", "retry_agent", "resume", "retry_init_verify", "continue_anyway",
+})
+_SKIP_ACTIONS = frozenset({
+    "skip_phase", "skip_agent", "skip_init_verify", "continue_partial_agent",
+})
+
+
+def _decision_command(pd: dict | None, intent: str) -> dict | None:
+    """The per-run command that resolves a blocked run for ``intent`` — "retry"
+    resumes, "skip" moves past. Prefers the pendingDecision's OWN actions (the
+    exact commands the FE offers — present on BE-authored pipeline_error cards),
+    and falls back to a kind→command mapping for the FE-synthesized kinds
+    (login_required / human_verification_required / agent_link_failed). Returns
+    None when there's nothing to act on. Every action it emits is handled by
+    research.py's per-run command listener."""
+    if not isinstance(pd, dict) or not pd:
+        return None
+    want_resume = intent == "retry"
+    # 1) Honor the decision's own actions verbatim when present.
+    actions = pd.get("actions")
+    if isinstance(actions, list):
+        for a in actions:
+            cmd = a.get("command") if isinstance(a, dict) else None
+            if not isinstance(cmd, dict):
+                continue
+            act = cmd.get("action")
+            if act == "agent_decision":
+                if cmd.get("decision") == ("retry" if want_resume else "skip"):
+                    return dict(cmd)
+            elif act in (_RESUME_ACTIONS if want_resume else _SKIP_ACTIONS):
+                return dict(cmd)
+    # 2) Fall back to the kind for the FE-synthesized cards (no actions array).
+    kind = pd.get("kind")
+    agent = pd.get("agent")
+    phase = pd.get("phase")
+    if kind == "agent_link_failed" and agent:
+        return {"action": "agent_decision", "agent": agent,
+                "decision": "retry" if want_resume else "skip"}
+    if kind == "human_verification_required":
+        if want_resume:
+            return {"action": "resume"}
+        return {"action": "skip_agent", "agent": agent} if agent else {"action": "skip_init_verify"}
+    if kind == "login_required" and not want_resume:
+        return {"action": "skip_init_verify"}
+    # login_required(retry) / pipeline_error / pro_required / generic.
+    cmd2: dict = {"action": "retry_phase" if want_resume else "skip_phase"}
+    if isinstance(phase, int):
+        cmd2["phase"] = phase
+    return cmd2
+
+
 def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
     """In-memory teardown shared by the /logout route and the revoke-consult.
 
     Compare-and-swap on ``sess``: tears down ONLY if it is still the live session
     (so a heartbeat deciding to self-logout against the OLD session can't undo a
-    reconnect that swapped a NEW one in). Returns True iff it actually tore down —
-    the revoke path gates the skill-uninstall on this so it never uninstalls when
-    a concurrent reconnect won the CAS. Clears the live session + the account-
-    bound device selection. Does NOT touch the agentSessions doc — the route
-    deletes it (clean logout), while the revoke path leaves the ``revoked: true``
-    row in place so the app shows the disconnect and a re-login can clear it.
+    reconnect that swapped a NEW one in). Returns True iff it actually tore down.
+    Clears the live session + the account-bound device selection. Both an app
+    Revoke and a clean logout are pure sign-outs — they KEEP the installed skill
+    + the recorded runtime, so a later `/sr login` / `agent login` reconnects
+    without re-running connect (`agent disconnect` is the only full teardown).
+    Does NOT touch the agentSessions doc — the route deletes it (clean logout),
+    while the revoke path leaves the ``revoked: true`` row in place so the app
+    shows the disconnect and a re-login can clear it.
     """
     if sess is None:
         prefs.clear_selected_device()
@@ -379,32 +463,6 @@ def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
     sess.logout()
     prefs.clear_selected_device()
     return True
-
-
-def _teardown_on_revoke() -> None:
-    """App Revoke = the cloud twin of `agent disconnect`: UNINSTALL the skill from
-    the runtime AND forget the recorded runtime, so the agent is fully torn down and
-    a bare `agent` re-onboards via connect (re-adding is then a deliberate
-    `agent connect`). Only the explicit app revoke does this — a clean /logout or a
-    token-level RevokedError keeps the skill + runtime. Best-effort + bounded to the
-    recorded runtime's own skill dir; a failure must never break the self-logout."""
-    rt = prefs.get_runtime()
-    if not rt:
-        return
-    # Target the home the skill was actually installed under — for a WSL runtime
-    # that's a \\wsl.localhost UNC path, NOT the Windows home. (Older connects
-    # that didn't record a home fall back to the Windows default.)
-    home = prefs.get_runtime_home()
-    kwargs = {"home": Path(home)} if home else {}
-    try:
-        if connect.uninstall(rt, **kwargs):
-            log.info("revoke: uninstalled the %s skill bundle", rt)
-    except Exception as e:
-        log.warning("revoke: skill uninstall failed (non-fatal): %s", type(e).__name__)
-    # Forget the runtime too (matches `agent disconnect`): clears the smart-entry
-    # signal so a post-revoke bare `agent` drops into connect, not a stale status
-    # that still claims "Runtime: hermes" with no skill behind it.
-    prefs.clear_runtime()
 
 
 def _arm_agent_session_on_start(state: BridgeState) -> None:
@@ -426,9 +484,8 @@ def _arm_agent_session_on_start(state: BridgeState) -> None:
         log.warning("startup agent-session check failed (non-fatal): %s", type(e).__name__)
         doc = None
     if isinstance(doc, dict) and doc.get("revoked") is True:
-        log.info("startup: agent was revoked while the bridge was down — honoring revoke + uninstall")
-        if _self_logout(state, sess):
-            _teardown_on_revoke()
+        log.info("startup: agent was revoked while the bridge was down — honoring revoke (skill + runtime kept)")
+        _self_logout(state, sess)
         return
     _write_agent_session_connected(sess, clear_revoked=False)
 
@@ -457,9 +514,8 @@ def _heartbeat_once(state: BridgeState) -> None:
         log.debug("heartbeat read transient failure: %s", type(e).__name__)
         return
     if isinstance(doc, dict) and doc.get("revoked") is True:
-        log.info("agent session %s revoked from the app — self-logout + uninstall", sid)
-        if _self_logout(state, sess):
-            _teardown_on_revoke()
+        log.info("agent session %s revoked from the app — self-logout (skill + runtime kept)", sid)
+        _self_logout(state, sess)
         return
     # A concurrent /logout or reconnect may have swapped the session out from
     # under us between the GET and here — don't write (would resurrect a just-
@@ -650,6 +706,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._device_select()
             elif path == "/research":
                 self._research()
+            elif path.startswith("/research/") and path.endswith("/stop"):
+                self._research_stop(path[len("/research/"):-len("/stop")])
+            elif path.startswith("/research/") and path.endswith("/resolve"):
+                self._research_resolve(path[len("/research/"):-len("/resolve")])
             elif path.startswith("/research/") and path.endswith("/cancel"):
                 self._research_cancel(path[len("/research/"):-len("/cancel")])
             elif path.startswith("/research/") and path.endswith("/skip"):
@@ -1116,7 +1176,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             runs = []
             for r in rows:
                 status = r.get("status")
-                if active_only and status not in ("queued", "ongoing"):
+                attention = _attention_text(r)
+                needs = attention is not None or status in _ATTENTION_STATUSES
+                # active=1 keeps the in-flight runs AND any run that needs the
+                # user — an errored/paused run isn't "ongoing" but is exactly what
+                # a chat poller must surface, so it must not be filtered out.
+                if active_only and status not in ("queued", "ongoing") and not needs:
                     continue
                 runs.append({
                     "runId": r.get("id"),
@@ -1126,6 +1191,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "phase": r.get("phase"),
                     "updatedAt": r.get("updatedAt"),
                     "links": runview.flatten_links(r.get("links")),
+                    "needsAttention": needs,
+                    "attention": attention,
                 })
             self._json(200, {"runs": runs})
 
@@ -1165,6 +1232,115 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return
             log.info("cancel requested for run %s on device %s", rid, device_id)
             self._json(200, {"ok": True, "runId": rid, "queueId": qid, "deviceId": device_id})
+
+        def _research_stop(self, rid: str) -> None:
+            """Gracefully STOP a run (the chat /sr stop) — the loopback twin of the
+            web app's Stop button. A RUNNING run gets a per-run action:"stop"
+            command (stops at the current phase, KEEPS partial results + the chat);
+            a still-QUEUED run gets a device-queue cancel carrying ownerControl:"stop"
+            (the BE flips it to a preserved "stopped" entry, no cascade-delete). It
+            NEVER sets `cancelled` — that flag (the legacy /cancel) is what deletes
+            the chat on close, which is exactly what we avoid here."""
+            rid = rid.strip("/")
+            if not _RID_RE.match(rid):
+                self._json(404, {"error": "run not found"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                doc = fs.get_research(sess.uid, rid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            if doc is None:
+                self._json(404, {"error": "run not found"})
+                return
+            status = (doc.get("status") or "").strip()
+            if runview.is_terminal(status):
+                self._json(200, {"ok": True, "runId": rid, "status": status, "alreadyDone": True})
+                return
+            device_id = (doc.get("deviceId") or "").strip()
+            if not device_id:
+                self._json(409, {"error": "run has no device — nothing to stop"})
+                return
+            try:
+                if status == "queued":
+                    # Not started yet → no per-run command listener is attached.
+                    # Route through the always-on device-queue listener with
+                    # ownerControl:"stop" so the run is PRESERVED (kept in the
+                    # listing, chat intact), not purged like a destructive cancel.
+                    fs.enqueue_cancel(device_id, uid=sess.uid, research_id=rid, owner_control="stop")
+                    mode = "queued"
+                else:
+                    # Running/paused → the per-run command listener is attached;
+                    # a fresh action:"stop" command stops it at the next phase
+                    # boundary and preserves partial results (the FE Stop button).
+                    fs.write_command(sess.uid, rid, "stop", device_id=device_id)
+                    mode = "running"
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            log.info("graceful stop requested for run %s on device %s (%s)", rid, device_id, mode)
+            self._json(200, {"ok": True, "runId": rid, "deviceId": device_id, "status": status, "mode": mode})
+
+        def _research_resolve(self, rid: str) -> None:
+            """Resolve a BLOCKED run from chat (C1): read its pendingDecision and
+            write the matching per-run command for the body's ``intent`` — "retry"
+            resumes (retry_phase / agent_decision:retry / resume), "skip" moves
+            past it (skip_phase / skip_agent / skip_init_verify) — the same writes
+            the FE decision card does. 409 if there's nothing to act on (→ the chat
+            tells the user to open the app)."""
+            rid = rid.strip("/")
+            if not _RID_RE.match(rid):
+                self._json(404, {"error": "run not found"})
+                return
+            intent = str(self._read_json().get("intent") or "retry").strip().lower()
+            if intent not in ("retry", "skip"):
+                self._json(400, {"error": "intent must be 'retry' or 'skip'"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                doc = fs.get_research(sess.uid, rid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            if doc is None:
+                self._json(404, {"error": "run not found"})
+                return
+            cmd = _decision_command(doc.get("pendingDecision"), intent)
+            if cmd is None:
+                self._json(409, {"error": "nothing to resolve — this run isn't waiting on a decision"})
+                return
+            device_id = (doc.get("deviceId") or "").strip()
+            if not device_id:
+                self._json(409, {"error": "run has no device"})
+                return
+            action = cmd.pop("action")
+            try:
+                fs.write_command(sess.uid, rid, action, device_id=device_id, extra=cmd or None)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            log.info("resolve(%s) run %s on device %s (%s)", intent, rid, device_id, action)
+            self._json(200, {"ok": True, "runId": rid, "deviceId": device_id,
+                             "intent": intent, "action": action})
 
         def _research_skip(self, rid: str) -> None:
             """Skip phases of a run (the chat /sr-skip). Writes pipelineConfig so the

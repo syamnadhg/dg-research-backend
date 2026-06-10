@@ -99,7 +99,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # already pinned. (When autostart launches serve windowless this is a no-op:
     # the task exists, so is_installed() is True and the tip is skipped.)
     if not autostart.is_installed():
-        b.dim("Tip: keep it always-up (background + on login)  →  "
+        b.dim("Tip: run the bridge in the background + on every login instead  →  "
               "python research.py agent resurrect")
     bridge.serve()
     return 0
@@ -307,11 +307,11 @@ def _connect_next(*, logged_in: bool, startup_pinned: bool) -> list[tuple[str, l
     else:
         terminal.append((p + "login", "sign in your account (local browser)"))
     if not startup_pinned:
-        terminal.append((p + "serve", "start the bridge in this terminal"))
-        terminal.append((p + "resurrect", "start it + run on startup"))
+        terminal.append((p + "serve", "run the bridge here in this terminal (foreground)"))
+        terminal.append((p + "resurrect", "run the bridge in the background + on every login"))
     terminal.append((p + "status", "check the bridge + session"))
-    terminal.append((p + "retire", "stop + unpin the startup bridge"))
-    terminal.append((p + "disconnect", "remove the skill + sign out"))
+    terminal.append((p + "retire", "stop the background bridge + remove it from login startup"))
+    terminal.append((p + "disconnect", "uninstall the skill + sign out + forget the runtime (full reset)"))
     terminal.append((p + "--help", "all agent commands"))
 
     chat: list[tuple[str, str]] = [
@@ -513,7 +513,7 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     # 'retire' hint when the bridge is already gone reads as unfinished cleanup).
     nexts = [("python research.py agent connect", "reconnect a runtime")]
     if kept_bridge:
-        nexts.append(("python research.py agent retire", "stop + unpin the background bridge"))
+        nexts.append(("python research.py agent retire", "stop the background bridge + remove it from login startup"))
     b.next_actions(nexts)
     return 0
 
@@ -546,7 +546,7 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
         b.dim("It starts at your next login (or run: python research.py agent serve).")
     b.next_actions([
         ("python research.py agent status", "check the bridge + session"),
-        ("python research.py agent retire", "stop + unpin the background bridge"),
+        ("python research.py agent retire", "stop the background bridge + remove it from login startup"),
     ])
     return 0
 
@@ -572,9 +572,14 @@ def cmd_retire(args: argparse.Namespace) -> int:
     """Stop the background bridge + remove the logon pin (the agent twin of the
     backend `--retire`). The account session + skill are left alone."""
     b.header("requiescat", "rest — no longer on login", tagline_color=branding._BOLD + branding._RED)
+    b.dim("Stops the background bridge (agent serve) + removes it from login startup.")
     _retire_bridge()
     b.dim("Your account session + the chat skill are untouched "
           "(use agent disconnect to remove those).")
+    b.next_actions([
+        ("python research.py agent resurrect", "run the bridge in the background + on every login"),
+        ("python research.py agent serve", "run the bridge here in this terminal (foreground)"),
+    ])
     return 0
 
 
@@ -1108,13 +1113,17 @@ def cmd_skip(args: argparse.Namespace) -> int:
 
 
 def cmd_stop(_args: argparse.Namespace) -> int:
-    """Stop the running host bridge."""
+    """Stop the running host bridge (this stops the BRIDGE process — not a research
+    run; use `agent cancel <id>` / `/sr stop` in chat to stop a run)."""
     res = _bridge_post("/shutdown")
     if res is None:
         print("Bridge isn't running (nothing to stop).")
         return 0
     if res[0] == 200:
         print(f"{_OK} Bridge stopping.")
+        if autostart.is_installed():
+            b.dim("It's pinned to startup, so it returns on your next login "
+                  "(remove the pin with: python research.py agent retire).")
         return 0
     print(f"{_NO} couldn't stop the bridge: {_err(res)}")
     return 1
@@ -1168,13 +1177,14 @@ def build_parser() -> argparse.ArgumentParser:
     cn.set_defaults(func=cmd_connect)
 
     dc = sub.add_parser("disconnect", parents=[common],
-                        help="full teardown — remove the skill from the runtime AND sign out "
-                             "(the app's Revoke twin)")
+                        help="full reset — uninstall the skill, sign out, AND forget the runtime "
+                             "(the app's Revoke now only signs out; this is the only full teardown)")
     dc.add_argument("runtime", nargs="?", help="hermes or openclaw (defaults to every connected one)")
     dc.add_argument("--dest", help="explicit install dir (default: the runtime's skills dir)")
     dc.set_defaults(func=cmd_disconnect)
 
-    sub.add_parser("serve", parents=[common], help="start the host bridge (blocking)").set_defaults(func=cmd_serve)
+    sub.add_parser("serve", parents=[common],
+                   help="run the host bridge here in this terminal (foreground, blocking)").set_defaults(func=cmd_serve)
     lg = sub.add_parser("login", parents=[common],
                         help="sign in your account on the SR web app (or --local for the host page)")
     lg.add_argument("--remote", action="store_true",

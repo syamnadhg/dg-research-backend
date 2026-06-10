@@ -61,16 +61,14 @@ def wired(monkeypatch):
     monkeypatch.setattr(bridge.prefs, "get_or_create_install_id", lambda: "iid-1")
     monkeypatch.setattr(bridge.prefs, "get_label", lambda: "Super Agent")
     monkeypatch.setattr(bridge.prefs, "get_runtime", lambda: "hermes")
-    # Record (don't perform) the runtime-forget so revoke tests can assert it fires
-    # on app-revoke and NOT on a clean logout / token-level revoke.
+    # Record (don't perform) the runtime-forget. Revoke is logout-only now, so it
+    # must NOT fire on any revoke/logout path here — only `agent disconnect` (cli,
+    # untested in this file) forgets the runtime; the guard asserts it stays False.
     monkeypatch.setattr(bridge.prefs, "clear_runtime",
                         lambda: setattr(RecFS, "runtime_cleared", True))
-    # Record (don't perform) the skill uninstall so tests never touch a real
-    # runtime dir; assert WHEN it fires (app revoke) vs not (logout / token revoke)
-    # AND the home= kwarg forwarded (so a WSL install under a UNC home is removed).
-    monkeypatch.setattr(bridge.connect, "uninstall",
-                        lambda rt, **kw: (RecFS.uninstalls.append(rt)
-                                          or RecFS.uninstall_homes.append(kw.get("home")) or True))
+    # NB: the bridge no longer uninstalls the skill on revoke (revoke == self-logout),
+    # so there is no connect.uninstall to patch — `uninstalls` stays empty and the
+    # tests assert that, guarding against a regression that re-adds the teardown.
     cleared = {"v": False}
     monkeypatch.setattr(bridge.prefs, "clear_selected_device", lambda: cleared.__setitem__("v", True))
     return cleared
@@ -156,31 +154,11 @@ def test_heartbeat_revoked_self_logs_out_and_leaves_row(wired):
     assert sess._logged_out["v"] is True  # token blanked
     assert wired["v"] is True  # device selection cleared
     assert RecFS.deletes == []  # revoke LEAVES the row (only a clean /logout deletes)
-    assert RecFS.uninstalls == ["hermes"]  # app revoke ALSO uninstalls the skill
-    assert RecFS.runtime_cleared is True  # …and forgets the runtime → bare `agent` re-onboards
-
-
-def test_revoke_uninstall_forwards_recorded_wsl_home(wired, monkeypatch):
-    # The bridge.py change: revoke must remove a WSL install under its recorded
-    # \\wsl.localhost UNC home, not just the Windows default path.
-    from pathlib import Path
-    unc = r"\\wsl.localhost\Ubuntu-24.04\home\me"
-    monkeypatch.setattr(bridge.prefs, "get_runtime_home", lambda: unc)
-    RecFS.doc = {"revoked": True}
-    st, _sess = _state()
-    bridge._heartbeat_once(st)
-    assert RecFS.uninstalls == ["hermes"]
-    assert RecFS.uninstall_homes == [Path(unc)]  # home= forwarded to connect.uninstall
-
-
-def test_revoke_uninstall_windows_default_when_no_home(wired, monkeypatch):
-    # No recorded home (older connect) → no home kwarg → Windows-default path.
-    monkeypatch.setattr(bridge.prefs, "get_runtime_home", lambda: None)
-    RecFS.doc = {"revoked": True}
-    st, _sess = _state()
-    bridge._heartbeat_once(st)
-    assert RecFS.uninstalls == ["hermes"]
-    assert RecFS.uninstall_homes == [None]
+    # Revoke is now LOGOUT-ONLY: the skill stays installed and the runtime stays
+    # recorded, so `/sr login` / `agent login` reconnects WITHOUT re-running connect.
+    # (`agent disconnect` remains the only full teardown.)
+    assert RecFS.uninstalls == []  # revoke does NOT uninstall the skill
+    assert RecFS.runtime_cleared is False  # …nor forget the runtime
 
 
 def test_heartbeat_recreates_missing_doc_fully(wired):
@@ -251,8 +229,9 @@ def test_startup_honors_pending_revoke(wired):
     assert st.session is None  # honored the revoke — did NOT re-attach
     # crucially, it never wrote a revoked:False (no un-revoke)
     assert all(u["fields"].get("revoked") is not False for u in RecFS.upserts)
-    assert RecFS.uninstalls == ["hermes"]  # a revoke honored on restart also uninstalls
-    assert RecFS.runtime_cleared is True  # …and forgets the runtime (full teardown)
+    # Honoring a revoke on restart is still logout-only — skill + runtime are kept.
+    assert RecFS.uninstalls == []
+    assert RecFS.runtime_cleared is False
 
 
 def test_startup_rearms_when_not_revoked(wired):

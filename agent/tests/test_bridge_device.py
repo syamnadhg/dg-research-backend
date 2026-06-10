@@ -304,6 +304,26 @@ def test_updates_active_filter(live):
     assert {r["runId"] for r in active} == {"r1"}
 
 
+def test_updates_active_keeps_needs_attention_runs(live):
+    # C1 safety-critical: a run that NEEDS the user must survive active=1 even
+    # though it isn't "ongoing"/"queued" — else a chat poller would miss exactly
+    # the runs it must surface. A plain completed run is still filtered out.
+    base, _ = live
+    FakeFS.researches = {
+        "r1": {"id": "r1", "status": "ongoing", "links": {}},
+        "r2": {"id": "r2", "status": "errored", "links": {}},  # stuck → keep
+        "r3": {"id": "r3", "status": "ongoing", "phase": 2,     # snag card → keep
+               "pendingDecision": {"kind": "login_required", "title": "Sign in to ChatGPT"}},
+        "r4": {"id": "r4", "status": "completed", "links": {}},  # done → drop
+    }
+    active = requests.get(base + "/updates?active=1").json()["runs"]
+    assert {r["runId"] for r in active} == {"r1", "r2", "r3"}
+    r2 = next(r for r in active if r["runId"] == "r2")
+    assert r2["needsAttention"] is True and r2["attention"]  # human reason surfaced
+    r3 = next(r for r in active if r["runId"] == "r3")
+    assert r3["needsAttention"] is True and "Sign in" in (r3["attention"] or "")
+
+
 def test_updates_tolerates_bad_limit(live):
     base, _ = live
     assert requests.get(base + "/updates?limit=999").status_code == 200

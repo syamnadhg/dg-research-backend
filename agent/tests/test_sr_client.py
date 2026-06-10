@@ -32,6 +32,7 @@ class FakeFS:
     researches: dict = {}
     last_enqueue = None
     last_cancel = None
+    last_command = None
     last_pc_patch = None
 
     def __init__(self, _tp):
@@ -54,9 +55,15 @@ class FakeFS:
         FakeFS.last_enqueue = {"device_id": device_id, **kw}
         return "Q-1"
 
-    def enqueue_cancel(self, device_id, *, uid, research_id):
-        FakeFS.last_cancel = {"device_id": device_id, "research_id": research_id}
+    def enqueue_cancel(self, device_id, *, uid, research_id, owner_control=""):
+        FakeFS.last_cancel = {"device_id": device_id, "research_id": research_id,
+                              "owner_control": owner_control}
         return "C-1"
+
+    def write_command(self, uid, research_id, action, *, device_id, extra=None):
+        FakeFS.last_command = {"uid": uid, "rid": research_id, "action": action,
+                               "device_id": device_id, "extra": extra}
+        return "CMD-1"
 
     def delete_research(self, uid, rid):
         FakeFS.researches.pop(rid, None)
@@ -70,6 +77,7 @@ def bridge_port(monkeypatch):
     FakeFS.researches = {}
     FakeFS.last_enqueue = None
     FakeFS.last_cancel = None
+    FakeFS.last_command = None
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
     sel = {"v": None}
     monkeypatch.setattr(bridge.prefs, "get_selected_device", lambda uid: sel["v"])
@@ -103,7 +111,9 @@ def test_devices(bridge_port, capsys):
 def test_research_then_status(bridge_port, capsys):
     assert sr.main(["research", "Tesla 2025"]) == 0
     out = capsys.readouterr().out
-    assert "Started" in out and "agent-" in out
+    assert "Started" in out and "Tesla 2025" in out
+    assert "My PC" in out          # the device is shown by NAME, not its id
+    assert "agent-" not in out      # no raw run-id leaks into chat (I4)
     assert FakeFS.last_enqueue["device_id"] == "dev-a"  # auto-picked the sole device
 
     # status with no id resolves to the most recent run
@@ -141,16 +151,83 @@ def test_updates_json(bridge_port, capsys):
     assert "runs" in payload and payload["runs"]
 
 
-def test_cancel(bridge_port, capsys):
-    FakeFS.researches["agent-x"] = {"id": "agent-x", "deviceId": "dev-a", "status": "ongoing"}
+def test_stop_running_is_graceful(bridge_port, capsys):
+    # `stop` (and its `cancel` alias) on a RUNNING run writes a per-run stop
+    # command (keeps results + chat) — NOT the destructive queue cancel.
+    FakeFS.researches["agent-x"] = {"id": "agent-x", "title": "Mars colony",
+                                    "deviceId": "dev-a", "status": "ongoing"}
     assert sr.main(["cancel", "agent-x"]) == 0
-    assert "Cancel requested" in capsys.readouterr().out
-    assert FakeFS.last_cancel == {"device_id": "dev-a", "research_id": "agent-x"}
+    out = capsys.readouterr().out
+    assert "Stopping" in out and "Mars colony" in out and "kept" in out
+    assert FakeFS.last_cancel is None  # never the destructive queue cancel
+    assert FakeFS.last_command == {"uid": "u1", "rid": "agent-x", "action": "stop",
+                                   "device_id": "dev-a", "extra": None}
+
+
+def test_stop_queued_is_preserved(bridge_port, capsys):
+    # A still-QUEUED run is preserved via ownerControl:"stop" (kept, chat intact).
+    FakeFS.researches["agent-z"] = {"id": "agent-z", "deviceId": "dev-a", "status": "queued"}
+    assert sr.main(["stop", "agent-z"]) == 0
+    assert "Stopping" in capsys.readouterr().out
+    assert FakeFS.last_command is None
+    assert FakeFS.last_cancel == {"device_id": "dev-a", "research_id": "agent-z",
+                                  "owner_control": "stop"}
+
+
+def test_stop_by_title_latest_active(bridge_port, capsys):
+    # bare `stop` targets the newest ACTIVE run; a title arg resolves by match.
+    FakeFS.researches["agent-old"] = {"id": "agent-old", "title": "Old", "status": "completed"}
+    FakeFS.researches["agent-new"] = {"id": "agent-new", "title": "Quantum batteries",
+                                      "deviceId": "dev-a", "status": "ongoing"}
+    assert sr.main(["stop", "quantum"]) == 0  # case-insensitive title match
+    assert FakeFS.last_command["rid"] == "agent-new"
+
+
+def test_retry_resumes_pending_decision(bridge_port, capsys):
+    FakeFS.researches["agent-r"] = {
+        "id": "agent-r", "deviceId": "dev-a", "status": "ongoing",
+        "pendingDecision": {"kind": "pipeline_error", "phase": 2, "title": "Hit a snag"},
+    }
+    assert sr.main(["retry", "agent-r"]) == 0
+    assert "Retrying" in capsys.readouterr().out
+    assert FakeFS.last_command["action"] == "retry_phase"
+    assert FakeFS.last_command["extra"] == {"phase": 2}
+
+
+def test_retry_nothing_to_do(bridge_port, capsys):
+    FakeFS.researches["agent-ok"] = {"id": "agent-ok", "deviceId": "dev-a", "status": "ongoing"}
+    assert sr.main(["retry", "agent-ok"]) == 1  # 409 → nothing waiting on a decision
+    assert "retry" in capsys.readouterr().out.lower()
+
+
+def test_skip_blocker_resolves_decision(bridge_port, capsys):
+    # `skip` with NO phases → skip whatever the run is blocked on. An
+    # agent_link_failed decision → agent_decision{decision:"skip"}.
+    FakeFS.researches["agent-b"] = {
+        "id": "agent-b", "deviceId": "dev-a", "status": "ongoing",
+        "pendingDecision": {"kind": "agent_link_failed", "agent": "gemini", "title": "Link failed"},
+    }
+    assert sr.main(["skip", "--run", "agent-b"]) == 0
+    assert "Skipping" in capsys.readouterr().out
+    assert FakeFS.last_command["action"] == "agent_decision"
+    assert FakeFS.last_command["extra"] == {"agent": "gemini", "decision": "skip"}
+
+
+def test_status_surfaces_blocker(bridge_port, capsys):
+    # C1: a run waiting on the user shows the "Needs you" line + a chat action.
+    FakeFS.researches["agent-s"] = {
+        "id": "agent-s", "status": "ongoing", "phase": 2,
+        "pendingDecision": {"kind": "login_required", "title": "Sign in to ChatGPT"},
+    }
+    assert sr.main(["status", "agent-s"]) == 0
+    out = capsys.readouterr().out
+    assert "Needs you" in out and "Sign in to ChatGPT" in out
+    assert "retry" in out.lower()
 
 
 def test_skip_by_name(bridge_port, capsys):
-    FakeFS.researches["agent-y"] = {"id": "agent-y", "pipelineConfig": {}}
-    assert sr.main(["skip", "agent-y", "video", "report"]) == 0
+    FakeFS.researches["agent-y"] = {"id": "agent-y", "status": "ongoing", "pipelineConfig": {}}
+    assert sr.main(["skip", "video", "report", "--run", "agent-y"]) == 0
     assert "skip" in capsys.readouterr().out.lower()
     u = FakeFS.last_pc_patch["updates"]
     assert u["videoEnabled"] is False and u["emailEnabled"] is False

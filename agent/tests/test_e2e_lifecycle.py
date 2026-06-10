@@ -3,7 +3,7 @@
 Drives sr.py (loaded as a runtime would) against a LIVE bridge whose remote-login
 broker is a mock FE and whose Firestore is faked — exercising the whole arc a user
 goes through in chat: not-signed-in → /sr login → approve → /sr device → /sr research →
-/sr status → updates → /sr skip → /sr cancel → /sr logout. The single live enqueue against a
+/sr status → updates → /sr skip → /sr stop → /sr logout. The single live enqueue against a
 real device is the human checkpoint (operator signs in); this proves the wiring.
 """
 
@@ -35,6 +35,7 @@ class FakeFS:
     researches: dict = {}
     last_rid = None
     last_cancel = None
+    last_command = None
     last_pc_patch = None
 
     def __init__(self, _tp):
@@ -57,9 +58,14 @@ class FakeFS:
     def enqueue_start(self, device_id, **kw):
         return "Q-1"
 
-    def enqueue_cancel(self, device_id, *, uid, research_id):
-        FakeFS.last_cancel = research_id
+    def enqueue_cancel(self, device_id, *, uid, research_id, owner_control=""):
+        FakeFS.last_cancel = {"rid": research_id, "owner_control": owner_control}
         return "C-1"
+
+    def write_command(self, uid, research_id, action, *, device_id, extra=None):
+        FakeFS.last_command = {"rid": research_id, "action": action,
+                               "device_id": device_id, "extra": extra}
+        return "CMD-1"
 
     def delete_research(self, uid, rid):
         FakeFS.researches.pop(rid, None)
@@ -85,7 +91,7 @@ class FakeFS:
 def live(monkeypatch, mock_fe):
     FakeFS.researches = {}
     FakeFS.agent_sessions = {}
-    FakeFS.last_rid = FakeFS.last_cancel = FakeFS.last_pc_patch = None
+    FakeFS.last_rid = FakeFS.last_cancel = FakeFS.last_command = FakeFS.last_pc_patch = None
 
     # in-memory secret store + prefs (no real ~/.super-agent / keyring)
     mem = {}
@@ -177,14 +183,15 @@ def test_full_chat_lifecycle(live, capsys):
     assert "Podcast ready" in pod_out and f"{rid}.m4a" in pod_out
     assert "token=" not in pod_out  # the Storage download token never reaches chat
 
-    # 10. /skip → tunes the run config
-    assert sr.main(["skip", rid, "video", "report"]) == 0
+    # 10. /skip → tunes the run config (run targeted by --run; phases are positional)
+    assert sr.main(["skip", "video", "report", "--run", rid]) == 0
     capsys.readouterr()
     assert FakeFS.last_pc_patch["updates"] == {"videoEnabled": False, "emailEnabled": False}
 
-    # 11. /cancel
-    assert sr.main(["cancel", rid]) == 0
-    assert FakeFS.last_cancel == rid
+    # 11. /stop → graceful. This run is still queued, so it's PRESERVED via
+    #     ownerControl:"stop" (NOT a destructive cancel that would delete the chat).
+    assert sr.main(["stop", rid]) == 0
+    assert FakeFS.last_cancel == {"rid": rid, "owner_control": "stop"}
     capsys.readouterr()
 
     # 12. /logout → signed out again, and the agent row is removed (#790)
