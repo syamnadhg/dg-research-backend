@@ -130,6 +130,32 @@ def test_install_then_uninstall_roundtrip_at_runtime_path(tmp_path):
     assert not target.exists()
 
 
+# ── streaming watchdog: connect drops it in HERMES_HOME/scripts (hermes only) ──
+
+def test_install_drops_stream_script_in_hermes_scripts(tmp_path):
+    # A standard-path hermes install also places the cron watchdog under
+    # HERMES_HOME/scripts so the /sr skill can arm a `no_agent` cron job by name.
+    connect.install("hermes", home=tmp_path)
+    poll = tmp_path / ".hermes" / "scripts" / "sr_attention_poll.py"
+    assert poll.is_file()
+    assert connect.uninstall("hermes", home=tmp_path) is True
+    assert not poll.exists()  # disconnect tears it down too
+
+
+def test_install_dest_override_skips_stream_script(tmp_path):
+    # A custom `dest` must NOT write to HERMES_HOME (else a dest test would hit the
+    # real ~/.hermes). The cron script belongs only with the standard layout.
+    connect.install("hermes", dest=tmp_path / "sr", home=tmp_path)
+    assert not (tmp_path / ".hermes" / "scripts" / "sr_attention_poll.py").exists()
+
+
+def test_openclaw_install_has_no_stream_script(tmp_path):
+    # The cron watchdog is hermes-only (OpenClaw has no equivalent scheduler).
+    connect.install("openclaw", home=tmp_path)
+    assert not (tmp_path / ".hermes" / "scripts" / "sr_attention_poll.py").exists()
+    assert not (tmp_path / ".openclaw" / "scripts" / "sr_attention_poll.py").exists()
+
+
 # ── Target + detect_targets (local + WSL) ────────────────────────────────────
 
 def test_host_os_label(monkeypatch):

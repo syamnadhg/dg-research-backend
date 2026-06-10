@@ -382,7 +382,53 @@ def install(runtime: str, *, dest: Path | None = None, home: Path | None = None)
     for f in (src / "scripts").glob("*.py"):
         shutil.copy2(f, scripts / f.name)
     _normalize_modes(target)
+    # Standard-path installs only (dest=None): a custom dest is a test/power-user
+    # location, not the runtime's HERMES_HOME, so the cron script doesn't belong
+    # there (and we must never write to the real ~/.hermes during a dest test).
+    if runtime == "hermes" and dest is None:
+        _install_stream_script(home)
     return target
+
+
+# The streaming watchdog (sr_attention_poll.py) runs as a Hermes `no_agent` cron
+# job the /sr skill arms via the gateway's `cronjob` tool — which requires the
+# script under HERMES_HOME/scripts/ (it validates containment there, rejecting the
+# bundle path). Mirror the bundled copy into that dir so the skill can arm the job
+# by filename. Hermes-only: OpenClaw has no equivalent cron scheduler.
+_STREAM_SCRIPT = "sr_attention_poll.py"
+
+
+def hermes_scripts_dir(home: Path | None = None) -> Path:
+    """HERMES_HOME/scripts for the default home layout (home/.hermes)."""
+    return (home or Path.home()) / ".hermes" / "scripts"
+
+
+def _install_stream_script(home: Path | None) -> None:
+    """Copy the streaming watchdog into HERMES_HOME/scripts/ so the /sr skill's
+    cron job can run it by filename. Best-effort — never breaks the skill install
+    (a WSL 9p / UNC mount can reject the write)."""
+    src = skill_src_dir() / "scripts" / _STREAM_SCRIPT
+    if not src.is_file():
+        return
+    try:
+        dst_dir = hermes_scripts_dir(home)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / _STREAM_SCRIPT
+        shutil.copy2(src, dst)
+        try:
+            dst.chmod(0o644)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _uninstall_stream_script(home: Path | None) -> None:
+    """Remove the streaming watchdog from HERMES_HOME/scripts/ (best-effort)."""
+    try:
+        (hermes_scripts_dir(home) / _STREAM_SCRIPT).unlink()
+    except OSError:
+        pass
 
 
 def _normalize_modes(target: Path) -> None:
@@ -413,6 +459,8 @@ def uninstall(runtime: str, *, dest: Path | None = None, home: Path | None = Non
     """
     if runtime not in RUNTIMES:
         raise ValueError(f"unknown runtime: {runtime}")
+    if runtime == "hermes" and dest is None:
+        _uninstall_stream_script(home)  # best-effort; the inert script is harmless if left
     target = dest or runtime_dest(runtime, home)
     if target.exists() and (target.name == _SKILL_LEAF or verify(target)):
         shutil.rmtree(target)

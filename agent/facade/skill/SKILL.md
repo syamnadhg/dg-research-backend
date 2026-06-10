@@ -104,25 +104,37 @@ If `sr.py status-account` says "Not signed in", guide the user through `/sr
 login` before running research. They pick a device with `/sr device` (skipped
 automatically if they have exactly one).
 
-## Streaming a run's progress
+## Streaming a run's progress (arm a watchdog once)
 
-After a run starts, it executes on the device and writes links phase by phase.
-Stream them to the user as they appear — do **not** poll in a tight loop
-yourself; rely on the runtime's periodic wake-up (cron). On each wake-up:
+The runtime does **not** wake you on a timer — so to push progress + alerts into
+this chat while a run executes unattended, arm a small recurring **cron watchdog**
+the first time the user starts a run (or asks for live updates). It runs a bundled
+script that, each minute, posts only what's **new** and stays silent otherwise —
+no spam, no tokens.
 
-1. Run `sr.py --json updates --active`.
-2. For each run, post any link you have **not** posted before (dedup by the run
-   id + link kind — never repeat a link you already sent).
-3. **If a run has `needsAttention: true`**, the run is blocked on the user: post
-   the `attention` reason and tell them they can say **"retry"** to resume,
-   **"skip"** to move past it, or open the Super Research app to act. Some
-   blockers need an on-device step first (signing in to an AI, solving a "are you
-   human" check) — say so, and that they should do it on the device, then "retry".
-4. When a run's status becomes `completed` (or `stopped` / `error`), post the
-   final state and stop streaming that run.
+1. Check it isn't already armed: `cronjob(action="list")` — look for a job named
+   `sr-stream`.
+2. If absent, arm it — it auto-delivers to **this** chat:
+   `cronjob(action="create", no_agent=true, script="sr_attention_poll.py",
+   schedule="every 1m", name="sr-stream")`.
+   (`agent connect` already placed `sr_attention_poll.py` in the scripts dir. If
+   create fails with a missing-script error, tell the user to re-run `agent
+   connect` on the host.)
+3. The watchdog then posts on its own:
+   - each new phase link as it lands (Brief → ChatGPT / Gemini / Claude →
+     NotebookLM + Audio → YouTube → the final Doc),
+   - **⚠ "<title>" needs you: <reason>** when a run is blocked — the user can
+     reply **"retry"** / **"skip"** right here, or open the app (some blockers —
+     signing in to an AI, a "are you human" check — need an on-device step first,
+     then "retry"),
+   - the final state when a run finishes / stops / errors.
 
-Links arrive in this order: Brief → ChatGPT / Gemini / Claude → NotebookLM +
-Audio → YouTube → the final Doc.
+On **`/sr logout`**, tear the watchdog down: `cronjob(action="list")` → find
+`sr-stream` → `cronjob(action="remove", job_id=<that id>)`.
+
+If the user is right there and just asks "status" / "what's running", answer
+immediately with `sr.py status` / `sr.py updates` — the watchdog is for unattended
+progress, not a replacement for a direct question.
 
 ## Safety
 
