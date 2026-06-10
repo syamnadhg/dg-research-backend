@@ -461,6 +461,13 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     else:
         b.dim("No account session was signed in.")
 
+    # Forget the recorded runtime so status stops claiming a now-skill-less runtime
+    # and a bare `agent` re-onboards via connect — but only when THIS disconnect
+    # covered it (a `disconnect openclaw` while hermes is recorded leaves hermes).
+    rec_rt = prefs.get_runtime()
+    if rec_rt and (not explicit or explicit == rec_rt):
+        prefs.clear_runtime()
+
     b.next_actions([
         ("python research.py agent connect", "reconnect a runtime"),
         ("python research.py agent retire", "also stop + unpin the background bridge"),
@@ -1061,9 +1068,15 @@ def cmd_stop(_args: argparse.Namespace) -> int:
 
 def cmd_home(args: argparse.Namespace) -> int:
     """Bare `agent` / `--agent` (no subcommand): smart entry — show status when the
-    agent is already set up (bridge up OR a runtime connected), else drop straight
-    into the interactive connect flow so a first run onboards you."""
-    if _bridge_up() or prefs.get_runtime():
+    agent is set up (a chat runtime is connected OR the bridge holds a signed-in
+    session), else drop straight into the interactive connect flow so a first run —
+    or a post-`disconnect` clean slate — onboards you.
+
+    Note it keys off the runtime/session, NOT a bare `_bridge_up()`: after
+    `disconnect` the background bridge is intentionally left running, so a
+    still-up-but-idle bridge with no runtime + no session must onboard, not park on
+    an empty status."""
+    if prefs.get_runtime() or _bridge_authed():
         return cmd_status(args)
     # cmd_connect reads args.runtime/.dest; the bare namespace lacks them (they're
     # defined only on the `connect` subparser) — supply the omitted defaults.

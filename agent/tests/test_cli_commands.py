@@ -153,9 +153,27 @@ def test_cmd_disconnect_removes_skill_and_signs_out(monkeypatch):
                         lambda rt, **kw: (removed.append((rt, kw.get("home"))) or True))
     logged_out = {"v": False}
     monkeypatch.setattr(cli, "_logout_session", lambda: logged_out.__setitem__("v", True) or True)
+    cleared = {"v": False}
+    monkeypatch.setattr(cli.prefs, "clear_runtime", lambda: cleared.__setitem__("v", True))
     assert cli.cmd_disconnect(_ns()) == 0
     assert removed == [("hermes", home)]  # step 1 removed the skill at the right home
     assert logged_out["v"] is True  # step 2 signed out
+    assert cleared["v"] is True  # …and forgot the runtime → bare `agent` re-onboards
+
+
+def test_cmd_disconnect_keeps_unrelated_runtime_pref(monkeypatch):
+    # `disconnect openclaw` while HERMES is the recorded runtime must not forget
+    # hermes — only the covered runtime is cleared.
+    monkeypatch.setattr(cli.connect, "detect_targets", lambda: [])
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
+    monkeypatch.setattr(cli.prefs, "get_runtime_home", lambda: None)
+    monkeypatch.setattr(cli.connect, "uninstall", lambda rt, **kw: False)
+    monkeypatch.setattr(cli, "_logout_session", lambda: False)
+    cleared = {"v": False}
+    monkeypatch.setattr(cli.prefs, "clear_runtime", lambda: cleared.__setitem__("v", True))
+    ns = SimpleNamespace(runtime="openclaw", dest=None, verbose=False)
+    assert cli.cmd_disconnect(ns) == 0
+    assert cleared["v"] is False  # hermes pref left intact
 
 
 # ── reachability: _ensure_reachable / _ensure_wsl_networking ──────────────────
@@ -560,21 +578,46 @@ def test_bridge_authed_false_when_bridge_down(monkeypatch):
 
 # ── cmd_home (bare `agent` / `--agent` smart entry) ───────────────────────────
 
-def test_cmd_home_when_set_up_shows_status(monkeypatch):
-    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+def _route_home(monkeypatch):
     routed = []
     monkeypatch.setattr(cli, "cmd_status", lambda args: routed.append("status") or 0)
     monkeypatch.setattr(cli, "cmd_connect", lambda args: routed.append("connect") or 0)
+    return routed
+
+
+def test_cmd_home_when_runtime_connected_shows_status(monkeypatch):
+    # A connected chat runtime = set up → status (even before signing in).
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
+    monkeypatch.setattr(cli, "_bridge_authed", lambda: False)
+    routed = _route_home(monkeypatch)
     assert cli.cmd_home(_ns()) == 0
     assert routed == ["status"]
 
 
+def test_cmd_home_when_signed_in_shows_status(monkeypatch):
+    # Signed in but no runtime recorded (e.g. CLI-only `agent login`) → still status.
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: None)
+    monkeypatch.setattr(cli, "_bridge_authed", lambda: True)
+    routed = _route_home(monkeypatch)
+    assert cli.cmd_home(_ns()) == 0
+    assert routed == ["status"]
+
+
+def test_cmd_home_idle_bridge_no_runtime_runs_connect(monkeypatch):
+    # The post-`disconnect` case: the background bridge is still UP, but with no
+    # runtime + no session it's idle → onboard via connect, don't park on status.
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: None)
+    monkeypatch.setattr(cli, "_bridge_authed", lambda: False)
+    routed = _route_home(monkeypatch)
+    ns = SimpleNamespace(verbose=False)  # bare namespace lacks runtime/dest
+    assert cli.cmd_home(ns) == 0
+    assert routed == ["connect"]
+
+
 def test_cmd_home_when_fresh_runs_connect(monkeypatch):
-    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
     monkeypatch.setattr(cli.prefs, "get_runtime", lambda: None)  # nothing connected yet
-    routed = []
-    monkeypatch.setattr(cli, "cmd_status", lambda args: routed.append("status") or 0)
-    monkeypatch.setattr(cli, "cmd_connect", lambda args: routed.append("connect") or 0)
+    monkeypatch.setattr(cli, "_bridge_authed", lambda: False)    # bridge down / not signed in
+    routed = _route_home(monkeypatch)
     ns = SimpleNamespace(verbose=False)  # bare namespace lacks runtime/dest
     assert cli.cmd_home(ns) == 0
     assert routed == ["connect"]

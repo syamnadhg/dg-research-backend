@@ -61,6 +61,22 @@ def test_runtime_records_wsl_install_location(monkeypatch, tmp_path):
     assert prefs.get_runtime_distro() == "Ubuntu-24.04"
 
 
+def test_clear_runtime_forgets_all_runtime_keys(monkeypatch, tmp_path):
+    _isolate(monkeypatch, tmp_path)
+    prefs.set_runtime("openclaw", home=r"\\wsl.localhost\U\home\me", location="wsl", distro="U")
+    prefs.set_selected_device("dev-1", "u1")  # a non-runtime pref that must SURVIVE
+    iid = prefs.get_or_create_install_id()     # the stable agent id must SURVIVE too
+    prefs.clear_runtime()
+    assert prefs.get_runtime() is None
+    assert prefs.get_runtime_home() is None
+    assert prefs.get_runtime_location() is None
+    assert prefs.get_runtime_distro() is None
+    # unrelated prefs are untouched (clear_runtime is runtime-only)
+    assert prefs.get_selected_device("u1") == "dev-1"
+    assert prefs.get_or_create_install_id() == iid
+    prefs.clear_runtime()  # idempotent — no error when nothing is recorded
+
+
 def test_runtime_local_clears_stale_distro(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path)
     prefs.set_runtime("openclaw", home=r"\\wsl.localhost\U\home\me", location="wsl", distro="U")

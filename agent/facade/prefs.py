@@ -108,8 +108,10 @@ def set_selected_device(device_id: str, uid: str) -> None:
 def clear_selected_device() -> None:
     with _lock:
         prefs = load()
-        changed = any(prefs.pop(k, None) is not None for k in (_SELECTED_DEVICE, _SELECTED_UID))
-        if changed:
+        # Pop EAGERLY (list, not a generator): a short-circuiting any() would stop
+        # at the first non-None key and orphan the rest.
+        popped = [prefs.pop(k, None) for k in (_SELECTED_DEVICE, _SELECTED_UID)]
+        if any(v is not None for v in popped):
             save(prefs)
 
 
@@ -165,6 +167,24 @@ def get_runtime_location() -> str | None:
 def get_runtime_distro() -> str | None:
     v = load().get(_RUNTIME_DISTRO)
     return v if isinstance(v, str) and v else None
+
+
+def clear_runtime() -> None:
+    """Forget the connected chat runtime + where its skill lived.
+
+    Called by `agent disconnect` once the skill has been removed: the connection
+    is gone, so status must stop claiming a now-skill-less runtime and a bare
+    `agent` should re-onboard via `connect`. Mirrors `clear_selected_device`;
+    idempotent (a no-op when nothing is recorded). Leaves the install id + label
+    alone — those identify the host/agent across re-connects."""
+    with _lock:
+        prefs = load()
+        keys = (_RUNTIME, _RUNTIME_HOME, _RUNTIME_LOCATION, _RUNTIME_DISTRO)
+        # Pop EAGERLY (list, not a generator): a short-circuiting any() would stop
+        # at the first non-None key and orphan the rest (e.g. leave runtimeHome).
+        popped = [prefs.pop(k, None) for k in keys]
+        if any(v is not None for v in popped):
+            save(prefs)
 
 
 def get_or_create_install_id() -> str:
