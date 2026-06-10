@@ -468,10 +468,26 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     if rec_rt and (not explicit or explicit == rec_rt):
         prefs.clear_runtime()
 
-    b.next_actions([
-        ("python research.py agent connect", "reconnect a runtime"),
-        ("python research.py agent retire", "also stop + unpin the background bridge"),
-    ])
+    # Offer to also tear down the background bridge (the `retire` axis) so a single
+    # `disconnect` is a complete "I'm done" cleanup. Consent-gated + default Yes:
+    # stopping a process + removing an OS autostart entry is heavier than deleting a
+    # skill file (the user should SEE it happen), and a re-`connect` rebuilds it
+    # anyway (install + pin + sign-in) — so keeping it serves only an immediate
+    # re-connect (the `n` path). Ctrl-C → confirm() is False → bridge left running
+    # (safe). Skip the prompt entirely when there's nothing to tear down.
+    retired = False
+    if autostart.is_installed() or _bridge_up():
+        print()
+        if b.confirm("Also stop the background bridge + remove it from startup?", default=True):
+            _retire_bridge()
+            retired = True
+        else:
+            b.dim("Left the background bridge running (it returns on login).")
+
+    nexts = [("python research.py agent connect", "reconnect a runtime")]
+    if not retired:
+        nexts.append(("python research.py agent retire", "stop + unpin the background bridge"))
+    b.next_actions(nexts)
     return 0
 
 
@@ -505,10 +521,11 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_retire(args: argparse.Namespace) -> int:
-    """Stop the background bridge + remove the logon pin (the agent twin of the
-    backend `--retire`). The account session + skill are left alone."""
-    b.header("requiescat", "rest — no longer on login", tagline_color=branding._BOLD + branding._RED)
+def _retire_bridge() -> None:
+    """Stop a running background bridge + remove its logon autostart pin — the core
+    of `agent retire`, shared with `disconnect`'s optional full-teardown step.
+    Best-effort + idempotent: a None /shutdown = already down; a 'cannot find'
+    uninstall = nothing was pinned. Prints its own progress; never raises."""
     # Stop a running bridge first (best-effort; None = already down).
     if _bridge_post("/shutdown") is not None:
         b.ok("Bridge stopping")
@@ -519,6 +536,13 @@ def cmd_retire(args: argparse.Namespace) -> int:
         b.dim("No autostart was installed.")
     else:
         b.warn(f"Autostart teardown: {out or 'unknown'}")
+
+
+def cmd_retire(args: argparse.Namespace) -> int:
+    """Stop the background bridge + remove the logon pin (the agent twin of the
+    backend `--retire`). The account session + skill are left alone."""
+    b.header("requiescat", "rest — no longer on login", tagline_color=branding._BOLD + branding._RED)
+    _retire_bridge()
     b.dim("Your account session + the chat skill are untouched "
           "(use agent disconnect to remove those).")
     return 0

@@ -155,6 +155,9 @@ def test_cmd_disconnect_removes_skill_and_signs_out(monkeypatch):
     monkeypatch.setattr(cli, "_logout_session", lambda: logged_out.__setitem__("v", True) or True)
     cleared = {"v": False}
     monkeypatch.setattr(cli.prefs, "clear_runtime", lambda: cleared.__setitem__("v", True))
+    # nothing pinned/running → the optional bridge-teardown prompt is skipped
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: False)
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
     assert cli.cmd_disconnect(_ns()) == 0
     assert removed == [("hermes", home)]  # step 1 removed the skill at the right home
     assert logged_out["v"] is True  # step 2 signed out
@@ -171,9 +174,53 @@ def test_cmd_disconnect_keeps_unrelated_runtime_pref(monkeypatch):
     monkeypatch.setattr(cli, "_logout_session", lambda: False)
     cleared = {"v": False}
     monkeypatch.setattr(cli.prefs, "clear_runtime", lambda: cleared.__setitem__("v", True))
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: False)
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
     ns = SimpleNamespace(runtime="openclaw", dest=None, verbose=False)
     assert cli.cmd_disconnect(ns) == 0
     assert cleared["v"] is False  # hermes pref left intact
+
+
+def _disconnect_teardown_fixture(monkeypatch):
+    # Common stubs for the optional bridge-teardown prompt: skill/session/runtime
+    # all no-ops, and SOMETHING is pinned so the prompt fires.
+    monkeypatch.setattr(cli.connect, "detect_targets", lambda: [])
+    monkeypatch.setattr(cli.prefs, "get_runtime", lambda: None)
+    monkeypatch.setattr(cli.prefs, "get_runtime_home", lambda: None)
+    monkeypatch.setattr(cli.connect, "uninstall", lambda rt, **kw: False)
+    monkeypatch.setattr(cli, "_logout_session", lambda: False)
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: True)  # something to tear down
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    retired = {"v": False}
+    monkeypatch.setattr(cli, "_retire_bridge", lambda: retired.__setitem__("v", True))
+    return retired
+
+
+def test_cmd_disconnect_full_teardown_when_confirmed(monkeypatch):
+    # Default-Yes prompt accepted → disconnect ALSO stops the bridge + unpins it.
+    retired = _disconnect_teardown_fixture(monkeypatch)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    assert cli.cmd_disconnect(_ns()) == 0
+    assert retired["v"] is True
+
+
+def test_cmd_disconnect_keeps_bridge_when_declined(monkeypatch):
+    # Decline (or Ctrl-C, which confirm() maps to False) → bridge left running.
+    retired = _disconnect_teardown_fixture(monkeypatch)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
+    assert cli.cmd_disconnect(_ns()) == 0
+    assert retired["v"] is False
+
+
+def test_cmd_disconnect_skips_teardown_prompt_when_nothing_pinned(monkeypatch):
+    # No autostart + no running bridge → never even ask about teardown.
+    _disconnect_teardown_fixture(monkeypatch)
+    monkeypatch.setattr(cli.autostart, "is_installed", lambda: False)
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    asked = {"v": False}
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: asked.__setitem__("v", True) or True)
+    assert cli.cmd_disconnect(_ns()) == 0
+    assert asked["v"] is False  # prompt skipped entirely
 
 
 # ── reachability: _ensure_reachable / _ensure_wsl_networking ──────────────────
