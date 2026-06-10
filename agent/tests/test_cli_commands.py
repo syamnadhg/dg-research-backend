@@ -121,6 +121,7 @@ def test_cmd_resurrect_install_failure_returns_1(monkeypatch):
 
 def test_cmd_resurrect_success_returns_0_even_if_start_fails(monkeypatch):
     monkeypatch.setattr(cli.autostart, "install", lambda: (True, ""))
+    monkeypatch.setattr(cli, "_wait_bridge_up", lambda *a, **k: True)
     monkeypatch.setattr(cli.autostart, "start_detached", lambda: (False, "boom"))
     assert cli.cmd_resurrect(_ns()) == 0  # pinned succeeded; immediate start is best-effort
     monkeypatch.setattr(cli.autostart, "start_detached", lambda: (True, ""))
@@ -514,7 +515,24 @@ def test_startup_step_pins_when_supported(monkeypatch):
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
     monkeypatch.setattr(cli.autostart, "install", lambda: (True, ""))
     monkeypatch.setattr(cli.autostart, "start_detached", lambda: (True, ""))
-    assert cli._startup_step() is True
+    monkeypatch.setattr(cli, "_wait_bridge_up", lambda *a, **k: True)  # bound promptly
+    rv, out = _cap(cli._startup_step)
+    assert rv is True
+    assert "started in the background" in out
+
+
+def test_startup_step_started_but_not_answering_warns(monkeypatch):
+    # Pinned + launched, but the socket isn't listening yet → honest warning, not a
+    # false "started" (and crucially not a silent claim the next step then refutes).
+    monkeypatch.setattr(cli.autostart, "supported", lambda: True)
+    monkeypatch.setattr(cli.autostart, "kind_label", lambda: "Scheduled Task")
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(cli.autostart, "install", lambda: (True, ""))
+    monkeypatch.setattr(cli.autostart, "start_detached", lambda: (True, ""))
+    monkeypatch.setattr(cli, "_wait_bridge_up", lambda *a, **k: False)  # didn't bind in time
+    rv, out = _cap(cli._startup_step)
+    assert rv is True
+    assert "not answering" in out.lower()
 
 
 def test_startup_step_decline(monkeypatch):
@@ -639,6 +657,25 @@ def test_bridge_authed_false_when_not_signed_in(monkeypatch):
 def test_bridge_authed_false_when_bridge_down(monkeypatch):
     monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: None)
     assert cli._bridge_authed() is False
+
+
+# _wait_bridge_up — a freshly-detached bridge needs a beat to bind; poll, don't glance.
+
+def test_wait_bridge_up_polls_until_ready(monkeypatch):
+    calls = {"n": 0}
+    def up():
+        calls["n"] += 1
+        return calls["n"] >= 3  # down for the first two polls, then up
+    monkeypatch.setattr(cli, "_bridge_up", up)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)  # don't actually wait
+    assert cli._wait_bridge_up(timeout=5.0, interval=0.01) is True
+    assert calls["n"] == 3
+
+
+def test_wait_bridge_up_times_out(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    assert cli._wait_bridge_up(timeout=0.0, interval=0.01) is False  # never comes up → False
 
 
 # ── cmd_home (bare `agent` / `--agent` smart entry) ───────────────────────────

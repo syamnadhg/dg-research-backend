@@ -26,11 +26,12 @@ def test_brand_mark_without_suffix():
 
 
 def test_channels_prints_every_name():
+    # Names-only (no glyph): each channel name appears in the row.
     out = _out(b.channels, [
-        ("WhatsApp", "✆", (37, 211, 102)),
-        ("Telegram", "✈", (34, 158, 217)),
-        ("iMessage", "💬", (52, 199, 89)),
-        ("Twilio", "☎", (242, 47, 70)),
+        ("WhatsApp", (37, 211, 102)),
+        ("Telegram", (34, 158, 217)),
+        ("iMessage", (52, 199, 89)),
+        ("Twilio", (242, 47, 70)),
     ])
     for name in ("WhatsApp", "Telegram", "iMessage", "Twilio"):
         assert name in out

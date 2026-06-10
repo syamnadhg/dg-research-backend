@@ -73,6 +73,22 @@ def _bridge_authed() -> bool:
     return bool(res and res[1].get("authed"))
 
 
+def _wait_bridge_up(timeout: float = 12.0, interval: float = 0.3) -> bool:
+    """Poll /healthz until the bridge answers, or `timeout` elapses (→ False).
+
+    `start_detached` only LAUNCHES the bridge; it needs a beat to bind its port, so
+    an *immediate* `_bridge_up()` right after starting it false-negatives (the
+    socket isn't listening yet → connection refused). A caller that just started it
+    must WAIT, not glance — otherwise the next step wrongly reports it as down."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if _bridge_up():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
 # ── commands ──────────────────────────────────────────────────────────────
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -89,13 +105,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
-# Chat channels Super Research reaches, shown as a row under the header. The
-# vector glyphs (✆ ✈ ☎) take the brand tint; 💬 is an emoji and stays native.
+# Chat channels Super Research reaches, shown as a row under the header — the
+# channel NAME in its exact brand color (no glyph: a terminal can't render the
+# apps' real SVG logos like the web auth page does, and stand-in emoji look
+# subpar). (name, (r,g,b)): WhatsApp green, Telegram blue, iMessage green, Twilio red.
 _CHANNELS = [
-    ("WhatsApp", "✆", (37, 211, 102)),
-    ("Telegram", "✈", (34, 158, 217)),
-    ("iMessage", "💬", (52, 199, 89)),
-    ("Twilio", "☎", (242, 47, 70)),
+    ("WhatsApp", (37, 211, 102)),
+    ("Telegram", (34, 158, 217)),
+    ("iMessage", (52, 199, 89)),
+    ("Twilio", (242, 47, 70)),
 ]
 
 
@@ -242,8 +260,14 @@ def _startup_step() -> bool:
         b.dim("Start it yourself:  python research.py agent serve")
         return False
     started, serr = autostart.start_detached()
-    if started:
+    # WAIT for it to actually bind before claiming success — else the very next
+    # step ([4/4] Sign in) checks _bridge_up() before the socket is listening and
+    # falsely reports "Bridge isn't running yet".
+    if started and _wait_bridge_up():
         b.ok(f"Pinned to startup ({autostart.kind_label()}) + started in the background.")
+    elif started:
+        b.warn(f"Pinned to startup ({autostart.kind_label()}) — launched, but it's not answering yet.")
+        b.dim("Give it a few seconds; if sign-in says it's not running, run: python research.py agent status")
     else:
         b.warn(f"Pinned to startup, but couldn't start it now: {serr}")
         b.dim("It starts at your next login (or run: python research.py agent serve).")
@@ -512,8 +536,11 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
         return 1
     b.ok(f"Pinned to login ({autostart.kind_label()})")
     started, serr = autostart.start_detached()
-    if started:
+    if started and _wait_bridge_up():
         b.ok("Bridge started in the background")
+    elif started:
+        b.warn("Bridge launched, but it's not answering yet — give it a few seconds.")
+        b.dim("Check it: python research.py agent status")
     else:
         b.warn(f"Pinned, but couldn't start it now: {serr}")
         b.dim("It starts at your next login (or run: python research.py agent serve).")

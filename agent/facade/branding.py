@@ -133,15 +133,19 @@ def brand_mark(icon: str, color_rgb: tuple[int, int, int], label: str, suffix: s
     return f"{glyph}  {name}{tail}"
 
 
-def channels(items: list[tuple[str, str, tuple[int, int, int]]]) -> None:
-    """A decorative row of the chat channels Super Research reaches, under the
-    header — each a brand-colored glyph + name. (Vector glyphs take the tint;
-    emoji render native.) items = (name, glyph, (r,g,b))."""
+def channels(items: list[tuple[str, tuple[int, int, int]]]) -> None:
+    """A row of the chat channels Super Research reaches, under the header — each
+    the channel NAME in its exact brand color (TrueColor), no glyph.
+
+    A terminal can't render the apps' real SVG logos (the way the web auth page
+    does), and stand-in emoji/vector glyphs read as subpar — so we show clean
+    brand-colored wordmarks instead, spaced apart (the colors do the separating;
+    no glyph or punctuation that could mojibake). items = (name, (r,g,b))."""
     if not items:
         return
-    chips = [f"{c(rgb(*col), glyph)} {c(rgb(*col), name)}" for name, glyph, col in items]
+    chips = [c(rgb(*col), name) for name, col in items]
     print()
-    print(f"  {c(_DIM, 'reach it from')}   " + "   ".join(chips))
+    print(f"  {c(_DIM, 'reach it from')}   " + "    ".join(chips))
 
 
 def next_actions(items: list[tuple[str, str]]) -> None:
