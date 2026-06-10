@@ -219,8 +219,26 @@ def test_cmd_disconnect_skips_teardown_prompt_when_nothing_pinned(monkeypatch):
     monkeypatch.setattr(cli, "_bridge_up", lambda: False)
     asked = {"v": False}
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: asked.__setitem__("v", True) or True)
-    assert cli.cmd_disconnect(_ns()) == 0
-    assert asked["v"] is False  # prompt skipped entirely
+    rv, out = _cap(cli.cmd_disconnect, _ns())
+    assert rv == 0
+    assert asked["v"] is False        # prompt skipped entirely
+    assert "retire" not in out        # …and no stale 'retire' hint (nothing to retire)
+
+
+def test_cmd_disconnect_next_omits_retire_after_teardown(monkeypatch):
+    # Tore the bridge down → `retire` is done, so don't suggest it again.
+    _disconnect_teardown_fixture(monkeypatch)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)
+    _, out = _cap(cli.cmd_disconnect, _ns())
+    assert "retire" not in out
+
+
+def test_cmd_disconnect_next_shows_retire_only_when_bridge_kept(monkeypatch):
+    # Declined teardown → a running bridge was kept → `retire` is the follow-up.
+    _disconnect_teardown_fixture(monkeypatch)
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
+    _, out = _cap(cli.cmd_disconnect, _ns())
+    assert "retire" in out
 
 
 # ── reachability: _ensure_reachable / _ensure_wsl_networking ──────────────────

@@ -475,17 +475,20 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     # anyway (install + pin + sign-in) — so keeping it serves only an immediate
     # re-connect (the `n` path). Ctrl-C → confirm() is False → bridge left running
     # (safe). Skip the prompt entirely when there's nothing to tear down.
-    retired = False
+    kept_bridge = False  # set only if the user DECLINED tearing down a running bridge
     if autostart.is_installed() or _bridge_up():
         print()
         if b.confirm("Also stop the background bridge + remove it from startup?", default=True):
             _retire_bridge()
-            retired = True
         else:
+            kept_bridge = True
             b.dim("Left the background bridge running (it returns on login).")
 
+    # Suggest `retire` ONLY when a running bridge was deliberately kept — never when
+    # it was just torn down, and never when there was nothing to tear down (a stale
+    # 'retire' hint when the bridge is already gone reads as unfinished cleanup).
     nexts = [("python research.py agent connect", "reconnect a runtime")]
-    if not retired:
+    if kept_bridge:
         nexts.append(("python research.py agent retire", "stop + unpin the background bridge"))
     b.next_actions(nexts)
     return 0
