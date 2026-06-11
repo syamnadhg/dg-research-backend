@@ -54,6 +54,16 @@ active** run. **Confirm before `stop` and `logout`** (they end / sign out a real
 session) — a quick "Stop the EV run?" is enough. Everything else is safe to run
 on a clear request. Explicit `/sr <command> …` forms always work too.
 
+**Voice messages count as typed text.** A voice note reaches you transcribed,
+wrapped like `[The user sent a voice message~ Here's what they said: "…"]` —
+treat the quoted transcript exactly as if the user typed it: extract the intent
+from the table above and act ("do a super research on the EV battery market"
+spoken aloud starts that run, same as typed). Strip obvious speech artifacts
+("uh", fillers, trailing punctuation) from a research topic but keep its
+substance, and echo the topic back in your confirmation so the user can catch a
+mis-transcription. If the transcript is too garbled to extract a clear topic or
+action, ask — don't guess. The same stop/logout confirmation rule applies.
+
 ## A bare `/sr` — start here
 
 When the user sends just **`/sr`** (or asks what Super Research is / how to
