@@ -65,11 +65,15 @@ def _get_updates() -> list:
     return body.get("runs", []) if isinstance(body, dict) else []
 
 
-def _load_state() -> dict:
+def _load_state() -> dict | None:
+    """The persisted last-seen state, or None when there is none (first tick
+    after arming, or an unreadable/corrupt file). None signals compute() to
+    BASELINE silently instead of replaying all recent history into the chat."""
     try:
-        return json.loads(_STATE_FILE.read_text("utf-8")) or {}
+        data = json.loads(_STATE_FILE.read_text("utf-8"))
+        return data if isinstance(data, dict) else None
     except Exception:
-        return {}
+        return None
 
 
 def _save_state(state: dict) -> None:
@@ -108,8 +112,20 @@ def _run_lines(run: dict, prior: dict) -> list[str]:
     return lines
 
 
-def compute(runs: list, prior_state: dict) -> tuple[list[str], dict]:
-    """Pure core (unit-tested): (chat lines to post, new state to persist)."""
+# Statuses that are genuinely "stuck mid-flight" — the only blockers worth
+# raising on the BASELINE tick. A long-dead errored run from days ago is
+# history the user already saw; re-alerting it on every arm would be noise.
+_LIVE_STUCK = ("queued", "ongoing", "paused_backend_restart", "paused_backend_restart_failed")
+
+
+def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[list[str], dict]:
+    """Pure core (unit-tested): (chat lines to post, new state to persist).
+
+    ``baseline=True`` = the first tick after arming (no state yet): record
+    everything SILENTLY instead of replaying recent history (up to 20 runs'
+    links + finish notices would otherwise flood the chat) — but still raise a
+    blocker on a run that is stuck RIGHT NOW, since that's actionable and is
+    exactly what the watchdog exists for."""
     out: list[str] = []
     new_state: dict = {}
     for run in runs:
@@ -117,8 +133,22 @@ def compute(runs: list, prior_state: dict) -> tuple[list[str], dict]:
         if not rid:
             continue
         prior = prior_state.get(rid, {})
-        out.extend(_run_lines(run, prior))
+        emit_prior = prior
+        if baseline:
+            # Synthesize an "already seen everything" prior so links + terminal
+            # notices stay silent; leave `needs` unseen ONLY for a live-stuck
+            # run so its blocker still posts now.
+            live_stuck = run.get("status") in _LIVE_STUCK
+            emit_prior = {
+                "links": [lk.get("kind") for lk in (run.get("links") or []) if lk.get("kind")],
+                "announced_terminal": True,
+                "needs": bool(run.get("needsAttention")) and not live_stuck,
+                "attention": run.get("attention") or "",
+            }
+        out.extend(_run_lines(run, emit_prior))
         status = run.get("status")
+        # NB: the persisted record uses the REAL prior (empty at baseline), so a
+        # run that's ongoing at baseline still gets its completion announced.
         new_state[rid] = {
             "status": status,
             "needs": bool(run.get("needsAttention")),
@@ -140,7 +170,8 @@ def main() -> int:
         # Bridge down / unreachable — stay SILENT (exit 0). A non-zero exit would
         # trip the cron error alert every minute while the host bridge is off.
         return 0
-    lines, new_state = compute(runs, _load_state())
+    prior = _load_state()
+    lines, new_state = compute(runs, prior or {}, baseline=prior is None)
     _save_state(new_state)
     if lines:
         print("\n".join(lines))

@@ -114,13 +114,16 @@ If `sr.py status-account` says "Not signed in", guide the user through `/sr
 login` before running research. They pick a device with `/sr device` (skipped
 automatically if they have exactly one).
 
-## Streaming a run's progress (arm a watchdog once)
+## Streaming a run's progress (arm the watchdog at sign-in)
 
 The runtime does **not** wake you on a timer — so to push progress + alerts into
-this chat while a run executes unattended, arm a small recurring **cron watchdog**
-the first time the user starts a run (or asks for live updates). It runs a bundled
-script that, each minute, posts only what's **new** and stays silent otherwise —
-no spam, no tokens.
+this chat the moment they happen (instead of the user having to ask for status),
+arm a small recurring **cron watchdog** **right after a successful `/sr login`**.
+It covers **every** run on the account — including ones started from the web app
+— and runs a bundled script that, each minute, posts only what's **new** and
+stays silent otherwise: no spam, no tokens. Its very first tick baselines
+quietly (it never replays old history into the chat; it only raises a run that
+is stuck right now).
 
 1. Check it isn't already armed: `cronjob(action="list")` — look for a job named
    `sr-stream`.
@@ -130,10 +133,12 @@ no spam, no tokens.
    (`agent connect` already placed `sr_attention_poll.py` in the scripts dir. If
    create fails with a missing-script error, tell the user to re-run `agent
    connect` on the host.)
-3. The watchdog then posts on its own:
+   Also re-check/arm whenever a research starts, in case sign-in happened
+   elsewhere or the job was removed.
+3. The watchdog then posts on its own — the user never needs to ask:
    - each new phase link as it lands (Brief → ChatGPT / Gemini / Claude →
      NotebookLM + Audio → YouTube → the final Doc),
-   - **⚠ "<title>" needs you: <reason>** when a run is blocked — the user can
+   - **⚠ "<title>" needs you: <reason>** the moment a run blocks — the user can
      reply **"retry"** / **"skip"** right here, or open the app (some blockers —
      signing in to an AI, a "are you human" check — need an on-device step first,
      then "retry"),

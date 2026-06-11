@@ -74,3 +74,60 @@ def test_user_stop_is_not_an_error():
 def test_runs_without_id_are_ignored():
     msgs, state = poll.compute([{"title": "no id", "status": "ongoing", "links": []}], {})
     assert msgs == [] and state == {}
+
+
+# ── baseline (the first tick after arming): silent on history, loud on live ──
+
+def test_baseline_first_tick_is_silent_on_history():
+    # Arming must NOT replay recent history (old links + finish notices) into
+    # the chat — up to 20 runs' worth would flood it.
+    runs = [
+        {"runId": "old", "title": "Old run", "status": "completed",
+         "links": [{"kind": "brief", "url": "u-b"}, {"kind": "doc", "url": "u-d"}]},
+        {"runId": "live", "title": "Live run", "status": "ongoing",
+         "links": [{"kind": "brief", "url": "u-b2"}]},
+    ]
+    msgs, state = poll.compute(runs, {}, baseline=True)
+    assert msgs == []  # fully silent
+    # …but the delta machinery still works from here: a NEW link posts.
+    runs[1]["links"].append({"kind": "chatgpt", "url": "u-c"})
+    msgs2, state2 = poll.compute(runs, state)
+    assert len(msgs2) == 1 and "u-c" in msgs2[0]
+    # …and the live run's eventual completion IS announced (baseline must not
+    # pre-mark an ongoing run as already-announced).
+    runs[1]["status"] = "completed"
+    msgs3, _ = poll.compute(runs, state2)
+    assert any("finished" in m for m in msgs3)
+
+
+def test_baseline_still_raises_a_live_blocker():
+    # A run stuck RIGHT NOW is exactly what the watchdog is for — it must post
+    # even on the baseline tick.
+    runs = [{"runId": "r1", "title": "EV", "status": "ongoing",
+             "links": [{"kind": "brief", "url": "u-b"}],
+             "needsAttention": True, "attention": "Sign in to ChatGPT"}]
+    msgs, state = poll.compute(runs, {}, baseline=True)
+    assert len(msgs) == 1  # the blocker only — the old link stays silent
+    assert "needs you" in msgs[0] and "Sign in to ChatGPT" in msgs[0]
+    msgs2, _ = poll.compute(runs, state)  # next tick, unchanged → silent
+    assert msgs2 == []
+
+
+def test_baseline_skips_stale_terminal_blockers():
+    # A long-dead errored run is history the user already saw — re-alerting it
+    # on every arm would be noise.
+    runs = [{"runId": "r1", "title": "Old fail", "status": "error", "links": [],
+             "needsAttention": True, "attention": "the run hit an error"}]
+    msgs, _ = poll.compute(runs, {}, baseline=True)
+    assert msgs == []
+
+
+def test_load_state_none_on_missing_and_corrupt(tmp_path, monkeypatch):
+    # No file AND a corrupt file must both trigger baseline (None) — a corrupt
+    # state treated as "empty but valid" would replay all history.
+    monkeypatch.setattr(poll, "_STATE_FILE", tmp_path / "state.json")
+    assert poll._load_state() is None  # missing
+    (tmp_path / "state.json").write_text("{not json", encoding="utf-8")
+    assert poll._load_state() is None  # corrupt
+    (tmp_path / "state.json").write_text('{"r1": {"status": "ongoing"}}', encoding="utf-8")
+    assert poll._load_state() == {"r1": {"status": "ongoing"}}  # valid
