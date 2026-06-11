@@ -15,7 +15,9 @@ or two from the topic) or run-id; omit it to mean the most recent / active run:
   login-wait         poll until the sign-in is approved / expires
   status-account     is the bridge up + signed in?
   devices            list reachable devices
-  device-use <id>    choose the device runs go to
+  device-use <name>  choose the device runs go to (name or id)
+  device-add <code>  pair a new device by the code on its screen
+  device-remove <name>  unlink a device (owner keeps it re-pairable; sharer leaves)
   research <topic>   start a run (--device <id> to override the selected device)
   status [run]       a run's progress + links + any blocker (no run = most recent)
   podcast [run]      download a run's audio → a local file to send as native audio
@@ -176,6 +178,38 @@ def _device_names() -> dict:
             for d in body.get("devices", [])}
 
 
+def _dev_label(d: dict) -> str:
+    return d.get("name") or d.get("hostname") or d.get("id") or "device"
+
+
+def _resolve_device_arg(arg: str) -> tuple[dict | None, list[str]]:
+    """A device NAME (or id) → the device dict. Exact id wins; else exact
+    case-insensitive name/hostname; else a unique substring match. Returns
+    (device, chat-lines-to-print-on-failure) — exactly one is set."""
+    code, body = _get("/devices")
+    if code != 200 or not isinstance(body, dict):
+        return None, [f"✗ {body.get('error', code)}"]
+    devices = body.get("devices", [])
+    if not devices:
+        return None, ["No devices on this account yet — add one with: device add <pair code>"]
+    a = arg.strip().lower()
+    for d in devices:
+        if a == (d.get("id") or "").lower():
+            return d, []
+    exact = [d for d in devices
+             if a == (d.get("name") or "").lower() or a == (d.get("hostname") or "").lower()]
+    if len(exact) == 1:
+        return exact[0], []
+    sub = exact or [d for d in devices
+                    if a in (d.get("name") or "").lower() or a in (d.get("hostname") or "").lower()]
+    if len(sub) == 1:
+        return sub[0], []
+    if sub:
+        names = ", ".join(f"“{_dev_label(d)}”" for d in sub)
+        return None, [f"That matches more than one device ({names}) — say the full name."]
+    return None, [f"No device matching “{arg}” — say “devices” to see them."]
+
+
 def _attention_lines(r: dict) -> list[str]:
     """Chat lines for a run that needs the user (C1). `r` is a run row (/updates)
     or a full research doc (/research/{id}); both may carry pendingDecision /
@@ -240,24 +274,80 @@ def cmd_devices(args) -> int:
     devices = body.get("devices", [])
     selected = body.get("selectedDeviceId")
     if not devices:
-        return _emit(body, args.json, ["No devices reachable by this account."])
+        return _emit(body, args.json, [
+            "No devices on this account yet.",
+            "On the computer running Super Research, grab the pair code from its "
+            "screen, then tell me:  device add <code>",
+        ])
     lines = ["Devices:"]
     for d in devices:
         mark = "→" if d.get("selected") else " "
         kind = "owned" if d.get("owned") else "shared"
-        lines.append(f"  {mark} {d.get('name') or d.get('id')}  ({kind})  id={d.get('id')}")
+        lines.append(f"  {mark} {_dev_label(d)}  ({kind})")
     if not selected:
-        lines.append("Pick one:  device-use <id>")
+        lines.append("Pick one:  device use <name>")
     return _emit(body, args.json, lines)
 
 
 def cmd_device_use(args) -> int:
-    code, body = _post("/device/select", {"deviceId": args.deviceId})
+    dev, fail = _resolve_device_arg(args.device)
+    if dev is None:
+        return _emit({}, args.json, fail, 1)
+    code, body = _post("/device/select", {"deviceId": dev.get("id")})
     if code != 200:
         return _emit(body, args.json, [f"✗ couldn't select device: {body.get('error', code)}"], _fail_code(code))
     d = body.get("device", {})
     kind = "owned" if d.get("owned") else "shared"
-    return _emit(body, args.json, [f"✓ Now running on {d.get('name') or d.get('id')} ({kind})."])
+    return _emit(body, args.json, [f"✓ Now running on {_dev_label(d)} ({kind})."])
+
+
+# Friendly wording for the web app's claim/unpair error codes.
+_PAIR_ERRORS = {
+    "invalid_code_format": "Pair codes are 8 letters/digits (like K7XQ-9B2M) — check the device's screen.",
+    "code_not_found": "That code didn’t match any device — re-check it on the device’s screen.",
+    "code_expired": "That code expired — reset the pair code on the device and try the fresh one.",
+    "not_previous_owner": "That device is waiting for its previous owner to re-pair — only they can.",
+    "revoked_sharer": "The owner removed your access to that device — ask them to share it again.",
+    "share_cap_reached": "That device has reached its sharer limit.",
+    "rate_limited": "Too many attempts — wait a few minutes and try again.",
+}
+
+
+def cmd_device_add(args) -> int:
+    """Pair a device to this account by the code shown on its screen."""
+    code, body = _post("/device/pair", {"code": args.code})
+    if code != 200:
+        err = body.get("error", "")
+        msg = _PAIR_ERRORS.get(err, f"couldn’t add the device: {err or code}")
+        return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
+    action = body.get("action")
+    name = body.get("deviceName") or "the new device"
+    if action in ("already-owner", "already-shared"):
+        return _emit(body, args.json, [f"“{name}” is already on your account."])
+    kind = "yours" if action in ("initial-pair", "re-pair") else "shared with you"
+    lines = [f"✓ Added “{name}” — it’s {kind} now."]
+    if body.get("selected"):
+        lines.append("It’s selected — say “research <topic>” to start.")
+    return _emit(body, args.json, lines)
+
+
+def cmd_device_remove(args) -> int:
+    """Unlink a device (owner: device stays installed + re-pairable; sharer: leaves it)."""
+    dev, fail = _resolve_device_arg(args.device)
+    if dev is None:
+        return _emit({}, args.json, fail, 1)
+    code, body = _post("/device/remove", {"deviceId": dev.get("id")})
+    if code != 200:
+        err = body.get("error", "")
+        msg = _PAIR_ERRORS.get(err, f"couldn’t remove the device: {err or code}")
+        return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
+    label = _dev_label(dev)
+    if body.get("action") == "left-shared":
+        return _emit(body, args.json, [f"✓ Left the shared device “{label}”."])
+    return _emit(body, args.json, [
+        f"✓ Unlinked “{label}” from your account.",
+        "(Nothing was deleted — the device keeps running and can be re-paired with its code.)",
+    ])
 
 
 def cmd_research(args) -> int:
@@ -442,9 +532,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status-account", help="bridge + session status").set_defaults(func=cmd_status_account)
     sub.add_parser("devices", help="list reachable devices").set_defaults(func=cmd_devices)
 
-    du = sub.add_parser("device-use", help="select the target device")
-    du.add_argument("deviceId")
+    du = sub.add_parser("device-use", help="select the target device (by name or id)")
+    du.add_argument("device")
     du.set_defaults(func=cmd_device_use)
+
+    da = sub.add_parser("device-add", help="pair a device by the code on its screen")
+    da.add_argument("code")
+    da.set_defaults(func=cmd_device_add)
+
+    dr = sub.add_parser("device-remove", help="unlink a device (by name or id)")
+    dr.add_argument("device")
+    dr.set_defaults(func=cmd_device_remove)
 
     rs = sub.add_parser("research", help="start a run")
     rs.add_argument("topic")

@@ -389,6 +389,29 @@ def _sr_links(doc: dict) -> dict:
     return out
 
 
+def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int, dict]:
+    """POST a web-app API route (`{FE_BASE}{path}`) as the signed-in USER —
+    the same Bearer-ID-token calls the browser makes. Used for the device
+    pair/unpair routes, which MUST go through the app's admin-SDK handlers
+    (Firestore rules deliberately block owner/sharer writes to ownerUid /
+    sharedWith). Returns (status, decoded-json|{}); never raises — transport
+    failures come back as (0, {"error": …}) for the caller to surface."""
+    try:
+        r = requests.post(
+            f"{config.FE_BASE}{path}",
+            json=payload,
+            headers={"Authorization": f"Bearer {sess.id_token()}"},
+            timeout=20,
+        )
+        try:
+            body = r.json() if r.content else {}
+        except ValueError:
+            body = {}
+        return r.status_code, body if isinstance(body, dict) else {}
+    except requests.RequestException as e:
+        return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
+
+
 def _attention_text(r: dict) -> str | None:
     """A short, human reason a run needs the user — or None if it's fine.
     Prefers the durable pendingDecision (the snag/login/verify card the BE
@@ -724,6 +747,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._logout()
             elif path == "/device/select":
                 self._device_select()
+            elif path == "/device/pair":
+                self._device_pair()
+            elif path == "/device/remove":
+                self._device_remove()
             elif path == "/research":
                 self._research()
             elif path.startswith("/research/") and path.endswith("/stop"):
@@ -1002,6 +1029,85 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             log.info("selected device %s", device_id)
             self._json(200, {"ok": True, "device": match})
 
+        def _device_pair(self) -> None:
+            """Pair a device to this account by its PAIR CODE (the chat
+            `device add <code>`). Forwards to the web app's /api/devices/claim
+            as the signed-in user — identical security to pairing in the web
+            app: the 8-char code only exists on the new device's screen, so
+            possession of a valid code IS the authorization. First claim of a
+            fresh device → this account becomes the OWNER; claiming an
+            already-owned device → this account becomes a SHARER. The app
+            route enforces format, rate limits, expiry, and the revoked-sharer
+            blocklist — errors are relayed for the chat client to word."""
+            code = (self._read_json().get("code") or "").strip()
+            if not code:
+                self._json(400, {"error": "code is required"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            status, body = _fe_api_post(sess, "/api/devices/claim", {"code": code})
+            if status == 0:
+                self._json(502, body)
+                return
+            if status != 200 or not body.get("ok"):
+                self._json(status if status >= 400 else 502,
+                           {"error": body.get("error") or f"claim failed (HTTP {status})",
+                            "retryAfterMs": body.get("retryAfterMs")})
+                return
+            device_id = body.get("deviceId") or ""
+            # Auto-select the new device when nothing is selected yet, so a
+            # zero-device user can fire research immediately after pairing.
+            auto_selected = False
+            if device_id and not prefs.get_selected_device(sess.uid):
+                prefs.set_selected_device(device_id, sess.uid)
+                auto_selected = True
+            # Name it for the chat reply (best-effort — a just-paired device
+            # may take a heartbeat to appear in the list).
+            name = None
+            try:
+                devs = fs.list_devices(sess.uid)
+                match = next((d for d in devs if d.get("id") == device_id), None)
+                if match:
+                    name = match.get("name") or match.get("hostname")
+            except Exception:
+                pass
+            log.info("device pair: %s (%s)", device_id, body.get("action"))
+            self._json(200, {"ok": True, "action": body.get("action"),
+                             "deviceId": device_id, "deviceName": name,
+                             "selected": auto_selected})
+
+        def _device_remove(self) -> None:
+            """Unlink a device from this account (the chat `device remove`).
+            Forwards to the web app's /api/devices/unpair-self, which branches
+            on the caller's relationship: OWNER → owner-unlink (the device doc
+            + its install stay alive; re-pairable with its code — nothing is
+            destroyed), SHARER → removes themself from sharedWith. The chat
+            client confirms with the user BEFORE calling this."""
+            device_id = (self._read_json().get("deviceId") or "").strip()
+            if not device_id:
+                self._json(400, {"error": "deviceId is required"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, _fs = acct
+            status, body = _fe_api_post(sess, "/api/devices/unpair-self", {"deviceId": device_id})
+            if status == 0:
+                self._json(502, body)
+                return
+            if status != 200 or not body.get("ok"):
+                self._json(status if status >= 400 else 502,
+                           {"error": body.get("error") or f"unlink failed (HTTP {status})",
+                            "retryAfterMs": body.get("retryAfterMs")})
+                return
+            # Don't leave a dangling selection pointing at the removed device.
+            if prefs.get_selected_device(sess.uid) == device_id:
+                prefs.clear_selected_device()
+            log.info("device remove: %s (%s)", device_id, body.get("action"))
+            self._json(200, {"ok": True, "action": body.get("action"), "deviceId": device_id})
+
         def _resolve_device(self, body: dict[str, Any], sess: AccountSession,
                             fs: FirestoreRest) -> str | None:
             """Resolve the target device for a run: explicit body.deviceId →
@@ -1025,16 +1131,20 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if selected:
                 if selected in ids:
                     return selected
-                self._json(409, {"error": "selected device no longer reachable — re-select with /device"})
+                self._json(409, {"error": "selected device no longer reachable — "
+                                          "pick another from the device list"})
                 return None
             if len(devs) == 1:
                 did = devs[0].get("id")
                 if did:
                     return did
             if not devs:
-                self._json(400, {"error": "no devices reachable by this account"})
+                # Relayed verbatim into chat — make it the next step, not a dead end.
+                self._json(400, {"error": "no devices yet — on the computer running "
+                                          "Super Research, grab the pair code from its "
+                                          "screen and add it here (device add <code>)"})
                 return None
-            self._json(400, {"error": "no device selected — choose one with /device"})
+            self._json(400, {"error": "no device selected — pick one from the device list"})
             return None
 
         def _research(self) -> None:

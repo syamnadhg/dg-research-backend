@@ -3,18 +3,21 @@ name: sr
 description: >-
   Run Super Research from chat. Invoke with /sr (or just ask naturally) to
   research a topic, run a deep-research report, get a brief / podcast / audio
-  overview / video on a subject, or to check, track, skip, stop, or resume a
-  Super Research run, or to sign in. A bare /sr is the welcome + help. Drives the
-  user's OWN Super Research account (research-only) on their existing devices;
-  every run shows up in their web app as a normal chat.
+  overview / video on a subject, to check, track, skip, stop, or resume a
+  Super Research run, to sign in, or to manage devices (list, switch, add by
+  pair code, remove). A bare /sr is the welcome + help. Drives the user's OWN
+  Super Research account; every run shows up in their web app as a normal chat.
 platforms: [linux, macos, windows]
 ---
 
 # Super Research (from chat) — `/sr`
 
 You operate the user's **own** Super Research account through a local bridge. You
-can **run, track, stop, and resume** research; you can **never** control devices
-(add / remove / pair / share) — that stays owner-only in the web app.
+can **run, track, stop, and resume** research, and manage the account's
+**devices**: list, switch, **add by pair code** (the code shown on the device's
+own screen — possession of the code is the authorization), and **remove/unlink**
+(confirm first). Sharing a device with OTHER people, revoking sharers, and
+resetting a device stay owner-only in the web app.
 
 You are invoked as the single command **`/sr`**. Whatever follows `/sr` — or
 whatever the user says next in this conversation — is the **action**. Read their
@@ -47,13 +50,18 @@ or say nothing to mean the most recent / active run.
 | "skip the video and the report" | `sr.py skip video report [--run "<title>"]` |
 | "sign in", "connect", "log me in" | `sr.py login` |
 | "sign out", "disconnect me from the agent" | `sr.py logout` |
-| "which devices?", "run it on my laptop" | `sr.py devices` / `sr.py device-use <id>` |
+| "which devices?", "which device are we using?" | `sr.py devices` (the → marks the selected one) |
+| "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
+| "add a device", "pair my new PC, code is K7XQ-9B2M" | `sr.py device-add <code>` |
+| "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome + the list |
 
 **Safe defaults:** when the user doesn't name a run, act on the **most recent
-active** run. **Confirm before `stop` and `logout`** (they end / sign out a real
-session) — a quick "Stop the EV run?" is enough. Everything else is safe to run
-on a clear request. Explicit `/sr <command> …` forms always work too.
+active** run. **Confirm before `stop`, `logout`, and `device-remove`** (they end
+/ sign out / unlink something real) — a quick "Stop the EV run?" / "Unlink
+'Office PC'?" is enough. Everything else is safe to run on a clear request.
+Devices are named by their **name** (or hostname) — never make the user type an
+id. Explicit `/sr <command> …` forms always work too.
 
 **Voice messages count as typed text.** A voice note reaches you transcribed,
 wrapped like `[The user sent a voice message~ Here's what they said: "…"]` —
@@ -76,11 +84,12 @@ start), run `sr.py status-account`, then:
   them at **"research <topic>"** to start (and **"which devices?"** to choose
   where it runs).
 
-The actions (all **research-only** — Super Research can never add, remove, pair,
-or share devices; that stays in the web app):
+The actions (sharing a device with other people, revoking sharers, and resets
+stay owner-only in the web app):
 
 - **sign in / out** — `/sr login` · `/sr logout`
-- **devices** — `/sr device` · `/sr device use <id>` to switch
+- **devices** — "which devices?" · switch by name · "add a device" (pair code) ·
+  "remove <name>"
 - **research a topic** — "research <topic>"
 - **check a run** — "status" (most recent) or "status <title>"
 - **what's running** — "updates"
@@ -95,8 +104,10 @@ or share devices; that stays in the web app):
 |---|---|---|
 | login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in** to Super Research, then **click Authenticate** to connect (it turns amber → green) — then run `sr.py login-wait` (repeat every few seconds while it says "still waiting"). |
 | logout | `sr.py logout` | **Confirm first**, then run. Removes the agent from their account. |
-| device (list) | `sr.py devices` | Relay the list. To switch: `sr.py device-use <id>`. |
-| device use `<id>` | `sr.py device-use <id>` | Relay. |
+| device (list) | `sr.py devices` | Relay the list (names; → = selected). |
+| device use `<name>` | `sr.py device-use "<name>"` | Switch where research runs. Name or hostname — it resolves; on an ambiguous name it lists the matches, relay that. |
+| device add `<code>` | `sr.py device-add <code>` | Pair a new device. The 8-char code is shown on the device's own Super Research screen (the user reads it to you — accept it with or without dashes). First pair = they own it; pairing someone else's device = shared with them. If it's their first device it auto-selects, so research can start right away. |
+| device remove `<name>` | `sr.py device-remove "<name>"` | **Confirm first** ("Unlink 'Office PC'?"). Owner: unlinks — the device keeps running and can be re-paired with its code (nothing deleted). Sharer: leaves the shared device. |
 | research `<topic>` | `sr.py research "<topic>"` | Relay (it names the run by title + device), then **stream** (below). |
 | status `[title]` | `sr.py status ["<title>"]` | Relay status + links + any **⚠ Needs you** blocker. No title = most recent. |
 | updates | `sr.py updates` | Relay all active runs + their links + any that need attention. |
@@ -135,6 +146,12 @@ or share devices; that stays in the web app):
 If `sr.py status-account` says "Not signed in", guide the user through `/sr
 login` before running research. They pick a device with `/sr device` (skipped
 automatically if they have exactly one).
+
+**No devices on the account** (a fresh account, or research errors with "no
+devices yet"): walk them through adding one — Super Research must be installed
+and running on a computer; its screen shows an 8-char **pair code**; they read
+it to you and you run `sr.py device-add <code>`. It auto-selects as their first
+device, so "research <topic>" works immediately after.
 
 ## Streaming a run's progress (arm the watchdog at sign-in)
 
@@ -175,8 +192,10 @@ progress, not a replacement for a direct question.
 
 ## Safety
 
-- Confirm before **stop** (it stops a real run) and **logout** (it signs the
-  agent out of their account).
+- Confirm before **stop** (it stops a real run), **logout** (it signs the agent
+  out of their account), and **device remove** (it unlinks a real device —
+  though nothing is deleted: an owner's device keeps running and re-pairs with
+  its code).
 - `stop` is graceful — it keeps partial results and the chat. There is **no**
   destructive "delete the chat" action from here.
 - Never ask for or handle passwords / tokens — sign-in happens on the user's own

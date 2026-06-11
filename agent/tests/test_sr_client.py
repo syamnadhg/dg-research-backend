@@ -75,6 +75,7 @@ class FakeFS:
 @pytest.fixture()
 def bridge_port(monkeypatch):
     FakeFS.researches = {}
+    FakeFS.devices = [{"id": "dev-a", "name": "My PC", "ownerUid": "u1"}]
     FakeFS.last_enqueue = None
     FakeFS.last_cancel = None
     FakeFS.last_command = None
@@ -106,6 +107,70 @@ def test_devices(bridge_port, capsys):
     assert sr.main(["devices"]) == 0
     out = capsys.readouterr().out
     assert "My PC" in out and "owned" in out
+
+
+def test_devices_empty_guides_pairing(bridge_port, capsys):
+    # Zero devices must NOT be a dead end — the user is told how to add one.
+    FakeFS.devices = []
+    assert sr.main(["devices"]) == 0
+    out = capsys.readouterr().out
+    assert "device add" in out and "pair code" in out
+
+
+def test_device_use_by_name(bridge_port, capsys):
+    # Switching takes the NAME (case-insensitive), never makes the user type an id.
+    FakeFS.devices = [{"id": "dev-a", "name": "My PC", "ownerUid": "u1"},
+                      {"id": "dev-b", "name": "Office PC", "ownerUid": "u1"}]
+    assert sr.main(["device-use", "office pc"]) == 0
+    assert "Office PC" in capsys.readouterr().out
+
+
+def test_device_use_ambiguous_name_lists_matches(bridge_port, capsys):
+    FakeFS.devices = [{"id": "dev-a", "name": "My PC", "ownerUid": "u1"},
+                      {"id": "dev-b", "name": "Office PC", "ownerUid": "u1"}]
+    assert sr.main(["device-use", "pc"]) == 1  # substring hits both
+    out = capsys.readouterr().out
+    assert "more than one device" in out and "My PC" in out and "Office PC" in out
+
+
+def test_device_add_pairs_and_autoselects(bridge_port, monkeypatch, capsys):
+    # First device: claim forwards to the web app route; the bridge auto-selects
+    # it so research can start immediately.
+    calls = {}
+    def fake_fe(sess, path, payload):
+        calls["path"], calls["payload"] = path, payload
+        return 200, {"ok": True, "action": "initial-pair", "deviceId": "dev-new"}
+    monkeypatch.setattr(bridge, "_fe_api_post", fake_fe)
+    FakeFS.devices = [{"id": "dev-new", "name": "New Laptop", "ownerUid": "u1"}]
+    assert sr.main(["device-add", "K7XQ-9B2M"]) == 0
+    out = capsys.readouterr().out
+    assert calls["path"] == "/api/devices/claim"
+    assert calls["payload"] == {"code": "K7XQ-9B2M"}  # server normalizes dashes
+    assert "Added" in out and "New Laptop" in out
+    assert "selected" in out  # auto-selected as the first device
+
+
+def test_device_add_friendly_errors(bridge_port, monkeypatch, capsys):
+    monkeypatch.setattr(bridge, "_fe_api_post",
+                        lambda sess, path, payload: (404, {"error": "code_not_found"}))
+    assert sr.main(["device-add", "BADCODE1"]) == 1
+    assert "match any device" in capsys.readouterr().out
+
+
+def test_device_remove_by_name_owner(bridge_port, monkeypatch, capsys):
+    monkeypatch.setattr(bridge, "_fe_api_post",
+                        lambda sess, path, payload: (200, {"ok": True, "action": "owner-unlinked"}))
+    assert sr.main(["device-remove", "my pc"]) == 0
+    out = capsys.readouterr().out
+    assert "Unlinked" in out and "My PC" in out and "re-paired" in out
+
+
+def test_device_remove_sharer_leaves(bridge_port, monkeypatch, capsys):
+    FakeFS.devices = [{"id": "dev-s", "name": "Boss PC", "ownerUid": "other"}]
+    monkeypatch.setattr(bridge, "_fe_api_post",
+                        lambda sess, path, payload: (200, {"ok": True, "action": "left-shared"}))
+    assert sr.main(["device-remove", "boss pc"]) == 0
+    assert "Left the shared device" in capsys.readouterr().out
 
 
 def test_research_then_status(bridge_port, capsys):
