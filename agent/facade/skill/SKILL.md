@@ -40,6 +40,7 @@ or say nothing to mean the most recent / active run.
 | "how's it going?", "status?", "where's the Tesla one at?" | `sr.py status ["<title>"]` |
 | "what's running?", "list my runs" | `sr.py updates` |
 | "send me the podcast", "the audio for the Mars run" | `sr.py podcast ["<title>"]` |
+| "podcast **link**", "link to the brief / ChatGPT doc" | `sr.py status ["<title>"]` → share the 🔒 permanent link (see **Which link to share**) |
 | "stop it", "stop the EV run", "that's enough" | `sr.py stop ["<title>"]` |
 | "retry", "try again", "resume", "I signed in — continue" | `sr.py retry ["<title>"]` |
 | "skip it", "skip this step", "move past the blocker" | `sr.py skip [--run "<title>"]` |
@@ -107,6 +108,27 @@ or share devices; that stays in the web app):
 
 `research` accepts `--no-video` and `--no-email` to skip those phases, and
 `--device <id>` to override the chosen device.
+
+## Which link to share
+
+`sr.py status` prints two groups of links. Pick by what the user asked for:
+
+- **"Send/get me the podcast"** (the audio itself) → run `sr.py podcast` and
+  attach the file as a **native audio / voice message** — never a link, never a
+  file path pasted as text.
+- **"Podcast link" / "link to the brief" / "the ChatGPT (P2) doc" / "share the
+  report"** → give the matching **🔒 permanent link** from the "Permanent links"
+  block (`https://…/shared/doc/…` or `/shared/podcast/…`). These are the same
+  Super Research links embedded in the delivered Google Doc — they never expire
+  and survive even "Revoke All Shares", so they're always safe to hand out.
+  (Brief = the P1 doc; ChatGPT / Gemini / Claude reports = the P2 docs.)
+- The plain 🔗 links (Google Doc brief, chatgpt.com / gemini / claude share
+  pages, NotebookLM, YouTube, the final Doc) are live **progress** links — fine
+  to relay as the run streams, but when the user asks for a link *to keep or
+  share*, prefer the 🔒 permanent one. If no permanent link exists yet (the run
+  hasn't delivered, or an older run), fall back to the plain link and say so.
+- **Never** send a `firebasestorage` / tokenized URL into chat (the client
+  already filters these out — don't dig one out of raw JSON).
 
 ## First-time setup
 

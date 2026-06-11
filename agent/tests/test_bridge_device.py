@@ -324,6 +324,26 @@ def test_updates_active_keeps_needs_attention_runs(live):
     assert r3["needsAttention"] is True and "Sign in" in (r3["attention"] or "")
 
 
+def test_updates_and_status_carry_permanent_sr_links(live):
+    # srShares (the P5-minted permanent share ids) must be projected as full
+    # /shared/{doc,podcast}/<id> URLs on both /updates rows and /research/{id}.
+    base, _ = live
+    FakeFS.researches = {
+        "r1": {"id": "r1", "status": "completed", "phase": 5, "links": {},
+               "srShares": {"podcast": "SP", "brief": "SB", "claude": "SC"}},
+        "r2": {"id": "r2", "status": "ongoing", "links": {}},  # not delivered yet
+    }
+    rows = requests.get(base + "/updates").json()["runs"]
+    r1 = next(r for r in rows if r["runId"] == "r1")
+    assert r1["srLinks"]["podcast"].endswith("/shared/podcast/SP")
+    assert r1["srLinks"]["brief"].endswith("/shared/doc/SB")
+    assert r1["srLinks"]["claude"].endswith("/shared/doc/SC")
+    r2 = next(r for r in rows if r["runId"] == "r2")
+    assert r2["srLinks"] == {}
+    one = requests.get(base + "/research/r1").json()
+    assert one["srLinks"]["podcast"].endswith("/shared/podcast/SP")
+
+
 def test_updates_tolerates_bad_limit(live):
     base, _ = live
     assert requests.get(base + "/updates?limit=999").status_code == 200

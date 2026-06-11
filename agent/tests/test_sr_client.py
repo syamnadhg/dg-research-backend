@@ -213,6 +213,37 @@ def test_skip_blocker_resolves_decision(bridge_port, capsys):
     assert FakeFS.last_command["extra"] == {"agent": "gemini", "decision": "skip"}
 
 
+def test_status_shows_permanent_links_and_hides_tokenized_audio(bridge_port, capsys):
+    # The 🔒 permanent share links (srShares, minted at P5 delivery — the same
+    # never-expiring links embedded in the delivered Google Doc) must surface in
+    # status; the tokenized Storage audio_file URL must NEVER print into chat.
+    FakeFS.researches["agent-d"] = {
+        "id": "agent-d", "title": "EV market", "status": "completed", "phase": 5,
+        "srShares": {"podcast": "SHARE-P", "brief": "SHARE-B", "chatgpt": "SHARE-C"},
+        "links": {
+            "doc": {"url": "https://docs.google.com/document/d/final", "phase": 5},
+            "audio_file": {"url": "https://firebasestorage.googleapis.com/v0/b/x/o/"
+                                  "a.m4a?alt=media&token=SECRET", "phase": 3},
+        },
+    }
+    assert sr.main(["status", "agent-d"]) == 0
+    out = capsys.readouterr().out
+    assert "Permanent links" in out
+    assert "/shared/podcast/SHARE-P" in out and "/shared/doc/SHARE-B" in out
+    assert "Podcast" in out and "Brief" in out and "ChatGPT report" in out
+    assert "docs.google.com" in out          # live progress link still shown
+    assert "token=" not in out               # tokenized Storage URL never reaches chat
+    assert "firebasestorage" not in out
+
+
+def test_status_no_permanent_block_when_not_delivered(bridge_port, capsys):
+    # Pre-delivery runs have no srShares → no empty "Permanent links" header.
+    FakeFS.researches["agent-e"] = {"id": "agent-e", "title": "WIP", "status": "ongoing",
+                                    "phase": 2, "links": {}}
+    assert sr.main(["status", "agent-e"]) == 0
+    assert "Permanent links" not in capsys.readouterr().out
+
+
 def test_status_surfaces_blocker(bridge_port, capsys):
     # C1: a run waiting on the user shows the "Needs you" line + a chat action.
     FakeFS.researches["agent-s"] = {

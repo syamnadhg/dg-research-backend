@@ -88,11 +88,12 @@ def _run_lines(run: dict, prior: dict) -> list[str]:
     title = run.get("title") or run.get("topic") or run.get("runId") or "your run"
     lines: list[str] = []
 
-    # New phase links (dedup by kind).
+    # New phase links (dedup by kind). audio_file is the tokenized Storage URL —
+    # never post it to chat (the podcast is delivered natively via /sr podcast).
     prior_kinds = set(prior.get("links", []))
     for lk in run.get("links", []) or []:
         kind = lk.get("kind")
-        if kind and kind not in prior_kinds:
+        if kind and kind != "audio_file" and kind not in prior_kinds:
             label = lk.get("label") or kind
             lines.append(f"🔗 “{title}”: {label} — {lk.get('url')}")
 

@@ -369,6 +369,26 @@ _ATTENTION_STATUSES = (
 )
 
 
+def _sr_links(doc: dict) -> dict:
+    """Permanent superresearch.io share links for a run, from the ``srShares``
+    map the FE mints at Phase-5 delivery (#741): docType→shareId for the brief +
+    each agent report, plus ``podcast``. These are denormalized SNAPSHOT shares
+    marked permanent — exempt from "Revoke All Shares" — i.e. the same
+    never-breaking links embedded in the delivered Google Doc, and the ones safe
+    to hand out in chat (unlike platform share links, which the user can revoke,
+    or the tokenized Storage audio URL, which must never reach chat at all)."""
+    shares = doc.get("srShares")
+    if not isinstance(shares, dict):
+        return {}
+    out: dict[str, str] = {}
+    for doc_type, share_id in shares.items():
+        if not share_id or not isinstance(share_id, str):
+            continue
+        page = "podcast" if doc_type == "podcast" else "doc"
+        out[doc_type] = f"{config.FE_BASE}/shared/{page}/{share_id}"
+    return out
+
+
 def _attention_text(r: dict) -> str | None:
     """A short, human reason a run needs the user — or None if it's fine.
     Prefers the durable pendingDecision (the snag/login/verify card the BE
@@ -1084,7 +1104,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return
             # `events` = the flattened, ordered per-phase links a streamer dedups
             # by kind (the raw `links` map is also returned for full fidelity).
-            self._json(200, {"research": doc, "events": runview.flatten_links(doc.get("links"))})
+            # `srLinks` = the permanent share links (the ones in the delivered doc).
+            self._json(200, {
+                "research": doc,
+                "events": runview.flatten_links(doc.get("links")),
+                "srLinks": _sr_links(doc),
+            })
 
         def _research_podcast(self, rid: str) -> None:
             """Resolve a run's NotebookLM audio → a local FILE the runtime sends as
@@ -1191,6 +1216,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "phase": r.get("phase"),
                     "updatedAt": r.get("updatedAt"),
                     "links": runview.flatten_links(r.get("links")),
+                    "srLinks": _sr_links(r),
                     "needsAttention": needs,
                     "attention": attention,
                 })

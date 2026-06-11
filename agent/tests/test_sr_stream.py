@@ -71,6 +71,19 @@ def test_user_stop_is_not_an_error():
     assert not any("error" in m for m in msgs)
 
 
+def test_tokenized_audio_link_never_posts():
+    # audio_file = the tokenized Firebase Storage URL — the watchdog must never
+    # post it to chat (the podcast is delivered natively via /sr podcast).
+    runs = [{"runId": "r1", "title": "EV", "status": "ongoing",
+             "links": [{"kind": "audio_file", "url": "https://firebasestorage/x?token=S"},
+                       {"kind": "youtube", "label": "YouTube Video", "url": "u-y"}]}]
+    msgs, state = poll.compute(runs, {})
+    assert len(msgs) == 1 and "u-y" in msgs[0]
+    assert not any("token=" in m for m in msgs)
+    msgs2, _ = poll.compute(runs, state)  # and it never re-surfaces as "new"
+    assert msgs2 == []
+
+
 def test_runs_without_id_are_ignored():
     msgs, state = poll.compute([{"title": "no id", "status": "ongoing", "links": []}], {})
     assert msgs == [] and state == {}

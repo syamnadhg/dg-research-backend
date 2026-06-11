@@ -107,8 +107,32 @@ def _fail_code(http_code: int) -> int:
 def _fmt_links(events: list) -> list[str]:
     out = []
     for e in events or []:
+        # audio_file is the tokenized Firebase Storage URL — it must never reach
+        # chat (the `podcast` command delivers the audio natively instead).
+        if e.get("kind") == "audio_file":
+            continue
         label = e.get("label") or e.get("kind")
         out.append(f"  🔗 {label}: {e.get('url')}")
+    return out
+
+
+_SR_LINK_LABELS = {
+    "brief": "Brief", "chatgpt": "ChatGPT report", "gemini": "Gemini report",
+    "claude": "Claude report", "podcast": "Podcast",
+}
+
+
+def _fmt_sr_links(sr_links: dict) -> list[str]:
+    """The permanent Super Research share links (the ones in the delivered doc —
+    they never expire or get revoked). These are what to hand out when the user
+    asks for "the podcast link" / a doc link."""
+    if not sr_links:
+        return []
+    out = ["  Permanent links (never expire — safe to share):"]
+    for key in ("podcast", "brief", "chatgpt", "gemini", "claude"):
+        url = sr_links.get(key)
+        if url:
+            out.append(f"  🔒 {_SR_LINK_LABELS.get(key, key)}: {url}")
     return out
 
 
@@ -277,6 +301,7 @@ def cmd_status(args) -> int:
     lines = [f"“{title}” — {r.get('status', '?')} (phase {r.get('phase', '?')}){where}"]
     lines += _attention_lines(r)
     lines += _fmt_links(b2.get("events", []))
+    lines += _fmt_sr_links(b2.get("srLinks") or {})
     return _emit(b2, args.json, lines)
 
 
