@@ -31,6 +31,15 @@ python scripts/sr.py <command> [args]
 If a command prints ``✗ bridge unreachable … is `agent serve` running?``, tell
 the user the host bridge isn't running, and stop.
 
+**Hard failure rule — never improvise the research.** If anything about this
+skill is broken — `scripts/sr.py` is missing, running it errors out, the skill
+content/tooling won't load, or the bridge keeps failing — tell the user plainly
+that the Super Research skill isn't correctly installed (fix: re-run
+`agent connect` on the host) and **STOP**. Do **not** attempt to perform the
+research, status, podcast, or any other action yourself in chat — Super Research
+runs on the user's device, not in this conversation, and an improvised answer is
+worse than the one-line error.
+
 ## Talk to it in plain language
 
 The user rarely types exact commands — interpret what they mean and pick the

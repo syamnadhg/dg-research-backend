@@ -39,8 +39,51 @@ def test_install_unknown_runtime_raises(tmp_path):
 def test_runtime_dest_paths(tmp_path):
     h = connect.runtime_dest("hermes", home=tmp_path)
     o = connect.runtime_dest("openclaw", home=tmp_path)
-    assert h == tmp_path / ".hermes" / "skills" / "research" / "super-research"
-    assert o == tmp_path / ".openclaw" / "workspace" / "skills" / "super-research"
+    assert h == tmp_path / ".hermes" / "skills" / "research" / "sr"
+    assert o == tmp_path / ".openclaw" / "workspace" / "skills" / "sr"
+
+
+def test_dir_leaf_matches_frontmatter_name():
+    # THE INVARIANT (2026-06-11 E2E failure): the gateway advertises a skill by
+    # its frontmatter `name:` but LOADS it by directory name — a mismatch makes
+    # the skill unloadable ("Skill 'sr' not found") and the model then tries to
+    # do the research itself in-chat. Every runtime's install leaf must equal
+    # the bundled frontmatter name, forever.
+    fm = connect._frontmatter_name(connect.skill_src_dir() / "SKILL.md")
+    assert fm == "sr"
+    for rt, rel in connect.RUNTIMES.items():
+        assert rel.name == fm, f"{rt} installs to {rel} but the skill is named {fm!r}"
+
+
+def test_install_rejects_leaf_name_drift(tmp_path, monkeypatch):
+    # If someone renames the frontmatter (or the RUNTIMES leaf) without the
+    # other, the install must fail loudly — not produce an unloadable skill.
+    monkeypatch.setitem(connect.RUNTIMES, "hermes",
+                        connect.RUNTIMES["hermes"].parent / "wrong-leaf")
+    with pytest.raises(RuntimeError, match="frontmatter name"):
+        connect.install("hermes", home=tmp_path)
+
+
+def test_install_prunes_legacy_super_research_dir(tmp_path):
+    # Upgrade path: a pre-rename install at .../research/super-research must be
+    # removed on re-connect, or the gateway sees two skills advertising "sr".
+    legacy = tmp_path / ".hermes" / "skills" / "research" / "super-research"
+    (legacy / "scripts").mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("---\nname: sr\n---\n", encoding="utf-8")
+    (legacy / "scripts" / "sr.py").write_text("# old", encoding="utf-8")
+    connect.install("hermes", home=tmp_path)
+    assert not legacy.exists()  # stale copy pruned
+    assert connect.verify(tmp_path / ".hermes" / "skills" / "research" / "sr")
+
+
+def test_uninstall_sweeps_legacy_leaf_too(tmp_path):
+    # disconnect on NEW code must clean an OLD install (user upgraded without
+    # ever re-connecting) — both leaves go.
+    legacy = tmp_path / ".hermes" / "skills" / "research" / "super-research"
+    (legacy / "scripts").mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("x", encoding="utf-8")
+    assert connect.uninstall("hermes", home=tmp_path) is True
+    assert not legacy.exists()
 
 
 def test_detect_runtimes(tmp_path):
@@ -98,14 +141,16 @@ def test_uninstall_removes_verified_custom_dest(tmp_path):
     assert not dest.exists()
 
 
-def test_uninstall_removes_super_research_leaf_even_if_partial(tmp_path):
-    # The standard 'super-research' leaf is cleaned even when half-installed.
-    dest = tmp_path / "super-research"
-    dest.mkdir()
-    (dest / "SKILL.md").write_text("x", encoding="utf-8")  # no scripts/sr.py → verify False
-    assert connect.verify(dest) is False
-    assert connect.uninstall("hermes", dest=dest) is True
-    assert not dest.exists()
+def test_uninstall_removes_own_leaf_even_if_partial(tmp_path):
+    # The standard skill leaf (current or legacy name) is cleaned even when
+    # half-installed.
+    for leaf in ("sr", "super-research"):
+        dest = tmp_path / leaf
+        dest.mkdir()
+        (dest / "SKILL.md").write_text("x", encoding="utf-8")  # no scripts/sr.py → verify False
+        assert connect.verify(dest) is False
+        assert connect.uninstall("hermes", dest=dest) is True
+        assert not dest.exists()
 
 
 def test_looks_containerized_false_off_linux(monkeypatch):

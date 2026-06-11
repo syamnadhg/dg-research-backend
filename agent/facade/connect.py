@@ -20,6 +20,7 @@ the already-running bridge at runtime. Install paths are overridable (``home`` /
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,10 +29,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # runtime → skills dir, relative to the user's home (same shape on Windows & WSL).
+#
+# HARD INVARIANT: the dir LEAF must equal the SKILL.md frontmatter `name:`
+# ("sr"). The gateway's skills LISTING advertises the frontmatter name, but its
+# skill_view/loader resolves by DIRECTORY NAME ONLY — a mismatch makes the
+# advertised skill unloadable ("Skill 'sr' not found") and the model then tries
+# to perform the research itself in-chat (the endless-typing failure, 2026-06-11
+# E2E). install() enforces this at runtime; test_connect pins it.
 RUNTIMES: dict[str, Path] = {
-    "openclaw": Path(".openclaw") / "workspace" / "skills" / "super-research",
-    "hermes": Path(".hermes") / "skills" / "research" / "super-research",
+    "openclaw": Path(".openclaw") / "workspace" / "skills" / "sr",
+    "hermes": Path(".hermes") / "skills" / "research" / "sr",
 }
+
+# Prior install leaves (pre-rename). install() prunes a stale sibling from these
+# on re-connect and uninstall() sweeps them too, so an upgrade never leaves two
+# copies of the skill advertising the same name.
+_LEGACY_LEAVES = ("super-research",)
 
 # Display metadata for the branded picker. rgb tints the NAME (and any vector
 # glyph) so each runtime reads as a colored brand mark matching its symbol's hue:
@@ -371,6 +384,16 @@ def install(runtime: str, *, dest: Path | None = None, home: Path | None = None)
         raise ValueError(f"unknown runtime: {runtime}")
     src = skill_src_dir()
     target = dest or runtime_dest(runtime, home)
+    if dest is None:
+        # ENFORCE dir-leaf == frontmatter name (see the RUNTIMES invariant): the
+        # gateway loads skills by directory name, so a drifted edit to either
+        # side must fail the install loudly, not produce an unloadable skill.
+        fm_name = _frontmatter_name(src / "SKILL.md")
+        if fm_name and target.name != fm_name:
+            raise RuntimeError(
+                f"skill dir leaf {target.name!r} != SKILL.md frontmatter name {fm_name!r} "
+                "— the runtime resolves skills by directory name, so these must match"
+            )
     scripts = target / "scripts"
     # Mirror the bundle: prune the scripts dir first so a file dropped from the
     # bundle doesn't linger in an existing install on re-connect. (Bounded to the
@@ -382,12 +405,40 @@ def install(runtime: str, *, dest: Path | None = None, home: Path | None = None)
     for f in (src / "scripts").glob("*.py"):
         shutil.copy2(f, scripts / f.name)
     _normalize_modes(target)
+    if dest is None:
+        # Upgrade hygiene: a pre-rename install at a legacy leaf (sibling dir)
+        # would advertise the same skill name twice — prune it.
+        _prune_legacy_installs(target.parent)
     # Standard-path installs only (dest=None): a custom dest is a test/power-user
     # location, not the runtime's HERMES_HOME, so the cron script doesn't belong
     # there (and we must never write to the real ~/.hermes during a dest test).
     if runtime == "hermes" and dest is None:
         _install_stream_script(home)
     return target
+
+
+def _frontmatter_name(skill_md: Path) -> str | None:
+    """The frontmatter ``name:`` of a SKILL.md (None if unreadable/absent)."""
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.search(r"^name:\s*(\S+)\s*$", text[:500], re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _prune_legacy_installs(parent: Path) -> None:
+    """Remove pre-rename copies of OUR skill under ``parent`` (best-effort).
+    Only runs for standard-path installs, where a legacy-named sibling can only
+    be our own previous install — so the name alone is sufficient (a half-broken
+    old copy without scripts/sr.py must go too, or it keeps advertising /sr)."""
+    for leaf in _LEGACY_LEAVES:
+        stale = parent / leaf
+        try:
+            if stale.is_dir():
+                shutil.rmtree(stale)
+        except OSError:
+            pass
 
 
 # The streaming watchdog (sr_attention_poll.py) runs as a Hermes `no_agent` cron
@@ -443,29 +494,42 @@ def _normalize_modes(target: Path) -> None:
             pass
 
 
-# The skill dir leaf — both runtimes install to .../research/super-research, so a
-# resolved uninstall target should end in this. Guards a mistyped --dest.
-_SKILL_LEAF = "super-research"
+# The skill dir leaf — both runtimes install to a dir named after the SKILL.md
+# frontmatter name (the gateway loads by dir name). A resolved uninstall target
+# should end in this (or a legacy leaf). Guards a mistyped --dest.
+_SKILL_LEAF = "sr"
 
 
 def uninstall(runtime: str, *, dest: Path | None = None, home: Path | None = None) -> bool:
     """Remove the skill bundle from ``runtime``'s skills dir (inverse of install).
 
     Idempotent — returns True if a skill dir was removed, False otherwise. Bounded
-    to the ``super-research`` skill dir we own: it only rmtrees a target whose leaf
-    is that name OR that VERIFIES as our bundle (SKILL.md + scripts/sr.py), so a
-    mistyped ``--dest`` pointing at an unrelated dir is refused, never deleted.
-    Used by `agent disconnect` and the bridge's revoke-consult (app Revoke).
+    to the skill dir we own: it only rmtrees a target whose leaf is ours (current
+    or legacy name) OR that VERIFIES as our bundle (SKILL.md + scripts/sr.py), so
+    a mistyped ``--dest`` pointing at an unrelated dir is refused, never deleted.
+    Also sweeps pre-rename legacy installs at the standard path. Used by
+    `agent disconnect` (the only full teardown).
     """
     if runtime not in RUNTIMES:
         raise ValueError(f"unknown runtime: {runtime}")
     if runtime == "hermes" and dest is None:
         _uninstall_stream_script(home)  # best-effort; the inert script is harmless if left
     target = dest or runtime_dest(runtime, home)
-    if target.exists() and (target.name == _SKILL_LEAF or verify(target)):
+    removed = False
+    own_leaves = (_SKILL_LEAF, *_LEGACY_LEAVES)
+    if target.exists() and (target.name in own_leaves or verify(target)):
         shutil.rmtree(target)
-        return True
-    return False
+        removed = True
+    if dest is None:
+        # A pre-rename install may still sit at a legacy leaf — remove it too so
+        # disconnect never strands an older copy that keeps advertising /sr.
+        # (Standard path only: a legacy-named sibling there is ours by construction.)
+        for leaf in _LEGACY_LEAVES:
+            stale = target.parent / leaf
+            if stale.is_dir():
+                shutil.rmtree(stale)
+                removed = True
+    return removed
 
 
 def verify(target: Path) -> bool:
