@@ -1,7 +1,8 @@
-"""The streaming watchdog (sr_attention_poll.py) — the de-dup core.
+"""The streaming watchdog (sr_attention_poll.py) — phase-completion de-dup core.
 
-Loaded standalone (as the cron `no_agent` runner would), exercising compute()'s
-transition logic: post a NEW link / blocker / completion once, then stay silent.
+Loaded standalone (as the cron `no_agent` runner would). compute() consumes the
+bridge's per-run `phaseUpdates` (one entry per done phase, with the phase's
+permanent SR link(s)) and posts each phase once + a needs-attention blocker.
 """
 
 import importlib.util
@@ -19,128 +20,107 @@ def _load():
 poll = _load()
 
 
-def test_first_link_posts_then_dedups():
-    runs = [{"runId": "r1", "title": "EV market", "status": "ongoing",
-             "links": [{"kind": "brief", "label": "Brief", "url": "u-b"}]}]
+def _pu(phase, name, links, status="complete", final=False):
+    return {"phase": phase, "name": name, "status": status, "final": final,
+            "links": [{"label": lbl, "url": url, "permanent": perm} for (lbl, url, perm) in links]}
+
+
+def _run(rid="r1", title="EV market", status="ongoing", phase_updates=None, needs=False, attention=""):
+    return {"runId": rid, "title": title, "status": status,
+            "phaseUpdates": phase_updates or [], "needsAttention": needs, "attention": attention}
+
+
+def test_phase_complete_posts_sr_link_once_then_dedups():
+    runs = [_run(phase_updates=[_pu(1, "Research Brief", [("Brief", "https://sr.io/shared/doc/B", True)])])]
     msgs, state = poll.compute(runs, {})
-    assert any("Brief" in m and "u-b" in m for m in msgs)
-    msgs2, _ = poll.compute(runs, state)  # nothing changed
-    assert msgs2 == []  # silent
-
-
-def test_only_the_new_link_posts_incrementally():
-    _, state = poll.compute(
-        [{"runId": "r1", "title": "EV", "status": "ongoing",
-          "links": [{"kind": "brief", "url": "u-b"}]}], {})
-    runs = [{"runId": "r1", "title": "EV", "status": "ongoing",
-             "links": [{"kind": "brief", "url": "u-b"}, {"kind": "chatgpt", "url": "u-c"}]}]
-    msgs, _ = poll.compute(runs, state)
-    assert len(msgs) == 1 and "u-c" in msgs[0]  # only the NEW kind, not the old
-
-
-def test_needs_attention_posts_once_then_on_reason_change():
-    runs = [{"runId": "r1", "title": "EV", "status": "ongoing", "links": [],
-             "needsAttention": True, "attention": "Sign in to ChatGPT"}]
-    msgs, state = poll.compute(runs, {})
-    assert any("needs you" in m and "Sign in to ChatGPT" in m and "retry" in m for m in msgs)
-    msgs2, state2 = poll.compute(runs, state)  # same blocker
-    assert msgs2 == []
-    runs[0]["attention"] = "Solve the verification check"  # reason changes
-    msgs3, _ = poll.compute(runs, state2)
-    assert any("Solve the verification check" in m for m in msgs3)
-
-
-def test_terminal_announced_once():
-    runs = [{"runId": "r1", "title": "EV", "status": "completed", "links": []}]
-    msgs, state = poll.compute(runs, {})
-    assert any("finished" in m for m in msgs)
-    msgs2, _ = poll.compute(runs, state)
-    assert msgs2 == []  # announced exactly once
-
-
-def test_error_and_watchdog_point_at_retry():
-    err, _ = poll.compute([{"runId": "r1", "title": "EV", "status": "error", "links": []}], {})
-    assert any("hit an error" in m and "retry" in m for m in err)
-    wd, _ = poll.compute([{"runId": "r2", "title": "X", "status": "stopped_by_watchdog", "links": []}], {})
-    assert any("retry" in m for m in wd)
-
-
-def test_user_stop_is_not_an_error():
-    msgs, _ = poll.compute([{"runId": "r1", "title": "EV", "status": "stopped", "links": []}], {})
-    assert any("stopped" in m and "kept" in m for m in msgs)
-    assert not any("error" in m for m in msgs)
-
-
-def test_tokenized_audio_link_never_posts():
-    # audio_file = the tokenized Firebase Storage URL — the watchdog must never
-    # post it to chat (the podcast is delivered natively via /sr podcast).
-    runs = [{"runId": "r1", "title": "EV", "status": "ongoing",
-             "links": [{"kind": "audio_file", "url": "https://firebasestorage/x?token=S"},
-                       {"kind": "youtube", "label": "YouTube Video", "url": "u-y"}]}]
-    msgs, state = poll.compute(runs, {})
-    assert len(msgs) == 1 and "u-y" in msgs[0]
-    assert not any("token=" in m for m in msgs)
-    msgs2, _ = poll.compute(runs, state)  # and it never re-surfaces as "new"
+    blob = "\n".join(msgs)
+    assert "Phase 1 (Research Brief) complete" in blob
+    assert "🔒 Brief: https://sr.io/shared/doc/B" in blob
+    assert state["r1"]["announced"] == [1]
+    msgs2, _ = poll.compute(runs, state)  # nothing new
     assert msgs2 == []
 
 
-def test_runs_without_id_are_ignored():
-    msgs, state = poll.compute([{"title": "no id", "status": "ongoing", "links": []}], {})
-    assert msgs == [] and state == {}
+def test_each_phase_announced_incrementally():
+    s1 = {"r1": {"announced": [1], "needs": False, "attention": ""}}
+    runs = [_run(phase_updates=[
+        _pu(1, "Research Brief", [("Brief", "u-b", True)]),
+        _pu(2, "Deep Research", [("ChatGPT", "u-c", True), ("Gemini", "u-g", True), ("Claude", "u-cl", True)]),
+    ])]
+    msgs, state = poll.compute(runs, s1)
+    blob = "\n".join(msgs)
+    assert "Phase 2 (Deep Research)" in blob
+    assert "Phase 1" not in blob  # already announced
+    # all three reports, each a permanent 🔒 link
+    assert blob.count("🔒") == 3 and "ChatGPT" in blob and "Gemini" in blob and "Claude" in blob
+    assert state["r1"]["announced"] == [1, 2]
 
 
-# ── baseline (the first tick after arming): silent on history, loud on live ──
+def test_final_phase_says_emailed_with_doc_link():
+    runs = [_run(status="completed", phase_updates=[
+        _pu(5, "Delivery", [("Google Doc", "https://docs.google.com/d/x", False)], final=True)])]
+    msgs, _ = poll.compute(runs, {})
+    blob = "\n".join(msgs)
+    assert "pipeline complete" in blob and "emailed" in blob
+    assert "📄 Google Doc: https://docs.google.com/d/x" in blob
 
-def test_baseline_first_tick_is_silent_on_history():
-    # Arming must NOT replay recent history (old links + finish notices) into
-    # the chat — up to 20 runs' worth would flood it.
-    runs = [
-        {"runId": "old", "title": "Old run", "status": "completed",
-         "links": [{"kind": "brief", "url": "u-b"}, {"kind": "doc", "url": "u-d"}]},
-        {"runId": "live", "title": "Live run", "status": "ongoing",
-         "links": [{"kind": "brief", "url": "u-b2"}]},
-    ]
+
+def test_p3_mixes_platform_and_permanent_icons():
+    runs = [_run(phase_updates=[_pu(3, "Audio Overview", [
+        ("NotebookLM", "https://notebooklm.google.com/n/1", False),  # platform → 🔗
+        ("Podcast", "https://sr.io/shared/podcast/P", True),         # SR → 🔒
+    ])])]
+    blob = "\n".join(poll.compute(runs, {})[0])
+    assert "🔗 NotebookLM: https://notebooklm.google.com/n/1" in blob
+    assert "🔒 Podcast: https://sr.io/shared/podcast/P" in blob
+
+
+def test_skipped_phase_has_no_links():
+    runs = [_run(phase_updates=[_pu(4, "Video", [], status="skipped")])]
+    msgs, _ = poll.compute(runs, {})
+    assert any("Phase 4 (Video) skipped" in m for m in msgs)
+    assert not any("http" in m for m in msgs)
+
+
+def test_baseline_silent_on_done_phases_but_records():
+    # First tick after arming: don't replay phases already done on pre-existing
+    # runs — record them silently so only FUTURE completions post.
+    runs = [_run(phase_updates=[_pu(1, "Research Brief", [("Brief", "u-b", True)])])]
     msgs, state = poll.compute(runs, {}, baseline=True)
-    assert msgs == []  # fully silent
-    # …but the delta machinery still works from here: a NEW link posts.
-    runs[1]["links"].append({"kind": "chatgpt", "url": "u-c"})
-    msgs2, state2 = poll.compute(runs, state)
-    assert len(msgs2) == 1 and "u-c" in msgs2[0]
-    # …and the live run's eventual completion IS announced (baseline must not
-    # pre-mark an ongoing run as already-announced).
-    runs[1]["status"] = "completed"
-    msgs3, _ = poll.compute(runs, state2)
-    assert any("finished" in m for m in msgs3)
+    assert msgs == []
+    assert state["r1"]["announced"] == [1]
+    runs[0]["phaseUpdates"].append(_pu(2, "Deep Research", [("ChatGPT", "u-c", True)]))
+    msgs2, _ = poll.compute(runs, state)  # only the NEW phase posts
+    blob = "\n".join(msgs2)
+    assert "Phase 2" in blob and "Phase 1" not in blob
 
 
 def test_baseline_still_raises_a_live_blocker():
-    # A run stuck RIGHT NOW is exactly what the watchdog is for — it must post
-    # even on the baseline tick.
-    runs = [{"runId": "r1", "title": "EV", "status": "ongoing",
-             "links": [{"kind": "brief", "url": "u-b"}],
-             "needsAttention": True, "attention": "Sign in to ChatGPT"}]
-    msgs, state = poll.compute(runs, {}, baseline=True)
-    assert len(msgs) == 1  # the blocker only — the old link stays silent
-    assert "needs you" in msgs[0] and "Sign in to ChatGPT" in msgs[0]
-    msgs2, _ = poll.compute(runs, state)  # next tick, unchanged → silent
-    assert msgs2 == []
-
-
-def test_baseline_skips_stale_terminal_blockers():
-    # A long-dead errored run is history the user already saw — re-alerting it
-    # on every arm would be noise.
-    runs = [{"runId": "r1", "title": "Old fail", "status": "error", "links": [],
-             "needsAttention": True, "attention": "the run hit an error"}]
+    runs = [_run(status="ongoing", needs=True, attention="Sign in to ChatGPT")]
     msgs, _ = poll.compute(runs, {}, baseline=True)
-    assert msgs == []
+    assert any("needs you" in m and "Sign in to ChatGPT" in m and "retry" in m for m in msgs)
 
 
-def test_load_state_none_on_missing_and_corrupt(tmp_path, monkeypatch):
-    # No file AND a corrupt file must both trigger baseline (None) — a corrupt
-    # state treated as "empty but valid" would replay all history.
-    monkeypatch.setattr(poll, "_STATE_FILE", tmp_path / "state.json")
-    assert poll._load_state() is None  # missing
-    (tmp_path / "state.json").write_text("{not json", encoding="utf-8")
-    assert poll._load_state() is None  # corrupt
-    (tmp_path / "state.json").write_text('{"r1": {"status": "ongoing"}}', encoding="utf-8")
-    assert poll._load_state() == {"r1": {"status": "ongoing"}}  # valid
+def test_needs_attention_posts_once_then_on_change():
+    runs = [_run(status="ongoing", needs=True, attention="Sign in")]
+    msgs, state = poll.compute(runs, {})
+    assert any("needs you" in m for m in msgs)
+    msgs2, state2 = poll.compute(runs, state)  # same blocker
+    assert not any("needs you" in m for m in msgs2)
+    runs[0]["attention"] = "Solve the check"  # reason changed
+    msgs3, _ = poll.compute(runs, state2)
+    assert any("Solve the check" in m for m in msgs3)
+
+
+def test_runs_without_id_are_ignored():
+    msgs, state = poll.compute([{"title": "x", "phaseUpdates": [_pu(1, "Research Brief", [])]}], {})
+    assert msgs == [] and state == {}
+
+
+def test_no_phase_or_platform_link_dump_of_raw_links():
+    # The old behavior dumped run["links"] (platform URLs) per kind. The new
+    # watchdog ignores run["links"] entirely — only phaseUpdates drive output.
+    runs = [_run(phase_updates=[])]
+    runs[0]["links"] = [{"kind": "chatgpt", "url": "https://chatgpt.com/c/x", "label": "ChatGPT"}]
+    msgs, _ = poll.compute(runs, {})
+    assert msgs == []  # raw platform links never posted

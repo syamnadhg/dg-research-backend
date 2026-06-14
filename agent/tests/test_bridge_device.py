@@ -427,6 +427,89 @@ def test_research_seeds_topic_and_intro_messages(live):
     assert FakeFS.seeded["topic"] == "EV battery market 2026"
 
 
+def test_completed_phases_from_status_and_advancement():
+    done = bridge._completed_phases({"phase": 3, "status": "ongoing",
+                                     "phases": [{"phase": 4, "status": "skipped"}]})
+    assert done.get(0) == "complete" and done.get(1) == "complete" and done.get(2) == "complete"
+    assert done.get(4) == "skipped"
+    assert 3 not in done  # the current ongoing phase isn't done yet
+
+
+def test_completed_phases_clean_completion_marks_final():
+    done = bridge._completed_phases({"phase": 5, "status": "completed"})
+    assert done.get(5) == "complete"
+
+
+def test_phase_updates_maps_links_per_phase():
+    doc = {"phase": 5, "status": "completed",
+           "srShares": {"brief": "B", "chatgpt": "C", "gemini": "G", "claude": "CL", "podcast": "P"},
+           "links": {
+               "notebooklm": {"url": "https://notebooklm.google.com/n", "phase": 3},
+               "youtube": {"url": "https://youtu.be/x", "phase": 4},
+               "gdocs": {"url": "https://docs.google.com/d/final", "phase": 5},
+           }}
+    sr = bridge._sr_links(doc)
+    pus = {pu["phase"]: pu for pu in bridge._phase_updates(doc, sr)}
+    assert [lk["label"] for lk in pus[1]["links"]] == ["Brief"] and pus[1]["links"][0]["permanent"]
+    assert {lk["label"] for lk in pus[2]["links"]} == {"ChatGPT", "Gemini", "Claude"}
+    p3 = {lk["label"]: lk for lk in pus[3]["links"]}
+    assert p3["NotebookLM"]["permanent"] is False and "notebooklm.google.com" in p3["NotebookLM"]["url"]
+    assert p3["Podcast"]["permanent"] is True and p3["Podcast"]["url"].endswith("/shared/podcast/P")
+    assert [lk["url"] for lk in pus[4]["links"]] == ["https://youtu.be/x"]
+    assert pus[5]["final"] is True and pus[5]["links"][0]["url"].endswith("/d/final")
+
+
+def test_sr_mint_gap_detects_unminted_complete_phase():
+    done = {1: "complete"}
+    platform = {"brief": "https://docs.google.com/brief"}  # proof the brief exists
+    assert bridge._sr_mint_gap({}, platform, done) is True          # no SR yet → gap
+    assert bridge._sr_mint_gap({"brief": "u"}, platform, done) is False  # already minted
+    assert bridge._sr_mint_gap({}, {}, done) is False              # no proof → not a gap
+
+
+def test_updates_via_agent_filters_and_builds_phase_updates(live, monkeypatch):
+    base, _sel = live
+    FakeFS.researches = {
+        "a1": {"id": "a1", "title": "EV", "status": "ongoing", "phase": 2, "viaAgent": True,
+               "srShares": {"brief": "B"},
+               "links": {"brief": {"url": "https://docs.google.com/brief", "phase": 1}}},
+        "w1": {"id": "w1", "title": "Web run", "status": "ongoing", "phase": 1},  # no viaAgent
+    }
+    monkeypatch.setattr(bridge, "_mint_sr", lambda *a, **k: None)  # brief already minted
+    runs = requests.get(base + "/updates?via=agent").json()["runs"]
+    assert {r["runId"] for r in runs} == {"a1"}  # web run filtered out
+    pus = {pu["phase"]: pu for pu in runs[0]["phaseUpdates"]}
+    assert pus[1]["status"] == "complete"
+    assert any(lk["url"].endswith("/shared/doc/B") and lk["permanent"] for lk in pus[1]["links"])
+
+
+def test_updates_via_agent_mints_missing_sr_link(live, monkeypatch):
+    base, _sel = live
+    FakeFS.researches = {
+        "a1": {"id": "a1", "title": "EV", "status": "ongoing", "phase": 2, "viaAgent": True,
+               "srShares": {},  # brief NOT minted yet
+               "links": {"brief": {"url": "https://docs.google.com/brief", "phase": 1}}},
+    }
+    minted = {}
+    monkeypatch.setattr(bridge, "_mint_sr",
+                        lambda sess, rid, title: minted.update(rid=rid) or {"brief": "https://sr.io/shared/doc/Bnew"})
+    runs = requests.get(base + "/updates?via=agent").json()["runs"]
+    assert minted["rid"] == "a1"  # mint triggered (platform brief present, srShares empty)
+    pu1 = next(pu for pu in runs[0]["phaseUpdates"] if pu["phase"] == 1)
+    assert any("Bnew" in lk["url"] for lk in pu1["links"])
+
+
+def test_updates_without_via_never_mints_or_builds_phase_updates(live, monkeypatch):
+    base, _sel = live
+    FakeFS.researches = {"a1": {"id": "a1", "status": "ongoing", "phase": 2, "viaAgent": True,
+                                "srShares": {}, "links": {"brief": {"url": "u", "phase": 1}}}}
+    called = {"v": False}
+    monkeypatch.setattr(bridge, "_mint_sr", lambda *a, **k: called.__setitem__("v", True) or None)
+    runs = requests.get(base + "/updates").json()["runs"]  # interactive, no via=agent
+    assert called["v"] is False           # interactive /updates never mints
+    assert runs[0]["phaseUpdates"] == []  # …nor computes phase updates
+
+
 def test_updates_tolerates_bad_limit(live):
     base, _ = live
     assert requests.get(base + "/updates?limit=999").status_code == 200

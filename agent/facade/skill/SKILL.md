@@ -167,11 +167,10 @@ device, so "research <topic>" works immediately after.
 The runtime does **not** wake you on a timer — so to push progress + alerts into
 this chat the moment they happen (instead of the user having to ask for status),
 arm a small recurring **cron watchdog** **right after a successful `/sr login`**.
-It covers **every** run on the account — including ones started from the web app
-— and runs a bundled script that, each minute, posts only what's **new** and
-stays silent otherwise: no spam, no tokens. Its very first tick baselines
-quietly (it never replays old history into the chat; it only raises a run that
-is stuck right now).
+It follows the runs the user starts **from chat** (agent runs) and, each minute,
+posts only what's **new** and stays silent otherwise: no spam, no tokens. Its
+very first tick baselines quietly (it never replays already-done phases; it only
+raises a run that is stuck right now).
 
 1. Check it isn't already armed: `cronjob(action="list")` — look for a job named
    `sr-stream`.
@@ -181,16 +180,21 @@ is stuck right now).
    (`agent connect` already placed `sr_attention_poll.py` in the scripts dir. If
    create fails with a missing-script error, tell the user to re-run `agent
    connect` on the host.)
-   Also re-check/arm whenever a research starts, in case sign-in happened
-   elsewhere or the job was removed.
-3. The watchdog then posts on its own — the user never needs to ask:
-   - each new phase link as it lands (Brief → ChatGPT / Gemini / Claude →
-     NotebookLM + Audio → YouTube → the final Doc),
-   - **⚠ "<title>" needs you: <reason>** the moment a run blocks — the user can
-     reply **"retry"** / **"skip"** right here, or open the app (some blockers —
-     signing in to an AI, a "are you human" check — need an on-device step first,
-     then "retry"),
-   - the final state when a run finishes / stops / errors.
+   Also re-check/arm whenever a research starts, in case the job was removed.
+3. The watchdog then posts on its own — the user never needs to ask. It sends
+   **one clean message per phase as it completes**, carrying that phase's
+   **permanent, non-revocable** Super Research link(s) (the same ones in the
+   delivered Google Doc — never raw platform links the user can't open):
+   - Phase 1 → 🔒 Research Brief
+   - Phase 2 → 🔒 ChatGPT / Gemini / Claude reports
+   - Phase 3 → 🔗 NotebookLM + 🔒 Podcast
+   - Phase 4 → 🔗 YouTube
+   - Phase 5 → 📄 the Google Doc + "pipeline complete — results emailed"
+   - and **⚠ "<title>" needs you: <reason>** the moment a run blocks — reply
+     **"retry"** / **"skip"** here, or open the app (some blockers — signing in
+     to an AI, a "are you human" check — need an on-device step first, then
+     "retry").
+   The watchdog already renders + de-dups all of this — you just relay it.
 
 On **`/sr logout`**, tear the watchdog down: `cronjob(action="list")` → find
 `sr-stream` → `cronjob(action="remove", job_id=<that id>)`.

@@ -412,6 +412,100 @@ def _fe_api_post(sess: "AccountSession", path: str, payload: dict) -> tuple[int,
         return 0, {"error": f"could not reach {config.FE_BASE} ({type(e).__name__})"}
 
 
+# Phase → (display name, ordered link specs). A spec is (label, source) where
+# source is "sr:<docType>" (the permanent, non-revocable share) or "pf:<kind>"
+# (a platform link with no SR equivalent — NotebookLM / YouTube / final Doc).
+# Mirrors what the delivered Phase-5 Google Doc embeds, grouped by phase.
+_PHASE_PLAN: dict[int, tuple[str, tuple[tuple[str, str], ...]]] = {
+    1: ("Research Brief", (("Brief", "sr:brief"),)),
+    2: ("Deep Research", (("ChatGPT", "sr:chatgpt"), ("Gemini", "sr:gemini"), ("Claude", "sr:claude"))),
+    3: ("Audio Overview", (("NotebookLM", "pf:notebooklm"), ("Podcast", "sr:podcast"))),
+    4: ("Video", (("YouTube", "pf:youtube"),)),
+    5: ("Delivery", (("Google Doc", "pf:gdocs"),)),
+}
+# The platform-link kind whose PRESENCE proves a phase's artifact exists (so its
+# SR snapshot can be minted). audio_file is the podcast's Storage source.
+_SR_PROOF_KIND = {"brief": "brief", "chatgpt": "chatgpt", "gemini": "gemini",
+                  "claude": "claude", "podcast": "audio_file"}
+
+
+def _completed_phases(doc: dict) -> dict:
+    """{phase: "complete"|"skipped"} for every phase that is DONE — from the
+    per-phase status array, plus phases the run advanced past, plus the final
+    phase on a clean completion."""
+    out: dict[int, str] = {}
+    phases = doc.get("phases")
+    if isinstance(phases, list):
+        for ph in phases:
+            if isinstance(ph, dict):
+                pn, st = ph.get("phase"), ph.get("status")
+                if isinstance(pn, int) and st in ("complete", "skipped"):
+                    out.setdefault(pn, st)
+    cur = doc.get("phase")
+    if isinstance(cur, int):
+        for p in range(cur):
+            out.setdefault(p, "complete")  # advanced past it
+        if doc.get("status") == "completed":
+            out.setdefault(cur, "complete")  # clean end → current phase done
+    return out
+
+
+def _platform_links(doc: dict) -> dict:
+    """{kind: url} from the run's flattened (platform) links."""
+    return {e["kind"]: e["url"] for e in runview.flatten_links(doc.get("links")) if e.get("url")}
+
+
+def _sr_mint_gap(sr_links: dict, platform: dict, done: dict) -> bool:
+    """True if a COMPLETE phase has an artifact (platform proof) but its
+    permanent SR share isn't minted yet — i.e. minting would fill a real gap."""
+    for p, st in done.items():
+        if st != "complete":
+            continue
+        for _label, src in _PHASE_PLAN.get(p, ("", ()))[1]:
+            if src.startswith("sr:"):
+                dt = src[3:]
+                if dt not in sr_links and _SR_PROOF_KIND.get(dt, dt) in platform:
+                    return True
+    return False
+
+
+def _phase_updates(doc: dict, sr_links: dict) -> list:
+    """Ordered per-phase chat updates the watchdog streams: one entry per DONE
+    phase (1-5) with its permanent SR link(s) + the platform-only links
+    (NotebookLM / YouTube / final Doc). Skipped phases carry no links."""
+    done = _completed_phases(doc)
+    platform = _platform_links(doc)
+    out = []
+    for p in (1, 2, 3, 4, 5):
+        st = done.get(p)
+        if not st:
+            continue
+        name, specs = _PHASE_PLAN[p]
+        links = []
+        if st == "complete":
+            for label, src in specs:
+                if src.startswith("sr:"):
+                    url = sr_links.get(src[3:])
+                elif src == "pf:gdocs":
+                    url = platform.get("gdocs") or platform.get("doc")
+                else:
+                    url = platform.get(src[3:])
+                if url:
+                    links.append({"label": label, "url": url, "permanent": src.startswith("sr:")})
+        out.append({"phase": p, "name": name, "status": st, "links": links, "final": p == 5})
+    return out
+
+
+def _mint_sr(sess: "AccountSession", rid: str, title: str) -> dict | None:
+    """Trigger per-phase SR minting via the web app (POST /api/mintSrLinks as the
+    user) — idempotent, mints only the docTypes whose content already exists.
+    Returns the fresh {docType: url} map, or None on failure (callers fall back
+    to whatever's already minted)."""
+    status, body = _fe_api_post(sess, "/api/mintSrLinks", {"research_id": rid, "title": title or ""})
+    sr = body.get("srLinks") if status == 200 else None
+    return sr if isinstance(sr, dict) else None
+
+
 def _attention_text(r: dict) -> str | None:
     """A short, human reason a run needs the user — or None if it's fine.
     Prefers the durable pendingDecision (the snag/login/verify card the BE
@@ -1302,6 +1396,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             sess, fs = acct
             qs = parse_qs(urlsplit(self.path).query)
             active_only = qs.get("active", ["0"])[0] in ("1", "true", "yes")
+            # ?via=agent (the streaming watchdog): restrict to runs STARTED via
+            # the agent (viaAgent) so web-app runs don't clutter the chat, and
+            # compute per-phase updates (lazily minting the permanent SR links).
+            via_agent = qs.get("via", [""])[0] == "agent"
             try:
                 limit = max(1, min(int(qs.get("limit", ["20"])[0]), 50))
             except ValueError:
@@ -1321,6 +1419,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             runs = []
             for r in rows:
                 status = r.get("status")
+                # Watchdog scope: only runs the user started via the agent.
+                if via_agent and not r.get("viaAgent"):
+                    continue
                 attention = _attention_text(r)
                 needs = attention is not None or status in _ATTENTION_STATUSES
                 # active=1 keeps the in-flight runs AND any run that needs the
@@ -1328,6 +1429,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # a chat poller must surface, so it must not be filtered out.
                 if active_only and status not in ("queued", "ongoing") and not needs:
                     continue
+                sr = _sr_links(r)
+                phase_updates: list = []
+                if via_agent:
+                    done = _completed_phases(r)
+                    if _sr_mint_gap(sr, _platform_links(r), done):
+                        fresh = _mint_sr(sess, r.get("id"), r.get("title") or r.get("topic") or "")
+                        if fresh:
+                            sr = {**sr, **fresh}
+                    phase_updates = _phase_updates(r, sr)
                 runs.append({
                     "runId": r.get("id"),
                     "title": r.get("title") or r.get("topic"),
@@ -1336,7 +1446,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "phase": r.get("phase"),
                     "updatedAt": r.get("updatedAt"),
                     "links": runview.flatten_links(r.get("links")),
-                    "srLinks": _sr_links(r),
+                    "srLinks": sr,
+                    "phaseUpdates": phase_updates,
                     "needsAttention": needs,
                     "attention": attention,
                 })
