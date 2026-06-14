@@ -230,6 +230,33 @@ class FirestoreRest:
             "PATCH", url, json_body={"fields": {k: to_value(v) for k, v in fields.items()}}
         )
 
+    def seed_chat_messages(self, uid: str, rid: str, *, topic: str, title: str) -> None:
+        """Seed the two opening chat bubbles the WEB APP writes client-side at
+        run start but an agent-started run never gets: the user TOPIC bubble +
+        the assistant intro ("Researching …"). Without them an agent run's in-app
+        chat is missing its opening messages and renders inconsistently with a
+        web-started chat (the BE pipeline only writes pipeline_events, never the
+        messages subcollection; the bridge is the agent's stand-in for the
+        missing web client). Mirrors the FE saveMessage doc shape exactly
+        ({role, content, timestamp} at messages/{id}, ordered by timestamp).
+        Deterministic ids keep it idempotent; ``intro-{rid}`` matches the web
+        app's id so the FE phase_start upgrade rewrites it in place rather than
+        adding a duplicate. Best-effort — callers must not let a failure fail the
+        run (tiles still hydrate from events)."""
+        now_ms = int(time.time() * 1000)
+        label = (title or topic or "").strip()
+        if len(label) > 100:
+            label = label[:100].rstrip() + "…"
+        intro = f'Researching **"{label}"**' if label else "Researching..."
+        msgs = (
+            (f"topic-{rid}", {"role": "user", "content": topic, "timestamp": now_ms}),
+            (f"intro-{rid}", {"role": "assistant", "content": intro, "timestamp": now_ms + 1}),
+        )
+        for mid, fields in msgs:
+            mask = "&".join(f"updateMask.fieldPaths={k}" for k in fields)
+            url = f"{config.FIRESTORE_BASE}/users/{uid}/researches/{rid}/messages/{mid}?{mask}"
+            self._request("PATCH", url, json_body={"fields": {k: to_value(v) for k, v in fields.items()}})
+
     def delete_research(self, uid: str, rid: str) -> None:
         """Delete a research doc under the user's own tree (owner branch).
 

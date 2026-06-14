@@ -34,6 +34,7 @@ class FakeFS:
     last_cancel = None
     last_command = None
     last_pc_patch = None
+    seeded = None
 
     def __init__(self, _tp):
         pass
@@ -54,6 +55,9 @@ class FakeFS:
     def enqueue_start(self, device_id, **kw):
         FakeFS.last_enqueue = {"device_id": device_id, **kw}
         return "Q-1"
+
+    def seed_chat_messages(self, uid, rid, *, topic, title):
+        FakeFS.seeded = {"rid": rid, "topic": topic, "title": title}
 
     def enqueue_cancel(self, device_id, *, uid, research_id, owner_control=""):
         FakeFS.last_cancel = {"device_id": device_id, "research_id": research_id,
@@ -79,6 +83,7 @@ def bridge_port(monkeypatch):
     FakeFS.last_enqueue = None
     FakeFS.last_cancel = None
     FakeFS.last_command = None
+    FakeFS.seeded = None
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
     sel = {"v": None}
     monkeypatch.setattr(bridge.prefs, "get_selected_device", lambda uid: sel["v"])

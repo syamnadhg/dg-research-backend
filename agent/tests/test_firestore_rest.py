@@ -155,6 +155,31 @@ def test_upsert_research_sets_update_mask():
     assert patch["body"]["fields"]["status"] == {"stringValue": "queued"}
 
 
+def test_seed_chat_messages_writes_topic_and_intro():
+    c, calls = _capture_client()
+    c.seed_chat_messages("u1", "agent-abc", topic="EV battery market", title="EV battery market")
+    patches = [x for x in calls if x["method"] == "PATCH"]
+    assert len(patches) == 2
+    # topic bubble (user) at messages/topic-{rid}
+    topic = next(x for x in patches if "messages/topic-agent-abc" in x["url"])
+    assert topic["body"]["fields"]["role"] == {"stringValue": "user"}
+    assert topic["body"]["fields"]["content"] == {"stringValue": "EV battery market"}
+    assert "integerValue" in topic["body"]["fields"]["timestamp"]  # ms number
+    # intro (assistant) at messages/intro-{rid} — id matches the web app's so the
+    # FE phase_start upgrade rewrites it in place (no duplicate)
+    intro = next(x for x in patches if "messages/intro-agent-abc" in x["url"])
+    assert intro["body"]["fields"]["role"] == {"stringValue": "assistant"}
+    assert "Researching" in intro["body"]["fields"]["content"]["stringValue"]
+
+
+def test_seed_chat_messages_truncates_long_title():
+    c, calls = _capture_client()
+    c.seed_chat_messages("u1", "agent-x", topic="x" * 500, title="t" * 500)
+    intro = next(x for x in calls if "messages/intro-" in x["url"])
+    content = intro["body"]["fields"]["content"]["stringValue"]
+    assert "…" in content and len(content) < 130  # intro stays compact
+
+
 def test_get_research_returns_none_on_404():
     c = FirestoreRest(lambda force=False: "tok")
     c._send = lambda *a, **k: _Resp(404)  # type: ignore[method-assign]

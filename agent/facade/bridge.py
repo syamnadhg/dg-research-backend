@@ -1188,6 +1188,16 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 else:
                     self._firestore_502(e)
                 return
+            # Seed the topic + "Researching …" chat bubbles the web app writes
+            # client-side at run start — so an agent-started run's in-app chat
+            # opens consistently with a web-started one (the BE pipeline only
+            # writes pipeline_events, never the messages subcollection). The
+            # title at creation == topic (_new_research_fields); the FE refines
+            # it later. Best-effort — a seed failure must not fail the run.
+            try:
+                fs.seed_chat_messages(sess.uid, rid, topic=topic, title=topic)
+            except Exception as e:
+                log.debug("chat-message seed for %s failed (non-fatal): %s", rid, type(e).__name__)
             log.info("enqueued run %s on device %s", rid, device_id)
             self._json(200, {"runId": rid, "queueId": qid, "deviceId": device_id})
 

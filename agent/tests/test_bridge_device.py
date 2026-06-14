@@ -21,6 +21,7 @@ class FakeFS:
     last_cancel = None
     last_pc_patch = None
     get_raises = False
+    seeded = None
 
     def __init__(self, _token_provider):
         pass
@@ -52,6 +53,9 @@ class FakeFS:
         FakeFS.last_enqueue = {"device_id": device_id, **kw}
         return "Q-1"
 
+    def seed_chat_messages(self, uid, rid, *, topic, title):
+        FakeFS.seeded = {"uid": uid, "rid": rid, "topic": topic, "title": title}
+
     def delete_research(self, uid, rid):
         FakeFS.deleted.append(rid)
 
@@ -70,6 +74,7 @@ def live(monkeypatch):
     FakeFS.last_cancel = None
     FakeFS.last_pc_patch = None
     FakeFS.get_raises = False
+    FakeFS.seeded = None
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
 
     # In-memory device selection (don't touch the real ~/.super-agent/prefs.json).
@@ -405,6 +410,21 @@ def test_research_with_zero_devices_guides_pairing(live):
     assert r.status_code == 400
     err = r.json()["error"]
     assert "pair code" in err and "device add" in err  # actionable, not a dead end
+
+
+def test_research_seeds_topic_and_intro_messages(live):
+    # Issue 1: an agent-started run must seed the topic + "researching" chat
+    # bubbles the web app writes client-side — else the in-app chat opens
+    # missing its first messages. The bridge is the agent's stand-in for the
+    # missing web client.
+    base, _sel = live
+    FakeFS.devices = [{"id": "dev-a", "name": "My PC", "ownerUid": "u1"}]
+    r = requests.post(base + "/research", json={"topic": "EV battery market 2026"})
+    assert r.status_code == 200
+    rid = r.json()["runId"]
+    assert FakeFS.seeded is not None
+    assert FakeFS.seeded["rid"] == rid
+    assert FakeFS.seeded["topic"] == "EV battery market 2026"
 
 
 def test_updates_tolerates_bad_limit(live):

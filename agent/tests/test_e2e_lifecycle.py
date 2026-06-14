@@ -37,6 +37,7 @@ class FakeFS:
     last_cancel = None
     last_command = None
     last_pc_patch = None
+    seeded = None
 
     def __init__(self, _tp):
         pass
@@ -57,6 +58,9 @@ class FakeFS:
 
     def enqueue_start(self, device_id, **kw):
         return "Q-1"
+
+    def seed_chat_messages(self, uid, rid, *, topic, title):
+        FakeFS.seeded = {"rid": rid, "topic": topic}
 
     def enqueue_cancel(self, device_id, *, uid, research_id, owner_control=""):
         FakeFS.last_cancel = {"rid": research_id, "owner_control": owner_control}
@@ -92,6 +96,7 @@ def live(monkeypatch, mock_fe):
     FakeFS.researches = {}
     FakeFS.agent_sessions = {}
     FakeFS.last_rid = FakeFS.last_cancel = FakeFS.last_command = FakeFS.last_pc_patch = None
+    FakeFS.seeded = None
 
     # in-memory secret store + prefs (no real ~/.super-agent / keyring)
     mem = {}
@@ -165,6 +170,8 @@ def test_full_chat_lifecycle(live, capsys):
     assert "Started" in capsys.readouterr().out
     rid = FakeFS.last_rid
     assert rid and rid.startswith("agent-")
+    # the agent run seeds the web app's opening chat bubbles (topic + intro)
+    assert FakeFS.seeded == {"rid": rid, "topic": "Tesla 2025 outlook"}
 
     # 8. /status [id] + 9. /updates (cron)
     assert sr.main(["status", rid]) == 0
