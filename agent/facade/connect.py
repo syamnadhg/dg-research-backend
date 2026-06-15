@@ -29,32 +29,86 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-# runtime → skills dir, relative to the user's home (same shape on Windows & WSL).
+# ── runtime profiles ─────────────────────────────────────────────────────────
+# Everything that differs between chat runtimes, in ONE place — so connect / cli /
+# install logic reads a runtime's deltas from a RuntimeProfile instead of
+# scattering `if runtime == "hermes"` branches across the module. (sr.py is the
+# standalone skill client copied INTO the runtime and CANNOT import this — it
+# stays self-contained; SKILL.md gates its own runtime-specific guidance.)
 #
-# HARD INVARIANT: the dir LEAF must equal the SKILL.md frontmatter `name:`
-# ("sr"). The gateway's skills LISTING advertises the frontmatter name, but its
-# skill_view/loader resolves by DIRECTORY NAME ONLY — a mismatch makes the
-# advertised skill unloadable ("Skill 'sr' not found") and the model then tries
-# to perform the research itself in-chat (the endless-typing failure, 2026-06-11
-# E2E). install() enforces this at runtime; test_connect pins it.
-RUNTIMES: dict[str, Path] = {
-    "openclaw": Path(".openclaw") / "workspace" / "skills" / "sr",
-    "hermes": Path(".hermes") / "skills" / "research" / "sr",
+# DIR-LEAF INVARIANT: every runtime installs the skill into a dir whose LEAF ==
+# the SKILL.md frontmatter `name:` ("sr"). The gateway REGISTERS the /command from
+# the frontmatter `name` (the directory name is only a fallback), but the hub's
+# install/lookup resolves a skill by `parent.name == name`, and the historical
+# skill_view loader keyed off the directory too — a mismatch produced the
+# 2026-06-11 "Skill 'sr' not found" → endless-typing failure. So keep dir-leaf ==
+# frontmatter name; install() enforces it at runtime and test_connect pins it.
+
+@dataclass(frozen=True)
+class RuntimeProfile:
+    """The per-runtime deltas the facade needs: display + install path + whether
+    the /sr skill can arm a per-chat background job + how skills reload."""
+
+    name: str                            # "hermes" | "openclaw"
+    label: str                           # display name in the branded picker
+    icon: str                            # brand glyph (⚚) or emoji (🦞)
+    rgb: tuple[int, int, int]            # brand tint for the name (and a vector glyph)
+    skill_subpath: Path                  # skills dir relative to home; LEAF == "sr"
+    # Can the /sr skill arm a PER-CHAT recurring job from WITHIN chat? Hermes
+    # exposes a `cronjob` no_agent tool the skill calls; OpenClaw's cron is
+    # admin/operator.admin-gated and runs in the gateway process (not as an agent
+    # exec call — issue #66142), so the skill cannot arm it → no chat watchdog.
+    has_chat_armable_scheduler: bool
+    # In-chat command to re-scan skills so /sr registers after a file-copy install
+    # (Hermes caches its skill scan). None when the runtime auto-watches the skill
+    # dir and so needs no manual reload.
+    reload_hint: str | None
+
+    @property
+    def meta(self) -> dict:
+        """Back-compat view for the branded picker (the old RUNTIME_META row)."""
+        return {"label": self.label, "icon": self.icon, "rgb": self.rgb}
+
+
+# Insertion order is load-bearing: detect_targets / the picker list runtimes in
+# this order (openclaw, then hermes), matching the prior RUNTIMES/RUNTIME_META.
+#   • OpenClaw — 🦞 (emoji, native red) + RED glowing name
+#   • Hermes   — ⚚ staff-of-Hermes glyph tinted gold #E0A33A + GOLD glowing name
+PROFILES: dict[str, RuntimeProfile] = {
+    "openclaw": RuntimeProfile(
+        name="openclaw",
+        label="OpenClaw",
+        icon="🦞",
+        rgb=(231, 76, 60),
+        skill_subpath=Path(".openclaw") / "workspace" / "skills" / "sr",
+        has_chat_armable_scheduler=False,
+        reload_hint="/reload-skills",
+    ),
+    "hermes": RuntimeProfile(
+        name="hermes",
+        label="Hermes",
+        icon="⚚",
+        rgb=(224, 163, 58),
+        skill_subpath=Path(".hermes") / "skills" / "research" / "sr",
+        has_chat_armable_scheduler=True,
+        reload_hint="/reload-skills",
+    ),
 }
+
+
+def profile(runtime: str) -> RuntimeProfile:
+    """The RuntimeProfile for ``runtime`` (raises KeyError on an unknown one)."""
+    return PROFILES[runtime]
+
+
+# Derived back-compat views — existing call sites read these unchanged.
+RUNTIMES: dict[str, Path] = {name: p.skill_subpath for name, p in PROFILES.items()}
+RUNTIME_META: dict[str, dict] = {name: p.meta for name, p in PROFILES.items()}
 
 # Prior install leaves (pre-rename). install() prunes a stale sibling from these
 # on re-connect and uninstall() sweeps them too, so an upgrade never leaves two
 # copies of the skill advertising the same name.
 _LEGACY_LEAVES = ("super-research",)
-
-# Display metadata for the branded picker. rgb tints the NAME (and any vector
-# glyph) so each runtime reads as a colored brand mark matching its symbol's hue:
-#   • OpenClaw — 🦞 (emoji, native red) + RED glowing name
-#   • Hermes   — ⚚ staff-of-Hermes glyph tinted gold #E0A33A + GOLD glowing name
-RUNTIME_META: dict[str, dict] = {
-    "openclaw": {"label": "OpenClaw", "icon": "🦞", "rgb": (231, 76, 60)},
-    "hermes": {"label": "Hermes", "icon": "⚚", "rgb": (224, 163, 58)},
-}
 
 # Pin/override the WSL distro list (skips `wsl -l -q`); comma-separated.
 WSL_DISTRO_ENV = "SUPER_AGENT_WSL_DISTRO"
@@ -413,7 +467,8 @@ def install(runtime: str, *, dest: Path | None = None, home: Path | None = None)
     # Standard-path installs only (dest=None): a custom dest is a test/power-user
     # location, not the runtime's HERMES_HOME, so the cron script doesn't belong
     # there (and we must never write to the real ~/.hermes during a dest test).
-    if runtime == "hermes" and dest is None:
+    # Only a runtime whose /sr skill can arm a chat cron needs the watchdog script.
+    if PROFILES[runtime].has_chat_armable_scheduler and dest is None:
         _install_stream_script(home)
     return target
 
@@ -588,7 +643,7 @@ def uninstall(runtime: str, *, dest: Path | None = None, home: Path | None = Non
     """
     if runtime not in RUNTIMES:
         raise ValueError(f"unknown runtime: {runtime}")
-    if runtime == "hermes" and dest is None:
+    if PROFILES[runtime].has_chat_armable_scheduler and dest is None:
         # Remove the gateway cron JOB(S) FIRST, then the script — and only delete
         # the script if the job removal is CONFIRMED (jobs.json free of watchdog
         # jobs). A job-without-script is exactly what spams "Script not found"

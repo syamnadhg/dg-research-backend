@@ -55,6 +55,33 @@ def test_dir_leaf_matches_frontmatter_name():
         assert rel.name == fm, f"{rt} installs to {rel} but the skill is named {fm!r}"
 
 
+def test_runtime_profiles_back_compat_views_stay_consistent():
+    # RUNTIMES / RUNTIME_META are now DERIVED from PROFILES — they must stay
+    # byte-identical views so every existing call site keeps working. Pin it.
+    assert set(connect.PROFILES) == set(connect.RUNTIMES) == set(connect.RUNTIME_META)
+    for name, p in connect.PROFILES.items():
+        assert connect.RUNTIMES[name] == p.skill_subpath
+        assert connect.RUNTIME_META[name] == p.meta
+        assert connect.RUNTIME_META[name] == {"label": p.label, "icon": p.icon, "rgb": p.rgb}
+        assert p.skill_subpath.name == "sr"            # dir-leaf invariant, per runtime
+    # Listing order is load-bearing (picker/detect_* order) — openclaw, then hermes.
+    assert list(connect.PROFILES) == ["openclaw", "hermes"]
+
+
+def test_chat_armable_scheduler_flag_matches_legacy_hermes_gate():
+    # The scheduler install/uninstall gates used to be `runtime == "hermes"`; the
+    # refactor routes them through this flag. It MUST stay True for hermes and
+    # False for openclaw or the watchdog wiring changes silently.
+    assert connect.PROFILES["hermes"].has_chat_armable_scheduler is True
+    assert connect.PROFILES["openclaw"].has_chat_armable_scheduler is False
+
+
+def test_profile_accessor_unknown_runtime_raises():
+    assert connect.profile("hermes") is connect.PROFILES["hermes"]
+    with pytest.raises(KeyError):
+        connect.profile("nope")
+
+
 def test_install_rejects_leaf_name_drift(tmp_path, monkeypatch):
     # If someone renames the frontmatter (or the RUNTIMES leaf) without the
     # other, the install must fail loudly — not produce an unloadable skill.
