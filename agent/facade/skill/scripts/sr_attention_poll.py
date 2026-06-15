@@ -69,7 +69,16 @@ def _load_state() -> dict | None:
     BASELINE silently instead of replaying every already-done phase into chat."""
     try:
         data = json.loads(_STATE_FILE.read_text("utf-8"))
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        # Migration: a PRE-phaseUpdates state (keyed by links/announced_terminal,
+        # no "announced") would make the new phase-completion compute() treat every
+        # done phase as new and re-announce the lot. Treat any old-format state as
+        # no-state → a silent baseline tick, which then re-persists the new shape.
+        for v in data.values():
+            if isinstance(v, dict) and "announced" not in v and ("announced_terminal" in v or "links" in v):
+                return None
+        return data
     except Exception:
         return None
 

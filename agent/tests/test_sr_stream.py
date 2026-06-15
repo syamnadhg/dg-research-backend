@@ -117,6 +117,21 @@ def test_runs_without_id_are_ignored():
     assert msgs == [] and state == {}
 
 
+def test_load_state_migrates_old_format_to_baseline(tmp_path, monkeypatch):
+    # A pre-phaseUpdates state file (old keys, no "announced") must be treated as
+    # no-state → silent baseline, NOT re-announce every done phase on upgrade.
+    import json as _json
+    monkeypatch.setattr(poll, "_STATE_FILE", tmp_path / "state.json")
+    assert poll._load_state() is None  # missing → baseline
+    (tmp_path / "state.json").write_text(
+        _json.dumps({"r1": {"status": "completed", "links": ["brief", "chatgpt"],
+                            "announced_terminal": True}}), encoding="utf-8")
+    assert poll._load_state() is None  # old format → baseline (no replay)
+    (tmp_path / "state.json").write_text(
+        _json.dumps({"r1": {"announced": [1, 2], "needs": False, "attention": ""}}), encoding="utf-8")
+    assert poll._load_state() == {"r1": {"announced": [1, 2], "needs": False, "attention": ""}}
+
+
 def test_no_phase_or_platform_link_dump_of_raw_links():
     # The old behavior dumped run["links"] (platform URLs) per kind. The new
     # watchdog ignores run["links"] entirely — only phaseUpdates drive output.

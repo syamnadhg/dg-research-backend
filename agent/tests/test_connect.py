@@ -183,8 +183,12 @@ def test_install_drops_stream_script_in_hermes_scripts(tmp_path):
     connect.install("hermes", home=tmp_path)
     poll = tmp_path / ".hermes" / "scripts" / "sr_attention_poll.py"
     assert poll.is_file()
+    # a stale de-dup state from a prior session must be swept on disconnect so a
+    # re-connect + re-arm starts from a clean silent baseline (no phase replay)
+    state = tmp_path / ".hermes" / "scripts" / ".sr_stream_state.json"
+    state.write_text("{}", encoding="utf-8")
     assert connect.uninstall("hermes", home=tmp_path) is True
-    assert not poll.exists()  # disconnect tears it down too
+    assert not poll.exists() and not state.exists()  # disconnect tears both down
 
 
 def test_install_dest_override_skips_stream_script(tmp_path):

@@ -475,11 +475,15 @@ def _install_stream_script(home: Path | None) -> None:
 
 
 def _uninstall_stream_script(home: Path | None) -> None:
-    """Remove the streaming watchdog from HERMES_HOME/scripts/ (best-effort)."""
-    try:
-        (hermes_scripts_dir(home) / _STREAM_SCRIPT).unlink()
-    except OSError:
-        pass
+    """Remove the streaming watchdog + its de-dup state from HERMES_HOME/scripts/
+    (best-effort). Clearing the state file means a later re-connect + re-arm
+    starts from a clean silent baseline instead of replaying old phases."""
+    scripts = hermes_scripts_dir(home)
+    for name in (_STREAM_SCRIPT, ".sr_stream_state.json"):
+        try:
+            (scripts / name).unlink()
+        except OSError:
+            pass
 
 
 def _normalize_modes(target: Path) -> None:
