@@ -230,6 +230,12 @@ def cmd_connect(args: argparse.Namespace) -> int:
             if reload_hint
             else "  In chat the skill auto-loads — open a new chat, then use  /sr .")
     b.line(b.c(branding._BOLD + branding._ACCENT, "Connected.") + b.c(branding._DIM, tail))
+    # Device prerequisite (soft heads-up): the agent DRIVES Super Research on a
+    # paired computer — it doesn't run the research in chat. The hard prompt comes
+    # later, on the first research with no device (the /sr skill walks them through
+    # pairing then).
+    b.dim("Super Research runs on a paired computer — the agent drives it, it doesn't research in chat.")
+    b.dim('Make sure one computer is running Super Research and paired; say "add a device" in chat to pair.')
     b.next_grouped(_connect_next(runtime=chosen.runtime, logged_in=logged_in,
                                  startup_pinned=startup_pinned))
     return 0
