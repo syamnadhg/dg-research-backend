@@ -4,6 +4,9 @@ goes through print → stdout)."""
 
 import contextlib
 import io
+import time
+
+import pytest
 
 from facade import branding as b
 
@@ -85,3 +88,58 @@ def test_confirm_enter_takes_default_and_explicit_answers(monkeypatch):
     assert b.confirm("x", default=False) is True
     monkeypatch.setattr("builtins.input", lambda _p="": "n")
     assert b.confirm("x", default=True) is False
+
+
+# spinner(): a blocking step should never just look hung. On a TTY it animates a
+# brand glyph on one rewritten line then clears it; off-TTY it degrades to a
+# single static line (no carriage-return spam).
+
+class _FakeTTY:
+    """A stdout stand-in that reports as a terminal and records what was written."""
+
+    def __init__(self):
+        self.chunks: list[str] = []
+
+    def write(self, s):
+        self.chunks.append(s)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return True
+
+
+def test_spinner_non_tty_prints_static_line_no_animation():
+    # Captured / piped stdout (StringIO.isatty() is False) → one static line,
+    # never a \r animation that would garble logs.
+    out = _out(lambda: _spin_noop("working"))
+    assert "working" in out and "\r" not in out
+
+
+def _spin_noop(msg):
+    with b.spinner(msg):
+        pass
+
+
+def test_spinner_animates_on_tty_then_clears(monkeypatch):
+    fake = _FakeTTY()
+    monkeypatch.setattr(b.sys, "stdout", fake)
+    monkeypatch.setattr(b, "_USE_COLOR", True)
+    with b.spinner("loading"):
+        time.sleep(0.25)  # let the daemon thread paint a few frames
+    out = "".join(fake.chunks)
+    assert "\r" in out and "loading" in out             # animated in place
+    assert "\033[?25l" in out and "\033[?25h" in out    # cursor hidden, then restored
+    assert "\033[K" in out                              # line cleared on exit
+
+
+def test_spinner_clears_and_reraises_on_exception(monkeypatch):
+    fake = _FakeTTY()
+    monkeypatch.setattr(b.sys, "stdout", fake)
+    monkeypatch.setattr(b, "_USE_COLOR", True)
+    with pytest.raises(ValueError):
+        with b.spinner("x"):
+            raise ValueError("boom")  # must propagate (spinner never suppresses)
+    out = "".join(fake.chunks)
+    assert "\033[K" in out and "\033[?25h" in out  # still cleaned up on error

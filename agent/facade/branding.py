@@ -11,9 +11,11 @@ beyond stdout/stdin, so cli.py remains the only place that orchestrates I/O.
 
 from __future__ import annotations
 
+import itertools
 import os
 import shutil
 import sys
+import threading
 
 # ── Color support (tty + Windows VT enable) — mirrors research.py ───────────
 _USE_COLOR = False
@@ -195,6 +197,69 @@ def ask(prompt: str, default: str = "", *, cancel_on_interrupt: bool = False) ->
     except (EOFError, KeyboardInterrupt):
         print()
         return None if cancel_on_interrupt else default
+
+
+# ── progress spinner ────────────────────────────────────────────────────────
+# Braille frames — smooth, single-column, widely rendered (same family the app's
+# CLI uses). Animated only on a real TTY; everywhere else we degrade to a static
+# line so a blocking step never just looks hung (and piped output stays clean).
+_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_FRAME_SECONDS = 0.08
+
+
+class _Spinner:
+    """A branded progress spinner for one blocking step that does NOT itself print.
+
+    Use as a context manager around the blocking call::
+
+        with branding.spinner("Installing the skill"):
+            connect.install(...)
+
+    On a TTY it animates a brand-tinted glyph on one rewritten line, then clears
+    it on exit so the caller's success/failure line prints clean. When stdout
+    isn't a TTY (piped/captured/windowless) it prints ONE static line instead —
+    never carriage-return spam. Best-effort and exception-safe: __exit__ always
+    clears the line and restores the cursor, including on Ctrl-C."""
+
+    def __init__(self, message: str, *, color: str = _ACCENT) -> None:
+        self.message = message
+        self.color = color
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        # Animate only when we can both color AND own a live terminal line.
+        self._animate = _USE_COLOR and sys.stdout.isatty()
+
+    def _run(self) -> None:
+        sys.stdout.write("\033[?25l")  # hide the cursor while spinning
+        sys.stdout.flush()
+        for frame in itertools.cycle(_SPIN_FRAMES):
+            if self._stop.is_set():
+                break
+            sys.stdout.write(f"\r  {self.color}{frame}{_RESET}  {_DIM}{self.message}…{_RESET} ")
+            sys.stdout.flush()
+            self._stop.wait(_FRAME_SECONDS)
+
+    def __enter__(self) -> "_Spinner":
+        if self._animate:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        else:
+            print(f"  {self.message}…")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=1.0)
+            sys.stdout.write("\r\033[K\033[?25h")  # clear the line + restore the cursor
+            sys.stdout.flush()
+        return False  # never suppress the wrapped block's exception
+
+
+def spinner(message: str, *, color: str = _ACCENT) -> _Spinner:
+    """A branded progress spinner — `with spinner("…"): blocking_call()`.
+    Animates on a TTY, degrades to a static line otherwise (see _Spinner)."""
+    return _Spinner(message, color=color)
 
 
 def confirm(prompt: str, default: bool = True) -> bool:

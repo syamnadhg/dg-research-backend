@@ -80,13 +80,16 @@ def _wait_bridge_up(timeout: float = 12.0, interval: float = 0.3) -> bool:
     an *immediate* `_bridge_up()` right after starting it false-negatives (the
     socket isn't listening yet → connection refused). A caller that just started it
     must WAIT, not glance — otherwise the next step wrongly reports it as down."""
+    if _bridge_up():
+        return True  # already listening — no wait, no spinner flash
     deadline = time.monotonic() + timeout
-    while True:
-        if _bridge_up():
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(interval)
+    with b.spinner("Waiting for the bridge to start"):
+        while True:
+            if _bridge_up():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(interval)
 
 
 # ── commands ──────────────────────────────────────────────────────────────
@@ -228,7 +231,8 @@ def _install_step(chosen: connect.Target, dest_override: Path | None) -> Path | 
         b.warn("Skipped — without the skill the chat runtime won't have the /sr- commands.")
         return None
     try:
-        target = connect.install(chosen.runtime, dest=dest_override, home=chosen.home)
+        with b.spinner("Installing the skill"):
+            target = connect.install(chosen.runtime, dest=dest_override, home=chosen.home)
     except OSError as e:
         b.no(f"Install failed: {e}")
         return None
@@ -406,7 +410,8 @@ def _ensure_wsl_networking() -> None:
     else:
         b.dim("WSL must restart for this to take effect.")
     if b.confirm("Run  wsl --shutdown  now? (closes all WSL sessions)", default=False):
-        ok, msg = connect.wsl_shutdown()
+        with b.spinner("Shutting down WSL (it restarts with mirrored networking)"):
+            ok, msg = connect.wsl_shutdown()
         if ok:
             b.ok("WSL is shutting down — it comes back with mirrored networking on next use.")
             b.dim("Relaunch your chat runtime in WSL, then sign in with  /sr-login .")
@@ -467,7 +472,8 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     removed_any = False
     for rt, home in _disconnect_pairs(explicit, dest_override):
         try:
-            removed = connect.uninstall(rt, dest=dest_override, home=home)
+            with b.spinner(f"Removing the skill from {rt}"):
+                removed = connect.uninstall(rt, dest=dest_override, home=home)
         except (OSError, ValueError) as e:
             b.warn(f"{rt}: couldn't remove skill ({e})")
             continue
@@ -627,29 +633,35 @@ def _remote_signin(*, open_browser: bool, runtime: str = "", label: str = "") ->
             webbrowser.open(url)
         except Exception:
             b.warn("Couldn't open a browser automatically — open the link above.")
-    b.dim("Waiting for approval… (Ctrl-C to stop)")
     deadline = time.monotonic() + float(out.get("expiresIn", 600) or 600)
     interval = config.REMOTE_POLL_INTERVAL_SECONDS
+    # Spin during the (possibly long) wait so it never looks hung; collect the
+    # outcome and print it AFTER the spinner clears so the line stays clean.
+    final: tuple[str, dict] = ("timeout", {})
     try:
-        while time.monotonic() < deadline:
-            time.sleep(interval)
-            pr = _bridge_post("/login/remote/poll")
-            if pr is None or pr[0] != 200:
-                continue  # transient — keep waiting
-            st = pr[1]
-            state = st.get("state")
-            if state == "connected":
-                b.ok(f"Connected as {st.get('email') or st.get('uid')}.")
-                return "connected"
-            if state == "expired":
-                b.no("Sign-in link expired before approval.")
-                return "expired"
-            if state == "error":
-                b.no(f"Sign-in failed: {st.get('error', 'unknown error')}")
-                return "error"
+        with b.spinner("Waiting for approval — Ctrl-C to stop"):
+            while time.monotonic() < deadline:
+                time.sleep(interval)
+                pr = _bridge_post("/login/remote/poll")
+                if pr is None or pr[0] != 200:
+                    continue  # transient — keep waiting
+                state = pr[1].get("state")
+                if state in ("connected", "expired", "error"):
+                    final = (state, pr[1])
+                    break
     except KeyboardInterrupt:
         b.dim("\n  Stopped waiting. The link may still be valid; re-run to resume.")
         return "cancelled"
+    state, st = final
+    if state == "connected":
+        b.ok(f"Connected as {st.get('email') or st.get('uid')}.")
+        return "connected"
+    if state == "expired":
+        b.no("Sign-in link expired before approval.")
+        return "expired"
+    if state == "error":
+        b.no(f"Sign-in failed: {st.get('error', 'unknown error')}")
+        return "error"
     b.no("Timed out waiting for approval.")
     return "timeout"
 
@@ -793,14 +805,16 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
             _doctor_row(mod, False, str(e))
 
     try:
-        requests.get("https://securetoken.googleapis.com", timeout=5)
+        with b.spinner("Checking google reachability"):
+            requests.get("https://securetoken.googleapis.com", timeout=5)
         _doctor_row("google", True, "reachable")
     except requests.RequestException as e:
         _doctor_row("google", False, str(e))
 
     # The remote-login broker (SR web app). Any HTTP response = reachable.
     try:
-        requests.get(config.FE_BASE, timeout=5)
+        with b.spinner("Checking sr web reachability"):
+            requests.get(config.FE_BASE, timeout=5)
         _doctor_row("sr web", True, f"reachable ({config.FE_BASE})")
     except requests.RequestException as e:
         _doctor_row("sr web", False, f"{config.FE_BASE} — {e}")
@@ -1009,7 +1023,8 @@ def cmd_podcast(args: argparse.Namespace) -> int:
                       if any(lk.get("kind") == "audio_file" for lk in r.get("links", []))]
         rid = (with_audio[0] if with_audio else runs[0]).get("runId")
     # The bridge downloads the audio file (can take a few seconds) → longer wait.
-    res = _bridge_get(f"/research/{rid}/podcast", timeout=180.0)
+    with b.spinner("Fetching the podcast audio"):
+        res = _bridge_get(f"/research/{rid}/podcast", timeout=180.0)
     if res is None or res[0] != 200:
         print(f"{_NO} {_err(res)}")
         return 1
