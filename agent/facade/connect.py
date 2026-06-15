@@ -19,6 +19,7 @@ the already-running bridge at runtime. Install paths are overridable (``home`` /
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -486,6 +487,38 @@ def _uninstall_stream_script(home: Path | None) -> None:
             pass
 
 
+def _remove_stream_cron(home: Path | None) -> None:
+    """Remove the watchdog's `sr-stream` cron job from the runtime's
+    cron/jobs.json so it stops firing (and erroring on the now-removed script)
+    after disconnect. The cron job is a GATEWAY artifact the agent arms via the
+    cronjob tool; a host-side disconnect can't reach the gateway API, so we edit
+    jobs.json directly. Best-effort + atomic (temp + replace); preserves every
+    other job. jobs.json shape: {"jobs": [ {name, script, …}, … ], …}. Tolerates
+    the gateway concurrently rewriting the file (worst case the entry survives a
+    race and is swept on the next disconnect, or removed via `/sr logout`)."""
+    jobs_file = (home or Path.home()) / ".hermes" / "cron" / "jobs.json"
+    try:
+        if not jobs_file.is_file():
+            return
+        data = json.loads(jobs_file.read_text("utf-8"))
+    except (OSError, ValueError):
+        return
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, list):
+        return
+    kept = [j for j in jobs if not (isinstance(j, dict)
+            and (j.get("name") == "sr-stream" or j.get("script") == _STREAM_SCRIPT))]
+    if len(kept) == len(jobs):
+        return  # nothing of ours to remove
+    data["jobs"] = kept
+    try:
+        tmp = jobs_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data), "utf-8")
+        os.replace(tmp, jobs_file)
+    except OSError:
+        pass
+
+
 def _normalize_modes(target: Path) -> None:
     """Best-effort 0644 on the copied skill files. copy2 carries the SOURCE mode
     (Windows ACL bits) onto POSIX/WSL, which can leave odd permissions on a
@@ -517,7 +550,8 @@ def uninstall(runtime: str, *, dest: Path | None = None, home: Path | None = Non
     if runtime not in RUNTIMES:
         raise ValueError(f"unknown runtime: {runtime}")
     if runtime == "hermes" and dest is None:
-        _uninstall_stream_script(home)  # best-effort; the inert script is harmless if left
+        _uninstall_stream_script(home)  # best-effort; removes the script + state
+        _remove_stream_cron(home)       # …and the gateway cron job, so it can't orphan-spam
     target = dest or runtime_dest(runtime, home)
     removed = False
     own_leaves = (_SKILL_LEAF, *_LEGACY_LEAVES)

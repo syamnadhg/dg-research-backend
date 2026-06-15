@@ -191,6 +191,36 @@ def test_install_drops_stream_script_in_hermes_scripts(tmp_path):
     assert not poll.exists() and not state.exists()  # disconnect tears both down
 
 
+def test_uninstall_removes_sr_stream_cron_job(tmp_path):
+    # disconnect must also remove the gateway `sr-stream` cron job — else it
+    # orphan-fires every tick erroring on the now-removed script (the spam bug).
+    import json
+    cron = tmp_path / ".hermes" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(json.dumps({
+        "jobs": [
+            {"name": "memory-dreaming", "enabled": False},
+            {"name": "sr-stream", "script": "sr_attention_poll.py", "enabled": True},
+        ],
+        "updated_at": 1,
+    }), encoding="utf-8")
+    connect.uninstall("hermes", home=tmp_path)
+    data = json.loads((cron / "jobs.json").read_text(encoding="utf-8"))
+    names = [j["name"] for j in data["jobs"]]
+    assert "sr-stream" not in names      # ours removed
+    assert "memory-dreaming" in names    # the user's other jobs preserved
+    assert data["updated_at"] == 1       # sibling top-level keys untouched
+
+
+def test_remove_stream_cron_tolerates_missing_or_odd_jobs_file(tmp_path):
+    connect._remove_stream_cron(tmp_path)  # no cron dir → no raise
+    cron = tmp_path / ".hermes" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text("not json", encoding="utf-8")
+    connect._remove_stream_cron(tmp_path)  # corrupt → no raise, left as-is
+    assert (cron / "jobs.json").read_text(encoding="utf-8") == "not json"
+
+
 def test_install_dest_override_skips_stream_script(tmp_path):
     # A custom `dest` must NOT write to HERMES_HOME (else a dest test would hit the
     # real ~/.hermes). The cron script belongs only with the standard layout.
