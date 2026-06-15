@@ -587,7 +587,7 @@ def test_signin_step_not_connected_returns_false(monkeypatch):
 # _connect_next — terminal vs chat split, varied by login + startup state.
 
 def test_connect_next_logged_in_and_pinned(monkeypatch):
-    groups = cli._connect_next(logged_in=True, startup_pinned=True)
+    groups = cli._connect_next(runtime="hermes", logged_in=True, startup_pinned=True)
     assert [lbl for lbl, _ in groups] == ["in this terminal", "in your chat (Hermes / OpenClaw)"]
     term = [c for c, _ in groups[0][1]]
     chat = [c for c, _ in groups[1][1]]
@@ -595,13 +595,13 @@ def test_connect_next_logged_in_and_pinned(monkeypatch):
     assert not any(c.endswith("agent login") for c in term)
     assert not any("serve" in c or "resurrect" in c for c in term)  # already pinned
     assert any(c.endswith("--help") for c in term)            # help always
-    assert "/reload-skills" in chat                           # register the skill
+    assert "/reload-skills" in chat                           # register the skill (Hermes caches its scan)
     assert "/sr" in chat                                       # single-command entry
     assert "/sr login" not in chat                            # already signed in
 
 
 def test_connect_next_fresh_and_unpinned(monkeypatch):
-    groups = cli._connect_next(logged_in=False, startup_pinned=False)
+    groups = cli._connect_next(runtime="hermes", logged_in=False, startup_pinned=False)
     term = [c for c, _ in groups[0][1]]
     chat = [c for c, _ in groups[1][1]]
     assert any(c.endswith("agent login") for c in term)
@@ -609,6 +609,15 @@ def test_connect_next_fresh_and_unpinned(monkeypatch):
     assert any("serve" in c for c in term) and any("resurrect" in c for c in term)
     assert any(c.endswith("--help") for c in term)            # help always
     assert "/reload-skills" in chat and "/sr login" in chat and "/sr" in chat
+
+
+def test_connect_next_openclaw_omits_reload_skills(monkeypatch):
+    # OpenClaw auto-watches the skill dir (no /reload-skills command). The chat
+    # group must NOT advertise a reload step there, but /sr must still appear.
+    groups = cli._connect_next(runtime="openclaw", logged_in=True, startup_pinned=True)
+    chat = [c for c, _ in groups[1][1]]
+    assert "/reload-skills" not in chat
+    assert "/sr" in chat
 
 
 # Cross-platform reachability: a co-located (local) runtime on a non-Windows host

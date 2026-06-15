@@ -204,9 +204,13 @@ def cmd_connect(args: argparse.Namespace) -> int:
     logged_in = started or _bridge_authed()
 
     print()
-    b.line(b.c(branding._BOLD + branding._ACCENT, "Connected.")
-           + b.c(branding._DIM, "  One more step in chat: run  /reload-skills  so  /sr  registers."))
-    b.next_grouped(_connect_next(logged_in=logged_in, startup_pinned=startup_pinned))
+    reload_hint = connect.profile(chosen.runtime).reload_hint
+    tail = (f"  One more step in chat: run  {reload_hint}  so  /sr  registers."
+            if reload_hint
+            else "  In chat the skill auto-loads — open a new chat, then use  /sr .")
+    b.line(b.c(branding._BOLD + branding._ACCENT, "Connected.") + b.c(branding._DIM, tail))
+    b.next_grouped(_connect_next(runtime=chosen.runtime, logged_in=logged_in,
+                                 startup_pinned=startup_pinned))
     return 0
 
 
@@ -301,9 +305,10 @@ def _signin_step() -> bool:
     return False
 
 
-def _connect_next(*, logged_in: bool, startup_pinned: bool) -> list[tuple[str, list[tuple[str, str]]]]:
+def _connect_next(*, runtime: str, logged_in: bool, startup_pinned: bool) -> list[tuple[str, list[tuple[str, str]]]]:
     """Closing 'Next' actions, split into terminal commands vs in-chat slash
-    commands, and varied by what the user chose (sign-in + startup state)."""
+    commands, and varied by what the user chose (sign-in + startup state) and the
+    runtime (the reload step only applies where skills don't auto-watch)."""
     p = "python research.py agent "
     terminal: list[tuple[str, str]] = []
     if logged_in:
@@ -318,9 +323,10 @@ def _connect_next(*, logged_in: bool, startup_pinned: bool) -> list[tuple[str, l
     terminal.append((p + "disconnect", "uninstall the skill + sign out + forget the runtime (full reset)"))
     terminal.append((p + "--help", "all agent commands"))
 
-    chat: list[tuple[str, str]] = [
-        ("/reload-skills", "run ONCE in chat so the new /sr command registers"),
-    ]
+    chat: list[tuple[str, str]] = []
+    reload_hint = connect.profile(runtime).reload_hint
+    if reload_hint:  # runtimes that auto-watch the skill dir (OpenClaw) need no reload step
+        chat.append((reload_hint, "run ONCE in chat so the new /sr command registers"))
     if not logged_in:
         chat.append(("/sr login", "sign in (approve on your phone)"))
     chat.append(("/sr", "welcome + everything you can do"))

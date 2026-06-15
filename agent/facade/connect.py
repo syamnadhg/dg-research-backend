@@ -82,7 +82,7 @@ PROFILES: dict[str, RuntimeProfile] = {
         rgb=(231, 76, 60),
         skill_subpath=Path(".openclaw") / "workspace" / "skills" / "sr",
         has_chat_armable_scheduler=False,
-        reload_hint="/reload-skills",
+        reload_hint=None,  # OpenClaw auto-watches the skill dir (skills.load.watch) — no manual reload command
     ),
     "hermes": RuntimeProfile(
         name="hermes",
@@ -501,7 +501,10 @@ def _prune_legacy_installs(parent: Path) -> None:
 # job the /sr skill arms via the gateway's `cronjob` tool — which requires the
 # script under HERMES_HOME/scripts/ (it validates containment there, rejecting the
 # bundle path). Mirror the bundled copy into that dir so the skill can arm the job
-# by filename. Hermes-only: OpenClaw has no equivalent cron scheduler.
+# by filename. Gated on RuntimeProfile.has_chat_armable_scheduler (Hermes only):
+# OpenClaw HAS cron (`openclaw cron …`) but it is admin/operator.admin-gated and
+# runs in the gateway process — NOT as an agent exec call (issue #66142) — so the
+# /sr skill can't arm it from chat the Hermes way, hence no per-chat watchdog there.
 _STREAM_SCRIPT = "sr_attention_poll.py"
 
 
