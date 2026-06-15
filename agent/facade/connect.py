@@ -506,36 +506,56 @@ def _is_stream_job(job: object) -> bool:
             or script == _STREAM_SCRIPT or script.startswith("sr_poll_"))
 
 
-def _remove_stream_cron(home: Path | None) -> None:
+def _stream_jobs_present(jobs_file: Path) -> bool | None:
+    """Whether jobs.json currently holds any watchdog job. None when it can't be
+    read (missing handled by the caller). Used to CONFIRM a removal actually
+    stuck, since the gateway reads jobs.json fresh each tick but could clobber a
+    host-side edit with its own concurrent save."""
+    try:
+        data = json.loads(jobs_file.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, list):
+        return None
+    return any(_is_stream_job(j) for j in jobs)
+
+
+def _remove_stream_cron(home: Path | None) -> bool:
     """Remove the watchdog cron jobs from the runtime's cron/jobs.json so they
     stop firing (and erroring on the now-removed scripts) after disconnect —
     both the shared `sr-stream` job and every per-chat `sr-stream-<slug>` job.
     The cron job is a GATEWAY artifact the agent arms via the cronjob tool; a
     host-side disconnect can't reach the gateway API, so we edit jobs.json
     directly. Best-effort + atomic (temp + replace); preserves every other job.
-    jobs.json shape: {"jobs": [ {name, script, …}, … ], …}. Tolerates the gateway
-    concurrently rewriting the file (worst case the entry survives a race and is
-    swept on the next disconnect, or removed via `/sr logout`)."""
+    jobs.json shape: {"jobs": [ {name, script, …}, … ], …}.
+
+    Returns True when, AFTER this call, jobs.json is confirmed free of watchdog
+    jobs (so the caller may safely delete the watchdog script). Returns False
+    when a watchdog job might still remain — jobs.json is unreadable / oddly
+    shaped, the write failed, or a concurrent gateway save clobbered our edit. In
+    that case the caller MUST KEEP the script: a surviving job then runs a script
+    that simply exits silently (the bridge is down post-disconnect), instead of
+    the scheduler erroring "Script not found" into chat every tick. The leftover
+    job is swept on the next disconnect or by `/sr logout` (gateway-side)."""
     jobs_file = (home or Path.home()) / ".hermes" / "cron" / "jobs.json"
+    if not jobs_file.is_file():
+        return True  # no jobs file → nothing references the watchdog script
+    present = _stream_jobs_present(jobs_file)
+    if present is None:
+        return False  # can't read/parse → can't confirm; keep the script to be safe
+    if not present:
+        return True  # already clean
     try:
-        if not jobs_file.is_file():
-            return
         data = json.loads(jobs_file.read_text("utf-8"))
-    except (OSError, ValueError):
-        return
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    if not isinstance(jobs, list):
-        return
-    kept = [j for j in jobs if not _is_stream_job(j)]
-    if len(kept) == len(jobs):
-        return  # nothing of ours to remove
-    data["jobs"] = kept
-    try:
+        data["jobs"] = [j for j in data.get("jobs", []) if not _is_stream_job(j)]
         tmp = jobs_file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data), "utf-8")
         os.replace(tmp, jobs_file)
-    except OSError:
-        pass
+    except (OSError, ValueError):
+        return False
+    # Confirm the removal stuck (a racing gateway save could have re-added it).
+    return _stream_jobs_present(jobs_file) is False
 
 
 def _normalize_modes(target: Path) -> None:
@@ -569,8 +589,16 @@ def uninstall(runtime: str, *, dest: Path | None = None, home: Path | None = Non
     if runtime not in RUNTIMES:
         raise ValueError(f"unknown runtime: {runtime}")
     if runtime == "hermes" and dest is None:
-        _uninstall_stream_script(home)  # best-effort; removes the script + state
-        _remove_stream_cron(home)       # …and the gateway cron job, so it can't orphan-spam
+        # Remove the gateway cron JOB(S) FIRST, then the script — and only delete
+        # the script if the job removal is CONFIRMED (jobs.json free of watchdog
+        # jobs). A job-without-script is exactly what spams "Script not found"
+        # every tick, so if removal can't be confirmed we KEEP the script: any
+        # surviving job then runs it and it exits silently (bridge is down), and
+        # the job is swept next disconnect / by `/sr logout`. Ordering matters —
+        # the old order (script first) left a window where a still-armed job hit
+        # a missing script.
+        if _remove_stream_cron(home):
+            _uninstall_stream_script(home)  # confirmed jobless → safe to remove + clear state
     target = dest or runtime_dest(runtime, home)
     removed = False
     own_leaves = (_SKILL_LEAF, *_LEGACY_LEAVES)

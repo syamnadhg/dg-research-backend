@@ -212,13 +212,18 @@ def test_uninstall_removes_sr_stream_cron_job(tmp_path):
     assert data["updated_at"] == 1       # sibling top-level keys untouched
 
 
-def test_remove_stream_cron_tolerates_missing_or_odd_jobs_file(tmp_path):
-    connect._remove_stream_cron(tmp_path)  # no cron dir → no raise
+def test_remove_stream_cron_return_contract(tmp_path):
+    # Returns True only when jobs.json is CONFIRMED free of watchdog jobs (safe to
+    # delete the script); False when it can't confirm (so the caller keeps it).
+    assert connect._remove_stream_cron(tmp_path) is True  # no cron dir → nothing references the script
     cron = tmp_path / ".hermes" / "cron"
     cron.mkdir(parents=True)
     (cron / "jobs.json").write_text("not json", encoding="utf-8")
-    connect._remove_stream_cron(tmp_path)  # corrupt → no raise, left as-is
-    assert (cron / "jobs.json").read_text(encoding="utf-8") == "not json"
+    assert connect._remove_stream_cron(tmp_path) is False  # corrupt → can't confirm → keep the script
+    assert (cron / "jobs.json").read_text(encoding="utf-8") == "not json"  # left as-is, no raise
+    import json
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"name": "memory-dreaming"}]}), encoding="utf-8")
+    assert connect._remove_stream_cron(tmp_path) is True  # no watchdog job present → already clean
 
 
 def test_uninstall_sweeps_per_chat_shims_and_state(tmp_path):
@@ -253,9 +258,44 @@ def test_remove_stream_cron_drops_per_chat_jobs(tmp_path):
         ],
         "updated_at": 7,
     }), encoding="utf-8")
-    connect._remove_stream_cron(tmp_path)
+    assert connect._remove_stream_cron(tmp_path) is True  # confirmed jobless after removal
     names = [j["name"] for j in json.loads((cron / "jobs.json").read_text(encoding="utf-8"))["jobs"]]
     assert names == ["memory-dreaming"]  # every watchdog job swept, user job kept
+
+
+def test_uninstall_keeps_script_when_cron_removal_unconfirmed(tmp_path):
+    # The spam guard: if the watchdog cron job removal can't be CONFIRMED (jobs.json
+    # corrupt/unreadable), disconnect KEEPS the watchdog script so a surviving job
+    # runs it and it exits silently (bridge down) — instead of the scheduler
+    # spamming "Script not found" every tick. (Job swept next disconnect / logout.)
+    connect.install("hermes", home=tmp_path)
+    script = tmp_path / ".hermes" / "scripts" / "sr_attention_poll.py"
+    assert script.is_file()
+    cron = tmp_path / ".hermes" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text("{ corrupt", encoding="utf-8")  # removal can't be confirmed
+    connect.uninstall("hermes", home=tmp_path)
+    assert script.is_file()  # KEPT — no job-without-script spam window
+    # the skill itself is still torn down (disconnect proceeds)
+    assert not (tmp_path / connect.RUNTIMES["hermes"]).exists()
+
+
+def test_uninstall_removes_job_then_script_when_confirmed(tmp_path):
+    # Normal path: a clean jobs.json → the watchdog job is removed AND confirmed
+    # gone → the script is deleted; unrelated jobs survive.
+    import json
+    connect.install("hermes", home=tmp_path)
+    script = tmp_path / ".hermes" / "scripts" / "sr_attention_poll.py"
+    cron = tmp_path / ".hermes" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [
+        {"name": "sr-stream", "script": "sr_attention_poll.py"},
+        {"name": "keep-me", "enabled": True},
+    ]}), encoding="utf-8")
+    connect.uninstall("hermes", home=tmp_path)
+    names = [j["name"] for j in json.loads((cron / "jobs.json").read_text(encoding="utf-8"))["jobs"]]
+    assert names == ["keep-me"]      # watchdog job removed, user job kept
+    assert not script.exists()       # confirmed jobless → script removed
 
 
 def test_is_stream_job_classifies():
