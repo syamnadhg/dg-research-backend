@@ -584,6 +584,81 @@ def test_signin_step_not_connected_returns_false(monkeypatch):
     assert cli._signin_step() is False
 
 
+# ── non-interactive connect: --yes / --runtime / --startup / --login (Phase 2) ──
+
+def test_decide_explicit_flag_wins_over_assume_yes(monkeypatch):
+    # An explicit --no-X (False) must win even under --yes; confirm never consulted.
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked")))
+    assert cli._decide(False, True, "x") is False
+    assert cli._decide(True, False, "x") is True
+
+
+def test_decide_assume_yes_skips_prompt(monkeypatch):
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked")))
+    assert cli._decide(None, True, "x") is True
+
+
+def test_decide_falls_through_to_confirm(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli.b, "confirm", lambda p, default=True: seen.append((p, default)) or True)
+    assert cli._decide(None, False, "Proceed?", default=False) is True
+    assert seen == [("Proceed?", False)]
+
+
+def test_choose_target_assume_yes_single_skips_confirm(monkeypatch):
+    # assume_yes auto-confirms a single target — confirm must NOT be reached.
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked")))
+    t = _t()
+    assert cli._choose_target([t], assume_yes=True) is t
+
+
+def test_choose_target_assume_yes_multiple_refuses(monkeypatch):
+    # Can't disambiguate >1 runtime non-interactively → refuse, tell them --runtime.
+    rv, out = _cap(cli._choose_target, [_t("hermes"), _t("openclaw")], assume_yes=True)
+    assert rv is None
+    assert "--runtime" in out
+
+
+def test_install_step_assume_yes_installs_without_prompt(monkeypatch):
+    seq = iter([False, True])  # absent, then verified after install
+    monkeypatch.setattr(cli.connect, "verify", lambda p: next(seq))
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked")))
+    monkeypatch.setattr(cli.connect, "install", lambda rt, **kw: Path("C:/dest"))
+    monkeypatch.setattr(cli, "_record_runtime", lambda c: None)
+    assert cli._install_step(_t(), None, assume_yes=True) == Path("C:/dest")
+
+
+def test_startup_step_explicit_false_skips(monkeypatch):
+    # --no-startup → skip without asking, even on a supported OS.
+    monkeypatch.setattr(cli.autostart, "supported", lambda: True)
+    monkeypatch.setattr(cli.autostart, "kind_label", lambda: "Scheduled Task")
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked")))
+    installed = []
+    monkeypatch.setattr(cli.autostart, "install", lambda: installed.append(1) or (True, ""))
+    assert cli._startup_step(explicit=False) is False
+    assert installed == []
+
+
+def test_signin_step_noninteractive_relays_link(monkeypatch):
+    # Chat exec: relay the link (no host browser, no block-poll) → not yet signed in.
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    called = []
+    monkeypatch.setattr(cli, "_remote_signin", lambda **k: called.append(k) or "started")
+    assert cli._signin_step(assume_yes=True, noninteractive=True) is False
+    assert called[0].get("open_browser") is False and called[0].get("poll") is False
+
+
+def test_connect_flags_parse():
+    a = cli.build_parser().parse_args(
+        ["connect", "--runtime", "hermes", "--yes", "--startup", "--login"])
+    assert a.runtime_opt == "hermes" and a.yes is True
+    assert a.startup is True and a.login is True
+    b2 = cli.build_parser().parse_args(["connect", "--no-startup", "--no-login"])
+    assert b2.startup is False and b2.login is False and b2.yes is False
+    c = cli.build_parser().parse_args(["connect"])  # nothing given → ask interactively
+    assert c.startup is None and c.login is None and c.runtime_opt is None
+
+
 # _connect_next — terminal vs chat split, varied by login + startup state.
 
 def test_connect_next_logged_in_and_pinned(monkeypatch):

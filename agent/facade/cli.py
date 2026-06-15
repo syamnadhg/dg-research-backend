@@ -120,12 +120,29 @@ _CHANNELS = [
 ]
 
 
-def _choose_target(targets: list[connect.Target]) -> connect.Target | None:
+def _decide(explicit: bool | None, assume_yes: bool, prompt: str, *, default: bool = True) -> bool:
+    """Resolve a yes/no connect step. An explicit --flag wins; otherwise --yes
+    assumes yes; otherwise ask interactively. So a chat-driven (non-interactive)
+    connect never blocks on a prompt that would EOF to False — the caller passes
+    --yes and/or the per-step flag, and only a real terminal reaches b.confirm."""
+    if explicit is not None:
+        return explicit
+    if assume_yes:
+        return True
+    return b.confirm(prompt, default=default)
+
+
+def _choose_target(targets: list[connect.Target], *, assume_yes: bool = False) -> connect.Target | None:
     """Step 1's chooser: pick a runtime (numbered, when >1) then CONFIRM it with a
     'Continue with X?' prompt — so even a single detected runtime is an explicit
     choice. Returns the chosen Target, or None to cancel (Ctrl-C / EOF /
-    out-of-range / a 'no' at the confirm)."""
+    out-of-range / a 'no' at the confirm). With ``assume_yes`` a single target is
+    auto-confirmed; multiple targets can't be disambiguated non-interactively, so
+    the caller must pass --runtime (we refuse rather than guess)."""
     if len(targets) > 1:
+        if assume_yes:
+            b.no("Multiple runtimes detected — pass --runtime hermes|openclaw for a non-interactive connect.")
+            return None
         for i, t in enumerate(targets, 1):
             print(f"     {b.c(branding._ACCENT + branding._BOLD, str(i))}  {_runtime_mark(t)}")
         ans = b.ask("Pick a runtime [1]:", cancel_on_interrupt=True)
@@ -140,7 +157,7 @@ def _choose_target(targets: list[connect.Target]) -> connect.Target | None:
         chosen = targets[idx - 1]
     else:
         chosen = targets[0]
-    if not b.confirm(f"Continue with {_runtime_mark(chosen)}?", default=True):
+    if not _decide(None, assume_yes, f"Continue with {_runtime_mark(chosen)}?", default=True):
         return None
     return chosen
 
@@ -153,7 +170,11 @@ def cmd_connect(args: argparse.Namespace) -> int:
     b.channels(_CHANNELS)
     b.step_arc(["Detect + choose", "Install", "Run on startup", "Sign in"])
 
-    explicit = args.runtime
+    explicit = args.runtime_opt or args.runtime
+    assume_yes = args.yes
+    # Non-interactive when --yes is passed OR there's no terminal (a chat exec):
+    # governs HOW sign-in runs (relay a link vs open a browser + block-poll).
+    noninteractive = assume_yes or not sys.stdin.isatty()
     if explicit and explicit not in connect.RUNTIMES:
         b.no(f"Unknown runtime '{explicit}'. Choose: {', '.join(connect.RUNTIMES)}")
         return 1
@@ -176,14 +197,14 @@ def cmd_connect(args: argparse.Namespace) -> int:
         return 1
     for t in targets:
         b.ok(f"Found {_runtime_mark(t)}")
-    chosen = _choose_target(targets)
+    chosen = _choose_target(targets, assume_yes=assume_yes)
     if chosen is None:
         b.dim("Cancelled — nothing was changed.")
         return 1
 
     # ── [2/4] Install the skill + make it reachable ──────────────────────────
     b.step(2, 4, "Install the skill")
-    target = _install_step(chosen, Path(args.dest) if args.dest else None)
+    target = _install_step(chosen, Path(args.dest) if args.dest else None, assume_yes=assume_yes)
     if target is None:
         return 1  # _install_step already printed the reason (declined / failed)
     # Reachability runs AFTER the copy: a WSL `wsl --shutdown` would unmount
@@ -193,14 +214,14 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
     # ── [3/4] Run on startup ──────────────────────────────────────────────────
     b.step(3, 4, "Run on startup")
-    startup_pinned = _startup_step()
+    startup_pinned = _startup_step(explicit=args.startup, assume_yes=assume_yes)
 
     # ── [4/4] Sign in ─────────────────────────────────────────────────────────
     b.step(4, 4, "Sign in")
     # Show 'logout' (switch account) in the closing card when sign-in was STARTED
     # here OR the bridge is already authed — never the redundant 'login' the user
     # just chose to do. (A browser sign-in completes async; choosing it counts.)
-    started = _signin_step()
+    started = _signin_step(explicit=args.login, assume_yes=assume_yes, noninteractive=noninteractive)
     logged_in = started or _bridge_authed()
 
     print()
@@ -221,18 +242,21 @@ def _record_runtime(chosen: connect.Target) -> None:
                       location=chosen.location, distro=chosen.distro)
 
 
-def _install_step(chosen: connect.Target, dest_override: Path | None) -> Path | None:
+def _install_step(chosen: connect.Target, dest_override: Path | None, *,
+                  assume_yes: bool = False) -> Path | None:
     """[2/4] Install (or keep) the skill. Returns the installed dir, or None if the
-    user declined an install that isn't already present (→ caller aborts)."""
+    user declined an install that isn't already present (→ caller aborts). With
+    ``assume_yes`` a fresh install proceeds and an existing one is refreshed
+    (non-interactive connect always lands the latest skill)."""
     existing = dest_override or chosen.dest
     if connect.verify(existing):
         b.dim(f"A Super Research skill is already installed at:\n     {existing}")
-        if not b.confirm("Reinstall (refresh to the latest)?", default=False):
+        if not _decide(None, assume_yes, "Reinstall (refresh to the latest)?", default=False):
             b.dim("Kept the existing skill.")
             _record_runtime(chosen)
             return existing
-    elif not b.confirm(f"Install the skill into {_runtime_mark(chosen)}?", default=True):
-        b.warn("Skipped — without the skill the chat runtime won't have the /sr- commands.")
+    elif not _decide(None, assume_yes, f"Install the skill into {_runtime_mark(chosen)}?", default=True):
+        b.warn("Skipped — without the skill the chat runtime won't have the /sr commands.")
         return None
     try:
         with b.spinner("Installing the skill"):
@@ -249,17 +273,18 @@ def _install_step(chosen: connect.Target, dest_override: Path | None) -> Path | 
     return target
 
 
-def _startup_step() -> bool:
+def _startup_step(*, explicit: bool | None = None, assume_yes: bool = False) -> bool:
     """[3/4] Offer to pin + start the background bridge so it returns after a
     reboot — a Scheduled Task (Windows), systemd --user unit (Linux), or launchd
     LaunchAgent (macOS). Returns True if it ends up pinned. Degrades cleanly with a
-    serve hint on an OS where pinning isn't implemented, so the flow never dead-ends."""
+    serve hint on an OS where pinning isn't implemented, so the flow never dead-ends.
+    ``explicit`` (--startup/--no-startup) or ``assume_yes`` skip the prompt."""
     if not autostart.supported():
         b.warn(f"Run-on-startup pinning isn't available on this host ({connect.host_os_label()}).")
         b.dim("Start the bridge yourself:  python research.py agent serve")
         return False
     b.dim(f"Pins a background bridge that starts on every login (a {autostart.kind_label()}).")
-    if not b.confirm("Run on startup? (background, every login)", default=True):
+    if not _decide(explicit, assume_yes, "Run on startup? (background, every login)", default=True):
         b.dim("Skipped — start it yourself when ready (see Next).")
         return False
     ok, out = autostart.install()
@@ -282,22 +307,32 @@ def _startup_step() -> bool:
     return True
 
 
-def _signin_step() -> bool:
+def _signin_step(*, explicit: bool | None = None, assume_yes: bool = False,
+                 noninteractive: bool = False) -> bool:
     """[4/4] Optional sign-in on the SR web app (superresearch.io) — the SAME page
-    `/sr login` uses, so it's consistent and works from any device. Blocks until
-    approved, so it returns True only when the account is ACTUALLY signed in. Needs
-    the bridge up (it brokers the session); if it isn't, point at starting it first."""
+    `/sr login` uses, so it's consistent and works from any device. Needs the
+    bridge up (it brokers the session); if it isn't, point at starting it first.
+
+    ``explicit`` (--login/--no-login) or ``assume_yes`` skip the prompt. When
+    ``noninteractive`` (a chat exec / --yes) it RELAYS the sign-in link instead of
+    opening a host browser + block-polling — the user approves and finishes in
+    chat with `/sr login-wait`. Returns True only when ACTUALLY signed in (so a
+    relayed-but-unapproved link returns False)."""
     if not _bridge_up():
         b.dim("Bridge isn't running yet — start it first, then sign in:")
         b.dim("  python research.py agent serve   (or: agent resurrect)")
         b.dim("then:  agent login   (or  /sr login  from your chat).")
         return False
-    if not b.confirm("Sign in now? (opens Super Research in your browser)", default=True):
+    prompt = ("Sign in now? (relays a link to approve)" if noninteractive
+              else "Sign in now? (opens Super Research in your browser)")
+    if not _decide(explicit, assume_yes, prompt, default=True):
         b.dim("Skipped — sign in later with  /sr login  in chat  (or: agent login).")
         return False
-    state = _remote_signin(open_browser=True)
+    state = _remote_signin(open_browser=not noninteractive, poll=not noninteractive)
     if state == "connected":
         return True
+    if state == "started":   # non-interactive: link relayed, approval pending in chat
+        return False
     if state == "start-failed":
         b.dim("Web sign-in unreachable right now — host-local fallback:  agent login --local")
     else:
@@ -619,12 +654,17 @@ def cmd_login(args: argparse.Namespace) -> int:
     return 0
 
 
-def _remote_signin(*, open_browser: bool, runtime: str = "", label: str = "") -> str:
+def _remote_signin(*, open_browser: bool, poll: bool = True, runtime: str = "", label: str = "") -> str:
     """Shared sign-in via the SR web app (superresearch.io) — the SAME page
     `/sr login` uses, so sign-in is consistent everywhere and works from any device
     (no host-local page; approve on phone or this PC). Starts the broker flow, opens
     the verify link, polls until approved. Returns the final state: 'connected' /
-    'expired' / 'error' / 'timeout' / 'cancelled' / 'start-failed'."""
+    'expired' / 'error' / 'timeout' / 'cancelled' / 'start-failed'.
+
+    With ``poll=False`` (a chat-driven / headless connect) it STARTS the flow and
+    prints the link, then returns 'started' WITHOUT opening a browser or blocking —
+    the user approves and finishes in chat with `/sr login-wait`, which polls the
+    same pending flow."""
     res = _bridge_post("/login/remote/start",
                        {"runtime": runtime or prefs.get_runtime() or "", "label": label or ""})
     if res is None or res[0] != 200:
@@ -634,6 +674,9 @@ def _remote_signin(*, open_browser: bool, runtime: str = "", label: str = "") ->
     url = out.get("verifyUrl") or ""
     b.line(f"Sign in here:  {url}")
     b.dim("Sign in with your Super Research Google account, then tap Approve & connect.")
+    if not poll:
+        b.dim("Approve it, then finish in chat:  /sr login-wait  (it captures the session).")
+        return "started"
     if open_browser and url:
         try:
             webbrowser.open(url)
@@ -1194,7 +1237,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="connect a chat runtime — branded flow: install the skill "
                              "(Windows or WSL) + optionally pin the bridge")
     cn.add_argument("runtime", nargs="?", help="hermes or openclaw (auto-detected if omitted)")
+    cn.add_argument("--runtime", dest="runtime_opt",
+                    help="hermes or openclaw (flag form — for non-interactive / chat-driven connect)")
     cn.add_argument("--dest", help="explicit install dir (default: the runtime's skills dir)")
+    cn.add_argument("-y", "--yes", action="store_true",
+                    help="non-interactive: assume yes to prompts without an explicit flag "
+                         "(install + the steps below) — for chat-driven connect")
+    cn.add_argument("--startup", dest="startup", action="store_true", default=None,
+                    help="pin run-on-startup without asking")
+    cn.add_argument("--no-startup", dest="startup", action="store_false",
+                    help="skip run-on-startup without asking")
+    cn.add_argument("--login", dest="login", action="store_true", default=None,
+                    help="start sign-in without asking (non-interactive: prints the link to relay in chat)")
+    cn.add_argument("--no-login", dest="login", action="store_false",
+                    help="skip sign-in without asking")
     cn.set_defaults(func=cmd_connect)
 
     dc = sub.add_parser("disconnect", parents=[common],
