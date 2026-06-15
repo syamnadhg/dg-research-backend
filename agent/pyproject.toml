@@ -3,9 +3,10 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "super-agent-facade"
-version = "0.0.1"
-description = "Super Agent bridge — account-authed Super Research client for chat runtimes (Hermes / OpenClaw)"
+name = "superresearch-agent"
+version = "0.1.0"
+description = "Install Super Research into a chat runtime (Hermes / OpenClaw) with `uvx superresearch-agent connect` — an account-authed loopback bridge that drives the user's own Super Research from chat."
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -19,6 +20,10 @@ dev = [
 ]
 
 [project.scripts]
+# Canonical name resolved by `uvx superresearch-agent connect`. `agent` is kept
+# as a short alias (back-compat with the `python research.py agent` front door
+# and existing docs/recipes); both run the same CLI.
+superresearch-agent = "facade.cli:main"
 agent = "facade.cli:main"
 
 [tool.setuptools]
