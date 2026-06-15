@@ -30,10 +30,13 @@ mints each phase's permanent share; this script just renders + de-dups.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -56,19 +59,42 @@ def _base() -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def _get_updates() -> list:
-    req = urllib.request.Request(_base() + "/updates?via=agent&limit=20", method="GET")
+def _origin_slug(origin: dict) -> str:
+    """A short, filesystem-safe id for a chat origin: a readable platform prefix
+    plus a hash of the full (platform, chat, thread) tuple. MUST stay identical
+    to sr._origin_slug so a generated shim (sr_poll_<slug>.py) and the state file
+    main() derives below (.sr_poll_<slug>.state.json) carry the same slug."""
+    platform = re.sub(r"[^A-Za-z0-9]", "", (origin.get("platform") or "")).lower()[:16] or "chat"
+    key = "\x00".join((origin.get("platform") or "", origin.get("chat_id") or "",
+                       origin.get("thread_id") or ""))
+    return f"{platform}_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:10]}"
+
+
+def _state_path(origin: dict | None) -> Path:
+    """The de-dup state file: the shared default for the account-wide watchdog,
+    or a per-chat file when scoped (so two chats' watchdogs never share state)."""
+    if not origin:
+        return _STATE_FILE
+    return Path(__file__).with_name(f".sr_poll_{_origin_slug(origin)}.state.json")
+
+
+def _get_updates(origin: dict | None = None) -> list:
+    q = "/updates?via=agent&limit=20"
+    if origin:
+        q += "&platform=" + urllib.parse.quote(origin.get("platform", ""), safe="")
+        q += "&chat=" + urllib.parse.quote(origin.get("chat_id", ""), safe="")
+    req = urllib.request.Request(_base() + q, method="GET")
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
         body = json.loads(resp.read() or b"{}")
     return body.get("runs", []) if isinstance(body, dict) else []
 
 
-def _load_state() -> dict | None:
+def _load_state(path: Path | None = None) -> dict | None:
     """The persisted last-seen state, or None when there is none (first tick
     after arming, or an unreadable/corrupt file). None signals compute() to
     BASELINE silently instead of replaying every already-done phase into chat."""
     try:
-        data = json.loads(_STATE_FILE.read_text("utf-8"))
+        data = json.loads((path or _STATE_FILE).read_text("utf-8"))
         if not isinstance(data, dict):
             return None
         # Migration: a PRE-phaseUpdates state (keyed by links/announced_terminal,
@@ -83,9 +109,9 @@ def _load_state() -> dict | None:
         return None
 
 
-def _save_state(state: dict) -> None:
+def _save_state(state: dict, path: Path | None = None) -> None:
     try:
-        _STATE_FILE.write_text(json.dumps(state), "utf-8")
+        (path or _STATE_FILE).write_text(json.dumps(state), "utf-8")
     except Exception:
         pass  # best-effort; a missed save just re-announces next tick (rare)
 
@@ -163,20 +189,24 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[l
     return out, new_state
 
 
-def main() -> int:
+def main(origin: dict | None = None) -> int:
+    """One watchdog tick. ``origin`` (passed by a generated per-chat shim) scopes
+    the bridge query + the de-dup state file to one chat; None = the shared,
+    account-wide watchdog (single-chat correct, the legacy behavior)."""
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
     try:
-        runs = _get_updates()
+        runs = _get_updates(origin)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
         # Bridge down / unreachable — stay SILENT (exit 0). A non-zero exit would
         # trip the cron error alert every minute while the host bridge is off.
         return 0
-    prior = _load_state()
+    state_file = _state_path(origin)
+    prior = _load_state(state_file)
     lines, new_state = compute(runs, prior or {}, baseline=prior is None)
-    _save_state(new_state)
+    _save_state(new_state, state_file)
     if lines:
         print("\n".join(lines))
     return 0

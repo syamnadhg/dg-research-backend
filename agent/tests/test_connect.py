@@ -221,6 +221,53 @@ def test_remove_stream_cron_tolerates_missing_or_odd_jobs_file(tmp_path):
     assert (cron / "jobs.json").read_text(encoding="utf-8") == "not json"
 
 
+def test_uninstall_sweeps_per_chat_shims_and_state(tmp_path):
+    # #819: arm-stream generates per-chat shims (sr_poll_<slug>.py) + state files
+    # (.sr_poll_<slug>.state.json). Disconnect must sweep ALL of them, not just
+    # the shared watchdog — else an orphaned shim keeps firing after disconnect.
+    connect.install("hermes", home=tmp_path)
+    scripts = tmp_path / ".hermes" / "scripts"
+    (scripts / "sr_poll_telegram_abc123.py").write_text("# shim\n", encoding="utf-8")
+    (scripts / ".sr_poll_telegram_abc123.state.json").write_text("{}", encoding="utf-8")
+    (scripts / "sr_poll_whatsapp_def456.py").write_text("# shim\n", encoding="utf-8")
+    # an unrelated user script in the same dir must survive
+    (scripts / "my_other_job.py").write_text("# keep me\n", encoding="utf-8")
+    assert connect.uninstall("hermes", home=tmp_path) is True
+    assert not list(scripts.glob("sr_poll_*.py"))
+    assert not list(scripts.glob(".sr_poll_*.state.json"))
+    assert (scripts / "my_other_job.py").is_file()  # untouched
+
+
+def test_remove_stream_cron_drops_per_chat_jobs(tmp_path):
+    # Both the shared `sr-stream` job and per-chat `sr-stream-<slug>` jobs (and a
+    # job pointing at a generated sr_poll_<slug>.py shim) must be removed.
+    import json
+    cron = tmp_path / ".hermes" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(json.dumps({
+        "jobs": [
+            {"name": "memory-dreaming", "enabled": False},
+            {"name": "sr-stream", "script": "sr_attention_poll.py"},
+            {"name": "sr-stream-telegram_abc123", "script": "sr_poll_telegram_abc123.py"},
+            {"name": "custom-name", "script": "sr_poll_whatsapp_def456.py"},  # matched by script
+        ],
+        "updated_at": 7,
+    }), encoding="utf-8")
+    connect._remove_stream_cron(tmp_path)
+    names = [j["name"] for j in json.loads((cron / "jobs.json").read_text(encoding="utf-8"))["jobs"]]
+    assert names == ["memory-dreaming"]  # every watchdog job swept, user job kept
+
+
+def test_is_stream_job_classifies():
+    assert connect._is_stream_job({"name": "sr-stream"})
+    assert connect._is_stream_job({"name": "sr-stream-telegram_abc"})
+    assert connect._is_stream_job({"script": "sr_attention_poll.py"})
+    assert connect._is_stream_job({"script": "sr_poll_x.py"})
+    assert not connect._is_stream_job({"name": "memory-dreaming"})
+    assert not connect._is_stream_job({"name": "stream-of-thought"})  # not our prefix
+    assert not connect._is_stream_job("nope")
+
+
 def test_install_dest_override_skips_stream_script(tmp_path):
     # A custom `dest` must NOT write to HERMES_HOME (else a dest test would hit the
     # real ~/.hermes). The cron script belongs only with the standard layout.

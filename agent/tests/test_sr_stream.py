@@ -139,3 +139,51 @@ def test_no_phase_or_platform_link_dump_of_raw_links():
     runs[0]["links"] = [{"kind": "chatgpt", "url": "https://chatgpt.com/c/x", "label": "ChatGPT"}]
     msgs, _ = poll.compute(runs, {})
     assert msgs == []  # raw platform links never posted
+
+
+# ── #819 per-chat scoping: origin threads into the query + a per-chat state file ──
+
+def test_state_path_distinct_per_origin():
+    assert poll._state_path(None) == poll._STATE_FILE  # account-wide default
+    a = poll._state_path({"platform": "telegram", "chat_id": "1"})
+    b = poll._state_path({"platform": "telegram", "chat_id": "2"})
+    assert a != b and a != poll._STATE_FILE
+    assert a.name.startswith(".sr_poll_telegram_") and a.name.endswith(".state.json")
+
+
+def test_get_updates_scopes_query_by_origin(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"runs": []}'
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _Resp()
+
+    monkeypatch.setattr(poll.urllib.request, "urlopen", fake_urlopen)
+    poll._get_updates({"platform": "telegram", "chat_id": "-100/x"})
+    assert "via=agent" in captured["url"]
+    assert "platform=telegram" in captured["url"]
+    assert "chat=-100" in captured["url"]  # url-encoded; the / becomes %2F
+    poll._get_updates()  # account-wide form omits the scope params
+    assert "platform=" not in captured["url"] and "chat=" not in captured["url"]
+
+
+def test_main_scoped_threads_origin_to_query_and_state(monkeypatch):
+    origin = {"platform": "telegram", "chat_id": "111"}
+    seen = {}
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: seen.__setitem__("origin", o) or [])
+    monkeypatch.setattr(poll, "_load_state", lambda path=None: seen.__setitem__("load", path) or None)
+    monkeypatch.setattr(poll, "_save_state", lambda state, path=None: seen.__setitem__("save", path))
+    assert poll.main(origin) == 0
+    assert seen["origin"] == origin
+    expected = poll._state_path(origin)
+    assert seen["load"] == expected and seen["save"] == expected and expected != poll._STATE_FILE

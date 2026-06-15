@@ -81,8 +81,37 @@ _ALLOWED_AUDIO_HOSTS = frozenset({"firebasestorage.googleapis.com", "storage.goo
 _ALLOWED_AUDIO_HOST_SUFFIXES = (".storage.googleapis.com",)
 
 
+# The chat a run was fired from — {platform, chat_id[, thread_id]} — captured by
+# sr.py from the gateway's per-session env and tagged onto the run doc. It scopes
+# the streaming watchdog so a run started in one chat only streams back to THAT
+# chat (Telegram→Telegram, WhatsApp→WhatsApp), never leaking across chats.
+_ORIGIN_MAX = 128
+
+
+def _clean_origin(raw: Any) -> dict[str, str] | None:
+    """Normalize a chat origin to short trimmed strings, or None unless BOTH
+    platform and chat_id are present (the minimum to scope updates to one chat).
+    thread_id is kept for fidelity but not required and not used for scoping."""
+    if not isinstance(raw, dict):
+        return None
+
+    def _s(key: str) -> str:
+        v = raw.get(key)
+        return str(v).strip()[:_ORIGIN_MAX] if v not in (None, "") else ""
+
+    platform, chat_id = _s("platform"), _s("chat_id")
+    if not platform or not chat_id:
+        return None
+    out: dict[str, str] = {"platform": platform, "chat_id": chat_id}
+    thread = _s("thread_id")
+    if thread:
+        out["thread_id"] = thread
+    return out
+
+
 def _new_research_fields(
-    topic: str, device_id: str, uid: str, cfg: dict[str, Any] | None
+    topic: str, device_id: str, uid: str, cfg: dict[str, Any] | None,
+    chat_origin: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """The research (chat) doc a fresh agent run creates.
 
@@ -114,6 +143,8 @@ def _new_research_fields(
     }
     if cfg:
         fields["pipelineConfig"] = cfg
+    if chat_origin:
+        fields["chatOrigin"] = chat_origin
     return fields
 
 
@@ -1256,8 +1287,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return  # _resolve_device already sent the error
             rid = "agent-" + uuid.uuid4().hex[:16]
             cfg = body.get("config") if isinstance(body.get("config"), dict) else None
+            # The chat this run was fired from (sr.py reads it from the gateway's
+            # per-session env) — tags the doc so the streaming watchdog can scope
+            # updates to this chat only. Absent for a CLI / older-gateway fire.
+            origin = _clean_origin(body.get("origin"))
             try:
-                fs.upsert_research(sess.uid, rid, _new_research_fields(topic, device_id, sess.uid, cfg))
+                fs.upsert_research(sess.uid, rid,
+                                   _new_research_fields(topic, device_id, sess.uid, cfg, origin))
             except RevokedError:
                 self._json(401, {"error": "session revoked — run /login again"})
                 return
@@ -1400,6 +1436,14 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # the agent (viaAgent) so web-app runs don't clutter the chat, and
             # compute per-phase updates (lazily minting the permanent SR links).
             via_agent = qs.get("via", [""])[0] == "agent"
+            # ?platform=…&chat=… (a PER-CHAT watchdog): further restrict to runs
+            # fired FROM that chat (matched on the doc's chatOrigin) so a run
+            # started in one chat streams back only to that chat. Both must be
+            # present to scope; otherwise via=agent returns every agent run (the
+            # single-chat / account-wide case — already correct for one chat).
+            want_platform = (qs.get("platform", [""])[0] or "").strip().lower()
+            want_chat = (qs.get("chat", [""])[0] or "").strip()
+            scope_chat = bool(via_agent and want_platform and want_chat)
             try:
                 limit = max(1, min(int(qs.get("limit", ["20"])[0]), 50))
             except ValueError:
@@ -1422,6 +1466,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 # Watchdog scope: only runs the user started via the agent.
                 if via_agent and not r.get("viaAgent"):
                     continue
+                # Per-chat scope: only runs fired FROM this watchdog's chat.
+                # Skip BEFORE the phase-update minting below so we never mint a
+                # permanent SR link on behalf of another chat's run.
+                if scope_chat:
+                    co = r.get("chatOrigin")
+                    if not (isinstance(co, dict)
+                            and (co.get("platform") or "").strip().lower() == want_platform
+                            and (co.get("chat_id") or "").strip() == want_chat):
+                        continue
                 attention = _attention_text(r)
                 needs = attention is not None or status in _ATTENTION_STATUSES
                 # active=1 keeps the in-flight runs AND any run that needs the
@@ -1448,6 +1501,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "links": runview.flatten_links(r.get("links")),
                     "srLinks": sr,
                     "phaseUpdates": phase_updates,
+                    "chatOrigin": r.get("chatOrigin"),
                     "needsAttention": needs,
                     "attention": attention,
                 })

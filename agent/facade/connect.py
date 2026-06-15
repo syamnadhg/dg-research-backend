@@ -477,25 +477,45 @@ def _install_stream_script(home: Path | None) -> None:
 
 def _uninstall_stream_script(home: Path | None) -> None:
     """Remove the streaming watchdog + its de-dup state from HERMES_HOME/scripts/
-    (best-effort). Clearing the state file means a later re-connect + re-arm
-    starts from a clean silent baseline instead of replaying old phases."""
+    (best-effort), PLUS every per-chat shim (sr_poll_<slug>.py) and its per-chat
+    state (.sr_poll_<slug>.state.json) that `sr.py arm-stream` generated. Clearing
+    the state means a later re-connect + re-arm starts from a clean silent
+    baseline instead of replaying old phases."""
     scripts = hermes_scripts_dir(home)
-    for name in (_STREAM_SCRIPT, ".sr_stream_state.json"):
+    targets = [scripts / _STREAM_SCRIPT, scripts / ".sr_stream_state.json"]
+    try:
+        targets += list(scripts.glob("sr_poll_*.py"))
+        targets += list(scripts.glob(".sr_poll_*.state.json"))
+    except OSError:
+        pass
+    for p in targets:
         try:
-            (scripts / name).unlink()
+            p.unlink()
         except OSError:
             pass
 
 
+def _is_stream_job(job: object) -> bool:
+    """True for any watchdog cron job we own: the shared `sr-stream` / its script,
+    or a per-chat `sr-stream-<slug>` job / its generated `sr_poll_<slug>.py` shim."""
+    if not isinstance(job, dict):
+        return False
+    name = job.get("name") or ""
+    script = job.get("script") or ""
+    return (name == "sr-stream" or name.startswith("sr-stream-")
+            or script == _STREAM_SCRIPT or script.startswith("sr_poll_"))
+
+
 def _remove_stream_cron(home: Path | None) -> None:
-    """Remove the watchdog's `sr-stream` cron job from the runtime's
-    cron/jobs.json so it stops firing (and erroring on the now-removed script)
-    after disconnect. The cron job is a GATEWAY artifact the agent arms via the
-    cronjob tool; a host-side disconnect can't reach the gateway API, so we edit
-    jobs.json directly. Best-effort + atomic (temp + replace); preserves every
-    other job. jobs.json shape: {"jobs": [ {name, script, …}, … ], …}. Tolerates
-    the gateway concurrently rewriting the file (worst case the entry survives a
-    race and is swept on the next disconnect, or removed via `/sr logout`)."""
+    """Remove the watchdog cron jobs from the runtime's cron/jobs.json so they
+    stop firing (and erroring on the now-removed scripts) after disconnect —
+    both the shared `sr-stream` job and every per-chat `sr-stream-<slug>` job.
+    The cron job is a GATEWAY artifact the agent arms via the cronjob tool; a
+    host-side disconnect can't reach the gateway API, so we edit jobs.json
+    directly. Best-effort + atomic (temp + replace); preserves every other job.
+    jobs.json shape: {"jobs": [ {name, script, …}, … ], …}. Tolerates the gateway
+    concurrently rewriting the file (worst case the entry survives a race and is
+    swept on the next disconnect, or removed via `/sr logout`)."""
     jobs_file = (home or Path.home()) / ".hermes" / "cron" / "jobs.json"
     try:
         if not jobs_file.is_file():
@@ -506,8 +526,7 @@ def _remove_stream_cron(home: Path | None) -> None:
     jobs = data.get("jobs") if isinstance(data, dict) else None
     if not isinstance(jobs, list):
         return
-    kept = [j for j in jobs if not (isinstance(j, dict)
-            and (j.get("name") == "sr-stream" or j.get("script") == _STREAM_SCRIPT))]
+    kept = [j for j in jobs if not _is_stream_job(j)]
     if len(kept) == len(jobs):
         return  # nothing of ours to remove
     data["jobs"] = kept

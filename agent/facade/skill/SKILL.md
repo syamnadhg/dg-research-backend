@@ -162,25 +162,32 @@ and running on a computer; its screen shows an 8-char **pair code**; they read
 it to you and you run `sr.py device-add <code>`. It auto-selects as their first
 device, so "research <topic>" works immediately after.
 
-## Streaming a run's progress (arm the watchdog at sign-in)
+## Streaming a run's progress (arm the watchdog when a run starts)
 
 The runtime does **not** wake you on a timer — so to push progress + alerts into
 this chat the moment they happen (instead of the user having to ask for status),
-arm a small recurring **cron watchdog** **right after a successful `/sr login`**.
-It follows the runs the user starts **from chat** (agent runs) and, each minute,
-posts only what's **new** and stays silent otherwise: no spam, no tokens. Its
-very first tick baselines quietly (it never replays already-done phases; it only
-raises a run that is stuck right now).
+arm a small recurring **cron watchdog**. Arm it **right after the first `/sr
+research` succeeds in this chat** (not at login — there's nothing to stream until
+a run exists). Each minute it posts only what's **new** and stays silent
+otherwise: no spam, no tokens. Its very first tick baselines quietly (it never
+replays already-done phases; it only raises a run that is stuck right now).
 
-1. Check it isn't already armed: `cronjob(action="list")` — look for a job named
-   `sr-stream`.
-2. If absent, arm it — it auto-delivers to **this** chat:
-   `cronjob(action="create", no_agent=true, script="sr_attention_poll.py",
-   schedule="every 1m", name="sr-stream")`.
-   (`agent connect` already placed `sr_attention_poll.py` in the scripts dir. If
-   create fails with a missing-script error, tell the user to re-run `agent
-   connect` on the host.)
-   Also re-check/arm whenever a research starts, in case the job was removed.
+The watchdog is **scoped to THIS chat**: a run you start here streams back only
+here — a run started in another chat (Telegram vs WhatsApp vs the web app) never
+shows up. To arm it:
+
+1. After a research starts, prepare this chat's watchdog: run
+   `python scripts/sr.py arm-stream`. It writes a tiny per-chat script and prints
+   the exact **`script`** and **`name`** to use (e.g. `script="sr_poll_<id>.py"`,
+   `name="sr-stream-<id>"`). If it prints a `✗` error about the watchdog not
+   being installed, tell the user to re-run `agent connect` on the host and stop.
+2. Check it isn't already armed: `cronjob(action="list")` — look for that exact
+   `name`. If absent, arm it (it auto-delivers to **this** chat) using the
+   `script` + `name` arm-stream just gave you:
+   `cronjob(action="create", no_agent=true, script="<that script>",
+   schedule="every 1m", name="<that name>")`.
+   Re-run `arm-stream` + re-check whenever a research starts, in case the job was
+   removed (it's safe to re-run; it just re-writes the same script).
 3. The watchdog then posts on its own — the user never needs to ask. It sends
    **one clean message per phase as it completes**, carrying that phase's
    **permanent, non-revocable** Super Research link(s) (the same ones in the
@@ -196,8 +203,9 @@ raises a run that is stuck right now).
      "retry").
    The watchdog already renders + de-dups all of this — you just relay it.
 
-On **`/sr logout`**, tear the watchdog down: `cronjob(action="list")` → find
-`sr-stream` → `cronjob(action="remove", job_id=<that id>)`.
+On **`/sr logout`**, tear this chat's watchdog down: `cronjob(action="list")` →
+find the job whose name starts with `sr-stream` → `cronjob(action="remove",
+job_id=<that id>)`.
 
 If the user is right there and just asks "status" / "what's running", answer
 immediately with `sr.py status` / `sr.py updates` — the watchdog is for unattended

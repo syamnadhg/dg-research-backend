@@ -334,6 +334,105 @@ def test_skip_by_name(bridge_port, capsys):
     assert u["videoEnabled"] is False and u["emailEnabled"] is False
 
 
+def test_research_tags_chat_origin(bridge_port, monkeypatch, capsys):
+    # sr.py reads the gateway's per-session env and tags the run with its origin
+    # chat, so a per-chat watchdog can scope updates to this chat only.
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "-100123")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "")
+    assert sr.main(["research", "EV market"]) == 0
+    capsys.readouterr()
+    rid = next(iter(FakeFS.researches))
+    assert FakeFS.researches[rid]["chatOrigin"] == {"platform": "telegram", "chat_id": "-100123"}
+
+
+def test_research_without_origin_env_omits_chat_origin(bridge_port, monkeypatch, capsys):
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    assert sr.main(["research", "No origin"]) == 0
+    capsys.readouterr()
+    rid = next(iter(FakeFS.researches))
+    assert "chatOrigin" not in FakeFS.researches[rid]
+
+
+def test_arm_stream_scoped_writes_shim(tmp_path, monkeypatch, capsys):
+    # With a chat origin in the env, arm-stream writes a per-chat shim that bakes
+    # the origin in + delegates to the shared watchdog, and prints the exact
+    # script + job name to arm.
+    (tmp_path / "sr_attention_poll.py").write_text("# watchdog\n", encoding="utf-8")
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "whatsapp")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "4477@c.us")
+    monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    import json
+    assert sr.main(["--json", "arm-stream"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scoped"] is True
+    assert payload["script"].startswith("sr_poll_whatsapp_") and payload["script"].endswith(".py")
+    assert payload["name"].startswith("sr-stream-whatsapp_")
+    assert payload["origin"] == {"platform": "whatsapp", "chat_id": "4477@c.us"}
+    # the shim landed beside the watchdog and imports it with the origin baked in
+    shim = (tmp_path / payload["script"]).read_text(encoding="utf-8")
+    assert "import sr_attention_poll" in shim
+    assert "'platform': 'whatsapp'" in shim and "'chat_id': '4477@c.us'" in shim
+    assert "main(origin=ORIGIN)" in shim
+
+
+def test_arm_stream_slug_matches_watchdog(tmp_path):
+    # The script slug sr.py generates MUST equal the slug the watchdog derives for
+    # its state file (so sr_poll_<slug>.py ↔ .sr_poll_<slug>.state.json line up).
+    path = Path(__file__).resolve().parents[1] / "facade" / "skill" / "scripts" / "sr_attention_poll.py"
+    spec = importlib.util.spec_from_file_location("sr_poll_slug_check", path)
+    poll = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(poll)
+    origin = {"platform": "telegram", "chat_id": "-100123", "thread_id": "7"}
+    assert sr._origin_slug(origin) == poll._origin_slug(origin)
+
+
+def test_scripts_dir_deployed_layout_is_authoritative(tmp_path, monkeypatch, capsys):
+    # Deployed Hermes layout: <home>/.hermes/skills/research/sr/scripts/sr.py.
+    # _scripts_dir must resolve to <home>/.hermes/scripts EVEN WHEN the watchdog
+    # copy isn't there yet — so a broken install yields a clean "re-run connect"
+    # error (via _write_poll_shim) instead of silently writing the shim into the
+    # bundle's own scripts dir (a path the cron tool rejects).
+    fake = tmp_path / ".hermes" / "skills" / "research" / "sr" / "scripts" / "sr.py"
+    fake.parent.mkdir(parents=True)
+    fake.write_text("# x", encoding="utf-8")
+    monkeypatch.setattr(sr, "__file__", str(fake))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    assert sr._scripts_dir() == tmp_path / ".hermes" / "scripts"  # not the bundle dir
+    # and arm-stream over a watchdog-less scripts dir reports the clean error
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "55")
+    capsys.readouterr()
+    assert sr.main(["arm-stream"]) == 1
+    out = capsys.readouterr().out
+    assert "agent connect" in out
+    assert not list((tmp_path / ".hermes" / "scripts").glob("sr_poll_*.py"))
+
+
+def test_arm_stream_unscoped_without_origin(monkeypatch, capsys):
+    # No origin in the env → account-wide fallback (the shared watchdog), no shim.
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    import json
+    assert sr.main(["--json", "arm-stream"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scoped"] is False
+    assert payload["script"] == "sr_attention_poll.py" and payload["name"] == "sr-stream"
+
+
+def test_arm_stream_missing_watchdog_errors(tmp_path, monkeypatch, capsys):
+    # arm-stream refuses to arm if the shared watchdog isn't installed (a broken
+    # connect) — it must not write a shim that would import-fail every tick.
+    monkeypatch.setattr(sr, "_scripts_dir", lambda: tmp_path)  # no sr_attention_poll.py here
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "99")
+    assert sr.main(["arm-stream"]) == 1
+    assert "agent connect" in capsys.readouterr().out
+    assert not list(tmp_path.glob("sr_poll_*.py"))
+
+
 def test_unreachable_bridge_is_graceful(monkeypatch, capsys):
     monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", "1")  # nothing listening
     # graceful (no traceback) but a NON-zero exit so the cron detects failure

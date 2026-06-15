@@ -510,6 +510,90 @@ def test_updates_without_via_never_mints_or_builds_phase_updates(live, monkeypat
     assert runs[0]["phaseUpdates"] == []  # …nor computes phase updates
 
 
+# ── #819 per-chat watchdog isolation: chatOrigin tagging + scoped /updates ──
+
+def test_clean_origin_requires_platform_and_chat():
+    assert bridge._clean_origin({"platform": "telegram", "chat_id": "123"}) == {
+        "platform": "telegram", "chat_id": "123"}
+    assert bridge._clean_origin(
+        {"platform": "telegram", "chat_id": "123", "thread_id": "9"}) == {
+        "platform": "telegram", "chat_id": "123", "thread_id": "9"}
+    assert bridge._clean_origin({"platform": "telegram"}) is None   # no chat
+    assert bridge._clean_origin({"chat_id": "123"}) is None         # no platform
+    assert bridge._clean_origin({"platform": " ", "chat_id": "1"}) is None  # blank platform
+    assert bridge._clean_origin("nope") is None
+    # over-long values are clamped; ints coerced to str
+    long_chat = bridge._clean_origin({"platform": "t", "chat_id": 42})
+    assert long_chat == {"platform": "t", "chat_id": "42"}
+
+
+def test_new_research_fields_includes_chat_origin():
+    f = bridge._new_research_fields("T", "dev", "u1", None,
+                                    {"platform": "telegram", "chat_id": "5"})
+    assert f["chatOrigin"] == {"platform": "telegram", "chat_id": "5"}
+    assert "chatOrigin" not in bridge._new_research_fields("T", "dev", "u1", None)
+
+
+def test_research_tags_chat_origin_from_body(live):
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "u1"}]
+    r = requests.post(base + "/research", json={
+        "topic": "T", "deviceId": "a",
+        "origin": {"platform": "telegram", "chat_id": "-100", "thread_id": ""}})
+    assert r.status_code == 200
+    assert FakeFS.last_upsert["fields"]["chatOrigin"] == {"platform": "telegram", "chat_id": "-100"}
+
+
+def test_research_without_origin_omits_chat_origin(live):
+    base, _ = live
+    FakeFS.devices = [{"id": "a", "ownerUid": "u1"}]
+    requests.post(base + "/research", json={"topic": "T", "deviceId": "a"})
+    assert "chatOrigin" not in FakeFS.last_upsert["fields"]
+
+
+def test_updates_scoped_to_chat_origin(live, monkeypatch):
+    # A per-chat watchdog (platform+chat query) sees ONLY runs fired from that
+    # chat; another chat's agent run and an un-tagged run are both excluded.
+    base, _ = live
+    FakeFS.researches = {
+        "tg": {"id": "tg", "title": "TG run", "status": "ongoing", "phase": 1, "viaAgent": True,
+               "chatOrigin": {"platform": "telegram", "chat_id": "111"}, "links": {}},
+        "wa": {"id": "wa", "title": "WA run", "status": "ongoing", "phase": 1, "viaAgent": True,
+               "chatOrigin": {"platform": "whatsapp", "chat_id": "222"}, "links": {}},
+        "old": {"id": "old", "title": "Untagged", "status": "ongoing", "phase": 1, "viaAgent": True,
+                "links": {}},  # pre-#819 agent run, no chatOrigin
+    }
+    minted = {"n": 0}
+    monkeypatch.setattr(bridge, "_mint_sr", lambda *a, **k: minted.__setitem__("n", minted["n"] + 1) or None)
+    runs = requests.get(base + "/updates?via=agent&platform=telegram&chat=111").json()["runs"]
+    assert {r["runId"] for r in runs} == {"tg"}
+    assert runs[0]["chatOrigin"] == {"platform": "telegram", "chat_id": "111"}
+
+
+def test_updates_chat_scope_case_insensitive_platform(live):
+    base, _ = live
+    FakeFS.researches = {
+        "tg": {"id": "tg", "status": "ongoing", "phase": 1, "viaAgent": True,
+               "chatOrigin": {"platform": "Telegram", "chat_id": "111"}, "links": {}},
+    }
+    runs = requests.get(base + "/updates?via=agent&platform=TELEGRAM&chat=111").json()["runs"]
+    assert {r["runId"] for r in runs} == {"tg"}
+
+
+def test_updates_via_agent_without_chat_returns_all_agent_runs(live):
+    # via=agent with NO platform/chat (the shared/account-wide watchdog, or a
+    # single-chat setup) still returns every agent run — backwards compatible.
+    base, _ = live
+    FakeFS.researches = {
+        "tg": {"id": "tg", "status": "ongoing", "phase": 1, "viaAgent": True,
+               "chatOrigin": {"platform": "telegram", "chat_id": "111"}, "links": {}},
+        "wa": {"id": "wa", "status": "ongoing", "phase": 1, "viaAgent": True,
+               "chatOrigin": {"platform": "whatsapp", "chat_id": "222"}, "links": {}},
+    }
+    runs = requests.get(base + "/updates?via=agent").json()["runs"]
+    assert {r["runId"] for r in runs} == {"tg", "wa"}
+
+
 def test_updates_tolerates_bad_limit(live):
     base, _ = live
     assert requests.get(base + "/updates?limit=999").status_code == 200
