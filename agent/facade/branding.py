@@ -265,7 +265,7 @@ def spinner(message: str, *, color: str = _ACCENT) -> _Spinner:
 def confirm(prompt: str, default: bool = True) -> bool:
     """Yes/No prompt. A bare Enter takes `default` (and sets the [Y/n] hint). A
     Ctrl-C / EOF returns False — an interrupt must NEVER silently proceed as a
-    default 'yes' (e.g. it must not trigger an install or a `wsl --shutdown`)."""
+    default 'yes' (e.g. it must not trigger an install or run a command in WSL)."""
     hint = "[Y/n]" if default else "[y/N]"
     ans = ask(f"{prompt} {c(_DIM, hint)}", cancel_on_interrupt=True)
     if ans is None:        # Ctrl-C / EOF → abort, not the default

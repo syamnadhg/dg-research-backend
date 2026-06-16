@@ -97,22 +97,23 @@ research-only — it can never control devices.
 > **After connecting, run `/reload-skills` once in your chat** (the gateway caches
 > its skill scan) so `/sr` registers without restarting the runtime.
 
-**Reachability — one rule, every platform.** The bridge co-locates with the
-Super Research backend (wherever you run `research.py`) and binds **loopback
-only**, so the runtime must share that loopback:
+**Reachability — Model A: the bridge runs WITH the runtime.** The bridge binds
+**loopback only**, so it can only be reached by a runtime on its *own* machine —
+which is why `connect` co-locates the bridge with the chat runtime:
 
 - **Co-located** (runtime native on the same OS as the bridge — Win+Win,
   Linux+Linux, macOS+macOS) → shares loopback, **zero setup**.
-- **WSL runtime + Windows bridge** → separate net namespace → needs **mirrored
-  networking**. `connect` detects this and **offers to enable it for you**:
-  it writes `networkingMode=mirrored` under `[wsl2]` in `%USERPROFILE%\.wslconfig`
-  (with your Y), then offers to run `wsl --shutdown` so it takes effect. `agent
-  doctor` reports the same row.
+- **WSL runtime** → the bridge must run **inside WSL** too. `connect` detects a
+  WSL runtime and **offers to run connect there for you** — `uvx
+  superresearch-agent connect` inside the distro (or prints the command, with a
+  `python research.py agent connect` backend-checkout fallback for before the
+  package is on PyPI). The bridge then shares WSL's loopback with the runtime —
+  no Windows↔WSL networking, no `.wslconfig`.
 - **Different machine** → can't reach a loopback-only bridge → **unsupported by
   design** (exposing the bridge on the network would break its security model).
 
-> Each side-effecting step still waits for your Y — `connect` never writes config
-> or restarts WSL on its own.
+> Each side-effecting step still waits for your Y — `connect` never installs or
+> runs anything inside WSL on its own.
 
 **Keep it always-up.** `resurrect` pins a windowless logon autostart (Windows
 Scheduled Task) **and** starts the bridge now, so it returns after a reboot; the

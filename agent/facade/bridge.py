@@ -1729,8 +1729,7 @@ def _port_holder_is_bridge(host: str, port: int) -> bool:
     """Probe http://host:port/healthz and return True only if the responder is
     actually a Super Agent bridge (its /healthz returns {"ok": true, "version": …}).
     Lets serve() tell a benign 'another bridge already running' apart from a FOREIGN
-    process squatting the port (possible under WSL mirrored networking). Stdlib
-    only.
+    process squatting the port. Stdlib only.
 
     Retries briefly: when our bind just failed, the holder may be a sibling bridge
     still coming up (idempotent ONLOGON re-fire / restart) that hasn't started
@@ -1771,7 +1770,7 @@ def serve(host: str | None = None, port: int | None = None) -> None:
         # Port taken. Distinguish a benign already-running bridge (idempotent
         # re-fire) from a FOREIGN process squatting the port — the latter would
         # otherwise be silently mis-reported as "already running" and leave the
-        # bridge mysteriously unreachable (esp. under WSL mirrored networking).
+        # bridge mysteriously unreachable.
         if _port_holder_is_bridge(host, port):
             log.info("bridge port %s:%d already serving a bridge — nothing to start", host, port)
             print(f"Super Agent bridge already running on http://{host}:{port} — nothing to start.")

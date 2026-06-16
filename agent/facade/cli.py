@@ -60,8 +60,8 @@ def _bridge_post(path: str, body: dict | None = None, timeout: float = 30.0) -> 
 
 def _bridge_up() -> bool:
     # Validate the /healthz body carries the bridge marker ({ok, version}) — not
-    # just ANY HTTP response — so a foreign server squatting :9876 (possible under
-    # WSL mirrored networking) isn't mistaken for the bridge.
+    # just ANY HTTP response — so a foreign server squatting :9876 isn't mistaken
+    # for the bridge.
     res = _bridge_get("/healthz", timeout=3.0)
     return bool(res and isinstance(res[1], dict) and "version" in res[1])
 
@@ -216,8 +216,8 @@ def cmd_connect(args: argparse.Namespace) -> int:
     target = _install_step(chosen, Path(args.dest) if args.dest else None, assume_yes=assume_yes)
     if target is None:
         return 1  # _install_step already printed the reason (declined / failed)
-    # Reachability runs AFTER the copy: a WSL `wsl --shutdown` would unmount
-    # \\wsl.localhost and corrupt an in-flight install.
+    # Co-located reachability: the bridge shares this host's loopback, so this is
+    # just the OK + an honest container/VM caveat (a WSL target never reaches here).
     print()
     _ensure_reachable(chosen)
 
