@@ -4,13 +4,14 @@ Copies the bundled skill (``facade/skill/`` — SKILL.md + scripts/sr.py) into t
 runtime's skills directory. Both Hermes and OpenClaw use Anthropic Agent-Skills,
 so one bundle serves both; only the install path differs.
 
-The runtime usually lives in **WSL** while the backend (and this bridge) run on
-**Windows**, so detection looks in two places:
+Detection looks in two places, since a runtime may live on this host OR inside a
+WSL distro:
   • Windows home    — ~/.hermes, ~/.openclaw
   • WSL distro home — \\wsl.localhost\<distro>\home\<user>\.hermes|.openclaw
-A WSL install reaches the Windows bridge over loopback only when WSL "mirrored
-networking" is on (see ``mirrored_networking_enabled``); `agent connect` /
-`agent doctor` surface that prerequisite.
+Model A: the bridge co-locates with the RUNTIME, so a co-located runtime shares
+its loopback natively. A WSL runtime's bridge must run IN WSL too — so connect
+hands a WSL target off to the in-distro package (``run_connect_in_wsl``) instead
+of bridging Windows↔WSL networking.
 
 Pure file-copy + path logic, no network — the bundle is a thin client that calls
 the already-running bridge at runtime. Install paths are overridable (``home`` /
@@ -313,164 +314,6 @@ def run_connect_in_wsl(distro: str, extra_args: list[str] | None = None) -> int:
     except (OSError, subprocess.SubprocessError):
         return 1
     return r.returncode
-
-
-# ── WSL mirrored-networking prerequisite ────────────────────────────────────
-
-def networking_mode(text: str) -> str | None:
-    """Parse ``[wsl2] networkingMode`` from a .wslconfig body (case-insensitive).
-
-    Returns the lower-cased value (e.g. "mirrored", "nat") or None if unset."""
-    in_wsl2 = False
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            in_wsl2 = line[1:-1].strip().lower() == "wsl2"
-            continue
-        if in_wsl2 and "=" in line:
-            key, _, val = line.partition("=")
-            if key.strip().lower() == "networkingmode":
-                # .wslconfig values are conventionally unquoted, but tolerate a
-                # quoted value rather than false-negative on it.
-                return val.strip().strip("'\"").lower()
-    return None
-
-
-def wslconfig_path(home: Path | None = None) -> Path:
-    return (home or Path.home()) / ".wslconfig"
-
-
-def mirrored_networking_enabled(home: Path | None = None) -> bool | None:
-    """True/False if .wslconfig sets networkingMode; None if there's no .wslconfig
-    (so callers can distinguish "explicitly NAT" from "never configured")."""
-    p = wslconfig_path(home)
-    if not p.exists():
-        return None
-    try:
-        # utf-8-sig strips a leading BOM — Notepad (the likeliest editor for
-        # %USERPROFILE%\.wslconfig) writes one by default, which would otherwise
-        # break the "[wsl2]" section match and yield a false "not mirrored".
-        return networking_mode(p.read_text(encoding="utf-8-sig", errors="ignore")) == "mirrored"
-    except OSError:
-        return None
-
-
-def enable_mirrored_networking(home: Path | None = None, *, mode: str = "mirrored") -> tuple[bool, Path]:
-    """Idempotently set ``[wsl2] networkingMode=<mode>`` in .wslconfig.
-
-    Surgical + non-destructive: an existing ``[wsl2]`` section keeps its other
-    keys (memory/swap/…) and comments; only the networkingMode line is added or
-    rewritten. With no ``[wsl2]`` section a new one is appended; with no file at
-    all one is created. Returns ``(changed, path)`` — ``changed`` is False when
-    the value was already ``<mode>`` (so the caller can skip the "restart WSL"
-    nudge). Reads utf-8-sig (BOM-tolerant — see ``mirrored_networking_enabled``)
-    and writes plain utf-8.
-    """
-    p = wslconfig_path(home)
-    try:
-        text = p.read_text(encoding="utf-8-sig", errors="ignore") if p.exists() else ""
-    except OSError:
-        text = ""
-    if networking_mode(text) == mode:
-        return (False, p)
-
-    out: list[str] = []
-    in_wsl2 = False
-    wrote = False
-    saw_wsl2 = False
-    line = f"networkingMode={mode}"
-    for raw in text.splitlines():
-        stripped = raw.split("#", 1)[0].strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            # Leaving a [wsl2] block we never wrote into → drop the key in first.
-            if in_wsl2 and not wrote:
-                out.append(line)
-                wrote = True
-            in_wsl2 = stripped[1:-1].strip().lower() == "wsl2"
-            saw_wsl2 = saw_wsl2 or in_wsl2
-            out.append(raw)
-            continue
-        if in_wsl2 and not wrote and "=" in stripped and \
-                stripped.split("=", 1)[0].strip().lower() == "networkingmode":
-            out.append(line)   # rewrite an existing (e.g. nat) value
-            wrote = True
-            continue
-        out.append(raw)
-    if in_wsl2 and not wrote:        # file ended inside [wsl2]
-        out.append(line)
-        wrote = True
-    if not saw_wsl2:                 # no [wsl2] anywhere → append a fresh section
-        if out and out[-1].strip():
-            out.append("")
-        out.extend(["[wsl2]", line])
-
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return (True, p)
-
-
-def wsl_shutdown() -> tuple[bool, str]:
-    """Run ``wsl --shutdown`` (Windows only) so a networkingMode change takes
-    effect. Returns ``(ok, message)``; ok is False off-Windows or on failure."""
-    if sys.platform != "win32":
-        return (False, "Windows-only")
-    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    try:
-        r = subprocess.run(["wsl.exe", "--shutdown"], capture_output=True,
-                           timeout=60, creationflags=no_window)
-    except (OSError, subprocess.SubprocessError) as e:
-        return (False, str(e))
-    if r.returncode == 0:
-        return (True, "")
-    err = (r.stderr or b"").decode("utf-16-le", errors="ignore").strip()
-    return (False, err or f"exit {r.returncode}")
-
-
-# ── mirrored-networking port-collision guard ─────────────────────────────────
-# Mirrored networking SHARES localhost between Windows and WSL, so a Windows
-# process holding a port shadows the SAME port inside WSL — that is how a stray
-# Windows :3000 dev server can knock out a WSL chat bridge (the #225 WhatsApp
-# break). These are the ports dev servers / chat-runtime services most often use;
-# `connect` flags any that Windows is already holding before it enables mirrored.
-COMMON_SHARED_PORTS: tuple[int, ...] = (
-    3000, 3001, 3737, 4000, 5000, 5173, 8000, 8080, 8888, 9000,
-)
-
-
-def _parse_listening_ports(netstat_text: str, wanted: set[int]) -> dict[int, str]:
-    """Pure parser for `netstat -ano` output → {port: pid} for LISTENING TCP rows
-    whose local port is in `wanted`. First holder per port wins."""
-    found: dict[int, str] = {}
-    for line in netstat_text.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0] == "TCP" and parts[3] == "LISTENING":
-            try:
-                port = int(parts[1].rsplit(":", 1)[1])  # 127.0.0.1:3000 / [::]:3000
-            except (ValueError, IndexError):
-                continue
-            if port in wanted and port not in found:
-                found[port] = parts[4]
-    return found
-
-
-def windows_port_owners(ports: tuple[int, ...] = COMMON_SHARED_PORTS) -> dict[int, str]:
-    """Which of `ports` a Windows process is LISTENING on → {port: pid}. Advisory
-    + best-effort: returns {} off-Windows or on any failure, so it can NEVER break
-    the connect flow. Used to warn that mirrored networking will let these Windows
-    ports shadow the same port inside WSL."""
-    if sys.platform != "win32":
-        return {}
-    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    try:
-        r = subprocess.run(
-            ["netstat", "-ano", "-p", "TCP"],
-            capture_output=True, text=True, timeout=10, creationflags=no_window,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    return _parse_listening_ports(r.stdout or "", set(ports))
 
 
 # ── install / uninstall ──────────────────────────────────────────────────────
