@@ -436,6 +436,89 @@ def test_wsl_distros_honors_env_override(monkeypatch):
     assert connect.wsl_distros() == ["Ubuntu-24.04", "Debian"]
 
 
+# ── WSL delegation (Model A: connect runs inside the distro) ─────────────────
+
+class _Rc:
+    def __init__(self, code):
+        self.returncode = code
+
+
+def test_wsl_uvx_available_true_via_login_shell(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    seen = {}
+
+    def fake_run(args, **kw):
+        seen["args"] = args
+        return _Rc(0)
+
+    monkeypatch.setattr(connect.subprocess, "run", fake_run)
+    assert connect.wsl_uvx_available("Ubuntu-24.04") is True
+    a = seen["args"]
+    assert a[:4] == ["wsl.exe", "-d", "Ubuntu-24.04", "--"]
+    # probe via a login shell so uv's PATH (~/.local/bin) is visible
+    assert "bash" in a and "-lc" in a and "command -v uvx" in a
+
+
+def test_wsl_uvx_available_false_on_nonzero(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    monkeypatch.setattr(connect.subprocess, "run", lambda *a, **k: _Rc(1))
+    assert connect.wsl_uvx_available("U") is False
+
+
+def test_wsl_uvx_available_off_windows(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    assert connect.wsl_uvx_available("U") is False
+
+
+def test_wsl_uvx_available_swallows_errors(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+
+    def boom(*a, **k):
+        raise OSError("no wsl")
+
+    monkeypatch.setattr(connect.subprocess, "run", boom)
+    assert connect.wsl_uvx_available("U") is False
+
+
+def test_run_connect_in_wsl_builds_login_shell_command(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    seen = {}
+
+    def fake_run(args, **kw):
+        seen["args"] = args
+        return _Rc(0)
+
+    monkeypatch.setattr(connect.subprocess, "run", fake_run)
+    rc = connect.run_connect_in_wsl("Ubuntu-24.04", ["--yes", "--no-login"])
+    assert rc == 0
+    a = seen["args"]
+    assert a[:5] == ["wsl.exe", "-d", "Ubuntu-24.04", "--", "bash"]
+    assert a[5] == "-lc"
+    # the in-distro command is the package's own connect with forwarded flags
+    assert a[6] == "uvx superresearch-agent connect --yes --no-login"
+
+
+def test_run_connect_in_wsl_passes_through_returncode(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    monkeypatch.setattr(connect.subprocess, "run", lambda *a, **k: _Rc(7))
+    assert connect.run_connect_in_wsl("U") == 7
+
+
+def test_run_connect_in_wsl_off_windows(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    assert connect.run_connect_in_wsl("U") == 1
+
+
+def test_run_connect_in_wsl_swallows_launch_error(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+
+    def boom(*a, **k):
+        raise FileNotFoundError("wsl.exe missing")
+
+    monkeypatch.setattr(connect.subprocess, "run", boom)
+    assert connect.run_connect_in_wsl("U") == 1
+
+
 # ── .wslconfig mirrored-networking parser ────────────────────────────────────
 
 def test_networking_mode_parses_mirrored():

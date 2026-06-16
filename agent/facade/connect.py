@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -265,6 +266,53 @@ def detect_targets(home: Path | None = None, *, include_wsl: bool = True) -> lis
     if include_wsl:
         targets.extend(detect_wsl_targets())
     return targets
+
+
+# ── WSL delegation (Model A: connect runs INSIDE the distro) ─────────────────
+# A loopback-only bridge can only be reached by a runtime on its OWN machine, so
+# a WSL runtime's bridge must run IN WSL (not on Windows). Instead of the old
+# mirrored-networking dance, connect runs its own self-install inside the distro
+# via the published package — the bridge then co-locates with the WSL runtime and
+# shares WSL's loopback natively.
+
+def wsl_uvx_available(distro: str) -> bool:
+    """Is ``uvx`` resolvable inside ``distro``? (i.e. is uv installed there.)
+
+    Probed through a LOGIN shell (``bash -lc``) so it sees the same PATH an
+    interactive WSL session does — uv installs to ~/.local/bin, which a bare
+    ``wsl -- <cmd>`` PATH usually omits. False off-Windows / on any failure."""
+    if sys.platform != "win32":
+        return False
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    try:
+        r = subprocess.run(
+            ["wsl.exe", "-d", distro, "--", "bash", "-lc", "command -v uvx"],
+            capture_output=True, timeout=15, creationflags=no_window,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def run_connect_in_wsl(distro: str, extra_args: list[str] | None = None) -> int:
+    """Run the agent's own ``connect`` INSIDE ``distro`` via the published package
+    (``uvx superresearch-agent connect``), so the bridge lands with the WSL
+    runtime. Runs through a LOGIN shell (uv's PATH) and INHERITS stdio, so the
+    in-distro connect's interactive 4-step flow drives this same terminal. Returns
+    its exit code; 1 off-Windows or if ``wsl`` can't be launched (a non-zero from a
+    started connect — e.g. uvx can't resolve the package pre-PyPI — flows through
+    so the caller can offer the manual fallback)."""
+    if sys.platform != "win32":
+        return 1
+    inner = " ".join(
+        shlex.quote(p)
+        for p in ("uvx", "superresearch-agent", "connect", *(extra_args or []))
+    )
+    try:
+        r = subprocess.run(["wsl.exe", "-d", distro, "--", "bash", "-lc", inner])
+    except (OSError, subprocess.SubprocessError):
+        return 1
+    return r.returncode
 
 
 # ── WSL mirrored-networking prerequisite ────────────────────────────────────
