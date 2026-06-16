@@ -206,6 +206,8 @@ def cmd_connect(args: argparse.Namespace) -> int:
     # can't share WSL's loopback. Hand off to the in-distro connect instead of
     # installing on Windows + mirror-networking.
     if chosen.location == "wsl":
+        if args.dest:
+            b.dim("(--dest is ignored for a WSL runtime — the in-distro connect installs at its own path.)")
         return _connect_wsl_runtime(
             chosen, assume_yes=assume_yes, noninteractive=noninteractive,
             startup=args.startup, login=args.login,
@@ -448,6 +450,11 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
     b.dim("Model A puts the bridge WITH the runtime, so connect it from inside the")
     b.dim("distro — a Windows bridge can't share WSL's loopback.")
 
+    # Consent gate. Unlike the retired `wsl --shutdown` (globally disruptive — it
+    # unmounts \\wsl.localhost + bounces every distro, so it was excluded from
+    # --yes), running connect inside ONE distro is scoped + non-destructive (a
+    # file-copy skill install + opt-in bridge pin / sign-in, each itself gated in
+    # the inner connect), so honoring --yes here is correct.
     # No TTY and no --yes → no channel to consent to running inside WSL; print it.
     if noninteractive and not assume_yes:
         _print_wsl_manual(distro, shown)
