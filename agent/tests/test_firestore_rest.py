@@ -195,6 +195,32 @@ def test_get_research_decodes_doc():
     assert c.get_research("u1", "r1") == {"title": "Alpha", "phase": 2, "id": "r1"}
 
 
+def test_get_user_settings_returns_none_on_404():
+    c = FirestoreRest(lambda force=False: "tok")
+    c._send = lambda *a, **k: _Resp(404)  # type: ignore[method-assign]
+    assert c.get_user_settings("u1") is None
+
+
+def test_get_user_settings_decodes_pipeline_map_from_prefs_doc():
+    seen = {}
+
+    def fake_send(method, url, token, json_body):
+        seen["url"] = url
+        return _Resp(200, {
+            "name": ".../settings/prefs",
+            "fields": {"pipeline": {"mapValue": {"fields": {
+                "skipInitVerify": {"booleanValue": True},
+                "agentClaude": {"booleanValue": False},
+            }}}},
+        })
+
+    c = FirestoreRest(lambda force=False: "tok")
+    c._send = fake_send  # type: ignore[method-assign]
+    out = c.get_user_settings("u1")
+    assert out == {"pipeline": {"skipInitVerify": True, "agentClaude": False}}
+    assert "/users/u1/settings/prefs" in seen["url"]  # reads the right doc
+
+
 def test_patch_pipeline_config_nested_mask():
     calls = []
 

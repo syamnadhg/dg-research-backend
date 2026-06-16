@@ -54,3 +54,56 @@ def test_port_holder_is_bridge_false_on_connection_error(monkeypatch):
         raise OSError("connection refused")
     monkeypatch.setattr(urllib.request, "urlopen", _boom)
     assert bridge._port_holder_is_bridge("127.0.0.1", 9876) is False
+
+
+# ── _config_from_settings: map the account's pipeline Settings → run config ──
+# Mirrors the web app's Settings→config derivation so an agent run honors the
+# same defaults. Field defaults must match the app's DEFAULT_SETTINGS.
+
+def test_config_from_settings_defaults_verify_all():
+    assert bridge._config_from_settings({}) == {
+        "skipPhases": [],
+        "agents": {"chatgpt": True, "gemini": True, "claude": True},
+        "videoEnabled": True,
+        "emailEnabled": True,
+        "podcastLength": "long",
+        "skipInitVerify": False,
+    }
+
+
+def test_config_from_settings_none_is_defaults():
+    assert bridge._config_from_settings(None)["skipInitVerify"] is False
+
+
+def test_config_from_settings_skip_init_verify():
+    assert bridge._config_from_settings({"skipInitVerify": True})["skipInitVerify"] is True
+
+
+def test_config_from_settings_agent_selection_and_skip_brief():
+    cfg = bridge._config_from_settings({"agentGemini": False, "skipBrief": True})
+    assert cfg["agents"] == {"chatgpt": True, "gemini": False, "claude": True}
+    assert 1 in cfg["skipPhases"]  # brief skipped
+
+
+def test_config_from_settings_all_agents_off_skips_research_phase():
+    cfg = bridge._config_from_settings(
+        {"agentChatGPT": False, "agentGemini": False, "agentClaude": False})
+    assert 2 in cfg["skipPhases"]
+
+
+def test_config_from_settings_podcast_off_skips_podcast_and_video():
+    cfg = bridge._config_from_settings({"generatePodcast": False})
+    assert set(cfg["skipPhases"]) >= {3, 4}
+    assert cfg["videoEnabled"] is False
+
+
+def test_config_from_settings_video_off_keeps_podcast():
+    cfg = bridge._config_from_settings({"generatePodcast": True, "videoLink": "off"})
+    assert cfg["videoEnabled"] is False
+    assert 3 not in cfg["skipPhases"]  # podcast (P3) still runs, only video (P4) off
+
+
+def test_config_from_settings_email_and_podcast_length():
+    cfg = bridge._config_from_settings({"sendEmail": False, "podcastLength": "short"})
+    assert cfg["emailEnabled"] is False
+    assert cfg["podcastLength"] == "short"

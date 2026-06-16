@@ -21,11 +21,16 @@ class FakeFS:
     last_upsert = None
     research_doc = None  # what get_research returns (set per podcast test)
     agent_session_doc = None  # what get_agent_session returns
+    user_settings = None  # what get_user_settings returns
     agent_upserts: list = []
     agent_deletes: list = []
 
     def __init__(self, _token_provider):
         pass
+
+    def get_user_settings(self, uid):
+        d = FakeFS.user_settings
+        return dict(d) if d else None
 
     def get_agent_session(self, uid, sid):
         d = FakeFS.agent_session_doc
@@ -62,6 +67,7 @@ class FakeFS:
 def live(monkeypatch):
     FakeFS.research_doc = None
     FakeFS.agent_session_doc = None
+    FakeFS.user_settings = None
     FakeFS.agent_upserts = []
     FakeFS.agent_deletes = []
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
@@ -112,6 +118,50 @@ def test_research_enqueue_route(live):
     f = FakeFS.last_upsert["fields"]
     assert f["phase"] == 0 and f["viaAgent"] is True
     assert f["platforms"] and f["documents"] == [] and f["audios"] == []
+
+
+def test_research_applies_account_pipeline_settings(live):
+    # The bug fix: an agent run must honor the account's saved pipeline Settings.
+    base, _ = live
+    FakeFS.user_settings = {"pipeline": {
+        "skipInitVerify": True, "agentGemini": False, "sendEmail": False,
+    }}
+    r = requests.post(base + "/research", json={"topic": "T", "deviceId": "dev1"})
+    assert r.status_code == 200
+    cfg = FakeFS.last_enqueue["config_obj"]
+    assert cfg["skipInitVerify"] is True            # the reported bug — now honored
+    assert cfg["agents"] == {"chatgpt": True, "gemini": False, "claude": True}
+    assert cfg["emailEnabled"] is False
+    # the research doc mirrors it: pipelineConfig + platforms drop the off agent
+    f = FakeFS.last_upsert["fields"]
+    assert f["pipelineConfig"]["skipInitVerify"] is True
+    assert "gemini" not in f["platforms"] and "chatgpt" in f["platforms"]
+
+
+def test_research_chat_flag_overrides_account_settings(live):
+    # An explicit chat flag (--no-email → emailEnabled False) wins over the
+    # account default (sendEmail on).
+    base, _ = live
+    FakeFS.user_settings = {"pipeline": {"sendEmail": True}}
+    r = requests.post(base + "/research", json={
+        "topic": "T", "deviceId": "dev1", "config": {"emailEnabled": False},
+    })
+    assert r.status_code == 200
+    assert FakeFS.last_enqueue["config_obj"]["emailEnabled"] is False
+
+
+def test_research_settings_read_failure_falls_back_to_defaults(live, monkeypatch):
+    # A settings-read blip must NEVER block a run — fall back to pipeline defaults.
+    base, _ = live
+
+    def boom(_uid):
+        raise RuntimeError("firestore down")
+
+    monkeypatch.setattr(FakeFS, "get_user_settings", boom)
+    r = requests.post(base + "/research", json={"topic": "T", "deviceId": "dev1"})
+    assert r.status_code == 200
+    cfg = FakeFS.last_enqueue["config_obj"]
+    assert cfg["skipInitVerify"] is False and cfg["agents"]["chatgpt"] is True
 
 
 def test_research_requires_topic(live):

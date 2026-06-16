@@ -109,6 +109,42 @@ def _clean_origin(raw: Any) -> dict[str, str] | None:
     return out
 
 
+def _config_from_settings(pipe: dict[str, Any] | None) -> dict[str, Any]:
+    """Map the account's saved pipeline Settings into the run-config the backend
+    pipeline reads, so an agent-fired run honors the same defaults the web app
+    applies. ``pipe`` is the ``pipeline`` map of ``users/{uid}/settings/prefs``.
+
+    Mirrors the web app's Settings→config derivation (ChatInput.tsx): which
+    agents run, which phases are skipped (brief; podcast+video when NotebookLM is
+    off), whether video/email run, the podcast length, and skipInitVerify. Field
+    defaults match the app's DEFAULT_SETTINGS, so an absent field behaves exactly
+    as it does in the app (e.g. a settings-less account → verify + all agents)."""
+    p = pipe if isinstance(pipe, dict) else {}
+    agents = {
+        "chatgpt": bool(p.get("agentChatGPT", True)),
+        "gemini": bool(p.get("agentGemini", True)),
+        "claude": bool(p.get("agentClaude", True)),
+    }
+    generate_podcast = bool(p.get("generatePodcast", True))
+    skip_phases: set[int] = set()
+    if p.get("skipBrief"):
+        skip_phases.add(1)
+    if not generate_podcast:            # NotebookLM off → podcast (3) + video (4) both skipped
+        skip_phases.update((3, 4))
+    if not any(agents.values()):        # all agents off → skip the whole research phase
+        skip_phases.add(2)
+    # Video runs unless the podcast is off OR the user set the video link to "off".
+    video_enabled = generate_podcast and p.get("videoLink", "youtube") != "off"
+    return {
+        "skipPhases": sorted(skip_phases),
+        "agents": agents,
+        "videoEnabled": bool(video_enabled),
+        "emailEnabled": bool(p.get("sendEmail", True)),
+        "podcastLength": p.get("podcastLength") or "long",
+        "skipInitVerify": bool(p.get("skipInitVerify", False)),
+    }
+
+
 def _new_research_fields(
     topic: str, device_id: str, uid: str, cfg: dict[str, Any] | None,
     chat_origin: dict[str, str] | None = None,
@@ -1286,7 +1322,23 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if device_id is None:
                 return  # _resolve_device already sent the error
             rid = "agent-" + uuid.uuid4().hex[:16]
-            cfg = body.get("config") if isinstance(body.get("config"), dict) else None
+            # Honor the account's saved pipeline Settings (which agents, skip
+            # brief/podcast/video/email, podcast length, skipInitVerify) — the
+            # web app ships these in its start config, but sr.py (the chat client)
+            # can't read Firestore, so resolve the account's settings doc HERE.
+            # Explicit chat flags (--no-video / --no-email) override the defaults.
+            chat_cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
+            pipe: dict[str, Any] = {}
+            try:
+                _settings = fs.get_user_settings(sess.uid)
+                if isinstance(_settings, dict) and isinstance(_settings.get("pipeline"), dict):
+                    pipe = _settings["pipeline"]
+            except Exception as e:  # advisory read — never block a run on it
+                # Log the type only (not the value) — this file's convention,
+                # so an upstream body never lands in logs.
+                log.warning("agent run: couldn't read account settings (%s) — using defaults",
+                            type(e).__name__)
+            cfg = {**_config_from_settings(pipe), **chat_cfg}
             # The chat this run was fired from (sr.py reads it from the gateway's
             # per-session env) — tags the doc so the streaming watchdog can scope
             # updates to this chat only. Absent for a CLI / older-gateway fire.

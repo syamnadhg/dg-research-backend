@@ -170,6 +170,21 @@ class FirestoreRest:
         row["id"] = doc_id(body.get("name", ""))
         return row
 
+    def get_user_settings(self, uid: str) -> dict[str, Any] | None:
+        """Read the account's settings doc (``users/{uid}/settings/prefs``), or
+        None if the user never saved settings.
+
+        Carries the per-account pipeline defaults (which agents, skip brief /
+        podcast / video / email, podcast length, skipInitVerify) that an
+        agent-fired run must honor — the same doc the web app's ``loadSettings``
+        reads. allow_missing so a settings-less account reads as None (→ the run
+        falls back to the pipeline defaults, same as the web app)."""
+        url = f"{config.FIRESTORE_BASE}/users/{uid}/settings/prefs"
+        body = self._request("GET", url, allow_missing=True)
+        if not body:
+            return None
+        return fields_to_dict(body)
+
     def get_agent_session(self, uid: str, sid: str) -> dict[str, Any] | None:
         """Read the agent-session doc (#790), or None if absent/deleted.
 
