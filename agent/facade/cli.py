@@ -1228,8 +1228,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command")
 
     cn = sub.add_parser("connect", parents=[common],
-                        help="connect a chat runtime — branded flow: install the skill "
-                             "(Windows or WSL) + optionally pin the bridge")
+                        help="connect a chat runtime (this host or WSL) — install the skill "
+                             "+ optionally pin the bridge (a WSL runtime connects in-distro)")
     cn.add_argument("runtime", nargs="?", help="hermes or openclaw (auto-detected if omitted)")
     cn.add_argument("--runtime", dest="runtime_opt",
                     help="hermes or openclaw (flag form — for non-interactive / chat-driven connect)")
