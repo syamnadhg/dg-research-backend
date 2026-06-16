@@ -242,151 +242,115 @@ def test_cmd_disconnect_next_shows_retire_only_when_bridge_kept(monkeypatch):
     assert "retire" in out
 
 
-# ── reachability: _ensure_reachable / _ensure_wsl_networking ──────────────────
+# ── reachability: _ensure_reachable (co-located only; WSL is delegated) ───────
 
 def test_ensure_reachable_local_is_noop_ok(monkeypatch):
     # A co-located (local) runtime on a non-containerized host shares the bridge's
-    # loopback — no WSL path, just the OK + an honest container caveat.
-    calls = []
-    monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: calls.append("wsl"))
+    # loopback — just the OK + an honest container caveat.
     monkeypatch.setattr(cli.connect, "looks_containerized", lambda: False)
     _, out = _cap(cli._ensure_reachable, connect.Target("hermes", "local", Path("C:/Users/me")))
-    assert calls == []
     assert "loopback" in out.lower()
     assert "container" in out.lower()  # honest caveat present, not a bare all-clear
 
 
 def test_ensure_reachable_containerized_host_warns(monkeypatch):
     # If the bridge host itself looks containerized, don't promise loopback.
-    monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: None)
     monkeypatch.setattr(cli.connect, "looks_containerized", lambda: True)
     _, out = _cap(cli._ensure_reachable, connect.Target("hermes", "local", Path("/root")))
     assert "container" in out.lower()
     assert "host networking" in out.lower() or "published port" in out.lower()
 
 
-def test_ensure_reachable_wsl_delegates(monkeypatch):
-    calls = []
-    monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: calls.append("wsl"))
-    cli._ensure_reachable(connect.Target("openclaw", "wsl", Path("/o"), distro="U"))
-    assert calls == ["wsl"]
+# ── WSL delegation: _connect_wsl_runtime (Model A — connect runs in the distro) ─
+
+def _wsl_target(distro="Ubuntu-24.04"):
+    return connect.Target("hermes", "wsl", Path("/home/u"), distro=distro)
 
 
-def test_ensure_wsl_networking_already_on_skips_write(monkeypatch):
-    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: True)
-    wrote = []
-    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
-                        lambda *a, **k: wrote.append(1) or (True, Path("x")))
-    cli._ensure_wsl_networking()
-    assert wrote == []  # already mirrored → nothing to write, no restart nudge
+def test_connect_wsl_assume_yes_runs_in_distro(monkeypatch):
+    monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
+    ran = {}
+    monkeypatch.setattr(cli.connect, "run_connect_in_wsl",
+                        lambda d, extra=None: ran.update(distro=d, extra=extra) or 0)
+    rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
+                                  startup=None, login=None)
+    assert rc == 0
+    assert ran == {"distro": "Ubuntu-24.04", "extra": ["--yes"]}
 
 
-def test_ensure_wsl_networking_decline_write_does_nothing(monkeypatch):
-    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
-    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)  # decline the write
-    wrote = []
-    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
-                        lambda *a, **k: wrote.append(1) or (True, Path("x")))
-    cli._ensure_wsl_networking()
-    assert wrote == []
+def test_connect_wsl_forwards_startup_login_flags(monkeypatch):
+    monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
+    ran = {}
+    monkeypatch.setattr(cli.connect, "run_connect_in_wsl",
+                        lambda d, extra=None: ran.update(extra=extra) or 0)
+    cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
+                             startup=False, login=True)
+    assert ran["extra"] == ["--yes", "--no-startup", "--login"]
 
 
-def test_ensure_wsl_networking_write_then_decline_restart(monkeypatch):
-    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
-    answers = iter([True, False])  # Y write, N shutdown
-    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
-    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
-                        lambda *a, **k: (True, Path("C:/Users/me/.wslconfig")))
-    shut = []
-    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: shut.append(1) or (True, ""))
-    cli._ensure_wsl_networking()
-    assert shut == []  # declined → we never shut WSL down out from under the user
+def test_connect_wsl_decline_prints_manual_no_run(monkeypatch, capsys):
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)  # decline run-in-WSL
+    monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
+    ran = []
+    monkeypatch.setattr(cli.connect, "run_connect_in_wsl", lambda *a, **k: ran.append(1) or 0)
+    rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=False, noninteractive=False,
+                                  startup=None, login=None)
+    out = capsys.readouterr().out
+    assert rc == 0 and ran == []                       # never ran in WSL
+    assert "uvx superresearch-agent connect" in out    # printed the manual command
+    assert "wsl -d Ubuntu-24.04" in out
 
 
-def test_ensure_wsl_networking_write_then_accept_restart(monkeypatch):
-    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
-    answers = iter([True, True])  # Y write, Y shutdown
-    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
-    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
-                        lambda *a, **k: (True, Path("C:/Users/me/.wslconfig")))
-    shut = []
-    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: shut.append(1) or (True, ""))
-    cli._ensure_wsl_networking()
-    assert shut == [1]  # accepted → wsl --shutdown invoked
+def test_connect_wsl_no_uvx_falls_back_to_manual(monkeypatch, capsys):
+    monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: False)  # uv missing
+    ran = []
+    monkeypatch.setattr(cli.connect, "run_connect_in_wsl", lambda *a, **k: ran.append(1) or 0)
+    rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
+                                  startup=None, login=None)
+    out = capsys.readouterr().out
+    assert rc == 0 and ran == []                        # didn't attempt uvx
+    assert "uv isn't installed" in out
+    assert "research.py agent connect" in out           # backend-checkout fallback
 
 
-def test_ensure_wsl_networking_write_failure_is_handled(monkeypatch, capsys):
-    # The OSError path (couldn't write .wslconfig) must degrade gracefully and
-    # never reach the restart offer.
-    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
-    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: True)  # accept the write
-    def _boom(*a, **k):
-        raise OSError("Access is denied")
-    monkeypatch.setattr(cli.connect, "enable_mirrored_networking", _boom)
-    shut = []
-    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: shut.append(1) or (True, ""))
-    cli._ensure_wsl_networking()
-    assert "Couldn't write" in capsys.readouterr().out
-    assert shut == []  # returned before offering the restart
+def test_connect_wsl_nonzero_rc_shows_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
+    monkeypatch.setattr(cli.connect, "run_connect_in_wsl", lambda *a, **k: 3)  # didn't finish
+    rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
+                                  startup=None, login=None)
+    out = capsys.readouterr().out
+    assert rc == 3
+    assert "didn't finish" in out
+    assert "uvx superresearch-agent connect" in out     # fallback printed
 
 
-def test_ensure_wsl_networking_shutdown_failure_is_handled(monkeypatch, capsys):
-    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
-    answers = iter([True, True])  # Y write, Y shutdown
-    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
-    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
-                        lambda *a, **k: (True, Path("C:/Users/me/.wslconfig")))
-    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: (False, "wsl.exe not found"))
-    cli._ensure_wsl_networking()
-    assert "Couldn't run wsl --shutdown" in capsys.readouterr().out
+def test_connect_wsl_noninteractive_without_yes_prints_manual(monkeypatch, capsys):
+    # Non-TTY and no --yes → no channel to consent to running in WSL → print it.
+    monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
+    ran = []
+    monkeypatch.setattr(cli.connect, "run_connect_in_wsl", lambda *a, **k: ran.append(1) or 0)
+    rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=False, noninteractive=True,
+                                  startup=None, login=None)
+    assert rc == 0 and ran == []
+    assert "uvx superresearch-agent connect" in capsys.readouterr().out
 
 
-def test_ensure_wsl_networking_already_configured_unapplied(monkeypatch, capsys):
-    # enable_mirrored_networking can return changed=False (value already present) —
-    # the message must say "Already set", not falsely claim a fresh enable.
-    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
-    answers = iter([True, False])  # Y write, N shutdown
-    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
-    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
-                        lambda *a, **k: (False, Path("C:/Users/me/.wslconfig")))
-    monkeypatch.setattr(cli.connect, "wsl_shutdown", lambda: (True, ""))
-    cli._ensure_wsl_networking()
-    assert "Already set" in capsys.readouterr().out
+def test_cmd_connect_routes_wsl_target_to_delegation(monkeypatch):
+    # cmd_connect must hand a chosen WSL target to _connect_wsl_runtime and NOT
+    # install on Windows.
+    monkeypatch.setattr(cli.connect, "detect_targets", lambda: [_wsl_target()])
+    monkeypatch.setattr(cli, "_choose_target", lambda targets, **k: targets[0])
+    captured = {}
+    monkeypatch.setattr(cli, "_connect_wsl_runtime",
+                        lambda target, **k: captured.update(target=target, **k) or 0)
 
+    def _no_install(*a, **k):
+        raise AssertionError("must not install on Windows for a WSL target")
 
-# _warn_shared_localhost — informed consent + the #225 port-squatter guard.
-
-def test_warn_shared_localhost_flags_windows_port_squatters(monkeypatch):
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {3000: "37292"})
-    _, out = _cap(cli._warn_shared_localhost)
-    assert "shares localhost" in out.lower()      # informed consent
-    assert "3000" in out and "37292" in out        # names the squatter + PID
-    assert "tasklist" in out.lower()               # actionable identify hint
-
-
-def test_warn_shared_localhost_clean_when_no_squatters(monkeypatch):
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
-    _, out = _cap(cli._warn_shared_localhost)
-    assert "shares localhost" in out.lower()       # still warns about the consequence
-    assert "PID" not in out                        # but no squatter list
-
-
-def test_ensure_wsl_networking_breadcrumb_on_enable(monkeypatch):
-    # The post-restart diagnostic breadcrumb (netstat hint) must be emitted.
-    monkeypatch.setattr(cli.connect, "mirrored_networking_enabled", lambda: False)
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {})
-    answers = iter([True, False])  # Y write, N shutdown
-    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: next(answers))
-    monkeypatch.setattr(cli.connect, "enable_mirrored_networking",
-                        lambda *a, **k: (True, Path("C:/Users/me/.wslconfig")))
-    _, out = _cap(cli._ensure_wsl_networking)
-    assert "netstat -ano" in out and "findstr" in out
+    monkeypatch.setattr(cli, "_install_step", _no_install)
+    args = cli.build_parser().parse_args(["connect", "--runtime", "hermes", "--yes"])
+    assert cli.cmd_connect(args) == 0
+    assert captured["target"].location == "wsl"
 
 
 # ── cmd_status runtime-location rendering ─────────────────────────────────────
@@ -702,10 +666,8 @@ def test_ensure_reachable_local_on_linux(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "linux")
     monkeypatch.setattr(connect, "host_os_label", lambda: "Linux")
     monkeypatch.setattr(cli.connect, "looks_containerized", lambda: False)
-    wsl = []
-    monkeypatch.setattr(cli, "_ensure_wsl_networking", lambda: wsl.append(1))
     _, out = _cap(cli._ensure_reachable, connect.Target("hermes", "local", Path("/home/x")))
-    assert wsl == [] and "loopback" in out.lower()
+    assert "loopback" in out.lower()
 
 
 def test_bridge_up_requires_version_marker(monkeypatch):
@@ -716,13 +678,6 @@ def test_bridge_up_requires_version_marker(monkeypatch):
     assert cli._bridge_up() is False   # foreign HTTP server on :9876 is NOT the bridge
     monkeypatch.setattr(cli, "_bridge_get", lambda p, **k: None)
     assert cli._bridge_up() is False
-
-
-def test_warn_shared_localhost_flags_bridge_own_port(monkeypatch):
-    # The bridge's own port (config.BRIDGE_PORT) is now scanned + specially tagged.
-    monkeypatch.setattr(cli.connect, "windows_port_owners", lambda *a, **k: {cli.config.BRIDGE_PORT: "55"})
-    _, out = _cap(cli._warn_shared_localhost)
-    assert str(cli.config.BRIDGE_PORT) in out and "the bridge's own port" in out
 
 
 # _bridge_authed — the closing card's 'logged_in' must reflect REAL auth, not

@@ -202,6 +202,15 @@ def cmd_connect(args: argparse.Namespace) -> int:
         b.dim("Cancelled — nothing was changed.")
         return 1
 
+    # A WSL runtime co-locates its bridge IN WSL (Model A) — a Windows bridge
+    # can't share WSL's loopback. Hand off to the in-distro connect instead of
+    # installing on Windows + mirror-networking.
+    if chosen.location == "wsl":
+        return _connect_wsl_runtime(
+            chosen, assume_yes=assume_yes, noninteractive=noninteractive,
+            startup=args.startup, login=args.login,
+        )
+
     # ── [2/4] Install the skill + make it reachable ──────────────────────────
     b.step(2, 4, "Install the skill")
     target = _install_step(chosen, Path(args.dest) if args.dest else None, assume_yes=assume_yes)
@@ -375,17 +384,12 @@ def _connect_next(*, runtime: str, logged_in: bool, startup_pinned: bool) -> lis
 
 
 def _ensure_reachable(target: connect.Target) -> None:
-    """Make sure the chosen runtime can reach the bridge over loopback.
+    """Make sure the chosen (co-located) runtime can reach the bridge over loopback.
 
-    One rule, every platform: the runtime must share the bridge's loopback.
-      • co-located (same OS as the bridge) → shares loopback, nothing to do.
-      • WSL runtime + Windows bridge → separate net namespace → offer the
-        mirrored-networking auto-fix.
-    (A runtime on a *different machine* can't reach a loopback-only bridge at all
-    — unsupported by design; detect_targets only ever finds local/WSL installs.)"""
-    if target.location == "wsl":
-        _ensure_wsl_networking()
-        return
+    Model A co-locates the bridge with the runtime, so a same-host runtime shares
+    the bridge's loopback and needs no setup. (A WSL runtime never reaches here —
+    cmd_connect hands it off to the in-distro connect before this step.) The only
+    caveat left is a container/VM whose loopback is scoped away from the host."""
     label = connect.RUNTIME_META[target.runtime]["label"]
     # "local" means same host filesystem — which USUALLY means same network
     # namespace (shared loopback), but not always: a runtime in a container/VM
@@ -403,73 +407,63 @@ def _ensure_reachable(target: connect.Target) -> None:
     b.dim(f" published port to reach 127.0.0.1:{config.BRIDGE_PORT} — same-OS alone isn't enough.)")
 
 
-def _warn_shared_localhost() -> None:
-    """Informed consent before enabling mirrored networking: it SHARES localhost
-    between Windows and WSL, so a Windows process on a port blocks a WSL service
-    from that same port (the #225 WhatsApp break), and applying it bounces all WSL
-    apps. Names any common service port a Windows process is already squatting so
-    the user can resolve it BEFORE a WSL chat service silently fails to bind."""
-    b.dim("Heads up — mirrored networking SHARES localhost between Windows and WSL:")
-    b.dim("  • a Windows process on a port then BLOCKS a WSL service from that same")
-    b.dim("    port (a stray Windows :3000 dev server can knock out a WSL chat bridge);")
-    b.dim("  • applying it needs  wsl --shutdown , which briefly stops ALL your WSL")
-    b.dim("    apps (Hermes / WhatsApp / etc.) — they reconnect afterwards.")
-    # Scan the common service ports AND the bridge's OWN port — under mirrored
-    # networking a Windows holder of :9876 would block the bridge's bind too.
-    owners = connect.windows_port_owners(connect.COMMON_SHARED_PORTS + (config.BRIDGE_PORT,))
-    if owners:
-        b.warn("Windows is already holding these ports — a WSL service can't share them once mirrored:")
-        for port, pid in sorted(owners.items()):
-            tag = "  ← the bridge's own port" if port == config.BRIDGE_PORT else ""
-            b.dim(f"    • port {port}  →  Windows PID {pid}   "
-                  f"(identify:  tasklist /FI \"PID eq {pid}\"){tag}")
-        b.dim("  If your chat runtime uses one of these, free it on Windows or move that")
-        b.dim("  WSL service to another port first.")
+def _print_wsl_manual(distro: str, cmd: str) -> None:
+    """Print the one command to run INSIDE a WSL distro to connect it (Model A),
+    with its prerequisites + a pre-PyPI backend-checkout fallback."""
+    b.dim(f"Run this inside WSL · {distro}:")
+    b.line("    " + b.c(branding._BOLD + branding._ACCENT, f"wsl -d {distro}"))
+    b.line("    " + b.c(branding._BOLD + branding._ACCENT, cmd))
+    b.dim("  Needs uv in the distro (https://astral.sh/uv). Before the package is on")
+    b.dim("  PyPI, a backend checkout works too — run INSIDE the distro:")
+    b.dim("      python research.py agent connect")
+    b.dim("  The bridge then runs in WSL with your runtime (shared loopback).")
 
 
-def _ensure_wsl_networking() -> None:
-    """WSL runtime prerequisite: the bridge runs on Windows and binds loopback, so
-    a WSL chat reaches it ONLY with WSL "mirrored" networking. If it's off, WARN
-    about the shared-localhost consequence (+ flag Windows port-squatters), then
-    offer to write it into %USERPROFILE%\\.wslconfig (Y), then — since the change
-    needs a WSL restart — offer to run `wsl --shutdown` (default NO: it closes
-    every WSL session, including the runtime just connected). Consent-gated."""
-    if connect.mirrored_networking_enabled():
-        b.ok("WSL mirrored networking is on — your WSL chat can reach the bridge.")
-        return
-    b.warn("WSL chat reaches this Windows bridge over loopback ONLY with mirrored networking.")
-    _warn_shared_localhost()
-    if not b.confirm("Enable mirrored networking now? (writes  %USERPROFILE%\\.wslconfig )", default=True):
-        b.dim("Skipped. Enable later: add  networkingMode=mirrored  under [wsl2] in")
-        b.dim("  %USERPROFILE%\\.wslconfig , then  wsl --shutdown   (or re-run agent connect).")
-        return
-    try:
-        changed, path = connect.enable_mirrored_networking()
-    except OSError as e:
-        b.no(f"Couldn't write .wslconfig: {e}")
-        b.dim("Add  networkingMode=mirrored  under [wsl2] manually, then  wsl --shutdown .")
-        return
-    b.ok(f"{'Enabled' if changed else 'Already set'} networkingMode=mirrored   ({path})")
-    if not changed:
-        # Configured but a prior enable hasn't been applied yet — still nudge the
-        # restart (mirrored_networking_enabled() read False to get us here).
-        b.dim("Configured already; WSL just needs to restart to apply it.")
-    else:
-        b.dim("WSL must restart for this to take effect.")
-    if b.confirm("Run  wsl --shutdown  now? (closes all WSL sessions)", default=False):
-        with b.spinner("Shutting down WSL (it restarts with mirrored networking)"):
-            ok, msg = connect.wsl_shutdown()
-        if ok:
-            b.ok("WSL is shutting down — it comes back with mirrored networking on next use.")
-            b.dim("Relaunch your chat runtime in WSL, then sign in with  /sr-login .")
-        else:
-            b.warn(f"Couldn't run wsl --shutdown: {msg}")
-            b.dim("Run it yourself, then verify:  python research.py agent doctor")
-    else:
-        b.dim("Run  wsl --shutdown  yourself, then verify:  python research.py agent doctor")
-    # Diagnostic breadcrumb for the exact #225 failure mode.
-    b.dim("If a WSL chat service doesn't reconnect after the restart, a Windows process may")
-    b.dim("  be holding its port (mirrored shares localhost) — check:  netstat -ano | findstr :<port>")
+def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninteractive: bool,
+                         startup: bool | None, login: bool | None) -> int:
+    """A WSL runtime co-locates its bridge IN WSL (Model A) — so connect runs
+    INSIDE the distro, not on Windows. Offer to run it now (consent-gated, default
+    yes); on yes hand off to ``uvx superresearch-agent connect`` in the distro,
+    forwarding the connect flags. Falls back to printing the command when the user
+    declines, when there's no consent channel (non-TTY without --yes), when uv
+    isn't installed in the distro, or when the in-WSL connect exits non-zero (e.g.
+    the package isn't on PyPI yet)."""
+    distro = target.distro or ""
+    label = connect.RUNTIME_META[target.runtime]["label"]
+    forwarded: list[str] = []
+    if assume_yes or noninteractive:
+        forwarded.append("--yes")
+    if startup is True:
+        forwarded.append("--startup")
+    elif startup is False:
+        forwarded.append("--no-startup")
+    if login is True:
+        forwarded.append("--login")
+    elif login is False:
+        forwarded.append("--no-login")
+    shown = "uvx superresearch-agent connect" + "".join(f" {f}" for f in forwarded)
+
+    b.dim(f"{label} lives in WSL · {distro}.")
+    b.dim("Model A puts the bridge WITH the runtime, so connect it from inside the")
+    b.dim("distro — a Windows bridge can't share WSL's loopback.")
+
+    # No TTY and no --yes → no channel to consent to running inside WSL; print it.
+    if noninteractive and not assume_yes:
+        _print_wsl_manual(distro, shown)
+        return 0
+    if not _decide(None, assume_yes, f"Run connect inside WSL · {distro} now?", default=True):
+        _print_wsl_manual(distro, shown)
+        return 0
+    if not connect.wsl_uvx_available(distro):
+        b.warn(f"uv isn't installed in WSL · {distro} yet — can't run uvx there.")
+        _print_wsl_manual(distro, shown)
+        return 0
+    b.dim(f"Handing off to WSL · {distro}  ({shown}) …")
+    rc = connect.run_connect_in_wsl(distro, forwarded)
+    if rc != 0:
+        b.warn(f"The in-WSL connect didn't finish (exit {rc}).")
+        _print_wsl_manual(distro, shown)
+    return rc
 
 
 def _disconnect_pairs(explicit: str | None,
@@ -873,19 +867,6 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         _doctor_row("sr web", True, f"reachable ({config.FE_BASE})")
     except requests.RequestException as e:
         _doctor_row("sr web", False, f"{config.FE_BASE} — {e}")
-
-    # WSL mirrored networking — only relevant when a WSL runtime is in play, but
-    # surfaced whenever WSL is present (a WSL chat can't reach the loopback bridge
-    # without it). Reads %USERPROFILE%\.wslconfig (no need to start WSL).
-    distros = connect.wsl_distros()
-    if distros or prefs.get_runtime_location() == "wsl":
-        mirrored = connect.mirrored_networking_enabled()
-        if mirrored:
-            _doctor_row("wsl net", True, "mirrored — WSL chat can reach the bridge")
-        else:
-            _doctor_row("wsl net", False,
-                        "not mirrored — WSL chat can't reach the loopback bridge", warn_only=True)
-            b.dim("           fix:  python research.py agent connect   (offers to enable it for you)")
 
     health = _bridge_get("/healthz")
     if health is None:
