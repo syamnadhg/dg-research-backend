@@ -30,7 +30,10 @@ _SELECTED_UID = "selectedUid"
 _RUNTIME = "runtime"
 _RUNTIME_HOME = "runtimeHome"          # where the skill was installed (str path)
 _RUNTIME_LOCATION = "runtimeLocation"  # "local" (this host) | "wsl"
-_RUNTIME_DISTRO = "runtimeDistro"      # WSL distro name (None for a local install)
+_RUNTIME_DISTRO = "runtimeDistro"      # LEGACY: a WSL distro name written by the
+#                                        pre-Model-A connect; no longer written
+#                                        (a WSL runtime now connects in-distro),
+#                                        only swept by clear_runtime for old prefs.
 _INSTALL_ID = "installId"
 _LABEL = "agentLabel"
 
@@ -126,12 +129,13 @@ def get_runtime() -> str | None:
 
 
 def set_runtime(runtime: str, *, home: str | None = None,
-                location: str | None = None, distro: str | None = None) -> None:
+                location: str | None = None) -> None:
     """Record the connected runtime and (optionally) WHERE its skill was
-    installed. The home/location/distro let the bridge's revoke-consult and
-    `agent disconnect` remove a WSL install precisely (the skill lives under a
-    \\\\wsl.localhost UNC home, not the Windows home). Passing only ``runtime``
-    keeps the back-compat behavior."""
+    installed. The home/location let the bridge's revoke-consult and `agent
+    disconnect` find the install. Under Model A only a CO-LOCATED install is
+    recorded here (a WSL runtime connects in-distro and records its own prefs
+    there), so location is always "local". Passing only ``runtime`` keeps the
+    back-compat behavior."""
     with _lock:
         prefs = load()
         prefs[_RUNTIME] = runtime
@@ -139,12 +143,6 @@ def set_runtime(runtime: str, *, home: str | None = None,
             prefs[_RUNTIME_HOME] = home
         if location is not None:
             prefs[_RUNTIME_LOCATION] = location
-        # distro is meaningful only for WSL; clear it for a Windows install so a
-        # later Windows connect doesn't inherit a stale distro from a WSL one.
-        if location == "wsl" and distro:
-            prefs[_RUNTIME_DISTRO] = distro
-        elif location is not None:
-            prefs.pop(_RUNTIME_DISTRO, None)
         save(prefs)
 
 
@@ -159,14 +157,10 @@ def get_runtime_location() -> str | None:
     v = load().get(_RUNTIME_LOCATION)
     if not (isinstance(v, str) and v):
         return None
-    # Migrate the pre-rename value: native installs were once "windows", now
-    # "local" (host-agnostic). Normalize on read so old prefs.json files behave.
-    return "local" if v == "windows" else v
-
-
-def get_runtime_distro() -> str | None:
-    v = load().get(_RUNTIME_DISTRO)
-    return v if isinstance(v, str) and v else None
+    # Normalize legacy values on read so old prefs.json files behave: native
+    # installs were once "windows", and a pre-Model-A WSL install recorded "wsl"
+    # — both now render as the co-located host ("local").
+    return "local" if v in ("windows", "wsl") else v
 
 
 def clear_runtime() -> None:

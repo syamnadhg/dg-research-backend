@@ -252,9 +252,10 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
 def _record_runtime(chosen: connect.Target) -> None:
     """Persist the connected runtime + WHERE it landed, so revoke/disconnect can
-    target a WSL install precisely."""
+    find the install. Only a co-located target reaches here (a WSL target is
+    handed off to the in-distro connect, which records its own prefs there)."""
     prefs.set_runtime(chosen.runtime, home=str(chosen.home),
-                      location=chosen.location, distro=chosen.distro)
+                      location=chosen.location)
 
 
 def _install_step(chosen: connect.Target, dest_override: Path | None, *,
@@ -753,8 +754,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
     rt = prefs.get_runtime()
     if rt:
         loc = prefs.get_runtime_location()
-        where = (f" · WSL · {prefs.get_runtime_distro()}" if loc == "wsl"
-                 else (f" · {connect.host_os_label()}" if loc else ""))
+        where = f" · {connect.host_os_label()}" if loc else ""
         b.dim(f"Runtime: {rt}{where}")
     if autostart.is_installed():
         b.ok(f"Autostart: pinned to login ({autostart.TASK_NAME})")

@@ -357,12 +357,11 @@ def test_cmd_connect_routes_wsl_target_to_delegation(monkeypatch):
 # (capture via redirect_stdout: capsys flakes on the branded multi-line header
 #  output for some of these, while redirect_stdout captures it deterministically.)
 
-def _status_out(monkeypatch, *, loc, distro="Ubuntu-24.04"):
+def _status_out(monkeypatch, *, loc):
     monkeypatch.setattr(cli, "_bridge_get", lambda *a, **k: None)  # bridge down (simplest)
     monkeypatch.setattr(cli.AccountSession, "load", staticmethod(lambda: None))
     monkeypatch.setattr(cli.prefs, "get_runtime", lambda: "hermes")
     monkeypatch.setattr(cli.prefs, "get_runtime_location", lambda: loc)
-    monkeypatch.setattr(cli.prefs, "get_runtime_distro", lambda: distro)
     monkeypatch.setattr(cli.autostart, "is_installed", lambda: False)
     monkeypatch.setattr(cli.connect, "host_os_label", lambda: "TestOS")
     buf = io.StringIO()
@@ -373,10 +372,6 @@ def _status_out(monkeypatch, *, loc, distro="Ubuntu-24.04"):
 
 def _runtime_line(out):
     return next(line for line in out.splitlines() if "Runtime:" in line)
-
-
-def test_cmd_status_renders_wsl_location(monkeypatch):
-    assert "Runtime: hermes · WSL · Ubuntu-24.04" in _status_out(monkeypatch, loc="wsl")
 
 
 def test_cmd_status_renders_local_as_host(monkeypatch):

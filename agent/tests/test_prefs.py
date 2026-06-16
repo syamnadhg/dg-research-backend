@@ -50,47 +50,46 @@ def test_runtime_roundtrip(monkeypatch, tmp_path):
     assert prefs.get_runtime() == "hermes" and prefs.get_selected_device("u1") == "dev-1"
 
 
-def test_runtime_records_wsl_install_location(monkeypatch, tmp_path):
+def test_runtime_records_install_home_and_location(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path)
     assert prefs.get_runtime_home() is None
-    prefs.set_runtime("openclaw", home=r"\\wsl.localhost\Ubuntu-24.04\home\me",
-                      location="wsl", distro="Ubuntu-24.04")
+    # Only a co-located install is recorded here under Model A (a WSL runtime
+    # connects in-distro and records its own prefs there).
+    prefs.set_runtime("openclaw", home="C:\\Users\\me", location="local")
     assert prefs.get_runtime() == "openclaw"
-    assert prefs.get_runtime_home() == r"\\wsl.localhost\Ubuntu-24.04\home\me"
-    assert prefs.get_runtime_location() == "wsl"
-    assert prefs.get_runtime_distro() == "Ubuntu-24.04"
+    assert prefs.get_runtime_home() == "C:\\Users\\me"
+    assert prefs.get_runtime_location() == "local"
 
 
 def test_clear_runtime_forgets_all_runtime_keys(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path)
-    prefs.set_runtime("openclaw", home=r"\\wsl.localhost\U\home\me", location="wsl", distro="U")
+    prefs.set_runtime("openclaw", home=r"\\wsl.localhost\U\home\me", location="local")
+    # A legacy prefs.json may still carry a runtimeDistro key (set_runtime no
+    # longer writes it) — clear_runtime must still sweep it.
+    d = prefs.load()
+    d[prefs._RUNTIME_DISTRO] = "U"
+    prefs.save(d)
     prefs.set_selected_device("dev-1", "u1")  # a non-runtime pref that must SURVIVE
     iid = prefs.get_or_create_install_id()     # the stable agent id must SURVIVE too
     prefs.clear_runtime()
     assert prefs.get_runtime() is None
     assert prefs.get_runtime_home() is None
     assert prefs.get_runtime_location() is None
-    assert prefs.get_runtime_distro() is None
+    assert prefs.load().get(prefs._RUNTIME_DISTRO) is None  # legacy key swept too
     # unrelated prefs are untouched (clear_runtime is runtime-only)
     assert prefs.get_selected_device("u1") == "dev-1"
     assert prefs.get_or_create_install_id() == iid
     prefs.clear_runtime()  # idempotent — no error when nothing is recorded
 
 
-def test_runtime_local_clears_stale_distro(monkeypatch, tmp_path):
-    _isolate(monkeypatch, tmp_path)
-    prefs.set_runtime("openclaw", home=r"\\wsl.localhost\U\home\me", location="wsl", distro="U")
-    # Re-connecting to a local (host-native) runtime must not inherit the WSL distro.
-    prefs.set_runtime("hermes", home="C:\\Users\\me", location="local")
-    assert prefs.get_runtime_location() == "local"
-    assert prefs.get_runtime_distro() is None
-
-
-def test_legacy_windows_location_normalizes_to_local(monkeypatch, tmp_path):
-    # A returning user whose prefs.json predates the rename has location="windows";
-    # get_runtime_location() migrates it to "local" on read (host-agnostic).
+def test_legacy_location_values_normalize_to_local(monkeypatch, tmp_path):
+    # A returning user whose prefs.json predates the rename has location="windows",
+    # and a pre-Model-A WSL install recorded "wsl" — both normalize to the
+    # co-located host ("local") on read.
     _isolate(monkeypatch, tmp_path)
     prefs.set_runtime("hermes", home="C:\\Users\\me", location="windows")
+    assert prefs.get_runtime_location() == "local"
+    prefs.set_runtime("openclaw", location="wsl")
     assert prefs.get_runtime_location() == "local"
 
 
