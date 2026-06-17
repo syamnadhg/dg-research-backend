@@ -11,7 +11,18 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from facade import cli, connect
+
+
+@pytest.fixture(autouse=True)
+def _no_wsl_by_default(monkeypatch):
+    """Default runtime detection to 'nothing here' so command tests take the LOCAL
+    path. The WSL delegation calls connect.detect_targets(), which on a real
+    Windows dev box finds the actual WSL Hermes and would delegate into it —
+    tests that exercise WSL detection/delegation override this explicitly."""
+    monkeypatch.setattr(cli.connect, "detect_targets", lambda *a, **k: [])
 
 
 def _ns(**kw):
@@ -270,21 +281,21 @@ def _wsl_target(distro="Ubuntu-24.04"):
 def test_connect_wsl_assume_yes_runs_in_distro(monkeypatch):
     monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
     ran = {}
-    monkeypatch.setattr(cli.connect, "run_connect_in_wsl",
-                        lambda d, extra=None: ran.update(distro=d, extra=extra) or 0)
+    monkeypatch.setattr(cli.connect, "run_agent_in_wsl",
+                        lambda d, sub, extra=None: ran.update(distro=d, extra=extra) or 0)
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
                                   startup=None, login=None)
     assert rc == 0
     # pre-selects the runtime; the continuation marker rides the env var (set by
-    # run_connect_in_wsl), so it's NOT a forwarded flag (version-safe).
+    # run_agent_in_wsl), so it's NOT a forwarded flag (version-safe).
     assert ran == {"distro": "Ubuntu-24.04", "extra": ["--runtime", "hermes", "--yes"]}
 
 
 def test_connect_wsl_forwards_startup_login_flags(monkeypatch):
     monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
     ran = {}
-    monkeypatch.setattr(cli.connect, "run_connect_in_wsl",
-                        lambda d, extra=None: ran.update(extra=extra) or 0)
+    monkeypatch.setattr(cli.connect, "run_agent_in_wsl",
+                        lambda d, sub, extra=None: ran.update(extra=extra) or 0)
     cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
                              startup=False, login=True)
     assert ran["extra"] == ["--runtime", "hermes", "--yes", "--no-startup", "--login"]
@@ -297,8 +308,8 @@ def test_connect_wsl_interactive_auto_proceeds_no_prompt(monkeypatch):
     monkeypatch.setattr(cli.b, "confirm",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt")))
     ran = {}
-    monkeypatch.setattr(cli.connect, "run_connect_in_wsl",
-                        lambda d, extra=None: ran.update(distro=d, extra=extra) or 0)
+    monkeypatch.setattr(cli.connect, "run_agent_in_wsl",
+                        lambda d, sub, extra=None: ran.update(distro=d, extra=extra) or 0)
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=False, noninteractive=False,
                                   startup=None, login=None)
     assert rc == 0
@@ -309,7 +320,7 @@ def test_connect_wsl_interactive_auto_proceeds_no_prompt(monkeypatch):
 def test_connect_wsl_no_uvx_falls_back_to_manual(monkeypatch, capsys):
     monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: False)  # uv missing
     ran = []
-    monkeypatch.setattr(cli.connect, "run_connect_in_wsl", lambda *a, **k: ran.append(1) or 0)
+    monkeypatch.setattr(cli.connect, "run_agent_in_wsl", lambda *a, **k: ran.append(1) or 0)
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
                                   startup=None, login=None)
     out = capsys.readouterr().out
@@ -320,7 +331,7 @@ def test_connect_wsl_no_uvx_falls_back_to_manual(monkeypatch, capsys):
 
 def test_connect_wsl_nonzero_rc_shows_fallback(monkeypatch, capsys):
     monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
-    monkeypatch.setattr(cli.connect, "run_connect_in_wsl", lambda *a, **k: 3)  # didn't finish
+    monkeypatch.setattr(cli.connect, "run_agent_in_wsl", lambda *a, **k: 3)  # didn't finish
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
                                   startup=None, login=None)
     out = capsys.readouterr().out
@@ -333,11 +344,83 @@ def test_connect_wsl_noninteractive_without_yes_prints_manual(monkeypatch, capsy
     # Non-TTY and no --yes → no channel to consent to running in WSL → print it.
     monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
     ran = []
-    monkeypatch.setattr(cli.connect, "run_connect_in_wsl", lambda *a, **k: ran.append(1) or 0)
+    monkeypatch.setattr(cli.connect, "run_agent_in_wsl", lambda *a, **k: ran.append(1) or 0)
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=False, noninteractive=True,
                                   startup=None, login=None)
     assert rc == 0 and ran == []
     assert "uvx superresearch-agent connect" in capsys.readouterr().out
+
+
+# ── lifecycle/query delegation to WSL (Option A — symmetric with connect) ─────
+
+def test_wsl_distro_for_returns_distro_when_only_wsl(monkeypatch):
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli.connect, "detect_targets",
+                        lambda: [connect.Target("hermes", "wsl", Path("/h"), distro="Ubuntu-24.04")])
+    assert cli._wsl_distro_for() == "Ubuntu-24.04"
+
+
+def test_wsl_distro_for_none_when_local_also_present(monkeypatch):
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli.connect, "detect_targets", lambda: [
+        connect.Target("hermes", "wsl", Path("/h"), distro="U"),
+        connect.Target("hermes", "local", Path("C:/x")),
+    ])
+    assert cli._wsl_distro_for() is None  # a co-located one exists → act locally
+
+
+def test_wsl_distro_for_off_windows(monkeypatch):
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.connect, "detect_targets",
+                        lambda: [connect.Target("hermes", "wsl", Path("/h"), distro="U")])
+    assert cli._wsl_distro_for() is None
+
+
+def test_delegate_lifecycle_runs_in_wsl(monkeypatch):
+    monkeypatch.setattr(cli, "_wsl_distro_for", lambda explicit=None: "Ubuntu-24.04")
+    monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
+    seen = {}
+    monkeypatch.setattr(cli.connect, "run_agent_in_wsl",
+                        lambda d, sub, extra=None: seen.update(distro=d, sub=sub, extra=extra) or 0)
+    rc = cli._delegate_lifecycle("retire", [], label="Retire")
+    assert rc == 0 and seen == {"distro": "Ubuntu-24.04", "sub": "retire", "extra": []}
+
+
+def test_delegate_lifecycle_none_when_co_located(monkeypatch):
+    monkeypatch.setattr(cli, "_wsl_distro_for", lambda explicit=None: None)
+    assert cli._delegate_lifecycle("retire", [], label="Retire") is None
+
+
+def test_delegate_lifecycle_refuses_when_uvx_missing(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_wsl_distro_for", lambda explicit=None: "U")
+    monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: False)
+    ran = []
+    monkeypatch.setattr(cli.connect, "run_agent_in_wsl", lambda *a, **k: ran.append(1) or 0)
+    rc = cli._delegate_lifecycle("retire", [], label="Retire")
+    assert rc == 1 and ran == []  # neither delegated nor silently ran locally
+    assert "uv isn't installed" in capsys.readouterr().out
+
+
+def test_redirect_if_wsl_redirects_when_no_local_bridge(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    monkeypatch.setattr(cli, "_wsl_distro_for", lambda explicit=None: "Ubuntu-24.04")
+    assert cli._redirect_if_wsl("Sign in from chat:  /sr login") == 0
+    out = capsys.readouterr().out
+    assert "WSL · Ubuntu-24.04" in out and "/sr login" in out
+
+
+def test_redirect_if_wsl_none_when_local_bridge_up(monkeypatch):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: True)
+    assert cli._redirect_if_wsl("x") is None
+
+
+def test_cmd_retire_delegates_to_wsl(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cli, "_delegate_lifecycle", lambda sub, extra, **k: seen.update(sub=sub) or 0)
+    monkeypatch.setattr(cli, "_retire_bridge",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not retire locally when delegated")))
+    assert cli.cmd_retire(cli.build_parser().parse_args(["retire"])) == 0
+    assert seen["sub"] == "retire"
 
 
 def test_cmd_connect_routes_wsl_target_to_delegation(monkeypatch):

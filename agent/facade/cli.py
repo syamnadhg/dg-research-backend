@@ -95,6 +95,11 @@ def _wait_bridge_up(timeout: float = 12.0, interval: float = 0.3) -> bool:
 # ── commands ──────────────────────────────────────────────────────────────
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    # A WSL runtime's bridge must run IN the distro — delegate (the in-distro serve
+    # blocks in this same terminal). Off-Windows / co-located → serve here.
+    rc = _delegate_lifecycle("serve", [], label="Serve")
+    if rc is not None:
+        return rc
     # The long-running bridge writes the durable operational log; short CLI
     # commands stay console-only (configured in main()).
     logsetup.configure(verbose=getattr(args, "verbose", False), to_file=True)
@@ -444,7 +449,7 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
     distro = target.distro or ""
     label = connect.RUNTIME_META[target.runtime]["label"]
     # The in-distro connect is a continuation of THIS flow: pre-select the same
-    # runtime (run_connect_in_wsl sets the continuation env var so it suppresses
+    # runtime (run_agent_in_wsl sets the continuation env var so it suppresses
     # its banner/re-detect) → the user sees one clean flow.
     forwarded: list[str] = ["--runtime", target.runtime]
     if assume_yes or noninteractive:
@@ -470,11 +475,63 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
         _print_wsl_manual(distro, "uvx superresearch-agent connect")
         return 0
     b.dim(f"Setting it up inside {distro}…")
-    rc = connect.run_connect_in_wsl(distro, forwarded)
+    rc = connect.run_agent_in_wsl(distro, "connect", forwarded)
     if rc != 0:
         b.warn(f"The in-WSL setup didn't finish (exit {rc}).")
         _print_wsl_manual(distro, "uvx superresearch-agent connect")
     return rc
+
+
+def _wsl_distro_for(explicit: str | None = None) -> str | None:
+    """If this Windows host's runtime lives in WSL (and not ALSO natively on
+    Windows), return its distro — the signal that a bridge-/skill-touching command
+    must delegate INTO that distro (the bridge co-locates with the runtime there,
+    unreachable from Windows). None when there's no WSL runtime, a co-located one
+    also exists, or we're not on Windows. Mirrors connect's detection."""
+    if sys.platform != "win32":
+        return None
+    try:
+        targets = connect.detect_targets()
+    except Exception:
+        return None
+    def _match(loc: str) -> list[connect.Target]:
+        return [t for t in targets if t.location == loc and (not explicit or t.runtime == explicit)]
+    wsl, local = _match("wsl"), _match("local")
+    return wsl[0].distro if (wsl and not local) else None
+
+
+def _delegate_lifecycle(subcommand: str, extra_args: list[str], *, label: str,
+                        explicit: str | None = None) -> int | None:
+    """A lifecycle command (disconnect/retire/resurrect/serve) whose runtime is in
+    WSL must run INSIDE the distro — the bridge/autostart/prefs live there, not on
+    Windows. Returns the in-distro exit code, or None to proceed locally (a
+    co-located runtime / no WSL runtime / off-Windows)."""
+    distro = _wsl_distro_for(explicit)
+    if distro is None:
+        return None
+    if not connect.wsl_uvx_available(distro):
+        b.warn(f"This runtime is in WSL · {distro}, but uv isn't installed there.")
+        b.dim(f"Run it inside the distro:  wsl -d {distro}   then   uvx superresearch-agent {subcommand}")
+        return 1
+    b.dim(f"{label} runs inside WSL · {distro} — doing it there…")
+    return connect.run_agent_in_wsl(distro, subcommand, extra_args)
+
+
+def _redirect_if_wsl(chat_hint: str) -> int | None:
+    """A bridge-query command (status/login/logout/device) can't reach a WSL
+    bridge from Windows, so when the runtime is in WSL and there's no local bridge,
+    point the user at chat / the in-distro CLI instead of querying a non-existent
+    Windows bridge. Returns 0 (redirected) or None (a local bridge is here →
+    proceed)."""
+    if _bridge_up():
+        return None
+    distro = _wsl_distro_for()
+    if distro is None:
+        return None
+    b.dim(f"Your runtime lives in WSL · {distro} — its bridge runs there, not on Windows.")
+    b.dim(f"  {chat_hint}")
+    b.dim(f"  …or inside the distro:  wsl -d {distro}   then   uvx superresearch-agent <command>")
+    return 0
 
 
 def _disconnect_pairs(explicit: str | None,
@@ -512,11 +569,18 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     the runtime AND sign out. (A session with no skill is dead weight, so the two
     go together.) The background bridge is left installed — use `agent retire` to
     also stop + unpin it."""
-    b.header("solvo", "disconnect from chat", tagline_color=branding._BOLD + branding._RED)
     explicit = args.runtime
     if explicit and explicit not in connect.RUNTIMES:
         b.no(f"Unknown runtime '{explicit}'. Choose: {', '.join(connect.RUNTIMES)}")
         return 1
+    # A WSL runtime's skill + bridge + session + prefs all live in the distro — run
+    # the whole teardown there (mirror connect's hand-off), not on Windows.
+    rc = _delegate_lifecycle("disconnect", (["--runtime", explicit] if explicit else []),
+                             label="Disconnect", explicit=explicit)
+    if rc is not None:
+        return rc
+    if not connect.is_continued():
+        b.header("solvo", "disconnect from chat", tagline_color=branding._BOLD + branding._RED)
     dest_override = Path(args.dest) if args.dest else None
 
     # ── [1/2] Remove the skill ────────────────────────────────────────────────
@@ -580,7 +644,11 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
     """Pin the bridge to login + start it in the background now (the agent twin of
     the backend `--resurrect`) — a Scheduled Task (Windows), systemd --user unit
     (Linux), or launchd LaunchAgent (macOS)."""
-    b.header("resurgam", "rise + run on every login", tagline_color=branding._BOLD + branding._BRIGHT)
+    rc = _delegate_lifecycle("resurrect", [], label="Resurrect")
+    if rc is not None:
+        return rc
+    if not connect.is_continued():
+        b.header("resurgam", "rise + run on every login", tagline_color=branding._BOLD + branding._BRIGHT)
     # Graceful on an OS where pinning isn't implemented: don't dead-end — point at
     # `agent serve` instead of erroring out under a "run on every login" banner.
     if not autostart.supported():
@@ -629,7 +697,11 @@ def _retire_bridge() -> None:
 def cmd_retire(args: argparse.Namespace) -> int:
     """Stop the background bridge + remove the logon pin (the agent twin of the
     backend `--retire`). The account session + skill are left alone."""
-    b.header("requiescat", "rest — no longer on login", tagline_color=branding._BOLD + branding._RED)
+    rc = _delegate_lifecycle("retire", [], label="Retire")
+    if rc is not None:
+        return rc
+    if not connect.is_continued():
+        b.header("requiescat", "rest — no longer on login", tagline_color=branding._BOLD + branding._RED)
     b.dim("Stops the background bridge (agent serve) + removes it from login startup.")
     _retire_bridge()
     b.dim("Your account session + the chat skill are untouched "
@@ -644,6 +716,9 @@ def cmd_retire(args: argparse.Namespace) -> int:
 def cmd_login(args: argparse.Namespace) -> int:
     b.header("ianua", "sign in your account", tagline_color=branding._BOLD + branding._ACCENT)
     print()
+    rc = _redirect_if_wsl("Sign in from chat:  /sr login")
+    if rc is not None:
+        return rc
     if not _bridge_up():
         b.no("Bridge isn't running.  Start it:  python research.py agent serve  "
              "(or: agent resurrect)")
@@ -744,6 +819,9 @@ def _login_remote(args: argparse.Namespace) -> int:
 def cmd_status(_args: argparse.Namespace) -> int:
     b.header("status", "bridge + session", tagline_color=branding._BOLD + branding._ACCENT)
     print()
+    rc = _redirect_if_wsl("Check it from chat:  /sr status")
+    if rc is not None:
+        return rc
     res = _bridge_get("/status")
     bridge_up = res is not None
     if bridge_up:
@@ -805,6 +883,9 @@ def _logout_session() -> bool:
 
 
 def cmd_logout(_args: argparse.Namespace) -> int:
+    rc = _redirect_if_wsl("Sign out from chat:  /sr logout")
+    if rc is not None:
+        return rc
     _logout_session()
     print("Logged out — account session cleared.")
     return 0
@@ -812,6 +893,9 @@ def cmd_logout(_args: argparse.Namespace) -> int:
 
 def cmd_device(args: argparse.Namespace) -> int:
     """List the devices the account can reach, or switch the target device."""
+    rc = _redirect_if_wsl("Manage devices from chat:  /sr device")
+    if rc is not None:
+        return rc
     if not _bridge_up():
         print(f"{_NO} Bridge isn't running. Run:  agent serve   then   agent login")
         return 1

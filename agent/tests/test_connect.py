@@ -480,7 +480,7 @@ def test_wsl_uvx_available_swallows_errors(monkeypatch):
     assert connect.wsl_uvx_available("U") is False
 
 
-def test_run_connect_in_wsl_builds_login_shell_command(monkeypatch):
+def test_run_agent_in_wsl_builds_login_shell_command(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "win32")
     seen = {}
 
@@ -489,32 +489,41 @@ def test_run_connect_in_wsl_builds_login_shell_command(monkeypatch):
         return _Rc(0)
 
     monkeypatch.setattr(connect.subprocess, "run", fake_run)
-    rc = connect.run_connect_in_wsl("Ubuntu-24.04", ["--yes", "--no-login"])
+    rc = connect.run_agent_in_wsl("Ubuntu-24.04", "connect", ["--yes", "--no-login"])
     assert rc == 0
     a = seen["args"]
     assert a[:5] == ["wsl.exe", "-d", "Ubuntu-24.04", "--", "bash"]
     assert a[5] == "-lc"
-    # the in-distro command is the package's own connect with forwarded flags,
+    # the in-distro command is the package's own <subcommand> with forwarded flags,
     # prefixed by the continuation marker as an env var (version-safe)
     assert a[6] == "SUPER_AGENT_CONNECT_CONTINUED=1 uvx superresearch-agent connect --yes --no-login"
 
 
-def test_run_connect_in_wsl_passes_through_returncode(monkeypatch):
+def test_run_agent_in_wsl_uses_the_given_subcommand(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    seen = {}
+    monkeypatch.setattr(connect.subprocess, "run",
+                        lambda args, **kw: seen.update(args=args) or _Rc(0))
+    connect.run_agent_in_wsl("Ubuntu-24.04", "disconnect")
+    assert seen["args"][6] == "SUPER_AGENT_CONNECT_CONTINUED=1 uvx superresearch-agent disconnect"
+
+
+def test_run_agent_in_wsl_passes_through_returncode(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "win32")
     monkeypatch.setattr(connect.subprocess, "run", lambda *a, **k: _Rc(7))
-    assert connect.run_connect_in_wsl("U") == 7
+    assert connect.run_agent_in_wsl("U", "retire") == 7
 
 
-def test_run_connect_in_wsl_off_windows(monkeypatch):
+def test_run_agent_in_wsl_off_windows(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "linux")
-    assert connect.run_connect_in_wsl("U") == 1
+    assert connect.run_agent_in_wsl("U", "connect") == 1
 
 
-def test_run_connect_in_wsl_swallows_launch_error(monkeypatch):
+def test_run_agent_in_wsl_swallows_launch_error(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "win32")
 
     def boom(*a, **k):
         raise FileNotFoundError("wsl.exe missing")
 
     monkeypatch.setattr(connect.subprocess, "run", boom)
-    assert connect.run_connect_in_wsl("U") == 1
+    assert connect.run_agent_in_wsl("U", "connect") == 1

@@ -10,7 +10,7 @@ WSL distro:
   • WSL distro home — \\wsl.localhost\<distro>\home\<user>\.hermes|.openclaw
 Model A: the bridge co-locates with the RUNTIME, so a co-located runtime shares
 its loopback natively. A WSL runtime's bridge must run IN WSL too — so connect
-hands a WSL target off to the in-distro package (``run_connect_in_wsl``) instead
+hands a WSL target off to the in-distro package (``run_agent_in_wsl``) instead
 of bridging Windows↔WSL networking.
 
 Pure file-copy + path logic, no network — the bundle is a thin client that calls
@@ -309,20 +309,22 @@ def is_continued() -> bool:
     return os.environ.get(CONTINUED_ENV) == "1"
 
 
-def run_connect_in_wsl(distro: str, extra_args: list[str] | None = None) -> int:
-    """Run the agent's own ``connect`` INSIDE ``distro`` via the published package
-    (``uvx superresearch-agent connect``), so the bridge lands with the WSL
-    runtime. Runs through a LOGIN shell (uv's PATH) and INHERITS stdio, so the
-    in-distro connect's interactive 4-step flow drives this same terminal. Returns
-    its exit code; 1 off-Windows or if ``wsl`` can't be launched (a non-zero from a
-    started connect — e.g. uvx can't resolve the package pre-PyPI — flows through
-    so the caller can offer the manual fallback)."""
+def run_agent_in_wsl(distro: str, subcommand: str, extra_args: list[str] | None = None) -> int:
+    """Run ``uvx superresearch-agent <subcommand> <args>`` INSIDE ``distro`` via the
+    published package, so the command acts on the bridge/skill that live WITH the
+    WSL runtime (connect, disconnect, retire, resurrect, serve …). Runs through a
+    LOGIN shell (uv's PATH) and INHERITS stdio, so the in-distro command's
+    interactive flow drives this same terminal. Sets the continuation marker so the
+    in-distro run suppresses its banner (one clean flow). Returns its exit code; 1
+    off-Windows or if ``wsl`` can't be launched (a non-zero from a started command
+    — e.g. uvx can't resolve the package pre-PyPI — flows through so the caller can
+    offer a manual fallback)."""
     if sys.platform != "win32":
         return 1
     # Prefix the continuation marker as an env var (version-safe — see CONTINUED_ENV).
     inner = f"{CONTINUED_ENV}=1 " + " ".join(
         shlex.quote(p)
-        for p in ("uvx", "superresearch-agent", "connect", *(extra_args or []))
+        for p in ("uvx", "superresearch-agent", subcommand, *(extra_args or []))
     )
     try:
         r = subprocess.run(["wsl.exe", "-d", distro, "--", "bash", "-lc", inner])
