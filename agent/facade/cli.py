@@ -500,6 +500,41 @@ def _wsl_distro_for(explicit: str | None = None) -> str | None:
     return wsl[0].distro if (wsl and not local) else None
 
 
+def _unreachable_wsl_distros() -> list[str]:
+    """Distros that are INSTALLED but not RUNNING while NOTHING is reachable here.
+
+    When a WSL distro is stopped its ``\\wsl.localhost`` mount is down, so
+    ``detect_targets`` can't see a runtime inside it and a Windows-side command
+    would silently no-op (or query a non-existent local bridge). Those stopped
+    distros are exactly the ones we *couldn't look in* — distinct from a running
+    distro we DID inspect and found empty. Returns [] when something IS reachable
+    locally / in a running distro (no ambiguity to warn about), or off-Windows."""
+    if sys.platform != "win32":
+        return []
+    try:
+        if connect.detect_targets():        # a runtime is reachable → nothing hidden
+            return []
+        installed = connect.wsl_distros()
+        running = set(connect.wsl_running_distros())
+    except Exception:
+        return []
+    return [d for d in installed if d not in running]
+
+
+def _warn_unreachable_wsl(action_hint: str) -> bool:
+    """If the runtime may live in a stopped WSL distro we couldn't inspect, say so
+    (clear message instead of a confusing no-op) and return True. Else False."""
+    stopped = _unreachable_wsl_distros()
+    if not stopped:
+        return False
+    names = ", ".join(stopped)
+    b.warn(f"Nothing is reachable here, but WSL is installed and stopped ({names}).")
+    b.dim("If your runtime lives in WSL, its distro is asleep so I can't reach it.")
+    b.dim(f"  Start it and retry:  wsl -d {stopped[0]}     then re-run this command")
+    b.dim(f"  …or {action_hint} inside the distro:  wsl -d {stopped[0]}   then   uvx superresearch-agent <command>")
+    return True
+
+
 def _delegate_lifecycle(subcommand: str, extra_args: list[str], *, label: str,
                         explicit: str | None = None) -> int | None:
     """A lifecycle command (disconnect/retire/resurrect/serve) whose runtime is in
@@ -508,6 +543,10 @@ def _delegate_lifecycle(subcommand: str, extra_args: list[str], *, label: str,
     co-located runtime / no WSL runtime / off-Windows)."""
     distro = _wsl_distro_for(explicit)
     if distro is None:
+        # No WSL runtime detected — but if a distro is stopped we may simply not
+        # have been able to look. Surface that instead of a silent local no-op.
+        if _warn_unreachable_wsl("run it"):
+            return 1
         return None
     if not connect.wsl_uvx_available(distro):
         b.warn(f"This runtime is in WSL · {distro}, but uv isn't installed there.")
@@ -527,6 +566,10 @@ def _redirect_if_wsl(chat_hint: str) -> int | None:
         return None
     distro = _wsl_distro_for()
     if distro is None:
+        # A stopped WSL distro could be hiding the runtime → say so rather than
+        # query a Windows bridge that was never here.
+        if _warn_unreachable_wsl("run it"):
+            return 0
         return None
     b.dim(f"Your runtime lives in WSL · {distro} — its bridge runs there, not on Windows.")
     b.dim(f"  {chat_hint}")

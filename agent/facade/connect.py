@@ -214,6 +214,36 @@ def wsl_distros() -> list[str]:
     return out
 
 
+def wsl_running_distros() -> list[str]:
+    """Names of WSL distros currently RUNNING (so their ``\\wsl.localhost`` mount
+    is reachable). A distro that's installed but stopped can't be inspected for a
+    runtime — ``detect_wsl_targets`` silently misses it — so callers diff this
+    against ``wsl_distros()`` to tell "no runtime there" from "couldn't look."
+
+    Honors the ``SUPER_AGENT_WSL_DISTRO`` pin (treats pinned distros as running,
+    matching ``wsl_distros``) so tests stay subprocess-free. Empty off-Windows /
+    on any failure."""
+    if os.environ.get(WSL_DISTRO_ENV):
+        return wsl_distros()
+    if sys.platform != "win32":
+        return []
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    try:
+        r = subprocess.run(
+            ["wsl.exe", "-l", "-q", "--running"],
+            capture_output=True, timeout=15, creationflags=no_window,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    text = (r.stdout or b"").decode("utf-16-le", errors="ignore")
+    out: list[str] = []
+    for ln in text.splitlines():
+        name = ln.replace("\x00", "").replace("﻿", "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 def wsl_root(distro: str) -> Path:
     """The Windows UNC mount point for a WSL distro's filesystem."""
     return Path(rf"\\wsl.localhost\{distro}")

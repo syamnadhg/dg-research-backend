@@ -436,6 +436,30 @@ def test_wsl_distros_honors_env_override(monkeypatch):
     assert connect.wsl_distros() == ["Ubuntu-24.04", "Debian"]
 
 
+def test_wsl_running_distros_honors_env_override(monkeypatch):
+    # The pin treats pinned distros as running so tests stay subprocess-free.
+    monkeypatch.setenv(connect.WSL_DISTRO_ENV, "Ubuntu-24.04")
+    assert connect.wsl_running_distros() == ["Ubuntu-24.04"]
+
+
+def test_wsl_running_distros_parses_running_list(monkeypatch):
+    monkeypatch.delenv(connect.WSL_DISTRO_ENV, raising=False)
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    captured = {}
+
+    class _R:
+        # UTF-16LE with a BOM + a NUL pad, like real `wsl -l -q --running`.
+        stdout = "﻿Ubuntu-24.04\r\n\x00".encode("utf-16-le")
+
+    def _run(cmd, **k):
+        captured["cmd"] = cmd
+        return _R()
+
+    monkeypatch.setattr(connect.subprocess, "run", _run)
+    assert connect.wsl_running_distros() == ["Ubuntu-24.04"]
+    assert "--running" in captured["cmd"]
+
+
 # ── WSL delegation (Model A: connect runs inside the distro) ─────────────────
 
 class _Rc:

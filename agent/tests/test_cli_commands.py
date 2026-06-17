@@ -23,6 +23,10 @@ def _no_wsl_by_default(monkeypatch):
     Windows dev box finds the actual WSL Hermes and would delegate into it —
     tests that exercise WSL detection/delegation override this explicitly."""
     monkeypatch.setattr(cli.connect, "detect_targets", lambda *a, **k: [])
+    # The unreachable-WSL guard also probes installed/running distros directly —
+    # default both to 'no WSL at all' so the local path stays clean.
+    monkeypatch.setattr(cli.connect, "wsl_distros", lambda *a, **k: [])
+    monkeypatch.setattr(cli.connect, "wsl_running_distros", lambda *a, **k: [])
 
 
 def _ns(**kw):
@@ -412,6 +416,59 @@ def test_redirect_if_wsl_redirects_when_no_local_bridge(monkeypatch, capsys):
 def test_redirect_if_wsl_none_when_local_bridge_up(monkeypatch):
     monkeypatch.setattr(cli, "_bridge_up", lambda: True)
     assert cli._redirect_if_wsl("x") is None
+
+
+# ── unreachable (stopped) WSL guard ───────────────────────────────────────────
+
+def test_unreachable_wsl_distros_lists_stopped_when_nothing_reachable(monkeypatch):
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli.connect, "detect_targets", lambda: [])
+    monkeypatch.setattr(cli.connect, "wsl_distros", lambda: ["Ubuntu-24.04", "kali"])
+    monkeypatch.setattr(cli.connect, "wsl_running_distros", lambda: ["kali"])
+    assert cli._unreachable_wsl_distros() == ["Ubuntu-24.04"]  # stopped one we couldn't inspect
+
+
+def test_unreachable_wsl_distros_empty_when_a_runtime_is_reachable(monkeypatch):
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli.connect, "detect_targets",
+                        lambda: [connect.Target("hermes", "local", Path("C:/x"))])
+    monkeypatch.setattr(cli.connect, "wsl_distros", lambda: ["Ubuntu-24.04"])
+    monkeypatch.setattr(cli.connect, "wsl_running_distros", lambda: [])
+    assert cli._unreachable_wsl_distros() == []  # don't warn — we found something
+
+
+def test_unreachable_wsl_distros_empty_when_all_running(monkeypatch):
+    # A running distro WAS inspected (and found empty) → not "couldn't look".
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli.connect, "detect_targets", lambda: [])
+    monkeypatch.setattr(cli.connect, "wsl_distros", lambda: ["Ubuntu-24.04"])
+    monkeypatch.setattr(cli.connect, "wsl_running_distros", lambda: ["Ubuntu-24.04"])
+    assert cli._unreachable_wsl_distros() == []
+
+
+def test_delegate_lifecycle_warns_on_stopped_wsl(monkeypatch, capsys):
+    # No WSL runtime detected, but a stopped distro could be hiding it → block with
+    # a clear message rather than silently no-op'ing locally.
+    monkeypatch.setattr(cli, "_wsl_distro_for", lambda explicit=None: None)
+    monkeypatch.setattr(cli, "_unreachable_wsl_distros", lambda: ["Ubuntu-24.04"])
+    rc = cli._delegate_lifecycle("disconnect", [], label="Disconnect")
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "stopped" in out and "Ubuntu-24.04" in out
+
+
+def test_delegate_lifecycle_proceeds_local_when_no_wsl_at_all(monkeypatch):
+    monkeypatch.setattr(cli, "_wsl_distro_for", lambda explicit=None: None)
+    monkeypatch.setattr(cli, "_unreachable_wsl_distros", lambda: [])
+    assert cli._delegate_lifecycle("disconnect", [], label="Disconnect") is None
+
+
+def test_redirect_if_wsl_warns_on_stopped_wsl(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_bridge_up", lambda: False)
+    monkeypatch.setattr(cli, "_wsl_distro_for", lambda explicit=None: None)
+    monkeypatch.setattr(cli, "_unreachable_wsl_distros", lambda: ["Ubuntu-24.04"])
+    assert cli._redirect_if_wsl("Sign in from chat:  /sr login") == 0
+    assert "stopped" in capsys.readouterr().out
 
 
 def test_cmd_retire_delegates_to_wsl(monkeypatch):
