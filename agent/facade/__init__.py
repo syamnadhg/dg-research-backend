@@ -16,4 +16,16 @@ Hard boundaries (the "nothing breaks" contract):
   * Research-only: it can never control devices (add/remove/pair/share).
 """
 
-__version__ = "0.0.1"
+# Reported by `agent --version` + `agent doctor`. Read from the installed
+# package metadata so it never drifts from pyproject's version (when run via
+# uvx / a pip install); falls back to the literal when run from a source
+# checkout (`python research.py agent …`, not installed as a distribution).
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    try:
+        __version__ = _pkg_version("superresearch-agent")
+    except PackageNotFoundError:
+        __version__ = "0.1.1"
+except Exception:
+    __version__ = "0.1.1"
