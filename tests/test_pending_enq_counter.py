@@ -23,7 +23,6 @@ from __future__ import annotations
 import os
 import sys
 import threading
-import time
 
 import pytest
 
@@ -34,6 +33,7 @@ from research import (  # noqa: E402
     _pending_enq_dec,
     _pending_enq_inc,
     _pending_enq_read,
+    _pending_enq_reset,
 )
 
 
@@ -73,6 +73,44 @@ def test_inc_then_dec_returns_to_zero():
 
 
 # ── Defensive floor ────────────────────────────────────────────────────
+
+def test_reset_clears_leaked_counter():
+    """FIX A2: the idle-rescan loop force-resets a counter that leaked >0
+    (an inc with no matching dec) once a worker has been verifiably idle for
+    >30s. A genuinely idle worker MUST have counter==0, so a sustained leak is
+    cleared to restore the listener claim path. Reset must zero ANY positive
+    value in one call (a stuck counter could be >1)."""
+    _pending_enq_inc()
+    _pending_enq_inc()
+    _pending_enq_inc()
+    assert _pending_enq_read() == 3
+    _pending_enq_reset()
+    assert _pending_enq_read() == 0
+    # Idempotent on an already-zero counter.
+    _pending_enq_reset()
+    assert _pending_enq_read() == 0
+
+
+def test_reset_tolerates_missing_lock():
+    """Like inc/dec/read, reset must work before run_server initialises the
+    lock (test / pre-init path)."""
+    _QUEUE_STATE["_pending_enq_lock"] = None
+    _pending_enq_inc()
+    assert _pending_enq_read() == 1
+    _pending_enq_reset()
+    assert _pending_enq_read() == 0
+
+
+def test_reset_then_inc_resumes_normally():
+    """After a self-heal reset, the counter must resume normal inc/dec — the
+    reset is not a one-way latch."""
+    _pending_enq_inc()
+    _pending_enq_reset()
+    _pending_enq_inc()
+    assert _pending_enq_read() == 1
+    _pending_enq_dec()
+    assert _pending_enq_read() == 0
+
 
 def test_dec_floors_at_zero():
     """A stray decrement (e.g., a crashed worker's resumed sibling sees

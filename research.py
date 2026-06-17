@@ -2880,6 +2880,22 @@ def _pending_enq_read() -> int:
     with lock:
         return int(_QUEUE_STATE.get("_pending_listener_enqueues", 0) or 0)
 
+
+def _pending_enq_reset():
+    """Force the busy-counter to 0. Self-heal ONLY (called by the idle-rescan
+    loop after a worker has been verifiably idle with a stuck counter for >30s).
+    A leaked `_pending_listener_enqueues` (an inc on the listener thread with no
+    matching dec) permanently arms the busy-defer gate at the listener, blocking
+    that worker's listener claim path forever. In a genuinely-idle worker the
+    counter MUST be 0, so a sustained >0 can only be a leak. Lock-guarded like
+    inc/dec since the listener thread also touches the value."""
+    lock = _QUEUE_STATE.get("_pending_enq_lock")
+    if lock is None:
+        _QUEUE_STATE["_pending_listener_enqueues"] = 0
+        return
+    with lock:
+        _QUEUE_STATE["_pending_listener_enqueues"] = 0
+
 # 2026-05-11: queue gate fallback — wait at most this many seconds for the
 # prior run's FE-P5 to flip status="completed" before force-dequeueing the
 # next job. Hoisted to module scope (2026-05-12) so the Firestore start
@@ -33720,8 +33736,18 @@ async def run_server(port=8000):
         if _exit_scheduled:
             log(f"[idle-rescan] worker {WORKER_ID}: skipping — exit scheduled", "INFO")
             return
-        if _QUEUE_STATE.get("running") or _job_queue.qsize() > 0:
-            return  # not actually idle
+        if (
+            _QUEUE_STATE.get("running")
+            or _job_queue.qsize() > 0
+            or _QUEUE_STATE.get("gate_pending_job")
+        ):
+            # Not actually idle: running a job, a job already queued locally, OR
+            # blocked in _wait_for_prior_fe_completion (gate_pending_job is set
+            # while the worker holds a dequeued job in the FE-completion gate with
+            # running=False/qsize=0). Without the gate check a periodic rescan
+            # would treat a gated worker as idle and claim a SECOND doc, serializing
+            # it behind the still-gated job.
+            return
         did = load_device_id()
         if not did:
             return
@@ -33757,7 +33783,12 @@ async def run_server(port=8000):
             # Re-check busy + shutdown before each claim attempt (could
             # have flipped mid-scan: a sibling claimed a different doc
             # OR a STOP landed between candidates).
-            if _exit_scheduled or _QUEUE_STATE.get("running") or _job_queue.qsize() > 0:
+            if (
+                _exit_scheduled
+                or _QUEUE_STATE.get("running")
+                or _job_queue.qsize() > 0
+                or _QUEUE_STATE.get("gate_pending_job")
+            ):
                 return
 
             # Conditional-update claim (replaces TX-based claim that
@@ -34622,6 +34653,70 @@ async def run_server(port=8000):
             except asyncio.CancelledError:
                 return
         asyncio.create_task(_aegis_pulse_loop())
+        # Level-triggered orphan recovery — the multi-worker stale-worker fix.
+        # The finally-block `_rescan_queue_for_unclaimed` is EDGE-triggered: it
+        # only runs after an IN-PROCESS job completes, and is suppressed entirely
+        # on a STOP-scheduled exit. A worker that goes idle via respawn/stop has
+        # no completion edge, and Firestore never re-fires ADDED for an already-
+        # existing queue doc — so an unclaimed FIFO head would sit forever while
+        # that worker blocks on `_job_queue.get()` (the observed "one worker goes
+        # stale while the other keeps working"). This standing loop re-offers
+        # orphans on a timer so no worker can stand down while claimable head work
+        # exists, for ANY worker count. Runs on EVERY worker (not worker-1-only).
+        # The rescan it calls is idempotent + CAS-safe (last_update_time
+        # precondition) and self-gates on idle/exit/single-worker/FE-gate, so
+        # concurrent timers across N workers are safe — at most one wins each doc.
+        async def _idle_rescan_loop():
+            # Base + per-worker jitter so N workers don't scan in lockstep (no
+            # thundering-herd of empty-queue reads). ~15-25s recovery latency is
+            # fine for this rare path. Single-worker mode is a cheap no-op (the
+            # rescan returns immediately on load_worker_count() <= 1).
+            BASE_SEC, JITTER_SEC = 15.0, 10.0
+            # FIX A2: a leaked `_pending_listener_enqueues` (an inc with no
+            # matching dec) permanently arms the busy-defer gate, blocking THIS
+            # worker's listener claim path. The periodic rescan recovers orphans
+            # regardless, but also self-heal the counter so the listener path is
+            # restored. Gate on a tracked idle-since timestamp (NOT first-sight)
+            # so we never race the legitimate sub-second window between a listener
+            # claim-win (inc) and the worker's running-flip (dec).
+            STUCK_COUNTER_RESET_MS = 30_000
+            _counter_idle_since = 0
+            try:
+                while True:
+                    await asyncio.sleep(BASE_SEC + random.uniform(0, JITTER_SEC))
+                    try:
+                        _idle = (
+                            not _QUEUE_STATE.get("running")
+                            and _job_queue.qsize() == 0
+                            and not _QUEUE_STATE.get("gate_pending_job")
+                            and not _exit_scheduled
+                        )
+                        if _idle and _pending_enq_read() > 0:
+                            _now_ms = int(time.time() * 1000)
+                            if _counter_idle_since == 0:
+                                _counter_idle_since = _now_ms
+                            elif _now_ms - _counter_idle_since >= STUCK_COUNTER_RESET_MS:
+                                log(
+                                    f"[idle-rescan] worker {WORKER_ID}: clearing leaked "
+                                    f"busy-counter (idle {STUCK_COUNTER_RESET_MS // 1000}s, "
+                                    f"pending={_pending_enq_read()})",
+                                    "WARN",
+                                )
+                                _pending_enq_reset()
+                                _counter_idle_since = 0
+                        else:
+                            _counter_idle_since = 0
+                        # Level-triggered re-offer. The rescan self-gates on
+                        # idle/exit/single-worker/FE-gate, so this is a safe no-op
+                        # unless this worker is genuinely idle with an unclaimed
+                        # orphan to claim.
+                        await _rescan_queue_for_unclaimed()
+                    except Exception as _ire:
+                        log(f"[idle-rescan-loop] worker {WORKER_ID}: tick error (non-fatal): {_ire}", "WARN")
+            except asyncio.CancelledError:
+                return
+        asyncio.create_task(_idle_rescan_loop())
+        log(f"[idle-rescan-loop] worker {WORKER_ID}: started (level-triggered orphan recovery, ~15-25s)")
         # Periodic orphan sweep: existence-based cleanup of local queues/
         # dirs whose Firestore research doc has been deleted. Worker-1
         # only — the queues/ tree is shared across workers and sweep is
