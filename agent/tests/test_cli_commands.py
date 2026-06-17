@@ -275,7 +275,9 @@ def test_connect_wsl_assume_yes_runs_in_distro(monkeypatch):
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
                                   startup=None, login=None)
     assert rc == 0
-    assert ran == {"distro": "Ubuntu-24.04", "extra": ["--yes"]}
+    # pre-selects the runtime + marks it a continuation (no second banner/choose)
+    assert ran == {"distro": "Ubuntu-24.04",
+                   "extra": ["--runtime", "hermes", "--continued", "--yes"]}
 
 
 def test_connect_wsl_forwards_startup_login_flags(monkeypatch):
@@ -285,20 +287,23 @@ def test_connect_wsl_forwards_startup_login_flags(monkeypatch):
                         lambda d, extra=None: ran.update(extra=extra) or 0)
     cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
                              startup=False, login=True)
-    assert ran["extra"] == ["--yes", "--no-startup", "--login"]
+    assert ran["extra"] == ["--runtime", "hermes", "--continued", "--yes", "--no-startup", "--login"]
 
 
-def test_connect_wsl_decline_prints_manual_no_run(monkeypatch, capsys):
-    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)  # decline run-in-WSL
+def test_connect_wsl_interactive_auto_proceeds_no_prompt(monkeypatch):
+    # No "Run connect inside WSL?" prompt anymore — choosing the WSL runtime IS
+    # the consent, so an interactive (TTY, no --yes) hand-off runs automatically.
     monkeypatch.setattr(cli.connect, "wsl_uvx_available", lambda d: True)
-    ran = []
-    monkeypatch.setattr(cli.connect, "run_connect_in_wsl", lambda *a, **k: ran.append(1) or 0)
+    monkeypatch.setattr(cli.b, "confirm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt")))
+    ran = {}
+    monkeypatch.setattr(cli.connect, "run_connect_in_wsl",
+                        lambda d, extra=None: ran.update(distro=d, extra=extra) or 0)
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=False, noninteractive=False,
                                   startup=None, login=None)
-    out = capsys.readouterr().out
-    assert rc == 0 and ran == []                       # never ran in WSL
-    assert "uvx superresearch-agent connect" in out    # printed the manual command
-    assert "wsl -d Ubuntu-24.04" in out
+    assert rc == 0
+    assert ran["distro"] == "Ubuntu-24.04"
+    assert ran["extra"] == ["--runtime", "hermes", "--continued"]   # interactive → no --yes
 
 
 def test_connect_wsl_no_uvx_falls_back_to_manual(monkeypatch, capsys):
@@ -351,6 +356,27 @@ def test_cmd_connect_routes_wsl_target_to_delegation(monkeypatch):
     args = cli.build_parser().parse_args(["connect", "--runtime", "hermes", "--yes"])
     assert cli.cmd_connect(args) == 0
     assert captured["target"].location == "wsl"
+
+
+def test_cmd_connect_continued_suppresses_banner_and_autoselects(monkeypatch):
+    # The in-WSL continuation (--continued): no banner, and it auto-selects the
+    # explicit runtime (no re-detect/choose prompt), resuming at Install.
+    monkeypatch.setattr(cli.connect, "detect_targets",
+                        lambda: [connect.Target("hermes", "local", Path("/home/u"))])
+    monkeypatch.setattr(cli.b, "header",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("banner must be suppressed")))
+    monkeypatch.setattr(cli, "_choose_target",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not re-choose")))
+    seen = {}
+    monkeypatch.setattr(cli, "_install_step",
+                        lambda chosen, dest, **k: seen.update(installed=chosen.runtime) or Path("/x"))
+    monkeypatch.setattr(cli, "_ensure_reachable", lambda t: None)
+    monkeypatch.setattr(cli, "_startup_step", lambda **k: False)
+    monkeypatch.setattr(cli, "_signin_step", lambda **k: False)
+    monkeypatch.setattr(cli, "_bridge_authed", lambda: False)
+    args = cli.build_parser().parse_args(["connect", "--runtime", "hermes", "--continued"])
+    assert cli.cmd_connect(args) == 0
+    assert seen["installed"] == "hermes"   # auto-selected + installed, no banner/choose
 
 
 # ── cmd_status runtime-location rendering ─────────────────────────────────────

@@ -166,9 +166,14 @@ def cmd_connect(args: argparse.Namespace) -> int:
     """Connect a chat runtime (Hermes / OpenClaw): choose it, install the Super
     Research skill where it lives + make it reachable, optionally pin the
     background bridge, and optionally sign in. Branded, interactive 4-step flow."""
-    b.header("nexus", "link Super Research to chat", tagline_color=branding._BOLD + branding._ACCENT)
-    b.channels(_CHANNELS)
-    b.step_arc(["Detect + choose", "Install", "Run on startup", "Sign in"])
+    # A WSL hand-off re-invokes connect INSIDE the distro with --continued: it's a
+    # seamless continuation of the host's flow, so suppress the banner + the
+    # re-detect/choose (the host already chose the runtime) and resume at Install.
+    continued = getattr(args, "continued", False)
+    if not continued:
+        b.header("nexus", "link Super Research to chat", tagline_color=branding._BOLD + branding._ACCENT)
+        b.channels(_CHANNELS)
+        b.step_arc(["Detect + choose", "Install", "Run on startup", "Sign in"])
 
     explicit = args.runtime_opt or args.runtime
     assume_yes = args.yes
@@ -180,13 +185,13 @@ def cmd_connect(args: argparse.Namespace) -> int:
         return 1
 
     # ── [1/4] Detect + choose ────────────────────────────────────────────────
-    b.step(1, 4, "Detect + choose")
-    b.dim(f"Bridge runs here · {connect.host_os_label()}  (alongside the Super Research backend).")
+    if not continued:
+        b.step(1, 4, "Detect + choose")
     targets = connect.detect_targets()
     if explicit:
         matches = [t for t in targets if t.runtime == explicit]
         targets = matches or [connect.Target(explicit, "local", Path.home())]
-        if not matches:
+        if not matches and not continued:
             b.dim(f"{explicit} not detected — will install at the default path on this host.")
     if not targets:
         b.no("No chat runtime found (looked for ~/.hermes, ~/.openclaw on this host and in WSL).")
@@ -195,12 +200,16 @@ def cmd_connect(args: argparse.Namespace) -> int:
         b.dim("  loopback-only bridge needs host networking / a published port to reach it;")
         b.dim("  point connect at it explicitly with  --dest <path-to-skills-dir>  if so.")
         return 1
-    for t in targets:
-        b.ok(f"Found {_runtime_mark(t)}")
-    chosen = _choose_target(targets, assume_yes=assume_yes)
-    if chosen is None:
-        b.dim("Cancelled — nothing was changed.")
-        return 1
+    if continued:
+        # The host already detected + chose this runtime; auto-select silently.
+        chosen = targets[0]
+    else:
+        for t in targets:
+            b.ok(f"Found {_runtime_mark(t)}")
+        chosen = _choose_target(targets, assume_yes=assume_yes)
+        if chosen is None:
+            b.dim("Cancelled — nothing was changed.")
+            return 1
 
     # A WSL runtime co-locates its bridge IN WSL (Model A) — a Windows bridge
     # can't share WSL's loopback. Hand off to the in-distro connect instead of
@@ -411,7 +420,7 @@ def _ensure_reachable(target: connect.Target) -> None:
 
 
 def _print_wsl_manual(distro: str, cmd: str) -> None:
-    """Print the one command to run INSIDE a WSL distro to connect it (Model A),
+    """Print the command to run INSIDE a WSL distro to set Super Research up there,
     with its prerequisites + a pre-PyPI backend-checkout fallback."""
     b.dim(f"Run this inside WSL · {distro}:")
     b.line("    " + b.c(branding._BOLD + branding._ACCENT, f"wsl -d {distro}"))
@@ -419,21 +428,23 @@ def _print_wsl_manual(distro: str, cmd: str) -> None:
     b.dim("  Needs uv in the distro (https://astral.sh/uv). Before the package is on")
     b.dim("  PyPI, a backend checkout works too — run INSIDE the distro:")
     b.dim("      python research.py agent connect")
-    b.dim("  The bridge then runs in WSL with your runtime (shared loopback).")
+    b.dim("  The bridge then runs in WSL with your runtime.")
 
 
 def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninteractive: bool,
                          startup: bool | None, login: bool | None) -> int:
-    """A WSL runtime co-locates its bridge IN WSL (Model A) — so connect runs
-    INSIDE the distro, not on Windows. Offer to run it now (consent-gated, default
-    yes); on yes hand off to ``uvx superresearch-agent connect`` in the distro,
-    forwarding the connect flags. Falls back to printing the command when the user
-    declines, when there's no consent channel (non-TTY without --yes), when uv
-    isn't installed in the distro, or when the in-WSL connect exits non-zero (e.g.
-    the package isn't on PyPI yet)."""
+    """The chosen runtime lives in WSL, so its bridge has to run INSIDE the distro
+    (a bridge on Windows can't reach WSL's loopback). Continue setup there by
+    re-running connect inside the distro (``--continued`` so it picks up as one
+    seamless flow), forwarding the connect flags. Choosing the WSL runtime is the
+    consent, so this proceeds automatically — falling back to printing the command
+    only when there's no way to run it: a non-TTY without --yes, uv missing in the
+    distro, or the in-distro run exits non-zero (e.g. the package isn't on PyPI)."""
     distro = target.distro or ""
     label = connect.RUNTIME_META[target.runtime]["label"]
-    forwarded: list[str] = []
+    # The in-distro connect is a continuation of THIS flow: pre-select the same
+    # runtime + suppress its banner/re-detect so the user sees one clean flow.
+    forwarded: list[str] = ["--runtime", target.runtime, "--continued"]
     if assume_yes or noninteractive:
         forwarded.append("--yes")
     if startup is True:
@@ -444,33 +455,23 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
         forwarded.append("--login")
     elif login is False:
         forwarded.append("--no-login")
-    shown = "uvx superresearch-agent connect" + "".join(f" {f}" for f in forwarded)
 
-    b.dim(f"{label} lives in WSL · {distro}.")
-    b.dim("Model A puts the bridge WITH the runtime, so connect it from inside the")
-    b.dim("distro — a Windows bridge can't share WSL's loopback.")
+    b.dim(f"{label} runs inside WSL · {distro}, so Super Research installs there too —")
+    b.dim("the bridge runs right next to it (same machine, shared loopback).")
 
-    # Consent gate. Unlike the retired `wsl --shutdown` (globally disruptive — it
-    # unmounts \\wsl.localhost + bounces every distro, so it was excluded from
-    # --yes), running connect inside ONE distro is scoped + non-destructive (a
-    # file-copy skill install + opt-in bridge pin / sign-in, each itself gated in
-    # the inner connect), so honoring --yes here is correct.
-    # No TTY and no --yes → no channel to consent to running inside WSL; print it.
+    # No TTY and no --yes → can't drive the interactive in-distro setup; print it.
     if noninteractive and not assume_yes:
-        _print_wsl_manual(distro, shown)
-        return 0
-    if not _decide(None, assume_yes, f"Run connect inside WSL · {distro} now?", default=True):
-        _print_wsl_manual(distro, shown)
+        _print_wsl_manual(distro, "uvx superresearch-agent connect")
         return 0
     if not connect.wsl_uvx_available(distro):
-        b.warn(f"uv isn't installed in WSL · {distro} yet — can't run uvx there.")
-        _print_wsl_manual(distro, shown)
+        b.warn(f"uv isn't installed in WSL · {distro} yet — can't set it up there automatically.")
+        _print_wsl_manual(distro, "uvx superresearch-agent connect")
         return 0
-    b.dim(f"Handing off to WSL · {distro}  ({shown}) …")
+    b.dim(f"Setting it up inside {distro}…")
     rc = connect.run_connect_in_wsl(distro, forwarded)
     if rc != 0:
-        b.warn(f"The in-WSL connect didn't finish (exit {rc}).")
-        _print_wsl_manual(distro, shown)
+        b.warn(f"The in-WSL setup didn't finish (exit {rc}).")
+        _print_wsl_manual(distro, "uvx superresearch-agent connect")
     return rc
 
 
@@ -1245,6 +1246,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="start sign-in without asking (non-interactive: prints the link to relay in chat)")
     cn.add_argument("--no-login", dest="login", action="store_false",
                     help="skip sign-in without asking")
+    # Internal: set when connect re-invokes itself INSIDE a WSL distro after a
+    # host hand-off. Marks it a continuation of the host's flow → suppress the
+    # banner + the redundant re-detect/choose, resume at Install.
+    cn.add_argument("--continued", action="store_true", help=argparse.SUPPRESS)
     cn.set_defaults(func=cmd_connect)
 
     dc = sub.add_parser("disconnect", parents=[common],
