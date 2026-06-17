@@ -182,10 +182,16 @@ def cmd_connect(args: argparse.Namespace) -> int:
         b.step_arc(["Detect + choose", "Install", "Run on startup", "Sign in"])
 
     explicit = args.runtime_opt or args.runtime
-    assume_yes = args.yes
-    # Non-interactive when --yes is passed OR there's no terminal (a chat exec):
-    # governs HOW sign-in runs (relay a link vs open a browser + block-poll).
-    noninteractive = assume_yes or not sys.stdin.isatty()
+    # Non-interactive when --yes is passed OR there's no terminal (a chat exec, e.g.
+    # a Hermes/OpenClaw agent running `uvx superresearch-agent connect` on the user's
+    # behalf). A non-TTY shell CAN'T answer a prompt, so it proceeds with the same
+    # safe defaults --yes would (install + pin startup) and RELAYS the sign-in link
+    # instead of opening a browser + block-polling. Explicit --no-startup/--no-login
+    # still win (they flow through _decide's `explicit` arg), and >1 runtime still
+    # refuses without --runtime rather than guessing. This is what makes
+    # "install from chat" a single, hang-free command.
+    noninteractive = args.yes or not sys.stdin.isatty()
+    assume_yes = noninteractive
     if explicit and explicit not in connect.RUNTIMES:
         b.no(f"Unknown runtime '{explicit}'. Choose: {', '.join(connect.RUNTIMES)}")
         return 1
@@ -1357,9 +1363,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_home)
     sub = p.add_subparsers(dest="command")
 
-    cn = sub.add_parser("connect", parents=[common],
+    cn = sub.add_parser("connect", parents=[common], aliases=["install"],
                         help="connect a chat runtime (this host or WSL) — install the skill "
-                             "+ optionally pin the bridge (a WSL runtime connects in-distro)")
+                             "+ optionally pin the bridge (a WSL runtime connects in-distro). "
+                             "Alias: install — so an agent asked to 'install superresearch' lands here.")
     cn.add_argument("runtime", nargs="?", help="hermes or openclaw (auto-detected if omitted)")
     cn.add_argument("--runtime", dest="runtime_opt",
                     help="hermes or openclaw (flag form — for non-interactive / chat-driven connect)")

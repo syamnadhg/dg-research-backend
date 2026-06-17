@@ -520,6 +520,38 @@ def test_cmd_connect_continued_suppresses_banner_and_autoselects(monkeypatch):
     assert seen["installed"] == "hermes"   # auto-selected + installed, no banner/choose
 
 
+def test_install_is_alias_for_connect():
+    # An agent asked to "install superresearch" reaches cmd_connect via the alias.
+    args = cli.build_parser().parse_args(["install", "--runtime", "hermes"])
+    assert args.func is cli.cmd_connect
+
+
+def test_connect_non_tty_proceeds_with_defaults(monkeypatch):
+    # A chat exec (no TTY, no --yes) must NOT route step prompts to b.confirm/EOF —
+    # it proceeds with the install defaults and relays the sign-in link.
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(cli.connect, "detect_targets",
+                        lambda: [connect.Target("hermes", "local", Path("/home/u"))])
+    monkeypatch.setattr(cli.b, "header", lambda *a, **k: None)
+    monkeypatch.setattr(cli.b, "confirm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt in a non-TTY exec")))
+    monkeypatch.setattr(cli.b, "ask",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt in a non-TTY exec")))
+    seen = {}
+    monkeypatch.setattr(cli, "_install_step",
+                        lambda chosen, dest, *, assume_yes: seen.update(installed=chosen.runtime, ay=assume_yes) or Path("/x"))
+    monkeypatch.setattr(cli, "_ensure_reachable", lambda t: None)
+    monkeypatch.setattr(cli, "_startup_step", lambda **k: seen.update(startup_ay=k.get("assume_yes")) or True)
+    monkeypatch.setattr(cli, "_signin_step",
+                        lambda **k: seen.update(signin_ni=k.get("noninteractive")) or False)
+    monkeypatch.setattr(cli, "_bridge_authed", lambda: False)
+    args = cli.build_parser().parse_args(["connect"])  # no --yes, no --runtime
+    assert cli.cmd_connect(args) == 0
+    assert seen["installed"] == "hermes"
+    assert seen["ay"] is True and seen["startup_ay"] is True   # defaults assumed
+    assert seen["signin_ni"] is True                            # link relayed, no block
+
+
 # ── cmd_status runtime-location rendering ─────────────────────────────────────
 # (capture via redirect_stdout: capsys flakes on the branded multi-line header
 #  output for some of these, while redirect_stdout captures it deterministically.)
