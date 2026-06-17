@@ -298,10 +298,14 @@ def test_status_shows_permanent_links_and_hides_tokenized_audio(bridge_port, cap
     }
     assert sr.main(["status", "agent-d"]) == 0
     out = capsys.readouterr().out
-    assert "Permanent links" in out
-    assert "/shared/podcast/SHARE-P" in out and "/shared/doc/SHARE-B" in out
-    assert "Podcast" in out and "Brief" in out and "ChatGPT report" in out
-    assert "docs.google.com" in out          # live progress link still shown
+    # Rendered per-phase: 🔒 permanent SR links for the brief + reports + podcast.
+    assert "Phase 1 (Research Brief) complete" in out
+    assert "🔒 Brief: " in out and "/shared/doc/SHARE-B" in out
+    assert "/shared/doc/SHARE-C" in out      # ChatGPT report (SR share, not chatgpt.com)
+    assert "/shared/podcast/SHARE-P" in out  # podcast SR share
+    # The final Google Doc is the only platform link (no SR equivalent) — 📄.
+    assert "📄 Google Doc: " in out and "docs.google.com/document/d/final" in out
+    assert "🔗" not in out                    # no raw, revocable platform links for reports
     assert "token=" not in out               # tokenized Storage URL never reaches chat
     assert "firebasestorage" not in out
 

@@ -114,7 +114,7 @@ stay owner-only in the web app):
 
 | Action | Run | Then |
 |---|---|---|
-| login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in** to Super Research, then **click Authenticate** to connect (it turns amber → green) — then run `sr.py login-wait` (repeat every few seconds while it says "still waiting"). |
+| login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in** to Super Research, then **click Authenticate** to connect (it turns amber → green) — then run `sr.py login-done` (repeat every few seconds while it says "still waiting"). |
 | logout | `sr.py logout` | **Confirm first**, then run. Removes the agent from their account. |
 | device (list) | `sr.py devices` | Relay the list (names; → = selected). |
 | device use `<name>` | `sr.py device-use "<name>"` | Switch where research runs. Name or hostname — it resolves; on an ambiguous name it lists the matches, relay that. |

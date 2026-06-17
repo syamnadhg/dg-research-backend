@@ -499,6 +499,26 @@ def test_updates_via_agent_mints_missing_sr_link(live, monkeypatch):
     assert any("Bnew" in lk["url"] for lk in pu1["links"])
 
 
+def test_research_status_mints_and_builds_phase_updates(live, monkeypatch):
+    # A MANUAL `status` (GET /research/<id>) must mint the permanent SR link for a
+    # complete phase and return phaseUpdates — so the chat shows the never-revoked
+    # SR link, not the raw platform link.
+    base, _sel = live
+    FakeFS.researches = {
+        "a1": {"id": "a1", "title": "EV", "status": "ongoing", "phase": 2,
+               "srShares": {},  # brief NOT minted yet
+               "links": {"brief": {"url": "https://docs.google.com/brief", "phase": 1}}},
+    }
+    minted = {}
+    monkeypatch.setattr(bridge, "_mint_sr",
+                        lambda sess, rid, title: minted.update(rid=rid) or {"brief": "https://sr.io/shared/doc/Bnew"})
+    body = requests.get(base + "/research/a1").json()
+    assert minted["rid"] == "a1"  # mint triggered on the per-run status path too
+    pu1 = next(pu for pu in body["phaseUpdates"] if pu["phase"] == 1)
+    assert any("Bnew" in lk["url"] and lk["permanent"] for lk in pu1["links"])
+    assert body["srLinks"].get("brief", "").endswith("/shared/doc/Bnew")
+
+
 def test_updates_without_via_never_mints_or_builds_phase_updates(live, monkeypatch):
     base, _sel = live
     FakeFS.researches = {"a1": {"id": "a1", "status": "ongoing", "phase": 2, "viaAgent": True,

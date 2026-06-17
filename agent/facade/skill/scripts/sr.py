@@ -12,7 +12,7 @@ account action is the bridge's responsibility (single-owner session).
 Commands (mirror the chat slash actions). A run is named by its TITLE (a word
 or two from the topic) or run-id; omit it to mean the most recent / active run:
   login              start a remote sign-in → prints a code + link to relay
-  login-wait         poll until the sign-in is approved / expires
+  login-done         poll until the sign-in is approved / expires (alias: login-wait)
   status-account     is the bridge up + signed in?
   devices            list reachable devices
   device-use <name>  choose the device runs go to (name or id)
@@ -143,11 +143,42 @@ def _fmt_sr_links(sr_links: dict) -> list[str]:
     return out
 
 
+def _fmt_phase_updates(phase_updates: list) -> list[str]:
+    """Per-phase links for a status snapshot — one block per DONE phase, carrying
+    its permanent Super Research link(s) (🔒, never revoked: brief + agent reports
+    + podcast) and platform-only links (🔗 / 📄 final doc) for artifacts with NO
+    SR equivalent (NotebookLM / YouTube / Google Doc). Mirrors what the streaming
+    watchdog posts so a manual `status` shows the SAME clean links — never the raw,
+    revocable platform links for the brief/reports."""
+    out: list[str] = []
+    for pu in phase_updates or []:
+        p, name, st = pu.get("phase"), pu.get("name", "Phase"), pu.get("status")
+        if st == "skipped":
+            out.append(f"  ⏭ Phase {p} ({name}) skipped")
+            continue
+        out.append(f"  {'🎉' if pu.get('final') else '✓'} Phase {p} ({name}) complete")
+        for lk in pu.get("links", []) or []:
+            url = lk.get("url")
+            if not url:
+                continue
+            icon = "🔒" if lk.get("permanent") else ("📄" if pu.get("final") else "🔗")
+            out.append(f"     {icon} {lk.get('label') or 'link'}: {url}")
+    return out
+
+
 # ── run resolution (titles, not ids) ─────────────────────────────────────────
 
-def _fetch_runs(active: bool = False, limit: int = 20) -> tuple[int, dict, list]:
-    """GET /updates → (http_code, body, runs). Runs are newest-first."""
-    code, body = _get("/updates?active=1" if active else f"/updates?limit={limit}")
+def _fetch_runs(active: bool = False, limit: int = 20,
+                via_agent: bool = False) -> tuple[int, dict, list]:
+    """GET /updates → (http_code, body, runs). Runs are newest-first. With
+    ``via_agent`` the bridge restricts to agent-started runs AND computes
+    per-phase updates (lazily minting the permanent SR links) — used by the
+    `updates` command so it streams the same clean per-phase links the watchdog
+    does. The plain (resolution) calls leave it off to avoid needless minting."""
+    q = "/updates?active=1" if active else f"/updates?limit={limit}"
+    if via_agent:
+        q += "&via=agent"
+    code, body = _get(q)
     runs = body.get("runs", []) if isinstance(body, dict) else []
     return code, body, runs
 
@@ -334,8 +365,8 @@ def cmd_login(args) -> int:
         return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
     return _emit(body, args.json, [
         f"Open this link and sign in:  {body.get('verifyUrl')}",
-        "(Sign in to Super Research on your phone, then tap Approve & connect.)",
-        "Then run:  login-wait",
+        "(Sign in to Super Research on your phone, then tap Authenticate.)",
+        "Then say:  login-done",
     ])
 
 
@@ -346,7 +377,7 @@ def cmd_login_wait(args) -> int:
     state = body.get("state")
     msg = {
         "connected": f"✓ Connected as {body.get('email') or body.get('uid')}.",
-        "pending": "… still waiting for approval — run login-wait again.",
+        "pending": "… still waiting for approval — say login-done again.",
         "expired": "✗ The sign-in link expired — run login again.",
         "error": f"✗ Sign-in failed: {body.get('error', 'unknown')}",
     }.get(state, f"state: {state}")
@@ -381,6 +412,7 @@ def cmd_devices(args) -> int:
         lines.append(f"  {mark} {_dev_label(d)}  ({kind})")
     if not selected:
         lines.append("Pick one:  device use <name>")
+    lines.append("Add one:   device add <pair code>")
     return _emit(body, args.json, lines)
 
 
@@ -490,8 +522,15 @@ def cmd_status(args) -> int:
     where = f"  ·  {dev}" if dev else ""
     lines = [f"“{title}” — {r.get('status', '?')} (phase {r.get('phase', '?')}){where}"]
     lines += _attention_lines(r)
-    lines += _fmt_links(b2.get("events", []))
-    lines += _fmt_sr_links(b2.get("srLinks") or {})
+    # Prefer the per-phase plan (clean 🔒 SR links + platform-only for the few
+    # artifacts with no SR share). Fall back to raw links + any already-minted
+    # permanent links only if the bridge didn't supply phaseUpdates (older build).
+    phase_updates = b2.get("phaseUpdates")
+    if phase_updates:
+        lines += _fmt_phase_updates(phase_updates)
+    else:
+        lines += _fmt_links(b2.get("events", []))
+        lines += _fmt_sr_links(b2.get("srLinks") or {})
     return _emit(b2, args.json, lines)
 
 
@@ -527,14 +566,20 @@ def cmd_podcast(args) -> int:
 
 
 def cmd_updates(args) -> int:
-    code, body, runs = _fetch_runs(active=args.active)
+    # via_agent → agent-only runs + per-phase SR-link minting (same clean links
+    # the streaming watchdog posts).
+    code, body, runs = _fetch_runs(active=args.active, via_agent=True)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     lines = []
     for r in runs:
         lines.append(f"“{r.get('title') or r.get('topic')}” — {r.get('status')} (phase {r.get('phase')})")
         lines += _attention_lines(r)
-        lines += _fmt_links(r.get("links", []))
+        phase_updates = r.get("phaseUpdates")
+        if phase_updates:
+            lines += _fmt_phase_updates(phase_updates)
+        else:
+            lines += _fmt_links(r.get("links", []))
     return _emit(body, args.json, lines or ["No active runs."])
 
 
@@ -661,7 +706,8 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--label", default="")
     lg.set_defaults(func=cmd_login)
 
-    sub.add_parser("login-wait", help="poll until sign-in completes").set_defaults(func=cmd_login_wait)
+    sub.add_parser("login-done", aliases=["login-wait"],
+                   help="poll until sign-in completes").set_defaults(func=cmd_login_wait)
     sub.add_parser("status-account", help="bridge + session status").set_defaults(func=cmd_status_account)
     sub.add_parser("devices", help="list reachable devices").set_defaults(func=cmd_devices)
 

@@ -1404,13 +1404,28 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if doc is None:
                 self._json(404, {"error": "run not found"})
                 return
+            # Mint the permanent SR shares for any COMPLETE phase whose artifact
+            # exists but isn't minted yet, so a MANUAL `status` returns the same
+            # clean, never-revoked per-phase links the streaming watchdog does —
+            # not the raw, revocable platform links. Idempotent + best-effort
+            # (mints only docTypes whose content already exists; falls back to
+            # whatever's already minted on failure).
+            sr = _sr_links(doc)
+            done = _completed_phases(doc)
+            if _sr_mint_gap(sr, _platform_links(doc), done):
+                fresh = _mint_sr(sess, rid, doc.get("title") or doc.get("topic") or "")
+                if fresh:
+                    sr = {**sr, **fresh}
             # `events` = the flattened, ordered per-phase links a streamer dedups
             # by kind (the raw `links` map is also returned for full fidelity).
             # `srLinks` = the permanent share links (the ones in the delivered doc).
+            # `phaseUpdates` = the per-phase plan (permanent SR links + platform-only
+            # links for NotebookLM/YouTube/final Doc) — what `status` should render.
             self._json(200, {
                 "research": doc,
                 "events": runview.flatten_links(doc.get("links")),
-                "srLinks": _sr_links(doc),
+                "srLinks": sr,
+                "phaseUpdates": _phase_updates(doc, sr),
             })
 
         def _research_podcast(self, rid: str) -> None:
