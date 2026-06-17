@@ -6,6 +6,7 @@ permanent SR link(s)) and posts each phase once + a needs-attention blocker.
 """
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -187,3 +188,93 @@ def test_main_scoped_threads_origin_to_query_and_state(monkeypatch):
     assert seen["origin"] == origin
     expected = poll._state_path(origin)
     assert seen["load"] == expected and seen["save"] == expected and expected != poll._STATE_FILE
+
+
+# ── strict run-linked teardown ───────────────────────────────────────────────
+
+def test_is_active():
+    assert poll._is_active({"status": "ongoing"})
+    assert poll._is_active({"status": "queued"})
+    assert poll._is_active({"status": "completed", "needsAttention": True})  # blocked = still live
+    assert not poll._is_active({"status": "completed"})
+    assert not poll._is_active({"status": "error"})
+
+
+def test_remove_cron_entry_drops_only_named_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(poll, "_hermes_home", lambda: tmp_path)
+    (tmp_path / "cron").mkdir()
+    jobs = tmp_path / "cron" / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [
+        {"id": "1", "name": "memory-dreaming"},
+        {"id": "2", "name": "sr-stream-telegram_abc"},
+    ]}), "utf-8")
+    assert poll._remove_cron_entry("sr-stream-telegram_abc") is True
+    assert [j["name"] for j in json.loads(jobs.read_text("utf-8"))["jobs"]] == ["memory-dreaming"]
+    assert poll._remove_cron_entry("sr-stream-telegram_abc") is False  # idempotent — already gone
+
+
+def test_remove_cron_entry_noop_when_missing_or_malformed(tmp_path, monkeypatch):
+    monkeypatch.setattr(poll, "_hermes_home", lambda: tmp_path)
+    assert poll._remove_cron_entry("sr-stream-x") is False        # no cron/jobs.json
+    (tmp_path / "cron").mkdir()
+    (tmp_path / "cron" / "jobs.json").write_text("not json", "utf-8")
+    assert poll._remove_cron_entry("sr-stream-x") is False        # unreadable → no-op
+
+
+def test_teardown_removes_cron_shim_and_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(poll, "_hermes_home", lambda: tmp_path)
+    origin = {"platform": "telegram", "chat_id": "111"}
+    slug = poll._origin_slug(origin)
+    (tmp_path / "cron").mkdir()
+    jobs = tmp_path / "cron" / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [{"id": "2", "name": f"sr-stream-{slug}"}]}), "utf-8")
+    (tmp_path / "scripts").mkdir()
+    shim = tmp_path / "scripts" / f"sr_poll_{slug}.py"
+    shim.write_text("x", "utf-8")
+    state = tmp_path / f".sr_poll_{slug}.state.json"
+    state.write_text("{}", "utf-8")
+    monkeypatch.setattr(poll, "_state_path", lambda o: state)
+    poll._teardown(origin)
+    assert not shim.exists() and not state.exists()
+    assert json.loads(jobs.read_text("utf-8"))["jobs"] == []
+
+
+def _main_with(monkeypatch, *, runs, lines, origin):
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: runs)
+    monkeypatch.setattr(poll, "_load_state", lambda path=None: {})  # not baseline
+    monkeypatch.setattr(poll, "_save_state", lambda *a, **k: None)
+    monkeypatch.setattr(poll, "compute", lambda r, prior, baseline=False: (lines, {}))
+    torn = {}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("o", o))
+    assert poll.main(origin) == 0
+    return torn
+
+
+def test_main_self_teardown_when_all_terminal(monkeypatch):
+    origin = {"platform": "telegram", "chat_id": "111"}
+    torn = _main_with(monkeypatch, runs=[{"runId": "r1", "status": "completed"}], lines=[], origin=origin)
+    assert torn.get("o") == origin  # done + nothing new → stop + clean up
+
+
+def test_main_no_teardown_while_active(monkeypatch):
+    torn = _main_with(monkeypatch, runs=[{"runId": "r1", "status": "ongoing"}], lines=[],
+                      origin={"platform": "telegram", "chat_id": "111"})
+    assert "o" not in torn
+
+
+def test_main_no_teardown_while_posting_final(monkeypatch):
+    # The tick that posts the final phase must NOT also tear down — wait for delivery.
+    torn = _main_with(monkeypatch, runs=[{"runId": "r1", "status": "completed"}], lines=["🎉 done"],
+                      origin={"platform": "telegram", "chat_id": "111"})
+    assert "o" not in torn
+
+
+def test_main_no_teardown_on_empty_window(monkeypatch):
+    torn = _main_with(monkeypatch, runs=[], lines=[], origin={"platform": "telegram", "chat_id": "111"})
+    assert "o" not in torn  # no runs yet (race) → don't tear down
+
+
+def test_main_no_teardown_account_wide(monkeypatch):
+    # The shared (origin=None) watchdog is never self-removed (its script serves all chats).
+    torn = _main_with(monkeypatch, runs=[{"runId": "r1", "status": "completed"}], lines=[], origin=None)
+    assert "o" not in torn

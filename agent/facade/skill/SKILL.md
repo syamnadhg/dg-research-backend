@@ -215,9 +215,15 @@ shows up. To arm it:
      "retry").
    The watchdog already renders + de-dups all of this — you just relay it.
 
-On **`/sr logout`**, tear this chat's watchdog down: `cronjob(action="list")` →
-find the job whose name starts with `sr-stream` → `cronjob(action="remove",
-job_id=<that id>)`.
+The watchdog is **strictly run-linked**: once this chat's runs are all finished
+(and their final phases posted), it **removes its own cron job + shim on its own**
+— so it never keeps polling after a run, and never fires after `disconnect`
+removed its script. You don't need to stop it on completion; a later research just
+re-arms a fresh one.
+
+On **`/sr logout`**, tear this chat's watchdog down anyway (belt-and-suspenders, in
+case a run is still mid-flight): `cronjob(action="list")` → find the job whose name
+starts with `sr-stream` → `cronjob(action="remove", job_id=<that id>)`.
 
 If the user is right there and just asks "status" / "what's running", answer
 immediately with `sr.py status` / `sr.py updates` — the watchdog is for unattended

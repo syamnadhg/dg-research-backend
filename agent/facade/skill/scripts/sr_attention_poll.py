@@ -116,6 +116,68 @@ def _save_state(state: dict, path: Path | None = None) -> None:
         pass  # best-effort; a missed save just re-announces next tick (rare)
 
 
+# ── strict run-linked teardown ───────────────────────────────────────────────
+# The watchdog is a recurring Hermes cron job (`sr-stream-<slug>`, every 1m). It
+# must STOP — and clean up its own cron entry + shim + state — once this chat has
+# no live work left, so it never lingers polling forever or, worse, fires after
+# `disconnect` deleted its script (the "Script not found" chat spam). We can't
+# call Hermes's agent-only `cronjob` tool from here, so we remove our OWN entry
+# from the cron's data file (`<HERMES_HOME>/cron/jobs.json`, which Hermes re-reads
+# every tick) — only the entry we created, matched by name; never touching others.
+
+# Runs still in flight (or stuck awaiting the user) — work the watchdog must keep
+# streaming. Everything else (completed / errored-and-done / cancelled) is terminal.
+_ACTIVE = ("queued", "ongoing", "paused_backend_restart", "paused_backend_restart_failed")
+
+
+def _is_active(run: dict) -> bool:
+    return run.get("status") in _ACTIVE or bool(run.get("needsAttention"))
+
+
+def _hermes_home() -> Path:
+    """<HERMES_HOME> — this watchdog lives at <HERMES_HOME>/scripts/<this file>."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _remove_cron_entry(job_name: str) -> bool:
+    """Remove the job named ``job_name`` from <HERMES_HOME>/cron/jobs.json (atomic,
+    best-effort). Only ever drops the entry we created; leaves every other job
+    untouched. Returns True if an entry was removed. No-op (False) if the file is
+    absent / unreadable / has no such job — so an already-clean state is harmless."""
+    path = _hermes_home() / "cron" / "jobs.json"
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except Exception:
+        return False
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(jobs, list):
+        return False
+    kept = [j for j in jobs if not (isinstance(j, dict) and j.get("name") == job_name)]
+    if len(kept) == len(jobs):
+        return False
+    data["jobs"] = kept
+    try:
+        tmp = path.with_suffix(".json.sr-tmp")
+        tmp.write_text(json.dumps(data), "utf-8")
+        os.replace(tmp, path)  # atomic; Hermes re-reads jobs.json each tick
+        return True
+    except Exception:
+        return False
+
+
+def _teardown(origin: dict) -> None:
+    """Stop this chat's watchdog for good: drop its cron entry, then delete its
+    generated shim + de-dup state. Scoped (per-chat) only — never the shared,
+    account-wide watchdog (its sr_attention_poll.py is used by every chat)."""
+    slug = _origin_slug(origin)
+    _remove_cron_entry(f"sr-stream-{slug}")
+    for p in (_hermes_home() / "scripts" / f"sr_poll_{slug}.py", _state_path(origin)):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
 def _title(run: dict) -> str:
     t = (run.get("title") or run.get("topic") or run.get("runId") or "your run").strip()
     return t if len(t) <= 60 else t[:60].rstrip() + "…"
@@ -209,6 +271,14 @@ def main(origin: dict | None = None) -> int:
     _save_state(new_state, state_file)
     if lines:
         print("\n".join(lines))
+    # Strict run-linkage: once this chat has runs but NONE are live AND there's
+    # nothing new to post (every completed phase was delivered on a prior tick),
+    # the work is done — stop polling and remove our own cron + shim + state. A
+    # later research in this chat simply re-arms a fresh watchdog. Scoped only;
+    # never tear down on an empty window (a run that hasn't appeared yet) or while
+    # we're still posting (so the final phase always lands first).
+    if origin and runs and not lines and not any(_is_active(r) for r in runs):
+        _teardown(origin)
     return 0
 
 
