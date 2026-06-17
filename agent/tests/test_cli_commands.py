@@ -275,9 +275,9 @@ def test_connect_wsl_assume_yes_runs_in_distro(monkeypatch):
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
                                   startup=None, login=None)
     assert rc == 0
-    # pre-selects the runtime + marks it a continuation (no second banner/choose)
-    assert ran == {"distro": "Ubuntu-24.04",
-                   "extra": ["--runtime", "hermes", "--continued", "--yes"]}
+    # pre-selects the runtime; the continuation marker rides the env var (set by
+    # run_connect_in_wsl), so it's NOT a forwarded flag (version-safe).
+    assert ran == {"distro": "Ubuntu-24.04", "extra": ["--runtime", "hermes", "--yes"]}
 
 
 def test_connect_wsl_forwards_startup_login_flags(monkeypatch):
@@ -287,7 +287,7 @@ def test_connect_wsl_forwards_startup_login_flags(monkeypatch):
                         lambda d, extra=None: ran.update(extra=extra) or 0)
     cli._connect_wsl_runtime(_wsl_target(), assume_yes=True, noninteractive=True,
                              startup=False, login=True)
-    assert ran["extra"] == ["--runtime", "hermes", "--continued", "--yes", "--no-startup", "--login"]
+    assert ran["extra"] == ["--runtime", "hermes", "--yes", "--no-startup", "--login"]
 
 
 def test_connect_wsl_interactive_auto_proceeds_no_prompt(monkeypatch):
@@ -303,7 +303,7 @@ def test_connect_wsl_interactive_auto_proceeds_no_prompt(monkeypatch):
                                   startup=None, login=None)
     assert rc == 0
     assert ran["distro"] == "Ubuntu-24.04"
-    assert ran["extra"] == ["--runtime", "hermes", "--continued"]   # interactive → no --yes
+    assert ran["extra"] == ["--runtime", "hermes"]   # interactive → no --yes; continuation via env
 
 
 def test_connect_wsl_no_uvx_falls_back_to_manual(monkeypatch, capsys):
@@ -359,8 +359,9 @@ def test_cmd_connect_routes_wsl_target_to_delegation(monkeypatch):
 
 
 def test_cmd_connect_continued_suppresses_banner_and_autoselects(monkeypatch):
-    # The in-WSL continuation (--continued): no banner, and it auto-selects the
-    # explicit runtime (no re-detect/choose prompt), resuming at Install.
+    # The in-WSL continuation (CONTINUED env var): no banner, and it auto-selects
+    # the explicit runtime (no re-detect/choose prompt), resuming at Install.
+    monkeypatch.setenv(connect.CONTINUED_ENV, "1")
     monkeypatch.setattr(cli.connect, "detect_targets",
                         lambda: [connect.Target("hermes", "local", Path("/home/u"))])
     monkeypatch.setattr(cli.b, "header",
@@ -374,7 +375,7 @@ def test_cmd_connect_continued_suppresses_banner_and_autoselects(monkeypatch):
     monkeypatch.setattr(cli, "_startup_step", lambda **k: False)
     monkeypatch.setattr(cli, "_signin_step", lambda **k: False)
     monkeypatch.setattr(cli, "_bridge_authed", lambda: False)
-    args = cli.build_parser().parse_args(["connect", "--runtime", "hermes", "--continued"])
+    args = cli.build_parser().parse_args(["connect", "--runtime", "hermes"])
     assert cli.cmd_connect(args) == 0
     assert seen["installed"] == "hermes"   # auto-selected + installed, no banner/choose
 

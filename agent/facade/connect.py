@@ -295,6 +295,20 @@ def wsl_uvx_available(distro: str) -> bool:
     return r.returncode == 0
 
 
+# Set by a WSL hand-off when it re-invokes connect INSIDE the distro — marks that
+# run a continuation of the host's flow (suppress the second banner + re-detect).
+# Deliberately an ENV VAR, not a CLI flag: an OLDER published package simply
+# ignores an unknown env var (no argparse crash), so a host ahead of the package
+# degrades to the old banner instead of erroring; a current package honors it.
+CONTINUED_ENV = "SUPER_AGENT_CONNECT_CONTINUED"
+
+
+def is_continued() -> bool:
+    """True when this connect run was launched inside WSL as a continuation of a
+    host hand-off (see ``CONTINUED_ENV``)."""
+    return os.environ.get(CONTINUED_ENV) == "1"
+
+
 def run_connect_in_wsl(distro: str, extra_args: list[str] | None = None) -> int:
     """Run the agent's own ``connect`` INSIDE ``distro`` via the published package
     (``uvx superresearch-agent connect``), so the bridge lands with the WSL
@@ -305,7 +319,8 @@ def run_connect_in_wsl(distro: str, extra_args: list[str] | None = None) -> int:
     so the caller can offer the manual fallback)."""
     if sys.platform != "win32":
         return 1
-    inner = " ".join(
+    # Prefix the continuation marker as an env var (version-safe — see CONTINUED_ENV).
+    inner = f"{CONTINUED_ENV}=1 " + " ".join(
         shlex.quote(p)
         for p in ("uvx", "superresearch-agent", "connect", *(extra_args or []))
     )

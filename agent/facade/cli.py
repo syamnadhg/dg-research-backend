@@ -166,10 +166,11 @@ def cmd_connect(args: argparse.Namespace) -> int:
     """Connect a chat runtime (Hermes / OpenClaw): choose it, install the Super
     Research skill where it lives + make it reachable, optionally pin the
     background bridge, and optionally sign in. Branded, interactive 4-step flow."""
-    # A WSL hand-off re-invokes connect INSIDE the distro with --continued: it's a
-    # seamless continuation of the host's flow, so suppress the banner + the
-    # re-detect/choose (the host already chose the runtime) and resume at Install.
-    continued = getattr(args, "continued", False)
+    # A WSL hand-off re-invokes connect INSIDE the distro as a continuation (the
+    # SUPER_AGENT_CONNECT_CONTINUED env var): it's a seamless continuation of the
+    # host's flow, so suppress the banner + the re-detect/choose (the host already
+    # chose the runtime) and resume at Install.
+    continued = connect.is_continued()
     if not continued:
         b.header("nexus", "link Super Research to chat", tagline_color=branding._BOLD + branding._ACCENT)
         b.channels(_CHANNELS)
@@ -443,8 +444,9 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
     distro = target.distro or ""
     label = connect.RUNTIME_META[target.runtime]["label"]
     # The in-distro connect is a continuation of THIS flow: pre-select the same
-    # runtime + suppress its banner/re-detect so the user sees one clean flow.
-    forwarded: list[str] = ["--runtime", target.runtime, "--continued"]
+    # runtime (run_connect_in_wsl sets the continuation env var so it suppresses
+    # its banner/re-detect) → the user sees one clean flow.
+    forwarded: list[str] = ["--runtime", target.runtime]
     if assume_yes or noninteractive:
         forwarded.append("--yes")
     if startup is True:
@@ -1246,10 +1248,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="start sign-in without asking (non-interactive: prints the link to relay in chat)")
     cn.add_argument("--no-login", dest="login", action="store_false",
                     help="skip sign-in without asking")
-    # Internal: set when connect re-invokes itself INSIDE a WSL distro after a
-    # host hand-off. Marks it a continuation of the host's flow → suppress the
-    # banner + the redundant re-detect/choose, resume at Install.
-    cn.add_argument("--continued", action="store_true", help=argparse.SUPPRESS)
     cn.set_defaults(func=cmd_connect)
 
     dc = sub.add_parser("disconnect", parents=[common],

@@ -494,8 +494,9 @@ def test_run_connect_in_wsl_builds_login_shell_command(monkeypatch):
     a = seen["args"]
     assert a[:5] == ["wsl.exe", "-d", "Ubuntu-24.04", "--", "bash"]
     assert a[5] == "-lc"
-    # the in-distro command is the package's own connect with forwarded flags
-    assert a[6] == "uvx superresearch-agent connect --yes --no-login"
+    # the in-distro command is the package's own connect with forwarded flags,
+    # prefixed by the continuation marker as an env var (version-safe)
+    assert a[6] == "SUPER_AGENT_CONNECT_CONTINUED=1 uvx superresearch-agent connect --yes --no-login"
 
 
 def test_run_connect_in_wsl_passes_through_returncode(monkeypatch):
