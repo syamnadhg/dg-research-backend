@@ -30,7 +30,7 @@ The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all
 ## Before you start (prerequisites checklist)
 
 - **Python 3.11+** (`python --version`).
-- **Real Google Chrome** installed (not just Chromium — patchright launches with `channel="chrome"`).
+- **Real Google Chrome** installed (not just Chromium — patchright launches with `channel="chrome"`). Chrome itself is an OS-level prerequisite; the patchright Chrome wrapper, though, is **auto-fetched** for you — `--pair` and `--doctor` now run `patchright install chrome` automatically, so you don't have to do that step by hand.
 - **Anthropic API key** with browser-automation access (`ANTHROPIC_API_KEY`; see Step 2).
 - **Super Research web app account** — sign in at the deployment URL the dev shares with you (Google sign-in). You'll paste the 8-char pair code into Account → Add Device during `--pair` Stage 1.
 - **Paid Pro tiers on ChatGPT, Claude, and Gemini** — required for the depth Phases 1–2 were tuned against:
@@ -41,6 +41,28 @@ The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all
 - *(Optional)* Gemini API key for the narrator's Flash fallback. (Phase 4 — YouTube upload — and Phase 5 — Google Doc creation + email — both run entirely in the frontend; no BE-side Resend / YouTube / Docs setup needed.)
 
 ## Quick Start
+
+### Option A — Install as a command (recommended)
+
+The backend installs as a `superresearch` console command via [pipx](https://pipx.pypa.io). No checkout to manage, and it runs from **any directory** — data + config live under `~/.super-research/` and `.dg-supervisor.env`.
+
+```bash
+# 1. Install
+pipx install superresearch
+
+# 2. Pair (one-time: mints an 8-char pair code, prompts API keys, runs browser logins)
+superresearch --pair      # auto-fetches the patchright Chrome wrapper for you
+
+# 3. Start the server (keep it running)
+superresearch --serve
+
+# One-shot CLI run (no pairing / Firebase round-trip — see § CLI Mode)
+superresearch "your topic"
+```
+
+> **`superresearch <flags>` is a pure drop-in for `python research.py <flags>`** — identical flags, identical branded UI, and the same `--pair` / `--serve` / `--resurrect` / `--retire` / `--unpair` / `--doctor` / `--commands` / `agent` verbs. Help is invocation-aware: it shows `superresearch …` when launched from the installed command, `python research.py …` from a source checkout. So every `python research.py …` example below works verbatim as `superresearch …` on an installed build.
+
+### Option B — From source (developers)
 
 ```bash
 # 1. Install
@@ -90,6 +112,8 @@ python research.py agent connect      # install the skill into your runtime (aut
 python research.py agent serve        # start the bridge that holds your account session (keep running)
 # then, in chat:  /superresearch  →  /sr-login  →  /sr-research <topic>
 ```
+
+> On an installed build, the same front door is `superresearch agent connect` (and the other `agent` verbs). The chat-runtime agent is a **separate package** — the installed `superresearch agent <verb>` delegates to `pipx run superresearch-agent <verb>`, which installs the `/sr` skill into Hermes/OpenClaw; a source checkout runs the in-tree agent instead.
 
 The agent is **research-only** — it runs / tracks / cancels research on your
 existing devices but can never add, remove, pair, or share them (that stays

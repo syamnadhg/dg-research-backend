@@ -4,6 +4,34 @@ Backend architecture + Frontend ↔ Backend contract for the Multi-Agent Deep Re
 
 ---
 
+## Running the Backend
+
+The backend ships as the **`superresearch` console command** (recommended). Install it once with pipx and run it from any directory — no checkout to manage; data/config live under `~/.super-research/` + `.dg-supervisor.env`:
+
+```bash
+pipx install superresearch
+superresearch --pair      # one-time pairing + browser logins
+superresearch --serve     # run the backend
+superresearch "<topic>"   # one-shot CLI run
+```
+
+`superresearch <flags>` is a pure drop-in for `python research.py <flags>` — identical flags (`--pair` / `--serve` / `--resurrect` / `--retire` / `--unpair` / `--doctor` / `--commands` / `agent`), identical branded UI. Invocation-aware help shows whichever prefix matches how it was launched (`superresearch` when installed, `python research.py` from a checkout).
+
+The **source / developer path** is unchanged and still fully supported:
+
+```bash
+git clone …
+cd …
+pip install -r requirements.txt
+python research.py --pair
+```
+
+> **Chrome:** `--pair` and `--doctor` now auto-fetch the patchright Chrome wrapper (`patchright install chrome`). Real Google Chrome remains an OS-level prerequisite.
+
+> **Chat-runtime agent (separate package):** the `/sr` chat skill is installed differently — `pipx run superresearch-agent connect`. The backend's own front door `superresearch agent <verb>` (installed build) delegates to `pipx run superresearch-agent <verb>`; a source checkout runs the in-tree agent. Don't conflate the two packages.
+
+---
+
 ## Pipeline Phases
 
 The pipeline has **6 phases** (0–5). Each phase has a backend execution step and a corresponding frontend visualization.

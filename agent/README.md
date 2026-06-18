@@ -29,8 +29,27 @@ This package is a **separate process** and never touches the existing app:
 
 ## Running it (no install)
 
-Run the agent as a **`research.py` command** — same front door as the rest of
-the backend, from the repo root, **no install and no editable mode**:
+Run the agent through the backend's **`agent` front door** — the same front door
+as the rest of the backend. There are two ways in:
+
+**Installed backend (recommended).** If the backend is installed as a console
+command (`pipx install superresearch`), it carries the agent front door with it
+and you can drive the agent from **any directory**:
+
+```sh
+superresearch agent <command>      # e.g. agent connect / agent serve / agent login
+superresearch --agent <command>    # flag-style alias (consistent with --pair/--serve)
+superresearch agent                # bare → smart entry: status if set up, else connect
+superresearch agent --help         # the full command list
+```
+
+An installed build's `superresearch agent <verb>` **delegates to `pipx run
+superresearch-agent <verb>`** — the published chat-runtime agent package — so you
+never need a backend checkout just to connect.
+
+**Source checkout.** From a developer checkout, run the agent as a
+**`research.py` command** from the repo root, **no install and no editable mode**;
+here the front door runs the **in-tree** agent (`python -m facade`):
 
 ```sh
 cd research-automate
@@ -40,13 +59,19 @@ python research.py agent                # bare → smart entry: status if set up
 python research.py agent --help         # the full command list
 ```
 
+> **`superresearch <flags>` is a pure drop-in for `python research.py <flags>`** —
+> identical flags and branded UI — so `superresearch agent …` and `python
+> research.py agent …` are equivalent; pick whichever matches how the backend is
+> installed.
+
 The agent's only deps (`requests`, `keyring`) already ship in the backend's
 `requirements.txt`, so once the backend is set up (`pip install -r
 requirements.txt`) there is **nothing extra to install**. Requires **Python
 3.11+**.
 
-> **Throughout this README, `agent <command>` is shorthand for
-> `python research.py agent <command>`.**
+> **Throughout this README, `agent <command>` is shorthand for the front-door
+> form — `superresearch agent <command>` on an installed build, or `python
+> research.py agent <command>` from a source checkout.**
 
 The code itself lives in this isolated sub-package (`research-automate/agent/`,
 its own process + its own two deps); `research.py` only *fronts* it so it's
