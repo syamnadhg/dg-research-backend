@@ -44,7 +44,6 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3 :: Only",
-    "Private :: Do Not Upload",
 ]
 # Runtime deps mirror requirements.txt (minus the test-only ones, which move to
 # the [dev] extra). Keep this list and requirements.txt in sync.
