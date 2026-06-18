@@ -36870,15 +36870,18 @@ def _launcher_path() -> str:
     supervisor unit/task/plist and the daemon-loop's child respawns all run
     `<python> <this> --serve|--daemon-loop …`.
 
-    In a source checkout this IS research.py (== __file__), so behavior is
-    unchanged. In a compiled (Nuitka) build the real code lives in research.<abi>.pyd
-    and __file__ points at the .pyd — which python can't execute as a script — so
-    we point at the readable research.py launcher shim the build ships beside it.
-    Falls back to __file__ if no sibling shim exists (defensive)."""
+    In a source checkout this IS research.py (== __file__). In a compiled
+    (Nuitka) build the real code lives in _sr_core.<abi>.pyd beside a readable
+    research.py launcher shim, and the runnable target is that shim.
+
+    Always prefer the sibling research.py — the runnable launcher in BOTH modes
+    (in source it's this file; compiled it's the shim). We do NOT key off
+    __file__'s suffix: Nuitka reports the compiled module's __file__ as
+    "_sr_core.py" (cosmetic, .py suffix, and that path does not exist), so a
+    suffix check would wrongly hand back a non-existent .py. Falls back to
+    __file__ only if no research.py sibling is found (defensive)."""
     here = Path(__file__).resolve()
-    if here.suffix.lower() == ".py":
-        return str(here)                      # source checkout — this file runs directly
-    shim = here.with_name("research.py")      # compiled — sibling readable launcher shim
+    shim = here.with_name("research.py")
     return str(shim if shim.exists() else here)
 
 
