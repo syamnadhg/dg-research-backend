@@ -467,7 +467,7 @@ class _Rc:
         self.returncode = code
 
 
-def test_wsl_uvx_available_true_via_login_shell(monkeypatch):
+def test_wsl_pipx_available_true_via_login_shell(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "win32")
     seen = {}
 
@@ -476,32 +476,71 @@ def test_wsl_uvx_available_true_via_login_shell(monkeypatch):
         return _Rc(0)
 
     monkeypatch.setattr(connect.subprocess, "run", fake_run)
-    assert connect.wsl_uvx_available("Ubuntu-24.04") is True
+    assert connect.wsl_pipx_available("Ubuntu-24.04") is True
     a = seen["args"]
     assert a[:4] == ["wsl.exe", "-d", "Ubuntu-24.04", "--"]
-    # probe via a login shell so uv's PATH (~/.local/bin) is visible
-    assert "bash" in a and "-lc" in a and "command -v uvx" in a
+    # probe via a login shell, module form so it's true the moment pipx is installed
+    assert "bash" in a and "-lc" in a and "python3 -m pipx --version" in a
 
 
-def test_wsl_uvx_available_false_on_nonzero(monkeypatch):
+def test_wsl_pipx_available_false_on_nonzero(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "win32")
     monkeypatch.setattr(connect.subprocess, "run", lambda *a, **k: _Rc(1))
-    assert connect.wsl_uvx_available("U") is False
+    assert connect.wsl_pipx_available("U") is False
 
 
-def test_wsl_uvx_available_off_windows(monkeypatch):
+def test_wsl_pipx_available_off_windows(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "linux")
-    assert connect.wsl_uvx_available("U") is False
+    assert connect.wsl_pipx_available("U") is False
 
 
-def test_wsl_uvx_available_swallows_errors(monkeypatch):
+def test_wsl_pipx_available_swallows_errors(monkeypatch):
     monkeypatch.setattr(connect.sys, "platform", "win32")
 
     def boom(*a, **k):
         raise OSError("no wsl")
 
     monkeypatch.setattr(connect.subprocess, "run", boom)
-    assert connect.wsl_uvx_available("U") is False
+    assert connect.wsl_pipx_available("U") is False
+
+
+def test_ensure_wsl_pipx_noop_when_already_present(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    monkeypatch.setattr(connect, "wsl_pipx_available", lambda d: True)
+    ran = []
+    monkeypatch.setattr(connect.subprocess, "run", lambda *a, **k: ran.append(a) or _Rc(0))
+    assert connect.ensure_wsl_pipx("U") is True
+    assert ran == []  # already present → no install attempt
+
+
+def test_ensure_wsl_pipx_installs_then_succeeds(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    probes = {"n": 0}
+
+    def fake_probe(d):
+        probes["n"] += 1
+        return probes["n"] > 1  # missing first, present after the install
+
+    monkeypatch.setattr(connect, "wsl_pipx_available", fake_probe)
+    seen = {}
+    monkeypatch.setattr(connect.subprocess, "run",
+                        lambda args, **kw: seen.update(args=args) or _Rc(0))
+    assert connect.ensure_wsl_pipx("Ubuntu-24.04") is True
+    inner = seen["args"][-1]  # the bash -lc command string
+    assert "pip install --user" in inner and "pipx" in inner
+    assert "--break-system-packages" in inner  # PEP-668 (Ubuntu 24.04) fallback
+
+
+def test_ensure_wsl_pipx_false_when_still_missing(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    monkeypatch.setattr(connect, "wsl_pipx_available", lambda d: False)  # never resolves
+    monkeypatch.setattr(connect.subprocess, "run", lambda *a, **k: _Rc(0))
+    assert connect.ensure_wsl_pipx("U") is False
+
+
+def test_ensure_wsl_pipx_off_windows(monkeypatch):
+    monkeypatch.setattr(connect.sys, "platform", "linux")
+    assert connect.ensure_wsl_pipx("U") is False
 
 
 def test_run_agent_in_wsl_builds_login_shell_command(monkeypatch):
@@ -520,7 +559,7 @@ def test_run_agent_in_wsl_builds_login_shell_command(monkeypatch):
     assert a[5] == "-lc"
     # the in-distro command is the package's own <subcommand> with forwarded flags,
     # prefixed by the continuation marker as an env var (version-safe)
-    assert a[6] == "SUPER_AGENT_CONNECT_CONTINUED=1 uvx superresearch-agent connect --yes --no-login"
+    assert a[6] == "SUPER_AGENT_CONNECT_CONTINUED=1 python3 -m pipx run superresearch-agent connect --yes --no-login"
 
 
 def test_run_agent_in_wsl_uses_the_given_subcommand(monkeypatch):
@@ -529,7 +568,7 @@ def test_run_agent_in_wsl_uses_the_given_subcommand(monkeypatch):
     monkeypatch.setattr(connect.subprocess, "run",
                         lambda args, **kw: seen.update(args=args) or _Rc(0))
     connect.run_agent_in_wsl("Ubuntu-24.04", "disconnect")
-    assert seen["args"][6] == "SUPER_AGENT_CONNECT_CONTINUED=1 uvx superresearch-agent disconnect"
+    assert seen["args"][6] == "SUPER_AGENT_CONNECT_CONTINUED=1 python3 -m pipx run superresearch-agent disconnect"
 
 
 def test_run_agent_in_wsl_passes_through_returncode(monkeypatch):

@@ -104,7 +104,7 @@ which is why `connect` co-locates the bridge with the chat runtime:
 - **Co-located** (runtime native on the same OS as the bridge — Win+Win,
   Linux+Linux, macOS+macOS) → shares loopback, **zero setup**.
 - **WSL runtime** → the bridge must run **inside WSL** too. `connect` detects a
-  WSL runtime and **offers to run connect there for you** — `uvx
+  WSL runtime and **offers to run connect there for you** — `pipx run
   superresearch-agent connect` inside the distro (or prints the command, with a
   `python research.py agent connect` backend-checkout fallback for before the
   package is on PyPI). The bridge then shares WSL's loopback with the runtime —

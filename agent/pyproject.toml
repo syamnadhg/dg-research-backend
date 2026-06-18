@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superresearch-agent"
-version = "0.1.4"
-description = "Install Super Research into a chat runtime (Hermes / OpenClaw) with `uvx superresearch-agent connect` — an account-authed loopback bridge that drives the user's own Super Research from chat."
+version = "0.1.5"
+description = "Install Super Research into a chat runtime (Hermes / OpenClaw) with `pipx run superresearch-agent connect` — an account-authed loopback bridge that drives the user's own Super Research from chat."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-# Canonical name resolved by `uvx superresearch-agent connect`. `agent` is kept
+# Canonical name resolved by `pipx run superresearch-agent connect`. `agent` is kept
 # as a short alias (back-compat with the `python research.py agent` front door
 # and existing docs/recipes); both run the same CLI.
 superresearch-agent = "facade.cli:main"

@@ -30,15 +30,15 @@ python scripts/sr.py <command> [args]
 
 If a command prints ``✗ bridge unreachable … is `agent serve` running?``, tell
 the user the host bridge isn't running, and stop. The fix is to (re-)run the
-connect step on the computer that runs Super Research — `uvx superresearch-agent
-connect` (or `python research.py agent connect` from a backend checkout) — which
+connect step on the computer that runs Super Research — `pipx run
+superresearch-agent connect` (or `python research.py agent connect` from a backend checkout) — which
 starts the bridge there.
 
 **Hard failure rule — never improvise the research.** If anything about this
 skill is broken — `scripts/sr.py` is missing, running it errors out, the skill
 content/tooling won't load, or the bridge keeps failing — tell the user plainly
 that the Super Research skill isn't correctly installed (fix: re-run the connect
-step on the host — `uvx superresearch-agent connect`) and **STOP**. Do **not** attempt to perform the
+step on the host — `pipx run superresearch-agent connect`) and **STOP**. Do **not** attempt to perform the
 research, status, podcast, or any other action yourself in chat — Super Research
 runs on the user's device, not in this conversation, and an improvised answer is
 worse than the one-line error.
@@ -192,7 +192,7 @@ shows up. To arm it:
    the exact **`script`** and **`name`** to use (e.g. `script="sr_poll_<id>.py"`,
    `name="sr-stream-<id>"`). If it prints a `✗` error about the watchdog not
    being installed, tell the user to re-run the connect step on the host
-   (`uvx superresearch-agent connect`) and stop.
+   (`pipx run superresearch-agent connect`) and stop.
 2. Check it isn't already armed: `cronjob(action="list")` — look for that exact
    `name`. If absent, arm it (it auto-delivers to **this** chat) using the
    `script` + `name` arm-stream just gave you:

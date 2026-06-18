@@ -183,7 +183,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
     explicit = args.runtime_opt or args.runtime
     # Non-interactive when --yes is passed OR there's no terminal (a chat exec, e.g.
-    # a Hermes/OpenClaw agent running `uvx superresearch-agent connect` on the user's
+    # a Hermes/OpenClaw agent running `pipx run superresearch-agent connect` on the user's
     # behalf). A non-TTY shell CAN'T answer a prompt, so it proceeds with the same
     # safe defaults --yes would (install + pin startup) and RELAYS the sign-in link
     # instead of opening a browser + block-polling. Explicit --no-startup/--no-login
@@ -485,17 +485,21 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
 
     # No TTY and no --yes → can't drive the interactive in-distro setup; print it.
     if noninteractive and not assume_yes:
-        _print_wsl_manual(distro, "uvx superresearch-agent connect")
+        _print_wsl_manual(distro, "pipx run superresearch-agent connect")
         return 0
-    if not connect.wsl_uvx_available(distro):
-        b.warn(f"uv isn't installed in WSL · {distro} yet — can't set it up there automatically.")
-        _print_wsl_manual(distro, "uvx superresearch-agent connect")
-        return 0
+    # pipx missing in the distro → install it autonomously (the WSL-side bootstrap),
+    # then proceed. Only fall back to the manual command if that install can't finish.
+    if not connect.wsl_pipx_available(distro):
+        b.dim(f"pipx isn't in WSL · {distro} yet — installing it there…")
+        if not connect.ensure_wsl_pipx(distro):
+            b.warn(f"Couldn't install pipx in WSL · {distro} automatically.")
+            _print_wsl_manual(distro, "pipx run superresearch-agent connect")
+            return 0
     b.dim(f"Setting it up inside {distro}…")
     rc = connect.run_agent_in_wsl(distro, "connect", forwarded)
     if rc != 0:
         b.warn(f"The in-WSL setup didn't finish (exit {rc}).")
-        _print_wsl_manual(distro, "uvx superresearch-agent connect")
+        _print_wsl_manual(distro, "pipx run superresearch-agent connect")
     return rc
 
 
@@ -548,7 +552,7 @@ def _warn_unreachable_wsl(action_hint: str) -> bool:
     b.warn(f"Nothing is reachable here, but WSL is installed and stopped ({names}).")
     b.dim("If your runtime lives in WSL, its distro is asleep so I can't reach it.")
     b.dim(f"  Start it and retry:  wsl -d {stopped[0]}     then re-run this command")
-    b.dim(f"  …or {action_hint} inside the distro:  wsl -d {stopped[0]}   then   uvx superresearch-agent <command>")
+    b.dim(f"  …or {action_hint} inside the distro:  wsl -d {stopped[0]}   then   pipx run superresearch-agent <command>")
     return True
 
 
@@ -565,9 +569,9 @@ def _delegate_lifecycle(subcommand: str, extra_args: list[str], *, label: str,
         if _warn_unreachable_wsl("run it"):
             return 1
         return None
-    if not connect.wsl_uvx_available(distro):
-        b.warn(f"This runtime is in WSL · {distro}, but uv isn't installed there.")
-        b.dim(f"Run it inside the distro:  wsl -d {distro}   then   uvx superresearch-agent {subcommand}")
+    if not connect.wsl_pipx_available(distro):
+        b.warn(f"This runtime is in WSL · {distro}, but pipx isn't installed there.")
+        b.dim(f"Run it inside the distro:  wsl -d {distro}   then   pipx run superresearch-agent {subcommand}")
         return 1
     b.dim(f"{label} runs inside WSL · {distro} — doing it there…")
     return connect.run_agent_in_wsl(distro, subcommand, extra_args)
@@ -590,7 +594,7 @@ def _redirect_if_wsl(chat_hint: str) -> int | None:
         return None
     b.dim(f"Your runtime lives in WSL · {distro} — its bridge runs there, not on Windows.")
     b.dim(f"  {chat_hint}")
-    b.dim(f"  …or inside the distro:  wsl -d {distro}   then   uvx superresearch-agent <command>")
+    b.dim(f"  …or inside the distro:  wsl -d {distro}   then   pipx run superresearch-agent <command>")
     return 0
 
 

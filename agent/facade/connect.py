@@ -306,23 +306,52 @@ def detect_targets(home: Path | None = None, *, include_wsl: bool = True) -> lis
 # via the published package — the bridge then co-locates with the WSL runtime and
 # shares WSL's loopback natively.
 
-def wsl_uvx_available(distro: str) -> bool:
-    """Is ``uvx`` resolvable inside ``distro``? (i.e. is uv installed there.)
-
-    Probed through a LOGIN shell (``bash -lc``) so it sees the same PATH an
-    interactive WSL session does — uv installs to ~/.local/bin, which a bare
-    ``wsl -- <cmd>`` PATH usually omits. False off-Windows / on any failure."""
+def wsl_pipx_available(distro: str) -> bool:
+    """Is ``pipx`` usable inside ``distro``? Probed via the MODULE form
+    (``python3 -m pipx``) so it's true whenever pipx is importable — independent of
+    whether the ``pipx`` PATH shim is wired up yet (a fresh ``pip install --user
+    pipx`` lands the module immediately but the shim only after a PATH refresh).
+    Run through a LOGIN shell (``bash -lc``) for the interactive PATH. False
+    off-Windows / on any failure."""
     if sys.platform != "win32":
         return False
     no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     try:
         r = subprocess.run(
-            ["wsl.exe", "-d", distro, "--", "bash", "-lc", "command -v uvx"],
-            capture_output=True, timeout=15, creationflags=no_window,
+            ["wsl.exe", "-d", distro, "--", "bash", "-lc", "python3 -m pipx --version"],
+            capture_output=True, timeout=20, creationflags=no_window,
         )
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0
+
+
+def ensure_wsl_pipx(distro: str) -> bool:
+    """Make ``pipx`` usable inside ``distro``, installing it AUTONOMOUSLY if missing —
+    the WSL analog of the host's pipx bootstrap. No-op (True) when pipx is already
+    there; otherwise ``python3 -m pip install --user pipx`` and re-probe. Tries a
+    plain ``--user`` install first, then falls back to ``--break-system-packages``
+    for PEP-668 "externally-managed" distros (Ubuntu 23.04+/Debian 12+, incl. the
+    common Ubuntu-24.04 WSL image) where a bare ``--user`` install is refused —
+    ``--break-system-packages`` is the sanctioned override for a user-site tool
+    install and does NOT touch system packages. Then best-effort ``ensurepath`` for
+    future shells. INHERITS stdio so progress shows in this terminal. False
+    off-Windows or if pipx still isn't usable afterward (caller offers a manual
+    fallback)."""
+    if sys.platform != "win32":
+        return False
+    if wsl_pipx_available(distro):
+        return True
+    install = (
+        "python3 -m pip install --user --quiet pipx "
+        "|| python3 -m pip install --user --quiet --break-system-packages pipx; "
+        "python3 -m pipx ensurepath >/dev/null 2>&1 || true"
+    )
+    try:
+        subprocess.run(["wsl.exe", "-d", distro, "--", "bash", "-lc", install])
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return wsl_pipx_available(distro)
 
 
 # Set by a WSL hand-off when it re-invokes connect INSIDE the distro — marks that
@@ -340,21 +369,22 @@ def is_continued() -> bool:
 
 
 def run_agent_in_wsl(distro: str, subcommand: str, extra_args: list[str] | None = None) -> int:
-    """Run ``uvx superresearch-agent <subcommand> <args>`` INSIDE ``distro`` via the
-    published package, so the command acts on the bridge/skill that live WITH the
-    WSL runtime (connect, disconnect, retire, resurrect, serve …). Runs through a
-    LOGIN shell (uv's PATH) and INHERITS stdio, so the in-distro command's
-    interactive flow drives this same terminal. Sets the continuation marker so the
-    in-distro run suppresses its banner (one clean flow). Returns its exit code; 1
-    off-Windows or if ``wsl`` can't be launched (a non-zero from a started command
-    — e.g. uvx can't resolve the package pre-PyPI — flows through so the caller can
-    offer a manual fallback)."""
+    """Run ``pipx run superresearch-agent <subcommand> <args>`` INSIDE ``distro`` via
+    the published package, so the command acts on the bridge/skill that live WITH the
+    WSL runtime (connect, disconnect, retire, resurrect, serve …). Invoked through the
+    MODULE form (``python3 -m pipx run``) so it works even when pipx's PATH shim isn't
+    wired up yet (e.g. right after ``ensure_wsl_pipx`` installs it). Runs through a
+    LOGIN shell and INHERITS stdio, so the in-distro command's interactive flow drives
+    this same terminal. Sets the continuation marker so the in-distro run suppresses
+    its banner (one clean flow). Returns its exit code; 1 off-Windows or if ``wsl``
+    can't be launched (a non-zero from a started command — e.g. pipx can't resolve the
+    package pre-PyPI — flows through so the caller can offer a manual fallback)."""
     if sys.platform != "win32":
         return 1
     # Prefix the continuation marker as an env var (version-safe — see CONTINUED_ENV).
     inner = f"{CONTINUED_ENV}=1 " + " ".join(
         shlex.quote(p)
-        for p in ("uvx", "superresearch-agent", subcommand, *(extra_args or []))
+        for p in ("python3", "-m", "pipx", "run", "superresearch-agent", subcommand, *(extra_args or []))
     )
     try:
         r = subprocess.run(["wsl.exe", "-d", distro, "--", "bash", "-lc", inner])
