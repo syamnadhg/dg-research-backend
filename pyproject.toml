@@ -1,0 +1,101 @@
+# Super Research — backend / pipeline packaging.
+#
+# This makes the backend installable as the `superresearch` command:
+#
+#     pipx install superresearch
+#     superresearch --pair          # first-run device pairing + browser logins
+#     superresearch --serve         # run the backend (usually via the supervisor)
+#     superresearch "my topic"      # one-shot CLI research run
+#     superresearch agent connect   # delegates to `pipx run superresearch-agent`
+#
+# `superresearch` is a PURE DROP-IN for `python research.py` — identical flags,
+# no new verbs. Running from a source checkout (`pip install -r requirements.txt`
+# then `python research.py …`) keeps working exactly as before; packaging is
+# purely additive. Invocation-aware help (research.py `_PROG`) shows whichever
+# prefix matches how the process was launched.
+#
+# Flat layout: research.py imports sibling top-level modules (models/prompts/
+# vision/narrate) and the `auth` package, and reads scripts/dg-supervisor.env.example
+# at runtime via Path(__file__).parent — so all of those ship in the wheel and
+# land beside research.py in site-packages. The supervisor re-execs research.py
+# by its on-disk __file__, which resolves to site-packages/research.py in an
+# installed build, so --resurrect autostart keeps working. The chat-runtime
+# agent stays its OWN package (`superresearch-agent`, see agent/pyproject.toml);
+# `superresearch agent …` delegates to it via pipx rather than bundling it.
+#
+# Canonical install is pipx (one isolated venv per app), which keeps the
+# top-level module/package names (research, auth, scripts, …) collision-free.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superresearch"
+version = "0.1.0"
+description = "Super Research — multi-agent deep-research pipeline: topic → brief → 3× deep research → NotebookLM → audio/video → delivery, driven from the web app or a paired device."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Distributed Global" }]
+keywords = ["research", "automation", "playwright", "agents", "super-research"]
+classifiers = [
+    "License :: Other/Proprietary License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Private :: Do Not Upload",
+]
+# Runtime deps mirror requirements.txt (minus the test-only ones, which move to
+# the [dev] extra). Keep this list and requirements.txt in sync.
+dependencies = [
+    "anthropic>=0.40",
+    "playwright>=1.40",
+    "patchright>=1.59",
+    "markdownify>=0.14",
+    "requests>=2.31",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "Pillow>=10.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "websockets>=13.0",
+    "pydantic>=2.0",
+    "google-cloud-firestore>=2.20",
+    "google-auth>=2.30",
+    "keyring>=25",
+    "qrcode>=7.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://superresearch.io"
+
+[project.scripts]
+# Installed console command. `superresearch = research:main` makes `superresearch`
+# a drop-in for `python research.py` (research.py:main dispatches every flag and
+# the `agent` front door identically).
+superresearch = "research:main"
+
+[tool.setuptools]
+# Flat layout — explicit lists (NOT auto-discovery) so we ship exactly the
+# pipeline modules + auth/scripts and never the agent/, tests/, logs/, queues/,
+# or runtime *.json/*.log files sitting in the repo root.
+py-modules = ["research", "models", "prompts", "vision", "narrate"]
+packages = ["auth", "scripts"]
+
+[tool.setuptools.package-data]
+# scripts/dg-supervisor.env.example is copied to .dg-supervisor.env on first run
+# (research.py _seed_env_file_if_missing reads it from Path(__file__).parent/"scripts").
+scripts = ["dg-supervisor.env.example"]
+
+# NOTE: intentionally NO [tool.ruff] / [tool.pytest.ini_options] here. The repo
+# has run ruff + pytest on their defaults (no root config) — adding tool config
+# would silently change linting/test behavior across the whole tree. Packaging
+# stays purely additive. The agent keeps its own config in agent/pyproject.toml.

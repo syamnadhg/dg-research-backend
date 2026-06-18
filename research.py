@@ -110,6 +110,35 @@ if sys.stderr is not None:
 
 PROFILE_DIR = Path.home() / ".super-research" / "browser-profile"
 
+
+def _prog_name() -> str:
+    """The command users should type to re-invoke this CLI, matching HOW the
+    process was launched:
+
+      • `superresearch`        — when run as the installed console script
+                                  (`pipx install superresearch`).
+      • `python research.py`   — when run from a source checkout.
+
+    Detected from the basename of sys.argv[0] (the console-script wrapper is
+    named `superresearch` / `superresearch.exe`; a checkout run shows
+    `research.py`). Keeps every help string / "Next" hint / error message
+    accurate for both install routes without duplicating the text. Computed
+    once at import; the per-process launch identity never changes mid-run."""
+    try:
+        base = Path(sys.argv[0] or "").name
+    except Exception:
+        return "python research.py"
+    stem = base[:-4] if base.lower().endswith(".exe") else base
+    return "superresearch" if stem.lower() == "superresearch" else "python research.py"
+
+
+# Canonical prog prefix for user-facing command strings. The command-reference
+# card, the per-subcommand "Next" block, --doctor's manual-step hints, and the
+# argparse usage/epilog all render commands authored as `python research.py …`
+# and swap this prefix in at the render boundary, so the displayed prefix always
+# matches the actual invocation (drop-in `superresearch …` vs `python research.py …`).
+_PROG = _prog_name()
+
 # Stamped by argparse dispatch in __main__ (research.py:~31320). Worker 1 is
 # the primary serve (FE-facing port 8000, heartbeats, currentRunId writes,
 # orphan-sweeps, hard_reset orchestration). Workers ≥2 are silent siblings
@@ -1729,6 +1758,10 @@ def _render_next_actions(items: list[tuple[str, str]]):
     adjacent tooling so they're not hunting through --help or memory."""
     if not items:
         return
+    # Commands are authored as `python research.py …`; swap in the prefix that
+    # matches how this process was launched (drop-in `superresearch` when
+    # installed). Done before width calc so column alignment uses the real text.
+    items = [(cmd.replace("python research.py", _PROG), desc) for cmd, desc in items]
     bar = _rule("┈")
     cmd_width = min(max(len(c) for c, _ in items), 40)
     print()
@@ -3031,7 +3064,7 @@ def init_firebase():
     install_uuid = _ks.install_uuid()
     if _ks.try_recover(install_uuid) is None:
         log(
-            "Firestore init: keystore empty — run `python research.py --pair` "
+            f"Firestore init: keystore empty — run `{_PROG} --pair` "
             "to establish a refresh token.",
             "ERROR",
         )
@@ -3842,7 +3875,7 @@ async def _revoked_recovery_loop():
                     f"[relink] giving up after {MAX_RECOVERY_WALLCLOCK_SEC}s "
                     "(device doc TTL likely expired) — exiting so supervisor "
                     "stops respawning into the same dead loop. Owner must "
-                    "run `python research.py --pair` to recover.",
+                    f"run `{_PROG} --pair` to recover.",
                     "ERROR",
                 )
                 await asyncio.sleep(0.5)
@@ -3921,7 +3954,7 @@ async def _revoked_recovery_loop():
                 log(
                     "[relink] exiting --serve so subscriptions reload "
                     "(supervisor will respawn within ~5s; "
-                    "unsupervised installs need `python research.py --serve`).",
+                    f"unsupervised installs need `{_PROG} --serve`).",
                     "INFO",
                 )
                 # Give the log line a beat to flush before we go.
@@ -35573,6 +35606,78 @@ async def _pair_prompt_api_keys(uid: str):
             print(f"  {_c(_DIM, '─')}  Skipped Gemini — set later from the web app (Account → API Config).")
 
 
+def _chrome_install_hint() -> str:
+    """OS-appropriate one-liner for installing real Google Chrome — the browser
+    the pipeline drives via channel='chrome' (research.py:~16137). We never
+    auto-install it (needs admin/sudo + an assumed package manager); --pair and
+    --doctor surface this hint when Chrome is absent."""
+    plat = _supervisor_platform()
+    if plat == "Windows":
+        return "Install Google Chrome:  winget install --id Google.Chrome -e   (or google.com/chrome)"
+    if plat == "Darwin":
+        return "Install Google Chrome:  brew install --cask google-chrome   (or google.com/chrome)"
+    if plat == "Linux":
+        return ("Install Google Chrome:  apt install google-chrome-stable  /  dnf install google-chrome-stable "
+                "(add Google's repo first, or grab the .deb/.rpm from google.com/chrome)")
+    return "Install Google Chrome from google.com/chrome"
+
+
+def _ensure_chrome_ready(*, auto_install: bool = True, quiet: bool = False) -> "tuple[bool, str]":
+    """Verify the browser stack the pipeline drives — real Google Chrome plus
+    patchright's stealth wrapper for channel='chrome' — and, when auto_install,
+    fetch the wrapper if it's missing (`patchright install chrome`).
+
+    This is the one network step a fresh `pipx install superresearch` needs
+    before its first --pair browser logins: pip installs the patchright PACKAGE
+    but not the browser that channel='chrome' resolves to. Idempotent — when the
+    wrapper + Chrome are already present the probe just returns ok in a few
+    seconds. Never raises; real Chrome itself is an OS-level dep we only detect
+    and guide. Returns (ok, detail). Sync (subprocess) — call via asyncio.to_thread
+    from async callers."""
+    import subprocess as _sp
+
+    def _probe() -> "tuple[bool, str]":
+        code = (
+            "from patchright.sync_api import sync_playwright; "
+            "pp=sync_playwright().start(); "
+            "b=pp.chromium.launch(headless=True, channel='chrome'); "
+            "b.close(); pp.stop(); "
+            "print('OK')"
+        )
+        try:
+            r = _sp.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=90)
+        except Exception as e:
+            return False, str(e)[:160]
+        out = ((r.stdout or "") + " " + (r.stderr or "")).strip()
+        return (r.returncode == 0 and "OK" in (r.stdout or "")), out
+
+    ok, detail = _probe()
+    if ok:
+        return True, "Chrome + patchright wrapper ready"
+
+    low = detail.lower()
+    wrapper_missing = (
+        "executable doesn't exist" in low or "playwright install" in low
+        or "browsertype.launch" in low or "no such file" in low
+    )
+    if wrapper_missing and auto_install:
+        if not quiet:
+            print(f"  {_c(_DIM, 'Fetching the Chrome stealth wrapper (patchright install chrome) — one-time…')}")
+        pcli = shutil.which("patchright")
+        install_cmd = ([pcli, "install", "chrome"] if pcli
+                       else [sys.executable, "-m", "patchright", "install", "chrome"])
+        try:
+            _sp.run(install_cmd, capture_output=True, text=True, timeout=600)
+        except Exception:
+            pass
+        ok, detail = _probe()
+        if ok:
+            return True, "Chrome + patchright wrapper ready (wrapper fetched)"
+
+    # Still not launchable → real Google Chrome is likely absent (OS-level dep).
+    return False, detail or "Chrome not launchable"
+
+
 async def cmd_pair_v2(profile_dir: "str | None" = None):
     """Track D user-mode pair (post-D5c default — plain `--pair` routes
     here on fresh installs).
@@ -35841,7 +35946,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             )
             _cleanup_partial_pair(captured_device_id)
             log(
-                "Cleanup done. Re-run `python research.py --pair` to try "
+                f"Cleanup done. Re-run `{_PROG} --pair` to try "
                 "again from a clean slate.",
                 "INFO",
             )
@@ -36126,7 +36231,7 @@ async def _continue_pair_stages_2_to_5(
         print(f"  {_c(_OK, '✓')}  On Startup will be enabled after the logins finish.")
     else:
         print(f"  {_c(_DIM, '     Skipped. You will run --serve manually in step 5.')}")
-        print(f"  {_c(_DIM, '     Enable later with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
+        print(f"  {_c(_DIM, '     Enable later with:')}  {_c(_BOLD, f'{_PROG} --resurrect')}")
     # Mirror the Stage 2 intent to the device doc so the FE Account-page
     # On Startup toggle flips in real time. The actual supervisor arm
     # still happens in Stage 5; if it fails the user can fix via
@@ -36165,6 +36270,25 @@ async def _continue_pair_stages_2_to_5(
     print(f"  {_c(_DIM, 'Walking through logins one platform at a time.')}")
     print(f"  {_c(_DIM, 'Each tab opens, you log in, then press Enter — vision verifies the session.')}")
     print(f"  {_c(_DIM, 'If a Pro-tier check trips, you decide whether to continue, retry, or skip.')}")
+    print("")
+
+    # Make sure the browser the pipeline drives is actually launchable before we
+    # open login tabs. A fresh `pipx install superresearch` ships the patchright
+    # PACKAGE but not the Chrome wrapper the channel resolves to — fetch it once
+    # here. Real Chrome itself is an OS-level dep: if it's missing, surface an
+    # install hint and stop cleanly rather than crash mid-login.
+    _chrome_ok, _chrome_detail = await asyncio.to_thread(_ensure_chrome_ready)
+    if _chrome_ok:
+        print(f"  {_c(_OK, '✓')}  Browser ready  {_c(_DIM, '· Google Chrome + patchright wrapper')}")
+    else:
+        # ADVISORY ONLY — never abort here. The headless probe can false-negative
+        # on a machine where the real (headful) launch below works fine, so we
+        # surface the install hint but still attempt the launch — that's the
+        # real source of truth. A genuinely-missing Chrome fails at browser.start().
+        print(f"  {_c(_WARN, '⚠')}  Chrome readiness check didn't pass — trying to launch anyway.")
+        if _chrome_detail:
+            print(f"       {_c(_DIM, _chrome_detail[:140])}")
+        print(f"       {_c(_DIM, 'If logins fail to open:')}  {_c(_BOLD, _chrome_install_hint())}")
     print("")
 
     browser = Browser(profile_dir, headless=False)
@@ -36208,8 +36332,8 @@ async def _continue_pair_stages_2_to_5(
                 print(f"    • {s}")
             print("")
             print(f"  {_c(_BOLD, 'To complete this account switch:')}")
-            print(f"    1. {_c(_BOLD, 'python research.py --unpair --deep')}  {_c(_DIM, '(clears pairing state + browser profile)')}")
-            print(f"    2. {_c(_BOLD, 'python research.py --pair')}  {_c(_DIM, '(re-runs the full flow with a fresh browser)')}")
+            print(f"    1. {_c(_BOLD, f'{_PROG} --unpair --deep')}  {_c(_DIM, '(clears pairing state + browser profile)')}")
+            print(f"    2. {_c(_BOLD, f'{_PROG} --pair')}  {_c(_DIM, '(re-runs the full flow with a fresh browser)')}")
             print("")
             try:
                 emit_event("security_pair_refused",
@@ -36491,7 +36615,7 @@ async def _continue_pair_stages_2_to_5(
                     print(f"  {_c(_WARN, '⚠')}  Only Windows / macOS / Linux desktop is supported.")
                 else:
                     print(f"  {_c(_WARN, '⚠')}  Could not enable On Startup: {info}")
-                print(f"  {_c(_DIM, '     Run manually with:')}  {_c(_BOLD, 'python research.py --resurrect')}")
+                print(f"  {_c(_DIM, '     Run manually with:')}  {_c(_BOLD, f'{_PROG} --resurrect')}")
         else:
             # User chose N to On Startup. Enforce that: remove any
             # previously-installed scheduled task + kill any running
@@ -36531,7 +36655,7 @@ async def _continue_pair_stages_2_to_5(
         else:
             print(f"  {_c(_BOLD + _ACCENT, '  The bond is forged.')}  {_c(_DIM, 'Start the backend in this terminal to accept jobs:')}")
             print()
-            print(f"       {_c(_BOLD, 'python research.py --serve')}")
+            print(f"       {_c(_BOLD, f'{_PROG} --serve')}")
             print()
             print(
                 f"  {_c(_BOLD + _BRIGHT, '◇')}  "
@@ -36558,7 +36682,7 @@ async def _continue_pair_stages_2_to_5(
                 print(f"        {mark}  {name if ok else _c(_DIM, name)}")
             print("")
         print(f"  {_c(_DIM, 'Your token is saved. Re-run when ready:')}")
-        print(f"        {_c(_BOLD, 'python research.py --pair')}")
+        print(f"        {_c(_BOLD, f'{_PROG} --pair')}")
         print("")
 
 
@@ -38034,8 +38158,8 @@ def run_daemon_loop(port: int = 8000):
                     except Exception as _ke:
                         log(
                             f"[daemon-loop] Keystore wipe failed: {_ke}. The user "
-                            f"may need to run `python research.py --unpair && "
-                            f"python research.py --pair` to recover manually.",
+                            f"may need to run `{_PROG} --unpair && "
+                            f"{_PROG} --pair` to recover manually.",
                             "ERROR",
                         )
         except KeyboardInterrupt:
@@ -38423,7 +38547,7 @@ def run_resurrect():
         _setup_step(1, 4, "Pre-flight")
         if not paired_uid:
             print(f"  {_c(_WARN, '⚠')} Device not paired yet.")
-            print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, 'python research.py --pair')} {_c(_DIM, 'first, then retry --resurrect.')}")
+            print(f"  {_c(_DIM, '     Run')} {_c(_BOLD, f'{_PROG} --pair')} {_c(_DIM, 'first, then retry --resurrect.')}")
             return
         print(f"  {_c(_OK, '✓')}  Pairing complete on this machine")
         _seed_env_file_if_missing()
@@ -39529,6 +39653,9 @@ def run_commands_help():
     def _section(title, rows):
         print(f"  {_c(_BOLD, title)}")
         print(f"  {_rule(max_width=64)}")
+        # Swap the authored `python research.py` prefix for the real invocation
+        # (`superresearch` when installed) before measuring/printing.
+        rows = [(cmd.replace("python research.py", _PROG), desc) for cmd, desc in rows]
         # Align command column; longest command wins the padding budget.
         pad = max(len(cmd) for cmd, _desc in rows)
         for cmd, desc in rows:
@@ -39619,7 +39746,7 @@ def run_commands_help():
     # under the Linux branch; Windows + macOS users never saw the full set.
     print(f"  {_c(_DIM, '  (Cross-platform: Windows Scheduled Task / macOS LaunchAgent / Linux systemd-user)')}")
     print(f"  {_c(_DIM, '• Config file: .dg-supervisor.env  (template at scripts/dg-supervisor.env.example)')}")
-    print(f"  {_c(_DIM, '• Pipeline broken? Run')}  {_c(_BOLD, 'python research.py --doctor')}  {_c(_DIM, 'to diagnose + auto-fix.')}")
+    print(f"  {_c(_DIM, '• Pipeline broken? Run')}  {_c(_BOLD, f'{_PROG} --doctor')}  {_c(_DIM, 'to diagnose + auto-fix.')}")
     print(f"  {_c(_DIM, '• Full docs: README.md   ·   ARCHITECTURE.md')}")
     print()
 
@@ -39710,10 +39837,14 @@ def run_doctor():
         # relying on a try/except inside -c. 60s timeout because cold
         # Chromium boot on slow hardware (Crostini, low-power) can take
         # a while; this probe runs once per `--doctor`, not per request.
+        # Probe REAL Google Chrome via channel="chrome" — the exact browser the
+        # pipeline drives (research.py:~16137 launch_persistent_context(channel=
+        # "chrome")). Probing bundled Chromium instead would pass even when real
+        # Chrome / its patchright wrapper is missing, masking the actual failure.
         _probe = (
             "from patchright.sync_api import sync_playwright; "
             "pp=sync_playwright().start(); "
-            "b=pp.chromium.launch(headless=True); "
+            "b=pp.chromium.launch(headless=True, channel='chrome'); "
             "b.close(); pp.stop(); "
             "print('OK')"
         )
@@ -39725,10 +39856,15 @@ def run_doctor():
         _stderr = (_chromium_check.stderr or "").strip()
         _combined = (_stdout + " " + _stderr).lower()
         if _chromium_check.returncode == 0 and "OK" in _stdout:
-            _ok("Chromium binary", "patchright launches headless cleanly")
-        elif "executable doesn't exist" in _combined or "browsertype.launch" in _combined or "playwright install" in _combined:
-            _fail("Chromium binary missing", "run patchright install chromium")
-            manual_actions.append("patchright install chromium")
+            _ok("Chrome binary", "patchright launches Chrome (channel=chrome) headless cleanly")
+        elif "executable doesn't exist" in _combined or "browsertype.launch" in _combined or "playwright install" in _combined or "no such file" in _combined:
+            # Two distinct causes: the patchright Chrome wrapper isn't fetched
+            # yet (fixable with `patchright install chrome`), or real Google
+            # Chrome isn't installed on the OS at all (an OS-level dep). Surface
+            # both so a fresh pipx install knows what to do.
+            _fail("Chrome not launchable", "run patchright install chrome (and install Google Chrome if absent)")
+            manual_actions.append("patchright install chrome")
+            manual_actions.append(_chrome_install_hint())
         elif "modulenotfounderror" in _combined or "no module named" in _combined:
             _fail("patchright module not importable in subprocess", "venv mismatch?")
             manual_actions.append("source .venv/bin/activate && pip install -r requirements.txt")
@@ -39916,11 +40052,37 @@ def run_doctor():
             print()
             print(f"  {_c(_BOLD, 'Manual steps still required:')}")
             for i, a in enumerate(manual_actions, 1):
-                print(f"    {_c(_ACCENT, f'{i}.')} {a}")
+                print(f"    {_c(_ACCENT, f'{i}.')} {a.replace('python research.py', _PROG)}")
     print()
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
+
+def _delegate_agent_via_pipx(agent_args: "list[str]") -> int:
+    """Run the Super Research agent via pipx — the path used when the backend
+    was installed as a package (no in-tree agent/ sibling). The agent is its own
+    PyPI package (`superresearch-agent`); `pipx run` fetches + runs it in an
+    isolated venv, exactly as the install docs / chat-install flow do. Falls
+    back to `python -m pipx run …` when the pipx shim isn't on PATH yet, and
+    prints a clear pointer if pipx is missing entirely."""
+    pipx = shutil.which("pipx")
+    if pipx:
+        cmd = [pipx, "run", "superresearch-agent", *agent_args]
+    else:
+        # pipx not on PATH (e.g. just installed, shim not refreshed) — module
+        # form via the current interpreter dodges the PATH-refresh gap.
+        cmd = [sys.executable, "-m", "pipx", "run", "superresearch-agent", *agent_args]
+    try:
+        return subprocess.call(cmd)
+    except KeyboardInterrupt:
+        return 130
+    except FileNotFoundError:
+        shown = " ".join(agent_args) if agent_args else "connect"
+        print("The Super Research agent runs via pipx, which isn't installed.")
+        print("Install pipx (https://pipx.pypa.io), then run:")
+        print(f"  pipx run superresearch-agent {shown}")
+        return 2
+
 
 def main():
     # Super Agent (chat-runtime bridge) — `python research.py agent <…>`
@@ -39935,20 +40097,28 @@ def main():
     # agent's own subcommands/flags pass straight through. (A research topic of
     # literally "agent" is shadowed — phrase it differently, e.g. "AI agents".)
     if len(sys.argv) > 1 and sys.argv[1] in ("agent", "--agent"):
+        agent_args = sys.argv[2:]
         agent_dir = Path(__file__).resolve().parent / "agent"
-        if not (agent_dir / "facade" / "__main__.py").exists():
-            print("Super Agent package not found at agent/ — incomplete checkout?")
-            raise SystemExit(2)
-        try:
-            rc = subprocess.call([sys.executable, "-m", "facade", *sys.argv[2:]],
-                                 cwd=str(agent_dir))
-        except KeyboardInterrupt:
-            rc = 130
-        raise SystemExit(rc)
+        if (agent_dir / "facade" / "__main__.py").exists():
+            # Source checkout: run the in-tree agent package directly (cwd=agent/
+            # so `-m facade` resolves; the agent owns its own deps + process).
+            try:
+                rc = subprocess.call([sys.executable, "-m", "facade", *agent_args],
+                                     cwd=str(agent_dir))
+            except KeyboardInterrupt:
+                rc = 130
+            raise SystemExit(rc)
+        # Installed build (`pipx install superresearch`): the agent is its own
+        # separately-published package, `superresearch-agent`. Delegate to the
+        # canonical `pipx run superresearch-agent …` path end-users use, so
+        # `superresearch agent connect` keeps working without bundling (and
+        # without duplicating) the agent inside this wheel.
+        raise SystemExit(_delegate_agent_via_pipx(agent_args))
 
     parser = argparse.ArgumentParser(
+        prog=_PROG,
         description="Multi-Agent Deep Research Pipeline",
-        epilog="Chat-runtime (Hermes / OpenClaw) commands:  python research.py agent --help"
+        epilog=f"Chat-runtime (Hermes / OpenClaw) commands:  {_PROG} agent --help"
                "   (bare  agent  /  --agent  → smart entry: status or connect)",
     )
     parser.add_argument("topic", nargs="?", help="Research topic")
@@ -40070,7 +40240,7 @@ def main():
         return
 
     if not args.topic:
-        parser.error('Provide topic: python research.py "Your topic"')
+        parser.error(f'Provide topic: {_PROG} "Your topic"')
 
     log(f"Topic: {args.topic}")
     if args.brief_file:
