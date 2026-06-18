@@ -47,10 +47,28 @@ _warned_plaintext = False
 
 
 def _try_keyring() -> Any | None:
+    """Return the keyring module only when a REAL backend is wired.
+
+    On a headless host with no OS keyring (the common WSL / bare-Linux case),
+    keyring auto-selects its ``fail.Keyring`` sentinel, which doesn't error until
+    you actually call get/set — surfacing a noisy "No recommended backend was
+    available" WARNING on every token read. That absence is expected here, not a
+    failure, so we detect the sentinel (and a chainer with nothing viable) up
+    front and quietly fall back to the file store. A genuine backend error still
+    propagates to the callers' WARNING path."""
     try:
         import keyring  # type: ignore[import-not-found]
+        from keyring.backends import fail  # type: ignore[import-not-found]
 
-        keyring.get_keyring()  # raises if no backend wired
+        kr = keyring.get_keyring()
+        if isinstance(kr, fail.Keyring):
+            log.debug("no OS keyring backend; using file store")
+            return None
+        # A chainer with no usable backends behaves like fail.Keyring.
+        backends = getattr(kr, "backends", None)
+        if backends is not None and not backends:
+            log.debug("no OS keyring backend; using file store")
+            return None
         return keyring
     except Exception as e:  # pragma: no cover - environment-specific
         log.debug("keyring unavailable, falling back to file (%s)", e)
@@ -123,9 +141,12 @@ def save(blob: dict[str, str]) -> None:
             log.warning("keyring write failed, using file: %s", e)
     global _warned_plaintext
     if not _warned_plaintext:
-        log.warning(
-            "No OS keyring backend — storing the account refresh token UNENCRYPTED "
-            "at %s (filesystem ACLs only). Configure a keyring backend for at-rest "
+        # INFO, not WARNING: on a headless host with no OS keyring (WSL/bare
+        # Linux) this is the expected, only-available path — surfacing it as a
+        # WARNING just clutters the chat-relayed connect/login output.
+        log.info(
+            "No OS keyring backend — storing the account refresh token at %s "
+            "(filesystem ACLs only). Configure a keyring backend for at-rest "
             "encryption.",
             _FALLBACK_PATH,
         )
