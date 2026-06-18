@@ -36865,6 +36865,23 @@ def _kill_until_clean(enumerate_fn, kill_fn, timeout_s: float = 8.0) -> int:
         _t.sleep(0.5)
 
 
+def _launcher_path() -> str:
+    """Absolute path to the RUNNABLE launcher script for every re-exec — the
+    supervisor unit/task/plist and the daemon-loop's child respawns all run
+    `<python> <this> --serve|--daemon-loop …`.
+
+    In a source checkout this IS research.py (== __file__), so behavior is
+    unchanged. In a compiled (Nuitka) build the real code lives in research.<abi>.pyd
+    and __file__ points at the .pyd — which python can't execute as a script — so
+    we point at the readable research.py launcher shim the build ships beside it.
+    Falls back to __file__ if no sibling shim exists (defensive)."""
+    here = Path(__file__).resolve()
+    if here.suffix.lower() == ".py":
+        return str(here)                      # source checkout — this file runs directly
+    shim = here.with_name("research.py")      # compiled — sibling readable launcher shim
+    return str(shim if shim.exists() else here)
+
+
 def _supervisor_python_exe() -> str:
     """Return pythonw.exe (no-console interpreter) sibling of the current
     interpreter, falling back to sys.executable. Used for the Scheduled
@@ -37010,7 +37027,7 @@ def _arm_supervisor_macos() -> "tuple[bool, int | None, str, int]":
         return False, None, f"could not create dirs: {e}", 0
 
     python_exe = sys.executable
-    script_path = str(Path(__file__).resolve())
+    script_path = _launcher_path()
     env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
     plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -37233,7 +37250,7 @@ def _arm_supervisor_linux() -> "tuple[bool, int | None, str, int]":
         return False, None, f"could not create dirs: {e}", 0
 
     python_exe = sys.executable
-    script_path = str(Path(__file__).resolve())
+    script_path = _launcher_path()
     env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
 
     # Capture display env from the CURRENT shell (the one running
@@ -37661,7 +37678,7 @@ def run_daemon_loop(port: int = 8000):
     import subprocess as _subprocess
     import time as _time
 
-    script_path = str(Path(__file__).resolve())
+    script_path = _launcher_path()
     _log_dir = Path(script_path).parent
     _serve_log = _log_dir / "backend.log"
     _serve_err = _log_dir / "backend.err.log"
@@ -38347,7 +38364,7 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
     # quoted arg that Python loads via _load_env_file() before subcommand
     # dispatch.
     python_exe = _supervisor_python_exe()
-    script_path = str(Path(__file__).resolve())
+    script_path = _launcher_path()
     env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
     task_run = f'"{python_exe}" "{script_path}" --daemon-loop --env-file "{env_file}"'
 
@@ -38635,7 +38652,7 @@ def run_resurrect():
     # would otherwise pop a visible daemon-loop terminal. Falls back to
     # sys.executable if pythonw.exe isn't installed alongside.
     python_exe = _supervisor_python_exe()
-    script_path = str(Path(__file__).resolve())
+    script_path = _launcher_path()
     env_file = _SUPERVISOR_ENV_FILE_DEFAULT_PATH
     # Use the full path to python.exe so the task runs even if PATH isn't set
     # up for the scheduler's session. Quote both to tolerate spaces.
