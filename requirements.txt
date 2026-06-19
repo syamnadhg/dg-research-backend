@@ -42,6 +42,13 @@ google-auth>=2.30
 # ~/.super-research/ on headless Linux without secret-service.
 keyring>=25
 
+# Process hygiene — orphan-Chrome cleanup after Stop/respawn, sibling
+# dual-spawn detection (worker-lock PID-liveness), and the unpair process
+# sweep. Every `import psutil` is try/except-guarded (a missing psutil
+# degrades those features rather than crashing), but it IS a real runtime
+# dep, so declare it — a fresh install should get full process hygiene.
+psutil>=5.9
+
 # Setup QR code rendering
 qrcode>=7.4
 
