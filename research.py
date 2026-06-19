@@ -40139,9 +40139,11 @@ def run_unpair(deep: bool = False):
 
 
 def run_commands_help():
-    """Branded CLI command reference. Listed by use-case (daily / lifecycle /
-    advanced / debugging) rather than alphabetically, since users learn the
-    workflow not the argparse layout. Use --help for the full argparse dump."""
+    """The `superresearch --help` / `-h` screen — a branded command reference
+    grouped by use-case (daily / lifecycle / agent / advanced / diagnostics)
+    rather than the raw argparse flag dump, since users learn the workflow not
+    the parser layout. This is the single discovery surface (the old separate
+    `--commands` flag was folded into --help)."""
     _branded_header("manuale", _BOLD + _ACCENT, "command reference")
     print()
 
@@ -40223,10 +40225,8 @@ def run_commands_help():
          "Wrapper that keeps --serve alive; spawned by the supervisor"),
         ("python research.py --verbose",
          "Tee extra logs to stdout (combine with any other command)"),
-        ("python research.py --help",
-         "Full argparse dump — all flags + types"),
-        ("python research.py --commands",
-         "This screen"),
+        ("python research.py --version",
+         "Print the installed version (+ any available update)"),
     ])
 
     # Platform-specific hint surfaced at the bottom so users don't miss it.
@@ -40907,9 +40907,12 @@ def main():
     parser = argparse.ArgumentParser(
         prog=_PROG,
         description="Multi-Agent Deep Research Pipeline",
+        add_help=False,  # -h/--help shows our branded, grouped command reference (run_commands_help)
         epilog=f"Chat-runtime (Hermes / OpenClaw) commands:  {_PROG} agent --help"
                "   (bare  agent  /  --agent  → smart entry: status or connect)",
     )
+    parser.add_argument("-h", "--help", action="store_true", dest="show_help",
+        help="Show the Super Research command reference (grouped by use-case).")
     parser.add_argument("topic", nargs="?", help="Research topic")
     parser.add_argument("--pdf", action="append", default=[], help="PDF to attach (Phase 1)")
     parser.add_argument("--brief-file", "-b", help="Existing brief file (skip Phase 1)")
@@ -40945,9 +40948,6 @@ def main():
         help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the On Startup scheduled task.")
     parser.add_argument("--env-file", default=None,
         help=f"Path to KEY=value env file. Default: <script_dir>/.dg-supervisor.env (silently skipped if missing).")
-    parser.add_argument("--commands", action="store_true",
-        help="Print a branded reference card of every Super Research CLI command, grouped by use-case. "
-             "Lighter-weight than --help; designed for at-a-glance recall.")
     parser.add_argument("--doctor", action="store_true",
         help="Diagnose + auto-repair common Super Research issues (pair state / Firebase / "
              "Chromium binary / supervisor unit / port 8000 / Linux DISPLAY propagation). "
@@ -40991,7 +40991,7 @@ def main():
     # sentinel — subsequent process starts skip the work.
     _migrate_legacy_api_keys()
 
-    if args.commands:
+    if args.show_help:
         run_commands_help()
         return
 

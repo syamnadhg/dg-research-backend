@@ -980,6 +980,25 @@ def cmd_device(args: argparse.Namespace) -> int:
         print(f"{_OK} Now running on: {d.get('name') or d.get('id')}  ({kind})")
         return 0
 
+    if getattr(args, "device_command", None) == "add":
+        with b.spinner("Pairing the device"):
+            res = _bridge_post("/device/pair", {"code": args.code})
+        if res is None or res[0] != 200:
+            print(f"{_NO} couldn't add device: {_err(res)}")
+            return 1
+        d = res[1]
+        nm = d.get("deviceName") or d.get("deviceId") or "device"
+        print(f"{_OK} Added {nm}{' (now selected)' if d.get('selected') else ''}.")
+        return 0
+
+    if getattr(args, "device_command", None) == "remove":
+        res = _bridge_post("/device/remove", {"deviceId": args.deviceId})
+        if res is None or res[0] != 200:
+            print(f"{_NO} couldn't remove device: {_err(res)}")
+            return 1
+        print(f"{_OK} Removed device {args.deviceId}.")
+        return 0
+
     dr = _bridge_get("/devices")
     if dr is None or dr[0] != 200:
         print(f"{_NO} list devices failed: {dr[1] if dr else 'no response'}")
@@ -1346,6 +1365,54 @@ def cmd_stop(_args: argparse.Namespace) -> int:
     return 1
 
 
+def _local_superresearch() -> "str | None":
+    """Path to the Super Research backend CLI on THIS machine, if installed (the
+    agent + backend are co-located in the standard setup). None if absent."""
+    import shutil as _sh
+    return _sh.which("superresearch")
+
+
+def cmd_version(_args: argparse.Namespace) -> int:
+    """Show the agent version AND the Super Research backend version (the backend
+    is the thing that runs research; the agent just drives it)."""
+    b.header("versio", "versions", tagline_color=branding._BOLD + branding._ACCENT)
+    print(f"\n  {b.c(branding._BOLD, 'Agent')} (superresearch-agent)   {b.c(branding._BOLD, 'v' + __version__)}")
+    sr = _local_superresearch()
+    if sr:
+        import subprocess as _sp
+        try:
+            out = _sp.run([sr, "--version"], capture_output=True, text=True, timeout=15).stdout.strip()
+        except Exception:
+            out = ""
+        print(f"  {b.c(branding._BOLD, 'Super Research')} (backend)   {b.c(branding._BOLD, (out.replace('Super Research', '').strip() or '(version unknown)'))}")
+    else:
+        print(f"  {b.c(branding._BOLD, 'Super Research')} (backend)   {b.c(branding._DIM, 'not installed on this machine')}")
+    print()
+    return 0
+
+
+def cmd_update(_args: argparse.Namespace) -> int:
+    """Update the Super Research backend (delegates to `superresearch --update`).
+    The backend is the package that does the research; update the chat agent
+    itself separately with `pipx upgrade superresearch-agent`."""
+    b.header("renovatio", "update Super Research", tagline_color=branding._BOLD + branding._ACCENT)
+    sr = _local_superresearch()
+    if not sr:
+        print(f"\n  {_NO} Super Research isn't installed on this machine.")
+        print(f"     {b.c(branding._DIM, 'The backend runs on the paired device — update it there.')}")
+        print()
+        return 1
+    import subprocess as _sp
+    print(f"\n  Updating Super Research (the backend) …")
+    try:
+        rc = _sp.call([sr, "--update"])
+    except KeyboardInterrupt:
+        return 130
+    print(f"  {b.c(branding._DIM, 'Update the chat agent itself with:')}  {b.c(branding._BOLD, 'pipx upgrade superresearch-agent')}")
+    print()
+    return rc
+
+
 def cmd_home(args: argparse.Namespace) -> int:
     """Bare `agent` / `--agent` (no subcommand): smart entry — show status when the
     agent is set up (a chat runtime is connected OR the bridge holds a signed-in
@@ -1435,6 +1502,12 @@ def build_parser() -> argparse.ArgumentParser:
     use = dvsub.add_parser("use", parents=[common], help="select the device to run on")
     use.add_argument("deviceId", help="deviceId to run on (from `agent device`)")
     use.set_defaults(func=cmd_device)
+    dvadd = dvsub.add_parser("add", parents=[common], help="pair a new device by its on-screen pair code")
+    dvadd.add_argument("code", help="the pair code shown on the new device's screen")
+    dvadd.set_defaults(func=cmd_device)
+    dvrm = dvsub.add_parser("remove", parents=[common], help="unlink a device from your account")
+    dvrm.add_argument("deviceId", help="deviceId to remove (from `agent device`)")
+    dvrm.set_defaults(func=cmd_device)
 
     sub.add_parser("logout", parents=[common], help="clear the account session").set_defaults(func=cmd_logout)
     sub.add_parser("doctor", parents=[common], help="run health + connectivity diagnostics").set_defaults(func=cmd_doctor)
@@ -1472,14 +1545,23 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("phases", nargs="+", help="phase numbers or names to skip")
     sk.set_defaults(func=cmd_skip)
 
-    sub.add_parser("stop", parents=[common], help="stop the running host bridge").set_defaults(func=cmd_stop)
+    sub.add_parser("stop", parents=[common],
+                   help="stop the bridge process NOW (it returns on next login if it's pinned)"
+                   ).set_defaults(func=cmd_stop)
 
     sub.add_parser("resurrect", parents=[common],
                    help="run the bridge in the background + on every login (windowless)"
                    ).set_defaults(func=cmd_resurrect)
     sub.add_parser("retire", parents=[common],
-                   help="stop the background bridge + remove the login pin"
+                   help="stop the bridge AND unpin it from login startup (won't return until 'resurrect')"
                    ).set_defaults(func=cmd_retire)
+
+    sub.add_parser("version", parents=[common],
+                   help="show the agent + Super Research backend versions"
+                   ).set_defaults(func=cmd_version)
+    sub.add_parser("update", parents=[common],
+                   help="update the Super Research backend to the latest published version"
+                   ).set_defaults(func=cmd_update)
 
     v = sub.add_parser("verify", parents=[common],
                        help="P0 gate proof: read researches + list devices (+ optional enqueue)")
