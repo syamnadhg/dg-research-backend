@@ -38736,14 +38736,18 @@ def run_resurrect():
             print(f"  {_c(_WARN, '⚠')}  {info or 'daemon-loop did not appear within 5s'} — {_kind} will retry ({_retry_hint}).")
         # API health probe (matches Windows handoff's _local_api_health call).
         import time as _time_pos
+        _api_ok, _api_detail = False, ""
         with _sync_spinner_ctx("Waiting for API"):
-            _time_pos.sleep(2)  # let uvicorn finish startup
-            _api_ok, _api_detail = _local_api_health()
+            for _hb_attempt in range(24):  # 24 × 1.5s = 36s — covers a compiled multi-worker cold start
+                _time_pos.sleep(1.5)
+                _api_ok, _api_detail = _local_api_health()
+                if _api_ok:
+                    break
         if _api_ok:
             print(f"  {_c(_OK, '✓')}  API responding ({_api_detail})")
         else:
-            print(f"  {_c(_WARN, '⚠')}  API not responding yet: {_api_detail}")
-            print(f"  {_c(_DIM, '     daemon-loop may still be initializing — curl localhost:8000/api/health in ~30s.')}")
+            print(f"  {_c(_WARN, '⚠')}  API still warming up: {_api_detail}")
+            print(f"  {_c(_DIM, '     A compiled multi-worker start can take a bit — it should come online shortly. Check the app, or curl localhost:8000/api/health.')}")
 
         # ── Final flourish + next actions (matches Windows path) ──
         print()
@@ -38976,7 +38980,7 @@ def run_resurrect():
                 _api_ok = False
                 _api_detail = ""
                 with _SyncSpinnerCtx("Waiting for API"):
-                    for _hb_attempt in range(8):  # 8 × 1.5s = 12s
+                    for _hb_attempt in range(24):  # 24 × 1.5s = 36s — covers a compiled multi-worker cold start
                         _time.sleep(1.5)
                         _api_ok, _api_detail = _local_api_health()
                         if _api_ok:
@@ -38984,8 +38988,8 @@ def run_resurrect():
                 if _api_ok:
                     print(f"  {_c(_OK, '✓')}  API responding ({_api_detail})")
                 else:
-                    print(f"  {_c(_WARN, '⚠')}  API not responding yet: {_api_detail}")
-                    print(f"  {_c(_DIM, '     daemon-loop may still be initializing — give it ~30s, then curl /api/health.')}")
+                    print(f"  {_c(_WARN, '⚠')}  API still warming up: {_api_detail}")
+                    print(f"  {_c(_DIM, '     A compiled multi-worker start can take a bit — it should come online shortly. Check the app, or curl localhost:8000/api/health.')}")
             else:
                 print(f"  {_c(_WARN, '⚠')}  Backend did not appear within 5s — check backend.err.log.")
                 print(f"  {_c(_DIM, '     The scheduled task still fires at next login as a fallback.')}")
