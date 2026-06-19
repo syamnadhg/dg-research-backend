@@ -40806,55 +40806,65 @@ def _spawn_detached_lifecycle(action: str) -> bool:
 
 def _self_update() -> int:
     """`superresearch --update` — upgrade the installed package via pipx (detached,
-    so pipx can rebuild the venv this process runs from)."""
+    so pipx can rebuild the venv this process runs from). Branded + crisp, matching
+    the other subcommands."""
+    _branded_header("renovatio", _BOLD + _ACCENT, "renew · update Super Research")
     if _is_source_checkout():
-        print("  You're running Super Research from a source checkout — update with:  git pull")
+        print(f"  Source checkout — update with  {_c(_BOLD, 'git pull')}.")
+        print()
         return 0
     if _pipx_cmd() is None:
-        print("  pipx not found. Update manually:  pipx upgrade superresearch")
+        print(f"  {_c(_WARN, '⚠')}  pipx not found — update manually:  {_c(_BOLD, 'pipx upgrade superresearch')}")
+        print()
         return 1
-    print("  Updating Super Research via pipx — running in the background because this")
-    print("  command must exit first so pipx can rebuild the environment it runs from.")
+    _newer = _newer_version_notice()
+    if _newer:
+        print(f"  Updating  {_c(_DIM, 'v' + _sr_version())}  →  {_c(_BOLD + _OK, 'v' + _newer)}")
+    else:
+        print(f"  Updating Super Research  {_c(_DIM, '(current: v' + _sr_version() + ')')}")
     if _spawn_detached_lifecycle("upgrade"):
-        print(f"  Upgrade scheduled (progress -> {_STATE_DIR / 'upgrade.log'}).")
-        print("  Re-run  superresearch --version  in ~20s to confirm. If On Startup was")
-        print("  enabled, run  superresearch --resurrect  afterwards to relaunch it.")
+        print(f"  {_c(_OK, '✓')}  Update running — completes a moment after this exits.")
+        print(f"  {_c(_DIM, 'Confirm with')}  {_c(_BOLD, _PROG + ' --version')}  {_c(_DIM, 'in ~20s. If On Startup was on, then')}  {_c(_BOLD, _PROG + ' --resurrect')}{_c(_DIM, '.')}")
+        print()
         return 0
-    print("  Could not start the background upgrade. From a NEW shell, run:")
-    print("    pipx upgrade superresearch")
+    print(f"  {_c(_WARN, '⚠')}  Couldn't start the update. Run:  {_c(_BOLD, 'pipx upgrade superresearch')}")
+    print()
     return 1
 
 
 def _self_uninstall() -> int:
-    """`superresearch --uninstall` — remove the installed package via pipx (detached,
-    so pipx can delete the venv this process runs from). Leaves ~/.super-research/
-    (logins + pairing) intact; --unpair is the full disconnect."""
+    """`superresearch --uninstall` — remove the installed package via pipx. Detached
+    by necessity: pipx cannot delete the venv THIS process runs from on Windows, so
+    a tiny helper finishes the removal the instant this command exits. Leaves
+    ~/.super-research/ (logins + pairing) intact; --unpair is the full disconnect.
+    Branded + crisp, matching the other subcommands."""
+    _branded_header("vale", _BOLD + _RED, "farewell · remove Super Research")
     if _is_source_checkout():
-        print("  You're running from a source checkout — nothing to uninstall.")
-        print("  To disconnect this machine, run:  python research.py --unpair")
+        print("  Source checkout — nothing to uninstall.")
+        print(f"  To disconnect this machine:  {_c(_BOLD, _PROG + ' --unpair')}")
+        print()
         return 0
     if _pipx_cmd() is None:
-        print("  pipx not found. Uninstall manually:  pipx uninstall superresearch")
+        print(f"  {_c(_WARN, '⚠')}  pipx not found — uninstall manually:  {_c(_BOLD, 'pipx uninstall superresearch')}")
+        print()
         return 1
     try:
-        ans = input("  Remove the Super Research backend (pipx uninstall superresearch)? [y/N] ").strip().lower()
+        ans = input(f"  Remove the Super Research backend?  {_c(_DIM, '[y/N]')} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         ans = ""
     if ans not in ("y", "yes"):
-        print("  Cancelled.")
+        print(f"  {_c(_DIM, 'Cancelled — nothing removed.')}")
+        print()
         return 0
-    print("  Uninstalling in the background — this command must exit first so pipx can")
-    print("  remove the environment it runs from (running it inline self-locks the venv")
-    print("  on Windows, which leaves a half-deleted venv husk).")
     if _spawn_detached_lifecycle("uninstall"):
-        print("  Removal scheduled — it finishes a few seconds after this exits")
-        print(f"  (progress -> {_STATE_DIR / 'uninstall.log'}).")
-        print("  Logins + pairing in ~/.super-research/ are left intact — run")
-        print("  superresearch --unpair  FIRST for a full disconnect (and --retire if you")
-        print("  enabled On Startup, so the scheduled task isn't left dangling).")
+        print()
+        print(f"  {_c(_OK, '✓')}  Super Research removed.")
+        print(f"  {_c(_DIM, 'Finalizing in the background (~3s) — verify with')}  {_c(_BOLD, 'pipx list')}{_c(_DIM, '.')}")
+        print(f"  {_c(_DIM, 'Logins kept in ~/.super-research; run')}  {_c(_BOLD, _PROG + ' --unpair')}  {_c(_DIM, 'to fully disconnect.')}")
+        print()
         return 0
-    print("  Could not start the background uninstall. From a NEW shell, run:")
-    print("    pipx uninstall superresearch")
+    print(f"  {_c(_WARN, '⚠')}  Couldn't start the uninstall. Run:  {_c(_BOLD, 'pipx uninstall superresearch')}")
+    print()
     return 1
 
 
@@ -40947,9 +40957,19 @@ def main():
     parser.add_argument("--uninstall", action="store_true",
         help="Uninstall the Super Research backend (via pipx). Keeps your logins + pairing; "
              "run --unpair first for a full disconnect.")
-    parser.add_argument("--version", action="version", version=f"superresearch {_sr_version()}",
-        help="Print the installed Super Research version and exit.")
+    parser.add_argument("--version", action="store_true", dest="show_version",
+        help="Print the installed Super Research version (+ any available update) and exit.")
     args = parser.parse_args()
+
+    if args.show_version:
+        print(f"  {_c(_BOLD + _ACCENT, 'Super')} {_c(_BOLD, 'Research')}  {_c(_BOLD, 'v' + _sr_version())}")
+        try:
+            _newer = _newer_version_notice()
+        except Exception:
+            _newer = None
+        if _newer:
+            print(f"  {_c(_OK, '⬆')}  {_c(_DIM, 'v' + _newer + ' available — run')}  {_c(_BOLD, _PROG + ' --update')}")
+        return 0
 
     # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand
     # (--serve, --daemon-loop, --resurrect, etc.) inherits the same values.
