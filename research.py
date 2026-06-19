@@ -40952,8 +40952,8 @@ def main():
         help="Diagnose + auto-repair common Super Research issues (pair state / Firebase / "
              "Chromium binary / supervisor unit / port 8000 / Linux DISPLAY propagation). "
              "First thing to run when something feels wrong. Non-destructive — never unpairs or deletes user data.")
-    parser.add_argument("--update", action="store_true",
-        help="Update Super Research to the latest published version (via pipx).")
+    parser.add_argument("--update", "--upgrade", action="store_true", dest="update",
+        help="Update Super Research to the latest published version (via pipx). Alias: --upgrade.")
     parser.add_argument("--uninstall", action="store_true",
         help="Uninstall the Super Research backend (via pipx). Keeps your logins + pairing; "
              "run --unpair first for a full disconnect.")

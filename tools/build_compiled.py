@@ -64,12 +64,44 @@ The pipeline is compiled into _sr_core.<abi>.pyd (Nuitka). This readable stub is
 the only first-party top-level source file in the wheel; it exists so the
 `superresearch` console entry (research:main), `python research.py ...`, and the
 windowless pythonw supervisor re-exec all keep working (a .pyd can't be run as a
-script and needs a stable importable name). It just hands off to main()."""
+script and needs a stable importable name).
+
+The heavy `_sr_core` import is LAZY (inside main()), so `--version` is INSTANT
+instead of paying the ~3s native-extension import that every other command needs.
+`main` stays the module attribute the console entry (research:main) resolves to."""
 import sys
-from _sr_core import main  # re-exported so `research:main` resolves to the core
+
+
+def main():
+    # Fast path: print version (+ cached upgrade nudge) WITHOUT importing the
+    # heavy compiled core. Keeps `--version` snappy; the nudge is read from the
+    # 24h cache other commands populate (no network here).
+    if "--version" in sys.argv:
+        try:
+            from importlib.metadata import version as _v
+            cur = _v("superresearch")
+        except Exception:
+            cur = "?"
+        print("  Super Research  v" + cur)
+        try:
+            import json, os
+            _cache = os.path.join(os.path.expanduser("~"), ".super-research", ".version_check.json")
+            latest = (json.load(open(_cache)).get("latest") or "") if os.path.exists(_cache) else ""
+            def _gt(a, b):
+                def _p(v): return [int("".join(c for c in s if c.isdigit()) or 0) for s in str(v).split(".")]
+                return _p(a) > _p(b)
+            if latest and cur != "?" and _gt(latest, cur):
+                print("  \\u2191  v" + latest + " available \\u2014 run: superresearch --update")
+        except Exception:
+            pass
+        return 0
+    from _sr_core import main as _core_main  # lazy: only pay the import when needed
+    return _core_main()
+
+
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except KeyboardInterrupt:
         print("\\n  Cancelled. Re-run when ready.")
         sys.exit(130)
