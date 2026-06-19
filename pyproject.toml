@@ -32,7 +32,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superresearch"
-version = "0.1.0"
+version = "0.1.1"
 description = "Super Research — multi-agent deep-research pipeline: topic → brief → 3× deep research → NotebookLM → audio/video → delivery, driven from the web app or a paired device."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -3368,9 +3368,15 @@ HEARTBEAT_REINIT_THRESHOLD = 3  # consecutive fails before reinit_firebase()
 # personal-usage scale.
 HEARTBEAT_INTERVAL_SEC = 5
 
-RESEARCH_CONFIG_PATH = Path(__file__).parent / "research_config.json"
+# Pairing/runtime state lives in the stable per-user state dir (~/.super-research/),
+# NOT next to the code. In a pipx-installed build the code dir is the venv's
+# site-packages, which a `pipx upgrade`/reinstall recreates — storing the pairing
+# identity there would orphan the device on every upgrade. _migrate_state_to_home()
+# (called from main) moves any pre-relocation file out of the old code dir once.
+_STATE_DIR = Path.home() / ".super-research"
+RESEARCH_CONFIG_PATH = _STATE_DIR / "research_config.json"
 # Legacy path — auto-migrated on first load so existing users don't lose their token.
-_LEGACY_PIPE_CONFIG_PATH = Path(__file__).parent / "pipe_config.json"
+_LEGACY_PIPE_CONFIG_PATH = _STATE_DIR / "pipe_config.json"
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -3385,6 +3391,7 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     deviceId — which would mint a fresh deviceId on the next pair
     and orphan the Firestore device doc."""
     import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)  # ensure ~/.super-research/ exists
     parent = str(path.parent)
     fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=path.name + ".", suffix=".tmp")
     try:
@@ -3403,6 +3410,38 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         except Exception:
             pass
         raise
+
+
+def _migrate_state_to_home() -> None:
+    """Move pre-relocation pairing/runtime state out of the code dir into the
+    stable ~/.super-research/ state dir. Older builds stored research_config.json
+    / pipe_config.json / run_analytics.json next to the code (site-packages in a
+    pipx build); a `pipx upgrade`/reinstall recreates that dir and would orphan
+    the paired device. Best-effort + idempotent: each file is moved only if the
+    new home doesn't already have it. No-op on a fresh install or once migrated."""
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    try:
+        _old_dir = Path(_launcher_path()).parent
+    except Exception:
+        return
+    try:
+        if _old_dir.resolve() == _STATE_DIR.resolve():
+            return  # already co-located (shouldn't happen, but never self-move)
+    except Exception:
+        pass
+    import shutil as _shutil
+    for _name in ("research_config.json", "pipe_config.json", "run_analytics.json"):
+        try:
+            _old = _old_dir / _name
+            _new = _STATE_DIR / _name
+            if _old.exists() and not _new.exists():
+                _shutil.move(str(_old), str(_new))
+                log(f"[migrate] moved {_name} -> {_STATE_DIR}", "INFO")
+        except Exception:
+            pass
 
 
 # ── Device registry (multi-device support) ─────────────────────────────────
@@ -4639,7 +4678,7 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
 
 # ── Run Analytics (phase duration tracking for realistic ETAs) ────────────
 
-ANALYTICS_PATH = Path(__file__).parent / "run_analytics.json"
+ANALYTICS_PATH = _STATE_DIR / "run_analytics.json"
 _phase_averages: dict[int, float] = {}  # phase → avg duration in seconds
 
 # Reasonable defaults when no analytics exist yet. Based on observed runs
@@ -34528,7 +34567,11 @@ async def run_server(port=8000):
     # Start worker directly (don't rely on @app.on_event which is deprecated and
     # sometimes doesn't fire reliably with newer FastAPI versions)
     # Initialize Firebase Admin SDK for Firestore bridge
-    init_firebase()
+    if sys.stdout and sys.stdout.isatty():
+        async with _async_spinner_ctx("Connecting to Firestore"):
+            await asyncio.to_thread(init_firebase)
+    else:
+        init_firebase()
     # Load run analytics for realistic ETAs
     load_analytics()
     # Track D: device identity loads via load_device_id() / the OS
@@ -34846,8 +34889,13 @@ async def run_server(port=8000):
                 # paused_backend_restart mark); for the owner tree_uid ==
                 # owner_uid == paired_uid. Worker-gating, the _SkipRehydration
                 # sentinel, the sharer loop, and the aggregate log line stay here.
-                _own_r, _own_o = await _rehydrate_ongoing_for_tree(
-                    paired_uid, paired_uid, _rehydrated_rids)
+                if sys.stdout and sys.stdout.isatty():
+                    async with _async_spinner_ctx("Recovering interrupted runs"):
+                        _own_r, _own_o = await _rehydrate_ongoing_for_tree(
+                            paired_uid, paired_uid, _rehydrated_rids)
+                else:
+                    _own_r, _own_o = await _rehydrate_ongoing_for_tree(
+                        paired_uid, paired_uid, _rehydrated_rids)
                 rehydrated += _own_r
                 orphaned += _own_o
                 # #724 item 3 (flag-gated): the scan above is OWNER-tree only.
@@ -34879,13 +34927,20 @@ async def run_server(port=8000):
                                 ]
                     except Exception as _se:
                         log(f"[rehydrate:sharers] sharedWith read failed ({_se}) — owner-only rehydration", "WARN")
-                    for _sharer_uid in _sharers:
-                        try:
-                            _sr, _so = await _rehydrate_ongoing_for_tree(_sharer_uid, paired_uid, _rehydrated_rids)
-                            rehydrated += _sr
-                            orphaned += _so
-                        except Exception as _she:
-                            log(f"[rehydrate:sharers] tree {_sharer_uid[:12]}… scan failed ({_she}) — skipping", "WARN")
+                    async def _scan_sharer_trees():
+                        nonlocal rehydrated, orphaned
+                        for _sharer_uid in _sharers:
+                            try:
+                                _sr, _so = await _rehydrate_ongoing_for_tree(_sharer_uid, paired_uid, _rehydrated_rids)
+                                rehydrated += _sr
+                                orphaned += _so
+                            except Exception as _she:
+                                log(f"[rehydrate:sharers] tree {_sharer_uid[:12]}… scan failed ({_she}) — skipping", "WARN")
+                    if _sharers and sys.stdout and sys.stdout.isatty():
+                        async with _async_spinner_ctx(f"Recovering interrupted runs ({len(_sharers)} devices)"):
+                            await _scan_sharer_trees()
+                    else:
+                        await _scan_sharer_trees()
                     if _sharers:
                         log(f"[rehydrate:sharers] scanned {len(_sharers)} sharer tree(s) (sharer-rehydration armed)")
                 if rehydrated or orphaned:
@@ -35002,7 +35057,11 @@ async def run_server(port=8000):
     # ownerDisplayName are written by the claim Cloud Function;
     # name + os are written by initiate-pair and user-editable from
     # the FE Account-page tile.
-    _meta = _fetch_device_meta()
+    if sys.stdout and sys.stdout.isatty():
+        async with _async_spinner_ctx("Loading device identity"):
+            _meta = await asyncio.to_thread(_fetch_device_meta)
+    else:
+        _meta = _fetch_device_meta()
     _paired_email = _meta.get("ownerEmail", "") or ""
     _paired_name = _meta.get("ownerDisplayName", "") or ""
     if _paired_name and _paired_email:
@@ -35786,6 +35845,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     pair_completed = False
     try:
         try:
+            print(f"  {_c(_DIM, 'Requesting a pair code…')}")
             result = await v2_flow.do_pair_v2(
                 poll_secret_hash=poll_secret_hash,
                 machine_name=hostname,
@@ -35841,51 +35901,52 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         # expireAt (cancels the 5-min "must confirm" TTL set by the claim
         # Cloud Function). Best-effort — if this fails the heartbeat at
         # Stage 5 still writes both via the same path.
-        if _pair_patch_device(
-            result["device_id"],
-            {"pairConfirmedAt": True},
-            delete_fields=["expireAt"],
-        ):
-            _pt("device confirmed in Firestore — FE tile should appear")
-        else:
-            _pt("device-confirm patch failed (heartbeat will retry)", "WARN")
-
-        # Owner-lookup via Firestore REST GET, authed with the freshly-
-        # minted idToken. Sidesteps the cold gRPC client init (~10-15s on
-        # Windows the first time) that init_firestore_user_scoped does, so
-        # the "Linked to {name} ({email})" banner shows the real owner
-        # instead of falling back to the synth uid. Bounded by a 10s HTTP
-        # timeout + graceful fallback — pair never blocks here.
-        owner_uid = result["uid"]
-        owner_label = ""
-        owner_email = ""
-        try:
-            from auth.v2_flow import PROJECT_ID as _PID
-            import requests as _requests
-            _id_token = result["credentials"].token  # set by RefreshTokenCredentials.bootstrap
-            _url = (
-                f"https://firestore.googleapis.com/v1/projects/{_PID}"
-                f"/databases/(default)/documents/devices/{result['device_id']}"
-            )
-            _resp = await asyncio.to_thread(
-                _requests.get,
-                _url,
-                headers={"Authorization": f"Bearer {_id_token}"},
-                timeout=10,
-            )
-            if _resp.status_code == 200:
-                _fields = (_resp.json() or {}).get("fields", {}) or {}
-                _owner_field = (_fields.get("ownerUid") or {}).get("stringValue") or ""
-                _label = (_fields.get("ownerDisplayName") or {}).get("stringValue") or ""
-                _email = (_fields.get("ownerEmail") or {}).get("stringValue") or ""
-                owner_uid = _owner_field or owner_uid
-                owner_label = _label or (_email.split("@")[0] if _email else "")
-                owner_email = _email
-                _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r} email={owner_email!r}")
+        async with _async_spinner_ctx("Confirming with Super Research"):
+            if _pair_patch_device(
+                result["device_id"],
+                {"pairConfirmedAt": True},
+                delete_fields=["expireAt"],
+            ):
+                _pt("device confirmed in Firestore — FE tile should appear")
             else:
-                _pt(f"owner read HTTP {_resp.status_code} — falling back", "DEBUG")
-        except Exception as e:
-            _pt(f"owner lookup failed: {e} (falling back)", "DEBUG")
+                _pt("device-confirm patch failed (heartbeat will retry)", "WARN")
+
+            # Owner-lookup via Firestore REST GET, authed with the freshly-
+            # minted idToken. Sidesteps the cold gRPC client init (~10-15s on
+            # Windows the first time) that init_firestore_user_scoped does, so
+            # the "Linked to {name} ({email})" banner shows the real owner
+            # instead of falling back to the synth uid. Bounded by a 10s HTTP
+            # timeout + graceful fallback — pair never blocks here.
+            owner_uid = result["uid"]
+            owner_label = ""
+            owner_email = ""
+            try:
+                from auth.v2_flow import PROJECT_ID as _PID
+                import requests as _requests
+                _id_token = result["credentials"].token  # set by RefreshTokenCredentials.bootstrap
+                _url = (
+                    f"https://firestore.googleapis.com/v1/projects/{_PID}"
+                    f"/databases/(default)/documents/devices/{result['device_id']}"
+                )
+                _resp = await asyncio.to_thread(
+                    _requests.get,
+                    _url,
+                    headers={"Authorization": f"Bearer {_id_token}"},
+                    timeout=10,
+                )
+                if _resp.status_code == 200:
+                    _fields = (_resp.json() or {}).get("fields", {}) or {}
+                    _owner_field = (_fields.get("ownerUid") or {}).get("stringValue") or ""
+                    _label = (_fields.get("ownerDisplayName") or {}).get("stringValue") or ""
+                    _email = (_fields.get("ownerEmail") or {}).get("stringValue") or ""
+                    owner_uid = _owner_field or owner_uid
+                    owner_label = _label or (_email.split("@")[0] if _email else "")
+                    owner_email = _email
+                    _pt(f"owner resolved — uid={owner_uid[:14]}… label={owner_label!r} email={owner_email!r}")
+                else:
+                    _pt(f"owner read HTTP {_resp.status_code} — falling back", "DEBUG")
+            except Exception as e:
+                _pt(f"owner lookup failed: {e} (falling back)", "DEBUG")
 
         # Re-write research_config.json with the REAL owner uid in
         # paired_uid. The earlier save (right after exchange) used the
@@ -36054,7 +36115,8 @@ async def _walk_platform_logins(
                 platform_ok = True
                 break
             try:
-                cua_ok = await verify_login_cua(tab, key, cua_client)
+                async with _async_spinner_ctx("Verifying sign-in"):
+                    cua_ok = await verify_login_cua(tab, key, cua_client)
             except Exception as e:
                 log(f"    CUA verify error for {key}: {e}", "WARN")
                 cua_ok = False
@@ -36277,7 +36339,8 @@ async def _continue_pair_stages_2_to_5(
     # PACKAGE but not the Chrome wrapper the channel resolves to — fetch it once
     # here. Real Chrome itself is an OS-level dep: if it's missing, surface an
     # install hint and stop cleanly rather than crash mid-login.
-    _chrome_ok, _chrome_detail = await asyncio.to_thread(_ensure_chrome_ready)
+    async with _async_spinner_ctx("Checking the browser"):
+        _chrome_ok, _chrome_detail = await asyncio.to_thread(_ensure_chrome_ready)
     if _chrome_ok:
         print(f"  {_c(_OK, '✓')}  Browser ready  {_c(_DIM, '· Google Chrome + patchright wrapper')}")
     else:
@@ -36292,7 +36355,8 @@ async def _continue_pair_stages_2_to_5(
     print("")
 
     browser = Browser(profile_dir, headless=False)
-    await browser.start()
+    async with _async_spinner_ctx("Launching the browser"):
+        await browser.start()
 
     # F4 / DGOPS-7451 — refuse to add a Google account to a profile that
     # already has one signed in. Multi-account state in this profile is
@@ -38416,25 +38480,53 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
         getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         if sys.platform == "win32" else 0
     )
+    # Capture the spawned daemon-loop's raw stdout/stderr to backend.err.log
+    # instead of DEVNULL. The daemon-loop reassigns its own stdio to the
+    # backend logs once running (research.py ~37695), but a crash in the window
+    # BEFORE that — the _sr_core import, a native-extension load, an early
+    # dispatch error — would otherwise vanish into DEVNULL, leaving the device
+    # silently offline (the exact failure this fixes). Append so we never
+    # clobber the daemon's own redirect target.
+    _log_dir = Path(script_path).parent
+    try:
+        _boot_fh = open(_log_dir / "backend.err.log", "a", encoding="utf-8")
+    except Exception:
+        _boot_fh = None
     try:
         _subprocess.Popen(
             [python_exe, script_path, "--daemon-loop"],
             creationflags=_DETACHED | _NEWGROUP,
-            stdout=_subprocess.DEVNULL,
-            stderr=_subprocess.DEVNULL,
+            stdout=(_boot_fh or _subprocess.DEVNULL),
+            stderr=(_boot_fh or _subprocess.DEVNULL),
             stdin=_subprocess.DEVNULL,
             close_fds=True,
         )
     except Exception as e:
+        if _boot_fh:
+            _boot_fh.close()
         return True, None, f"spawn failed: {e}", killed_serve_count
 
-    deadline = _time.time() + 5.0
+    # Poll up to 30s, not 5s. A freshly pipx-installed COMPILED build has a slow
+    # cold start: the daemon-loop imports the heavy native deps (playwright,
+    # grpc/firestore, anthropic) before it's detectable, and a first-ever launch
+    # also races Windows Defender scanning the just-extracted .pyd files. The old
+    # 5s window expired mid-import and wrongly reported "did not appear," leaving
+    # On-Startup armed but the device offline. 30s comfortably covers the cold
+    # start (a warm --serve reaches Firestore-init in ~7s); we still return the
+    # instant a daemon-loop is detected, so a warm start is no slower.
+    deadline = _time.time() + 30.0
     while _time.time() < deadline:
         _time.sleep(0.5)
         for pid, _cmd, role in _enumerate_research_py_procs():
             if role == "daemon-loop":
+                if _boot_fh:
+                    _boot_fh.close()
                 return True, pid, "", killed_serve_count
-    return True, None, "daemon-loop did not appear within 5s", killed_serve_count
+    if _boot_fh:
+        _boot_fh.close()
+    return True, None, (
+        f"daemon-loop did not appear within 30s — check backend.err.log in {_log_dir}"
+    ), killed_serve_count
 
 
 def _disarm_supervisor_quiet() -> "tuple[str, int]":
@@ -38535,7 +38627,8 @@ def run_resurrect():
         # the banner shows "VivobookPro" / "Rocky (alice@example.com)"
         # instead of the raw deviceId UUID / uid[:8] prefix. Best-effort —
         # drops back to the raw values on any failure.
-        _meta_b = _fetch_device_meta_rest()
+        with _sync_spinner_ctx("Reading device info"):
+            _meta_b = _fetch_device_meta_rest()
         device_name = (
             (_meta_b.get("name") if isinstance(_meta_b.get("name"), str) else "")
             or (_meta_b.get("hostname") if isinstance(_meta_b.get("hostname"), str) else "")
@@ -38588,13 +38681,15 @@ def run_resurrect():
             print(f"  {_c(_DIM, '     Run:')} {_c(_BOLD, f'sudo loginctl enable-linger {_linger_user}')}")
             print(f"  {_c(_DIM, '     (continuing — supervisor still works while logged in)')}")
         if plat == "Darwin":
-            ok, daemon_pid, info, killed_serve = _arm_supervisor_macos()
+            with _sync_spinner_ctx("Installing & starting supervisor"):
+                ok, daemon_pid, info, killed_serve = _arm_supervisor_macos()
             if not ok:
                 print(f"  {_c(_WARN, '⚠')}  launchd install failed: {info}")
                 return
             print(f"  {_c(_OK, '✓')}  LaunchAgent installed ({_SUPERVISOR_PLIST_LABEL})")
         else:
-            ok, daemon_pid, info, killed_serve = _arm_supervisor_linux()
+            with _sync_spinner_ctx("Installing & starting supervisor"):
+                ok, daemon_pid, info, killed_serve = _arm_supervisor_linux()
             if not ok:
                 print(f"  {_c(_WARN, '⚠')}  systemctl install failed: {info}")
                 return
@@ -38623,8 +38718,9 @@ def run_resurrect():
             print(f"  {_c(_WARN, '⚠')}  {info or 'daemon-loop did not appear within 5s'} — {_kind} will retry ({_retry_hint}).")
         # API health probe (matches Windows handoff's _local_api_health call).
         import time as _time_pos
-        _time_pos.sleep(2)  # let uvicorn finish startup
-        _api_ok, _api_detail = _local_api_health()
+        with _sync_spinner_ctx("Waiting for API"):
+            _time_pos.sleep(2)  # let uvicorn finish startup
+            _api_ok, _api_detail = _local_api_health()
         if _api_ok:
             print(f"  {_c(_OK, '✓')}  API responding ({_api_detail})")
         else:
@@ -38679,7 +38775,8 @@ def run_resurrect():
     # banner shows "VivobookPro" / "Rocky (alice@example.com)" instead of
     # the raw deviceId UUID / uid[:8] prefix. Best-effort — drops back to
     # the raw values on any failure.
-    _meta_b = _fetch_device_meta_rest()
+    with _sync_spinner_ctx("Reading device info"):
+        _meta_b = _fetch_device_meta_rest()
     device_name = (
         (_meta_b.get("name") if isinstance(_meta_b.get("name"), str) else "")
         or (_meta_b.get("hostname") if isinstance(_meta_b.get("hostname"), str) else "")
@@ -38727,8 +38824,9 @@ def run_resurrect():
         "/F",                   # overwrite existing
     ]
     try:
-        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                                 creationflags=_PS_NO_WINDOW)
+        with _sync_spinner_ctx("Pinning Scheduled Task"):
+            result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                     creationflags=_PS_NO_WINDOW)
     except Exception as e:
         print(f"  {_c(_WARN, '⚠')}  Failed to run schtasks: {e}")
         return
@@ -38745,7 +38843,8 @@ def run_resurrect():
     print(f"  {_c(_DIM, '     Executes:')} {task_run}")
 
     # Layer respawn policy onto the task — PT5M repetition + restart-on-failure.
-    _ok, _msg = _apply_supervisor_respawn_policy()
+    with _sync_spinner_ctx("Applying respawn policy"):
+        _ok, _msg = _apply_supervisor_respawn_policy()
     if _ok:
         print(f"  {_c(_OK, '✓')}  Respawn policy applied (5-min repetition + restart-on-failure)")
     else:
@@ -38928,7 +39027,8 @@ def run_retire():
         # the banner shows "VivobookPro" / "Rocky (alice@example.com)"
         # instead of the raw deviceId UUID / uid[:8] prefix. Best-effort —
         # drops back to the raw values on any failure.
-        _meta_b = _fetch_device_meta_rest()
+        with _sync_spinner_ctx("Reading device info"):
+            _meta_b = _fetch_device_meta_rest()
         device_name = (
             (_meta_b.get("name") if isinstance(_meta_b.get("name"), str) else "")
             or (_meta_b.get("hostname") if isinstance(_meta_b.get("hostname"), str) else "")
@@ -38976,7 +39076,8 @@ def run_retire():
         # ── [1/3] Unbinding schedule ──
         _setup_step(1, 3, "Unbinding schedule")
         if plat == "Darwin":
-            status, killed_during_disarm = _disarm_supervisor_macos()
+            with _sync_spinner_ctx("Unbinding supervisor & stopping backend"):
+                status, killed_during_disarm = _disarm_supervisor_macos()
             if status == "removed":
                 print(f"  {_c(_OK, '✓')}  LaunchAgent removed ({_SUPERVISOR_PLIST_LABEL})")
             elif status == "no-task":
@@ -38984,7 +39085,8 @@ def run_retire():
             else:
                 print(f"  {_c(_WARN, '⚠')}  bootout returned: {status}")
         else:
-            status, killed_during_disarm = _disarm_supervisor_linux()
+            with _sync_spinner_ctx("Unbinding supervisor & stopping backend"):
+                status, killed_during_disarm = _disarm_supervisor_linux()
             if status == "removed":
                 print(f"  {_c(_OK, '✓')}  systemd user unit removed ({_SUPERVISOR_UNIT_NAME})")
             elif status == "no-task":
@@ -39027,7 +39129,8 @@ def run_retire():
     # banner shows "VivobookPro" / "Rocky (alice@example.com)" instead of
     # the raw deviceId UUID / uid[:8] prefix. Best-effort — drops back to
     # the raw values on any failure.
-    _meta_b = _fetch_device_meta_rest()
+    with _sync_spinner_ctx("Reading device info"):
+        _meta_b = _fetch_device_meta_rest()
     device_name = (
         (_meta_b.get("name") if isinstance(_meta_b.get("name"), str) else "")
         or (_meta_b.get("hostname") if isinstance(_meta_b.get("hostname"), str) else "")
@@ -39079,8 +39182,9 @@ def run_retire():
         "/F",
     ]
     try:
-        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                                 creationflags=_PS_NO_WINDOW)
+        with _sync_spinner_ctx("Removing Scheduled Task"):
+            result = _subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                     creationflags=_PS_NO_WINDOW)
     except Exception as e:
         print(f"  {_c(_WARN, '⚠')}  Failed to run schtasks: {e}")
         return
@@ -39261,23 +39365,24 @@ def run_unpair(deep: bool = False):
     # correctness — a clean-state guarantee outweighs the wall-clock
     # for a once-per-device-lifetime operation).
     if paired_uid and device_id:
-        try:
-            init_firebase()
-            global _firebase_db
-            if _firebase_db:
-                _swp_n, _swp_f = _sweep_stuck_research_docs_for_device(
-                    _firebase_db, paired_uid, device_id,
-                    stopped_by="unpair_sweep",
-                    summary="Cancelled by Unpair",
-                )
-                if _swp_n or _swp_f:
-                    log(f"[unpair] Firestore sweep marked {_swp_n} stale run(s) as stopped ({_swp_f} failed) — owner + sharer trees", "INFO")
+        with _sync_spinner_ctx("Removing this device's runs from your account"):
+            try:
+                init_firebase()
+                global _firebase_db
+                if _firebase_db:
+                    _swp_n, _swp_f = _sweep_stuck_research_docs_for_device(
+                        _firebase_db, paired_uid, device_id,
+                        stopped_by="unpair_sweep",
+                        summary="Cancelled by Unpair",
+                    )
+                    if _swp_n or _swp_f:
+                        log(f"[unpair] Firestore sweep marked {_swp_n} stale run(s) as stopped ({_swp_f} failed) — owner + sharer trees", "INFO")
+                    else:
+                        log("[unpair] Firestore sweep — no stale runs found (owner + sharers)", "DEBUG")
                 else:
-                    log("[unpair] Firestore sweep — no stale runs found (owner + sharers)", "DEBUG")
-            else:
-                log("[unpair] skipping Firestore sweep — init_firebase did not produce a client", "WARN")
-        except Exception as _sw_err:
-            log(f"[unpair] Firestore sweep failed (continuing): {_sw_err}", "WARN")
+                    log("[unpair] skipping Firestore sweep — init_firebase did not produce a client", "WARN")
+            except Exception as _sw_err:
+                log(f"[unpair] Firestore sweep failed (continuing): {_sw_err}", "WARN")
 
     # Best-effort server-side retire BEFORE we wipe the keystore. The
     # endpoint deletes the top-level devices/{deviceId} doc + revokes
@@ -39288,29 +39393,30 @@ def run_unpair(deep: bool = False):
     # wipe still happens and the FE Unlink button is the fallback.
     _retire_action = None
     if device_id:
-        try:
-            import requests as _requests
-            from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
-            _id_token = _fresh_user_mode_id_token()
-            if _id_token:
-                _resp = _requests.post(
-                    f"{_FE_BASE_URL}/api/devices/unpair-self",
-                    headers={"Authorization": f"Bearer {_id_token}"},
-                    json={"deviceId": device_id},
-                    timeout=15,
-                )
-                if _resp.status_code == 200:
-                    try:
-                        _retire_action = (_resp.json() or {}).get("action")
-                    except Exception:
-                        _retire_action = "retired"
-                else:
-                    log(
-                        f"[unpair] retire endpoint HTTP {_resp.status_code}: {_resp.text[:200]}",
-                        "WARN",
+        with _sync_spinner_ctx("Releasing this device from the server"):
+            try:
+                import requests as _requests
+                from auth.v2_flow import FE_BASE_URL as _FE_BASE_URL
+                _id_token = _fresh_user_mode_id_token()
+                if _id_token:
+                    _resp = _requests.post(
+                        f"{_FE_BASE_URL}/api/devices/unpair-self",
+                        headers={"Authorization": f"Bearer {_id_token}"},
+                        json={"deviceId": device_id},
+                        timeout=15,
                     )
-        except Exception as _re:
-            log(f"[unpair] retire endpoint failed (continuing): {_re}", "WARN")
+                    if _resp.status_code == 200:
+                        try:
+                            _retire_action = (_resp.json() or {}).get("action")
+                        except Exception:
+                            _retire_action = "retired"
+                    else:
+                        log(
+                            f"[unpair] retire endpoint HTTP {_resp.status_code}: {_resp.text[:200]}",
+                            "WARN",
+                        )
+            except Exception as _re:
+                log(f"[unpair] retire endpoint failed (continuing): {_re}", "WARN")
 
     # NOTE: no "nothing to do" short-circuit here even when local config is
     # missing. A prior --unpair (or manual config wipe) can leave orphan
@@ -39833,7 +39939,9 @@ def run_doctor():
         _fail("Not paired", "research_config.json missing or incomplete — run --pair")
         manual_actions.append("Run `python research.py --pair`")
 
-    if init_firebase():
+    with _sync_spinner_ctx("Checking Firestore connectivity"):
+        _fb_ok = init_firebase()
+    if _fb_ok:
         _ok("Firestore client", "user-mode (refresh-token credentials)")
     else:
         _fail("Firestore init failed", "OS keystore empty or refresh token revoked")
@@ -39868,10 +39976,11 @@ def run_doctor():
             "b.close(); pp.stop(); "
             "print('OK')"
         )
-        _chromium_check = _sp.run(
-            [sys.executable, "-c", _probe],
-            capture_output=True, text=True, timeout=60,
-        )
+        with _sync_spinner_ctx("Launching Chrome (headless) to verify it boots"):
+            _chromium_check = _sp.run(
+                [sys.executable, "-c", _probe],
+                capture_output=True, text=True, timeout=60,
+            )
         _stdout = (_chromium_check.stdout or "").strip()
         _stderr = (_chromium_check.stderr or "").strip()
         _combined = (_stdout + " " + _stderr).lower()
@@ -40093,6 +40202,7 @@ def _delegate_agent_via_pipx(agent_args: "list[str]") -> int:
         # form via the current interpreter dodges the PATH-refresh gap.
         cmd = [sys.executable, "-m", "pipx", "run", "superresearch-agent", *agent_args]
     try:
+        print("Fetching the Super Research agent (first run downloads it; this can take a moment)…")
         return subprocess.call(cmd)
     except KeyboardInterrupt:
         return 130
@@ -40102,6 +40212,77 @@ def _delegate_agent_via_pipx(agent_args: "list[str]") -> int:
         print("Install pipx (https://pipx.pypa.io), then run:")
         print(f"  pipx run superresearch-agent {shown}")
         return 2
+
+
+def _is_source_checkout() -> bool:
+    """True when running from a dev source tree (vs a pipx/pip-installed build).
+    Mirrors the agent front-door heuristic: the in-tree agent package exists only
+    in a checkout, never in an installed wheel."""
+    try:
+        return (Path(__file__).resolve().parent / "agent" / "facade" / "__main__.py").exists()
+    except Exception:
+        return False
+
+
+def _pipx_cmd() -> "list[str] | None":
+    """How to invoke pipx — prefer the `pipx` shim, fall back to `python -m pipx`;
+    None if pipx isn't available."""
+    import shutil as _shutil
+    if _shutil.which("pipx"):
+        return ["pipx"]
+    try:
+        r = subprocess.run([sys.executable, "-m", "pipx", "--version"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return [sys.executable, "-m", "pipx"]
+    except Exception:
+        pass
+    return None
+
+
+def _self_update() -> int:
+    """`superresearch --update` — upgrade the installed package via pipx."""
+    if _is_source_checkout():
+        print("  You're running Super Research from a source checkout — update with:  git pull")
+        return 0
+    pipx = _pipx_cmd()
+    if pipx is None:
+        print("  pipx not found. Update manually:  pipx upgrade superresearch")
+        return 1
+    print("  Updating Super Research via pipx …")
+    try:
+        return subprocess.call([*pipx, "upgrade", "superresearch"])
+    except KeyboardInterrupt:
+        return 130
+
+
+def _self_uninstall() -> int:
+    """`superresearch --uninstall` — remove the installed package via pipx. Leaves
+    ~/.super-research/ (logins + pairing) intact; --unpair is the full disconnect."""
+    if _is_source_checkout():
+        print("  You're running from a source checkout — nothing to uninstall.")
+        print("  To disconnect this machine, run:  python research.py --unpair")
+        return 0
+    pipx = _pipx_cmd()
+    if pipx is None:
+        print("  pipx not found. Uninstall manually:  pipx uninstall superresearch")
+        return 1
+    try:
+        ans = input("  Remove the Super Research backend (pipx uninstall superresearch)? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    if ans not in ("y", "yes"):
+        print("  Cancelled.")
+        return 0
+    print("  Uninstalling Super Research via pipx …")
+    try:
+        rc = subprocess.call([*pipx, "uninstall", "superresearch"])
+    except KeyboardInterrupt:
+        return 130
+    if rc == 0:
+        print("  Removed. Logins + pairing in ~/.super-research/ were left intact —")
+        print("  run  superresearch --unpair  BEFORE uninstalling for a full disconnect.")
+    return rc
 
 
 def main():
@@ -40134,6 +40315,11 @@ def main():
         # `superresearch agent connect` keeps working without bundling (and
         # without duplicating) the agent inside this wheel.
         raise SystemExit(_delegate_agent_via_pipx(agent_args))
+
+    # Relocate any pre-relocation pairing/runtime state into ~/.super-research/
+    # before anything reads it, so a pipx upgrade/reinstall can't orphan a paired
+    # device. Best-effort + idempotent; runs for every non-agent CLI invocation.
+    _migrate_state_to_home()
 
     parser = argparse.ArgumentParser(
         prog=_PROG,
@@ -40183,6 +40369,11 @@ def main():
         help="Diagnose + auto-repair common Super Research issues (pair state / Firebase / "
              "Chromium binary / supervisor unit / port 8000 / Linux DISPLAY propagation). "
              "First thing to run when something feels wrong. Non-destructive — never unpairs or deletes user data.")
+    parser.add_argument("--update", action="store_true",
+        help="Update Super Research to the latest published version (via pipx).")
+    parser.add_argument("--uninstall", action="store_true",
+        help="Uninstall the Super Research backend (via pipx). Keeps your logins + pairing; "
+             "run --unpair first for a full disconnect.")
     args = parser.parse_args()
 
     # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand
@@ -40208,6 +40399,12 @@ def main():
     if args.commands:
         run_commands_help()
         return
+
+    if args.update:
+        raise SystemExit(_self_update())
+
+    if args.uninstall:
+        raise SystemExit(_self_uninstall())
 
     if args.doctor:
         run_doctor()
