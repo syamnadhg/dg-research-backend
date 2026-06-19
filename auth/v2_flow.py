@@ -413,8 +413,26 @@ def init_firestore_user_scoped(install_uuid: str | None = None):
         creds.refresh(None)  # type: ignore[arg-type]
         return client
     except credentials.RevokedError:
+        # Re-read before wiping: under N concurrent worker processes a sibling
+        # may have rotated a fresh token into `current` in the gap between our
+        # read and POST (the per-process refresh lock can't serialise across
+        # processes). Only the token we POSTed was rejected — retry ONCE against
+        # whatever `current` holds now; only wipe if that ALSO fails. (RC-5)
+        try:
+            if keystore.try_recover(iuid) is not None:
+                creds2 = credentials.RefreshTokenCredentials(iuid, WEB_API_KEY)
+                client2 = _gcf.Client(project=PROJECT_ID, credentials=creds2)
+                creds2.refresh(None)  # type: ignore[arg-type]
+                return client2
+        except credentials.RevokedError:
+            pass  # re-read token ALSO revoked → genuine
+        except Exception:
+            # Transient (network) on the retry — token is intact; let the
+            # caller's reconnect path retry. Do NOT wipe.
+            raise
         log.warning(
-            "refresh token rejected — keystore wiped, caller should prompt re-pair"
+            "refresh token rejected (confirmed after re-read) — keystore wiped, "
+            "caller should prompt re-pair"
         )
-        keystore.clear_all(iuid)
+        keystore.clear_all(iuid, reason="revoke")
         return None

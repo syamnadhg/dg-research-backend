@@ -1756,6 +1756,19 @@ def _render_next_actions(items: list[tuple[str, str]]):
     likely follow-up commands with one-liner purposes. items = [(command,
     description), ...]. Gives the user a consistent discovery surface for
     adjacent tooling so they're not hunting through --help or memory."""
+    # pip-style upgrade nudge: when a NEWER version is published on PyPI, prepend
+    # an "update available" action so it surfaces in the Next block of whatever
+    # command the user just ran. Memoized + 24h-cached + fail-silent (see
+    # _check_newer_version) so it adds no real cost and never blocks.
+    try:
+        _newer = _newer_version_notice()
+    except Exception:
+        _newer = None
+    if _newer:
+        items = [(
+            "python research.py --update",
+            f"update available — v{_newer} is on PyPI (you have v{_sr_version()})",
+        )] + list(items)
     if not items:
         return
     # Commands are authored as `python research.py …`; swap in the prefix that
@@ -3818,7 +3831,11 @@ async def _firebase_reconnect_loop():
                 idx = 0
                 if pending_respawn and not _QUEUE_STATE.get("running"):
                     log("[reconnect] run finished — clean respawn to re-bind Firestore listeners", "INFO")
-                    _schedule_server_exit("firestore-reconnect")
+                    # Stagger the respawn by worker id so a shared blip doesn't
+                    # exit the whole fleet in lockstep (which would briefly drop
+                    # every worker → stale heartbeat → device flickers offline).
+                    # Worker 1 goes first, siblings follow 8s apart. (RC-29)
+                    _schedule_server_exit("firestore-reconnect", delay_sec=3.0 + (max(1, WORKER_ID) - 1) * 8.0)
                     pending_respawn = False
                 await asyncio.sleep(5)
                 continue
@@ -3844,7 +3861,8 @@ async def _firebase_reconnect_loop():
                     log("[reconnect] Firestore back, run active — rebuilt in-process; clean respawn deferred to idle to re-bind listeners", "INFO")
                 else:
                     log("[reconnect] Firestore reachable again — clean respawn to re-bind listeners", "INFO")
-                    _schedule_server_exit("firestore-reconnect")
+                    # Stagger by worker id so the fleet doesn't exit in lockstep. (RC-29)
+                    _schedule_server_exit("firestore-reconnect", delay_sec=3.0 + (max(1, WORKER_ID) - 1) * 8.0)
                 await asyncio.sleep(5)
             else:
                 if _firebase_down_reason == "revoked":
@@ -34571,7 +34589,11 @@ async def run_server(port=8000):
         async with _async_spinner_ctx("Connecting to Firestore"):
             await asyncio.to_thread(init_firebase)
     else:
-        init_firebase()
+        # Non-TTY (supervisor/pipe): the spinner can't animate, so emit one
+        # static progress line — otherwise the ~10-15s cold gRPC init is a
+        # silent gap that reads as "stuck". (F/RC-22)
+        log("Connecting to Firestore…")
+        await asyncio.to_thread(init_firebase)
     # Load run analytics for realistic ETAs
     load_analytics()
     # Track D: device identity loads via load_device_id() / the OS
@@ -35099,6 +35121,20 @@ async def run_server(port=8000):
     if _bat_serve:
         _ctx_rows_serve.append(("Power", _c(_DIM, _bat_serve)))
     _render_context_strip(_ctx_rows_serve)
+    # ADVISORY pre-bind port probe — NEVER fatal. If the port looks busy we only
+    # warn; we then let uvicorn attempt the bind anyway and the try/except around
+    # server.serve() below converts a REAL EADDRINUSE into a clean message + the
+    # stderr signature the supervisor's port-recovery greps for. (Earlier this
+    # probe did `raise SystemExit(3)` on a False result — a speculative gate in
+    # the critical startup path that could keep the API from ever binding; the
+    # bind itself is the authoritative source of truth, so the probe must not
+    # block it.) Runs in a thread so it never stalls the loop.
+    try:
+        if not await asyncio.to_thread(_wait_for_port_free, port, 6.0):
+            log(f"Port {port} looks busy at the pre-bind probe — binding anyway; "
+                f"uvicorn will surface a real conflict if one exists.", "WARN")
+    except Exception:
+        pass
     print()
     print(f"  {_c(_BOLD + _ACCENT, '  Listening for pipeline jobs.')}  {_c(_DIM, 'Keep this terminal open.')}")
     print()
@@ -35140,6 +35176,24 @@ async def run_server(port=8000):
     server = uvicorn.Server(config)
     try:
         await server.serve()
+    except OSError as _bind_err:
+        # TOCTOU: a racing process grabbed the port between our probe and
+        # uvicorn's bind. Echo the EADDRINUSE signature (supervisor port-recovery
+        # keys on it) and exit non-zero with a clean line instead of a raw trace.
+        _emsg = str(_bind_err).lower()
+        if (
+            "address already in use" in _emsg
+            or "10048" in _emsg
+            or "errno 98" in _emsg
+            or "only one usage of each socket address" in _emsg
+        ):
+            print(
+                f"[serve] bind failed: address already in use (EADDRINUSE) on port {port}",
+                file=sys.stderr, flush=True,
+            )
+            print(f"  {_c(_WARN, '⚠')}  Port {port} was taken at bind time — not started.")
+            raise SystemExit(3) from _bind_err
+        raise
     finally:
         worker_task.cancel()
         if heartbeat_task:
@@ -35187,8 +35241,21 @@ def _fresh_user_mode_id_token() -> "str | None":
         creds.refresh(None)  # type: ignore[arg-type]
         return creds.token  # type: ignore[no-any-return]
     except credentials.RevokedError:
+        # Re-read before wiping: a sibling worker may have rotated a fresh token
+        # into `current` microseconds ago (cross-process refresh race). Only the
+        # token we actually POSTed was rejected — retry once against whatever
+        # `current` now holds before declaring a genuine revoke. (RC-5 guard)
+        try:
+            if keystore.try_recover(iuid) is not None:
+                creds2 = credentials.RefreshTokenCredentials(iuid, WEB_API_KEY)
+                creds2.refresh(None)  # type: ignore[arg-type]
+                return creds2.token  # type: ignore[no-any-return]
+        except credentials.RevokedError:
+            pass  # re-read token ALSO revoked → genuine, fall through to wipe
+        except Exception:
+            return None  # transient on the retry — leave keystore intact
         log("user-mode id-token: refresh token revoked — wiping keystore", "WARN")
-        keystore.clear_all(iuid)
+        keystore.clear_all(iuid, reason="revoke")
         return None
     except Exception as e:
         log(f"user-mode id-token: refresh failed: {e}", "WARN")
@@ -35315,7 +35382,7 @@ def _cleanup_partial_pair(device_id: str) -> None:
     # starts from a clean slate.
     try:
         from auth import keystore as _ks
-        _ks.clear_all(_ks.install_uuid())
+        _ks.clear_all(_ks.install_uuid(), reason="retire")
         log("[cleanup] OS keystore cleared", "INFO")
     except Exception as e:
         log(f"[cleanup] keystore wipe failed: {e}", "WARN")
@@ -36581,10 +36648,13 @@ async def _continue_pair_stages_2_to_5(
                 break
 
             prof_path = _profile_dir(next_profile_n)
-            print(f"  {_c(_DIM, f'Opening browser profile {next_profile_n} at {prof_path}…')}")
+            print(f"  {_c(_DIM, f'Profile {next_profile_n} at {prof_path}')}")
             try:
                 browser_n = Browser(str(prof_path), headless=False)
-                await browser_n.start()
+                # Same spinner as profile-1's "Launching the browser" — without it,
+                # profiles 2+ looked frozen during the (slow) Chrome launch.
+                async with _async_spinner_ctx(f"Launching browser profile {next_profile_n}"):
+                    await browser_n.start()
             except Exception as e:
                 log(f"Setup: failed to open browser for profile {next_profile_n}: {e}", "ERROR")
                 print(f"  {_c(_WARN, f'Could not launch browser for profile {next_profile_n}: {e}')}")
@@ -37641,19 +37711,20 @@ def _kill_pids(pids: list[int]) -> int:
     return 0
 
 
-def _free_port_8000() -> "list[int]":
-    """Find and force-kill any process listening on port 8000 so a fresh
-    --serve can bind. Used by --resurrect (and any future arming path)
-    to clear stale squatters — both crashed-but-port-leaked --serves and
-    accidentally-running third-party apps.
+def _free_port(port: int = 8000) -> "list[int]":
+    """Find and force-kill any process listening on `port` so a fresh --serve
+    can bind. Used by --resurrect, the multi-worker port-squatter auto-recovery,
+    and any arming path — clears stale squatters (crashed-but-port-leaked
+    --serves and accidentally-running third-party apps) on any worker port.
 
-    Returns the list of PIDs that were killed. Returns [] when port is
+    Returns the list of PIDs that were killed. Returns [] when the port is
     already free or no killable owner could be identified (best-effort).
     Cross-platform — Windows uses netstat, POSIX uses lsof.
     """
     import subprocess as _sp
     plat = _supervisor_platform()
     pids_to_kill: "set[int]" = set()
+    _p = str(port)
     try:
         if plat == "Windows":
             r = _sp.run(
@@ -37665,8 +37736,8 @@ def _free_port_8000() -> "list[int]":
                 # Format: "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    1234"
                 if "LISTENING" not in line:
                     continue
-                if ":8000 " not in line and not line.endswith(":8000"):
-                    if " :8000\t" not in line and "0.0.0.0:8000" not in line and "[::]:8000" not in line:
+                if f":{_p} " not in line and not line.endswith(f":{_p}"):
+                    if f" :{_p}\t" not in line and f"0.0.0.0:{_p}" not in line and f"[::]:{_p}" not in line:
                         continue
                 parts = line.split()
                 if not parts:
@@ -37679,7 +37750,7 @@ def _free_port_8000() -> "list[int]":
                     pids_to_kill.add(pid)
         elif plat in ("Darwin", "Linux"):
             r = _sp.run(
-                ["lsof", "-ti", ":8000"],
+                ["lsof", "-ti", f":{_p}"],
                 capture_output=True, text=True, timeout=8,
             )
             for line in (r.stdout or "").splitlines():
@@ -37698,6 +37769,35 @@ def _free_port_8000() -> "list[int]":
         return []
     _kill_pids(list(pids_to_kill))
     return sorted(pids_to_kill)
+
+
+def _free_port_8000() -> "list[int]":
+    """Back-compat alias — see `_free_port`. Retained for existing callers."""
+    return _free_port(8000)
+
+
+def _serve_exit_was_port_conflict(err_log_path: "Path", since_ts: "float | None" = None) -> bool:
+    """Best-effort: did the most recent --serve exit fail to BIND its port
+    (EADDRINUSE) rather than crash for an internal reason? A port-bind failure
+    is a recoverable squatter problem — NOT a token revoke and NOT a code
+    crash — so the supervisor frees the port and respawns WITHOUT counting it
+    toward the crash-loop tracker. Scans the tail of the worker's stderr log
+    for the platform's address-in-use signature.
+    """
+    try:
+        if not err_log_path.exists():
+            return False
+        # Only the tail matters (the last exit's traceback).
+        data = err_log_path.read_text(encoding="utf-8", errors="replace")[-4000:].lower()
+    except Exception:
+        return False
+    return (
+        "winerror 10048" in data
+        or "errno 10048" in data
+        or "address already in use" in data
+        or "only one usage of each socket address" in data
+        or "[errno 98]" in data  # POSIX EADDRINUSE
+    )
 
 
 def _kill_pids_windows(pids: list[int]) -> int:
@@ -37746,6 +37846,128 @@ def _wait_for_port_free(port: int, max_wait_s: float = 10.0) -> bool:
     return False
 
 
+def _port_answers_health(port: "int | None", timeout: float = 1.5) -> bool:
+    """True if http://127.0.0.1:<port>/api/health responds 2xx. Used by the
+    pre-flight sweep to avoid reaping a worker that is currently serving — it
+    may belong to a LIVE sibling supervisor (RC-2 collateral protection in the
+    degraded no-single-instance-lock case). stdlib only."""
+    if not port:
+        return False
+    try:
+        import urllib.request as _u
+        with _u.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=timeout) as r:
+            return 200 <= getattr(r, "status", 200) < 300
+    except Exception:
+        return False
+
+
+def _parse_serve_port_from_cmd(cmd: str) -> "int | None":
+    """Extract the `--port N` value from a --serve process command line, or None
+    if absent (a serve with no explicit --port defaults to 8000)."""
+    import re
+    m = re.search(r"--port[=\s]+(\d+)", cmd or "")
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return 8000 if "--serve" in (cmd or "") else None
+
+
+def _sweep_kill_targets(procs, self_pid, fleet_lo, fleet_hi, max_age_h, *, health_fn, age_fn):
+    """Pure kill-list computation for the daemon-loop pre-flight orphan sweep —
+    extracted so the ROOT-CAUSE invariant is regression-tested in isolation.
+
+    INVARIANT (the long-standing offline-after-pair bug): a peer `--daemon-loop`
+    process is NEVER reaped. Killing one cascaded (parent/child or pid-reused
+    ancestry) and terminated the surviving supervisor itself, before it spawned
+    any worker → API never bound → offline. Single-instance is guarded by the
+    cross-process lock, not by killing peers.
+
+    Returns (kill_pids, skipped_healthy) where kill_pids = stale --serve
+    (out-of-fleet-range OR not answering /api/health) + old role=='other';
+    skipped_healthy = in-range serve pids left alive for per-worker recovery.
+    `health_fn(port)->bool` and `age_fn(pid)->float|None` are injected so the
+    logic is unit-testable without touching real processes/sockets.
+    """
+    kill_pids: list[int] = []
+    skipped_healthy: list[int] = []
+    for pid, cmd, role in procs:
+        if pid == self_pid:
+            continue
+        if role == "daemon-loop":
+            continue  # NEVER reap a peer supervisor — see INVARIANT above
+        if role == "serve":
+            sp = _parse_serve_port_from_cmd(cmd)
+            if sp is not None and fleet_lo <= sp <= fleet_hi and health_fn(sp):
+                skipped_healthy.append(pid)
+                continue
+            kill_pids.append(pid)
+        elif role == "other" and max_age_h > 0:
+            age_s = age_fn(pid)
+            if age_s is not None and age_s > max_age_h * 3600:
+                kill_pids.append(pid)
+    return kill_pids, skipped_healthy
+
+
+def _acquire_supervisor_lock():
+    """Cross-process single-instance guard for the daemon-loop supervisor (RC-1).
+
+    Returns one of:
+      • an open file handle  → WE hold the lock; keep the handle referenced for
+                               the supervisor's whole lifetime (do NOT close it).
+      • False                → another LIVE supervisor already holds it; the
+                               caller must exit immediately WITHOUT sweeping
+                               (sweeping would reap the live supervisor's healthy
+                               workers — the RC-2 collateral-kill).
+      • None                 → the lock primitive is unavailable on this host;
+                               degrade to running unlocked (never block startup).
+
+    Two supervisors coexisting is the condition that let a second, single-worker
+    supervisor run alongside a healthy multi-worker fleet at 02:44 and (via the
+    old crash-loop path) wipe the shared keystore. The OS releases the lock when
+    the holder process dies, so a crashed previous supervisor's lock is reclaimed
+    automatically on the next attempt — no manual stale-PID cleanup needed.
+    """
+    try:
+        path = Path.home() / ".super-research" / ".supervisor.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+    except Exception:
+        return None  # can't even create the lock file → don't block the supervisor
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            try:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                fh.close()
+                return False  # held by a live supervisor
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fh.close()
+                return False  # held by a live supervisor
+    except Exception:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return None  # lock primitive missing/unusable → degrade to unlocked
+    # Record our PID for human diagnostics (the OS lock is the real guard).
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+    except Exception:
+        pass
+    return fh
+
+
 def run_daemon_loop(port: int = 8000):
     """Wrapper that keeps `--serve` alive. The scheduled task installed by
     --resurrect invokes this instead of --serve directly so that the
@@ -37764,7 +37986,17 @@ def run_daemon_loop(port: int = 8000):
     import time as _time
 
     script_path = _launcher_path()
-    _log_dir = Path(script_path).parent
+    # Logs live in ~/.super-research/logs/ — NOT in the pipx venv (site-packages).
+    # A venv-local log dies the instant `pipx uninstall` rebuilds/removes the
+    # venv, which is exactly when post-mortem logs are most needed (a user
+    # uninstalling after an offline episode lost the evidence). The state dir
+    # survives reinstall. Falls back to the script dir if the state dir is
+    # somehow unwritable.
+    _log_dir = _STATE_DIR / "logs"
+    try:
+        _log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        _log_dir = Path(script_path).parent
     _serve_log = _log_dir / "backend.log"
     _serve_err = _log_dir / "backend.err.log"
 
@@ -37780,6 +38012,50 @@ def run_daemon_loop(port: int = 8000):
             _sys.stderr = open(_serve_err, "a", encoding="utf-8", buffering=1)
         except Exception:
             pass
+
+    def _sup_audit(msg: str) -> None:
+        """Append a supervisor-level event to backend.log REGARDLESS of the
+        interpreter. The stdout tee above only fires under pythonw.exe, so a
+        console-attached supervisor's own log() lines (crash-loop diagnostics,
+        identity) were previously lost to the now-gone terminal — which is why
+        the 02:44 wipe had to be reconstructed from absence-of-evidence (RC-6).
+        This guarantees those events land in a durable file no matter how the
+        supervisor was launched. Best-effort; never raises, never echoes-only."""
+        try:
+            with open(_serve_log, "a", encoding="utf-8") as _f:
+                _f.write(f"[{_time.strftime('%H:%M:%S')}] [daemon-loop] {msg}\n")
+                _f.flush()
+        except Exception:
+            pass
+
+    # Supervisor identity line — pid, interpreter, worker count + branch. Makes
+    # a second, overlapping supervisor (the RC-1 condition) instantly visible in
+    # backend.log instead of having to be inferred from a stray single-worker
+    # startup line.
+    try:
+        _sup_audit(
+            f"supervisor up: pid={os.getpid()} exe={Path(_sys.executable).name} "
+            f"workerCount={load_worker_count()} port={port}"
+        )
+    except Exception:
+        pass
+
+    # Single-instance guard (RC-1) — MUST run before any sweep so a refused
+    # second supervisor exits WITHOUT reaping the live one's workers (RC-2).
+    # Keep `_supervisor_lock` referenced for the whole function lifetime; the OS
+    # holds the lock until this process exits.
+    _supervisor_lock = _acquire_supervisor_lock()
+    if _supervisor_lock is False:
+        _sup_audit(
+            f"second supervisor refused: single-instance lock held by a live "
+            f"supervisor (this pid={os.getpid()} exiting cleanly, no sweep)"
+        )
+        log(
+            "[daemon-loop] Another supervisor is already running — exiting "
+            "(single-instance). The existing supervisor keeps the device alive.",
+            "WARN",
+        )
+        return
 
     # --serve always runs under console python.exe for predictable stdio
     # semantics even when the supervisor itself is pythonw.exe; uvicorn
@@ -37824,21 +38100,40 @@ def run_daemon_loop(port: int = 8000):
     except ValueError:
         max_age_h = 4.0
     sweep_pids: list[int] = []
+    # Our intended worker-port range — a healthy serve INSIDE this range that is
+    # currently answering /api/health must NOT be reaped here: it is either a
+    # live sibling supervisor's worker (RC-2 — never murder a healthy fleet) or
+    # a leftover we'll cleanly reclaim via the per-worker EADDRINUSE port-
+    # recovery on collision. Either way, killing it blindly is the bug that made
+    # "workers came up healthy then went silent". (The single-instance lock
+    # above is the primary guard; this scoping is the no-lock-degraded backstop.)
     try:
-        for pid, _cmd, role in _enumerate_research_py_procs():
-            if pid == self_pid:
-                continue
-            if role in ("daemon-loop", "serve"):
-                sweep_pids.append(pid)
-            elif role == "other" and max_age_h > 0:
-                age_s = _proc_age_seconds(pid)
-                if age_s is not None and age_s > max_age_h * 3600:
-                    sweep_pids.append(pid)
+        _fleet_lo = port
+        _fleet_hi = port + max(1, load_worker_count()) - 1
+    except Exception:
+        _fleet_lo, _fleet_hi = port, port
+    try:
+        # ROOT-CAUSE FIX (the long-standing "offline after pair/autostart"):
+        # _sweep_kill_targets NEVER reaps a peer `--daemon-loop` — killing one
+        # cascaded (parent/child / pid-reused ancestry from pair/resurrect's two
+        # daemon-loop procs) and terminated the surviving supervisor itself
+        # before it spawned any worker → API never bound → WinError 10061 →
+        # offline. Single-instance is guarded by _acquire_supervisor_lock above,
+        # not by killing peers. The helper reaps only stale --serve (out-of-
+        # fleet-range or unhealthy) + old one-off `research.py <topic>` procs.
+        sweep_pids, _skipped = _sweep_kill_targets(
+            _enumerate_research_py_procs(), self_pid, _fleet_lo, _fleet_hi, max_age_h,
+            health_fn=_port_answers_health, age_fn=_proc_age_seconds,
+        )
+        for _hp in _skipped:
+            log(f"[daemon-loop] Pre-flight sweep: NOT reaping healthy in-range serve "
+                f"pid={_hp} (alive); leaving it to per-worker port-recovery if we collide.", "INFO")
     except Exception as _se:
+        sweep_pids = []
         log(f"[daemon-loop] Pre-flight sweep enumeration failed: {_se}", "WARN")
     if sweep_pids:
         killed = _kill_pids(sweep_pids)
-        log(f"[daemon-loop] Pre-flight sweep: killed {killed}/{len(sweep_pids)} stale research.py procs ({sweep_pids})")
+        log(f"[daemon-loop] Pre-flight sweep: killed {killed}/{len(sweep_pids)} stale --serve/orphan procs ({sweep_pids})")
 
     # Pre-flight dependency probe — runs once before the respawn loop.
     # Catches the silent-crash trap: when --serve fails its import
@@ -37902,8 +38197,8 @@ def run_daemon_loop(port: int = 8000):
     # EXIT; a worker can also WEDGE (event loop stalled, or Firestore stuck
     # offline despite localhost up) without exiting. The watchdog polls
     # /api/health and force-respawns a wedged worker. It is damped by its OWN
-    # window (NOT crash_window) so a watchdog respawn NEVER trips the worker-1
-    # keystore-wipe path, and capped so a sustained global outage (every worker
+    # window (NOT crash_window) so a watchdog respawn never inflates the crash
+    # tracker's stop-respawn/back-off counter, and capped so a sustained global outage (every worker
     # unreachable) doesn't storm. Backstops are idle-only and worker-aware to
     # avoid false-killing a busy run or the heartbeat-silent worker 2.
     WATCHDOG_HANG_SEC = 180          # /api/health unreachable this long while IDLE → wedged
@@ -37916,9 +38211,10 @@ def run_daemon_loop(port: int = 8000):
     if n_workers > 1:
         log(f"[daemon-loop] Multi-worker mode: spawning {n_workers} workers")
         # Per-worker state: process handle, log file handles, crash window,
-        # keystore-wiped flag, restart count. None = dead (won't respawn —
-        # for workers that hit crash-loop threshold; worker-1 always retries
-        # via the keystore-wipe recovery path).
+        # restart count. {"_dead": True} = won't respawn (a worker 2+ that hit
+        # the crash-loop threshold); worker 1 always keeps retrying with backoff
+        # (never marked dead) since it owns heartbeat/recovery. (`keystore_wiped`
+        # is vestigial — the crash-loop keystore wipe was removed in RC-3.)
         workers: dict[int, dict] = {}
 
         def _open_logs(k: int):
@@ -37989,8 +38285,8 @@ def run_daemon_loop(port: int = 8000):
 
         def _watchdog_respawn(k: int, state: dict, reason: str):
             """Force-respawn a wedged worker. Uses a SEPARATE damping window so
-            it never feeds the crash tracker (which wipes worker-1's keystore on
-            a 3x loop). Hard terminate — a wedged event loop can't run its own
+            it never feeds the crash tracker (which stops respawning / backs off
+            a worker on a 3x loop). Hard terminate — a wedged event loop can't run its own
             graceful exit; the respawned worker's Browser.start() orphan sweep
             reaps any leftover chromium. Gives up after WATCHDOG_KILL_THRESHOLD
             respawns in the window so a sustained outage (every worker
@@ -38021,8 +38317,22 @@ def run_daemon_loop(port: int = 8000):
             w1 writes it); active-run + relink workers are exempt from the idle
             backstops; the frozen-pulse check uses the per-worker lastTickAt so
             it also covers the heartbeat-silent worker 2. (#717)"""
-            if state.get("watchdog_gaveup") or state.get("watchdog_killing"):
+            if state.get("watchdog_killing"):
                 return
+            if state.get("watchdog_gaveup"):
+                # Re-arm once the give-up window has fully elapsed with no new
+                # respawns (RC-30). A give-up must be TIME-BOUNDED: otherwise a
+                # single sustained-outage burst disables the watchdog for this
+                # worker for the rest of the process's life — and a worker-1 that
+                # wedges after that point is a permanent, silent offline.
+                _gw = state.get("watchdog_window", [])
+                if not _gw or (_time.time() - max(_gw)) > WATCHDOG_KILL_WINDOW_SEC:
+                    log(f"[watchdog] worker {k}: re-arming (give-up window of "
+                        f"{WATCHDOG_KILL_WINDOW_SEC}s elapsed quietly)", "INFO")
+                    state["watchdog_gaveup"] = False
+                    state["watchdog_window"] = []
+                else:
+                    return
             now = _time.time()
             health = _probe_worker_health(state.get("port"))
             if health is None:
@@ -38087,9 +38397,9 @@ def run_daemon_loop(port: int = 8000):
                     except Exception:
                         pass
                     # A watchdog-initiated terminate must NOT feed the crash
-                    # tracker — that path wipes worker-1's keystore on a 3x loop
-                    # and would force a re-pair. Respawn clean, carrying only the
-                    # watchdog's own damping window. (#717)
+                    # tracker — that path stops respawning / backs off a worker on
+                    # a 3x loop. Respawn clean, carrying only the watchdog's own
+                    # damping window. (#717)
                     if state.pop("watchdog_killing", False):
                         log(f"[daemon-loop] worker {k}: respawning after watchdog terminate")
                         _time.sleep(2)
@@ -38106,47 +38416,91 @@ def run_daemon_loop(port: int = 8000):
                         state["watchdog_window"] = []  # clean exit resets watchdog damping too
                     else:
                         _now = _time.time()
-                        state["crash_window"].append(_now)
-                        state["crash_window"] = [
-                            t for t in state["crash_window"] if t > _now - CRASH_WINDOW_SEC
-                        ]
-                        if (
-                            len(state["crash_window"]) >= CRASH_THRESHOLD
-                            and not state["keystore_wiped"]
-                        ):
-                            if k == 1:
-                                # Worker 1 owns the keystore; on crash loop,
-                                # wipe so the next --serve enters recovery.
-                                log(
-                                    f"[daemon-loop] worker 1: crash loop "
-                                    f"({len(state['crash_window'])} non-zero exits "
-                                    f"in <{CRASH_WINDOW_SEC}s) — wiping keystore",
-                                    "WARN",
+                        # Port-squatter auto-recovery (RC-3/RC-16): a leftover
+                        # process on this worker's port makes uvicorn raise
+                        # EADDRINUSE and exit non-zero. That is RECOVERABLE and it
+                        # is NOT a crash — free the port and respawn WITHOUT
+                        # counting it toward the crash tracker (else a persistent
+                        # squatter would falsely look like a crash loop and, in the
+                        # old code, trip a keystore wipe).
+                        _w_port = state.get("port") or (port + (k - 1))
+                        _, _err_path = _open_logs(k)
+                        if _serve_exit_was_port_conflict(_err_path):
+                            freed = _free_port(_w_port)
+                            log(
+                                f"[daemon-loop] worker {k}: port {_w_port} was occupied "
+                                f"(EADDRINUSE) — freed {freed or 'nothing'}; respawning "
+                                f"(not counted as a crash)",
+                                "WARN",
+                            )
+                        else:
+                            state["crash_window"].append(_now)
+                            state["crash_window"] = [
+                                t for t in state["crash_window"] if t > _now - CRASH_WINDOW_SEC
+                            ]
+                            if len(state["crash_window"]) >= CRASH_THRESHOLD:
+                                # RC-3: a non-zero --serve exit is a CRASH (bad dep /
+                                # corrupt profile / unexpected error) — NEVER a token
+                                # revoke. A genuine revoke makes --serve exit 0 and
+                                # enter the in-process relink loop; by the time we see
+                                # 3 non-zero exits, init_firebase has already done a
+                                # live refresh + rotated a valid token N times. So we
+                                # do NOT wipe the keystore here: it is shared
+                                # install-wide, and wiping forced a re-pair AND
+                                # de-authed healthy sibling workers (the 02:44 bug).
+                                #
+                                # Belt-and-suspenders: if ANY sibling is reachable +
+                                # healthy, the shared token is provably valid, which
+                                # makes an auth problem impossible by construction.
+                                _sib_ok = any(
+                                    _probe_worker_health(w.get("port"))
+                                    for j, w in workers.items()
+                                    if j != k and w and not w.get("_dead")
                                 )
-                                try:
-                                    from auth import keystore as _ks_recovery
-                                    _ks_recovery.clear_all(_ks_recovery.install_uuid())
-                                    state["keystore_wiped"] = True
+                                if k == 1:
+                                    _sup_audit(
+                                        f"worker 1 crash loop ({len(state['crash_window'])} "
+                                        f"non-zero exits in <{CRASH_WINDOW_SEC}s) — NOT wiping "
+                                        f"keystore; siblings_healthy={_sib_ok}; see backend.err.log"
+                                    )
+                                    log(
+                                        f"[daemon-loop] worker 1: crash loop "
+                                        f"({len(state['crash_window'])} non-zero exits in "
+                                        f"<{CRASH_WINDOW_SEC}s) — NOT wiping keystore (a "
+                                        f"crash is not a revoke). Inspect backend.err.log "
+                                        f"(port conflict / corrupt profile dir / dep "
+                                        f"mismatch)."
+                                        + (
+                                            " Siblings are healthy → the auth token is "
+                                            "valid; this is a worker-1-local problem."
+                                            if _sib_ok else ""
+                                        )
+                                        + " Backing off, will keep retrying.",
+                                        "ERROR",
+                                    )
+                                    # Diagnose once per loop, not every cycle, and
+                                    # back off harder than the 5s below.
                                     state["crash_window"] = []
-                                except Exception as _ke:
-                                    log(f"[daemon-loop] keystore wipe failed: {_ke}", "ERROR")
-                            else:
-                                # Worker 2+ crash loop: most likely a port
-                                # conflict or missing profile dir. Stop
-                                # respawning to prevent log spam; primary
-                                # (w1) keeps running so the device stays
-                                # functional in degraded mode.
-                                log(
-                                    f"[daemon-loop] worker {k}: crash loop "
-                                    f"({len(state['crash_window'])} non-zero exits "
-                                    f"in <{CRASH_WINDOW_SEC}s) — STOPPING respawn "
-                                    f"for this worker. Check backend-{k}.err.log "
-                                    f"and fix the underlying issue (port "
-                                    f"conflict / profile dir missing / dep mismatch).",
-                                    "ERROR",
-                                )
-                                workers[k] = {"_dead": True}
-                                continue
+                                    _time.sleep(25)
+                                else:
+                                    # Worker 2+: stop respawning to prevent spam;
+                                    # worker 1 keeps the device functional.
+                                    _sup_audit(
+                                        f"worker {k} crash loop ({len(state['crash_window'])} "
+                                        f"non-zero exits in <{CRASH_WINDOW_SEC}s) — STOPPING "
+                                        f"respawn; see backend-{k}.err.log"
+                                    )
+                                    log(
+                                        f"[daemon-loop] worker {k}: crash loop "
+                                        f"({len(state['crash_window'])} non-zero exits in "
+                                        f"<{CRASH_WINDOW_SEC}s) — STOPPING respawn for this "
+                                        f"worker. Check backend-{k}.err.log and fix the "
+                                        f"underlying issue (port conflict / profile dir "
+                                        f"missing / dep mismatch). Siblings keep running.",
+                                        "ERROR",
+                                    )
+                                    workers[k] = {"_dead": True}
+                                    continue
                     state["restarts"] += 1
                     log(f"[daemon-loop] worker {k}: restarting (restart #{state['restarts']}) in 5s…")
                     _time.sleep(5)
@@ -38190,25 +38544,19 @@ def run_daemon_loop(port: int = 8000):
             return
 
     # ──── Single-worker branch (legacy, workerCount==1) ────────────────
-    # Crash-loop safety net. If --serve exits non-zero CRASH_THRESHOLD
-    # times within CRASH_WINDOW_SEC, the daemon-loop wipes the OS
-    # keystore so the recovery loop inside the next --serve can take
-    # over from a clean slate. Without this, a stuck refresh token
-    # (e.g. an edge-case Firebase error the parser at credentials.py
-    # doesn't recognize as revoked) traps the BE in an infinite
-    # respawn — the FE "Reset backend" button can't help because the
-    # device-commands listener lives inside --serve, which never
-    # finishes starting up. Auto-recovery: keystore goes empty -> next
-    # --serve's init_firebase returns False -> _firebase_db = None ->
-    # _revoked_recovery_loop polls the pending subdoc for a fresh
-    # customToken from a Reset+Approve cycle. User-visible action: tap
-    # Reset on the device tile in the FE Account page; the email's
-    # Approve link deposits the customToken the recovery loop is
-    # waiting for. `keystore_wiped_by_crashloop` gates against repeated
-    # wipes if --serve keeps crashing for a different reason after the
-    # wipe — wiping again would do nothing.
+    # Crash-loop diagnostic (RC-3). If --serve exits non-zero CRASH_THRESHOLD
+    # times within CRASH_WINDOW_SEC, surface the real cause loudly and keep
+    # retrying with backoff. We deliberately do NOT wipe the keystore here:
+    # a non-zero exit is a CRASH (port squatter — already auto-freed by the
+    # mid-cycle sweep below — or a dep/profile fault), and a crash is NOT a
+    # token revoke (a genuine revoke makes --serve exit 0 and enter the
+    # in-process _revoked_recovery_loop). The old behaviour wiped the keystore
+    # on any crash loop, which forced a needless re-pair on a recoverable local
+    # problem (and, in multi-worker, de-authed healthy siblings). A genuinely
+    # stuck / parser-unrecognised revoke is now visible in backend.err.log and
+    # ~/.super-research/keystore-audit.log rather than silently nuking the
+    # pairing; the fix for that is to harden the revoke parser, not to wipe.
     crash_window: list[float] = []
-    keystore_wiped_by_crashloop = False
     restarts = 0
     while True:
         try:
@@ -38229,41 +38577,32 @@ def run_daemon_loop(port: int = 8000):
             # flagged later.
             if result.returncode == 0:
                 crash_window = []
-                keystore_wiped_by_crashloop = False
             else:
                 _now = _time.time()
                 crash_window.append(_now)
                 crash_window = [t for t in crash_window if t > _now - CRASH_WINDOW_SEC]
-                if (
-                    len(crash_window) >= CRASH_THRESHOLD
-                    and not keystore_wiped_by_crashloop
-                ):
+                if len(crash_window) >= CRASH_THRESHOLD:
+                    # RC-3: surface the cause; never wipe the keystore on a crash.
+                    _sup_audit(
+                        f"single-worker crash loop ({len(crash_window)} non-zero "
+                        f"exits in <{CRASH_WINDOW_SEC}s) — NOT wiping keystore; see backend.err.log"
+                    )
                     log(
                         f"[daemon-loop] Crash loop detected: {len(crash_window)} "
-                        f"non-zero exits in <{CRASH_WINDOW_SEC}s. Wiping the OS "
-                        f"keystore so the recovery loop in the next --serve can "
-                        f"poll for a fresh customToken.",
-                        "WARN",
+                        f"non-zero exits in <{CRASH_WINDOW_SEC}s. NOT wiping the "
+                        f"keystore (a crash is not a revoke). Inspect "
+                        f"backend.err.log for the real cause (port conflict / dep "
+                        f"mismatch / corrupt profile). If the refresh token is "
+                        f"genuinely revoked, run `{_PROG} --unpair && "
+                        f"{_PROG} --pair`. Backing off, will keep retrying.",
+                        "ERROR",
                     )
+                    crash_window = []  # diagnose once per loop, not every cycle
                     try:
-                        from auth import keystore as _ks_recovery
-                        _ks_recovery.clear_all(_ks_recovery.install_uuid())
-                        keystore_wiped_by_crashloop = True
-                        crash_window = []
-                        log(
-                            "[daemon-loop] Keystore wiped. The next --serve will "
-                            "boot into recovery mode and wait for a Reset+Approve "
-                            "from the FE Account page (Settings → Manage devices "
-                            "→ Reset, then click Approve in the email).",
-                            "INFO",
-                        )
-                    except Exception as _ke:
-                        log(
-                            f"[daemon-loop] Keystore wipe failed: {_ke}. The user "
-                            f"may need to run `{_PROG} --unpair && "
-                            f"{_PROG} --pair` to recover manually.",
-                            "ERROR",
-                        )
+                        _time.sleep(25)  # extra backoff on top of the 5s below
+                    except KeyboardInterrupt:
+                        log("[daemon-loop] Interrupted during backoff — exiting wrapper")
+                        return
         except KeyboardInterrupt:
             log("[daemon-loop] Interrupted — exiting wrapper")
             return
@@ -38291,27 +38630,18 @@ def run_daemon_loop(port: int = 8000):
         # in `_wait_for_port_free`'s inner sleep doesn't escape and
         # crash the wrapper.
         try:
-            # 2026-05-11: also sweep peer daemon-loop wrappers. Pre-fix
-            # this only killed stale --serve children but NOT peer
-            # --daemon-loop supervisors — so if someone (or an external
-            # tool) spawned a second wrapper, both wrappers' children
-            # raced for port 8000 in a permanent crash loop (winner
-            # served; loser kept exiting code 1 on EADDRINUSE and the
-            # daemon-loop respawned it every 5s). The "self_pid !=" guard
-            # is critical — we're a daemon-loop too; we'd otherwise kill
-            # ourselves.
+            # Per-restart sweep reaps stale --serve children only. We do NOT kill
+            # peer --daemon-loop wrappers here (see the ROOT-CAUSE FIX in the
+            # pre-flight sweep above): the single-instance lock guarantees only one
+            # supervisor runs, and taskkilling a peer/parent daemon-loop cascaded
+            # and killed THIS supervisor too — the offline-after-pair bug. A losing
+            # daemon-loop exits cleanly via the lock on its own.
             stale_serve: list[int] = []
-            stale_daemon: list[int] = []
             for pid, _cmd, role in _enumerate_research_py_procs():
                 if pid == self_pid:
                     continue
                 if role == "serve":
                     stale_serve.append(pid)
-                elif role == "daemon-loop":
-                    stale_daemon.append(pid)
-            if stale_daemon:
-                killed = _kill_pids(stale_daemon)
-                log(f"[daemon-loop] Pre-restart sweep: killed {killed}/{len(stale_daemon)} peer daemon-loop wrappers ({stale_daemon})")
             if stale_serve:
                 killed = _kill_pids(stale_serve)
                 log(f"[daemon-loop] Pre-restart sweep: killed {killed}/{len(stale_serve)} stale --serve procs ({stale_serve})")
@@ -38366,6 +38696,12 @@ def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
         "$t.Triggers[0].Repetition.Interval = 'PT5M'; "
         "$t.Settings.RestartCount = 3; "
         "$t.Settings.RestartInterval = 'PT1M'; "
+        # Make the comment true: if a supervisor is already running when the
+        # PT5M repetition (or a re-logon) fires, the scheduler must NOT launch a
+        # second one. The in-process single-instance lock (_acquire_supervisor_
+        # lock) is the real backstop for manual launches, but setting this stops
+        # the scheduler from even spawning a redundant supervisor. (RC-1)
+        "$t.Settings.MultipleInstances = 'IgnoreNew'; "
         "$t.Settings.StartWhenAvailable = $true; "
         # Vista compat-mode defaults gate task start/run on AC power. On a
         # laptop, this means the supervisor goes "Queued" forever the moment
@@ -38505,7 +38841,14 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
     # dispatch error — would otherwise vanish into DEVNULL, leaving the device
     # silently offline (the exact failure this fixes). Append so we never
     # clobber the daemon's own redirect target.
-    _log_dir = Path(script_path).parent
+    # Capture early-boot errors to the SAME relocated log dir the daemon-loop
+    # uses (~/.super-research/logs/), so a crash before the daemon's own redirect
+    # survives a later `pipx uninstall`.
+    _log_dir = _STATE_DIR / "logs"
+    try:
+        _log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        _log_dir = Path(script_path).parent
     try:
         _boot_fh = open(_log_dir / "backend.err.log", "a", encoding="utf-8")
     except Exception:
@@ -38958,9 +39301,13 @@ def run_resurrect():
             print(f"  {_c(_WARN, '⚠')}  Could not start backend: {e}")
             print(f"  {_c(_DIM, '     The scheduled task still fires at next login.')}")
         else:
+            # PID detection is COSMETIC (for the "Backend started PID X" line).
+            # 15s window — a freshly pipx-installed COMPILED build cold-starts
+            # slowly (heavy native imports + Defender scanning the new .pyd), and
+            # under pythonw the daemon-loop can take a moment to surface in wmic.
             spawned_pid = None
             with _sync_spinner_ctx("Starting backend"):
-                deadline = _time.time() + 5.0
+                deadline = _time.time() + 15.0
                 while _time.time() < deadline:
                     _time.sleep(0.5)
                     for pid, _cmd, role in _enumerate_research_py_procs():
@@ -38971,28 +39318,28 @@ def run_resurrect():
                         break
             if spawned_pid is not None:
                 print(f"  {_c(_OK, '✓')}  Backend started (PID {spawned_pid}, running in background)")
-                # Health probe — confirm the API is actually responding
-                # before declaring success. Daemon-loop has to (1) start
-                # --serve, (2) Firestore client init (~3-5s on Windows
-                # cold), (3) uvicorn bind. Retry up to ~12s with a
-                # spinner so the user doesn't see a false-alarm WARN
-                # for the common "uvicorn just hasn't bound yet" case.
-                _api_ok = False
-                _api_detail = ""
-                with _SyncSpinnerCtx("Waiting for API"):
-                    for _hb_attempt in range(24):  # 24 × 1.5s = 36s — covers a compiled multi-worker cold start
-                        _time.sleep(1.5)
-                        _api_ok, _api_detail = _local_api_health()
-                        if _api_ok:
-                            break
-                if _api_ok:
-                    print(f"  {_c(_OK, '✓')}  API responding ({_api_detail})")
-                else:
-                    print(f"  {_c(_WARN, '⚠')}  API still warming up: {_api_detail}")
-                    print(f"  {_c(_DIM, '     A compiled multi-worker start can take a bit — it should come online shortly. Check the app, or curl localhost:8000/api/health.')}")
             else:
-                print(f"  {_c(_WARN, '⚠')}  Backend did not appear within 5s — check backend.err.log.")
-                print(f"  {_c(_DIM, '     The scheduled task still fires at next login as a fallback.')}")
+                print(f"  {_c(_DIM, '  Backend launching in the background — checking the API directly…')}")
+            # Health probe — the AUTHORITATIVE readiness check, run REGARDLESS of
+            # whether we saw the PID. PID detection can miss a slow/pythonw cold
+            # start, but a bound API cannot be faked. (Previously this was nested
+            # inside `if spawned_pid` with a 5s detect window, so a slow start
+            # printed a false "did not appear" + never probed the API — the same
+            # offline-symptom class this fix targets.) Daemon-loop must (1) start
+            # --serve, (2) Firestore init (~3-5s cold), (3) uvicorn bind.
+            _api_ok = False
+            _api_detail = ""
+            with _SyncSpinnerCtx("Waiting for API"):
+                for _hb_attempt in range(24):  # 24 × 1.5s = 36s — covers a compiled multi-worker cold start
+                    _time.sleep(1.5)
+                    _api_ok, _api_detail = _local_api_health()
+                    if _api_ok:
+                        break
+            if _api_ok:
+                print(f"  {_c(_OK, '✓')}  API responding ({_api_detail})")
+            else:
+                print(f"  {_c(_WARN, '⚠')}  API still warming up: {_api_detail}")
+                print(f"  {_c(_DIM, '     A compiled multi-worker start can take a bit — it should come online shortly. Check the app, or curl localhost:8000/api/health.')}")
 
     print()
     _print_with_flourish(
@@ -39481,7 +39828,7 @@ def run_unpair(deep: bool = False):
     # Clear the OS keystore so the refresh token can't re-auth this BE.
     try:
         from auth import keystore as _ks
-        _ks.clear_all(_ks.install_uuid())
+        _ks.clear_all(_ks.install_uuid(), reason="unpair")
         wiped.append("OS keystore")
     except Exception as _ke:
         print(f"  {_c(_WARN, '⚠')}  Keystore clear failed: {_ke}")
@@ -40256,6 +40603,83 @@ def _is_source_checkout() -> bool:
         return False
 
 
+def _version_gt(a: str, b: str) -> bool:
+    """True if version string `a` is strictly newer than `b`. Tolerant numeric
+    component compare (1.0.10 > 1.0.9); non-numeric suffixes are ignored. Returns
+    False on any parse error so a weird version never spams an upgrade nudge."""
+    def _parse(v: str) -> tuple:
+        out = []
+        for chunk in str(v).split("."):
+            digits = ""
+            for ch in chunk:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            out.append(int(digits) if digits else 0)
+        return tuple(out)
+    try:
+        return _parse(a) > _parse(b)
+    except Exception:
+        return False
+
+
+def _check_newer_version() -> "str | None":
+    """Return the latest superresearch version published on PyPI IF it is newer
+    than the installed one, else None — a pip-style "new version available" nudge.
+
+    Cheap + safe by construction: skips entirely on a source checkout; caches the
+    PyPI answer to ~/.super-research/.version_check.json for 24h (so it costs at
+    most ONE short network call per day, shared across all commands/workers);
+    fail-silent on offline / timeout / parse error so it can NEVER block or break
+    a command. The 2.5s timeout only ever applies once per day on a cache miss."""
+    if _is_source_checkout():
+        return None
+    cur = _sr_version()
+    if not cur or cur.startswith("("):
+        return None
+    import json as _j
+    import time as _t
+    cache = _STATE_DIR / ".version_check.json"
+    try:
+        if cache.exists():
+            data = _j.loads(cache.read_text())
+            if _t.time() - float(data.get("checked_at", 0)) < 86400:
+                latest = data.get("latest") or ""
+                return latest if (latest and _version_gt(latest, cur)) else None
+    except Exception:
+        pass
+    latest = ""
+    try:
+        import urllib.request as _u
+        with _u.urlopen("https://pypi.org/pypi/superresearch/json", timeout=2.5) as r:
+            latest = ((_j.loads(r.read().decode("utf-8")).get("info") or {}).get("version")) or ""
+    except Exception:
+        latest = ""
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(_j.dumps({"checked_at": _t.time(), "latest": latest}))
+    except Exception:
+        pass
+    return latest if (latest and _version_gt(latest, cur)) else None
+
+
+# Per-process memo so the Next-block renderer doesn't re-check every call.
+_VERSION_NOTICE_SENTINEL = object()
+_VERSION_NOTICE_MEMO: object = _VERSION_NOTICE_SENTINEL
+
+
+def _newer_version_notice() -> "str | None":
+    """Memoized `_check_newer_version()` — computed at most once per process."""
+    global _VERSION_NOTICE_MEMO
+    if _VERSION_NOTICE_MEMO is _VERSION_NOTICE_SENTINEL:
+        try:
+            _VERSION_NOTICE_MEMO = _check_newer_version()
+        except Exception:
+            _VERSION_NOTICE_MEMO = None
+    return _VERSION_NOTICE_MEMO  # type: ignore[return-value]
+
+
 def _pipx_cmd() -> "list[str] | None":
     """How to invoke pipx from an INSTALLED build. pipx lives in the user's
     Python, NOT this app's isolated pipx venv — so NEVER use sys.executable (the
@@ -40279,31 +40703,137 @@ def _pipx_cmd() -> "list[str] | None":
     return None
 
 
+# Detached lifecycle waiter (run by a NON-venv Python): waits for THIS process
+# to exit, then runs `pipx <action> superresearch`. Required because
+# `--update`/`--uninstall` run from the very venv pipx must rebuild/delete — on
+# Windows you cannot delete files a running process has open, which is what left
+# a half-deleted venv husk + a WinError-5 traceback when uninstall ran inline.
+_LIFECYCLE_WAITER = r'''
+import os, sys, time, subprocess
+pid = int(sys.argv[1]); cmd = sys.argv[2:]
+def _alive(p):
+    if sys.platform == "win32":
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x00100000, 0, p)  # SYNCHRONIZE
+        if not h:
+            return False
+        r = ctypes.windll.kernel32.WaitForSingleObject(h, 0)
+        ctypes.windll.kernel32.CloseHandle(h)
+        return r == 0x00000102  # WAIT_TIMEOUT -> still running
+    try:
+        os.kill(p, 0); return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+for _ in range(120):  # wait up to ~60s for the launcher to exit
+    if not _alive(pid):
+        break
+    time.sleep(0.5)
+time.sleep(2)  # grace for the OS to release the venv's file handles
+subprocess.run(cmd)
+'''
+
+
+def _path_python() -> "str | None":
+    """A NON-venv Python on PATH, to run the detached lifecycle waiter (which
+    must outlive this process — the venv python is about to be deleted/rebuilt).
+    Never sys.executable (that IS the venv python)."""
+    import shutil as _shutil
+    try:
+        me = Path(sys.executable).resolve()
+    except Exception:
+        me = None
+    cands = [exe for _c in ("py", "python", "python3") if (exe := _shutil.which(_c))]
+    for exe in cands:
+        try:
+            if me is None or Path(exe).resolve() != me:
+                return exe
+        except Exception:
+            return exe
+    return cands[0] if cands else None
+
+
+def _spawn_detached_lifecycle(action: str) -> bool:
+    """Stop any running supervisor/workers, then spawn a DETACHED waiter that
+    runs `pipx <action> superresearch` once THIS process exits. `action` is
+    'uninstall' or 'upgrade'. Returns True if the waiter was launched."""
+    pipx = _pipx_cmd()
+    py = _path_python()
+    if pipx is None or py is None:
+        return False
+    # Free the venv: kill any leftover daemon-loop / --serve workers (NOT self) —
+    # they'd otherwise keep the venv's files open and pipx would still fail. The
+    # detached waiter handles the LAST holder (this process) by waiting for it.
+    try:
+        self_pid = os.getpid()
+        victims = [pid for pid, _cmd, role in _enumerate_research_py_procs()
+                   if pid != self_pid and role in ("daemon-loop", "serve")]
+        if victims:
+            _kill_pids(victims)
+            print(f"  Stopped {len(victims)} running backend process(es) so the "
+                  f"{action} can complete.")
+    except Exception:
+        pass
+    log_path = _STATE_DIR / f"{action}.log"
+    logf = subprocess.DEVNULL
+    try:
+        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        logf = open(log_path, "ab")
+    except Exception:
+        pass
+    cmd = [py, "-c", _LIFECYCLE_WAITER, str(os.getpid()), *pipx, action, "superresearch"]
+    creationflags = 0
+    kwargs: dict = {}
+    if sys.platform == "win32":
+        creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
+        return True
+    except Exception as e:
+        print(f"  Could not launch the background {action} helper: {e}")
+        return False
+    finally:
+        if logf is not subprocess.DEVNULL:
+            try:
+                logf.close()
+            except Exception:
+                pass
+
+
 def _self_update() -> int:
-    """`superresearch --update` — upgrade the installed package via pipx."""
+    """`superresearch --update` — upgrade the installed package via pipx (detached,
+    so pipx can rebuild the venv this process runs from)."""
     if _is_source_checkout():
         print("  You're running Super Research from a source checkout — update with:  git pull")
         return 0
-    pipx = _pipx_cmd()
-    if pipx is None:
+    if _pipx_cmd() is None:
         print("  pipx not found. Update manually:  pipx upgrade superresearch")
         return 1
-    print("  Updating Super Research via pipx …")
-    try:
-        return subprocess.call([*pipx, "upgrade", "superresearch"])
-    except KeyboardInterrupt:
-        return 130
+    print("  Updating Super Research via pipx — running in the background because this")
+    print("  command must exit first so pipx can rebuild the environment it runs from.")
+    if _spawn_detached_lifecycle("upgrade"):
+        print(f"  Upgrade scheduled (progress -> {_STATE_DIR / 'upgrade.log'}).")
+        print("  Re-run  superresearch --version  in ~20s to confirm. If On Startup was")
+        print("  enabled, run  superresearch --resurrect  afterwards to relaunch it.")
+        return 0
+    print("  Could not start the background upgrade. From a NEW shell, run:")
+    print("    pipx upgrade superresearch")
+    return 1
 
 
 def _self_uninstall() -> int:
-    """`superresearch --uninstall` — remove the installed package via pipx. Leaves
-    ~/.super-research/ (logins + pairing) intact; --unpair is the full disconnect."""
+    """`superresearch --uninstall` — remove the installed package via pipx (detached,
+    so pipx can delete the venv this process runs from). Leaves ~/.super-research/
+    (logins + pairing) intact; --unpair is the full disconnect."""
     if _is_source_checkout():
         print("  You're running from a source checkout — nothing to uninstall.")
         print("  To disconnect this machine, run:  python research.py --unpair")
         return 0
-    pipx = _pipx_cmd()
-    if pipx is None:
+    if _pipx_cmd() is None:
         print("  pipx not found. Uninstall manually:  pipx uninstall superresearch")
         return 1
     try:
@@ -40313,15 +40843,19 @@ def _self_uninstall() -> int:
     if ans not in ("y", "yes"):
         print("  Cancelled.")
         return 0
-    print("  Uninstalling Super Research via pipx …")
-    try:
-        rc = subprocess.call([*pipx, "uninstall", "superresearch"])
-    except KeyboardInterrupt:
-        return 130
-    if rc == 0:
-        print("  Removed. Logins + pairing in ~/.super-research/ were left intact —")
-        print("  run  superresearch --unpair  BEFORE uninstalling for a full disconnect.")
-    return rc
+    print("  Uninstalling in the background — this command must exit first so pipx can")
+    print("  remove the environment it runs from (running it inline self-locks the venv")
+    print("  on Windows, which leaves a half-deleted venv husk).")
+    if _spawn_detached_lifecycle("uninstall"):
+        print("  Removal scheduled — it finishes a few seconds after this exits")
+        print(f"  (progress -> {_STATE_DIR / 'uninstall.log'}).")
+        print("  Logins + pairing in ~/.super-research/ are left intact — run")
+        print("  superresearch --unpair  FIRST for a full disconnect (and --retire if you")
+        print("  enabled On Startup, so the scheduled task isn't left dangling).")
+        return 0
+    print("  Could not start the background uninstall. From a NEW shell, run:")
+    print("    pipx uninstall superresearch")
+    return 1
 
 
 def main():

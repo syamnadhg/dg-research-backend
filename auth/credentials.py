@@ -3,9 +3,14 @@
 Implements `google.auth.credentials.Credentials` so it slots into the same
 `firestore.Client(credentials=...)` constructor that the rest of the BE
 already calls. ID tokens are 1-hour Firebase tokens minted by exchanging
-the long-lived refresh token at `securetoken.googleapis.com`. Every refresh
-rotates the refresh token (Firebase issues a new one) and the new value is
-persisted to the OS keystore via the three-slot rotation in `keystore.py`.
+the long-lived refresh token at `securetoken.googleapis.com`. For STANDARD
+Firebase Auth the securetoken endpoint returns the SAME refresh token on every
+refresh (one-time-use rotation is a GCP Identity Platform opt-in that is NOT
+enabled on this project). We still write `body["refresh_token"]` back through
+the three-slot rotation in `keystore.py` so that IF rotation is ever turned on,
+the new value is persisted atomically — but today it is effectively a no-op
+re-write of the same value, which is why N concurrent workers can all refresh
+successfully with no spurious revoke.
 
 Lifecycle:
 1. Caller constructs RefreshTokenCredentials(install_uuid, web_api_key).
@@ -34,19 +39,23 @@ log = logging.getLogger(__name__)
 
 _SECURE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
 
-# #720: PROCESS-WIDE refresh lock shared by EVERY RefreshTokenCredentials
-# instance. Multiple independent refreshers rotate the SAME single keystore
-# refresh token: google-auth's on-expiry refresh (fired by the gRPC
-# AuthMetadataPlugin metadata thread), the #720 gRPC-write 403 self-heal,
-# init_firebase's startup force-refresh, and _fresh_user_mode_id_token's
-# transient creds. Each refresh does `keystore.set("pending", RT_new)` then
-# `keystore.promote_pending()` — a non-atomic multi-step keyring sequence. If
-# two refreshes interleave it, `current` can end up holding a refresh token
-# that securetoken already rotated away (Firebase invalidates the prior
-# refresh_token when it mints a new one) → INVALID_REFRESH_TOKEN → spurious
-# RevokedError + keystore wipe + re-pair prompt. Serializing the whole
-# read→POST→set→promote sequence behind one shared lock makes rotation atomic
-# across all refreshers in the process.
+# #720: in-process refresh lock shared by EVERY RefreshTokenCredentials
+# instance WITHIN ONE interpreter. Multiple independent refreshers rotate the
+# SAME single keystore refresh token: google-auth's on-expiry refresh (fired by
+# the gRPC AuthMetadataPlugin metadata thread), the #720 gRPC-write 403
+# self-heal, init_firebase's startup force-refresh, and _fresh_user_mode_id_
+# token's transient creds. Each refresh does `keystore.set("pending", RT_new)`
+# then `keystore.promote_pending()` — a non-atomic multi-step keyring sequence.
+# Serialising the whole read→POST→set→promote behind this lock makes rotation
+# atomic across all refreshers IN THE PROCESS.
+#
+# IMPORTANT (RC-5): this is a threading.Lock — it serialises THREADS, not the N
+# separate `--serve` worker PROCESSES, each of which gets its OWN _REFRESH_LOCK.
+# Cross-process serialisation is provided by keystore.cross_process_refresh_lock()
+# taken inside _refresh_locked. (In practice rotation is not enabled on this
+# project — securetoken returns the same refresh_token — so concurrent refreshes
+# are benign today; the cross-process lock is defence for a future rotation
+# opt-in, backed by the re-read-before-wipe guards at the RevokedError sites.)
 _REFRESH_LOCK = threading.Lock()
 
 # Refresh proactively a few minutes before expiry to absorb clock skew + the
@@ -133,8 +142,24 @@ class RefreshTokenCredentials(google.auth.credentials.Credentials):
             self._refresh_locked()
 
     def _refresh_locked(self) -> None:
-        """The actual securetoken exchange + keystore rotation. MUST be called
-        with `_REFRESH_LOCK` held (see refresh())."""
+        """Serialise the securetoken exchange + keystore rotation across BOTH
+        threads (the in-process `_REFRESH_LOCK`, already held by refresh()) AND
+        the N separate `--serve` worker PROCESSES (a cross-process file lock).
+        Each worker process has its OWN `_REFRESH_LOCK`, so without the file lock
+        two workers could POST the same `current` token concurrently and — if
+        refresh-token rotation is ever enabled — trample each other into a
+        spurious revoke. After acquiring the cross-process lock we RE-READ
+        `current` inside `_do_refresh_exchange`, so a token a sibling rotated
+        while we waited is used instead of a stale one. The lock degrades to
+        unlocked (never blocks a refresh forever); the re-read-before-wipe guards
+        at the RevokedError call sites are the safety net. (RC-5)"""
+        with keystore.cross_process_refresh_lock():
+            self._do_refresh_exchange()
+
+    def _do_refresh_exchange(self) -> None:
+        """The securetoken POST + slot rotation. Must run holding both locks
+        (see _refresh_locked). Re-reads `current` first so it always POSTs the
+        freshest refresh token — never one a sibling just rotated away."""
         refresh_token = keystore.get("current", self._install_uuid)
         if not refresh_token:
             raise RevokedError("no refresh token in keystore")

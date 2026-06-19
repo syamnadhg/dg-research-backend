@@ -27,6 +27,10 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setattr(keystore, "_FALLBACK_DIR", tmp_path)
     monkeypatch.setattr(keystore, "_FALLBACK_PATH", tmp_path / "auth.json")
     monkeypatch.setattr(keystore, "_INSTALL_UUID_PATH", tmp_path / "install_uuid")
+    # Keep the wipe-audit + refresh-lock files inside the tmp dir too, so tests
+    # don't write to the real ~/.super-research/ (they're module constants).
+    monkeypatch.setattr(keystore, "_WIPE_LOG", tmp_path / "keystore-audit.log")
+    monkeypatch.setattr(keystore, "_REFRESH_LOCK_PATH", tmp_path / ".refresh.lock")
     # Force the keyring backend to "unavailable" so all ops hit the file.
     monkeypatch.setattr(keystore, "_try_keyring", lambda: None)
     return tmp_path
@@ -179,14 +183,14 @@ class TestClearAll:
     def test_wipes_every_slot(self, isolated_home):
         for slot in keystore.SLOTS:
             keystore.set(slot, "i", f"val-{slot}")
-        keystore.clear_all("i")
+        keystore.clear_all("i", reason="test")
         for slot in keystore.SLOTS:
             assert keystore.get(slot, "i") is None
 
     def test_other_installs_unaffected(self, isolated_home):
         keystore.set("current", "install-A", "a")
         keystore.set("current", "install-B", "b")
-        keystore.clear_all("install-A")
+        keystore.clear_all("install-A", reason="test")
         assert keystore.get("current", "install-A") is None
         assert keystore.get("current", "install-B") == "b"
 
@@ -219,3 +223,131 @@ class TestFileFallbackAtomicity:
         assert blob["current:i"] == "tok-c"
         assert "pending:i" in blob
         assert blob["pending:i"] == "tok-p"
+
+
+class TestWipeAudit:
+    """clear_all must require a reason and leave a durable audit breadcrumb so a
+    future wipe is never again unattributable (RC-6 / RC-4)."""
+
+    def test_reason_is_required(self, isolated_home):
+        import pytest as _pytest
+        with _pytest.raises(TypeError):
+            keystore.clear_all("i")  # missing the keyword-only `reason`
+
+    def test_writes_audit_record_before_deletion(self, isolated_home):
+        keystore.set("current", "i", "tok")
+        keystore.clear_all("i", reason="crash-loop")
+        audit = isolated_home / "keystore-audit.log"
+        assert audit.exists()
+        rec = json.loads(audit.read_text().strip().splitlines()[-1])
+        assert rec["event"] == "clear_all"
+        assert rec["reason"] == "crash-loop"
+        assert rec["install"] == "i"[:8]
+        assert "pid" in rec and "stack" in rec
+
+    def test_audit_appends_one_line_per_wipe(self, isolated_home):
+        keystore.clear_all("i", reason="unpair")
+        keystore.clear_all("i", reason="retire")
+        lines = (isolated_home / "keystore-audit.log").read_text().strip().splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[0])["reason"] == "unpair"
+        assert json.loads(lines[1])["reason"] == "retire"
+
+
+class TestCrossProcessRefreshLock:
+    """The cross-process refresh lock must acquire/release cleanly and — the
+    correctness-critical property — must NOT mask exceptions raised inside the
+    `with` body (a single yield, no double-yield)."""
+
+    def test_acquire_and_release(self, isolated_home):
+        with keystore.cross_process_refresh_lock() as locked:
+            assert locked is True
+        # Released → re-acquirable.
+        with keystore.cross_process_refresh_lock() as locked2:
+            assert locked2 is True
+
+    def test_body_exception_propagates_not_masked(self, isolated_home):
+        import pytest as _pytest
+
+        class Boom(RuntimeError):
+            pass
+
+        with _pytest.raises(Boom):
+            with keystore.cross_process_refresh_lock():
+                raise Boom("body error must surface, not a generator RuntimeError")
+        # Lock is released after the exception → next acquire still works.
+        with keystore.cross_process_refresh_lock() as locked:
+            assert locked is True
+
+
+class TestTryKeyringSentinel:
+    """_try_keyring must reject the fail.Keyring sentinel so headless hosts use
+    the file fallback cleanly instead of throwing on every op (RC-23)."""
+
+    def test_fail_keyring_returns_none(self, tmp_path, monkeypatch):
+        # NOTE: do NOT use isolated_home here — it stubs _try_keyring. Exercise
+        # the real function against a fake keyring whose backend is fail.Keyring.
+        import sys as _sys
+        import types as _types
+
+        fail_mod = _types.ModuleType("keyring.backends.fail")
+
+        class _FailKeyring:
+            pass
+
+        fail_mod.Keyring = _FailKeyring
+        kr_mod = _types.ModuleType("keyring")
+        kr_mod.get_keyring = lambda: _FailKeyring()
+        backends_mod = _types.ModuleType("keyring.backends")
+        monkeypatch.setitem(_sys.modules, "keyring", kr_mod)
+        monkeypatch.setitem(_sys.modules, "keyring.backends", backends_mod)
+        monkeypatch.setitem(_sys.modules, "keyring.backends.fail", fail_mod)
+        assert keystore._try_keyring() is None
+
+    def test_real_backend_returned(self, tmp_path, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        fail_mod = _types.ModuleType("keyring.backends.fail")
+
+        class _FailKeyring:
+            pass
+
+        fail_mod.Keyring = _FailKeyring
+
+        class _RealBackend:
+            pass  # not a _FailKeyring, no empty `backends` attr
+
+        kr_mod = _types.ModuleType("keyring")
+        kr_mod.get_keyring = lambda: _RealBackend()
+        backends_mod = _types.ModuleType("keyring.backends")
+        monkeypatch.setitem(_sys.modules, "keyring", kr_mod)
+        monkeypatch.setitem(_sys.modules, "keyring.backends", backends_mod)
+        monkeypatch.setitem(_sys.modules, "keyring.backends.fail", fail_mod)
+        assert keystore._try_keyring() is kr_mod
+
+
+class TestSetPurgesFileShadow:
+    """When keyring is the live store, set() must purge any stale file-fallback
+    shadow so a later transient keyring miss can't return an outdated token
+    (RC-24)."""
+
+    def test_keyring_success_removes_file_shadow(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(keystore, "_FALLBACK_DIR", tmp_path)
+        monkeypatch.setattr(keystore, "_FALLBACK_PATH", tmp_path / "auth.json")
+        # Seed a stale file shadow for current:i
+        (tmp_path / "auth.json").write_text(json.dumps({"current:i": "STALE"}))
+
+        store: dict[str, str] = {}
+
+        class _KR:
+            def set_password(self, _svc, acct, val):
+                store[acct] = val
+
+        monkeypatch.setattr(keystore, "_try_keyring", lambda: _KR())
+        keystore.set("current", "i", "FRESH")
+        # Keyring got the value…
+        assert store["current:i"] == "FRESH"
+        # …and the stale file shadow is gone (no split-brain).
+        blob = json.loads((tmp_path / "auth.json").read_text())
+        assert "current:i" not in blob
