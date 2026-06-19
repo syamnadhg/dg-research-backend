@@ -1817,16 +1817,21 @@ def _sync_spinner_ctx(label: str) -> _SyncSpinnerCtx:
 
 
 class _AsyncSpinnerCtx:
-    """Async variant of _sync_spinner_ctx — same visual, async-friendly
-    so it composes with `async with` inside run_pair without blocking the
-    event loop. Used in --pair step 4 while the supervisor spawn is
-    waited on (~5s)."""
+    """Async-context spinner. The animation runs in a BACKGROUND THREAD (not an
+    asyncio task) so it keeps spinning even when the wrapped operation blocks the
+    event loop — a Chrome cold-launch, a sync call that wasn't offloaded, a
+    Playwright op, etc. An asyncio-task spinner freezes in exactly those cases,
+    which is what read as 'stuck' during --pair (browser launch, etc.). Thread
+    animation is independent of the loop, so it animates no matter what the
+    wrapped op does."""
     def __init__(self, label: str):
         self.label = label
-        self._stop = asyncio.Event()
-        self._task: asyncio.Task | None = None
+        import threading as _threading
+        self._threading = _threading
+        self._stop = _threading.Event()
+        self._thread = None
 
-    async def _spin(self):
+    def _spin(self):
         i = 0
         start = time.time()
         while not self._stop.is_set():
@@ -1838,22 +1843,17 @@ class _AsyncSpinnerCtx:
             )
             sys.stdout.flush()
             i += 1
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=0.1)
-            except asyncio.TimeoutError:
-                pass
+            time.sleep(0.1)
 
     async def __aenter__(self):
-        self._task = asyncio.create_task(self._spin())
+        self._thread = self._threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
         return self
 
     async def __aexit__(self, *_exc):
         self._stop.set()
-        if self._task is not None:
-            try:
-                await self._task
-            except Exception:
-                pass
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
         _clear_status_line()
         return False
 
@@ -35789,7 +35789,21 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
 
     captured = {"device_id": None, "pair_code": None}
 
+    # Spinner during the initiate-pair POST — the silent 2-15s before the pair
+    # code appears. Thread-based (via _sync_spinner_ctx) so it animates even
+    # though do_pair_v2 is awaited; stopped the instant on_code fires (success)
+    # or by the finally below (error), so it never overruns the code display.
+    _init_spinner = {"ctx": None}
+
+    def _stop_init_spinner():
+        if _init_spinner["ctx"] is not None:
+            try:
+                _init_spinner["ctx"].__exit__()
+            finally:
+                _init_spinner["ctx"] = None
+
     def _on_code(device_id: str, pair_code: str) -> None:
+        _stop_init_spinner()
         captured["device_id"] = device_id
         captured["pair_code"] = pair_code
         formatted = (
@@ -35845,15 +35859,19 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
     pair_completed = False
     try:
         try:
-            print(f"  {_c(_DIM, 'Requesting a pair code…')}")
-            result = await v2_flow.do_pair_v2(
-                poll_secret_hash=poll_secret_hash,
-                machine_name=hostname,
-                hostname=hostname,
-                os_string=os_string,
-                on_code=_on_code,
-                on_waiting=_on_waiting,
-            )
+            _init_spinner["ctx"] = _sync_spinner_ctx("Requesting a pair code")
+            _init_spinner["ctx"].__enter__()
+            try:
+                result = await v2_flow.do_pair_v2(
+                    poll_secret_hash=poll_secret_hash,
+                    machine_name=hostname,
+                    hostname=hostname,
+                    os_string=os_string,
+                    on_code=_on_code,
+                    on_waiting=_on_waiting,
+                )
+            finally:
+                _stop_init_spinner()
         except v2_flow.PollTimeout:
             print()
             _pt("polling timed out — re-run --pair to start fresh", "ERROR")
@@ -40214,6 +40232,16 @@ def _delegate_agent_via_pipx(agent_args: "list[str]") -> int:
         return 2
 
 
+def _sr_version() -> str:
+    """Installed package version (from wheel metadata), or a source-checkout
+    label when not pip-installed."""
+    try:
+        from importlib.metadata import version as _v
+        return _v("superresearch")
+    except Exception:
+        return "(source checkout)"
+
+
 def _is_source_checkout() -> bool:
     """True when running from a dev source tree (vs a pipx/pip-installed build).
     Mirrors the agent front-door heuristic: the in-tree agent package exists only
@@ -40225,18 +40253,25 @@ def _is_source_checkout() -> bool:
 
 
 def _pipx_cmd() -> "list[str] | None":
-    """How to invoke pipx — prefer the `pipx` shim, fall back to `python -m pipx`;
-    None if pipx isn't available."""
+    """How to invoke pipx from an INSTALLED build. pipx lives in the user's
+    Python, NOT this app's isolated pipx venv — so NEVER use sys.executable (the
+    venv's python has no pipx module; that's the bug that made `--update` /
+    `--uninstall` wrongly report 'pipx not found'). Prefer the `pipx` shim on
+    PATH, else a PATH python's `-m pipx`."""
     import shutil as _shutil
     if _shutil.which("pipx"):
         return ["pipx"]
-    try:
-        r = subprocess.run([sys.executable, "-m", "pipx", "--version"],
-                           capture_output=True, text=True, timeout=15)
-        if r.returncode == 0:
-            return [sys.executable, "-m", "pipx"]
-    except Exception:
-        pass
+    for _cand in ("python", "py", "python3"):
+        _exe = _shutil.which(_cand)
+        if not _exe:
+            continue
+        try:
+            r = subprocess.run([_exe, "-m", "pipx", "--version"],
+                               capture_output=True, text=True, timeout=20)
+            if r.returncode == 0:
+                return [_exe, "-m", "pipx"]
+        except Exception:
+            pass
     return None
 
 
@@ -40374,6 +40409,8 @@ def main():
     parser.add_argument("--uninstall", action="store_true",
         help="Uninstall the Super Research backend (via pipx). Keeps your logins + pairing; "
              "run --unpair first for a full disconnect.")
+    parser.add_argument("--version", action="version", version=f"superresearch {_sr_version()}",
+        help="Print the installed Super Research version and exit.")
     args = parser.parse_args()
 
     # Load .dg-supervisor.env BEFORE subcommand dispatch so every subcommand

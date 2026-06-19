@@ -61,21 +61,53 @@ def _try_keyring() -> "object | None":
 def _file_load() -> dict[str, str]:
     if not _FALLBACK_PATH.exists():
         return {}
-    try:
-        return json.loads(_FALLBACK_PATH.read_text())
-    except Exception:
-        log.warning("auth.json unreadable, treating as empty")
-        return {}
+    import time as _time
+    # Retry transient read failures: a sibling worker mid-`os.replace` can briefly
+    # make the read hit a Windows sharing violation or catch a half-written file.
+    # Without the retry, a transient error would falsely report "not signed in"
+    # under multi-worker contention.
+    for i in range(8):
+        try:
+            return json.loads(_FALLBACK_PATH.read_text())
+        except (OSError, ValueError):
+            if i < 7:
+                _time.sleep(0.05 * (i + 1))
+                continue
+            log.warning("auth.json unreadable after retries, treating as empty")
+            return {}
+    return {}
+
+
+def _replace_with_retry(src: str, dst) -> None:
+    """`os.replace` with retry for the Windows sharing-violation race. On Windows,
+    replacing auth.json fails with PermissionError (WinError 5) or WinError 32 if
+    a sibling process (e.g. another multi-worker `--serve`) has it open at that
+    instant. The holder releases in milliseconds, so retry with a short backoff
+    rather than failing the keystore write — an unretried failure cascaded into a
+    transient Firestore-init error and a cross-worker reconnect-respawn loop that
+    left the device perpetually offline under workerCount > 1. POSIX rename is
+    atomic and never hits this (first attempt succeeds)."""
+    import time as _time
+    for i in range(15):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            transient = isinstance(e, PermissionError) or getattr(e, "winerror", None) in (5, 32)
+            if not transient or i == 14:
+                raise
+            _time.sleep(min(0.4, 0.05 * (i + 1)))
 
 
 def _file_save(blob: dict[str, str]) -> None:
     _FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
-    # Write to tmp + os.replace for atomicity on POSIX (best effort on Windows).
+    # Write to tmp + atomic replace; _replace_with_retry absorbs the Windows
+    # multi-worker sharing-violation race on auth.json.
     fd, tmp = tempfile.mkstemp(dir=str(_FALLBACK_DIR), prefix=".auth.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(blob, fh)
-        os.replace(tmp, _FALLBACK_PATH)
+        _replace_with_retry(tmp, _FALLBACK_PATH)
         try:
             os.chmod(_FALLBACK_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
         except OSError:
