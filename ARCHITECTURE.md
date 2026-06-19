@@ -6,10 +6,13 @@ Backend architecture + Frontend ↔ Backend contract for the Multi-Agent Deep Re
 
 ## Running the Backend
 
-The backend ships as the **`superresearch` console command** (recommended). Install it once with pipx and run it from any directory — no checkout to manage; data/config live under `~/.super-research/` + `.dg-supervisor.env`:
+The backend ships as the **`superresearch` console command** (recommended). Install it with one command from **[superresearch.io/install](https://superresearch.io/install)** (it sets up Python/pipx for you), then run it from any directory — no checkout to manage; data/config live under `~/.super-research/` + `.dg-supervisor.env`:
 
 ```bash
-pipx install superresearch
+# Install (one command — see superresearch.io/install)
+irm https://superresearch.io/install.ps1 | iex        # Windows
+curl -fsSL https://superresearch.io/install.sh | sh   # macOS / Linux
+
 superresearch --pair      # one-time pairing + browser logins
 superresearch --serve     # run the backend
 superresearch "<topic>"   # one-shot CLI run

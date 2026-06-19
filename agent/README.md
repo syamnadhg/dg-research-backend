@@ -33,7 +33,7 @@ Run the agent through the backend's **`agent` front door** — the same front do
 as the rest of the backend. There are two ways in:
 
 **Installed backend (recommended).** If the backend is installed as a console
-command (`pipx install superresearch`), it carries the agent front door with it
+command (from **superresearch.io/install**), it carries the agent front door with it
 and you can drive the agent from **any directory**:
 
 ```sh

@@ -46,7 +46,7 @@ The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all
 
 The backend installs as a `superresearch` console command via [pipx](https://pipx.pypa.io). No checkout to manage, and it runs from **any directory** — data + config live under `~/.super-research/` and `.dg-supervisor.env`.
 
-**One command** (ensures Python 3.11+ & pipx — auto-installs pipx if missing — then installs `superresearch`):
+**One command** — also at **[superresearch.io/install](https://superresearch.io/install)** (ensures Python 3.11+ & pipx — auto-installs pipx if missing — then installs `superresearch`):
 
 ```bash
 # Windows (PowerShell)
