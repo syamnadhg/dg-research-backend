@@ -199,7 +199,8 @@ def cmd_connect(args: argparse.Namespace) -> int:
     # ── [1/4] Detect + choose ────────────────────────────────────────────────
     if not continued:
         b.step(1, 4, "Detect + choose")
-    targets = connect.detect_targets()
+    with b.spinner("Looking for chat runtimes (this host + WSL)"):
+        targets = connect.detect_targets()
     if explicit:
         matches = [t for t in targets if t.runtime == explicit]
         targets = matches or [connect.Target(explicit, "local", Path.home())]
@@ -489,7 +490,9 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
         return 0
     # pipx missing in the distro → install it autonomously (the WSL-side bootstrap),
     # then proceed. Only fall back to the manual command if that install can't finish.
-    if not connect.wsl_pipx_available(distro):
+    with b.spinner(f"Checking pipx inside WSL · {distro}"):
+        _pipx_ok = connect.wsl_pipx_available(distro)
+    if not _pipx_ok:
         b.dim(f"pipx isn't in WSL · {distro} yet — installing it there…")
         if not connect.ensure_wsl_pipx(distro):
             b.warn(f"Couldn't install pipx in WSL · {distro} automatically.")
@@ -512,7 +515,8 @@ def _wsl_distro_for(explicit: str | None = None) -> str | None:
     if sys.platform != "win32":
         return None
     try:
-        targets = connect.detect_targets()
+        with b.spinner("Checking for a WSL runtime"):
+            targets = connect.detect_targets()
     except Exception:
         return None
     def _match(loc: str) -> list[connect.Target]:
@@ -569,7 +573,9 @@ def _delegate_lifecycle(subcommand: str, extra_args: list[str], *, label: str,
         if _warn_unreachable_wsl("run it"):
             return 1
         return None
-    if not connect.wsl_pipx_available(distro):
+    with b.spinner(f"Checking pipx inside WSL · {distro}"):
+        _pipx_ok = connect.wsl_pipx_available(distro)
+    if not _pipx_ok:
         b.warn(f"This runtime is in WSL · {distro}, but pipx isn't installed there.")
         b.dim(f"Run it inside the distro:  wsl -d {distro}   then   pipx run superresearch-agent {subcommand}")
         return 1
@@ -1087,7 +1093,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     # Smoke config: real P1–P3 run, but skip video (P4, scarce YouTube quota)
     # and email so a verification run is light. Remove for a full run later.
     cfg = {"videoEnabled": False, "emailEnabled": False}
-    res = _bridge_post("/research", {"topic": args.topic, "deviceId": args.device, "config": cfg})
+    with b.spinner("Enqueuing the run"):
+        res = _bridge_post("/research", {"topic": args.topic, "deviceId": args.device, "config": cfg})
     if res is None or res[0] != 200:
         print(f"{_NO} enqueue failed: {res[1] if res else 'no response'}")
         return 1
@@ -1142,7 +1149,8 @@ def cmd_research(args: argparse.Namespace) -> int:
         cfg["emailEnabled"] = False
     if cfg:
         body["config"] = cfg
-    res = _bridge_post("/research", body)
+    with b.spinner("Starting the run"):
+        res = _bridge_post("/research", body)
     if res is None or res[0] != 200:
         print(f"{_NO} couldn't start: {_err(res)}")
         return 1
