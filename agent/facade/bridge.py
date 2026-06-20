@@ -755,6 +755,46 @@ def _heartbeat_loop(state: BridgeState, stop: threading.Event) -> None:
             log.debug("heartbeat tick error: %s", type(e).__name__)
 
 
+def _backend_cli() -> "str | None":
+    """Path to the Super Research backend CLI co-located with this bridge, or
+    None if it isn't on the host's PATH. The bridge runs on the same machine as
+    the backend (the standard setup), so the chat `version` / `update` actions
+    drive the LOCAL backend through it."""
+    import shutil
+    return shutil.which("superresearch")
+
+
+def _backend_version() -> "str | None":
+    """Version of the co-located Super Research backend, parsed from
+    `superresearch --version` (the compiled build answers this on its fast lazy
+    path — no heavy import). None if the backend CLI is absent or doesn't answer."""
+    exe = _backend_cli()
+    if not exe:
+        return None
+    import re
+    import subprocess
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True,
+                             text=True, timeout=15).stdout or ""
+    except Exception:
+        return None
+    m = re.search(r"(\d+\.\d+\.\d+\S*)", out)
+    return m.group(1) if m else (out.strip() or None)
+
+
+def _start_backend_update() -> "dict[str, object]":
+    """Kick `superresearch --update` on this host. The backend's updater detaches
+    (waits for its own short-lived process to exit, then runs the upgrade) and
+    returns promptly, so this does not block on the actual install. Raises
+    FileNotFoundError when the backend CLI is absent so the route can 404."""
+    exe = _backend_cli()
+    if not exe:
+        raise FileNotFoundError("backend_not_installed")
+    import subprocess
+    r = subprocess.run([exe, "--update"], capture_output=True, text=True, timeout=180)
+    return {"rc": r.returncode, "output": (r.stdout or r.stderr or "").strip()[-1500:]}
+
+
 def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
     class Handler(BaseHTTPRequestHandler):
@@ -859,6 +899,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._device_current()
             elif path == "/updates":
                 self._updates()
+            elif path == "/version":
+                self._version()
             elif path.startswith("/research/") and path.endswith("/podcast"):
                 self._research_podcast(path[len("/research/"):-len("/podcast")])
             elif path.startswith("/research/"):
@@ -924,6 +966,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._research_skip(path[len("/research/"):-len("/skip")])
             elif path == "/shutdown":
                 self._shutdown()
+            elif path == "/update":
+                self._update_backend()
             else:
                 self._json(404, {"error": "not found"})
 
@@ -1788,6 +1832,28 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             log.info("shutdown requested")
             self._json(200, {"ok": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+        def _version(self) -> None:
+            """The agent version + the co-located Super Research backend version
+            (read-only; no account needed — loopback + Host gated like every
+            route). Lets `version` work from chat the same as the agent CLI."""
+            self._json(200, {"agent": __version__, "backend": _backend_version()})
+
+        def _update_backend(self) -> None:
+            """Update the co-located Super Research backend (delegates to
+            `superresearch --update`, which detaches its own updater). Host/Origin
+            gated like every write; the backend that runs here is the host user's
+            own, so this is a local maintenance action (no account needed)."""
+            try:
+                res = _start_backend_update()
+            except FileNotFoundError:
+                self._json(404, {"error": "backend_not_installed"})
+                return
+            except Exception as e:  # subprocess/timeout — report, don't crash the worker
+                log.warning("backend update failed to start: %s", e)
+                self._json(502, {"error": f"update_failed: {type(e).__name__}"})
+                return
+            self._json(200, {"ok": True, "started": True, **res})
 
     return Handler
 

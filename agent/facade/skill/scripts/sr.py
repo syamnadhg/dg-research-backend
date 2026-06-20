@@ -28,6 +28,8 @@ or two from the topic) or run-id; omit it to mean the most recent / active run:
                        (--run <run> to target one; else the latest active run)
   arm-stream         prepare this chat's streaming watchdog → prints the cron
                        script + job name to arm via the runtime's cronjob tool
+  version            show the agent + Super Research backend versions
+  update             update the Super Research backend on the connected device
   logout             clear the account session
   help               this list
 
@@ -663,6 +665,41 @@ def cmd_logout(args) -> int:
     return _emit(body, args.json, ["✓ Logged out — account session cleared."])
 
 
+def cmd_version(args) -> int:
+    """Show the chat agent's version AND the Super Research backend's version
+    (the backend, co-located with the bridge, is the thing that runs research)."""
+    code, body = _get("/version")
+    if code != 200:
+        return _emit(body, args.json, [f"✗ couldn't read versions: {body.get('error', code)}"],
+                     _fail_code(code))
+    agent = body.get("agent") or "?"
+    backend = body.get("backend")
+    lines = [f"Super Research agent    v{agent}"]
+    if backend:
+        lines.append(f"Super Research backend  v{backend}")
+    else:
+        lines.append("Super Research backend  (not installed on the connected device)")
+    return _emit(body, args.json, lines)
+
+
+def cmd_update(args) -> int:
+    """Update the Super Research backend on the connected device (delegates to
+    `superresearch --update` there). The backend's updater runs in the
+    background, so this returns right away."""
+    code, body = _post("/update")
+    if code != 200:
+        err = body.get("error", "")
+        if err == "backend_not_installed":
+            msg = "Super Research isn't installed on the connected device — update it where it runs."
+        else:
+            msg = f"couldn't start the update: {err or code}"
+        return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
+    return _emit(body, args.json, [
+        "⬆️ Updating Super Research in the background.",
+        "It restarts on the new version shortly — say “version” in a bit to confirm.",
+    ])
+
+
 def cmd_arm_stream(args) -> int:
     """Prepare THIS chat's streaming watchdog and tell the agent how to arm it.
 
@@ -761,6 +798,12 @@ def build_parser() -> argparse.ArgumentParser:
     sk.set_defaults(func=cmd_skip)
 
     sub.add_parser("logout", help="clear the account session").set_defaults(func=cmd_logout)
+
+    sub.add_parser("version", aliases=["versions"],
+                   help="show the agent + Super Research backend versions").set_defaults(func=cmd_version)
+    sub.add_parser("update", aliases=["upgrade"],
+                   help="update the Super Research backend on the connected device").set_defaults(func=cmd_update)
+
     sub.add_parser(
         "arm-stream",
         help="prepare this chat's streaming watchdog (prints the cron script + name to arm)",

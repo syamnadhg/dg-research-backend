@@ -1403,7 +1403,7 @@ def cmd_update(_args: argparse.Namespace) -> int:
         print()
         return 1
     import subprocess as _sp
-    print(f"\n  Updating Super Research (the backend) …")
+    print("\n  Updating Super Research (the backend) …")
     try:
         rc = _sp.call([sr, "--update"])
     except KeyboardInterrupt:

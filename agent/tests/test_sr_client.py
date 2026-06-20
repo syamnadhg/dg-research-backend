@@ -178,6 +178,46 @@ def test_device_remove_sharer_leaves(bridge_port, monkeypatch, capsys):
     assert "Left the shared device" in capsys.readouterr().out
 
 
+def test_version_reports_agent_and_backend(bridge_port, monkeypatch, capsys):
+    # `version` from chat reads the bridge's /version: the agent's own version +
+    # the co-located backend's version (parsed from `superresearch --version`).
+    monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
+    assert sr.main(["version"]) == 0
+    out = capsys.readouterr().out
+    assert f"v{bridge.__version__}" in out      # agent version
+    assert "backend  v0.1.1" in out             # backend version
+
+
+def test_version_when_backend_absent(bridge_port, monkeypatch, capsys):
+    # Backend not co-located (CLI off PATH) → say so, don't fabricate a version.
+    monkeypatch.setattr(bridge, "_backend_version", lambda: None)
+    assert sr.main(["version"]) == 0
+    assert "not installed" in capsys.readouterr().out
+
+
+def test_update_starts_backend(bridge_port, monkeypatch, capsys):
+    # `update` from chat kicks `superresearch --update` on the connected device
+    # (the bridge shells out; the backend's updater detaches and returns fast).
+    calls = {}
+    def _fake_update():
+        calls["ran"] = True
+        return {"rc": 0, "output": "started"}
+    monkeypatch.setattr(bridge, "_start_backend_update", _fake_update)
+    assert sr.main(["update"]) == 0
+    assert calls.get("ran") is True
+    assert "Updating Super Research" in capsys.readouterr().out
+
+
+def test_update_when_backend_absent(bridge_port, monkeypatch, capsys):
+    # No backend on the connected device → a clear chat error (route 404s), not a
+    # crash or a silent no-op.
+    def _absent():
+        raise FileNotFoundError("backend_not_installed")
+    monkeypatch.setattr(bridge, "_start_backend_update", _absent)
+    assert sr.main(["update"]) == 1
+    assert "isn't installed" in capsys.readouterr().out
+
+
 def test_research_then_status(bridge_port, capsys):
     assert sr.main(["research", "Tesla 2025"]) == 0
     out = capsys.readouterr().out
