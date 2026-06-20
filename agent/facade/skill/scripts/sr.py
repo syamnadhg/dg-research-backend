@@ -386,13 +386,27 @@ def cmd_login_wait(args) -> int:
     return _emit(body, args.json, [msg])
 
 
+def _update_notices(body: dict) -> list[str]:
+    """Proactive "a newer version is available" prompts from a /status (or /version)
+    body — so the user is nudged on the welcome without having to ask."""
+    out = []
+    if body.get("backendUpdate"):
+        out.append(f"⬆️ Super Research v{body['backendUpdate']} is available — say “update”.")
+    if body.get("agentUpdate"):
+        out.append(f"⬆️ Agent v{body['agentUpdate']} is available — say “update the agent”.")
+    return out
+
+
 def cmd_status_account(args) -> int:
     code, body = _get("/status")
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     if body.get("authed"):
-        return _emit(body, args.json, [f"✓ Signed in as {body.get('email') or body.get('uid')}"])
-    return _emit(body, args.json, ["Not signed in — run login."])
+        lines = [f"✓ Signed in as {body.get('email') or body.get('uid')}"]
+    else:
+        lines = ["Not signed in — run login."]
+    lines += _update_notices(body)
+    return _emit(body, args.json, lines)
 
 
 def cmd_devices(args) -> int:
@@ -666,20 +680,46 @@ def cmd_logout(args) -> int:
 
 
 def cmd_version(args) -> int:
-    """Show the chat agent's version AND the Super Research backend's version
-    (the backend, co-located with the bridge, is the thing that runs research)."""
+    """Show the chat agent's version AND the Super Research backend's version, each
+    with a "newer available" nudge when one is published (the backend, co-located
+    with the bridge, is the thing that runs research)."""
     code, body = _get("/version")
     if code != 200:
         return _emit(body, args.json, [f"✗ couldn't read versions: {body.get('error', code)}"],
                      _fail_code(code))
     agent = body.get("agent") or "?"
     backend = body.get("backend")
-    lines = [f"Super Research agent    v{agent}"]
+    a_new = body.get("agentLatest")
+    b_new = body.get("backendLatest")
+    lines = [f"Super Research agent    v{agent}"
+             + (f"   ⬆️ v{a_new} available — say “update the agent”" if a_new else "")]
     if backend:
-        lines.append(f"Super Research backend  v{backend}")
+        lines.append(f"Super Research backend  v{backend}"
+                     + (f"   ⬆️ v{b_new} available — say “update”" if b_new else ""))
     else:
         lines.append("Super Research backend  (not installed on the connected device)")
     return _emit(body, args.json, lines)
+
+
+def cmd_agent_update(args) -> int:
+    """Update the chat AGENT itself — its package + skill + bridge — to the latest
+    published version (the bridge reconnects from the latest in the background).
+    Distinct from `update`, which updates the Super Research backend."""
+    code, body = _post("/agent-install")
+    if code != 200:
+        err = body.get("error", "")
+        if err == "agent_unavailable":
+            msg = ("can't reach the latest agent right now — the device may be offline, "
+                   "or this version isn't published yet. (Nothing changed; the agent is still running.)")
+        elif err == "update_helper_failed":
+            msg = "couldn't start the agent update (is pipx available on the connected device?)"
+        else:
+            msg = f"couldn't start the agent update: {err or code}"
+        return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
+    return _emit(body, args.json, [
+        "⬆️ Updating the Super Research agent (skill + bridge) to the latest version.",
+        "The bridge briefly restarts on the new version — say “agent version” in a bit to confirm.",
+    ])
 
 
 def cmd_update(args) -> int:
@@ -800,9 +840,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("logout", help="clear the account session").set_defaults(func=cmd_logout)
 
     sub.add_parser("version", aliases=["versions"],
-                   help="show the agent + Super Research backend versions").set_defaults(func=cmd_version)
+                   help="show the agent + Super Research backend versions (+ update notices)").set_defaults(func=cmd_version)
     sub.add_parser("update", aliases=["upgrade"],
                    help="update the Super Research backend on the connected device").set_defaults(func=cmd_update)
+    sub.add_parser("agent-update",
+                   aliases=["agent-install", "update-agent", "update-skill", "upgrade-agent"],
+                   help="update the chat agent itself (package + skill + bridge) to the latest"
+                   ).set_defaults(func=cmd_agent_update)
 
     sub.add_parser(
         "arm-stream",

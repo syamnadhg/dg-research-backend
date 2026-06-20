@@ -1374,17 +1374,31 @@ def _local_superresearch() -> "str | None":
 
 def cmd_version(_args: argparse.Namespace) -> int:
     """Show the agent version AND the Super Research backend version (the backend
-    is the thing that runs research; the agent just drives it)."""
+    is the thing that runs research; the agent just drives it), each with a
+    pip-style "newer on PyPI" nudge when one is available."""
+    from . import selfupdate
     b.header("versio", "versions", tagline_color=branding._BOLD + branding._ACCENT)
     print(f"\n  {b.c(branding._BOLD, 'Agent')} (superresearch-agent)   {b.c(branding._BOLD, 'v' + __version__)}")
+    a_new = selfupdate.agent_update_available()
+    if a_new:
+        print(f"     {b.c(branding._ACCENT, '⬆ v' + a_new + ' available')} — update with  "
+              f"{b.c(branding._BOLD, 'pipx run superresearch-agent connect')}")
     sr = _local_superresearch()
+    backend_ver = None
     if sr:
         import subprocess as _sp
         try:
             out = _sp.run([sr, "--version"], capture_output=True, text=True, timeout=15).stdout.strip()
         except Exception:
             out = ""
-        print(f"  {b.c(branding._BOLD, 'Super Research')} (backend)   {b.c(branding._BOLD, (out.replace('Super Research', '').strip() or '(version unknown)'))}")
+        import re as _re
+        m = _re.search(r"(\d+\.\d+\.\d+\S*)", out)
+        backend_ver = m.group(1) if m else None
+        print(f"  {b.c(branding._BOLD, 'Super Research')} (backend)   {b.c(branding._BOLD, ('v' + backend_ver) if backend_ver else '(version unknown)')}")
+        b_new = selfupdate.backend_update_available(backend_ver)
+        if b_new:
+            print(f"     {b.c(branding._ACCENT, '⬆ v' + b_new + ' available')} — update with  "
+                  f"{b.c(branding._BOLD, 'superresearch --update')}")
     else:
         print(f"  {b.c(branding._BOLD, 'Super Research')} (backend)   {b.c(branding._DIM, 'not installed on this machine')}")
     print()

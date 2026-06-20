@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 
-from . import __version__, config, devicelogin, prefs, runview
+from . import __version__, config, devicelogin, prefs, runview, selfupdate
 from .devicelogin import DeviceLoginError
 from .firestore_rest import FirestoreError, FirestoreRest
 from .session import AccountSession, CustomTokenError, RevokedError
@@ -779,7 +779,10 @@ def _backend_version() -> "str | None":
     except Exception:
         return None
     m = re.search(r"(\d+\.\d+\.\d+\S*)", out)
-    return m.group(1) if m else (out.strip() or None)
+    # On a regex miss return None (version unknown) rather than raw CLI text — a
+    # non-version string would make backend_update_available() compare garbage and
+    # falsely report an upgrade.
+    return m.group(1) if m else None
 
 
 def _start_backend_update() -> "dict[str, object]":
@@ -968,6 +971,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._shutdown()
             elif path == "/update":
                 self._update_backend()
+            elif path == "/agent-install":
+                self._agent_install()
             else:
                 self._json(404, {"error": "not found"})
 
@@ -1094,11 +1099,17 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._json(200, self._remote_payload(flow))
 
         def _status(self) -> None:
+            # Carry the pip-style update notices so the welcome / a bare /sr can
+            # PROACTIVELY prompt "a newer version is available" (cached 24h — cheap).
+            updates = {
+                "agentUpdate": selfupdate.agent_update_available(),
+                "backendUpdate": selfupdate.backend_update_available(_backend_version()),
+            }
             sess = state.session
             if sess is None:
-                self._json(200, {"authed": False})
+                self._json(200, {"authed": False, **updates})
                 return
-            self._json(200, {"authed": True, "uid": sess.uid, "email": sess.email})
+            self._json(200, {"authed": True, "uid": sess.uid, "email": sess.email, **updates})
 
         def _icon(self, path: str) -> None:
             # Serve the bundled brand PNGs for the sign-in page's phase row.
@@ -1834,10 +1845,17 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             threading.Thread(target=self.server.shutdown, daemon=True).start()
 
         def _version(self) -> None:
-            """The agent version + the co-located Super Research backend version
-            (read-only; no account needed — loopback + Host gated like every
-            route). Lets `version` work from chat the same as the agent CLI."""
-            self._json(200, {"agent": __version__, "backend": _backend_version()})
+            """The agent version + the co-located Super Research backend version,
+            each with a pip-style "newer on PyPI" notice (read-only; no account
+            needed — loopback + Host gated like every route). Lets `version` work
+            from chat the same as the agent CLI."""
+            backend = _backend_version()
+            self._json(200, {
+                "agent": __version__,
+                "backend": backend,
+                "agentLatest": selfupdate.agent_update_available(),
+                "backendLatest": selfupdate.backend_update_available(backend),
+            })
 
         def _update_backend(self) -> None:
             """Update the co-located Super Research backend (delegates to
@@ -1854,6 +1872,27 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._json(502, {"error": f"update_failed: {type(e).__name__}"})
                 return
             self._json(200, {"ok": True, "started": True, **res})
+
+        def _agent_install(self) -> None:
+            """Update the AGENT itself (package + skill + bridge) to the latest
+            published version. `pipx run superresearch-agent` is always-latest, so we
+            spawn a DETACHED reconnect (redeploy skill + re-pin launcher + start the
+            new bridge) that fires once THIS process exits, then shut down — freeing
+            the loopback port so the new bridge can bind it. Host/Origin gated like
+            every write; this is a local maintenance action on the host user's own
+            agent (no account needed). Mirrors the backend's detached self-update."""
+            # Pre-flight: only tear the running bridge down if the update can ACTUALLY
+            # proceed (online, package published, pipx healthy). Otherwise refuse and
+            # keep the current bridge alive — never strand the user with no chat.
+            if not selfupdate.agent_resolvable():
+                self._json(502, {"error": "agent_unavailable"})
+                return
+            if not selfupdate.spawn_detached_reconnect():
+                self._json(502, {"error": "update_helper_failed"})
+                return
+            log.info("agent self-update requested — reconnecting from latest")
+            self._json(200, {"ok": True, "started": True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     return Handler
 

@@ -67,8 +67,9 @@ or say nothing to mean the most recent / active run.
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "add a device", "pair my new PC, code is K7XQ-9B2M" | `sr.py device-add <code>` |
 | "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
-| "what version?", "which Super Research version am I on?" | `sr.py version` |
-| "update Super Research", "upgrade it to the latest" | **confirm**, then `sr.py update` |
+| "what version?", "which Super Research version am I on?" | `sr.py version` (shows both + any update available) |
+| "update Super Research", "upgrade it to the latest" | **confirm**, then `sr.py update` (backend) |
+| "update the agent", "update the skill", "upgrade the agent" | **confirm**, then `sr.py agent-update` (the chat agent itself) |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome + the list |
 
 **Safe defaults:** when the user doesn't name a run, act on the **most recent
@@ -112,8 +113,8 @@ stay owner-only in the web app):
 - **stop a run** — "stop" (keeps the results so far)
 - **resume a blocked run** — "retry" or "skip"
 - **trim phases** — "skip the video / report"
-- **version / update** — "what version?" · "update Super Research" (restarts on
-  the new version)
+- **version / update** — "what version?" (shows both + any update available) ·
+  "update Super Research" (backend) · "update the agent" (the chat agent itself)
 
 ## Action → what to run
 
@@ -132,8 +133,9 @@ stay owner-only in the web app):
 | stop `[title]` | `sr.py stop ["<title>"]` | **Confirm first**, then run. Stops the run at the current phase and **keeps the results so far + the chat** (it does not delete anything). No title = the latest active run. |
 | retry `[title]` | `sr.py retry ["<title>"]` | Resume a run that's waiting on a decision / hit an error. Use after the user has done any on-device step the blocker asked for (e.g. signed in). |
 | skip `[phases] [--run title]` | `sr.py skip [phases] [--run "<title>"]` | **No phases** → skip whatever the run is currently **blocked** on (resolve the decision). **With phases** (Brief=1, Podcast=3, Video=4, Report=5, or their names) → trim those phases when reached. |
-| version | `sr.py version` | Relay the agent + Super Research backend versions. |
-| update | `sr.py update` | **Confirm first** ("Update Super Research?"). Updates the backend on the connected device — it restarts on the new version in the background; tell them to check `version` shortly. |
+| version | `sr.py version` | Relay the agent + Super Research backend versions; if it shows "⬆️ vX available", offer the matching update ("update Super Research" → `update`; "update the agent" → `agent-update`). |
+| update | `sr.py update` | **Confirm first** ("Update Super Research?"). Updates the **backend** on the connected device — it restarts on the new version in the background; tell them to check `version` shortly. |
+| agent-update | `sr.py agent-update` | **Confirm first** ("Update the chat agent?"). Updates the **chat agent itself** (package + skill + bridge) to the latest — the bridge briefly restarts, so chat may be unresponsive for a moment; tell them to check "agent version" shortly. |
 | (bare `/sr`) | `sr.py status-account` | Welcome + list the actions (see **start here**). |
 
 `research` accepts `--no-video` and `--no-email` to skip those phases, and
