@@ -68,6 +68,7 @@ or say nothing to mean the most recent / active run.
 | "add a device", "pair my new PC, code is K7XQ-9B2M" | `sr.py device-add <code>` |
 | "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
 | "what version?", "which Super Research version am I on?" | `sr.py version` (shows both + any update available) |
+| "install Super Research here", "set up the backend on this PC", "host it here", "no devices — set one up" | **confirm**, then `sr.py install`, then guide pairing |
 | "update Super Research", "upgrade it to the latest" | **confirm**, then `sr.py update` (backend) |
 | "update the agent", "update the skill", "upgrade the agent" | **confirm**, then `sr.py agent-update` (the chat agent itself) |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome + the list |
@@ -133,6 +134,7 @@ stay owner-only in the web app):
 | stop `[title]` | `sr.py stop ["<title>"]` | **Confirm first**, then run. Stops the run at the current phase and **keeps the results so far + the chat** (it does not delete anything). No title = the latest active run. |
 | retry `[title]` | `sr.py retry ["<title>"]` | Resume a run that's waiting on a decision / hit an error. Use after the user has done any on-device step the blocker asked for (e.g. signed in). |
 | skip `[phases] [--run title]` | `sr.py skip [phases] [--run "<title>"]` | **No phases** → skip whatever the run is currently **blocked** on (resolve the decision). **With phases** (Brief=1, Podcast=3, Video=4, Report=5, or their names) → trim those phases when reached. |
+| install | `sr.py install` | **Confirm first**. Installs the **backend** on the connected device (turns that PC into a research host) — runs in the background. Then **guide pairing**: tell them to run `superresearch --pair` on that PC; it shows an 8-char code → they read it to you → you run `device add <code>`; then they finish the API-key + browser-login steps **on the PC** (those can't be done from chat). Once done, the device shows up in `devices` and is ready. Use this when `research` reports "no devices yet". |
 | version | `sr.py version` | Relay the agent + Super Research backend versions; if it shows "⬆️ vX available", offer the matching update ("update Super Research" → `update`; "update the agent" → `agent-update`). |
 | update | `sr.py update` | **Confirm first** ("Update Super Research?"). Updates the **backend** on the connected device — it restarts on the new version in the background; tell them to check `version` shortly. |
 | agent-update | `sr.py agent-update` | **Confirm first** ("Update the chat agent?"). Updates the **chat agent itself** (package + skill + bridge) to the latest — the bridge briefly restarts, so chat may be unresponsive for a moment; tell them to check "agent version" shortly. |

@@ -973,6 +973,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._update_backend()
             elif path == "/agent-install":
                 self._agent_install()
+            elif path == "/install-backend":
+                self._install_backend()
             else:
                 self._json(404, {"error": "not found"})
 
@@ -1893,6 +1895,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             log.info("agent self-update requested — reconnecting from latest")
             self._json(200, {"ok": True, "started": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+        def _install_backend(self) -> None:
+            """Install the Super Research BACKEND on this host (`pipx install
+            superresearch`) — turns this PC into a research host, all from chat.
+            Detached (the bridge keeps running; this is a separate package). If the
+            backend is already present, say so (use `/update` to upgrade). Host/Origin
+            gated; pairing (API keys + browser logins) is done on the host after."""
+            if _backend_cli():
+                self._json(200, {"ok": True, "already": True})
+                return
+            if not selfupdate.spawn_detached_backend_install():
+                self._json(502, {"error": "install_helper_failed"})
+                return
+            log.info("backend install requested (pipx install superresearch)")
+            self._json(200, {"ok": True, "started": True})
 
     return Handler
 

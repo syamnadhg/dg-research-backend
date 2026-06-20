@@ -740,6 +740,31 @@ def cmd_update(args) -> int:
     ])
 
 
+def cmd_install(args) -> int:
+    """Install the Super Research BACKEND on the connected device — turns that PC
+    into a research host (`pipx install superresearch`). The install runs in the
+    background; pairing afterwards is done on the host."""
+    code, body = _post("/install-backend")
+    if code != 200:
+        err = body.get("error", "")
+        if err == "install_helper_failed":
+            msg = "couldn't start the install (is pipx available on the connected device?)"
+        else:
+            msg = f"couldn't start the install: {err or code}"
+        return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
+    if body.get("already"):
+        return _emit(body, args.json, [
+            "Super Research is already installed on this device.",
+            "Say “update” to upgrade it, or “devices” to see/pair it.",
+        ])
+    return _emit(body, args.json, [
+        "⬇️ Installing Super Research (the backend) on this device in the background.",
+        "When it finishes, pair it on that PC:  run  superresearch --pair  there —",
+        "it shows an 8-char code; read it to me and I’ll add it (then finish the",
+        "API-key + browser-login steps on the PC, and it’s ready to run research).",
+    ])
+
+
 def cmd_arm_stream(args) -> int:
     """Prepare THIS chat's streaming watchdog and tell the agent how to arm it.
 
@@ -841,6 +866,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("version", aliases=["versions"],
                    help="show the agent + Super Research backend versions (+ update notices)").set_defaults(func=cmd_version)
+    sub.add_parser("install", aliases=["install-backend", "setup-backend"],
+                   help="install the Super Research backend on the connected device (host a BE)"
+                   ).set_defaults(func=cmd_install)
     sub.add_parser("update", aliases=["upgrade"],
                    help="update the Super Research backend on the connected device").set_defaults(func=cmd_update)
     sub.add_parser("agent-update",

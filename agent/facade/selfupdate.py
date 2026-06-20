@@ -179,6 +179,36 @@ def agent_resolvable() -> bool:
         return False
 
 
+def _spawn_detached(cmd: list, log_name: str) -> bool:
+    """Launch `cmd` fully detached (survives this process), logging to
+    ~/.super-agent/<log_name>. Returns True if it launched. Stdlib only;
+    cross-platform (Windows DETACHED_PROCESS / POSIX start_new_session)."""
+    logf = subprocess.DEVNULL
+    try:
+        config.store_dir().mkdir(parents=True, exist_ok=True)
+        logf = open(config.store_dir() / log_name, "ab")
+    except Exception:
+        logf = subprocess.DEVNULL
+    creationflags = 0
+    kwargs: dict = {}
+    if sys.platform == "win32":
+        creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
+        return True
+    except Exception:
+        return False
+    finally:
+        if logf is not subprocess.DEVNULL:
+            try:
+                logf.close()
+            except Exception:
+                pass
+
+
 def spawn_detached_reconnect() -> bool:
     """Spawn a DETACHED process that, once THIS (bridge) process exits, runs
     ``pipx run superresearch-agent connect --yes --no-login`` — fetching the latest
@@ -200,27 +230,16 @@ def spawn_detached_reconnect() -> bool:
     if rt:
         reconnect += ["--runtime", rt]
     cmd = [py, "-c", _RECONNECT_WAITER, str(os.getpid()), *reconnect]
-    logf = subprocess.DEVNULL
-    try:
-        config.store_dir().mkdir(parents=True, exist_ok=True)
-        logf = open(config.store_dir() / "self-update.log", "ab")
-    except Exception:
-        logf = subprocess.DEVNULL
-    creationflags = 0
-    kwargs: dict = {}
-    if sys.platform == "win32":
-        creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    try:
-        subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, creationflags=creationflags, **kwargs)
-        return True
-    except Exception:
+    return _spawn_detached(cmd, "self-update.log")
+
+
+def spawn_detached_backend_install() -> bool:
+    """Install the Super Research BACKEND on THIS host (``pipx install
+    superresearch``) in a detached process — the bridge keeps running (the backend
+    is a SEPARATE package, no restart) and the multi-minute install doesn't block
+    the HTTP response. Returns True if the install launched. Pairing (stages 2-5:
+    API keys + browser logins) is interactive on the host afterwards."""
+    pipx = _pipx_cmd()
+    if pipx is None:
         return False
-    finally:
-        if logf is not subprocess.DEVNULL:
-            try:
-                logf.close()
-            except Exception:
-                pass
+    return _spawn_detached([*pipx, "install", BACKEND_PKG], "backend-install.log")

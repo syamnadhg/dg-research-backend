@@ -134,6 +134,21 @@ def test_spawn_detached_reconnect_no_pipx(monkeypatch):
     assert selfupdate.spawn_detached_reconnect() is False
 
 
+def test_spawn_detached_backend_install(tmp_path, monkeypatch):
+    monkeypatch.setattr(selfupdate.config, "store_dir", lambda: tmp_path)
+    monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
+    seen = {}
+    monkeypatch.setattr(selfupdate.subprocess, "Popen",
+                        lambda cmd, **kw: seen.update(cmd=cmd) or types.SimpleNamespace())
+    assert selfupdate.spawn_detached_backend_install() is True
+    assert seen["cmd"] == ["pipx", "install", "superresearch"]  # backend package
+
+
+def test_spawn_detached_backend_install_no_pipx(monkeypatch):
+    monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: None)
+    assert selfupdate.spawn_detached_backend_install() is False
+
+
 def test_agent_resolvable(monkeypatch):
     monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
     monkeypatch.setattr(selfupdate.subprocess, "run",

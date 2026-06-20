@@ -275,6 +275,29 @@ def test_agent_update_helper_fails(bridge_port, monkeypatch, capsys):
     assert "pipx" in capsys.readouterr().out.lower()
 
 
+def test_install_backend_starts(bridge_port, monkeypatch, capsys):
+    # `install` installs the backend on the host (turning it into a research host),
+    # then the chat guides the user through host-side pairing.
+    monkeypatch.setattr(bridge, "_backend_cli", lambda: None)  # not yet installed
+    monkeypatch.setattr(bridge.selfupdate, "spawn_detached_backend_install", lambda: True)
+    assert sr.main(["install"]) == 0
+    out = capsys.readouterr().out
+    assert "Installing Super Research" in out and "--pair" in out
+
+
+def test_install_backend_already_present(bridge_port, monkeypatch, capsys):
+    monkeypatch.setattr(bridge, "_backend_cli", lambda: "/usr/local/bin/superresearch")
+    assert sr.main(["install"]) == 0
+    assert "already installed" in capsys.readouterr().out.lower()
+
+
+def test_install_backend_helper_fails(bridge_port, monkeypatch, capsys):
+    monkeypatch.setattr(bridge, "_backend_cli", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "spawn_detached_backend_install", lambda: False)
+    assert sr.main(["install"]) == 1
+    assert "pipx" in capsys.readouterr().out.lower()
+
+
 def test_status_account_prompts_available_updates(bridge_port, monkeypatch, capsys):
     # The welcome / bare-/sr proactively nudges when an update is available.
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: "0.1.9")
