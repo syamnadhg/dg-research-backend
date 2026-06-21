@@ -1,248 +1,190 @@
 # Super Agent — drive Super Research from chat (Hermes / OpenClaw)
 
 Lets a chat runtime (Hermes / OpenClaw) drive **Super Research** as a *headless
-session of your account*. You sign in once with Google (`/sr login`); the bridge
-then enqueues research runs on your account's existing devices, and every run
-shows up in the web app like a normal chat.
+session of your account*. You install a small `/sr` skill + a local loopback
+bridge, sign in once with Google, and then run / track research from chat —
+every run shows up in the web app like a normal chat.
 
-- **Research-only.** It can run / track / fetch research. It can **never**
-  control devices (add / remove / pair / share) — that stays owner-only.
+- **Research-only.** Run / track / fetch research. It can **never** control
+  devices (add / remove / pair / share stay owner-only in the app).
 - **One agent per account** (owner or sharer).
-- **No dedicated worker, no separate logins, no identity minting.** It uses the
-  account's existing devices, on the app's normal Firestore plane.
+- **No dedicated worker, no separate logins, no identity minting.** It uses your
+  account's existing paired devices, on the app's normal Firestore plane.
 
-Design source of truth: `../SuperAgentRecipe.md`.
+---
 
-## The "nothing breaks" contract
+## Install
 
-This package is a **separate process** and never touches the existing app:
-
-- No import of, or write to, `research-automate` or `research-app`.
-- Its own secret-store namespace (`super-agent`, `~/.super-agent`) — **never**
-  the device daemon's `super-research` keystore. The account refresh token and
-  the device refresh token are different Firebase users; isolating them means a
-  refresh here can never disturb a paired device.
-- Writes only what a normal account client may write under the **existing**
-  Firestore rules: research docs under your own tree + device-queue `start`
-  docs where you're a member. No rules change, no keystore change, no queue /
-  claim / pipeline change.
-
-## Running it (no install)
-
-Run the agent through the backend's **`agent` front door** — the same front door
-as the rest of the backend. There are two ways in:
-
-**Installed backend (recommended).** If the backend is installed as a console
-command (from **superresearch.io/install**), it carries the agent front door with it
-and you can drive the agent from **any directory**:
+One command, run in your chat runtime's environment — or grab it from the page at
+**https://superresearch.io/agent-install**:
 
 ```sh
-superresearch agent <command>      # e.g. agent connect / agent serve / agent login
-superresearch --agent <command>    # flag-style alias (consistent with --pair/--serve)
-superresearch agent                # bare → smart entry: status if set up, else connect
-superresearch agent --help         # the full command list
+pipx run superresearch-agent connect      # published package (fallback: uvx superresearch-agent connect)
 ```
 
-An installed build's `superresearch agent <verb>` **delegates to `pipx run
-superresearch-agent <verb>`** — the published chat-runtime agent package — so you
-never need a backend checkout just to connect.
+`connect` is a branded, interactive flow — **Detect → Choose → Install → Go
+live** — that finds your runtime (native on this OS, or inside WSL), copies the
+`/sr` skill in, offers to keep a background bridge running on every login, and
+signs you in. Then, in chat:
 
-**Source checkout.** From a developer checkout, run the agent as a
-**`research.py` command** from the repo root, **no install and no editable mode**;
-here the front door runs the **in-tree** agent (`python -m facade`):
-
-```sh
-cd research-automate
-python research.py agent <command>      # e.g. agent connect / agent serve / agent login
-python research.py --agent <command>    # flag-style alias (consistent with --pair/--serve)
-python research.py agent                # bare → smart entry: status if set up, else connect
-python research.py agent --help         # the full command list
+```
+/reload-skills          # Hermes only, once, so /sr registers
+/sr login               # sign in (approve on your phone)
+/sr research <topic>    # …and you're running
 ```
 
-> **`superresearch <flags>` is a pure drop-in for `python research.py <flags>`** —
-> identical flags and branded UI — so `superresearch agent …` and `python
-> research.py agent …` are equivalent; pick whichever matches how the backend is
-> installed.
+**Install straight from chat.** Hermes / OpenClaw can run the command themselves —
+just ask ("install Super Research"), and the agent runs `pipx run
+superresearch-agent connect` and relays the sign-in link. (The runtime's
+`/skills` marketplace command is terminal-only and doesn't work over a chat
+platform — *running the command* does.) The machine-readable companion is at
+**https://superresearch.io/agent-install.json** (command + flags + steps).
 
-The agent's only deps (`requests`, `keyring`) already ship in the backend's
-`requirements.txt`, so once the backend is set up (`pip install -r
-requirements.txt`) there is **nothing extra to install**. Requires **Python
-3.11+**.
+**No backend host yet?** The agent orchestrates from chat; the research pipeline
+runs on a paired computer. If you don't have one, say **"install Super Research
+here"** (`/sr install`) to install the backend on this machine from chat, then
+pair it: run `superresearch --pair` on the host, read the 8-char code to chat,
+and `device add <code>`.
 
-> **Throughout this README, `agent <command>` is shorthand for the front-door
-> form — `superresearch agent <command>` on an installed build, or `python
-> research.py agent <command>` from a source checkout.**
+---
 
-The code itself lives in this isolated sub-package (`research-automate/agent/`,
-its own process + its own two deps); `research.py` only *fronts* it so it's
-invoked consistently — it never imports the package.
+## Use it from chat (`/sr`)
 
-<details><summary>Optional — a bare <code>agent</code> command / dev setup</summary>
+The runtime registers the skill as one slash command — **`/sr`** — and the action
+follows it (natural phrasing works too: "research the EV market", "send me the
+podcast"):
 
-If you'd rather type a bare `agent` (outside the backend) or run the tests:
-
-```sh
-cd research-automate/agent
-pip install .                      # adds a standalone `agent` command (entry point)
-python -m facade <command>         # or run module-style, no install
-pip install .[dev]                 # + test deps (pytest, ruff)
-pip install -r requirements-dev.txt
+```
+/sr login                        sign in (account session)      ·   /sr logout
+/sr research <topic>             start a run
+/sr status [title]               a run's progress + permanent share links
+/sr updates                      all active runs + their links
+/sr podcast [title]              the run's audio, sent as a native voice message
+/sr retry [title]                resume a run waiting on a decision / error
+/sr skip [phases] [--run title]  trim phases (brief/podcast/video/report) or resolve a blocker
+/sr stop [title]                 gracefully stop a run (keeps results + chat)
+/sr device                       list devices  ·  device use <name>  ·  device add <code>  ·  device remove <name>
 ```
 
-`requirements.txt` / `requirements-dev.txt` here mirror `pyproject.toml` for a
-fresh venv. The `python research.py agent` path above needs none of this.
-</details>
+A bare `/sr` is the welcome + help. **Every account action needs `/sr login`
+first** — the agent operates as an authorized session on your account, so it's
+signed in before it can list devices, start research, or pair.
 
-## Use it from chat (Hermes / OpenClaw)
+### Versions + updates (from chat)
 
-Install the Super Research skill into your chat runtime, then drive everything
-with slash commands:
-
-```sh
-cd research-automate
-python research.py agent connect    # branded 4-step flow; detects Windows + WSL runtimes
-# step 4 offers to run the bridge in the background now + on every login
-# then in chat:  /reload-skills (once) → /sr login → approve on phone → /sr research <topic>
+```
+/sr version        agent + Super Research backend versions, with a "⬆ newer available" nudge
+                   (also surfaced on the welcome)
+/sr update         update the Super Research BACKEND on the connected device
+/sr agent-update   update the chat AGENT itself (package + skill + bridge)
+/sr install        install the backend on this host (turn this PC into a research host)
 ```
 
-`agent connect` is an interactive, branded flow — **Detect → Choose → Install →
-Go live** — that finds your chat runtime on **Windows** (`~/.hermes`,
-`~/.openclaw`) *and* inside **WSL** (`\\wsl.localhost\<distro>\home\<user>\…`),
-lets you pick when more than one is found, copies a small dependency-free skill
-(a `SKILL.md` + a `scripts/sr.py` client that calls the bridge over loopback)
-into the runtime's skills dir, and offers to pin the always-up bridge.
+`update` / `agent-update` reply "already up to date" when nothing newer is
+published, instead of a pointless reinstall.
 
-The runtime registers a skill as a single slash command (`/<skill-name>`), so the
-skill is **`/sr`** and the action follows it: `/sr login`, `/sr research <topic>`,
-`/sr status [id]`, `/sr device [use <id>] [add <code>]`, `/sr podcast [id]`, `/sr
-skip <id> <phases>`, `/sr cancel <id>`, `/sr logout`; a bare **`/sr`** is the
-welcome / help. Natural phrasing works too ("research Tesla 2025", "send me the
-podcast"). It's research-only — it can never control devices.
+---
 
-**Manage Super Research from chat too:** `/sr version` (agent **and** backend
-versions, with a "⬆ newer available" nudge — also surfaced on the welcome), `/sr
-update` (update the **backend**), `/sr agent-update` (update the **chat agent
-itself** — package + skill + bridge, a detached reconnect-from-latest), and `/sr
-install` (install the backend on this host — turns the PC into a research host;
-the pairing API-key/browser-login steps are then done on the host). `update` /
-`agent-update` reply "already up to date" when nothing newer is published rather
-than reinstalling. Every account action (`research`, `device …`, `install`'s
-pairing) needs **`/sr login`** first — the agent operates as an authorized session
-on your account, so it must be signed in.
+## Reachability — the bridge runs WITH the runtime
 
-> **After connecting, run `/reload-skills` once in your chat** (the gateway caches
-> its skill scan) so `/sr` registers without restarting the runtime.
+The bridge binds **loopback only**, so it can only be reached by a runtime on its
+*own* machine — which is why `connect` co-locates them:
 
-**Reachability — Model A: the bridge runs WITH the runtime.** The bridge binds
-**loopback only**, so it can only be reached by a runtime on its *own* machine —
-which is why `connect` co-locates the bridge with the chat runtime:
-
-- **Co-located** (runtime native on the same OS as the bridge — Win+Win,
-  Linux+Linux, macOS+macOS) → shares loopback, **zero setup**.
-- **WSL runtime** → the bridge must run **inside WSL** too. `connect` detects a
-  WSL runtime and **offers to run connect there for you** — `pipx run
-  superresearch-agent connect` inside the distro (or prints the command, with a
-  `python research.py agent connect` backend-checkout fallback for before the
-  package is on PyPI). The bridge then shares WSL's loopback with the runtime —
-  no Windows↔WSL networking, no `.wslconfig`.
+- **Co-located** (runtime native on the same OS — Win+Win / Linux+Linux /
+  macOS+macOS) → shares loopback, **zero setup**.
+- **WSL runtime** → `connect` detects it and runs the install **inside WSL** (the
+  bridge then shares WSL's loopback with the runtime) — no Windows↔WSL
+  networking, no `.wslconfig`. Each side-effecting step still waits for your Y.
 - **Different machine** → can't reach a loopback-only bridge → **unsupported by
   design** (exposing the bridge on the network would break its security model).
 
-> Each side-effecting step still waits for your Y — `connect` never installs or
-> runs anything inside WSL on its own.
+---
 
-**Keep it always-up.** `resurrect` pins a windowless logon autostart (Windows
-Scheduled Task) **and** starts the bridge now, so it returns after a reboot; the
-account session + device selection persist, so a restart resumes without
-re-login. `retire` is the inverse.
+## Keep it always-up / tear it down
 
 ```sh
-agent resurrect    # background + on every login (windowless); starts it now too
+agent resurrect    # pin to login + start now, windowless (Scheduled Task / systemd --user / launchd)
 agent retire       # stop the background bridge + remove the logon pin
-agent serve        # foreground (this terminal) instead of background
+agent serve        # run the bridge in THIS terminal (foreground) instead
 agent stop         # stop the running bridge
+agent disconnect   # FULL teardown — remove the skill from the runtime AND sign out
+                   #   (the CLI twin of the app's "Revoke"); use `agent retire` too to also drop the bridge
 ```
 
-**Disconnect.** `agent disconnect` is a full teardown — it removes the skill from
-the runtime **and** signs out (the CLI twin of the app's **Revoke**). Use
-`agent retire` as well if you also want the background bridge gone.
+The account session + device selection persist, so a restart resumes without
+re-login.
 
-## P0 — connect + prove the plane
+> **`agent <cmd>` shorthand** — equivalently:
+> `superresearch agent <cmd>` (installed backend; delegates to `pipx run
+> superresearch-agent <cmd>`), `pipx run superresearch-agent <cmd>` (standalone),
+> or `python research.py agent <cmd>` (from a backend source checkout). Pick
+> whichever matches how things are set up.
 
-```sh
-agent serve            # start the loopback bridge (127.0.0.1:9876)
-agent login            # sign in on the SR web app (superresearch.io); --local = host page
-agent status           # → "Signed in as you@…"
-agent doctor           # health + token-refresh + connectivity checks
-agent verify           # reads your researches + lists reachable devices
-agent verify --enqueue --device <id> --topic "Tesla 2025"   # starts a real run
-```
+---
 
-`agent verify` (no `--enqueue`) is read-only. With `--enqueue` it creates a
-research doc + a device-queue start doc — a real pipeline run that will appear
-as an app chat.
+## Sign-in
 
-## P1 — remote sign-in + operational logging
-
-**Remote sign-in (no localhost needed).** Approve from your phone via the
-Super Research web app — the bridge brokers an OAuth device-style flow and makes
-only outbound calls (see `SuperAgentRecipe.md` §11a):
+`agent login` (and `/sr login`) default to the **web app**
+(`https://superresearch.io/agent-auth`) — the same page everywhere — brokering an
+approve-on-your-phone flow that makes only **outbound** calls (no localhost
+needed). `agent login --local` is the host-local Google page
+(`http://localhost:9876/login`) fallback for dev / no-network.
 
 ```sh
 agent login --remote --runtime hermes
-#  → Open  https://superresearch.io/connect-agent  and enter code:  AB-12
-#  (sign in to Super Research on your phone, tap Approve)
+#  → Open  https://superresearch.io/agent-auth  → sign in → tap Authenticate
 #  ✓ Connected as you@…
 ```
 
-**`agent login` now defaults to the web app** (`superresearch.io` — the same page as
-`/sr login` from chat + the connect Step 4 "Sign in"), so sign-in is one consistent
-flow everywhere. The local Google page (`http://localhost:9876/login`) is the
-`agent login --local` host-local fallback for dev / no-network.
+`agent serve` writes a durable, rotating operational log to
+`~/.super-agent/bridge.log` (request + run-lifecycle lines; never a token);
+add `-v` / `--verbose` for DEBUG.
 
-**Logging.** `agent serve` writes a durable, rotating operational log to
-`~/.super-agent/bridge.log` (request + run-lifecycle lines; never a token).
-Add `-v` / `--verbose` (before or after the subcommand) for DEBUG.
+---
 
-**Pick a device.** List the devices your account can reach and choose which one
-runs your research (the selection persists across restarts in
-`~/.super-agent/prefs.json`):
+## Developing (from a backend source checkout)
 
-```sh
-agent device                 # list (→ marks the selected one; (owned)/(shared))
-agent device use <deviceId>  # switch the target device
-```
-
-`agent research`/`/sr research` resolves the device as: an explicit id → your
-selection → the sole reachable device → an error asking you to pick one.
-
-**Run, track, cancel.**
+You don't need the published package to hack on it. Run the agent through the
+backend's **`agent` front door** — it never imports the agent package, it just
+fronts it, so the agent stays an isolated sub-package + process:
 
 ```sh
-agent research "Tesla 2025 outlook"   # start a run → prints a run id immediately
-agent runs                            # list recent runs (status + phase)
-agent run [id]                        # one run's status + links (no id = latest)
-agent watch [id]                      # stream per-phase links live until it finishes
-agent skip <id> <phases…>             # skip phases (1/3/4/5 or brief/podcast/video/report)
-agent cancel <id>                     # stop a run (queued → dropped; running → stopped)
+cd research-automate
+python research.py agent <command>      # connect / serve / login / status / doctor / device / research / …
+python research.py agent --help         # full command list
+python research.py agent                # bare → smart entry: status if set up, else connect
 ```
 
-`agent skip` tunes the run's config (Brief / Podcast → `skippedPhases`; Video →
-`videoEnabled` off; Report → `emailEnabled` off); the device applies it when each
-phase is reached.
+Standalone `agent` command + the test suite:
 
-`agent watch` polls and prints each new link (Brief → ChatGPT/Gemini/Claude →
-NotebookLM/Audio → YouTube → Doc) as the device produces it, then stops at a
-terminal status. The same signal feeds a runtime's streaming cron via
-`GET /updates` (account-wide active runs + their current links) — a poller
-dedups by `(runId, kind)`. (No `?since=` watermark: the backend doesn't bump
-`updatedAt` on a per-phase link write, so the current link set is returned every
-poll and deduped client-side.) Cancel writes a single `action:"cancel"` to the
-run's device queue — dropped if queued, stopped if running.
+```sh
+cd research-automate/agent
+pip install .[dev]      # standalone `agent` entry point + pytest + ruff
+python -m facade <cmd>  # or run module-style without installing
+python -m pytest        # the test suite
+ruff check .
+```
 
-> The web app's broker routes (`/api/agent/login/{start,approve,poll}` +
-> `/connect-agent`) are built separately under review; this package is only the
-> outbound client.
+The agent's only runtime deps (`requests`, `keyring`) already ship in the
+backend's `requirements.txt`. Requires **Python 3.11+**.
+
+---
+
+## The "nothing breaks" contract
+
+A **separate process** that never touches the existing app:
+
+- No import of, or write to, `research-automate` or `research-app`.
+- Its own secret-store namespace (`super-agent`, `~/.super-agent`) — **never** the
+  device daemon's `super-research` keystore. The account refresh token and the
+  device refresh token are different Firebase users; isolating them means a
+  refresh here can't disturb a paired device.
+- Writes only what a normal account client may write under the **existing**
+  Firestore rules: research docs under your own tree + device-queue `start` docs
+  where you're a member. No rules change, no keystore change, no queue / claim /
+  pipeline change.
+
+---
 
 ## Layout
 
@@ -254,15 +196,15 @@ facade/
   session.py         AccountSession — refresh-token / custom-token → ID-token
   firestore_rest.py  minimal Firestore REST (researches/devices, upsert, enqueue, cancel)
   devicelogin.py     remote-login device-flow client (→ the SR web app broker)
+  selfupdate.py      PyPI version notices + self-update (agent reconnect-from-latest;
+                     backend install/update) — detached, mirrors the backend pattern
   logsetup.py        rotating-file + console logging (--verbose)
   runview.py         flatten links.{kind} → ordered events; terminal-status set
-  connect.py         install the skill into a chat runtime
-  selfupdate.py      PyPI version notices + self-update (agent reconnect-from-latest,
-                     backend install/update) — detached, mirrors the backend pattern
-  bridge.py          loopback HTTP server (/login, /login/remote/*, /devices,
-                     /device, /research, /updates, /version, /update, /agent-install,
-                     /install-backend, …)
+  connect.py         install the skill into a chat runtime (+ WSL hand-off)
+  autostart.py       windowless logon autostart (schtasks / systemd --user / launchd)
+  bridge.py          loopback HTTP server (/login, /login/remote/*, /devices, /device,
+                     /research, /updates, /version, /update, /agent-install, /install-backend, …)
   web/login.html     Firebase Web SDK Google sign-in (TOTP MFA aware)
-  skill/             the chat-runtime bundle (SKILL.md + scripts/sr.py)
+  skill/             the chat-runtime bundle (SKILL.md + scripts/sr.py + the streaming watchdog)
   cli.py             the `agent` command
 ```
