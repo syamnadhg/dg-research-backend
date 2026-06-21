@@ -1,7 +1,7 @@
 # Super Agent — test matrix (P7)
 
 What each surface is covered by, and what only a live run can prove. Run the
-suite with `pytest` (422 tests; ruff clean). The bridge is the single owner of
+suite with `pytest` (502 tests; ruff clean). The bridge is the single owner of
 the account session — every CLI/skill command routes through it over loopback.
 
 ## Coverage
@@ -24,6 +24,9 @@ the account session — every CLI/skill command routes through it over loopback.
 | Cancel | `POST /research/<id>/cancel` | `test_bridge_device` |
 | Skip phases | `POST /research/<id>/skip` | `test_bridge_device`, `test_firestore_rest` |
 | Shutdown | `POST /shutdown` | `test_bridge_shutdown` |
+| Versions + "newer" notices (agent & backend) | `GET /version`, `GET /status` | `test_sr_client`, `test_selfupdate` |
+| Update backend / agent self-update (+ "already up to date") | `POST /update`, `POST /agent-install` | `test_sr_client`, `test_selfupdate` |
+| Install backend from chat | `POST /install-backend` | `test_sr_client`, `test_selfupdate` |
 | Body cap / RST guard / rid guard | `do_POST` | `test_bridge_device` (413, malformed rid) |
 | CLI parsing (all commands) | — | `test_cli_parser` |
 | Skill client (`sr.py`) | all of the above | `test_sr_client`, `test_e2e_lifecycle` |

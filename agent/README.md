@@ -114,10 +114,21 @@ into the runtime's skills dir, and offers to pin the always-up bridge.
 
 The runtime registers a skill as a single slash command (`/<skill-name>`), so the
 skill is **`/sr`** and the action follows it: `/sr login`, `/sr research <topic>`,
-`/sr status [id]`, `/sr device [use <id>]`, `/sr podcast [id]`, `/sr skip <id>
-<phases>`, `/sr cancel <id>`, `/sr logout`; a bare **`/sr`** is the welcome / help.
-Natural phrasing works too ("research Tesla 2025", "send me the podcast"). It's
-research-only — it can never control devices.
+`/sr status [id]`, `/sr device [use <id>] [add <code>]`, `/sr podcast [id]`, `/sr
+skip <id> <phases>`, `/sr cancel <id>`, `/sr logout`; a bare **`/sr`** is the
+welcome / help. Natural phrasing works too ("research Tesla 2025", "send me the
+podcast"). It's research-only — it can never control devices.
+
+**Manage Super Research from chat too:** `/sr version` (agent **and** backend
+versions, with a "⬆ newer available" nudge — also surfaced on the welcome), `/sr
+update` (update the **backend**), `/sr agent-update` (update the **chat agent
+itself** — package + skill + bridge, a detached reconnect-from-latest), and `/sr
+install` (install the backend on this host — turns the PC into a research host;
+the pairing API-key/browser-login steps are then done on the host). `update` /
+`agent-update` reply "already up to date" when nothing newer is published rather
+than reinstalling. Every account action (`research`, `device …`, `install`'s
+pairing) needs **`/sr login`** first — the agent operates as an authorized session
+on your account, so it must be signed in.
 
 > **After connecting, run `/reload-skills` once in your chat** (the gateway caches
 > its skill scan) so `/sr` registers without restarting the runtime.
@@ -246,8 +257,11 @@ facade/
   logsetup.py        rotating-file + console logging (--verbose)
   runview.py         flatten links.{kind} → ordered events; terminal-status set
   connect.py         install the skill into a chat runtime
+  selfupdate.py      PyPI version notices + self-update (agent reconnect-from-latest,
+                     backend install/update) — detached, mirrors the backend pattern
   bridge.py          loopback HTTP server (/login, /login/remote/*, /devices,
-                     /device, /research, /updates, …)
+                     /device, /research, /updates, /version, /update, /agent-install,
+                     /install-backend, …)
   web/login.html     Firebase Web SDK Google sign-in (TOTP MFA aware)
   skill/             the chat-runtime bundle (SKILL.md + scripts/sr.py)
   cli.py             the `agent` command
