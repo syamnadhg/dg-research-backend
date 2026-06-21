@@ -19,7 +19,7 @@ One command, run in your chat runtime's environment — or grab it from the page
 **https://superresearch.io/agent-install**:
 
 ```sh
-pipx run superresearch-agent connect      # published package (fallback: uvx superresearch-agent connect)
+pipx run superresearch-agent connect      # the published package
 ```
 
 `connect` is a branded, interactive flow — **Detect → Choose → Install → Go
