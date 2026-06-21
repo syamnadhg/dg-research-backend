@@ -93,6 +93,9 @@ def bridge_port(monkeypatch):
     # /status + /version routes call these). Tests that assert notices override them.
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
     monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: None)
+    # The update routes do a FRESH latest_on_pypi(force=True) check; default it to
+    # None (= "couldn't determine → proceed"). "already up to date" tests override it.
+    monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: None)
 
     state = bridge.BridgeState()
     state.set_session(SimpleNamespace(uid="u1", email="e@x.y", id_token=lambda force=False: "tok"))
@@ -202,6 +205,8 @@ def test_version_when_backend_absent(bridge_port, monkeypatch, capsys):
 def test_update_starts_backend(bridge_port, monkeypatch, capsys):
     # `update` from chat kicks `superresearch --update` on the connected device
     # (the bridge shells out; the backend's updater detaches and returns fast).
+    monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
+    monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: "0.2.0")  # newer
     calls = {}
     def _fake_update():
         calls["ran"] = True
@@ -210,6 +215,18 @@ def test_update_starts_backend(bridge_port, monkeypatch, capsys):
     assert sr.main(["update"]) == 0
     assert calls.get("ran") is True
     assert "Updating Super Research" in capsys.readouterr().out
+
+
+def test_update_already_latest(bridge_port, monkeypatch, capsys):
+    # On the newest published backend → say so, don't pointlessly reinstall/restart.
+    monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
+    monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: "0.1.1")
+    ran = {"v": False}
+    monkeypatch.setattr(bridge, "_start_backend_update", lambda: ran.__setitem__("v", True))
+    assert sr.main(["update"]) == 0
+    out = capsys.readouterr().out
+    assert "already up to date" in out and "0.1.1" in out
+    assert ran["v"] is False  # never shelled the updater
 
 
 def test_update_when_backend_absent(bridge_port, monkeypatch, capsys):
@@ -258,6 +275,18 @@ def test_agent_install_alias_still_works(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: True)
     assert sr.main(["agent-install"]) == 0
     assert "Updating the Super Research agent" in capsys.readouterr().out
+
+
+def test_agent_update_already_latest(bridge_port, monkeypatch, capsys):
+    # Agent already on the newest published version → say so, no reconnect/restart.
+    monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: bridge.__version__)
+    spawned = {"v": False}
+    monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect",
+                        lambda: spawned.__setitem__("v", True) or True)
+    assert sr.main(["agent-update"]) == 0
+    out = capsys.readouterr().out
+    assert "already up to date" in out and bridge.__version__ in out
+    assert spawned["v"] is False  # never tore the bridge down
 
 
 def test_agent_update_refuses_when_unavailable(bridge_port, monkeypatch, capsys):

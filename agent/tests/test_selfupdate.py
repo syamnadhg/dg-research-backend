@@ -54,6 +54,16 @@ def test_latest_on_pypi_caches_for_24h(cache, monkeypatch):
     assert calls["n"] == 1  # second read came from the cache
 
 
+def test_latest_on_pypi_force_bypasses_cache(cache, monkeypatch):
+    # An explicit "update now" must re-check PyPI, not trust the 24h cache.
+    versions = iter(["0.1.6", "0.1.9"])
+    monkeypatch.setattr(selfupdate.urllib.request, "urlopen",
+                        lambda url, timeout=0: _FakeResp({"info": {"version": next(versions)}}))
+    assert selfupdate.latest_on_pypi("superresearch-agent") == "0.1.6"            # caches 0.1.6
+    assert selfupdate.latest_on_pypi("superresearch-agent") == "0.1.6"            # cached (no fetch)
+    assert selfupdate.latest_on_pypi("superresearch-agent", force=True) == "0.1.9"  # fresh fetch
+
+
 def test_latest_on_pypi_failsilent_offline(cache, monkeypatch):
     monkeypatch.setattr(selfupdate.urllib.request, "urlopen",
                         lambda url, timeout=0: (_ for _ in ()).throw(OSError("offline")))

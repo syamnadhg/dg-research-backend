@@ -59,23 +59,25 @@ def version_gt(a: str, b: str) -> bool:
         return False
 
 
-def latest_on_pypi(pkg: str) -> "str | None":
+def latest_on_pypi(pkg: str, *, force: bool = False) -> "str | None":
     """Latest published version of `pkg` on PyPI, or None. Cached 24h per package
     at ~/.super-agent/.version_check.json; fail-silent on offline / timeout / parse
     so it can NEVER block or break a command. The 2.5s timeout applies at most once
-    per day per package (on a cache miss)."""
+    per day per package (on a cache miss). `force=True` bypasses the cache read for a
+    FRESH check (used by the update commands — an explicit "update now" must not be
+    decided off a stale 24h cache); it still refreshes the cache."""
     cache = _cache_path()
     now = time.time()
     data: dict = {}
     try:
         if cache.exists():
             data = json.loads(cache.read_text(encoding="utf-8")) or {}
-            if isinstance(data, dict):
+            if not isinstance(data, dict):
+                data = {}
+            elif not force:
                 entry = data.get(pkg) or {}
                 if now - float(entry.get("checked_at", 0)) < _CACHE_TTL:
                     return entry.get("latest") or None
-            else:
-                data = {}
     except Exception:
         data = {}
     latest = ""

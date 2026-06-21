@@ -1864,6 +1864,17 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             `superresearch --update`, which detaches its own updater). Host/Origin
             gated like every write; the backend that runs here is the host user's
             own, so this is a local maintenance action (no account needed)."""
+            backend = _backend_version()
+            if backend is None:
+                self._json(404, {"error": "backend_not_installed"})
+                return
+            # Already on (or ahead of) the latest published version → say so instead
+            # of a pointless reinstall (fresh check; an explicit "update now" must not
+            # be decided off the 24h cache).
+            latest = selfupdate.latest_on_pypi(selfupdate.BACKEND_PKG, force=True)
+            if latest and not selfupdate.version_gt(latest, backend):
+                self._json(200, {"ok": True, "already": True, "current": backend})
+                return
             try:
                 res = _start_backend_update()
             except FileNotFoundError:
@@ -1883,6 +1894,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             the loopback port so the new bridge can bind it. Host/Origin gated like
             every write; this is a local maintenance action on the host user's own
             agent (no account needed). Mirrors the backend's detached self-update."""
+            # Already on (or ahead of) the latest published agent → say so instead of
+            # a pointless reconnect + bridge restart (fresh check, not the 24h cache).
+            latest = selfupdate.latest_on_pypi(selfupdate.AGENT_PKG, force=True)
+            if latest and not selfupdate.version_gt(latest, __version__):
+                self._json(200, {"ok": True, "already": True, "current": __version__})
+                return
             # Pre-flight: only tear the running bridge down if the update can ACTUALLY
             # proceed (online, package published, pipx healthy). Otherwise refuse and
             # keep the current bridge alive — never strand the user with no chat.

@@ -716,6 +716,10 @@ def cmd_agent_update(args) -> int:
         else:
             msg = f"couldn't start the agent update: {err or code}"
         return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
+    if body.get("already"):
+        cur = body.get("current") or ""
+        return _emit(body, args.json,
+                     [f"✓ The agent is already up to date{(' (v' + cur + ')') if cur else ''}."])
     return _emit(body, args.json, [
         "⬆️ Updating the Super Research agent (skill + bridge) to the latest version.",
         "The bridge briefly restarts on the new version — say “agent version” in a bit to confirm.",
@@ -734,6 +738,10 @@ def cmd_update(args) -> int:
         else:
             msg = f"couldn't start the update: {err or code}"
         return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
+    if body.get("already"):
+        cur = body.get("current") or ""
+        return _emit(body, args.json,
+                     [f"✓ Super Research is already up to date{(' (v' + cur + ')') if cur else ''}."])
     return _emit(body, args.json, [
         "⬆️ Updating Super Research in the background.",
         "It restarts on the new version shortly — say “version” in a bit to confirm.",
