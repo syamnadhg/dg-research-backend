@@ -90,7 +90,7 @@ superresearch = "research:main"
 # Flat layout — explicit lists (NOT auto-discovery) so we ship exactly the
 # pipeline modules + auth/scripts and never the agent/, tests/, logs/, queues/,
 # or runtime *.json/*.log files sitting in the repo root.
-py-modules = ["research", "models", "prompts", "vision", "narrate"]
+py-modules = ["research", "models", "prompts", "vision", "narrate", "selfheal"]
 packages = ["auth", "scripts"]
 
 [tool.setuptools.package-data]

@@ -1,0 +1,134 @@
+{
+  "chatgpt.enable_deep_research": {
+    "platform": "chatgpt",
+    "intent_id": "enable_deep_research",
+    "type": "toggle",
+    "irreversible": false,
+    "region": "form",
+    "outcome_predicate": "cgpt_state:active",
+    "signal_hints": {
+      "accessible_name": "deep research",
+      "role": [
+        "button",
+        "menuitem",
+        "menuitemradio"
+      ]
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
+  },
+  "gemini.enable_deep_research": {
+    "platform": "gemini",
+    "intent_id": "enable_deep_research",
+    "type": "toggle",
+    "irreversible": false,
+    "region": "composer",
+    "outcome_predicate": "gemini_dr_state:placeholderResearch||pressed",
+    "signal_hints": {
+      "accessible_name": "deep research",
+      "role": [
+        "button"
+      ],
+      "placeholder": "what do you want to research"
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
+  },
+  "claude.enable_deep_research": {
+    "platform": "claude",
+    "intent_id": "enable_deep_research",
+    "type": "toggle",
+    "irreversible": false,
+    "region": "composer",
+    "outcome_predicate": "claude_research_tool:on",
+    "signal_hints": {
+      "accessible_name": "research",
+      "role": [
+        "button"
+      ]
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
+  },
+  "chatgpt.select_model": {
+    "platform": "chatgpt",
+    "intent_id": "select_model",
+    "type": "select",
+    "irreversible": false,
+    "region": "composer",
+    "outcome_predicate": "chatgpt_model_selector:absent",
+    "signal_hints": {
+      "accessible_name": "model",
+      "role": [
+        "button"
+      ],
+      "detect_only": true
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
+  },
+  "gemini.select_model": {
+    "platform": "gemini",
+    "intent_id": "select_model",
+    "type": "select",
+    "irreversible": false,
+    "region": "composer",
+    "outcome_predicate": "gemini_flash_selected:trigger",
+    "signal_hints": {
+      "accessible_name": "model",
+      "role": [
+        "button"
+      ],
+      "value_contains": "flash"
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
+  },
+  "claude.select_model": {
+    "platform": "claude",
+    "intent_id": "select_model",
+    "type": "select",
+    "irreversible": false,
+    "region": "composer",
+    "outcome_predicate": "claude_trigger_verOf:>=floor",
+    "signal_hints": {
+      "accessible_name": "model",
+      "role": [
+        "button"
+      ],
+      "value_matches": "opus"
+    },
+    "tier_sequence": [
+      "registry",
+      "builtin",
+      "heal",
+      "vision",
+      "cua"
+    ]
+  }
+}
