@@ -170,11 +170,65 @@ def p2_labels(platform: str) -> dict:
 
 
 def p2_known_good(platform: str):
-    """The last canary-verified-working model version for a platform (the
-    fallback target when the latest can't be verified). None until the canary
-    records one. Validated-present each canary tick, so it can't outlive a
-    retired model."""
-    return _load_model_refresh_overlay().get(platform, {}).get("known_good")
+    """The last verified-working model version for a platform (the C1 fallback
+    target when the latest can't be verified). None until a real run records
+    one (see record_known_good). Coerced to float so a stringly-typed overlay
+    value can't break the float comparisons in the picker JS."""
+    raw = _load_model_refresh_overlay().get(platform, {}).get("known_good")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _write_model_refresh_overlay(data: dict) -> bool:
+    """Atomically persist the overlay: write a temp file then os.replace() it,
+    so a reader always sees a whole file (never a torn write) and no lock is
+    needed. No-op unless the kill-switch is on. Never raises — a write failure
+    just means the overlay isn't updated (the run is unaffected)."""
+    if not DG_MODEL_REFRESH_ENABLED:
+        return False
+    try:
+        _MODEL_REFRESH_OVERLAY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _MODEL_REFRESH_OVERLAY_PATH.with_name(_MODEL_REFRESH_OVERLAY_PATH.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, _MODEL_REFRESH_OVERLAY_PATH)
+        return True
+    except Exception:
+        return False
+
+
+def record_known_good(platform: str, version) -> bool:
+    """On-the-fly learning (replaces the dropped weekly canary): record
+    `version` as the last verified-working model for `platform` — the C1
+    fallback target — so it tracks the latest PROVEN model as platforms advance.
+
+    Pure side-channel: it only updates the fallback TARGET and can never change
+    what a run does (the hard gates stay model + Deep-Research tool). No-op
+    unless DG_MODEL_REFRESH_ENABLED is on. Coerces to float, ignores junk, and
+    writes ONLY when the value actually changes (no per-run disk churn). Never
+    raises. Returns True iff it wrote."""
+    if not DG_MODEL_REFRESH_ENABLED:
+        return False
+    try:
+        v = float(version)
+    except (TypeError, ValueError):
+        return False
+    if v <= 0:
+        return False
+    overlay = _load_model_refresh_overlay()
+    cur = overlay.get(platform, {}).get("known_good")
+    try:
+        if cur is not None and abs(float(cur) - v) < 0.001:
+            return False  # unchanged — skip the write
+    except (TypeError, ValueError):
+        pass
+    merged = dict(overlay)
+    entry = dict(merged.get(platform, {}))
+    entry["known_good"] = v
+    merged[platform] = entry
+    return _write_model_refresh_overlay(merged)
 
 
 def _fmt_ver(v) -> str:

@@ -40,7 +40,9 @@ def test_caller_advisory_is_soft_and_only_when_proceeding():
     # the amber _emit_model_drift_alert (not the red chat-mode gate).
     adv = src.find("advisory thinking-config notice")
     assert adv != -1
-    block = src[adv:adv + 1400]
+    # Scope precisely to the advisory section: from its comment up to the
+    # chat-mode gate that follows it (avoids bleeding into that gate's code).
+    block = src[adv:src.find("if not research_ok:", adv)]
     assert 'if research_ok and platform_l in ("claude", "gemini")' in block
     assert "_emit_model_drift_alert(" in block
     # It reads the recorded state + the policy, and never calls the blocking gate.

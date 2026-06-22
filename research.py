@@ -76,6 +76,8 @@ from models import (
     p2_labels,
     p2_claude_ver,
     p2_claude_setup_directive,
+    parse_family_version,
+    record_known_good,
 )
 
 # Vision tier-2 module (shadow-eval today, tier-2 promotion per hotspot
@@ -24227,6 +24229,12 @@ async def setup_chatgpt_dr(page) -> bool:
 # (each worker is its own process); last write wins = the final setup state.
 _P2_THINKING_STATE: dict = {}
 
+# Phoenix (model_refresh) — last model VERSION the setup actually selected per
+# platform (numeric), written by setup_*_dr and read by the caller to record
+# the latest verified-working model as known_good (on-the-fly learning). Float
+# or None; process-local; last write wins.
+_P2_PICKED_VERSION: dict = {}
+
 
 # Phoenix (model_refresh) — Gemini "pick highest Flash" ranker. Mirrors
 # models.pick_highest_model (Python, unit-tested + reused by the canary): among
@@ -24369,6 +24377,8 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
         log(f"[setup_gemini_dr] model-pick OK: ranker clicked '{picked}' "
             f"(v{(_rank or {}).get('version')}, floor={p2_floor('gemini')}) | "
             f"legacy /3.5 flash/ -> '{_legacy}'{_div}")
+        # Record the selected Flash version for on-the-fly known-good learning.
+        _P2_PICKED_VERSION["gemini"] = (_rank or {}).get("version")
 
         # Step 3: set Thinking level = Extended (the pipeline wants "Flash
         # Extended", not the default "Standard"). The model menu carries a
@@ -25360,6 +25370,10 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         # the caller's soft notice (NOT part of the success contract — model +
         # research remain the only hard gates).
         _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed}
+        # Record the selected model version for on-the-fly known-good learning
+        # (the trigger version when already-correct, else parsed from the pick).
+        _P2_PICKED_VERSION["claude"] = (
+            model_trigger_ver if model_ok else parse_family_version(opus_selected or "", "opus"))
         # Success only when all three critical knobs are in place
         return bool(opus_selected) and bool(research_enabled)
     except Exception as e:
@@ -26715,6 +26729,12 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         # has the latest model + Deep Research; only the thinking level may have
         # fallen back to default.
         if research_ok and platform_l in ("claude", "gemini"):
+            # Phoenix on-the-fly learning: this run verified Deep Research on the
+            # selected model → record it as the known-good fallback target so it
+            # tracks the latest PROVEN model as platforms advance. Pure side-
+            # channel (only the fallback TARGET; never the gates); no-op unless
+            # DG_MODEL_REFRESH_ENABLED is armed.
+            record_known_good(platform_l, _P2_PICKED_VERSION.get(platform_l))
             _tstate = _P2_THINKING_STATE.get(platform_l) or {}
             _pol = p2_labels(platform_l)
             _missing = []

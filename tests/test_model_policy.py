@@ -163,3 +163,54 @@ def test_pick_highest_opus_family_for_canary_reuse():
 def test_pick_highest_none_when_no_candidate():
     assert models.pick_highest_model([], "flash", floor=3.5) is None
     assert models.pick_highest_model([None, "", "Ask Gemini"], "flash", floor=3.5) is None
+
+
+# ── record_known_good / on-the-fly learning (revised Phase D) ─────────────
+
+
+def test_record_known_good_is_noop_when_flag_off(monkeypatch, tmp_path):
+    p = tmp_path / "model_refresh.json"
+    monkeypatch.setattr(models, "DG_MODEL_REFRESH_ENABLED", False)
+    monkeypatch.setattr(models, "_MODEL_REFRESH_OVERLAY_PATH", p)
+    assert models.record_known_good("claude", 4.8) is False
+    assert not p.exists()  # nothing written when un-armed
+
+
+def test_record_known_good_writes_and_reads_back_as_float(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path, None)
+    assert models.record_known_good("claude", 4.8) is True
+    assert models.p2_known_good("claude") == 4.8
+    assert isinstance(models.p2_known_good("claude"), float)
+    # the overlay file is whole/valid JSON (atomic temp+replace)
+    assert json.loads((tmp_path / "model_refresh.json").read_text(encoding="utf-8"))["claude"]["known_good"] == 4.8
+
+
+def test_record_known_good_only_writes_on_change(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path, None)
+    assert models.record_known_good("claude", 4.8) is True
+    assert models.record_known_good("claude", 4.8) is False  # unchanged → no churn
+    assert models.record_known_good("claude", 5.0) is True   # advanced → write
+
+
+def test_record_known_good_rejects_junk(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path, None)
+    assert models.record_known_good("claude", None) is False
+    assert models.record_known_good("claude", "abc") is False
+    assert models.record_known_good("claude", -1) is False
+    assert models.record_known_good("claude", 0) is False
+
+
+def test_record_known_good_preserves_other_platforms(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path, None)
+    models.record_known_good("claude", 4.8)
+    models.record_known_good("gemini", 3.5)
+    assert models.p2_known_good("claude") == 4.8
+    assert models.p2_known_good("gemini") == 3.5
+
+
+def test_p2_known_good_coerces_string_overlay_value(monkeypatch, tmp_path):
+    # A stringly-typed overlay value must not break the float comparisons.
+    _arm(monkeypatch, tmp_path, {"claude": {"known_good": "4.8"}})
+    assert models.p2_known_good("claude") == 4.8
+    _arm(monkeypatch, tmp_path, {"claude": {"known_good": "garbage"}})
+    assert models.p2_known_good("claude") is None
