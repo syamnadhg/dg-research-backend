@@ -755,6 +755,85 @@ def _heartbeat_loop(state: BridgeState, stop: threading.Event) -> None:
             log.debug("heartbeat tick error: %s", type(e).__name__)
 
 
+def _advance_remote_flow(state: BridgeState) -> str | None:
+    """Advance the pending remote-login (device-flow) by ONE broker poll.
+
+    MUST be called holding ``state.remote_lock``. Reads ``state.remote`` FRESH
+    (never a by-arg reference captured across the long poll), so a flow a
+    concurrent /login/remote/start superseded can't be redeemed, and mutates
+    ``flow.state`` in place. On the broker's APPROVED it redeems the one-time
+    custom token, sets the live session, and writes the #790 agent-session row
+    (clear_revoked=True — an explicit human sign-in). A NO-OP — no broker call —
+    on an absent / terminal / past-TTL flow, so it is safe to call every tick.
+
+    Returns a transient note for the HTTP payload (the auto-poll loop ignores
+    it), else None. This is the exact transition `_login_remote_poll` used to run
+    inline; it now lives here so the serve()-owned auto-poll loop shares it
+    byte-for-byte (and the same lock), keeping the one-time token single-use.
+    """
+    flow = state.remote
+    if flow is None or flow.state in ("connected", "expired", "error"):
+        return None
+    if time.time() >= flow.expires_at:
+        flow.state = "expired"
+        return None
+    try:
+        res = devicelogin.poll_once(flow.poll_token)
+    except DeviceLoginError as e:
+        # Transient transport blip — stay pending, keep polling. Log the detail;
+        # the client gets a fixed message, not the upstream body.
+        log.debug("remote poll transient error: %s", e)
+        return "sign-in service temporarily unreachable"
+    status = res.get("status")
+    if status == devicelogin.APPROVED:
+        try:
+            sess = AccountSession.from_custom_token(res["customToken"])
+        except CustomTokenError as e:
+            flow.state = "error"
+            flow.error = "sign-in could not be completed"  # non-reflective
+            log.warning("remote login custom-token exchange failed: %s", e)
+            return None
+        # Capture. We hold remote_lock for the whole call, so `flow` is still the
+        # current state.remote here — no superseded-flow capture is possible.
+        state.set_session(sess)
+        flow.state = "connected"
+        # #790 identity row — explicit human sign-in, so clear any prior revoke.
+        _write_agent_session_connected(sess, clear_revoked=True)
+        log.info("remote login connected as %s", sess.email or sess.uid)
+    elif status == devicelogin.EXPIRED:
+        flow.state = "expired"
+        log.info("remote login expired before approval")
+    return None
+
+
+def _remote_autopoll_loop(state: BridgeState, stop: threading.Event) -> None:
+    """serve()-owned daemon that drives a pending remote-login flow to capture the
+    instant the user approves in the browser — so chat ``/sr login`` no longer
+    needs a second ``login-done`` to complete the sign-in (the #848 fix; the
+    browser's /approve only PARKS the token, the bridge must poll to redeem it).
+
+    Mirrors `_heartbeat_loop`: one periodic tick, daemon, stop-event for
+    deterministic shutdown. Each tick advances the CURRENT flow by one broker poll
+    UNDER ``remote_lock`` (shared with the /login/remote/poll route + the PC
+    ``agent login`` poller, so the one-time token is redeemed exactly once). It is
+    a NO-OP — no network call — when no flow is pending, and the flow
+    self-terminates at its TTL, so a finished or idle bridge does no broker
+    traffic. Spawned from serve() (NOT a request handler), so handler-only unit
+    tests never start it and can drive the flow by explicit polls as before.
+    """
+    interval = config.REMOTE_POLL_INTERVAL_SECONDS
+    if interval <= 0:  # guard a misconfigured env from a broker-hammering busy loop
+        interval = 3.0
+    while not stop.wait(interval):
+        try:
+            with state.remote_lock:
+                flow = state.remote
+                if flow is not None and flow.state == "pending":
+                    _advance_remote_flow(state)
+        except Exception as e:  # defensive — a tick must never kill the thread
+            log.debug("remote autopoll tick error: %s", type(e).__name__)
+
+
 def _backend_cli() -> "str | None":
     """Path to the Super Research backend CLI co-located with this bridge, or
     None if it isn't on the host's PATH. The bridge runs on the same machine as
@@ -1055,50 +1134,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
 
         def _login_remote_poll(self) -> None:
             # Hold remote_lock across the whole transition: it serializes polls so
-            # two in-flight requests can't double-redeem the one-shot custom token,
-            # and (paired with _login_remote_start taking the same lock) guarantees
-            # we operate on the current flow, not one a concurrent start superseded.
+            # two in-flight requests (or the serve()-owned auto-poller) can't
+            # double-redeem the one-shot custom token, and (paired with
+            # _login_remote_start taking the same lock) guarantees we operate on the
+            # current flow, not one a concurrent start superseded. The transition
+            # itself is the module fn _advance_remote_flow, shared with the auto-poll
+            # loop so both drive the flow identically.
             with state.remote_lock:
-                flow = state.remote
-                if flow is None:
+                if state.remote is None:
                     self._json(400, {"error": "no remote login in progress — POST /login/remote/start first"})
                     return
-                if flow.state in ("connected", "expired", "error"):
-                    self._json(200, self._remote_payload(flow))  # terminal — just report
-                    return
-                if time.time() >= flow.expires_at:
-                    flow.state = "expired"
-                    self._json(200, self._remote_payload(flow))
-                    return
-                try:
-                    res = devicelogin.poll_once(flow.poll_token)
-                except DeviceLoginError as e:
-                    # Transient transport blip — stay pending, keep polling. Log the
-                    # detail; the client gets a fixed message, not the upstream body.
-                    log.debug("remote poll transient error: %s", e)
-                    payload = self._remote_payload(flow)
-                    payload["transient"] = "sign-in service temporarily unreachable"
-                    self._json(200, payload)
-                    return
-                status = res.get("status")
-                if status == devicelogin.APPROVED:
-                    try:
-                        sess = AccountSession.from_custom_token(res["customToken"])
-                    except CustomTokenError as e:
-                        flow.state = "error"
-                        flow.error = "sign-in could not be completed"  # non-reflective
-                        log.warning("remote login custom-token exchange failed: %s", e)
-                        self._json(200, self._remote_payload(flow))
-                        return
-                    state.set_session(sess)
-                    flow.state = "connected"
-                    # #790 identity row — explicit human sign-in, so clear any prior revoke.
-                    _write_agent_session_connected(sess, clear_revoked=True)
-                    log.info("remote login connected as %s", sess.email or sess.uid)
-                elif status == devicelogin.EXPIRED:
-                    flow.state = "expired"
-                    log.info("remote login expired before approval")
-                self._json(200, self._remote_payload(flow))
+                transient = _advance_remote_flow(state)
+                payload = self._remote_payload(state.remote)
+                if transient:
+                    payload["transient"] = transient
+                self._json(200, payload)
 
         def _status(self) -> None:
             # Carry the pip-style update notices so the welcome / a bare /sr can
@@ -2001,6 +2051,15 @@ def serve(host: str | None = None, port: int | None = None) -> None:
         target=_heartbeat_loop, args=(state, hb_stop), name="agent-heartbeat", daemon=True
     )
     hb_thread.start()
+    # serve()-owned remote-login auto-poller (#848): once a /sr login (or PC
+    # `agent login`) starts a flow, drive it to capture the instant the user
+    # approves in the browser — no second `login-done`. Daemon + stop event so
+    # shutdown is deterministic (same pattern as the heartbeat thread above).
+    rp_stop = threading.Event()
+    rp_thread = threading.Thread(
+        target=_remote_autopoll_loop, args=(state, rp_stop), name="agent-remote-autopoll", daemon=True
+    )
+    rp_thread.start()
     log.info("Super Agent bridge on http://%s:%d (authed=%s)", host, port, authed)
     print(f"Super Agent bridge listening on http://{host}:{port}")
     print(f"  sign in:  {config.login_origin()}/login   (local page; or remote via chat /sr-login)")
@@ -2012,4 +2071,5 @@ def serve(host: str | None = None, port: int | None = None) -> None:
         pass
     finally:
         hb_stop.set()
+        rp_stop.set()
         httpd.shutdown()
