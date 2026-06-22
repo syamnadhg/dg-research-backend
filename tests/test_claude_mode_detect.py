@@ -20,10 +20,15 @@ def test_extended_detector_reads_model_button_not_body_extended():
         "ensure_deep_mode_active must NOT detect the model via a body-wide "
         "'extended' text scan — the UI dropped that word (#708)."
     )
-    # It must read the model-selector button's Opus version (>= 4.8).
-    assert "verOf" in src and ">= 4.8" in src, (
+    # It must read the model-selector button's Opus version and compare it to
+    # the policy floor (injected into the JS as `floor`; default 4.8).
+    assert "verOf" in src and ">= floor" in src, (
         "the high-tier-model check must parse the model button's Opus version "
-        "and treat >= 4.8 as active (#708)."
+        "and treat >= the policy floor as active (#708; floor from p2_floor, "
+        "Phoenix A2)."
+    )
+    assert "p2_floor" in src, (
+        "the floor must come from the central P2_MODEL_POLICY (Phoenix A2)."
     )
 
 

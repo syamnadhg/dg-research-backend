@@ -14,12 +14,19 @@ import inspect
 import research
 
 
-def test_step1b_version_gates_to_4_8_or_higher():
+def test_step1b_version_gates_to_floor():
     src = inspect.getsource(research.setup_claude_dr)
-    # The numeric guard that forbids picking sub-4.8 Opus must be present.
-    assert "< 4.8" in src, (
-        "Step 1B must version-gate candidates to Opus >= 4.8 so it never "
-        "silently selects Opus 4.7 (#708)."
+    # The numeric guard that forbids picking sub-floor Opus must be present.
+    # The floor is now policy-driven (p2_floor → models.P2_MODEL_POLICY,
+    # default 4.8) and injected into the picker JS as `floor`, so a floor bump
+    # touches one place — but the never-downgrade gate itself is unchanged (#708).
+    assert "< floor" in src, (
+        "Step 1B must version-gate candidates to Opus >= the policy floor so it "
+        "never silently selects a lower Opus (#708)."
+    )
+    assert "p2_floor" in src and "_claude_floor" in src, (
+        "the floor must come from the central P2_MODEL_POLICY (p2_floor), not a "
+        "hardcoded literal scattered across sites (Phoenix A2)."
     )
     # Version is parsed from the option text, not a brittle '4.8' substring,
     # so a future Opus 4.9/5 is still picked as the strongest.
@@ -66,15 +73,16 @@ def test_step1_does_not_repick_already_correct_model():
     assert "model_trigger_ver" in src, (
         "Step 1 must read the model-selector trigger version first (#744)."
     )
-    assert "model_ok" in src and "model_trigger_ver >= 4.8" in src, (
-        "Step 1 must derive model_ok from the trigger version (#744)."
+    assert "model_ok" in src and "model_trigger_ver >= _claude_floor" in src, (
+        "Step 1 must derive model_ok from the trigger version vs the policy "
+        "floor (#744; floor now from p2_floor, Phoenix A2)."
     )
     assert ("not re-picked" in src) or ("NOT re-picking" in src), (
         "an already-correct model must be recorded but NOT re-picked (#744)."
     )
     # The model-pick poll must run ONLY when the model is not already correct.
-    pick_idx = src.find("opus_selected = await page.evaluate(_pick_opus_js)")
-    assert pick_idx != -1, "the _pick_opus_js poll must still exist."
+    pick_idx = src.find("opus_selected = await page.evaluate(_pick_opus_js, _claude_floor)")
+    assert pick_idx != -1, "the _pick_opus_js poll must still exist (now passing the policy floor arg)."
     guard_idx = src.rfind("if not model_ok:", 0, pick_idx)
     assert guard_idx != -1, (
         "the model-pick poll must be guarded by `if not model_ok:` so a correct "

@@ -71,6 +71,8 @@ from models import (
     TITLE_HAIKU,
     GEMINI_TEXT,
     GEMINI_NARRATE,
+    p2_floor,
+    p2_claude_setup_directive,
 )
 
 # Vision tier-2 module (shadow-eval today, tier-2 promotion per hotspot
@@ -18552,7 +18554,7 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         new_page, _setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://claude.ai/new",
             PROMPT_CLAUDE_DEEP_RESEARCH,
-            "Select Opus 4.8 + Max effort + Adaptive Thinking + Research tool (if Opus 4.8 isn't offered, pick the highest Opus available — never downgrade to 4.7 when 4.8 exists). Do NOT type — just set up and focus input. Say 'ready for paste'.",
+            p2_claude_setup_directive(),
             brief_text, "2C-retry", "Claude", verbose, brief_path=brief_path,
             source_paths=source_paths)
         if not _setup_ok:
@@ -24836,7 +24838,13 @@ async def setup_claude_dr(page) -> bool:
     try:
         await asyncio.sleep(2)
 
-        # ── Step 1: model = Opus >= 4.8, Effort = Max, Thinking toggle ON ──
+        # Never-downgrade version floor — single source of truth (P2_MODEL_POLICY
+        # in models.py). The runtime still auto-picks the HIGHEST Opus offered;
+        # this floor only refuses anything below it. Injected into the picker JS
+        # below so a floor bump touches one place, not ~3 scattered literals.
+        _claude_floor = p2_floor("claude")
+
+        # ── Step 1: model = Opus >= floor, Effort = Max, Thinking toggle ON ──
         # (#744) Read the model-selector TRIGGER first — it shows BOTH the
         # current model AND its effort, e.g. "Opus 4.8 Max". NEVER re-pick an
         # already-correct model (re-clicking a correct option was the loop that
@@ -24862,7 +24870,7 @@ async def setup_claude_dr(page) -> bool:
             for (const b of btns) { const v = verOf(b.textContent); if (v !== null && (best === null || v > best)) best = v; }
             return best;
         }""")
-        model_ok = isinstance(model_trigger_ver, (int, float)) and model_trigger_ver >= 4.8
+        model_ok = isinstance(model_trigger_ver, (int, float)) and model_trigger_ver >= _claude_floor
         opus_selected = None
         if model_ok:
             # Model already correct — record it but DO NOT re-pick (the #744
@@ -24875,7 +24883,7 @@ async def setup_claude_dr(page) -> bool:
         # version-gates to >= 4.8 so it NEVER downgrades to 4.7; sees
         # role="menuitemradio"/div options and uses getClientRects() so a
         # fixed-position popover isn't filtered by offsetParent (#708/#744).
-        _pick_opus_js = """() => {
+        _pick_opus_js = """(floor) => {
             const vis = el => el.getClientRects().length > 0;
             const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
                 .filter(vis);
@@ -24893,7 +24901,7 @@ async def setup_claude_dr(page) -> bool:
             for (const el of items) {
                 const t = (el.textContent || '').trim();
                 const v = verOf(t);
-                if (v === null || v < 4.8) continue;   // only Opus >= 4.8 — never downgrade
+                if (v === null || v < floor) continue;   // only Opus >= floor — never downgrade
                 if (v > bestV || (v === bestV && t.length < bestLen)) {
                     best = el; bestV = v; bestLen = t.length;
                 }
@@ -24924,7 +24932,7 @@ async def setup_claude_dr(page) -> bool:
             if not model_ok:
                 try:
                     for _attempt in range(8):
-                        opus_selected = await page.evaluate(_pick_opus_js)
+                        opus_selected = await page.evaluate(_pick_opus_js, _claude_floor)
                         if opus_selected:
                             break
                         await asyncio.sleep(0.4)
@@ -25655,7 +25663,9 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
             return {"platform": "gemini", "active": active}
         if platform_l == "claude":
             # Check BOTH: high-tier Opus model AND Research tool are on.
-            _claude_state_js = """() => {
+            # Floor from policy (single source of truth) — passed into the JS.
+            _cl_floor = p2_floor("claude")
+            _claude_state_js = """(floor) => {
                 const txt = (document.body.innerText || '').toLowerCase();
                 // 2026-05-28: the UI dropped the word "Extended" — the model
                 // button now reads "Opus 4.8 Max" and Adaptive shows as a
@@ -25676,7 +25686,7 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
                 // [role=menu]/[role=listbox]/[role=dialog] popover.
                 const hasExtended = [...document.querySelectorAll('button, [role="button"]')]
                     .filter(b => !b.closest('[role="menu"], [role="listbox"], [role="dialog"]'))
-                    .some(b => { const v = verOf(b.textContent); return v !== null && v >= 4.8; });
+                    .some(b => { const v = verOf(b.textContent); return v !== null && v >= floor; });
                 // Research tool shows as a magnifying-glass icon / label near composer
                 const researchOn = Array.from(document.querySelectorAll('button, [role="button"]'))
                     .some(b => {
@@ -25690,7 +25700,7 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
                     });
                 return { hasExtended, researchOn };
             }"""
-            state = await page.evaluate(_claude_state_js)
+            state = await page.evaluate(_claude_state_js, _cl_floor)
             if not state.get("hasExtended") or not state.get("researchOn"):
                 log(f"[{label}] Claude mode regressed before send "
                     f"(extended={state.get('hasExtended')}, research={state.get('researchOn')}) — re-activating", "WARN")
@@ -25699,7 +25709,7 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
                 # caller sees the actual final state, not the pre-fix one.
                 # If Step 3A/3B selectors are still broken, researchOn will
                 # remain False and the caller pauses for user decision.
-                state = await page.evaluate(_claude_state_js)
+                state = await page.evaluate(_claude_state_js, _cl_floor)
                 log(f"[{label}] Claude mode post-re-activate: "
                     f"extended={state.get('hasExtended')}, research={state.get('researchOn')}", "INFO")
                 # #744 self-documenting dump: when researchOn STILL reads False
@@ -26891,7 +26901,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             claude_page, _claude_setup_ok = await start_agent_no_gemini_wait(
                 browser, cua_client, "https://claude.ai/new",
                 PROMPT_CLAUDE_DEEP_RESEARCH,
-                "Select Opus 4.8 + Max effort + Adaptive Thinking + Research tool (if Opus 4.8 isn't offered, pick the highest Opus available — never downgrade to 4.7 when 4.8 exists). Do NOT type — just set up and focus input. Say 'ready for paste'.",
+                p2_claude_setup_directive(),
                 brief_text, "2B", "Claude", verbose, brief_path=brief_path,
                 source_paths=source_paths)
             if not _claude_setup_ok:
