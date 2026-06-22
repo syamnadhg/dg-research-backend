@@ -60,6 +60,36 @@ def test_fallback_runs_before_the_chat_mode_gate_and_is_single_shot():
     assert "setup_gemini_dr(page, pin_model=_kg)" in src
 
 
+def test_fallback_only_fires_on_a_different_model():
+    # Capstone review fix: re-pinning the SAME version that just failed can't
+    # help and would needlessly re-click an already-correct model — so the
+    # fallback is gated on known-good DIFFERING from the failed version. When
+    # they match (the common flag-off case: floor == what ran) it's a no-op =
+    # pre-Phoenix behavior.
+    src = inspect.getsource(research.start_agent_no_gemini_wait)
+    assert "_kg_differs" in src and "_P2_PICKED_VERSION.get(platform_l)" in src
+    assert "abs(float(_kg) - float(_failed))" in src, (
+        "the fallback must compare known-good vs the failed version and skip when equal."
+    )
+
+
+def test_fallback_holds_the_pin_via_measure_only_reactivate():
+    # Capstone review fix: the fallback measures with reactivate=False so the
+    # un-pinned re-activation can't re-pick the highest (= the failed model) and
+    # silently undo the pin.
+    src = inspect.getsource(research.start_agent_no_gemini_wait)
+    assert "ensure_deep_mode_active(page, platform, label, reactivate=False)" in src
+
+
+def test_ensure_deep_mode_active_reactivate_param_gates_resetup():
+    # reactivate=True (default) preserves today's behavior; False = measure-only.
+    ed = inspect.getsource(research.ensure_deep_mode_active)
+    assert "reactivate=True" in ed
+    assert ed.count("reactivate and") == 3, (
+        "all three platform re-activation blocks must be gated on `reactivate`."
+    )
+
+
 def test_drift_alert_is_amber_warning_not_red_error():
     # Badge philosophy: a "fell back / FYI" notice is a pipeline_warning
     # (alertType warn), NEVER a red pipeline_error.

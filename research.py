@@ -25714,10 +25714,15 @@ async def type_short_inline_prompt(page, platform, label):
         return False
 
 
-async def ensure_deep_mode_active(page, platform, label) -> dict:
+async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dict:
     """Just-before-send check: is the platform still in its required mode?
     Re-activates if it has been toggled off, then RE-EVALUATES state and
     returns it.
+
+    `reactivate` (default True) — when False, MEASURE ONLY: report the current
+    state without re-running setup_*_dr. The Phoenix known-good fallback uses
+    this so its pinned model isn't silently undone by the default re-activation
+    (which re-picks the HIGHEST model = the one that just failed).
 
     E2 / DGOPS-7364 — return type was always-True; now returns a state
     dict so the caller can gate Send on whether the required mode is
@@ -25760,7 +25765,7 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
                          pillVisible, placeholder: placeholder.slice(0, 60) };
             }"""
             state = await page.evaluate(_cgpt_state_js)
-            if not state.get("active"):
+            if reactivate and not state.get("active"):
                 log(f"[{label}] ChatGPT Deep Research OFF before send "
                     f"(pillVisible={state.get('pillVisible')}) — re-activating", "WARN")
                 await setup_chatgpt_dr(page)
@@ -25774,7 +25779,7 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
             # agree exactly. A present-but-inactive pill must NOT read as active.
             st = await page.evaluate(_GEMINI_DR_STATE_JS)
             active = bool(st.get("placeholderResearch") or st.get("pressed"))
-            if not active:
+            if reactivate and not active:
                 log(f"[{label}] Gemini Deep Research not active before send "
                     f"(placeholder={st.get('placeholder')!r}) — re-activating", "WARN")
                 await setup_gemini_dr(page)
@@ -25823,7 +25828,7 @@ async def ensure_deep_mode_active(page, platform, label) -> dict:
                 return { hasExtended, researchOn };
             }"""
             state = await page.evaluate(_claude_state_js, _cl_floor)
-            if not state.get("hasExtended") or not state.get("researchOn"):
+            if reactivate and (not state.get("hasExtended") or not state.get("researchOn")):
                 log(f"[{label}] Claude mode regressed before send "
                     f"(extended={state.get('hasExtended')}, research={state.get('researchOn')}) — re-activating", "WARN")
                 await setup_claude_dr(page)
@@ -26698,15 +26703,29 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         # today's Skip path).
         if not research_ok and platform_l in ("claude", "gemini"):
             _kg = p2_known_good(platform_l) or p2_floor(platform_l)
-            if _kg is not None:
-                log(f"[{label}] Phoenix: latest model unverified for Deep Research — "
-                    f"retrying once pinned to known-good {platform_l} v{_kg}", "WARN")
+            _failed = _P2_PICKED_VERSION.get(platform_l)
+            # Only retry when known-good is a DIFFERENT model than the one that
+            # just failed: re-pinning the SAME version can't help (it just
+            # failed) and would needlessly re-click an already-correct model
+            # (the #744-adjacent action). When known-good == the failed model
+            # (the common case — e.g. the floor IS what ran, the default with
+            # the kill-switch off), this is a TRUE no-op and control goes
+            # straight to the gate, exactly like pre-Phoenix.
+            _kg_differs = _kg is not None and not (
+                isinstance(_failed, (int, float)) and abs(float(_kg) - float(_failed)) < 0.001)
+            if _kg_differs:
+                log(f"[{label}] Phoenix: latest model (v{_failed}) unverified for Deep "
+                    f"Research — retrying once pinned to known-good {platform_l} v{_kg}", "WARN")
                 try:
                     if platform_l == "claude":
                         await setup_claude_dr(page, pin_model=_kg)
                     else:
                         await setup_gemini_dr(page, pin_model=_kg)
-                    mode_state = await ensure_deep_mode_active(page, platform, label)
+                    # Measure WITHOUT the un-pinned re-activation (reactivate=False)
+                    # so the pin HOLDS — the default ensure path re-runs setup
+                    # unpinned, which would re-pick the highest (= the model that
+                    # just failed) and silently undo the fallback.
+                    mode_state = await ensure_deep_mode_active(page, platform, label, reactivate=False)
                     if platform_l == "claude":
                         research_ok = bool((mode_state or {}).get("researchOn")) or bool(cua_confirmed)
                     else:
