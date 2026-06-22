@@ -72,6 +72,7 @@ from models import (
     GEMINI_TEXT,
     GEMINI_NARRATE,
     p2_floor,
+    p2_known_good,
     p2_claude_ver,
     p2_claude_setup_directive,
 )
@@ -12294,6 +12295,26 @@ def _emit_claude_chat_mode_alert():
     _emit_chat_mode_alert("claude")
 
 
+def _emit_model_drift_alert(platform_l: str, message: str, details: str = ""):
+    """Soft, NON-blocking AMBER notice for a Phoenix (model_refresh) event — the
+    run does NOT pause on it. Uses pipeline_warning (alertType "warn"), NOT the
+    red pipeline_error, because these are FYI, not failures: e.g. the latest
+    model couldn't be verified into Deep Research so the agent fell back to a
+    known-good model (the run continues normally), or an advisory thinking knob
+    (max-effort / extended-thinking) couldn't be confirmed. Badge philosophy:
+    amber warning, never a red error badge for a non-error. NB: this is the
+    model_refresh "Phoenix", NOT the daemon restart/resume one."""
+    names = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
+    name = names.get(platform_l, platform_l.title())
+    emit_event(
+        "pipeline_warning", phase=2, agent=platform_l,
+        message=message or f"{name}: model auto-update notice",
+        details=details,
+        actions=[], alertType="warn", dismissible=True,
+        alert_id=f"phase2_{platform_l}_model_refresh",
+    )
+
+
 def emit_browser_recovery_status(phase: int, agent: str | None = None):
     """Passive 'Reconnecting…' banner for a browser crash that will
     auto-recover via run_pipeline.finally. NO action buttons — the banner
@@ -24205,7 +24226,7 @@ async def setup_chatgpt_dr(page) -> bool:
 # doClick it clicks the winner; otherwise it's a read-only shadow probe. Also
 # returns `legacy` = what the old frozen /3.5 flash/ match would have hit, for
 # the shadow-comparison log. NB: model_refresh "Phoenix", not the restart one.
-_GEMINI_FLASH_RANK_JS = """({floor, doClick}) => {
+_GEMINI_FLASH_RANK_JS = """({floor, doClick, pin}) => {
     const items = [...document.querySelectorAll(
         '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')];
     const flashVer = t => { const m = t.match(/(\\d+(?:\\.\\d+)?)\\s*flash/i); return m ? parseFloat(m[1]) : null; };
@@ -24218,7 +24239,10 @@ _GEMINI_FLASH_RANK_JS = """({floor, doClick}) => {
         if (t.includes('lite') || t.includes('deep think') || /\\bpro\\b/.test(t)) continue;
         if (!legacy && /3\\.5\\s*flash/i.test(t)) legacy = t.slice(0, 40);
         const v = flashVer(t);
-        if (v === null || (floor != null && v < floor)) continue;
+        if (v === null) continue;
+        if (pin != null) {
+            if (Math.abs(v - pin) > 0.001) continue;   // pin: exact known-good Flash version
+        } else if (floor != null && v < floor) continue;
         if (v > bestV || (v === bestV && t.length < bestLen)) {
             bestEl = el; best = t.slice(0, 40); bestV = v; bestLen = t.length;
         }
@@ -24228,8 +24252,8 @@ _GEMINI_FLASH_RANK_JS = """({floor, doClick}) => {
 }"""
 
 
-async def _gemini_select_flash_model(page) -> bool:
-    """Pre-DR step: open the model dropdown and select 3.5 Flash.
+async def _gemini_select_flash_model(page, pin_model=None) -> bool:
+    """Pre-DR step: open the model dropdown and select the latest Flash.
 
     Why this matters: the pipeline runs Gemini Deep Research on 3.5 Flash
     (user-validated 2026-05-26 — Flash completes cleanly and its done-state
@@ -24315,7 +24339,7 @@ async def _gemini_select_flash_model(page) -> bool:
         # shadow-comparison trail and flags any divergence in an E2E.
         try:
             _rank = await page.evaluate(
-                _GEMINI_FLASH_RANK_JS, {"floor": p2_floor("gemini"), "doClick": True})
+                _GEMINI_FLASH_RANK_JS, {"floor": p2_floor("gemini"), "doClick": True, "pin": pin_model})
         except Exception as _re:
             log(f"[setup_gemini_dr] model-pick: ranker eval errored ({_re})", "WARN")
             _rank = {}
@@ -24486,7 +24510,7 @@ _GEMINI_DR_STATE_JS = """() => {
 }"""
 
 
-async def setup_gemini_dr(page) -> bool:
+async def setup_gemini_dr(page, pin_model=None) -> bool:
     """Enable Gemini Deep Research. Returns True only when DR is verified
     ACTIVE (pill visible + pressed/selected). Returns False otherwise so
     the caller's CUA fallback kicks in instead of letting the run proceed
@@ -24510,9 +24534,10 @@ async def setup_gemini_dr(page) -> bool:
     """
     try:
         await asyncio.sleep(2)
-        # Best-effort: pick 3.5 Flash before opening + menu. Non-fatal if it
-        # misses (run proceeds on whatever model the dropdown was on).
-        await _gemini_select_flash_model(page)
+        # Best-effort: pick the latest Flash before opening + menu. Non-fatal if
+        # it misses (run proceeds on whatever model the dropdown was on).
+        # pin_model (Phoenix known-good fallback) forces an exact-version pick.
+        await _gemini_select_flash_model(page, pin_model=pin_model)
         await asyncio.sleep(0.5)
         direct_clicked = False
 
@@ -24863,7 +24888,7 @@ async def setup_gemini_dr(page) -> bool:
         return False
 
 
-async def setup_claude_dr(page) -> bool:
+async def setup_claude_dr(page, pin_model=None) -> bool:
     """Enable Claude Opus 4.8 + Max Effort + Thinking + Research tool via
     direct Playwright selectors. As of 2026-05-28 the claude.ai UI splits
     these across the model popover + the tools menu:
@@ -24915,7 +24940,14 @@ async def setup_claude_dr(page) -> bool:
             for (const b of btns) { const v = verOf(b.textContent); if (v !== null && (best === null || v > best)) best = v; }
             return best;
         }""")
-        model_ok = isinstance(model_trigger_ver, (int, float)) and model_trigger_ver >= _claude_floor
+        # Phoenix known-good fallback: when pin_model is set (the latest model
+        # just failed Deep-Research verification), FORCE a re-pick to that exact
+        # version — even if the trigger already shows a higher Opus (that higher
+        # model is the one that failed). A deliberate one-shot switch to a
+        # different model, NOT the #744 re-click-a-correct-model loop.
+        model_ok = (pin_model is None) and isinstance(model_trigger_ver, (int, float)) and model_trigger_ver >= _claude_floor
+        if pin_model is not None:
+            log(f"[setup_claude_dr] pin: forcing re-pick to Opus {pin_model} (known-good fallback)")
         opus_selected = None
         if model_ok:
             # Model already correct — record it but DO NOT re-pick (the #744
@@ -24928,7 +24960,7 @@ async def setup_claude_dr(page) -> bool:
         # version-gates to >= 4.8 so it NEVER downgrades to 4.7; sees
         # role="menuitemradio"/div options and uses getClientRects() so a
         # fixed-position popover isn't filtered by offsetParent (#708/#744).
-        _pick_opus_js = """(floor) => {
+        _pick_opus_js = """({floor, pin}) => {
             const vis = el => el.getClientRects().length > 0;
             const menus = [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"]')]
                 .filter(vis);
@@ -24946,7 +24978,10 @@ async def setup_claude_dr(page) -> bool:
             for (const el of items) {
                 const t = (el.textContent || '').trim();
                 const v = verOf(t);
-                if (v === null || v < floor) continue;   // only Opus >= floor — never downgrade
+                if (v === null) continue;
+                if (pin != null) {
+                    if (Math.abs(v - pin) > 0.001) continue;   // pin: target the exact known-good version
+                } else if (v < floor) continue;                // else only Opus >= floor — never downgrade
                 if (v > bestV || (v === bestV && t.length < bestLen)) {
                     best = el; bestV = v; bestLen = t.length;
                 }
@@ -24977,7 +25012,7 @@ async def setup_claude_dr(page) -> bool:
             if not model_ok:
                 try:
                     for _attempt in range(8):
-                        opus_selected = await page.evaluate(_pick_opus_js, _claude_floor)
+                        opus_selected = await page.evaluate(_pick_opus_js, {"floor": _claude_floor, "pin": pin_model})
                         if opus_selected:
                             break
                         await asyncio.sleep(0.4)
@@ -26607,6 +26642,43 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             research_ok = bool((mode_state or {}).get("researchOn")) or bool(cua_confirmed)
         else:
             research_ok = bool((mode_state or {}).get("active"))
+
+        # ── Phoenix model_refresh — known-good fallback (auto-adopt + verify +
+        #    fallback) ──────────────────────────────────────────────────────
+        # If the LATEST model couldn't be verified into Deep Research, retry
+        # ONCE pinning the last known-good model (canary-recorded; else the
+        # policy floor = today's proven model) BEFORE the chat-mode gate fires.
+        # A newer model that doesn't yet support DR then degrades to a working
+        # older model instead of a Skip. Single-shot (straight-line, no loop);
+        # ChatGPT has no model lever → not eligible. The pinned re-pick reuses
+        # setup_*_dr so the #744/#751 popover/Escape invariants stay intact, and
+        # a failure here just falls through to the existing gate (worst case =
+        # today's Skip path).
+        if not research_ok and platform_l in ("claude", "gemini"):
+            _kg = p2_known_good(platform_l) or p2_floor(platform_l)
+            if _kg is not None:
+                log(f"[{label}] Phoenix: latest model unverified for Deep Research — "
+                    f"retrying once pinned to known-good {platform_l} v{_kg}", "WARN")
+                try:
+                    if platform_l == "claude":
+                        await setup_claude_dr(page, pin_model=_kg)
+                    else:
+                        await setup_gemini_dr(page, pin_model=_kg)
+                    mode_state = await ensure_deep_mode_active(page, platform, label)
+                    if platform_l == "claude":
+                        research_ok = bool((mode_state or {}).get("researchOn")) or bool(cua_confirmed)
+                    else:
+                        research_ok = bool((mode_state or {}).get("active"))
+                except Exception as _kge:
+                    log(f"[{label}] Phoenix known-good retry errored (non-fatal): {_kge}", "WARN")
+                if research_ok:
+                    _emit_model_drift_alert(
+                        platform_l,
+                        f"{_agent_name} used a known-good model (v{_kg}) for Deep Research",
+                        "The latest model couldn't be verified into Deep Research, so the "
+                        f"agent fell back to a known-good model (v{_kg}). The run continues normally.")
+                    log(f"[{label}] Phoenix: known-good fallback verified — proceeding on v{_kg}")
+
         if not research_ok:
             log(f"[{label}] Deep Research unavailable after Layer 1 + Layer 2 + "
                 f"pre-send re-activation — emitting chat-mode decision alert", "WARN")

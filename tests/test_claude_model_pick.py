@@ -81,8 +81,8 @@ def test_step1_does_not_repick_already_correct_model():
         "an already-correct model must be recorded but NOT re-picked (#744)."
     )
     # The model-pick poll must run ONLY when the model is not already correct.
-    pick_idx = src.find("opus_selected = await page.evaluate(_pick_opus_js, _claude_floor)")
-    assert pick_idx != -1, "the _pick_opus_js poll must still exist (now passing the policy floor arg)."
+    pick_idx = src.find("opus_selected = await page.evaluate(_pick_opus_js, {")
+    assert pick_idx != -1, "the _pick_opus_js poll must still exist (now passing {floor, pin})."
     guard_idx = src.rfind("if not model_ok:", 0, pick_idx)
     assert guard_idx != -1, (
         "the model-pick poll must be guarded by `if not model_ok:` so a correct "
