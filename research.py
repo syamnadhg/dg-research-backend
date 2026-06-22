@@ -24197,6 +24197,37 @@ async def setup_chatgpt_dr(page) -> bool:
         return False
 
 
+# Phoenix (model_refresh) — Gemini "pick highest Flash" ranker. Mirrors
+# models.pick_highest_model (Python, unit-tested + reused by the canary): among
+# visible dropdown rows, reject Flash-Lite/Pro/Deep-Think FIRST, parse the Flash
+# version (row text is title+desc concatenated, so no trailing boundary after
+# "flash"), and pick the HIGHEST >= floor (tie → shortest text = leaf row). With
+# doClick it clicks the winner; otherwise it's a read-only shadow probe. Also
+# returns `legacy` = what the old frozen /3.5 flash/ match would have hit, for
+# the shadow-comparison log. NB: model_refresh "Phoenix", not the restart one.
+_GEMINI_FLASH_RANK_JS = """({floor, doClick}) => {
+    const items = [...document.querySelectorAll(
+        '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')];
+    const flashVer = t => { const m = t.match(/(\\d+(?:\\.\\d+)?)\\s*flash/i); return m ? parseFloat(m[1]) : null; };
+    let bestEl = null, best = '', bestV = -1, bestLen = Infinity, legacy = '';
+    for (const el of items) {
+        if (!el.offsetParent) continue;
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (!t) continue;
+        // Reject siblings FIRST (order matters — "Flash-Lite" also has "flash").
+        if (t.includes('lite') || t.includes('deep think') || /\\bpro\\b/.test(t)) continue;
+        if (!legacy && /3\\.5\\s*flash/i.test(t)) legacy = t.slice(0, 40);
+        const v = flashVer(t);
+        if (v === null || (floor != null && v < floor)) continue;
+        if (v > bestV || (v === bestV && t.length < bestLen)) {
+            bestEl = el; best = t.slice(0, 40); bestV = v; bestLen = t.length;
+        }
+    }
+    if (doClick && bestEl) bestEl.click();
+    return { pick: best, version: bestV, legacy, clicked: !!(doClick && bestEl) };
+}"""
+
+
 async def _gemini_select_flash_model(page) -> bool:
     """Pre-DR step: open the model dropdown and select 3.5 Flash.
 
@@ -24275,6 +24306,24 @@ async def _gemini_select_flash_model(page) -> bool:
             log("[setup_gemini_dr] model-pick: dropdown button not found — skipping Flash selection", "INFO")
             return False
         await asyncio.sleep(0.8)
+
+        # Phoenix model_refresh — SHADOW (Phase B1): compute what the version-
+        # ranker WOULD pick (highest Flash >= floor) WITHOUT clicking, alongside
+        # the legacy frozen /3.5 flash/ match. Today they agree (3.5 is the
+        # highest Flash) so this only proves the ranker parses the live dropdown
+        # correctly; the day a newer Flash ships, the log flags the divergence.
+        # The frozen pick below still does the actual click — activation is a
+        # separate, isolated commit (B2).
+        try:
+            _shadow = await page.evaluate(
+                _GEMINI_FLASH_RANK_JS, {"floor": p2_floor("gemini"), "doClick": False})
+            _rp, _lg = (_shadow or {}).get("pick") or "", (_shadow or {}).get("legacy") or ""
+            _div = " — DIVERGES from legacy!" if (_rp and _lg and _rp != _lg) else ""
+            log(f"[setup_gemini_dr] model-pick SHADOW: ranker would pick '{_rp}' "
+                f"(v{(_shadow or {}).get('version')}, floor={p2_floor('gemini')}) | "
+                f"legacy /3.5 flash/ -> '{_lg}'{_div}", "INFO")
+        except Exception as _se:
+            log(f"[setup_gemini_dr] model-pick SHADOW eval failed (non-fatal): {_se}", "INFO")
 
         # Step 2: click the "3.5 Flash" model row. The menu row's textContent
         # is the title CONCATENATED with its description ("3.5 FlashAll-around
@@ -24381,6 +24430,24 @@ async def _gemini_select_flash_model(page) -> bool:
             pass
         try:
             await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        # Phoenix model_refresh — read-only post-pick predicate: confirm the
+        # model-selector TRIGGER now reflects a Flash model (the pick used to
+        # trust the click and never re-read → a silent-wrong-model gap). Runs
+        # AFTER the menu is closed; must NOT reopen it. Observability only — it
+        # does not change setup_gemini_dr's return (DR-placeholder-gated upstream).
+        try:
+            _trig = await page.evaluate("""() => {
+                const b = document.querySelector(
+                    'button[data-test-id="bard-mode-menu-button"], bard-mode-menu-button button');
+                return b ? (b.textContent || '').trim() : '';
+            }""")
+            if "flash" in (_trig or "").lower():
+                log(f"[setup_gemini_dr] model-pick verify: trigger now reads '{_trig[:40]}'")
+            else:
+                log(f"[setup_gemini_dr] model-pick verify: trigger does NOT show Flash "
+                    f"(reads '{_trig[:40]}') — pick may not have taken", "WARN")
         except Exception:
             pass
         return True

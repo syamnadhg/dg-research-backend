@@ -99,3 +99,58 @@ def test_missing_overlay_falls_back_to_defaults(monkeypatch, tmp_path):
 def test_non_dict_overlay_is_rejected(monkeypatch, tmp_path):
     _arm(monkeypatch, tmp_path, "[1, 2, 3]")  # valid json, wrong shape
     assert models.p2_floor("claude") == 4.8
+
+
+# ── pick_highest_model / parse_family_version (the ranker algorithm) ──────
+
+
+def test_parse_family_version_handles_concatenated_row_text():
+    # Dropdown rows are title+description concatenated, no trailing boundary.
+    assert models.parse_family_version("3.5 FlashAll-around help", "flash") == 3.5
+    assert models.parse_family_version("Gemini 4.0 Flash · fast", "flash") == 4.0
+    assert models.parse_family_version("Opus 4.8 Max", "opus") == 4.8
+    assert models.parse_family_version("Sonnet 4.6", "opus") is None
+    assert models.parse_family_version("", "flash") is None
+
+
+def test_pick_highest_flash_picks_the_newest():
+    rows = ["2.5 Flash", "3.5 FlashAll-around help", "4.0 Flash (new)"]
+    best = models.pick_highest_model(rows, "flash", floor=3.5, reject=["lite", "deep think", "pro"])
+    assert best["version"] == 4.0 and best["index"] == 2
+
+
+def test_pick_highest_flash_rejects_siblings():
+    # Flash-Lite / Pro / Deep Think must never win even if numerically higher.
+    rows = ["5.0 Flash-Lite", "9.9 Gemini Pro", "3.5 Flash Deep Think", "3.5 Flash"]
+    best = models.pick_highest_model(rows, "flash", floor=3.5, reject=["lite", "deep think", "pro"])
+    assert best["label"] == "3.5 Flash"
+
+
+def test_pick_highest_floor_refuses_below():
+    rows = ["3.0 Flash", "2.5 Flash"]
+    assert models.pick_highest_model(rows, "flash", floor=3.5, reject=["lite", "deep think", "pro"]) is None
+
+
+def test_pick_highest_tie_breaks_to_shortest_label():
+    # A wrapper row concatenating several models loses to the leaf at the same version.
+    rows = ["4.0 Flash — All-around help, fast responses, multimodal, etc.", "4.0 Flash"]
+    best = models.pick_highest_model(rows, "flash", floor=3.5, reject=[])
+    assert best["label"] == "4.0 Flash"
+
+
+def test_pick_highest_reject_is_word_boundary():
+    # 'pro' must not trip on 'approve'/'professional'-style substrings.
+    rows = ["4.0 Flash (approved, professional-grade)"]
+    best = models.pick_highest_model(rows, "flash", floor=3.5, reject=["pro"])
+    assert best is not None and best["version"] == 4.0
+
+
+def test_pick_highest_opus_family_for_canary_reuse():
+    rows = ["Opus 4.7 Adaptive", "Opus 4.8 Max", "Sonnet 4.6", "Opus 5.0"]
+    best = models.pick_highest_model(rows, "opus", floor=4.8, reject=[])
+    assert best["version"] == 5.0
+
+
+def test_pick_highest_none_when_no_candidate():
+    assert models.pick_highest_model([], "flash", floor=3.5) is None
+    assert models.pick_highest_model([None, "", "Ask Gemini"], "flash", floor=3.5) is None

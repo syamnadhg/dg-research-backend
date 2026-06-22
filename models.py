@@ -13,6 +13,7 @@ Refreshed 2026-05-28 against:
 """
 import json
 import os
+import re
 from pathlib import Path
 
 # ── Anthropic Claude ────────────────────────────────────────────────────
@@ -204,6 +205,51 @@ def p2_claude_major() -> str:
     """The major component of the Claude floor, e.g. '4' (for 'any Opus 4.x')."""
     f = p2_floor("claude")
     return str(int(f)) if isinstance(f, (int, float)) else ""
+
+
+def parse_family_version(text: str, family: str):
+    """Parse a version adjacent to the family word out of a model-dropdown row
+    label, in EITHER order:
+      • num-before-family (Gemini): '3.5 flash' → 3.5, 'gemini 4.0 flash' → 4.0
+      • family-before-num (Claude): 'opus 4.8 max' → 4.8
+    Row text is often title+description CONCATENATED ('3.5 FlashAll-around
+    help'), so there is no trailing boundary after the family word. Returns a
+    float or None."""
+    t = (text or "").lower()
+    fam = re.escape(family.lower())
+    m = re.search(r"(\d+(?:\.\d+)?)\s*" + fam, t) or re.search(fam + r"[^0-9]*(\d+(?:\.\d+)?)", t)
+    return float(m.group(1)) if m else None
+
+
+def pick_highest_model(labels, family: str, floor=None, reject=()):
+    """From candidate dropdown-row labels, pick the row with the HIGHEST
+    <family> version that is >= floor, REJECTING (checked first) any label
+    containing a reject term (word-boundary match, so 'pro' won't trip on
+    'approve'). Tie-break: shortest label (prefer a leaf row over a wrapper
+    that concatenates several models).
+
+    Returns {'index', 'version', 'label'} of the winner, or None.
+
+    This is the Python mirror of the JS ranker in research.py's
+    _gemini_select_flash_model — used by the weekly canary (which scrapes rows
+    in Python) and unit-tested here so the ranking ALGORITHM has real coverage
+    (the live JS picker can't be unit-tested without a browser)."""
+    rej = [r.lower() for r in (reject or [])]
+    best = None
+    for i, raw in enumerate(labels):
+        t = (raw or "").strip().lower()
+        if not t:
+            continue
+        if any(re.search(r"\b" + re.escape(r) + r"\b", t) for r in rej):
+            continue
+        v = parse_family_version(t, family)
+        if v is None or (floor is not None and v < floor):
+            continue
+        if best is None or v > best["version"] or (v == best["version"] and len(t) < best["_len"]):
+            best = {"index": i, "version": v, "label": (raw or "").strip(), "_len": len(t)}
+    if best is not None:
+        best.pop("_len", None)
+    return best
 
 
 def p2_claude_setup_directive() -> str:
