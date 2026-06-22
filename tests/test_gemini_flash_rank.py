@@ -25,15 +25,20 @@ def test_ranker_constant_rejects_siblings_before_version():
     assert "v > bestV" in js and "t.length < bestLen" in js
 
 
-def test_b1_is_shadow_only():
+def test_b2_ranker_is_activated_and_clicks():
     src = inspect.getsource(research._gemini_select_flash_model)
-    # The ranker runs read-only (doClick False); activation (doClick True) is B2.
-    assert '"doClick": False' in src, "B1 must run the ranker read-only (doClick False)."
-    assert '"doClick": True' not in src, "B1 must NOT activate the ranker click yet (that's B2)."
-    # The legacy frozen pick must still be the one that clicks in B1.
-    assert "picked = await page.evaluate" in src, "the frozen /3.5 flash/ pick must still click in B1."
-    # A shadow comparison line is logged for the E2E confidence trail.
-    assert "SHADOW" in src and "DIVERGES from legacy" in src
+    # B2: the ranker now does the click (doClick True); the read-only shadow
+    # (doClick False) and the frozen /3.5 flash/ block are gone.
+    assert '"doClick": True' in src, "B2 must activate the ranker click (doClick True)."
+    assert '"doClick": False' not in src, "the read-only shadow eval must be removed in B2."
+    assert 'Step 2: click the "3.5 Flash" model row' not in src, (
+        "the frozen /3.5 flash/ literal pick must be superseded by the ranker."
+    )
+    # The legacy comparison is still logged on success for the E2E trail.
+    assert "DIVERGES from legacy" in src and "legacy /3.5 flash/" in src
+    # A ranker miss degrades to the same proceed-on-default path as the old
+    # frozen miss (WARN + Escape + return False), not a hard break.
+    assert "no Flash >= floor found" in src and "return False" in src
 
 
 def test_post_pick_predicate_is_read_only():

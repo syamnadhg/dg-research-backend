@@ -233,8 +233,11 @@ def _make_model_pick_eval(opened, picked, tl_seq, ext_picked, mode_txt):
     def fake_eval(js, *a, **k):
         if "inViewableArea" in js:            # Step 1: open the model menu
             return opened
-        if "includes('lite')" in js:          # Step 2: pick the model row
-            return picked
+        if "doClick" in js:                    # Step 2: ranker picks+clicks the row
+            # Phoenix B2: the ranker returns a dict (was a bare string for the
+            # frozen /3.5 flash/ pick). `clicked` mirrors a successful pick.
+            return {"pick": picked, "version": 3.5, "legacy": picked,
+                    "clicked": bool(picked)}
         if "thinking level" in js:             # Step 3a: open Thinking submenu
             return next(tl_iter)
         if "startsWith('extended')" in js:     # Step 3b: pick Extended

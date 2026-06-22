@@ -24307,48 +24307,22 @@ async def _gemini_select_flash_model(page) -> bool:
             return False
         await asyncio.sleep(0.8)
 
-        # Phoenix model_refresh — SHADOW (Phase B1): compute what the version-
-        # ranker WOULD pick (highest Flash >= floor) WITHOUT clicking, alongside
-        # the legacy frozen /3.5 flash/ match. Today they agree (3.5 is the
-        # highest Flash) so this only proves the ranker parses the live dropdown
-        # correctly; the day a newer Flash ships, the log flags the divergence.
-        # The frozen pick below still does the actual click — activation is a
-        # separate, isolated commit (B2).
+        # Phoenix model_refresh — ACTIVATED (Phase B2): the version-ranker now
+        # picks AND clicks the highest Flash >= floor, superseding the frozen
+        # /3.5 flash/ literal. Behavior-identical TODAY (3.5 is the highest
+        # Flash) and auto-adapts the day a newer Flash ships. `legacy` records
+        # what the old frozen match would have hit, so the success log keeps the
+        # shadow-comparison trail and flags any divergence in an E2E.
         try:
-            _shadow = await page.evaluate(
-                _GEMINI_FLASH_RANK_JS, {"floor": p2_floor("gemini"), "doClick": False})
-            _rp, _lg = (_shadow or {}).get("pick") or "", (_shadow or {}).get("legacy") or ""
-            _div = " — DIVERGES from legacy!" if (_rp and _lg and _rp != _lg) else ""
-            log(f"[setup_gemini_dr] model-pick SHADOW: ranker would pick '{_rp}' "
-                f"(v{(_shadow or {}).get('version')}, floor={p2_floor('gemini')}) | "
-                f"legacy /3.5 flash/ -> '{_lg}'{_div}", "INFO")
-        except Exception as _se:
-            log(f"[setup_gemini_dr] model-pick SHADOW eval failed (non-fatal): {_se}", "INFO")
-
-        # Step 2: click the "3.5 Flash" model row. The menu row's textContent
-        # is the title CONCATENATED with its description ("3.5 FlashAll-around
-        # help"), so match "3.5 flash" WITHOUT a trailing word boundary (a
-        # \\bflash\\b would fail against "flashall..."). Reject Flash-Lite /
-        # Pro / Deep Think siblings first — order matters ("Flash-Lite" also
-        # contains "flash").
-        picked = await page.evaluate("""() => {
-            const items = document.querySelectorAll(
-                '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li');
-            for (const el of items) {
-                if (!el.offsetParent) continue;
-                const t = (el.textContent || '').trim().toLowerCase();
-                if (!t) continue;
-                if (t.includes('lite') || t.includes('deep think') ||
-                    /\\bpro\\b/.test(t)) continue;
-                if (/3\\.5\\s*flash/i.test(t)) {
-                    el.click();
-                    return t.slice(0, 40);
-                }
-            }
-            return '';
-        }""")
+            _rank = await page.evaluate(
+                _GEMINI_FLASH_RANK_JS, {"floor": p2_floor("gemini"), "doClick": True})
+        except Exception as _re:
+            log(f"[setup_gemini_dr] model-pick: ranker eval errored ({_re})", "WARN")
+            _rank = {}
+        picked = ((_rank or {}).get("pick") or "") if (_rank or {}).get("clicked") else ""
+        _legacy = (_rank or {}).get("legacy") or ""
         if not picked:
-            log("[setup_gemini_dr] model-pick: 3.5 Flash item not found in dropdown — closing menu", "WARN")
+            log("[setup_gemini_dr] model-pick: no Flash >= floor found in dropdown — closing menu", "WARN")
             # Best-effort: close the open dropdown so the next step's + button
             # isn't sitting under an overlay.
             try:
@@ -24357,7 +24331,10 @@ async def _gemini_select_flash_model(page) -> bool:
                 pass
             return False
         await asyncio.sleep(0.6)
-        log(f"[setup_gemini_dr] model-pick OK: clicked '{picked}'")
+        _div = " — DIVERGES from legacy!" if (_legacy and picked != _legacy) else ""
+        log(f"[setup_gemini_dr] model-pick OK: ranker clicked '{picked}' "
+            f"(v{(_rank or {}).get('version')}, floor={p2_floor('gemini')}) | "
+            f"legacy /3.5 flash/ -> '{_legacy}'{_div}")
 
         # Step 3: set Thinking level = Extended (the pipeline wants "Flash
         # Extended", not the default "Standard"). The model menu carries a
