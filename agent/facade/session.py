@@ -73,12 +73,20 @@ class AccountSession:
         refresh_token: str,
         id_token: str | None = None,
         expires_at: float = 0.0,
+        connected_at_ms: int | None = None,
     ) -> None:
         self._uid = uid
         self._email = email
         self._refresh_token = refresh_token
         self._id_token = id_token
         self._expires_at = expires_at  # epoch seconds; 0 ⇒ unknown ⇒ refresh now
+        # Epoch-ms of the human sign-in that captured this session (set by
+        # from_capture, persisted, rehydrated by load). The bridge heartbeat
+        # compares the agent row's `revokedAt` against this to IGNORE a revoke
+        # that predates this sign-in — a stale revoked row must not self-logout a
+        # freshly-captured session (#848). None ⇒ unknown (a pre-change
+        # rehydrated session) ⇒ the heartbeat conservatively honors the revoke.
+        self.connected_at_ms = connected_at_ms
         self._lock = threading.Lock()
 
     # ── identity ──
@@ -108,6 +116,10 @@ class AccountSession:
             refresh_token=refresh_token,
             id_token=id_token,
             expires_at=time.time() + max(0, expires_in - _REFRESH_MARGIN_SECONDS),
+            # Stamp the capture instant HERE (every fresh human sign-in flows
+            # through from_capture) so the #848 stale-revoke guard has an
+            # authoritative epoch even if the agent-row write fails downstream.
+            connected_at_ms=int(time.time() * 1000),
         )
         sess._persist()
         return sess
@@ -177,12 +189,16 @@ class AccountSession:
         uid = blob.get("uid")
         if not rt or not uid:
             return None
+        cap = blob.get("connected_at_ms")
         return cls(
             uid=uid,
             email=blob.get("email", ""),
             refresh_token=rt,
             id_token=None,  # force a refresh on first use → validates the token
             expires_at=0.0,
+            # Rehydrate the original capture epoch (absent on pre-change blobs →
+            # None → the heartbeat conservatively honors a revoke until re-signin).
+            connected_at_ms=int(cap) if isinstance(cap, (int, float)) else None,
         )
 
     # ── token access ──
@@ -244,13 +260,14 @@ class AccountSession:
 
     # ── persistence ──
     def _persist(self) -> None:
-        store.save(
-            {
-                "uid": self._uid,
-                "email": self._email,
-                "refresh_token": self._refresh_token,
-            }
-        )
+        blob: dict[str, Any] = {
+            "uid": self._uid,
+            "email": self._email,
+            "refresh_token": self._refresh_token,
+        }
+        if self.connected_at_ms is not None:
+            blob["connected_at_ms"] = int(self.connected_at_ms)
+        store.save(blob)
 
     def logout(self) -> None:
         store.clear()

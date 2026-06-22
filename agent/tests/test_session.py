@@ -86,6 +86,11 @@ def test_from_capture_sets_fields(monkeypatch):
         refresh_token="RT", id_token="ID", uid="u9", email="z@z.z", expires_in=3600,
     )
     assert s.uid == "u9" and s.email == "z@z.z"
+    # from_capture also stamps + persists the capture epoch (#848 stale-revoke
+    # guard) — a human-sign-in marker the heartbeat compares revokedAt against.
+    cap = saved.pop("connected_at_ms")
+    assert isinstance(cap, int) and cap > 0
+    assert s.connected_at_ms == cap  # in-memory matches the persisted value
     assert saved == {"uid": "u9", "email": "z@z.z", "refresh_token": "RT"}
     # cached token used immediately, no network
     monkeypatch.setattr(sess_mod.requests, "post", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not refresh")))

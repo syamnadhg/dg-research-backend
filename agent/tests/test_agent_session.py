@@ -6,6 +6,7 @@ the revoke→self-logout, the missing-doc re-create, and silent-self-heal on a
 transient blip — is deterministic.
 """
 
+import datetime as _dt
 import threading
 import time
 from types import SimpleNamespace
@@ -13,6 +14,16 @@ from types import SimpleNamespace
 import pytest
 
 from facade import bridge, config
+
+
+def _iso(ms: int) -> str:
+    """A Firestore-style ISO-8601 UTC timestamp (…Z) for an epoch-ms value —
+    mirrors how a serverTimestamp `revokedAt` reads back via FirestoreRest."""
+    return (
+        _dt.datetime.fromtimestamp(ms / 1000, _dt.timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 class RecFS:
@@ -315,3 +326,106 @@ def test_heartbeat_loop_survives_a_throwing_tick(monkeypatch):
     t.join(timeout=2)
     assert not t.is_alive()  # a throwing tick must not kill the thread
     assert calls["n"] >= 2  # it kept ticking past the first exception
+
+
+# ── #848 P2: stale-revoke guard (revokedAt ordering vs the capture epoch) ──────
+
+def test_parse_firestore_ts_ms_int_and_iso():
+    p = bridge._parse_firestore_ts_ms
+    assert p(None) is None
+    assert p(1782151690374) == 1782151690374
+    assert p(1700.0) == 1700
+    base = _dt.datetime(2026, 6, 10, 0, 10, 26, 123000, tzinfo=_dt.timezone.utc)
+    want = int(base.timestamp() * 1000)
+    assert p("2026-06-10T00:10:26.123Z") == want
+    # Firestore nanosecond precision is TRUNCATED to micros (sub-ms floored), not rejected.
+    assert p("2026-06-10T00:10:26.123456789Z") == want
+    assert p("not-a-timestamp") is None
+    assert p({"weird": 1}) is None
+
+
+def test_should_honor_revoke_unknown_capture_honors():
+    # A pre-change rehydrated session (no connected_at_ms) → honor the revoke (safe).
+    sess = SimpleNamespace()
+    assert bridge._should_honor_revoke({"revoked": True, "revokedAt": "2020-01-01T00:00:00Z"}, sess) is True
+
+
+def test_should_honor_revoke_stale_predates_capture_is_ignored():
+    now = int(time.time() * 1000)
+    sess = SimpleNamespace(connected_at_ms=now)
+    # A revoke from a week before this sign-in is stale → do NOT honor.
+    assert bridge._should_honor_revoke({"revokedAt": _iso(now - 7 * 24 * 3600 * 1000)}, sess) is False
+
+
+def test_should_honor_revoke_after_capture_is_honored():
+    now = int(time.time() * 1000)
+    sess = SimpleNamespace(connected_at_ms=now - 60_000)  # signed in a minute ago
+    assert bridge._should_honor_revoke({"revokedAt": _iso(now)}, sess) is True
+
+
+def test_should_honor_revoke_within_skew_margin_is_honored():
+    now = int(time.time() * 1000)
+    sess = SimpleNamespace(connected_at_ms=now)
+    # A revoke 2 min "before" capture is within the 5-min skew margin → honor it
+    # (clock drift between the host and Firestore must never drop a genuine revoke).
+    assert bridge._should_honor_revoke({"revokedAt": _iso(now - 2 * 60 * 1000)}, sess) is True
+
+
+def test_should_honor_revoke_no_revokedAt_with_known_capture_is_ignored():
+    # A genuine revoke always carries a serverTimestamp; revoked:true with none,
+    # when we DO know our capture time, is a stale/legacy row → ignore.
+    sess = SimpleNamespace(connected_at_ms=int(time.time() * 1000))
+    assert bridge._should_honor_revoke({"revoked": True}, sess) is False
+
+
+def test_heartbeat_stale_revoke_reasserts_clear_not_logout(wired):
+    # The exact #848 compounding case: a fresh sign-in, but a stale revoked row
+    # lingers (a prior clear_revoked write failed). The heartbeat must NOT
+    # self-logout the live session — it re-asserts the clear instead.
+    now = int(time.time() * 1000)
+    RecFS.doc = {"revoked": True, "revokedAt": _iso(now - 7 * 24 * 3600 * 1000)}
+    st, sess = _state()
+    sess.connected_at_ms = now  # signed in just now
+    bridge._heartbeat_once(st)
+    assert st.session is sess  # NOT logged out
+    assert sess._logged_out["v"] is False
+    assert any(u["fields"].get("revoked") is False for u in RecFS.upserts)  # re-asserted clear
+    assert RecFS.deletes == []
+
+
+def test_heartbeat_genuine_revoke_after_capture_logs_out(wired):
+    # A revoke that post-dates this sign-in is the user disconnecting THIS live
+    # agent → honor it (self-logout), leaving the revoked row in place.
+    now = int(time.time() * 1000)
+    RecFS.doc = {"revoked": True, "revokedAt": _iso(now)}
+    st, sess = _state()
+    sess.connected_at_ms = now - 10 * 60 * 1000  # signed in 10 min ago
+    bridge._heartbeat_once(st)
+    assert st.session is None  # honored → self-logout
+    assert sess._logged_out["v"] is True
+    assert RecFS.deletes == []  # revoke leaves the row (only a clean /logout deletes)
+
+
+def test_startup_ignores_stale_revoke_and_reasserts(wired):
+    now = int(time.time() * 1000)
+    RecFS.doc = {"label": "X", "revoked": True, "revokedAt": _iso(now - 7 * 24 * 3600 * 1000)}
+    st, sess = _state()
+    sess.connected_at_ms = now
+    bridge._arm_agent_session_on_start(st)
+    assert st.session is sess  # not logged out
+    assert any(u["fields"].get("revoked") is False for u in RecFS.upserts)  # re-asserted clear
+
+
+def test_session_persists_and_rehydrates_capture_epoch(monkeypatch):
+    # The capture epoch round-trips through the secret store so the guard works
+    # across a bridge restart (load()).
+    from facade import session as sess_mod
+    mem: dict = {}
+    monkeypatch.setattr(sess_mod.store, "load", lambda: mem.get("blob"))
+    monkeypatch.setattr(sess_mod.store, "save", lambda blob: mem.__setitem__("blob", dict(blob)))
+    s = sess_mod.AccountSession.from_capture(
+        refresh_token="RT", id_token="ID", uid="u9", email="z@z.z", expires_in=3600,
+    )
+    assert isinstance(s.connected_at_ms, int)
+    rehydrated = sess_mod.AccountSession.load()
+    assert rehydrated is not None and rehydrated.connected_at_ms == s.connected_at_ms

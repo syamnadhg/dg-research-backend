@@ -14,6 +14,7 @@ Bound to 127.0.0.1 only; every request is Host- and (for writes) Origin-checked.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import logging
@@ -669,13 +670,67 @@ def _self_logout(state: BridgeState, sess: AccountSession | None) -> bool:
     return True
 
 
+# Tolerate clock skew between THIS host's clock (connected_at_ms, from time.time()
+# at capture) and Firestore's serverTimestamp (revokedAt) when deciding whether a
+# revoke post-dates the current sign-in. Generous: a genuine revoke of a LIVE
+# agent lands minutes-to-days after capture, so a 5-min margin never mis-ignores
+# one; a stale revoke (the #848 case) predates capture by far more, so it is still
+# correctly ignored. Errs toward HONORING a revoke (security) on the boundary.
+_REVOKE_SKEW_MARGIN_MS = 5 * 60 * 1000
+
+
+def _parse_firestore_ts_ms(v: Any) -> int | None:
+    """Best-effort epoch-ms from a value read back via FirestoreRest: a plain int
+    (the bridge writes connectedAt/lastSeenAt as ms ints) or an ISO-8601 string
+    (a serverTimestamp, e.g. revokedAt='2026-06-10T00:10:26.123456789Z'). None on
+    anything unparseable."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    if not isinstance(v, str):
+        return None
+    s = v.strip().replace("Z", "+00:00")
+    # Firestore may emit nanosecond precision; datetime.fromisoformat accepts at
+    # most microseconds — truncate any longer fractional part to 6 digits.
+    m = re.match(r"^(.*\.\d{6})\d+(.*)$", s)
+    if m:
+        s = m.group(1) + m.group(2)
+    try:
+        return int(dt.datetime.fromisoformat(s).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _should_honor_revoke(doc: dict, sess: AccountSession) -> bool:
+    """Whether a ``revoked: true`` agent-row should self-logout this session.
+
+    Honor it ONLY when the revoke post-dates this sign-in — i.e. the user revoked
+    THIS live agent — so a stale revoked row left from before the current capture
+    can't tear down a freshly-signed-in session (#848). Conservative on the edges:
+      * unknown capture epoch (a pre-change rehydrated session) ⇒ honor;
+      * a genuine revoke always carries a serverTimestamp ``revokedAt``, so a
+        ``revoked: true`` with no resolvable revokedAt is a stale/legacy row ⇒
+        ignore (the heartbeat re-asserts the clear instead of self-logging-out).
+    The skew margin absorbs host-vs-Firestore clock drift, erring toward honoring.
+    """
+    cap = getattr(sess, "connected_at_ms", None)
+    if cap is None:
+        return True  # we don't know when we signed in → honor the revoke (safe)
+    revoked_at = _parse_firestore_ts_ms(doc.get("revokedAt"))
+    if revoked_at is None:
+        return False  # revoked:true with no resolvable revokedAt → stale row
+    return revoked_at >= (int(cap) - _REVOKE_SKEW_MARGIN_MS)
+
+
 def _arm_agent_session_on_start(state: BridgeState) -> None:
     """At serve() startup with a session rehydrated from disk: honor a revoke
     that landed while the bridge was DOWN, otherwise re-arm the row.
 
     A restart is an AUTOMATIC reconnect (no human present), so it must not
-    un-revoke. If the stored row is already revoked, self-logout (the bridge does
-    not re-attach); else (re)write the row WITHOUT clearing revoked.
+    un-revoke a genuine revoke. But a STALE revoke (one that predates this
+    session's sign-in — see _should_honor_revoke) must NOT strand a valid
+    session, so we re-assert the clear for it (#848).
     """
     sess = state.session
     if sess is None:
@@ -688,8 +743,12 @@ def _arm_agent_session_on_start(state: BridgeState) -> None:
         log.warning("startup agent-session check failed (non-fatal): %s", type(e).__name__)
         doc = None
     if isinstance(doc, dict) and doc.get("revoked") is True:
-        log.info("startup: agent was revoked while the bridge was down — honoring revoke (skill + runtime kept)")
-        _self_logout(state, sess)
+        if _should_honor_revoke(doc, sess):
+            log.info("startup: agent was revoked while the bridge was down — honoring revoke (skill + runtime kept)")
+            _self_logout(state, sess)
+            return
+        log.info("startup: ignoring a stale revoke that predates this sign-in — re-asserting the agent row")
+        _write_agent_session_connected(sess, clear_revoked=True)
         return
     _write_agent_session_connected(sess, clear_revoked=False)
 
@@ -718,8 +777,18 @@ def _heartbeat_once(state: BridgeState) -> None:
         log.debug("heartbeat read transient failure: %s", type(e).__name__)
         return
     if isinstance(doc, dict) and doc.get("revoked") is True:
-        log.info("agent session %s revoked from the app — self-logout (skill + runtime kept)", sid)
-        _self_logout(state, sess)
+        if _should_honor_revoke(doc, sess):
+            log.info("agent session %s revoked from the app — self-logout (skill + runtime kept)", sid)
+            _self_logout(state, sess)
+            return
+        # Stale revoke (predates THIS sign-in): a prior capture's clear_revoked
+        # write may have failed (best-effort). Re-assert the clear rather than
+        # self-logging-out a freshly-captured session (#848) — but only if we're
+        # still the current session (a concurrent /logout/reconnect could have
+        # swapped it out between the GET and here).
+        log.info("heartbeat: ignoring a stale revoke on %s (predates this sign-in) — re-asserting clear", sid)
+        if state.is_current(sess):
+            _write_agent_session_connected(sess, clear_revoked=True)
         return
     # A concurrent /logout or reconnect may have swapped the session out from
     # under us between the GET and here — don't write (would resurrect a just-
