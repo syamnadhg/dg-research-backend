@@ -24283,6 +24283,12 @@ async def _selfheal_shadow_observe(page, intent_id: str, *, outcome_pass) -> Non
         region = intent.get("region") or "document"
         snap = await selfheal.probe_region(page, region)
         ok = bool(outcome_pass)
+        # PX-2 (shadow): what the Tier-1.5 heal WOULD resolve here — the matched
+        # element, its confidence, and the selector it would persist. Pure; acts
+        # on nothing. selector_or_box stays None (PX-0/shadow resolves/clicks
+        # nothing); the candidate lives in heal_* so the report can grade match
+        # quality before activation.
+        heal = selfheal.shadow_heal_decision(snap, intent)
         selfheal.shadow_log({
             "platform": intent.get("platform") or intent_id.split(".", 1)[0],
             "intent": intent_id,
@@ -24290,9 +24296,14 @@ async def _selfheal_shadow_observe(page, intent_id: str, *, outcome_pass) -> Non
             "outcome_pass": ok,
             "would_heal": not ok,       # PX-2 would attempt a heal at this point
             "probe_count": len(snap),
-            "selector_or_box": None,    # PX-0 resolves/acts nothing
+            "selector_or_box": None,    # shadow resolves/acts nothing
             "confidence": None,
             "resolved_by": "shadow",
+            "heal_match_found": heal.get("match_found"),
+            "heal_confidence": heal.get("match_confidence"),
+            "heal_selector": heal.get("inferred_selector"),
+            "heal_reason": heal.get("match_reason"),
+            "ui_fingerprint": heal.get("ui_fingerprint"),
         })
     except Exception as exc:
         # The log() call itself is guarded: this helper's whole contract is that

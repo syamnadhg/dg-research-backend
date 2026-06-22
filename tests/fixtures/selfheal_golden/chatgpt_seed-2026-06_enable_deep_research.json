@@ -7,7 +7,7 @@
   "account_type": "personal",
   "region_locale": "us",
   "outcome_predicate": "cgpt_state:active",
-  "known_good_selector": { "by": "role+name", "value": "menuitemradio|deep research" },
+  "known_good_selector": { "by": "role+text", "value": "menuitemradio|deep research" },
   "a11y_snapshot": [
     {
       "role": "menuitemradio",

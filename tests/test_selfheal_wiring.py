@@ -64,7 +64,8 @@ def _read_shadow():
 
 def test_shadow_observe_writes_a_record_with_outcome_and_probe(monkeypatch):
     monkeypatch.setenv("DG_SELFHEAL_ENABLED", "1")
-    page = FakePage([{"role": "button", "text": "Deep research"}])
+    page = FakePage([{"role": "button", "accessible_name": "deep research", "text": "Deep research",
+                      "attrs": {}, "bounds": {"x": 0, "y": 0, "w": 10, "h": 10}, "visible": True}])
     asyncio.run(research._selfheal_shadow_observe(page, "gemini.enable_deep_research", outcome_pass=True))
     recs = _read_shadow()
     assert len(recs) == 1
@@ -73,6 +74,10 @@ def test_shadow_observe_writes_a_record_with_outcome_and_probe(monkeypatch):
     assert r["outcome_pass"] is True and r["would_heal"] is False
     assert r["tier"] == "builtin" and r["resolved_by"] == "shadow"
     assert r["probe_count"] == 1 and r["selector_or_box"] is None
+    # PX-2 (shadow): the heal decision is logged alongside the predicate outcome.
+    assert r["heal_match_found"] is True
+    assert r["heal_selector"]["by"] == "role+name"  # aria-named DR pill
+    assert isinstance(r["heal_confidence"], (int, float)) and len(r["ui_fingerprint"]) == 12
 
 
 def test_shadow_observe_failing_predicate_flags_would_heal(monkeypatch):

@@ -7,7 +7,7 @@
   "account_type": "personal",
   "region_locale": "us",
   "outcome_predicate": "claude_trigger_verOf:>=floor",
-  "known_good_selector": { "by": "role+name", "value": "button|model-selector-trigger" },
+  "known_good_selector": { "by": "role+text", "value": "button|opus 4.8 max" },
   "a11y_snapshot": [
     {
       "role": "button",

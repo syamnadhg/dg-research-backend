@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -608,6 +609,166 @@ def decide_toggle(
     if opposite_confirmed:
         return "act"
     return "ambiguous"
+
+
+# ── 4.5 Tier-1.5 heal resolver (PX-2) — pure matching, ranks durable signals ──
+def _norm(s: Optional[str]) -> str:
+    """Whitespace-collapse + lowercase for case-insensitive signal matching."""
+    return " ".join((s or "").split()).strip().lower()
+
+
+def ui_fingerprint(snap: list[dict[str, Any]]) -> str:
+    """Stable short hash of a region's DURABLE anchors (sorted
+    ``role|accessible_name|text`` triples of the visible elements).
+
+    Order-independent and blind to volatile bounds / CSS class, so it survives a
+    restyle but changes when the surface's durable structure changes — which is
+    exactly when the registry entry should be re-validated / re-healed. Keys the
+    ``selectors.json`` overlay (``platform|intent_id|ui_fingerprint``).
+    """
+    anchors = sorted(
+        f"{_norm(el.get('role'))}|{_norm(el.get('accessible_name'))}|{_norm(el.get('text'))}"
+        for el in (snap or [])
+        if el.get("visible", True)
+    )
+    return hashlib.sha1("\n".join(anchors).encode("utf-8")).hexdigest()[:12]
+
+
+# Max achievable raw score = name-exact (1.0) + role (0.4) + one value token (0.6).
+# value_contains and value_matches are the SAME "value token" slot (mutually
+# exclusive in scoring, see below), so 2.0 is the true ceiling — used to normalise
+# confidence into [0, 1].
+_MATCH_SCORE_MAX = 2.0
+
+
+def semantic_match(
+    snap: list[dict[str, Any]], signal_hints: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    """Find the element in a ``probe_region`` snapshot that best matches an
+    intent's ``signal_hints``, ranking by FORGERY/ROTATION resistance (§3.2):
+    accessible name + role > visible text > semantic value tokens. CSS class is
+    NEVER scored (the #709 failure). Returns ``{element, confidence, reason}`` or
+    ``None`` if nothing scores.
+
+    Recognised hints (all optional): ``accessible_name`` (matched against the
+    element's aria-label first, then visible text), ``role`` (list of acceptable
+    roles), ``value_contains`` / ``value_matches`` (semantic tokens like ``flash``
+    / ``opus`` for model triggers). NB: ``placeholder`` in a manifest is an
+    OUTCOME-predicate detail (it describes the composer, not the control to act
+    on), so it is intentionally NOT used to LOCATE the element.
+    """
+    name = _norm(signal_hints.get("accessible_name"))
+    roles = [r.lower() for r in (signal_hints.get("role") or [])]
+    vc = _norm(signal_hints.get("value_contains"))
+    vm = _norm(signal_hints.get("value_matches"))
+    best = None
+    for el in snap or []:
+        if not el.get("visible", True):
+            continue
+        an = _norm(el.get("accessible_name"))
+        tx = _norm(el.get("text"))
+        role = _norm(el.get("role"))
+        score = 0.0
+        reasons = []
+        if name:
+            if an and an == name:
+                score += 1.0
+                reasons.append("aria==name")
+            elif an and name in an:
+                score += 0.7
+                reasons.append("aria~name")
+            elif tx and tx == name:
+                score += 0.6
+                reasons.append("text==name")
+            elif tx and name in tx:
+                score += 0.4
+                reasons.append("text~name")
+        if roles and role in roles:
+            score += 0.4
+            reasons.append("role")
+        # value_contains / value_matches are two spellings of the SAME "value
+        # token" signal (e.g. flash / opus) — score at most ONE so a future intent
+        # carrying both can't double-count past the _MATCH_SCORE_MAX ceiling.
+        if vc and (vc in an or vc in tx):
+            score += 0.6
+            reasons.append("value_contains")
+        elif vm and (vm in an or vm in tx):
+            score += 0.6
+            reasons.append("value_matches")
+        if score <= 0:
+            continue
+        b = el.get("bounds") or {}
+        area = (b.get("w", 0) or 0) * (b.get("h", 0) or 0)
+        # Tie-break: higher score, then shorter text (leaf row, not a container),
+        # then smaller area (the control, not its wrapper).
+        key = (score, -len(tx), -area)
+        if best is None or key > best[0]:
+            best = (key, el, score, reasons)
+    if best is None:
+        return None
+    _, el, score, reasons = best
+    return {
+        "element": el,
+        "confidence": round(min(1.0, score / _MATCH_SCORE_MAX), 3),
+        "reason": ",".join(reasons),
+    }
+
+
+def selector_inference(element: dict[str, Any]) -> list[dict[str, str]]:
+    """Map a matched element to a RANKED list of re-resolvable selector strategies,
+    most-durable first, per §3.2 (accessible name + role > visible text > semantic
+    attr > data-testid > **never CSS class**). The first entry is the preferred
+    ``known_good`` strategy; the rest are fallbacks for the validity gate.
+    """
+    role = _norm(element.get("role")) or "*"
+    attrs = element.get("attrs") or {}
+    an = _norm(element.get("accessible_name"))
+    tx = _norm(element.get("text"))
+    haspopup = _norm(attrs.get("haspopup"))
+    placeholder = _norm(attrs.get("placeholder"))
+    testid = (attrs.get("testid") or "").strip()
+    strategies: list[dict[str, str]] = []
+    if an:
+        strategies.append({"by": "role+name", "value": f"{role}|{an}"})
+    if tx:
+        strategies.append({"by": "role+text", "value": f"{role}|{tx}"})
+    if haspopup:
+        strategies.append({"by": "role+haspopup", "value": f"{role}|{haspopup}"})
+    if placeholder:
+        strategies.append({"by": "role+placeholder", "value": f"{role}|{placeholder}"})
+    if testid:
+        strategies.append({"by": "testid", "value": testid})
+    if not strategies:
+        strategies.append({"by": "role", "value": role})
+    return strategies  # CSS class is NEVER emitted (forgery/rotation-prone)
+
+
+def shadow_heal_decision(
+    snap: list[dict[str, Any]], intent: dict[str, Any]
+) -> dict[str, Any]:
+    """PURE: what the Tier-1.5 heal WOULD resolve for ``intent`` given a probe
+    ``snap`` — the matched element, its confidence, the selector it would persist,
+    and the surface fingerprint. Acts on NOTHING (no click, no persist). The
+    shadow layer logs this so we can validate match quality before activating.
+    """
+    out: dict[str, Any] = {
+        "ui_fingerprint": ui_fingerprint(snap),
+        "match_found": False,
+    }
+    m = semantic_match(snap, intent.get("signal_hints") or {})
+    if m:
+        el = m["element"]
+        strategies = selector_inference(el)
+        out.update(
+            match_found=True,
+            match_confidence=m["confidence"],
+            match_reason=m["reason"],
+            match_role=el.get("role"),
+            match_name=el.get("accessible_name") or el.get("text"),
+            inferred_selector=strategies[0] if strategies else None,
+            strategy_rank=strategies,
+        )
+    return out
 
 
 # ── 5. Shadow log ─────────────────────────────────────────────────────────────
