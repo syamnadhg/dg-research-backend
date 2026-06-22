@@ -11,7 +11,9 @@ Refreshed 2026-05-28 against:
   - https://docs.claude.com (Claude model overview + Computer Use docs)
   - https://ai.google.dev (Gemini model release notes + deprecations)
 """
+import json
 import os
+from pathlib import Path
 
 # ── Anthropic Claude ────────────────────────────────────────────────────
 # CUA — Computer Use Agent for browser automation. Sonnet 4.6 is the
@@ -71,3 +73,149 @@ GEMINI_NARRATE = os.environ.get("GEMINI_NARRATE_MODEL", "gemini-3.5-flash")
 # preview as of 2026-05-28); 2.5-pro deprecation is 2026-10-16, giving
 # ample runway to migrate when the next Pro lands.
 GEMINI_NARRATE_FALLBACK = os.environ.get("GEMINI_NARRATE_FALLBACK_MODEL", "gemini-2.5-pro")
+
+
+# ── Phoenix (model_refresh) — P2 deep-research model POLICY ──────────────
+# NB: "Phoenix" here is the model-FRESHNESS slice of PhoenixRecipe.md §6 — a
+# DISTINCT concept from research.py's unrelated daemon restart/resume/
+# checkpoint "Phoenix". All symbols are namespaced `model_refresh` / `p2_*`
+# to avoid grep-confusion with that subsystem.
+#
+# This is the SINGLE SOURCE OF TRUTH for the model + Deep-Research tool +
+# thinking config that the P2 pipeline drives in the live Claude.ai /
+# ChatGPT / Gemini WEB UIs (a separate concern from the API/harness model
+# constants above — those drive SDK calls, this drives what the user gets in
+# deep research). It de-duplicates the model literals that were previously
+# scattered across research.py (the floor `>= 4.8` in ~3 page.evaluate JS
+# sites + the byte-identical CUA directive at two call sites) and prompts.py.
+#
+# Per-platform reality (do not assume symmetry):
+#   • claude  — the runtime ALREADY auto-picks the highest Opus available;
+#               `floor` is the never-downgrade guard, the only frozen value.
+#   • gemini  — runtime picks the highest *Flash* (rejecting Pro/Lite/Deep
+#               Think); `floor` is advisory (the ranker picks highest≥floor).
+#   • chatgpt — NO model picker in P2 (only the Deep-Research toggle); `model`
+#               is None and there is nothing to bump today.
+P2_MODEL_POLICY = {
+    "claude": {
+        "family": "opus", "floor": 4.8, "pick": "highest",
+        "effort": "max", "thinking": True, "tool": "research",
+    },
+    "gemini": {
+        "family": "flash", "floor": 3.5, "pick": "highest",
+        "reject": ["lite", "deep think", "pro"],
+        "thinking": "extended", "tool": "deep research",
+    },
+    "chatgpt": {
+        "model": None, "tool": "deep research",
+    },
+}
+
+
+def _flag_on(name: str, default: str = "0") -> bool:
+    """Codebase DG_* boolean idiom (mirrors vision.py / research.py)."""
+    return (os.environ.get(name, default) or "").strip().lower() not in ("0", "false", "no", "")
+
+
+# Kill-switch: default OFF → the weekly canary AND the runtime overlay are
+# fully dark until armed. With it off, every p2_* accessor returns the code
+# defaults above, so an un-armed install behaves exactly as before Phoenix.
+DG_MODEL_REFRESH_ENABLED = _flag_on("DG_MODEL_REFRESH_ENABLED")
+
+# Runtime overlay (canary-discovered floor/labels + per-platform known_good),
+# written by the weekly canary (Phase D) and loaded OVER the code defaults —
+# but ONLY when the kill-switch is on. Path is env-overridable; reconciled
+# with the repo's data-dir convention when the canary writer lands.
+_MODEL_REFRESH_OVERLAY_PATH = Path(
+    os.environ.get("DG_MODEL_REFRESH_OVERLAY")
+    or (Path.home() / ".super-research" / "model_refresh.json")
+)
+
+
+def _load_model_refresh_overlay() -> dict:
+    """Read the runtime overlay; never raise. Returns {} when the kill-switch
+    is off, the file is absent, or the JSON is corrupt — so the code defaults
+    in P2_MODEL_POLICY are always a safe fallback (a bad/missing overlay can
+    never break model selection)."""
+    if not DG_MODEL_REFRESH_ENABLED:
+        return {}
+    try:
+        with open(_MODEL_REFRESH_OVERLAY_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def p2_floor(platform: str) -> float | None:
+    """The never-downgrade version floor for a platform's P2 model. Returns
+    max(code floor, overlay floor) so the canary can only ever RAISE it (never
+    silently lower it). None for platforms with no model lever (chatgpt)."""
+    pol = P2_MODEL_POLICY.get(platform, {})
+    base = pol.get("floor")
+    ov = _load_model_refresh_overlay().get(platform, {})
+    ov_floor = ov.get("floor")
+    if isinstance(base, (int, float)) and isinstance(ov_floor, (int, float)):
+        return max(base, ov_floor)
+    return ov_floor if isinstance(ov_floor, (int, float)) else base
+
+
+def p2_labels(platform: str) -> dict:
+    """Merged label policy (family / reject-list / effort / thinking / tool),
+    code defaults overlaid by any canary-refreshed values."""
+    merged = dict(P2_MODEL_POLICY.get(platform, {}))
+    merged.update(_load_model_refresh_overlay().get(platform, {}).get("labels", {}))
+    return merged
+
+
+def p2_known_good(platform: str):
+    """The last canary-verified-working model version for a platform (the
+    fallback target when the latest can't be verified). None until the canary
+    records one. Validated-present each canary tick, so it can't outlive a
+    retired model."""
+    return _load_model_refresh_overlay().get(platform, {}).get("known_good")
+
+
+def _fmt_ver(v) -> str:
+    """Render a version float the way the UI/prompts spell it: 4.8 → '4.8',
+    4.0 → '4.0', 5 → '5'. Used so the model literals derive from the floor
+    instead of being hand-typed in multiple places."""
+    if not isinstance(v, (int, float)):
+        return str(v)
+    # round() kills float dust (4.8 - 0.1 == 4.6999…); keep one decimal place
+    # unless the value is a whole number with no fractional part recorded.
+    r = round(float(v), 2)
+    return ("%g" % r)
+
+
+def p2_claude_ver() -> str:
+    """The current Claude floor as a UI string, e.g. '4.8'."""
+    return _fmt_ver(p2_floor("claude"))
+
+
+def p2_claude_prev_ver() -> str:
+    """The minor below the Claude floor, e.g. '4.7' — for the 'never downgrade
+    to X when Y exists' guidance that mirrors today's literal."""
+    f = p2_floor("claude")
+    return _fmt_ver(round(float(f) - 0.1, 2)) if isinstance(f, (int, float)) else ""
+
+
+def p2_claude_major() -> str:
+    """The major component of the Claude floor, e.g. '4' (for 'any Opus 4.x')."""
+    f = p2_floor("claude")
+    return str(int(f)) if isinstance(f, (int, float)) else ""
+
+
+def p2_claude_setup_directive() -> str:
+    """The CUA user-instruction that drives Claude's P2 setup (model + effort +
+    thinking + Research tool). Single source replacing the byte-identical
+    literal previously duplicated at two research.py call sites. Derives the
+    version numbers from the policy floor so a floor bump updates one place."""
+    fam = P2_MODEL_POLICY["claude"]["family"].capitalize()  # "Opus"
+    cur, prev = p2_claude_ver(), p2_claude_prev_ver()
+    return (
+        f"Select {fam} {cur} + Max effort + Adaptive Thinking + Research tool "
+        f"(if {fam} {cur} isn't offered, pick the highest {fam} available — never "
+        f"downgrade to {prev} when {cur} exists). Do NOT type — just set up and "
+        f"focus input. Say 'ready for paste'."
+    )
