@@ -9451,6 +9451,17 @@ async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = Fals
     pname = platform.lower()
     if pname not in _PRO_TIER_PLATFORMS:
         return "unsure"  # No prompt for this platform — caller should not have called us
+    # ChatGPT: skip the cheap "light" (Sonnet) pre-check and read tier directly
+    # on the heavy (Opus) model. The light model reliably PREAMBLES ("Looking at
+    # the screenshot, I…") and the 8-token cap chops it off before the required
+    # one-word verdict, so for ChatGPT the light pass is always 'unsure' and
+    # always escalates to heavy anyway — wasting a Sonnet call + a 2s settle and
+    # logging a noisy "light verdict unsure … escalating" line every time. Going
+    # straight to heavy is cheaper (no wasted light call), faster, and quiet.
+    # Claude/Gemini keep the light fast-path (their badges read cleanly on the
+    # cheap model, so light usually gives a clean verdict — see triage evidence).
+    if pname == "chatgpt":
+        heavy = True
     try:
         from prompts import (
             PROMPT_DETECT_CHATGPT_PRO,

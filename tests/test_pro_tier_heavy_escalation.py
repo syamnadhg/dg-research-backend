@@ -64,16 +64,20 @@ class _FakePage:
         return dict(self._dom_tier)
 
 
-def _run(verdicts, heavy=False, dom_tier=None):
+def _run(verdicts, heavy=False, dom_tier=None, platform="chatgpt"):
     page = _FakePage(dom_tier)
     client = _FakeClient(verdicts)
-    result = asyncio.run(research._cua_pro_tier_call(page, "chatgpt", client, heavy=heavy))
+    result = asyncio.run(research._cua_pro_tier_call(page, platform, client, heavy=heavy))
     return result, client.messages.calls, page.shots
 
 
+# The light→heavy escalation mechanism applies to Claude/Gemini (their badges
+# read cleanly on the cheap model, so the light fast-path is worth keeping).
+# ChatGPT deliberately SKIPS the light pass (see test_chatgpt_skips_light below),
+# so these mechanism tests use "claude".
 def test_unsure_light_escalates_to_heavy_and_resolves():
     # Light says junk (unsure) → heavy says pro → final 'pro', two calls.
-    result, calls, shots = _run(["maybe?", "pro"])
+    result, calls, shots = _run(["maybe?", "pro"], platform="claude")
     assert result == "pro"
     assert len(calls) == 2
     assert calls[0]["model"] == research.VISION_LIGHT_MODEL
@@ -82,10 +86,21 @@ def test_unsure_light_escalates_to_heavy_and_resolves():
 
 
 def test_clear_pro_does_not_escalate():
-    result, calls, shots = _run(["pro and clearly so"])
+    result, calls, shots = _run(["pro and clearly so"], platform="claude")
     assert result == "pro"
     assert len(calls) == 1
     assert calls[0]["model"] == research.VISION_LIGHT_MODEL
+    assert shots == 1
+
+
+def test_chatgpt_skips_light_and_reads_on_heavy_directly():
+    # ChatGPT skips the cheap light pre-check (Sonnet reliably preambles →
+    # always 'unsure' → always escalates) and reads tier directly on the heavy
+    # (Opus) model: ONE call, no escalation, no wasted Sonnet pass.
+    result, calls, shots = _run(["pro"], platform="chatgpt")
+    assert result == "pro"
+    assert len(calls) == 1
+    assert calls[0]["model"] == research.VISION_HEAVY_MODEL  # Opus directly, not Sonnet
     assert shots == 1
 
 
@@ -122,7 +137,7 @@ def test_heavy_unsure_does_not_recurse():
 
 def test_unsure_both_passes_returns_unsure():
     # Light unsure → heavy also unsure → fail-open 'unsure', two calls.
-    result, calls, _ = _run(["???", "still not sure"])
+    result, calls, _ = _run(["???", "still not sure"], platform="claude")
     assert result == "unsure"
     assert len(calls) == 2
     assert calls[1]["model"] == research.VISION_HEAVY_MODEL
