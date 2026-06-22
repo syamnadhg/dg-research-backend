@@ -66,6 +66,39 @@ def test_summarize_dod_flags_complete_corpus():
     assert dod["heal_shadowed_per_platform"]
 
 
+def test_summarize_tracks_resolver_match_quality():
+    # shadow records carry the heal DECISION (heal_match_found)
+    records = [
+        {"platform": "gemini", "intent": "gemini.enable_deep_research", "resolved_by": "shadow",
+         "outcome_pass": False, "would_heal": True, "probe_count": 4, "heal_match_found": True},
+        {"platform": "gemini", "intent": "gemini.enable_deep_research", "resolved_by": "shadow",
+         "outcome_pass": False, "would_heal": True, "probe_count": 4, "heal_match_found": False},
+    ]
+    g = report.summarize(records)["per_intent"]["gemini.enable_deep_research"]
+    assert g["resolver_seen"] == 2 and g["resolver_matched"] == 1
+
+
+def test_summarize_tracks_activation_results():
+    # heal records (resolved_by="heal") carry the ACTIVATION outcome
+    records = [
+        {"platform": "gemini", "intent": "gemini.enable_deep_research", "resolved_by": "heal",
+         "acted": True, "outcome_pass": True},
+        {"platform": "gemini", "intent": "gemini.enable_deep_research", "resolved_by": "heal",
+         "acted": True, "outcome_pass": False},
+    ]
+    g = report.summarize(records)["per_intent"]["gemini.enable_deep_research"]
+    assert g["heal_attempts"] == 2 and g["heal_acted"] == 2 and g["heal_ok"] == 1
+
+
+def test_format_report_shows_px2_section_only_when_heal_data_present():
+    plain = report.format_report(report.summarize([_rec("gemini.enable_deep_research", "gemini", True)]))
+    assert "PX-2 heal resolver" not in plain  # no heal/resolver telemetry → section omitted
+    withheal = report.format_report(report.summarize([
+        {"platform": "gemini", "intent": "gemini.enable_deep_research", "resolved_by": "heal",
+         "acted": True, "outcome_pass": True}]))
+    assert "PX-2 heal resolver / activation:" in withheal
+
+
 def test_summarize_dod_incomplete_when_missing_platform():
     records = [_rec("gemini.enable_deep_research", "gemini", False)]
     dod = report.summarize(records)["dod"]

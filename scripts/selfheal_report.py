@@ -70,7 +70,9 @@ def load_records(paths: list[str]) -> list[dict]:
 def summarize(records: list[dict]) -> dict:
     """Aggregate records into a pure, testable summary structure."""
     per_intent: dict[str, dict] = defaultdict(
-        lambda: {"total": 0, "pass": 0, "would_heal": 0, "probe_sum": 0, "probe_max": 0}
+        lambda: {"total": 0, "pass": 0, "would_heal": 0, "probe_sum": 0, "probe_max": 0,
+                 "resolver_seen": 0, "resolver_matched": 0,
+                 "heal_attempts": 0, "heal_acted": 0, "heal_ok": 0}
     )
     platforms_seen: set[str] = set()
     for rec in records:
@@ -85,6 +87,19 @@ def summarize(records: list[dict]) -> dict:
         if isinstance(pc, int):
             s["probe_sum"] += pc
             s["probe_max"] = max(s["probe_max"], pc)
+        # PX-2 telemetry. Shadow records (resolved_by="shadow") carry the heal
+        # DECISION (did the resolver find a candidate?); heal records
+        # (resolved_by="heal") carry the ACTIVATION outcome (acted/healed).
+        if "heal_match_found" in rec:
+            s["resolver_seen"] += 1
+            if rec.get("heal_match_found") is True:
+                s["resolver_matched"] += 1
+        if rec.get("resolved_by") == "heal":
+            s["heal_attempts"] += 1
+            if rec.get("acted") is True:
+                s["heal_acted"] += 1
+            if rec.get("outcome_pass") is True:
+                s["heal_ok"] += 1
         plat = rec.get("platform")
         if plat:
             platforms_seen.add(plat)
@@ -140,6 +155,17 @@ def format_report(summary: dict) -> str:
     lines.append(f"  [{'x' if dod['all_three_platforms'] else ' '}] probe deployed on all 3 platforms")
     heals = ", ".join(f"{p}:{summary['heals_by_platform'][p]}" for p in PLATFORMS)
     lines.append(f"  [{'x' if dod['heal_shadowed_per_platform'] else ' '}] >=1 heal shadowed per platform ({heals})")
+    # PX-2 — resolver match quality (shadow) + activation results (heal records).
+    rows = [(i, s) for i in INTENTS if (s := summary["per_intent"].get(i))
+            and (s["resolver_seen"] or s["heal_attempts"])]
+    if rows:
+        lines.append("")
+        lines.append("PX-2 heal resolver / activation:")
+        lines.append(f"{'intent':<34}{'rslv':>6}{'match':>7}{'acts':>6}{'ok':>5}")
+        lines.append("-" * 58)
+        for intent, s in rows:
+            mr = f"{(100.0 * s['resolver_matched'] / s['resolver_seen']):.0f}%" if s["resolver_seen"] else "-"
+            lines.append(f"{intent:<34}{s['resolver_seen']:>6}{mr:>7}{s['heal_acted']:>6}{s['heal_ok']:>5}")
     lines.append("=" * 68)
     return "\n".join(lines)
 
