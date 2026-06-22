@@ -1,0 +1,32 @@
+{
+  "platform": "chatgpt",
+  "intent_id": "enable_deep_research",
+  "ui_fingerprint": "seed-2026-06",
+  "region": "menu",
+  "captured_ts": null,
+  "account_type": "personal",
+  "region_locale": "us",
+  "outcome_predicate": "cgpt_state:active",
+  "known_good_selector": { "by": "role+name", "value": "menuitemradio|deep research" },
+  "a11y_snapshot": [
+    {
+      "role": "menuitemradio",
+      "accessible_name": "",
+      "text": "Deep research",
+      "attrs": { "testid": "", "haspopup": "", "pressed": "", "checked": "false", "selected": "", "state": "", "placeholder": "", "cls": "" },
+      "bounds": { "x": 80, "y": 420, "w": 260, "h": 40 },
+      "visible": true
+    },
+    {
+      "role": "menuitemradio",
+      "accessible_name": "",
+      "text": "Web search",
+      "attrs": { "testid": "", "haspopup": "", "pressed": "", "checked": "false", "selected": "", "state": "", "placeholder": "", "cls": "" },
+      "bounds": { "x": 80, "y": 380, "w": 260, "h": 40 },
+      "visible": true
+    }
+  ],
+  "raw_html": null,
+  "screenshot": null,
+  "source": "synthetic seed from #709 ChatGPT Step-2 menu dump (role=menuitemradio, exact text 'Deep research', empty aria-label + empty data-testid — role+text is the only durable signal)"
+}

@@ -1,0 +1,32 @@
+{
+  "platform": "claude",
+  "intent_id": "select_model",
+  "ui_fingerprint": "seed-2026-06",
+  "region": "composer",
+  "captured_ts": null,
+  "account_type": "personal",
+  "region_locale": "us",
+  "outcome_predicate": "claude_trigger_verOf:>=floor",
+  "known_good_selector": { "by": "role+name", "value": "button|model-selector-trigger" },
+  "a11y_snapshot": [
+    {
+      "role": "button",
+      "accessible_name": "",
+      "text": "Opus 4.8 Max",
+      "attrs": { "testid": "", "haspopup": "menu", "pressed": "", "checked": "", "selected": "", "state": "", "placeholder": "", "cls": "" },
+      "bounds": { "x": 96, "y": 700, "w": 150, "h": 32 },
+      "visible": true
+    },
+    {
+      "role": "button",
+      "accessible_name": "research",
+      "text": "Research",
+      "attrs": { "testid": "", "haspopup": "", "pressed": "true", "checked": "", "selected": "", "state": "on", "placeholder": "", "cls": "active" },
+      "bounds": { "x": 256, "y": 700, "w": 110, "h": 32 },
+      "visible": true
+    }
+  ],
+  "raw_html": null,
+  "screenshot": null,
+  "source": "synthetic seed from #708 Claude Step-3A composer dump (model trigger reads 'Opus N.N Max' outside any popover; verOf>=floor parses the highest Opus on a trigger button)"
+}

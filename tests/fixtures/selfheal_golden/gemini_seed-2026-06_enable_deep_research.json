@@ -1,0 +1,32 @@
+{
+  "platform": "gemini",
+  "intent_id": "enable_deep_research",
+  "ui_fingerprint": "seed-2026-06",
+  "region": "composer",
+  "captured_ts": null,
+  "account_type": "personal",
+  "region_locale": "us",
+  "outcome_predicate": "gemini_dr_state:placeholderResearch||pressed",
+  "known_good_selector": { "by": "role+name", "value": "button|deep research" },
+  "a11y_snapshot": [
+    {
+      "role": "button",
+      "accessible_name": "deep research",
+      "text": "Deep research",
+      "attrs": { "testid": "", "haspopup": "", "pressed": "", "checked": "", "selected": "", "state": "", "placeholder": "", "cls": "mdc-button mat-mdc-button-base mat-tonal-button" },
+      "bounds": { "x": 240, "y": 612, "w": 132, "h": 36 },
+      "visible": true
+    },
+    {
+      "role": "textbox",
+      "accessible_name": "",
+      "text": "",
+      "attrs": { "testid": "", "haspopup": "", "pressed": "", "checked": "", "selected": "", "state": "", "placeholder": "what do you want to research?", "cls": "" },
+      "bounds": { "x": 120, "y": 560, "w": 720, "h": 44 },
+      "visible": true
+    }
+  ],
+  "raw_html": null,
+  "screenshot": null,
+  "source": "synthetic seed from #709 _GEMINI_DR_STATE_JS dump shape (pill class carries no pressed marker; placeholder is the authoritative signal)"
+}
