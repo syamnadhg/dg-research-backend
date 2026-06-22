@@ -79,6 +79,16 @@ def is_enabled() -> bool:
     return _flag_on("DG_SELFHEAL_ENABLED")
 
 
+def act_enabled() -> bool:
+    """Activation sub-switch — ``DG_SELFHEAL_ACT`` (default OFF), AND-ed with the
+    master switch. The engine ACTS (clicks + persists a heal) only when BOTH are
+    on; with just ``DG_SELFHEAL_ENABLED`` it runs shadow-only (observe + log what
+    it WOULD heal). This is the recipe's shadow-first rollout: prove match quality
+    in the shadow log, then flip ``DG_SELFHEAL_ACT`` after a clean window.
+    """
+    return is_enabled() and _flag_on("DG_SELFHEAL_ACT")
+
+
 # ── Paths (resolved live so env overrides + test isolation just work) ─────────
 def _state_dir() -> Path:
     """Persistent state dir — ``~/.super-research`` (matches model_refresh.json
@@ -769,6 +779,210 @@ def shadow_heal_decision(
             strategy_rank=strategies,
         )
     return out
+
+
+# ── 4.6 Tier-1.5 heal ACTIVATION (PX-2 C5) — resolve → guard → act → verify → persist
+# Re-resolves a persisted/inferred strategy to a live element and (optionally)
+# clicks it. READ-ONLY unless doClick. Anti-ambiguity: if a strategy resolves to
+# more than one visible element it REFUSES to click (a wrong click can't be undone
+# safely — escalate instead). Mirrors the probe's visibility rule.
+_RESOLVE_CLICK_JS = """(params) => {
+    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    let root = document.body;
+    if (params.scopeSel) {
+        const a = document.querySelector(params.scopeSel);
+        if (a) {
+            let s = a;
+            for (let i = 0; i < (params.scopeClimb || 0) && s && s.parentElement; i++) s = s.parentElement;
+            root = s || document.body;
+        }
+    }
+    const by = params.by, value = params.value || '';
+    const sep = value.indexOf('|');
+    const vRole = sep >= 0 ? value.slice(0, sep) : '';
+    const vRest = sep >= 0 ? value.slice(sep + 1) : value;
+    const vis = el => el.getClientRects().length > 0 || !!el.offsetParent;
+    const roleOf = el => (el.getAttribute('role') || el.tagName).toLowerCase();
+    const cands = [...root.querySelectorAll(
+        'button, [role="button"], [role="menuitem"], [role="menuitemradio"], [role="option"], a, li, [role="switch"], [role="checkbox"]'
+    )].filter(vis);
+    const match = el => {
+        const role = roleOf(el);
+        if (by === 'testid') return (el.getAttribute('data-testid') || '') === value;
+        if (vRole && role !== vRole) return false;
+        if (by === 'role+name') return norm(el.getAttribute('aria-label')) === vRest;
+        if (by === 'role+text') return norm(el.textContent) === vRest;
+        if (by === 'role+haspopup') return norm(el.getAttribute('aria-haspopup')) === vRest;
+        if (by === 'role+placeholder') return norm(el.getAttribute('data-placeholder') || el.getAttribute('placeholder')) === vRest;
+        if (by === 'role') return role === vRest;
+        return false;
+    };
+    const hits = cands.filter(match);
+    if (!hits.length) return { matched: 0, clicked: false };
+    if (hits.length > 1) return { matched: hits.length, clicked: false, ambiguous: true };
+    const el = hits[0];
+    let clicked = false;
+    if (params.doClick) { try { el.click(); clicked = true; } catch (e) {} }
+    return { matched: 1, clicked, role: roleOf(el), text: (el.textContent || '').trim().slice(0, 40) };
+}"""
+
+# Registry health thresholds (§7): evict a selector after this many CONSECUTIVE
+# failed heals (a poisoned/stale strategy must not linger).
+_SELECTOR_EVICT_FAILS = 3
+
+
+async def resolve_and_click(page: Any, region: Any, strategy: dict[str, str], *, do_click: bool) -> dict[str, Any]:
+    """Re-resolve ``strategy`` within ``region`` and (if ``do_click``) click the
+    sole matching visible element. ``do_click=False`` is the read-only validity
+    probe (does this persisted selector still resolve?). Never raises — returns
+    ``{}`` on any failure. Refuses to click an ambiguous (>1) match.
+    """
+    spec = REGIONS.get(region) if isinstance(region, str) else (region or {})
+    params = {
+        "scopeSel": (spec or {}).get("scopeSel", ""),
+        "scopeClimb": int((spec or {}).get("scopeClimb", 0)),
+        "by": strategy.get("by"),
+        "value": strategy.get("value", ""),
+        "doClick": bool(do_click),
+    }
+    try:
+        res = await page.evaluate(_RESOLVE_CLICK_JS, params)
+    except Exception as exc:
+        logger.debug("resolve_and_click(%s) failed: %s", strategy, exc)
+        return {}
+    return res if isinstance(res, dict) else {}
+
+
+def _registry_key(intent_key: str, fingerprint: str) -> str:
+    """``platform.intent_id`` + fingerprint → the ``platform|intent_id|fp`` overlay
+    key (the schema _valid_selector_entry enforces: exactly two pipes)."""
+    return f"{intent_key.replace('.', '|', 1)}|{fingerprint}"
+
+
+def record_heal(intent_key: str, fingerprint: str, strategy_rank: list[dict[str, str]], *, success: bool) -> dict[str, Any]:
+    """Upsert the selector overlay entry under the cross-process lock and update
+    its health. On success: bump success_count, reset the consecutive-fail run,
+    refresh the working strategy. On failure: bump fail_count + consecutive_fails,
+    and EVICT once ``_SELECTOR_EVICT_FAILS`` consecutive fails are reached (the
+    eviction is audited by persist_selectors). Returns the persisted overlay.
+    """
+    key = _registry_key(intent_key, fingerprint)
+
+    def _mut(cur: dict[str, Any]) -> dict[str, Any]:
+        e = cur.get(key) or {
+            "strategy_rank": strategy_rank,
+            "success_count": 0,
+            "fail_count": 0,
+            "consecutive_fails": 0,
+        }
+        if success:
+            e["success_count"] = e.get("success_count", 0) + 1
+            e["consecutive_fails"] = 0
+            e["strategy_rank"] = strategy_rank  # the verified-working strategy
+        else:
+            e["fail_count"] = e.get("fail_count", 0) + 1
+            e["consecutive_fails"] = e.get("consecutive_fails", 0) + 1
+        tot = e["success_count"] + e["fail_count"]
+        e["confidence"] = round(e["success_count"] / tot, 3) if tot else 0.0
+        e["last_used"] = datetime.now(timezone.utc).isoformat()
+        if e.get("consecutive_fails", 0) >= _SELECTOR_EVICT_FAILS:
+            cur.pop(key, None)  # poisoned → evict (audited)
+        else:
+            cur[key] = e
+        return cur
+
+    return persist_selectors(_mut)
+
+
+async def heal_once(
+    page: Any,
+    intent: dict[str, Any],
+    *,
+    check_active: Callable[[], Any],
+    confirmed_off: bool,
+    do_act: bool,
+) -> dict[str, Any]:
+    """One bounded Tier-1.5 heal attempt for ``intent`` (PhoenixRecipe §5). Never
+    raises — returns a result dict.
+
+    Sequence: probe → fingerprint → Tier-0 registry hit (validity-gated: the
+    persisted strategy must still RESOLVE, else evict + fall through) → else
+    Tier-1.5 ``semantic_match`` → MANDATORY pre-act toggle guard (``decide_toggle``
+    on the live predicate; an ambiguous read NEVER clicks — the #709 firewall) →
+    act (only if ``do_act``) → VERIFY-BEFORE-TRUST (re-eval the real predicate) →
+    persist the working strategy on pass / record a fail otherwise.
+
+    Args:
+        check_active: async/sync callable -> bool, the REAL outcome predicate.
+        confirmed_off: the platform's POSITIVE off-signal (not mere "predicate
+            false") — gates the click so a false-negative predicate can't toggle a
+            live control OFF.
+        do_act: actually click + persist (False = full dry-run for the shadow log).
+    """
+    key = f"{intent.get('platform')}.{intent.get('intent_id')}"
+    region = intent.get("region") or "document"
+    result: dict[str, Any] = {"intent": key, "tier": None, "acted": False, "healed": False, "reason": ""}
+    try:
+        snap = await probe_region(page, region)
+        fp = ui_fingerprint(snap)
+        result["fingerprint"] = fp
+        strategy_rank: Optional[list[dict[str, str]]] = None
+        tier = None
+        # Tier 0 — persisted selector for this fingerprint, validity-gated.
+        entry = load_selectors().get(_registry_key(key, fp))
+        if entry and entry.get("strategy_rank"):
+            probe = await resolve_and_click(page, region, entry["strategy_rank"][0], do_click=False)
+            if probe.get("matched"):
+                strategy_rank = entry["strategy_rank"]
+                tier = "registry"
+            elif do_act:
+                record_heal(key, fp, entry["strategy_rank"], success=False)  # stale → demote/evict
+        # Tier 1.5 — heuristic match.
+        if strategy_rank is None:
+            m = semantic_match(snap, intent.get("signal_hints") or {})
+            if not m:
+                result["reason"] = "no_candidate"
+                return result
+            strategy_rank = selector_inference(m["element"])
+            tier = "heal"
+        result["tier"] = tier
+        result["strategy"] = strategy_rank[0]
+        # MANDATORY pre-act toggle guard (#709) — only act from a confirmed-opposite
+        # state; never click on an ambiguous read.
+        if intent.get("type") == "toggle":
+            already = check_active()
+            if hasattr(already, "__await__"):
+                already = await already
+            decision = decide_toggle(bool(already), bool(confirmed_off))
+            if decision == "skip":
+                result["healed"] = True
+                result["reason"] = "already_active"
+                return result
+            if decision == "ambiguous":
+                result["reason"] = "ambiguous_no_act"
+                return result
+        if not do_act:
+            result["reason"] = "shadow_no_act"
+            return result
+        # ACT.
+        click = await resolve_and_click(page, region, strategy_rank[0], do_click=True)
+        result["acted"] = bool(click.get("clicked"))
+        if not click.get("clicked"):
+            result["reason"] = "ambiguous_match" if click.get("ambiguous") else "click_failed"
+            record_heal(key, fp, strategy_rank, success=False)
+            return result
+        # VERIFY-BEFORE-TRUST — re-eval the real predicate; persist only on pass.
+        ok = check_active()
+        if hasattr(ok, "__await__"):
+            ok = await ok
+        result["healed"] = bool(ok)
+        result["reason"] = "verified" if ok else "act_did_not_satisfy_predicate"
+        record_heal(key, fp, strategy_rank, success=bool(ok))
+        return result
+    except Exception as exc:
+        logger.debug("heal_once(%s) failed: %s", key, exc)
+        result["reason"] = f"error:{exc}"
+        return result
 
 
 # ── 5. Shadow log ─────────────────────────────────────────────────────────────

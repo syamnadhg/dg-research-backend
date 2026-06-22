@@ -188,3 +188,26 @@ def test_helper_degrades_when_module_missing():
     # _selfheal_shadow_observe must tolerate selfheal is None (guarded import).
     src = inspect.getsource(research._selfheal_shadow_observe)
     assert "if selfheal is None:" in src and "return" in src
+
+
+# ── PX-2 activation wiring (default OFF) ────────────────────────────────────────
+def test_selfheal_try_exists_and_is_isolated():
+    src = inspect.getsource(research._selfheal_try)
+    assert "if selfheal is None:" in src           # tolerates guarded import
+    assert "heal_once(" in src                       # delegates to the engine
+    assert "do_act=True" in src                      # the caller is the act path
+
+
+def test_act_heal_is_double_gated_and_gemini_only():
+    src = inspect.getsource(research.ensure_deep_mode_active)
+    # the active heal is wired exactly once, for gemini, behind act_enabled()
+    assert src.count("_selfheal_try(") == 1, "exactly one ACT-heal call expected (gemini-only)"
+    call = '_selfheal_try(page, "gemini.enable_deep_research"'
+    assert call in src
+    idx = src.index(call)
+    window = src[max(0, idx - 500):idx]
+    assert "selfheal.act_enabled()" in window, "ACT heal must be behind DG_SELFHEAL_ACT"
+    assert "not active" in window, "ACT heal must run only after the built-in heuristic failed"
+    # chatgpt/claude enable_DR + select_model are NOT wired for ACTING yet
+    assert '_selfheal_try(page, "chatgpt' not in src
+    assert '_selfheal_try(page, "claude' not in src

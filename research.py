@@ -24316,6 +24316,52 @@ async def _selfheal_shadow_observe(page, intent_id: str, *, outcome_pass) -> Non
             pass
 
 
+async def _selfheal_try(page, intent_id: str, *, check_active, confirmed_off) -> bool:
+    """Phoenix self-heal SELECTOR engine (PX-2 ACTIVATION) — attempt ONE bounded
+    Tier-1.5 selector heal after the built-in DOM heuristic FAILED its predicate,
+    before escalating to CUA/Decision-alert.
+
+    DOUBLE-GATED: callers invoke this only behind ``selfheal.act_enabled()``
+    (``DG_SELFHEAL_ACT`` AND ``DG_SELFHEAL_ENABLED``, both default OFF), so the
+    live pipeline is unchanged until BOTH are flipped after a clean shadow window.
+    Returns True iff the heal verified the intent active (re-ran the real
+    predicate). Fully isolated — never raises into the verify path.
+
+    ``check_active`` is the platform's REAL outcome predicate (async/sync -> bool);
+    ``confirmed_off`` is its POSITIVE off-signal (gates the click per #709, so a
+    false-negative predicate can't toggle a live control OFF).
+    """
+    if selfheal is None:
+        return False
+    try:
+        intent = selfheal.load_intents().get(intent_id) or {}
+        if not intent:
+            return False
+        res = await selfheal.heal_once(
+            page, intent, check_active=check_active, confirmed_off=confirmed_off, do_act=True
+        )
+        try:
+            log(f"[selfheal] heal {intent_id}: tier={res.get('tier')} acted={res.get('acted')} "
+                f"healed={res.get('healed')} reason={res.get('reason')}", "INFO")
+            selfheal.shadow_log({
+                "platform": intent.get("platform"), "intent": intent_id,
+                "tier": res.get("tier"), "outcome_pass": res.get("healed"),
+                "would_heal": False, "acted": res.get("acted"),
+                "selector_or_box": res.get("strategy"), "confidence": None,
+                "resolved_by": "heal", "reason": res.get("reason"),
+                "ui_fingerprint": res.get("fingerprint"),
+            })
+        except Exception:
+            pass
+        return bool(res.get("healed"))
+    except Exception as exc:
+        try:
+            log(f"[selfheal] heal {intent_id} skipped: {exc}", "INFO")
+        except Exception:
+            pass
+        return False
+
+
 # Phoenix (model_refresh) — Gemini "pick highest Flash" ranker. Mirrors
 # models.pick_highest_model (Python, unit-tested + reused by the canary): among
 # visible dropdown rows, reject Flash-Lite/Pro/Deep-Think FIRST, parse the Flash
@@ -25872,6 +25918,24 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                 active = bool(st.get("placeholderResearch") or st.get("pressed"))
                 log(f"[{label}] Gemini DR post-re-activate: active={active} "
                     f"placeholder={st.get('placeholder')!r}", "INFO")
+                # PX-2 selector heal (DOUBLE-GATED, default OFF): the built-in
+                # re-activation still left DR off → one bounded Tier-1.5 heal
+                # before the run proceeds in chat mode. Gated on the #709 POSITIVE
+                # off-signal (composer placeholder explicitly "Ask Gemini"), so the
+                # heal can only ever turn a confirmed-off pill ON, never toggle an
+                # active one off. Only Gemini is wired for ACTING today (its
+                # placeholder gives a clean off-signal + the pill is a single-click
+                # composer control); the other intents stay shadow-only.
+                if not active and selfheal and selfheal.act_enabled():
+                    async def _gem_dr_active():
+                        s = await page.evaluate(_GEMINI_DR_STATE_JS)
+                        return bool(s.get("placeholderResearch") or s.get("pressed"))
+                    _off = bool(st.get("placeholderChat") and not st.get("placeholderResearch")
+                                and not st.get("pressed"))
+                    if await _selfheal_try(page, "gemini.enable_deep_research",
+                                           check_active=_gem_dr_active, confirmed_off=_off):
+                        active = True
+                        log(f"[{label}] Gemini DR recovered by selfheal", "INFO")
             if selfheal and selfheal.is_enabled():
                 await _selfheal_shadow_observe(page, "gemini.enable_deep_research",
                                                outcome_pass=active)
