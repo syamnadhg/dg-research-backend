@@ -73,6 +73,7 @@ from models import (
     GEMINI_NARRATE,
     p2_floor,
     p2_known_good,
+    p2_labels,
     p2_claude_ver,
     p2_claude_setup_directive,
 )
@@ -24218,6 +24219,15 @@ async def setup_chatgpt_dr(page) -> bool:
         return False
 
 
+# Phoenix (model_refresh) — last-observed advisory thinking/effort confirmation
+# per platform, written by setup_*_dr and read by the caller to surface a soft
+# notice when the policy's thinking config (Claude max-effort + thinking toggle,
+# Gemini extended thinking) couldn't be applied. ADVISORY ONLY — never gates a
+# run (user decision #4 = verify + soft-escalate, not hard-gate). Process-local
+# (each worker is its own process); last write wins = the final setup state.
+_P2_THINKING_STATE: dict = {}
+
+
 # Phoenix (model_refresh) — Gemini "pick highest Flash" ranker. Mirrors
 # models.pick_highest_model (Python, unit-tested + reused by the canary): among
 # visible dropdown rows, reject Flash-Lite/Pro/Deep-Think FIRST, parse the Flash
@@ -24388,6 +24398,7 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
             }
             return false;
         }"""
+        _gem_ext_confirmed = False  # Phoenix: advisory extended-thinking confirmation
         tl_opened = await page.evaluate(_click_tl_js)
         if not tl_opened:
             await page.evaluate(_reopen_js)
@@ -24411,6 +24422,7 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
             }""")
             await asyncio.sleep(0.5)
             if ext_picked:
+                _gem_ext_confirmed = True
                 log(f"[setup_gemini_dr] model-pick: Thinking level -> Extended ('{ext_picked}')")
             else:
                 log("[setup_gemini_dr] model-pick: 'Extended' option not found — leaving default thinking level", "WARN")
@@ -24426,9 +24438,13 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
                 return b ? ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).toLowerCase() : '';
             }""")
             if 'extended' in (_mode_txt or ''):
+                _gem_ext_confirmed = True
                 log("[setup_gemini_dr] model-pick verify: mode button shows Extended")
         except Exception:
             pass
+        # Phoenix model_refresh — record advisory extended-thinking state for the
+        # caller's soft notice (never gates _gemini_select_flash_model's return).
+        _P2_THINKING_STATE["gemini"] = {"thinking": _gem_ext_confirmed}
         try:
             await page.keyboard.press("Escape")
         except Exception:
@@ -24949,6 +24965,12 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
         if pin_model is not None:
             log(f"[setup_claude_dr] pin: forcing re-pick to Opus {pin_model} (known-good fallback)")
         opus_selected = None
+        # Phoenix model_refresh — advisory thinking/effort confirmation (never
+        # gates; the caller surfaces a soft amber notice if a policy-required
+        # knob couldn't be set). Initialized here because _think/_eff_set are
+        # bound only on the popover-opened path (avoids an unset-local read).
+        _effort_confirmed = False
+        _thinking_confirmed = False
         if model_ok:
             # Model already correct — record it but DO NOT re-pick (the #744
             # re-click loop). We still open the popover below for Effort/Thinking.
@@ -25099,6 +25121,7 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                     if not _think.get("found"):
                         log("[setup_claude_dr] Step 1D WARN: 'Thinking' toggle not found in Effort submenu — UI moved/relabelled it", "WARN")
                     else:
+                        _thinking_confirmed = True  # found ⇒ ON (just-toggled or already-on)
                         log(f"[setup_claude_dr] Step 1D OK: Thinking {'just enabled' if _think.get('toggled') else 'already on'}")
                     await asyncio.sleep(0.3)
                     # ── Step 1C': set Effort = Max (state-aware) ──
@@ -25117,6 +25140,7 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                         return already ? 'max (already)' : 'max';
                     }""")
                     if _eff_set:
+                        _effort_confirmed = True
                         log(f"[setup_claude_dr] Step 1C OK: Effort '{_eff_set}'")
                     else:
                         log("[setup_claude_dr] Step 1C WARN: 'Max' effort not found in submenu — CUA validate will fix", "WARN")
@@ -25332,6 +25356,10 @@ async def setup_claude_dr(page, pin_model=None) -> bool:
                     break
             except Exception:
                 continue
+        # Phoenix model_refresh — record the advisory thinking/effort state for
+        # the caller's soft notice (NOT part of the success contract — model +
+        # research remain the only hard gates).
+        _P2_THINKING_STATE["claude"] = {"effort": _effort_confirmed, "thinking": _thinking_confirmed}
         # Success only when all three critical knobs are in place
         return bool(opus_selected) and bool(research_enabled)
     except Exception as e:
@@ -26678,6 +26706,31 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                         "The latest model couldn't be verified into Deep Research, so the "
                         f"agent fell back to a known-good model (v{_kg}). The run continues normally.")
                     log(f"[{label}] Phoenix: known-good fallback verified — proceeding on v{_kg}")
+
+        # ── Phoenix model_refresh — advisory thinking-config notice ──────────
+        # When we're proceeding in RESEARCH mode but a policy-required thinking
+        # knob (Claude max-effort + thinking toggle, Gemini extended thinking)
+        # couldn't be confirmed at setup, surface a SOFT amber notice (user
+        # decision #4 = verify + soft-escalate). Never blocks — the run still
+        # has the latest model + Deep Research; only the thinking level may have
+        # fallen back to default.
+        if research_ok and platform_l in ("claude", "gemini"):
+            _tstate = _P2_THINKING_STATE.get(platform_l) or {}
+            _pol = p2_labels(platform_l)
+            _missing = []
+            if _pol.get("thinking") and not _tstate.get("thinking"):
+                _missing.append("extended thinking" if platform_l == "gemini" else "the thinking toggle")
+            if platform_l == "claude" and _pol.get("effort") and not _tstate.get("effort"):
+                _missing.append("max effort")
+            if _missing:
+                _ms = " + ".join(_missing)
+                log(f"[{label}] Phoenix: proceeding with Deep Research but thinking config "
+                    f"unconfirmed ({_ms}) — default level in use", "WARN")
+                _emit_model_drift_alert(
+                    platform_l,
+                    f"{_agent_name} is running Deep Research at default thinking settings",
+                    f"Couldn't confirm {_ms} for {_agent_name}. The research still runs (latest "
+                    "model + Deep Research are on); the thinking level may be lower than configured.")
 
         if not research_ok:
             log(f"[{label}] Deep Research unavailable after Layer 1 + Layer 2 + "
