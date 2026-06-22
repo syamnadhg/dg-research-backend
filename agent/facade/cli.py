@@ -366,9 +366,10 @@ def _signin_step(*, explicit: bool | None = None, assume_yes: bool = False,
 
     ``explicit`` (--login/--no-login) or ``assume_yes`` skip the prompt. When
     ``noninteractive`` (a chat exec / --yes) it RELAYS the sign-in link instead of
-    opening a host browser + block-polling — the user approves and finishes in
-    chat with `/sr login-wait`. Returns True only when ACTUALLY signed in (so a
-    relayed-but-unapproved link returns False)."""
+    opening a host browser + block-polling — the user approves in the browser and
+    the bridge's auto-poller captures the session automatically (#848; `/sr
+    login-done` is an optional confirmation, no longer required). Returns True
+    only when ACTUALLY signed in here (so a relayed link returns 'started')."""
     if not _bridge_up():
         b.dim("Bridge isn't running yet — start it first, then sign in:")
         b.dim("  python research.py agent serve   (or: agent resurrect)")
@@ -831,7 +832,8 @@ def _remote_signin(*, open_browser: bool, poll: bool = True, runtime: str = "", 
     b.line(f"Sign in here:  {url}")
     b.dim("Sign in with your Super Research Google account, then tap Approve & connect.")
     if not poll:
-        b.dim("Approve it, then finish in chat:  /sr login-wait  (it captures the session).")
+        b.dim("Approve it in your browser — the bridge connects you automatically.")
+        b.dim("(Confirm any time in chat:  /sr login-done.)")
         return "started"
     if open_browser and url:
         try:
@@ -899,6 +901,11 @@ def cmd_status(_args: argparse.Namespace) -> int:
         st = res[1]
         if st.get("authed"):
             b.ok(f"Account: signed in as {st.get('email') or st.get('uid')}")
+        elif st.get("remoteLogin") == "pending":
+            # A sign-in is mid-flight; the bridge auto-captures on approval (#848).
+            b.warn("Account: sign-in in progress — approve it in your browser; you'll connect automatically.")
+        elif st.get("remoteLogin") in ("error", "expired"):
+            b.warn("Account: last sign-in didn't complete  →  python research.py agent login")
         else:
             b.warn("Account: not signed in  →  python research.py agent login")
     else:

@@ -7,6 +7,7 @@ proving the chat slash-command path works over the loopback HTTP contract.
 
 import importlib.util
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,6 +114,31 @@ def bridge_port(monkeypatch):
 def test_status_account(bridge_port, capsys):
     assert sr.main(["status-account"]) == 0
     assert "Signed in as e@x.y" in capsys.readouterr().out
+
+
+def test_status_account_inflight_signin_hint(monkeypatch, capsys):
+    # #848 P3: a not-signed-in bridge with a sign-in mid-flight tells the user to
+    # approve it in the browser (the auto-poller then connects them), instead of a
+    # bare "Not signed in — run login".
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: None)
+    monkeypatch.setattr(bridge, "_backend_version", lambda: None)
+    state = bridge.BridgeState()
+    state.set_session(None)  # force not-signed-in regardless of any on-disk session
+    state.set_remote(bridge.RemoteFlow(
+        poll_token="PT", code="X", verify_url="https://x/c", expires_at=time.time() + 600,
+    ))
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._make_handler(state))
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", str(port))
+    try:
+        assert sr.main(["status-account"]) == 0
+        out = capsys.readouterr().out.lower()
+        assert "in progress" in out and "browser" in out and "not signed in" not in out
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_devices(bridge_port, capsys):

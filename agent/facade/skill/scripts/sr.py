@@ -367,8 +367,8 @@ def cmd_login(args) -> int:
         return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
     return _emit(body, args.json, [
         f"Open this link and sign in:  {body.get('verifyUrl')}",
-        "(Sign in to Super Research on your phone, then tap Authenticate.)",
-        "Then say:  login-done",
+        "(Sign in to Super Research, then tap Authenticate — you'll be connected automatically.)",
+        "Say  login-done  any time if you want to confirm it went through.",
     ])
 
 
@@ -379,7 +379,7 @@ def cmd_login_wait(args) -> int:
     state = body.get("state")
     msg = {
         "connected": f"✓ Connected as {body.get('email') or body.get('uid')}.",
-        "pending": "… still waiting for approval — say login-done again.",
+        "pending": "… not approved yet — approve it in your browser; you'll connect automatically.",
         "expired": "✗ The sign-in link expired — run login again.",
         "error": f"✗ Sign-in failed: {body.get('error', 'unknown')}",
     }.get(state, f"state: {state}")
@@ -403,6 +403,12 @@ def cmd_status_account(args) -> int:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     if body.get("authed"):
         lines = [f"✓ Signed in as {body.get('email') or body.get('uid')}"]
+    elif body.get("remoteLogin") == "pending":
+        # A sign-in is mid-flight: approve it in the browser and the bridge
+        # captures it automatically (no second command needed) — #848.
+        lines = ["A sign-in is in progress — approve it in your browser; you'll connect automatically."]
+    elif body.get("remoteLogin") in ("error", "expired"):
+        lines = ["The last sign-in didn't complete — run login again."]
     else:
         lines = ["Not signed in — run login."]
     lines += _update_notices(body)

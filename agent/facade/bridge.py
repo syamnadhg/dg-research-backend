@@ -1228,7 +1228,15 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             }
             sess = state.session
             if sess is None:
-                self._json(200, {"authed": False, **updates})
+                body = {"authed": False, **updates}
+                # Surface an in-flight remote sign-in so `agent status` / `/sr status`
+                # can say "approve it in your browser — you'll connect automatically"
+                # instead of a bare "not signed in" during the brief approve→capture
+                # window the auto-poller closes (#848).
+                flow = state.remote
+                if flow is not None and flow.state in ("pending", "error", "expired"):
+                    body["remoteLogin"] = flow.state
+                self._json(200, body)
                 return
             self._json(200, {"authed": True, "uid": sess.uid, "email": sess.email, **updates})
 

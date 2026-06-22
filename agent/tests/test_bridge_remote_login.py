@@ -127,6 +127,29 @@ def test_remote_start_broker_unreachable_is_502(live, monkeypatch):
     assert requests.post(base + "/login/remote/start", json={}).status_code == 502
 
 
+def test_status_surfaces_inflight_remote_login(live, mock_fe, monkeypatch):
+    # #848 P3: while a sign-in is mid-flight (started, not yet approved/captured),
+    # /status carries `remoteLogin: "pending"` so the CLI/chat can say "approve it
+    # in your browser — you'll connect automatically" instead of a bare "not
+    # signed in". (The live fixture runs no serve()-owned auto-poller, so the flow
+    # stays pending deterministically.)
+    base, _state, _ = live
+    fe = mock_fe(
+        start_resp={"code": "X", "pollToken": "PT", "verifyUrl": "https://x/c", "expiresIn": 600},
+        poll_script=[(200, {"status": "pending"})],
+    )
+    monkeypatch.setattr(config, "FE_BASE", fe)
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda _v: None)
+    monkeypatch.setattr(bridge, "_backend_version", lambda: None)
+
+    s0 = requests.get(base + "/status").json()
+    assert s0["authed"] is False and "remoteLogin" not in s0  # no flow yet
+    requests.post(base + "/login/remote/start", json={})
+    s1 = requests.get(base + "/status").json()
+    assert s1["authed"] is False and s1["remoteLogin"] == "pending"
+
+
 def test_remote_login_bad_custom_token_error_state(live, mock_fe, monkeypatch):
     base, state, _ = live
     fe = mock_fe(
