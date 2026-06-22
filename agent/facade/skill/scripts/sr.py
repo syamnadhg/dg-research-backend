@@ -517,6 +517,23 @@ def cmd_research(args) -> int:
         payload["config"] = cfg
     code, body = _post("/research", payload)
     if code != 200:
+        # Not signed in (401): give an ACTIONABLE next step, not a dead end. A
+        # prior login link expires (~10 min), so steering back to "the link I
+        # sent" strands the user — point at a FRESH `login` instead. If a sign-in
+        # is already mid-flight, say so (the bridge auto-captures on approval —
+        # #848, no `login-done` needed).
+        if code == 401:
+            sc, sbody = _get("/status")
+            if sc == 200 and sbody.get("remoteLogin") == "pending":
+                return _emit(body, args.json, [
+                    f"Can't start “{args.topic}” yet — approve the sign-in link in your browser "
+                    "and you'll connect automatically. Then ask for it again.",
+                ], _fail_code(code))
+            return _emit(body, args.json, [
+                f"Can't start “{args.topic}” — Super Research isn't signed in.",
+                "Say  login  for a fresh sign-in link, approve it in your browser "
+                "(you connect automatically), then ask for the research again.",
+            ], _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
     where = f" on {dev}" if dev else ""

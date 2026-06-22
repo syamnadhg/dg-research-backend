@@ -141,6 +141,54 @@ def test_status_account_inflight_signin_hint(monkeypatch, capsys):
         httpd.server_close()
 
 
+def _no_session_bridge(monkeypatch, *, remote_state: str | None = None):
+    """A running bridge with NO account session (optionally a remote flow in
+    `remote_state`). Returns (httpd) — caller closes it."""
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: None)
+    monkeypatch.setattr(bridge, "_backend_version", lambda: None)
+    state = bridge.BridgeState()
+    state.set_session(None)  # force not-signed-in regardless of any on-disk session
+    if remote_state:
+        rf = bridge.RemoteFlow(poll_token="PT", code="X", verify_url="https://x/c", expires_at=time.time() + 600)
+        rf.state = remote_state
+        state.set_remote(rf)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._make_handler(state))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", str(httpd.server_address[1]))
+    return httpd
+
+
+def test_research_when_not_signed_in_steers_to_fresh_login(monkeypatch, capsys):
+    # #848 follow-up: a research attempt while not signed in must steer to a FRESH
+    # `login` (a prior link expires ~10 min, so "the link I sent" is a dead end),
+    # and never tell the user to run login-done (auto-capture removed that step).
+    httpd = _no_session_bridge(monkeypatch)
+    try:
+        rc = sr.main(["research", "Golden retriever"])
+        out = capsys.readouterr().out.lower()
+        assert rc != 0
+        assert "golden retriever" in out and "login" in out
+        assert "connect automatically" in out and "login-done" not in out
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_research_when_signin_in_flight_says_approve_in_browser(monkeypatch, capsys):
+    # A sign-in is mid-flight → tell the user to approve it in the browser (the
+    # bridge auto-captures), not to start a fresh login.
+    httpd = _no_session_bridge(monkeypatch, remote_state="pending")
+    try:
+        rc = sr.main(["research", "Golden retriever"])
+        out = capsys.readouterr().out.lower()
+        assert rc != 0
+        assert "approve" in out and "browser" in out
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_devices(bridge_port, capsys):
     assert sr.main(["devices"]) == 0
     out = capsys.readouterr().out
