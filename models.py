@@ -224,9 +224,12 @@ def parse_family_version(text: str, family: str):
 def pick_highest_model(labels, family: str, floor=None, reject=()):
     """From candidate dropdown-row labels, pick the row with the HIGHEST
     <family> version that is >= floor, REJECTING (checked first) any label
-    containing a reject term (word-boundary match, so 'pro' won't trip on
-    'approve'). Tie-break: shortest label (prefer a leaf row over a wrapper
-    that concatenates several models).
+    whose text contains a reject term anchored at a word boundary on the LEFT
+    only — so a glued row ('3.1 flash-litefastest answers') is still rejected
+    (matching the JS ranker's substring includes() for glued descriptions),
+    while a term buried inside another word ('elite', 'improved', 'approve')
+    is NOT a false reject. Tie-break: shortest label (prefer a leaf row over a
+    wrapper that concatenates several models).
 
     Returns {'index', 'version', 'label'} of the winner, or None.
 
@@ -240,7 +243,7 @@ def pick_highest_model(labels, family: str, floor=None, reject=()):
         t = (raw or "").strip().lower()
         if not t:
             continue
-        if any(re.search(r"\b" + re.escape(r) + r"\b", t) for r in rej):
+        if any(re.search(r"\b" + re.escape(r), t) for r in rej):
             continue
         v = parse_family_version(t, family)
         if v is None or (floor is not None and v < floor):

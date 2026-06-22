@@ -138,11 +138,20 @@ def test_pick_highest_tie_breaks_to_shortest_label():
     assert best["label"] == "4.0 Flash"
 
 
-def test_pick_highest_reject_is_word_boundary():
-    # 'pro' must not trip on 'approve'/'professional'-style substrings.
-    rows = ["4.0 Flash (approved, professional-grade)"]
-    best = models.pick_highest_model(rows, "flash", floor=3.5, reject=["pro"])
+def test_pick_highest_reject_boundary_before_only():
+    # A reject term buried INSIDE another word must NOT false-reject the row.
+    rows = ["4.0 Flash — improved, enterprise-grade (approved)"]
+    best = models.pick_highest_model(rows, "flash", floor=3.5, reject=["pro", "lite"])
     assert best is not None and best["version"] == 4.0
+
+
+def test_pick_highest_rejects_glued_sibling():
+    # A GLUED sibling row ('4.0 flash-litefastest answers') must still be
+    # rejected (boundary-before match mirrors the JS ranker's includes()), so a
+    # numerically-higher Lite/Pro variant can never win over the real Flash.
+    rows = ["4.0 flash-litefastest answers", "3.5 flashall-around help"]
+    best = models.pick_highest_model(rows, "flash", floor=3.5, reject=["lite", "deep think", "pro"])
+    assert best["label"] == "3.5 flashall-around help"
 
 
 def test_pick_highest_opus_family_for_canary_reuse():
