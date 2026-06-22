@@ -94,6 +94,18 @@ except Exception as _ve:
     if sys.stdout is not None:
         print(f"[vision] import failed (shadow disabled): {_ve}", flush=True)
 
+# Phoenix self-heal SELECTOR engine (PX-0 foundation — SHADOW-ONLY, flag
+# DG_SELFHEAL_ENABLED default OFF). Wrapped like the vision import so an import
+# error can never break the pipeline; when the module is absent or the flag is
+# off, every selfheal entry point is inert. NB: namespaced `selfheal` to avoid
+# the unrelated restart/resume "Phoenix" in this file.
+try:
+    import selfheal  # type: ignore
+except Exception as _she:
+    selfheal = None  # noqa: N816 — fallthrough; the flag-gated shadow path no-ops.
+    if sys.stdout is not None:
+        print(f"[selfheal] import failed (self-heal shadow disabled): {_she}", flush=True)
+
 # UTF-8 + errors="replace" reconfigure for stdout/stderr on every platform.
 # Windows needs it for the cp1252 default; Linux/macOS need it when LANG=C
 # or POSIX is in effect (Crostini's penguin shell pre-`dpkg-reconfigure
@@ -24226,6 +24238,11 @@ async def setup_chatgpt_dr(page) -> bool:
             log("[setup_chatgpt_dr] Step 3 FAIL: clicked DR but no pill/placeholder change visible after 1.5s — click may have been intercepted", "WARN")
             return False
         log(f"[setup_chatgpt_dr] Step 3 OK: verified DR active via {active.get('via')} → {active.get('text')}")
+        if selfheal and selfheal.is_enabled():
+            # Detect-only: ChatGPT has no P2 model lever today; the probe captures
+            # the composer so the shadow report surfaces a model selector if one
+            # ever appears (→ escalate at PX-2, never silently heal).
+            await _selfheal_shadow_observe(page, "chatgpt.select_model", outcome_pass=True)
         return True
     except Exception as e:
         log(f"[setup_chatgpt_dr] exception: {e}", "WARN")
@@ -24245,6 +24262,47 @@ _P2_THINKING_STATE: dict = {}
 # the latest verified-working model as known_good (on-the-fly learning). Float
 # or None; process-local; last write wins.
 _P2_PICKED_VERSION: dict = {}
+
+
+async def _selfheal_shadow_observe(page, intent_id: str, *, outcome_pass) -> None:
+    """Phoenix self-heal SELECTOR engine (PX-0) — SHADOW observation, no action.
+
+    Records what the self-heal engine WOULD see at one P2 setup intent: the
+    intent's outcome predicate (REUSED verbatim from the live verify and passed
+    in as ``outcome_pass``) plus a read-only ``probe_region`` snapshot of the
+    intent's DOM region. Writes one line to ``logs/selfheal_shadow.jsonl`` and
+    NOTHING else — it resolves no selector and clicks nothing (PX-2 turns these
+    observations into real heals). Callers gate on ``selfheal.is_enabled()``
+    (default OFF) so this is inert in production; it is additionally fully
+    isolated here so any failure is swallowed and can never perturb a run.
+    """
+    if selfheal is None:
+        return
+    try:
+        intent = selfheal.load_intents().get(intent_id) or {}
+        region = intent.get("region") or "document"
+        snap = await selfheal.probe_region(page, region)
+        ok = bool(outcome_pass)
+        selfheal.shadow_log({
+            "platform": intent.get("platform") or intent_id.split(".", 1)[0],
+            "intent": intent_id,
+            "tier": "builtin",          # the existing DOM heuristic just ran
+            "outcome_pass": ok,
+            "would_heal": not ok,       # PX-2 would attempt a heal at this point
+            "probe_count": len(snap),
+            "selector_or_box": None,    # PX-0 resolves/acts nothing
+            "confidence": None,
+            "resolved_by": "shadow",
+        })
+    except Exception as exc:
+        # The log() call itself is guarded: this helper's whole contract is that
+        # NOTHING escapes into the caller (ensure_deep_mode_active's outer except
+        # treats a raise as active=True, which would flip a genuine active=False
+        # under flag-ON). A log/stdout failure must not breach that.
+        try:
+            log(f"[selfheal] shadow observe {intent_id} skipped: {exc}", "INFO")
+        except Exception:
+            pass
 
 
 # Phoenix (model_refresh) — Gemini "pick highest Flash" ranker. Mirrors
@@ -24574,7 +24632,9 @@ async def setup_gemini_dr(page, pin_model=None) -> bool:
         # Best-effort: pick the latest Flash before opening + menu. Non-fatal if
         # it misses (run proceeds on whatever model the dropdown was on).
         # pin_model (Phoenix known-good fallback) forces an exact-version pick.
-        await _gemini_select_flash_model(page, pin_model=pin_model)
+        _gem_model_ok = await _gemini_select_flash_model(page, pin_model=pin_model)
+        if selfheal and selfheal.is_enabled():
+            await _selfheal_shadow_observe(page, "gemini.select_model", outcome_pass=_gem_model_ok)
         await asyncio.sleep(0.5)
         direct_clicked = False
 
@@ -25782,6 +25842,9 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                 await setup_chatgpt_dr(page)
                 state = await page.evaluate(_cgpt_state_js)
                 log(f"[{label}] ChatGPT DR post-re-activate: active={state.get('active')}", "INFO")
+            if selfheal and selfheal.is_enabled():
+                await _selfheal_shadow_observe(page, "chatgpt.enable_deep_research",
+                                               outcome_pass=bool(state.get("active")))
             return {"platform": "chatgpt", "active": bool(state.get("active"))}
         if platform_l == "gemini":
             # 2026-05-29 (#709): return the REAL state (was always active=True),
@@ -25798,6 +25861,9 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                 active = bool(st.get("placeholderResearch") or st.get("pressed"))
                 log(f"[{label}] Gemini DR post-re-activate: active={active} "
                     f"placeholder={st.get('placeholder')!r}", "INFO")
+            if selfheal and selfheal.is_enabled():
+                await _selfheal_shadow_observe(page, "gemini.enable_deep_research",
+                                               outcome_pass=active)
             return {"platform": "gemini", "active": active}
         if platform_l == "claude":
             # Check BOTH: high-tier Opus model AND Research tool are on.
@@ -25881,6 +25947,11 @@ async def ensure_deep_mode_active(page, platform, label, reactivate=True) -> dic
                     except Exception as _rde:
                         log(f"[{label}] #744 Research-pill dump failed: {_rde}", "INFO")
             ok = bool(state.get("hasExtended") and state.get("researchOn"))
+            if selfheal and selfheal.is_enabled():
+                await _selfheal_shadow_observe(page, "claude.enable_deep_research",
+                                               outcome_pass=bool(state.get("researchOn")))
+                await _selfheal_shadow_observe(page, "claude.select_model",
+                                               outcome_pass=bool(state.get("hasExtended")))
             return {"platform": "claude", "active": ok,
                     "hasExtended": bool(state.get("hasExtended")),
                     "researchOn": bool(state.get("researchOn"))}

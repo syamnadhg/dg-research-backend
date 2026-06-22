@@ -368,12 +368,14 @@ def test_shadow_log_never_raises_on_bad_path(monkeypatch):
     selfheal.shadow_log({"platform": "x"})  # must swallow, not raise
 
 
-# ── PX-0 invariant: NOTHING is wired into the pipeline yet ──────────────────────
-def test_px0_is_not_wired_into_research():
-    """C1 must change zero pipeline behaviour: research.py must not import or
-    reference selfheal. (This guard flips at C2, which wires the 6 intents in
-    flag-gated, shadow-only.)"""
+# ── PX-0 invariant: the C2 wiring is import-guarded ─────────────────────────────
+def test_research_import_of_selfheal_is_guarded():
+    """research.py imports selfheal inside a try/except (so an import error can
+    never break the pipeline) and tolerates ``selfheal is None``. (The detailed
+    flag-gated wiring guards live in test_selfheal_wiring.py.)"""
     research_py = Path(selfheal.__file__).resolve().parent / "research.py"
     src = research_py.read_text(encoding="utf-8", errors="ignore")
-    assert "import selfheal" not in src
-    assert "selfheal." not in src
+    assert "import selfheal" in src
+    i = src.index("import selfheal")
+    assert "try:" in src[max(0, i - 60):i], "selfheal import must be inside a try/except"
+    assert "selfheal = None" in src, "must degrade to None on import failure"
