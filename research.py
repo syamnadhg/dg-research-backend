@@ -72,6 +72,7 @@ from models import (
     GEMINI_TEXT,
     GEMINI_NARRATE,
     p2_floor,
+    p2_claude_ver,
     p2_claude_setup_directive,
 )
 
@@ -25291,7 +25292,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
     user_msg_map = {
         "chatgpt": "Verify Deep Research mode is ACTIVE in ChatGPT. Fix if not. Do not type.",
         "gemini": "Verify Gemini Deep Research is ACTIVE — the composer placeholder MUST read 'What do you want to research?' (NOT 'Ask Gemini'). A merely-visible chip is NOT enough proof. Fix if not. Do not type.",
-        "claude": "Verify Opus 4.8 + Max effort + Adaptive thinking + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
+        "claude": f"Verify Opus {p2_claude_ver()} + Max effort + Adaptive thinking + Research tool are ON in Claude. Clear any stale attachments. Do not type.",
     }
     sys_prompt = validator_map.get(platform.lower())
     user_prompt = user_msg_map.get(platform.lower())

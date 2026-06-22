@@ -5,6 +5,17 @@ All Claude Computer Use API (CUA) system prompts and task prompts.
 Imported by research.py — edit prompts here, logic stays in research.py.
 """
 
+from models import p2_claude_major, p2_claude_prev_ver, p2_claude_ver
+
+# Claude P2 model-version tokens — derived from the central P2_MODEL_POLICY
+# (models.py) so the model names baked into the CUA prompts below track the
+# policy floor instead of being hand-edited here. Default floor 4.8 →
+# _OPUS="4.8", _OPUS_PREV="4.7", _OPUS_MAJOR="4" (byte-identical to the prior
+# literals). NB: this is the model_refresh "Phoenix", NOT the daemon-restart one.
+_OPUS = p2_claude_ver()
+_OPUS_PREV = p2_claude_prev_ver()
+_OPUS_MAJOR = p2_claude_major()
+
 SYSTEM_BASE = (
     "You are an expert browser automation agent. You control a browser via mouse clicks, "
     "keyboard input, and screenshots. Be precise with clicks. Always verify actions with "
@@ -198,13 +209,13 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 Once Deep Research pill is ACTIVE (visibly selected) and input is focused,
 your job is DONE."""
 
-PROMPT_CLAUDE_DEEP_RESEARCH = SYSTEM_BASE + """
+PROMPT_CLAUDE_DEEP_RESEARCH = SYSTEM_BASE + f"""
 
 Your task: Configure Claude for research. Nothing else.
 
 Steps:
 1. Look at the Claude.ai page.
-2. Click the model selector and pick "Opus 4.8". In that SAME popover: open the "Effort" submenu and choose "Max", and turn the "Adaptive thinking" toggle ON. (Older UI may show a single "Opus 4.7 Adaptive" option instead — pick that if 4.8/Effort aren't present.)
+2. Click the model selector and pick "Opus {_OPUS}". In that SAME popover: open the "Effort" submenu and choose "Max", and turn the "Adaptive thinking" toggle ON. (Older UI may show a single "Opus {_OPUS_PREV} Adaptive" option instead — pick that if {_OPUS}/Effort aren't present.)
 3. Click the "+" or tools menu near the input; enable the "Research" mode/tool.
 4. Close the menu (Escape) and click the message input area to focus it.
 5. Say "ready for paste" and STOP.
@@ -216,7 +227,7 @@ ABSOLUTELY FORBIDDEN — ZERO TOLERANCE:
 - DO NOT send anything.
 - DO NOT click Send / Submit.
 - DO NOT attach any files.
-- If Opus 4.8 + Max effort + Adaptive thinking are already set: say "ready for paste" immediately and STOP.
+- If Opus {_OPUS} + Max effort + Adaptive thinking are already set: say "ready for paste" immediately and STOP.
 - If Research mode toggle is already on: leave it alone.
 - If options are unavailable: say "partial setup" and STOP.
 
@@ -276,12 +287,12 @@ ABSOLUTELY FORBIDDEN:
 - DO NOT treat a merely-visible chip as active — the placeholder is the proof."""
 
 
-PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + """
+PROMPT_VALIDATE_CLAUDE_SETUP = SYSTEM_BASE + f"""
 
 Your task: Verify Claude is ready for Deep Research and fix ONLY what is wrong. The ONE thing that matters is the Research tool — everything else is secondary.
 
 Read the composer. Do NOT open the model popover unless step 1 explicitly tells you to.
-1. MODEL: the model-selector button (bottom of the composer) shows the current model. If it reads "Opus 4.8" — or any "Opus 4.x" — the model is FINE; do nothing to it. That button ALSO shows the effort (e.g. "Max") right on it. DO NOT open the model popover, and DO NOT try to expand the "Effort" or "Adaptive thinking" submenu — those are quality knobs, NOT requirements, and clicking a submenu that won't expand only wastes turns. ONLY touch the model if the button shows Sonnet/Haiku with no Opus at all: then open it once, pick "Opus 4.8", and close it.
+1. MODEL: the model-selector button (bottom of the composer) shows the current model. If it reads "Opus {_OPUS}" — or any "Opus {_OPUS_MAJOR}.x" — the model is FINE; do nothing to it. That button ALSO shows the effort (e.g. "Max") right on it. DO NOT open the model popover, and DO NOT try to expand the "Effort" or "Adaptive thinking" submenu — those are quality knobs, NOT requirements, and clicking a submenu that won't expand only wastes turns. ONLY touch the model if the button shows Sonnet/Haiku with no Opus at all: then open it once, pick "Opus {_OPUS}", and close it.
 2. RESEARCH TOOL (the priority — this is what actually matters): is "Research" / "Deep research" enabled near the composer (an active/highlighted pill or chip, or a checkmark beside "Research" in the "+" tools menu)? If you cannot tell from the current view, open the "+" / tools menu and look. If Research is OFF, turn it ON. If it is already ON, leave it.
 3. ATTACHMENTS: if a stale attachment is already visible in the composer, click its X to remove it.
 4. Click the input area to focus it.
