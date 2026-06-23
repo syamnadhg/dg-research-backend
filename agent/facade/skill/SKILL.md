@@ -169,6 +169,12 @@ chat — they can be revoked and don't open when the user is signed out.
   hasn't finished — say so and offer to check again in a bit.
 - **Never** send a `firebasestorage` / tokenized URL into chat (the client already
   filters these out — don't dig one out of raw JSON).
+- **No noise about absent links.** SR-only is BY DESIGN — Phase 4 (Video) and
+  Phase 5 (Delivery / final Google Doc) have **no** shareable link, and that's
+  correct, not missing. Just give the SR links that exist (Brief / reports /
+  Podcast); do **NOT** add commentary like "I don't see a final doc link" or
+  "no separate report link." When a run finishes, the only message is the
+  links + "results have been emailed" — nothing else.
 
 ## First-time setup
 
