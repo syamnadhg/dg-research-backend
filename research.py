@@ -27202,6 +27202,60 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 await asyncio.sleep(2)
         except Exception as _re:
             log(f"[{label}] In-page Retry guard raised (non-fatal): {_re}", "DEBUG")
+
+    # 2026-06-23: Gemini submit-verification. Gemini intermittently DROPS a clicked
+    # submission — the DOM click "succeeds" but the brief never enters a
+    # conversation: the composer reverts to the empty new-chat home and the URL
+    # stays the bare .../app (backend-2.log 2026-06-23 ~12:14: Send clicked, URL
+    # frozen at bare /app, 0 sources / 0 chars to 23m, user stopped it). The old
+    # code returned True regardless, so the [2D] plan-wait burned its full 10-min
+    # budget waiting for a 'Start research' that could never appear. Confirm the
+    # brief actually started a conversation (the URL advances to /app/<id> — the
+    # reliable signal: every healthy run gets one, a dropped send never does);
+    # re-submit ONCE; else return False so the caller's skip-gate (run_phase2 2C)
+    # marks Gemini failed and skips the dead 10-min dwell.
+    if platform_l == "gemini":
+        def _gemini_in_conversation() -> bool:
+            try:
+                u = (page.url or "").split("?", 1)[0].rstrip("/")
+                return "/app/" in u  # /app/<conversation-id>, not the bare /app home
+            except Exception:
+                return False
+
+        async def _gemini_landed(deadline_s: float) -> bool:
+            waited = 0.0
+            while waited <= deadline_s:
+                if _gemini_in_conversation():
+                    return True
+                await asyncio.sleep(1.5)
+                waited += 1.5
+            return False
+
+        if not await _gemini_landed(15.0):
+            log(f"[{label}] Gemini submission not confirmed (URL still bare /app) — re-submitting once", "WARN")
+            try:
+                resent = False
+                for _sel in _send_sels:
+                    try:
+                        _b = await page.query_selector(_sel)
+                        if _b and await _b.is_enabled():
+                            await _b.click()
+                            resent = True
+                            break
+                    except Exception:
+                        continue
+                if not resent:
+                    try:
+                        await page.keyboard.press("Enter")  # composer submit as a last resort
+                    except Exception:
+                        pass
+            except Exception as _se:
+                log(f"[{label}] Gemini re-submit raised (non-fatal): {_se}", "DEBUG")
+            if not await _gemini_landed(15.0):
+                log(f"[{label}] Gemini brief never entered a conversation — failing fast "
+                    f"(skips the 10-min plan wait)", "ERROR")
+                return page, False
+        log(f"[{label}] Gemini submission confirmed ✓ (conversation started)")
     return page, True
 
 
