@@ -34,20 +34,22 @@ def test_setup_records_thinking_state():
     assert '_P2_THINKING_STATE["gemini"]' in sg
 
 
-def test_caller_advisory_is_soft_and_only_when_proceeding():
+def test_caller_thinking_advisory_is_telemetry_only_when_proceeding():
+    # 2026-06-22 live finding: the thinking/effort confirmation false-alarms on
+    # nearly every run (Claude folded Max-effort into Extended Pro, so the separate
+    # control is absent). The advisory is now TELEMETRY ONLY — it logs the miss but
+    # must NOT raise a user-facing alert, and must never reach the blocking gate.
     src = inspect.getsource(research.start_agent_no_gemini_wait)
-    # The advisory only fires when research_ok (we're proceeding), and routes to
-    # the amber _emit_model_drift_alert (not the red chat-mode gate).
-    adv = src.find("advisory thinking-config notice")
+    adv = src.find("thinking-config telemetry (NO user alert)")
     assert adv != -1
-    # Scope precisely to the advisory section: from its comment up to the
+    # Scope precisely to the telemetry section: from its comment up to the
     # chat-mode gate that follows it (avoids bleeding into that gate's code).
     block = src[adv:src.find("if not research_ok:", adv)]
     assert 'if research_ok and platform_l in ("claude", "gemini")' in block
-    assert "_emit_model_drift_alert(" in block
-    # It reads the recorded state + the policy, and never calls the blocking gate.
+    # It reads the recorded state + policy and logs the miss, but raises NOTHING.
     assert "_P2_THINKING_STATE.get(platform_l)" in block and "p2_labels(" in block
-    assert "_emit_chat_mode_alert" not in block
+    assert "_emit_model_drift_alert(" not in block  # no amber alert (false-alarm)
+    assert "_emit_chat_mode_alert" not in block     # never the red blocking gate
 
 
 def test_ensure_deep_mode_active_still_excludes_thinking():

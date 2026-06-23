@@ -12326,10 +12326,12 @@ def _emit_model_drift_alert(platform_l: str, message: str, details: str = ""):
     run does NOT pause on it. Uses pipeline_warning (alertType "warn"), NOT the
     red pipeline_error, because these are FYI, not failures: e.g. the latest
     model couldn't be verified into Deep Research so the agent fell back to a
-    known-good model (the run continues normally), or an advisory thinking knob
-    (max-effort / extended-thinking) couldn't be confirmed. Badge philosophy:
-    amber warning, never a red error badge for a non-error. NB: this is the
-    model_refresh "Phoenix", NOT the daemon restart/resume one."""
+    known-good model (the run continues normally). NB: the advisory thinking-knob
+    miss (max-effort / extended-thinking unconfirmed) deliberately does NOT use
+    this — it's telemetry/log only (it false-alarms when a knob is folded into the
+    model, e.g. Claude's Extended Pro). Badge philosophy: amber warning, never a
+    red error badge for a non-error. NB: this is the model_refresh "Phoenix", NOT
+    the daemon restart/resume one."""
     names = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
     name = names.get(platform_l, platform_l.title())
     emit_event(
@@ -26904,13 +26906,19 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                         f"agent fell back to a known-good model (v{_kg}). The run continues normally.")
                     log(f"[{label}] Phoenix: known-good fallback verified — proceeding on v{_kg}")
 
-        # ── Phoenix model_refresh — advisory thinking-config notice ──────────
-        # When we're proceeding in RESEARCH mode but a policy-required thinking
-        # knob (Claude max-effort + thinking toggle, Gemini extended thinking)
-        # couldn't be confirmed at setup, surface a SOFT amber notice (user
-        # decision #4 = verify + soft-escalate). Never blocks — the run still
-        # has the latest model + Deep Research; only the thinking level may have
-        # fallen back to default.
+        # ── Phoenix model_refresh — thinking-config telemetry (NO user alert) ──
+        # When we're proceeding in RESEARCH mode but a policy thinking knob (Claude
+        # max-effort + thinking toggle, Gemini extended thinking) couldn't be
+        # CONFIRMED at setup, record it to the log + telemetry ONLY — never a
+        # user-facing alert. Rationale (live finding 2026-06-22): this confirmation
+        # is inherently unreliable — the effort/thinking controls are the most
+        # label-volatile in the UI, and Claude has folded "Max effort" into the
+        # Extended Pro model so the separate control is simply ABSENT, making the
+        # exact-match read miss on essentially every run. Surfacing that as an amber
+        # notice is therefore a false alarm nearly every time (the model + Deep
+        # Research are correctly selected). Thinking is advisory and never gates, so
+        # we keep the signal in the log + _P2_THINKING_STATE telemetry for measuring
+        # confirm rates, but we do NOT alert the user.
         if research_ok and platform_l in ("claude", "gemini"):
             # Phoenix on-the-fly learning: this run verified Deep Research on the
             # selected model → record it as the known-good fallback target so it
@@ -26927,13 +26935,10 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 _missing.append("max effort")
             if _missing:
                 _ms = " + ".join(_missing)
-                log(f"[{label}] Phoenix: proceeding with Deep Research but thinking config "
-                    f"unconfirmed ({_ms}) — default level in use", "WARN")
-                _emit_model_drift_alert(
-                    platform_l,
-                    f"{_agent_name} is running Deep Research at default thinking settings",
-                    f"Couldn't confirm {_ms} for {_agent_name}. The research still runs (latest "
-                    "model + Deep Research are on); the thinking level may be lower than configured.")
+                # Telemetry only — deliberately NOT an _emit_model_drift_alert (see
+                # the block comment above: it false-alarms on nearly every run).
+                log(f"[{label}] Phoenix: proceeding with Deep Research; thinking config "
+                    f"unconfirmed ({_ms}) — telemetry only, no user alert (advisory, never gates)", "WARN")
 
         if not research_ok:
             log(f"[{label}] Deep Research unavailable after Layer 1 + Layer 2 + "
