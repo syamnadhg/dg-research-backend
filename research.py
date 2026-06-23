@@ -24305,6 +24305,13 @@ async def _selfheal_shadow_observe(page, intent_id: str, *, outcome_pass) -> Non
             "heal_reason": heal.get("match_reason"),
             "ui_fingerprint": heal.get("ui_fingerprint"),
         })
+        # Optional corpus capture (DG_SELFHEAL_CAPTURE, default OFF): dump the FULL
+        # probe snapshot so a real golden corpus + drift fixtures can be built from
+        # live DOM. Self-gates; pure data capture.
+        selfheal.capture_snapshot(
+            intent.get("platform") or intent_id.split(".", 1)[0],
+            intent_id, snap, outcome_pass=ok, fingerprint=heal.get("ui_fingerprint"),
+        )
     except Exception as exc:
         # The log() call itself is guarded: this helper's whole contract is that
         # NOTHING escapes into the caller (ensure_deep_mode_active's outer except

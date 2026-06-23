@@ -89,6 +89,16 @@ def act_enabled() -> bool:
     return is_enabled() and _flag_on("DG_SELFHEAL_ACT")
 
 
+def capture_enabled() -> bool:
+    """Corpus-capture sub-switch — ``DG_SELFHEAL_CAPTURE`` (default OFF), AND-ed
+    with the master switch. When on, the shadow layer ALSO records the FULL probe
+    snapshot of each intent's region to ``logs/selfheal_capture.jsonl`` so a real
+    golden corpus + drift fixtures can be built from live DOM (replacing the
+    synthetic seeds). Pure data capture — acts on nothing.
+    """
+    return is_enabled() and _flag_on("DG_SELFHEAL_CAPTURE")
+
+
 # ── Paths (resolved live so env overrides + test isolation just work) ─────────
 def _state_dir() -> Path:
     """Persistent state dir — ``~/.super-research`` (matches model_refresh.json
@@ -127,6 +137,15 @@ def _shadow_log_path() -> str:
     sibling shadow log exactly (cwd-relative, str)."""
     return os.environ.get("DG_SELFHEAL_SHADOW_LOG") or os.path.join(
         "logs", "selfheal_shadow.jsonl"
+    )
+
+
+def _capture_log_path() -> str:
+    """Full-snapshot corpus-capture JSONL (separate from the lean shadow log so
+    the bulky raw DOM doesn't bloat per-send telemetry). ``DG_SELFHEAL_CAPTURE_LOG``
+    overrides; default ``logs/selfheal_capture.jsonl`` in the cwd."""
+    return os.environ.get("DG_SELFHEAL_CAPTURE_LOG") or os.path.join(
+        "logs", "selfheal_capture.jsonl"
     )
 
 
@@ -1006,3 +1025,34 @@ def shadow_log(rec: dict[str, Any]) -> None:
             f.write(json.dumps(out, default=str) + "\n")
     except Exception as exc:
         logger.debug("selfheal shadow log append failed: %s", exc)
+
+
+def capture_snapshot(
+    platform: Optional[str],
+    intent_id: str,
+    snap: list[dict[str, Any]],
+    *,
+    outcome_pass: Any,
+    fingerprint: Optional[str] = None,
+) -> None:
+    """Append a FULL probe snapshot to ``logs/selfheal_capture.jsonl`` for corpus
+    building. NO-OP unless ``DG_SELFHEAL_CAPTURE`` (+ master). One JSON object per
+    line; bounded by probe_region's element cap. Never raises — pure data capture.
+    """
+    if not capture_enabled():
+        return
+    try:
+        path = _capture_log_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "platform": platform,
+            "intent": intent_id,
+            "ui_fingerprint": fingerprint or ui_fingerprint(snap),
+            "outcome_pass": bool(outcome_pass),
+            "snapshot": snap,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception as exc:
+        logger.debug("selfheal capture failed: %s", exc)

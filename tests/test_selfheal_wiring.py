@@ -88,14 +88,16 @@ def test_shadow_observe_failing_predicate_flags_would_heal(monkeypatch):
 
 
 def test_shadow_observe_resolves_and_acts_nothing(monkeypatch):
-    # The helper must only probe + log — it records selector_or_box=None and
-    # never resolves a selector or performs an action (PX-2 owns acting).
+    # The helper must only probe + log/capture — it records selector_or_box=None
+    # and never resolves a selector or performs an action (PX-2 owns acting).
     monkeypatch.setenv("DG_SELFHEAL_ENABLED", "1")
     asyncio.run(research._selfheal_shadow_observe(FakePage([]), "chatgpt.select_model", outcome_pass=True))
     assert _read_shadow()[-1]["selector_or_box"] is None
     src = inspect.getsource(research._selfheal_shadow_observe)
-    for forbidden in (".click(", "setup_", "persist_selectors", "decide_toggle"):
+    for forbidden in (".click(", "setup_", "persist_selectors", "decide_toggle", "heal_once"):
         assert forbidden not in src, f"shadow observe must not act — found {forbidden!r}"
+    # but it DOES offer corpus capture (self-gated by DG_SELFHEAL_CAPTURE)
+    assert "capture_snapshot(" in src
 
 
 def test_shadow_observe_never_raises_on_probe_failure(monkeypatch):

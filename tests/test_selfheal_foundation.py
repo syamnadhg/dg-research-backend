@@ -31,6 +31,8 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setenv("DG_SELFHEAL_SELECTORS", str(tmp_path / "state" / "selectors.json"))
     monkeypatch.setenv("DG_SELFHEAL_SHADOW_LOG", str(tmp_path / "logs" / "selfheal_shadow.jsonl"))
     monkeypatch.delenv("DG_SELFHEAL_ENABLED", raising=False)
+    monkeypatch.delenv("DG_SELFHEAL_ACT", raising=False)
+    monkeypatch.delenv("DG_SELFHEAL_CAPTURE", raising=False)
     monkeypatch.delenv("DG_SELFHEAL_INTENTS", raising=False)
 
 
@@ -357,6 +359,47 @@ def test_shadow_log_writes_and_stamps_ts_when_enabled(monkeypatch):
     j = json.loads(line)
     assert j["platform"] == "gemini" and j["outcome_pass"] is True and j["resolved_by"] == "shadow"
     assert "ts" in j
+
+
+def test_capture_enabled_requires_both_flags(monkeypatch):
+    assert selfheal.capture_enabled() is False
+    monkeypatch.setenv("DG_SELFHEAL_ENABLED", "1")
+    assert selfheal.capture_enabled() is False  # master on, capture off
+    monkeypatch.setenv("DG_SELFHEAL_CAPTURE", "1")
+    assert selfheal.capture_enabled() is True
+    monkeypatch.setenv("DG_SELFHEAL_ENABLED", "0")
+    assert selfheal.capture_enabled() is False  # capture on but master off
+
+
+def test_capture_snapshot_noop_when_disabled(monkeypatch, tmp_path):
+    cap = tmp_path / "cap.jsonl"
+    monkeypatch.setenv("DG_SELFHEAL_CAPTURE_LOG", str(cap))
+    monkeypatch.setenv("DG_SELFHEAL_ENABLED", "1")  # capture flag still OFF
+    selfheal.capture_snapshot("gemini", "gemini.enable_deep_research", [{"role": "button"}], outcome_pass=True)
+    assert not cap.exists()
+
+
+def test_capture_snapshot_writes_full_snapshot_when_on(monkeypatch, tmp_path):
+    cap = tmp_path / "cap.jsonl"
+    monkeypatch.setenv("DG_SELFHEAL_CAPTURE_LOG", str(cap))
+    monkeypatch.setenv("DG_SELFHEAL_ENABLED", "1")
+    monkeypatch.setenv("DG_SELFHEAL_CAPTURE", "1")
+    snap = [{"role": "button", "accessible_name": "deep research", "text": "Deep research",
+             "attrs": {"cls": "x"}, "bounds": {"x": 1, "y": 2, "w": 3, "h": 4}, "visible": True}]
+    selfheal.capture_snapshot("gemini", "gemini.enable_deep_research", snap, outcome_pass=False)
+    rec = json.loads(cap.read_text(encoding="utf-8").strip())
+    assert rec["intent"] == "gemini.enable_deep_research" and rec["platform"] == "gemini"
+    assert rec["snapshot"] == snap  # FULL snapshot captured
+    assert rec["outcome_pass"] is False and len(rec["ui_fingerprint"]) == 12 and "ts" in rec
+
+
+def test_capture_snapshot_never_raises(monkeypatch, tmp_path):
+    blocker = tmp_path / "afile"
+    blocker.write_text("not a dir", encoding="utf-8")
+    monkeypatch.setenv("DG_SELFHEAL_CAPTURE_LOG", str(blocker / "cap.jsonl"))  # parent is a file
+    monkeypatch.setenv("DG_SELFHEAL_ENABLED", "1")
+    monkeypatch.setenv("DG_SELFHEAL_CAPTURE", "1")
+    selfheal.capture_snapshot("gemini", "x", [], outcome_pass=True)  # must swallow
 
 
 def test_shadow_log_never_raises_on_bad_path(monkeypatch):
