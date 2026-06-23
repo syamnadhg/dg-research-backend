@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections import Counter
@@ -57,9 +58,20 @@ ActionVerb = Literal[
 MODEL_SONNET = VISION_LIGHT_MODEL
 MODEL_OPUS = VISION_HEAVY_MODEL
 
-# Per-call hard timeout — matches the user-perceived stall threshold. Above
-# this, the user sees a frozen UI. asyncio.wait_for around the SDK call.
-DEFAULT_TIMEOUT_S = 8.0
+# Per-call hard timeout (asyncio.wait_for around the SDK call). Vision is the
+# smart tier-2 between Playwright and CUA; the CUA fallback routinely takes
+# 20–30s, so an 8s ceiling was far too tight — it produced mostly TimeoutError
+# in shadow telemetry (the model needs ~4s but the call also screenshots + b64s
+# a multi-MB PNG). 20s gives real headroom while staying well under CUA. Tunable
+# via DG_VISION_TIMEOUT_S for in-the-loop tuning without a redeploy.
+try:
+    DEFAULT_TIMEOUT_S = float(os.environ.get("DG_VISION_TIMEOUT_S") or 20.0)
+except (TypeError, ValueError):
+    DEFAULT_TIMEOUT_S = 20.0
+# A fat-fingered 0 / negative would make every wait_for fire instantly →
+# 100% TimeoutError (the exact failure this raise fixes). Floor it.
+if DEFAULT_TIMEOUT_S <= 0:
+    DEFAULT_TIMEOUT_S = 20.0
 
 # Single transport retry on network/5xx/429. Two retries pushes p95 over budget.
 TRANSPORT_RETRY_DELAY_S = 1.5
@@ -245,10 +257,13 @@ _SYSTEM_PROMPT = (
     "is the fallback if you can't make sense of the screen. "
     "\n\n"
     "RULES:\n"
-    "1. Coordinates are 0–1 ratios of the viewport — never pixels. Center of "
-    "screen is (0.5, 0.5).\n"
-    "2. Return confidence honestly. Below 0.6, the caller will escalate to "
-    "CUA — that's better than a confident-but-wrong click.\n"
+    "1. Coordinates are 0–1 ratios of the viewport, NOT pixels — the center is "
+    "(0.5, 0.5) and the far-right edge is x≈1.0. NEVER return a pixel value like "
+    "1238; if you're thinking in pixels, divide by the viewport size first.\n"
+    "2. If you can CLEARLY see the target, click its CENTER and report high "
+    "confidence. If you CANNOT locate it, return action='escalate_to_cua' — do "
+    "NOT emit a low-confidence guess at the screen edge. A clean escalation beats "
+    "a wrong click (and below 0.6 confidence the caller escalates anyway).\n"
     "3. If you see a captcha (reCAPTCHA, hCaptcha, Cloudflare), return "
     "action='escalate_to_cua' immediately. Never attempt to solve.\n"
     "4. If the workflow goal is already visible on screen (e.g. the share "
@@ -333,10 +348,16 @@ class VisionClient:
         prompt: str | None = None,
         high_stakes: bool = False,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        transport_retry: bool = True,
     ) -> ActionResult:
         """Send screenshot + flow_context to the vision model, force tool-use,
         return a typed ActionResult. Never raises — failures return action=
-        'declare_failure'. Callers can chain into CUA without try/except."""
+        'declare_failure'. Callers can chain into CUA without try/except.
+
+        ``transport_retry=False`` does a SINGLE attempt (no 1.5s+retry on a
+        transport error) — used by shadow mode, which doesn't need Vision to
+        succeed (CUA carries) and must stay self-bounded so a caller's outer
+        timeout can't mask the retry and mislabel transport churn as a timeout."""
         if self.metrics.call_count >= self._call_budget:
             raise BudgetExceeded(
                 f"Vision call budget {self._call_budget} exceeded — escalate to CUA"
@@ -346,7 +367,7 @@ class VisionClient:
         user_text = self._build_user_message(flow_context, prompt, img_meta)
         t0 = time.time()
 
-        for attempt in range(2):  # 1 try + 1 transport retry
+        for attempt in range(2 if transport_retry else 1):  # 1 try + optional transport retry
             try:
                 resp = await asyncio.wait_for(
                     self._client.messages.create(
@@ -373,7 +394,7 @@ class VisionClient:
                     timeout=timeout_s,
                 )
                 latency_ms = (time.time() - t0) * 1000.0
-                result = self._parse_response(resp, model, latency_ms)
+                result = self._parse_response(resp, model, latency_ms, img_meta)
                 self.metrics.record(result)
                 if self._on_action:
                     try:
@@ -395,13 +416,13 @@ class VisionClient:
                 )
             except (anthropic.APIConnectionError, anthropic.RateLimitError,
                     anthropic.InternalServerError) as e:
-                if attempt == 0:
+                if attempt == 0 and transport_retry:
                     logger.info("vision: transport error, retrying once: %s", e)
                     await asyncio.sleep(TRANSPORT_RETRY_DELAY_S)
                     continue
                 latency_ms = (time.time() - t0) * 1000.0
                 return self._failure(
-                    f"transport error after retry: {type(e).__name__}: {e}",
+                    f"transport error: {type(e).__name__}: {e}",
                     model, latency_ms,
                 )
             except Exception as e:
@@ -492,13 +513,15 @@ class VisionClient:
         return "\n".join(parts)
 
     def _parse_response(
-        self, resp: Any, model: str, latency_ms: float,
+        self, resp: Any, model: str, latency_ms: float, img_meta: ImgMeta | None = None,
     ) -> ActionResult:
         """Extract the propose_action tool call from the response.
         Forced tool-use guarantees this exists, but we defend anyway."""
         usage = getattr(resp, "usage", None)
         in_tok = getattr(usage, "input_tokens", 0) if usage else 0
         out_tok = getattr(usage, "output_tokens", 0) if usage else 0
+        vw = img_meta.width_css if img_meta else 0
+        vh = img_meta.height_css if img_meta else 0
 
         for block in (resp.content or []):
             if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == "propose_action":
@@ -509,8 +532,8 @@ class VisionClient:
                     reason=str(inp.get("reason", "")),
                     confidence=conf,
                     next_expected_state=str(inp.get("next_expected_state", "")),
-                    x_ratio=_opt_float(inp.get("x_ratio")),
-                    y_ratio=_opt_float(inp.get("y_ratio")),
+                    x_ratio=_norm_ratio(inp.get("x_ratio"), vw),
+                    y_ratio=_norm_ratio(inp.get("y_ratio"), vh),
                     text=_opt_str(inp.get("text")),
                     key=_opt_str(inp.get("key")),
                     scroll_dy_ratio=_opt_float(inp.get("scroll_dy_ratio")),
@@ -711,15 +734,38 @@ async def shadow_observe_then_cua(
     async def _vision_observe() -> dict:
         t0 = time.time()
         try:
-            img, meta = await vc.screenshot(page)
-            await _harvest_fixture(img, hotspot_id, run_id)
-            # act() takes its own screenshot internally; the one above is
-            # solely for fixture harvest. act() signature: (page, ctx, *,
-            # prompt, high_stakes, timeout_s) — no image/img_meta kwargs.
+            # ONE screenshot, reused for fixture harvest AND the model call —
+            # ask() takes the image directly, so no second capture (the old
+            # path screenshotted twice, both inside the timed window). Shadow
+            # uses a SINGLE attempt (transport_retry=False): it doesn't need
+            # Vision to succeed (CUA carries), and a self-bounded single ask()
+            # means the outer wait_for below can't mask the inner timeout/retry
+            # and mislabel transport churn as a model-latency timeout. The outer
+            # is just a safety net for a hung screenshot, sized above ask()'s
+            # own inner timeout so it never races it.
+            async def _shot_and_ask() -> ActionResult:
+                img, meta = await vc.screenshot(page)
+                await _harvest_fixture(img, hotspot_id, run_id)
+                return await vc.ask(
+                    img, meta, flow_context,
+                    high_stakes=high_stakes, transport_retry=False,
+                )
             result = await asyncio.wait_for(
-                vc.act(page, flow_context, high_stakes=high_stakes),
-                timeout=DEFAULT_TIMEOUT_S,
+                _shot_and_ask(), timeout=DEFAULT_TIMEOUT_S + 8,
             )
+            # ask() never raises — engine failures come back as declare_failure
+            # with a known reason. Preserve the {"timeout"}/{"error"} record
+            # shapes (so the report keeps categorising + the SOURCE is distinct),
+            # while a GENUINE model declare_failure stays a full action record.
+            if result.action == "declare_failure":
+                r = (result.reason or "").lower()
+                if "timeout" in r:
+                    return {"timeout": True, "elapsed_ms": int(result.latency_ms),
+                            "reason": result.reason}
+                if (r.startswith("transport error") or r.startswith("unexpected error")
+                        or "did not return" in r):
+                    return {"error": result.reason,
+                            "elapsed_ms": int(result.latency_ms)}
             return {
                 "action": result.action,
                 "reason": result.reason,
@@ -846,6 +892,32 @@ def _opt_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _norm_ratio(v: Any, dim: int) -> float | None:
+    """Normalise a coordinate to a 0–1 ratio. The model is told to return
+    ratios, but in practice it sometimes returns RAW PIXELS (observed:
+    x_ratio=1238 on a 1280px viewport → execute_action would then multiply by
+    width again and click far off-screen). Recovery: a value clearly above the
+    ratio range (>1.5) with a known viewport dim is treated as pixels and
+    divided back to a ratio (1238/1280 = 0.967 — the right-edge target it
+    actually meant); everything is then clamped to [0,1] so a stray value can
+    never click outside the viewport. None stays None."""
+    f = _opt_float(v)
+    if f is None:
+        return None
+    # NaN/inf would slip past the >/< clamps below (every comparison with NaN is
+    # False) and reach page.mouse.click(nan, nan). Reject up front → None, which
+    # makes execute_action's "click requires x_ratio/y_ratio" guard fire instead.
+    if not math.isfinite(f):
+        return None
+    if f > 1.5 and dim and dim > 0:
+        f = f / dim
+    if f < 0.0:
+        return 0.0
+    if f > 1.0:
+        return 1.0
+    return f
 
 
 def _opt_int(v: Any) -> int | None:

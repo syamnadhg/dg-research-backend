@@ -11752,6 +11752,63 @@ _HOTSPOT_TO_OP = {
 }
 
 
+# Per-hotspot Vision hints — a concrete description of WHAT to look for + the
+# success signal, merged into the shadow flow_context so the tier-2 Vision call
+# can LOCATE the target confidently instead of guessing at the screen edge
+# (the low-confidence/edge-click pattern seen in vision_shadow.jsonl). The
+# call-site's run-specific context_hint (elapsed/cycle) is appended after this.
+# These MUST agree with the canonical CUA prompts (prompts.py) so the shadow
+# Vision call aims at the SAME element CUA does — a divergent hint corrupts the
+# promotion data. 7c/7c-p1 ↔ PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
+# 7d ↔ PROMPT_OPEN_CLAUDE_SOURCE_ARTIFACT.
+_HOTSPOT_VISION_HINTS = {
+    "7c-p1": {
+        "expected_outcome": "ChatGPT's activity side panel (step list + source URLs) slides open on the right",
+        "context_hint": (
+            "Open ChatGPT's activity panel (P1 Pro + Extended Thinking). The target is the "
+            "SHIMMERING / glowing inline activity label attached to the TRAILING (bottom) edge "
+            "of the LATEST assistant message — a short pill that pulses, text like "
+            "'Pro thinking…' / 'Reasoning…' / 'Searching…' usually ending in '...'. Click that "
+            "label once. It is NOT pinned to the top, NOT the Share button, NOT the model "
+            "selector/header, NOT the composer — do not click those."
+        ),
+        "success_signals": ["a side panel on the RIGHT (~30-40% width)", "a numbered/bulleted step list with source URL rows"],
+    },
+    "7c": {
+        "expected_outcome": "the Deep Research activity/step-list side panel opens on the right",
+        "context_hint": (
+            "Open ChatGPT's Deep Research activity panel (P2). The target is the activity strip "
+            "attached to the BOTTOM/trailing edge of the latest response — a row with a small "
+            "spinner/dot on the left and a count badge ('196 searches' / '47 sources' / 'N results') "
+            "on the right, the live line ending in '...'. Click that strip once. Do NOT click the "
+            "Share button, model selector/header, or the composer."
+        ),
+        "success_signals": ["a right-side panel with a numbered step list + URL rows", "a 'Deep research report plan' / activity header"],
+    },
+    "7d": {
+        "expected_outcome": "the FIRST research/sources tracking artifact opens in Claude's right panel",
+        "context_hint": (
+            "Open Claude's research-tracking artifact. The target is the FIRST / earliest artifact "
+            "card embedded in Claude's reply (left column, below the user's message) — its title "
+            "contains 'Research' / 'Sources' / 'Tracking' or the topic, with a checklist preview. "
+            "Do NOT pick the last/bottom card (that's the FINAL report — must not be opened here), "
+            "and do NOT pick any filename card (brief.md or *.md/.pdf/.docx — those are attachments)."
+        ),
+        "success_signals": ["a checklist / step list opens in the RIGHT panel", "a tracking/sources artifact (not the final report)"],
+    },
+    "p2-share": {
+        "expected_outcome": "a public share / published URL is produced for the report",
+        "context_hint": (
+            "Get the report's public share link. On ChatGPT: the 'Share' button at the top of the "
+            "conversation, which opens a modal with 'Create link' / 'Copy link'. Elsewhere "
+            "(Claude/Gemini artifact or published page): a share / publish / link icon near the "
+            "top-right of the artifact. Click it to create/reveal/copy the public URL."
+        ),
+        "success_signals": ["a share modal with Create/Copy link", "a visible or copied public share URL", "a 'link copied' confirmation"],
+    },
+}
+
+
 def _attempts_for_hotspot(hotspot_id: str, platform: str) -> int:
     """Return the per-(op, agent) escalation count for a Vision hotspot,
     falling back to 1 when the hotspot isn't tier-tracked. Reads the
@@ -11793,13 +11850,22 @@ async def _shadow_observed_cua(
     except Exception:
         return await cua_coro_factory()
 
+    # Enrich with the per-hotspot target description so Vision can locate the
+    # element confidently (raises confidence / kills the edge-guessing). The
+    # run-specific context_hint (elapsed/cycle/DOM-miss detail) is appended.
+    _hint = _HOTSPOT_VISION_HINTS.get(hotspot_id, {})
+    _ctx_hint = (
+        f"{_hint['context_hint']} (run detail: {context_hint})"
+        if _hint.get("context_hint") else context_hint
+    )
     flow_ctx = {
         "workflow_name": hotspot_id,
         "phase": phase,
         "platform": platform,
         "current_step": current_step,
-        "expected_outcome": expected_outcome,
-        "context_hint": context_hint,
+        "expected_outcome": expected_outcome or _hint.get("expected_outcome", ""),
+        "context_hint": _ctx_hint,
+        "success_signals": _hint.get("success_signals", []),
         "attempts": _attempts_for_hotspot(hotspot_id, platform),
     }
     try:
