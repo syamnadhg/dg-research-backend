@@ -149,6 +149,24 @@ def test_report_constants_match_runtime_contracts():
     assert set(report.PLATFORMS) == set(selfheal.PLATFORMS)
 
 
+def test_report_px4_drift_section_renders_verdicts():
+    # resolver-decision records carrying anchor confidence drive the drift canary.
+    recs = []
+    for _ in range(3):
+        recs.append({"platform": "chatgpt", "intent": "chatgpt.select_model", "resolved_by": "shadow",
+                     "outcome_pass": True, "heal_match_found": True, "heal_confidence": 0.20})
+        recs.append({"platform": "claude", "intent": "claude.select_model", "resolved_by": "shadow",
+                     "outcome_pass": True, "heal_match_found": True, "heal_confidence": 0.85})
+    s = report.summarize(recs)
+    cm = s["per_intent"]["chatgpt.select_model"]
+    assert cm["heal_conf_n"] == 3 and abs(cm["heal_conf_sum"] - 0.60) < 1e-6
+    out = report.format_report(s)
+    assert "PX-4 drift canary" in out
+    drift = out.split("PX-4 drift canary", 1)[1]  # only the drift block
+    assert any(ln.startswith("chatgpt.select_model") and "weak" in ln for ln in drift.splitlines())
+    assert any(ln.startswith("claude.select_model") and "stable" in ln for ln in drift.splitlines())
+
+
 # ── golden corpus seeds ─────────────────────────────────────────────────────
 def _golden_files():
     return sorted(_GOLDEN.glob("*.json"))

@@ -71,7 +71,7 @@ def summarize(records: list[dict]) -> dict:
     """Aggregate records into a pure, testable summary structure."""
     per_intent: dict[str, dict] = defaultdict(
         lambda: {"total": 0, "pass": 0, "would_heal": 0, "probe_sum": 0, "probe_max": 0,
-                 "resolver_seen": 0, "resolver_matched": 0,
+                 "resolver_seen": 0, "resolver_matched": 0, "heal_conf_sum": 0.0, "heal_conf_n": 0,
                  "heal_attempts": 0, "heal_acted": 0, "heal_ok": 0}
     )
     platforms_seen: set[str] = set()
@@ -94,6 +94,10 @@ def summarize(records: list[dict]) -> dict:
             s["resolver_seen"] += 1
             if rec.get("heal_match_found") is True:
                 s["resolver_matched"] += 1
+            hc = rec.get("heal_confidence")
+            if isinstance(hc, (int, float)):
+                s["heal_conf_sum"] += float(hc)
+                s["heal_conf_n"] += 1
         if rec.get("resolved_by") == "heal":
             s["heal_attempts"] += 1
             if rec.get("acted") is True:
@@ -166,6 +170,23 @@ def format_report(summary: dict) -> str:
         for intent, s in rows:
             mr = f"{(100.0 * s['resolver_matched'] / s['resolver_seen']):.0f}%" if s["resolver_seen"] else "-"
             lines.append(f"{intent:<34}{s['resolver_seen']:>6}{mr:>7}{s['heal_acted']:>6}{s['heal_ok']:>5}")
+    # PX-4 — drift canary: anchor-strength early warning per intent. A heal rests on
+    # the durable anchor semantic_match locked onto; a weak/falling confidence is the
+    # drift signal (robust to the noisy fingerprint). 'weak' can be benign (a control
+    # that doesn't exist, e.g. ChatGPT has no P2 model picker). Floor mirrors
+    # selfheal._DRIFT_CONF_FLOOR (kept inline so the report stays import-free).
+    drift_rows = [(i, s) for i in INTENTS if (s := summary["per_intent"].get(i)) and s["resolver_seen"]]
+    if drift_rows:
+        lines.append("")
+        lines.append("PX-4 drift canary (anchor strength):")
+        lines.append(f"{'intent':<34}{'found%':>7}{'conf~':>7}  verdict")
+        lines.append("-" * 60)
+        for intent, s in drift_rows:
+            seen = s["resolver_seen"]
+            fr = (s["resolver_matched"] / seen) if seen else 0.0
+            mc = (s["heal_conf_sum"] / s["heal_conf_n"]) if s["heal_conf_n"] else 0.0
+            verdict = "DRIFT" if (seen and fr < 1.0) else ("weak" if mc < 0.35 else "stable")
+            lines.append(f"{intent:<34}{100.0 * fr:>6.0f}%{mc:>7.2f}  {verdict}")
     lines.append("=" * 68)
     return "\n".join(lines)
 

@@ -42,6 +42,7 @@ import logging
 import os
 import sys
 import traceback
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -849,6 +850,12 @@ _RESOLVE_CLICK_JS = """(params) => {
 # failed heals (a poisoned/stale strategy must not linger).
 _SELECTOR_EVICT_FAILS = 3
 
+# PX-5 promotion (§5): after this many CONSECUTIVE verified-OK heals a registry
+# entry is marked ``trusted`` (proven across runs → a candidate to bake into the
+# hardcoded selectors / auto-PR). A single fail un-trusts it (it must stay
+# reliable); 3 consecutive fails still evict it entirely.
+_PROMOTE_THRESHOLD = 3
+
 
 async def resolve_and_click(page: Any, region: Any, strategy: dict[str, str], *, do_click: bool) -> dict[str, Any]:
     """Re-resolve ``strategy`` within ``region`` and (if ``do_click``) click the
@@ -881,9 +888,11 @@ def _registry_key(intent_key: str, fingerprint: str) -> str:
 def record_heal(intent_key: str, fingerprint: str, strategy_rank: list[dict[str, str]], *, success: bool) -> dict[str, Any]:
     """Upsert the selector overlay entry under the cross-process lock and update
     its health. On success: bump success_count, reset the consecutive-fail run,
-    refresh the working strategy. On failure: bump fail_count + consecutive_fails,
-    and EVICT once ``_SELECTOR_EVICT_FAILS`` consecutive fails are reached (the
-    eviction is audited by persist_selectors). Returns the persisted overlay.
+    bump the consecutive-OK run, refresh the working strategy, and PROMOTE to
+    ``trusted`` after ``_PROMOTE_THRESHOLD`` consecutive verified heals (PX-5). On
+    failure: bump fail_count + consecutive_fails, reset the consecutive-OK run,
+    un-trust the entry, and EVICT once ``_SELECTOR_EVICT_FAILS`` consecutive fails
+    are reached (the eviction is audited by persist_selectors). Returns the overlay.
     """
     key = _registry_key(intent_key, fingerprint)
 
@@ -893,14 +902,30 @@ def record_heal(intent_key: str, fingerprint: str, strategy_rank: list[dict[str,
             "success_count": 0,
             "fail_count": 0,
             "consecutive_fails": 0,
+            "consecutive_oks": 0,
         }
+        # Lenient contract (matches _valid_selector_entry, which requires only a
+        # valid strategy_rank): normalize the health counts so a hand-edited or
+        # partially-written on-disk entry lacking them is still health-tracked and
+        # remains EVICTABLE (else the direct-subscript total below would KeyError,
+        # be swallowed, and that entry could never reach the eviction threshold).
+        for _f in ("success_count", "fail_count", "consecutive_fails", "consecutive_oks"):
+            e.setdefault(_f, 0)
         if success:
             e["success_count"] = e.get("success_count", 0) + 1
             e["consecutive_fails"] = 0
+            e["consecutive_oks"] = e.get("consecutive_oks", 0) + 1
             e["strategy_rank"] = strategy_rank  # the verified-working strategy
+            # PX-5: promote after a clean run of verified heals (proven durable).
+            if e["consecutive_oks"] >= _PROMOTE_THRESHOLD and not e.get("trusted"):
+                e["trusted"] = True
+                e["promoted_ts"] = datetime.now(timezone.utc).isoformat()
         else:
             e["fail_count"] = e.get("fail_count", 0) + 1
             e["consecutive_fails"] = e.get("consecutive_fails", 0) + 1
+            e["consecutive_oks"] = 0
+            if e.get("trusted"):
+                e["trusted"] = False  # one fail un-trusts (a trusted selector must stay reliable)
         tot = e["success_count"] + e["fail_count"]
         e["confidence"] = round(e["success_count"] / tot, 3) if tot else 0.0
         e["last_used"] = datetime.now(timezone.utc).isoformat()
@@ -911,6 +936,27 @@ def record_heal(intent_key: str, fingerprint: str, strategy_rank: list[dict[str,
         return cur
 
     return persist_selectors(_mut)
+
+
+def promotion_candidates(selectors: dict[str, Any]) -> list[dict[str, Any]]:
+    """PX-5: from a loaded selector overlay, return the ``trusted`` entries — the
+    selectors proven across ``_PROMOTE_THRESHOLD``+ consecutive verified heals, i.e.
+    the candidates to bake into the hardcoded selectors (a later human-gated auto-PR
+    step). Pure; sorted by success_count desc. Never raises.
+    """
+    out: list[dict[str, Any]] = []
+    for key, entry in (selectors or {}).items():
+        if not isinstance(entry, dict) or not entry.get("trusted"):
+            continue
+        rank = entry.get("strategy_rank") or []
+        out.append({
+            "key": key,
+            "strategy": rank[0] if rank else None,
+            "success_count": entry.get("success_count", 0),
+            "promoted_ts": entry.get("promoted_ts"),
+        })
+    out.sort(key=lambda r: r.get("success_count", 0), reverse=True)
+    return out
 
 
 async def heal_once(
@@ -1056,3 +1102,85 @@ def capture_snapshot(
             f.write(json.dumps(rec, default=str) + "\n")
     except Exception as exc:
         logger.debug("selfheal capture failed: %s", exc)
+
+
+# ── 6. PX-4 drift canary ──────────────────────────────────────────────────────
+# A heal rests on the DURABLE anchor semantic_match locked onto; the STRENGTH of
+# that anchor (heal_confidence) is the early-warning signal — it degrades when the
+# platform's UI drifts, and is robust to the noisy ui_fingerprint (which can change
+# run-to-run on a stable surface, e.g. chatgpt.enable_deep_research showed 4 distinct
+# fingerprints across 4 clean runs). Offline + pure: reads the shadow log the
+# pipeline already emits; acts on nothing.
+_DRIFT_CONF_FLOOR = 0.35    # below this, the match rests on a weak anchor (review)
+_DRIFT_DROP_MARGIN = 0.15   # a mean-confidence drop > this vs a baseline = drift
+
+
+def drift_canary(
+    records: list[dict[str, Any]], baseline: Optional[dict[str, float]] = None
+) -> dict[str, dict[str, Any]]:
+    """PX-4: per-intent UI-drift early-warning over shadow records (those carrying a
+    resolver decision, i.e. ``heal_match_found``). Aggregates the resolver match
+    rate + mean anchor confidence and returns a verdict per intent:
+
+      * ``"drift"``  — the resolver LOST the element on some runs (found_rate < 1),
+        or (with a ``baseline``) mean confidence dropped > ``_DRIFT_DROP_MARGIN``
+        below the baseline → the surface changed.
+      * ``"weak"``   — mean confidence < ``_DRIFT_CONF_FLOOR`` → the match rests on a
+        weak anchor; the intent's signal_hints likely need strengthening. May be
+        BENIGN for a control that genuinely doesn't exist (e.g. ChatGPT has no P2
+        model picker, so chatgpt.select_model grasps a low-confidence candidate).
+      * ``"stable"`` — otherwise.
+
+    ``baseline`` is an optional ``{intent: mean_confidence}`` snapshot from a known-
+    good window (see ``drift_baseline``) for trend-based drift. Pure; never raises.
+    """
+    agg: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"n": 0, "found": 0, "conf": [], "fps": set(), "reasons": Counter()}
+    )
+    for r in records or []:
+        if not isinstance(r, dict) or "heal_match_found" not in r:
+            continue  # only resolver-decision records carry the drift signal
+        a = agg[r.get("intent") or "?"]
+        a["n"] += 1
+        if r.get("heal_match_found"):
+            a["found"] += 1
+        c = r.get("heal_confidence")
+        if isinstance(c, (int, float)):
+            a["conf"].append(float(c))
+        fp = r.get("ui_fingerprint")
+        if fp:
+            a["fps"].add(fp)
+        reason = r.get("heal_reason")
+        if reason:
+            a["reasons"][reason] += 1
+    out: dict[str, dict[str, Any]] = {}
+    base = baseline or {}
+    for intent, a in agg.items():
+        n = a["n"]
+        found_rate = (a["found"] / n) if n else 0.0
+        mean_conf = (sum(a["conf"]) / len(a["conf"])) if a["conf"] else 0.0
+        if n and found_rate < 1.0:
+            verdict = "drift"
+        elif intent in base and mean_conf < base[intent] - _DRIFT_DROP_MARGIN:
+            verdict = "drift"
+        elif mean_conf < _DRIFT_CONF_FLOOR:
+            verdict = "weak"
+        else:
+            verdict = "stable"
+        out[intent] = {
+            "n": n,
+            "found_rate": round(found_rate, 3),
+            "mean_confidence": round(mean_conf, 3),
+            "fingerprints": len(a["fps"]),
+            "top_reason": (a["reasons"].most_common(1)[0][0] if a["reasons"] else None),
+            "verdict": verdict,
+        }
+    return out
+
+
+def drift_baseline(records: list[dict[str, Any]]) -> dict[str, float]:
+    """Snapshot ``{intent: mean_confidence}`` from a known-good window. Feed it back
+    into ``drift_canary(records, baseline=...)`` on a later window to detect a
+    confidence DROP (real drift) rather than only an absolute-floor weakness. Pure.
+    """
+    return {intent: v["mean_confidence"] for intent, v in drift_canary(records).items()}

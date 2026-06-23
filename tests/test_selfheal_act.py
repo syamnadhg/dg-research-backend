@@ -225,6 +225,58 @@ def test_record_heal_evicts_after_three_consecutive_fails():
     assert "evict" in audit
 
 
+# ── record_heal: PX-5 trusted-selector promotion ─────────────────────────────
+def test_record_heal_promotes_to_trusted_after_threshold():
+    rank = [{"by": "role+name", "value": "button|deep research"}]
+    k = "gemini.enable_deep_research"
+    out = {}
+    for _ in range(selfheal._PROMOTE_THRESHOLD):
+        out = selfheal.record_heal(k, "fpP", rank, success=True)
+    entry = out[selfheal._registry_key(k, "fpP")]
+    assert entry["consecutive_oks"] == selfheal._PROMOTE_THRESHOLD
+    assert entry.get("trusted") is True and entry.get("promoted_ts")
+
+
+def test_record_heal_untrusts_and_resets_oks_on_fail():
+    rank = [{"by": "role+name", "value": "button|deep research"}]
+    k = "gemini.enable_deep_research"
+    for _ in range(selfheal._PROMOTE_THRESHOLD):
+        selfheal.record_heal(k, "fpQ", rank, success=True)  # → trusted
+    out = selfheal.record_heal(k, "fpQ", rank, success=False)
+    entry = out[selfheal._registry_key(k, "fpQ")]
+    assert entry.get("trusted") is False
+    assert entry["consecutive_oks"] == 0 and entry["consecutive_fails"] == 1
+
+
+def test_promotion_candidates_returns_only_trusted_sorted():
+    sel = {
+        "gemini|enable_deep_research|fp1": {"strategy_rank": [{"by": "role+name", "value": "a"}],
+                                            "trusted": True, "success_count": 5, "promoted_ts": "t"},
+        "claude|select_model|fp2": {"strategy_rank": [{"by": "role+name", "value": "b"}],
+                                    "trusted": True, "success_count": 9},
+        "chatgpt|enable_deep_research|fp3": {"strategy_rank": [{"by": "role", "value": "c"}],
+                                             "success_count": 2},  # not trusted
+    }
+    cands = selfheal.promotion_candidates(sel)
+    assert [c["key"] for c in cands] == ["claude|select_model|fp2", "gemini|enable_deep_research|fp1"]
+    assert cands[0]["strategy"] == {"by": "role+name", "value": "b"}
+    assert selfheal.promotion_candidates({}) == []
+
+
+def test_record_heal_normalizes_countless_entry_and_still_evicts():
+    # A hand-edited / partially-written on-disk entry carrying only strategy_rank
+    # (valid per _valid_selector_entry) must still be health-tracked + EVICTABLE —
+    # not KeyError-swallowed and stranded forever.
+    k, fp = "gemini.enable_deep_research", "fpC"
+    rk = selfheal._registry_key(k, fp)
+    selfheal.persist_selectors(lambda cur: {**cur, rk: {"strategy_rank": [{"by": "role", "value": "x"}]}})
+    assert rk in selfheal.load_selectors()
+    rank = [{"by": "role", "value": "x"}]
+    for _ in range(3):
+        selfheal.record_heal(k, fp, rank, success=False)
+    assert rk not in selfheal.load_selectors()  # evicted despite missing counts
+
+
 # ── resolve_and_click JS guards ──────────────────────────────────────────────
 def test_resolve_click_js_is_read_only_unless_doclick():
     js = selfheal._RESOLVE_CLICK_JS
