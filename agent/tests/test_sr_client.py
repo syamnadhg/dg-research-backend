@@ -116,6 +116,43 @@ def test_status_account(bridge_port, capsys):
     assert "Signed in as e@x.y" in capsys.readouterr().out
 
 
+def test_status_account_no_device_nudges_pairing(bridge_port, capsys):
+    # #851 item 2: signed in but no paired device → can't run research yet, so
+    # steer to pairing instead of leaving the user at a dead end.
+    FakeFS.devices = []
+    assert sr.main(["status-account"]) == 0
+    out = capsys.readouterr().out
+    assert "Signed in as e@x.y" in out
+    assert "No device paired" in out and "add a device" in out
+
+
+def test_connected_msg_is_device_aware(bridge_port):
+    # #851 item 2: the post-sign-in confirmation depends on whether a device exists.
+    assert "fire your research" in sr._connected_msg("e@x.y")  # FakeFS has My PC
+    FakeFS.devices = []
+    assert "pair a device" in sr._connected_msg("e@x.y").lower()
+
+
+def test_login_copy_does_not_demand_login_done():
+    # #851 item 2: the user must NOT be told to run/repeat login-done — sign-in
+    # auto-completes (the bridge auto-poller, #848); the AI confirms it.
+    import inspect
+    assert "login-done" not in inspect.getsource(sr.cmd_login).lower()
+
+
+def test_prepare_stream_arm_account_wide_without_origin(monkeypatch):
+    # #851 item 3: with no chat origin in env, arming falls back to the shared
+    # account-wide watchdog directive (no per-chat shim write); rc ok, fixed
+    # dedupable job name, and the self-teardown promise in the copy.
+    for v in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_THREAD_ID"):
+        monkeypatch.delenv(v, raising=False)
+    lines, payload, rc = sr._prepare_stream_arm()
+    assert rc == 0 and payload["scoped"] is False
+    blob = "\n".join(lines)
+    assert "cronjob: create" in blob and 'name="sr-stream"' in blob
+    assert "auto-removes when the run finishes" in blob
+
+
 def test_status_account_inflight_signin_hint(monkeypatch, capsys):
     # #848 P3: a not-signed-in bridge with a sign-in mid-flight tells the user to
     # approve it in the browser (the auto-poller then connects them), instead of a

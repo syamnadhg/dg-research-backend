@@ -142,6 +142,44 @@ def test_no_phase_or_platform_link_dump_of_raw_links():
     assert msgs == []  # raw platform links never posted
 
 
+# ── #851 item 3: a stop/cancel (incl. from the web app) is announced once ──────
+
+def test_stopped_run_announced_once_when_tracked():
+    # We tracked the run while it was live (prior exists); it's now cancelled
+    # (e.g. stopped from the app) → one ⏹ notice, then silent.
+    prior = {"r1": {"announced": [], "needs": False, "attention": ""}}
+    runs = [_run(status="cancelled")]
+    msgs, state = poll.compute(runs, prior)
+    assert any("stopped" in m for m in msgs)
+    assert state["r1"]["ended"] is True
+    msgs2, _ = poll.compute(runs, state)  # already announced
+    assert not any("stopped" in m for m in msgs2)
+
+
+def test_stop_silent_on_baseline_but_recorded():
+    # First tick after arming must not replay an already-stopped run, but records
+    # it as ended so it never surfaces later either.
+    msgs, state = poll.compute([_run(status="cancelled")], {}, baseline=True)
+    assert not any("stopped" in m for m in msgs)
+    assert state["r1"]["ended"] is True
+
+
+def test_stop_not_announced_for_untracked_run():
+    # A terminal run we never saw live (no prior state) must NOT surface as a
+    # stop — only a real active→stopped transition we witnessed counts.
+    msgs, _ = poll.compute([_run(status="cancelled")], {})
+    assert not any("stopped" in m for m in msgs)
+
+
+def test_completed_run_not_announced_as_stopped():
+    # A normal finish (final phase) is the 🎉 line, never a ⏹ stop.
+    prior = {"r1": {"announced": [5], "needs": False, "attention": "", "ended": False}}
+    runs = [_run(status="completed",
+                 phase_updates=[_pu(5, "Delivery", [("Doc", "u", False)], final=True)])]
+    msgs, _ = poll.compute(runs, prior)
+    assert not any("stopped" in m for m in msgs)
+
+
 # ── #819 per-chat scoping: origin threads into the query + a per-chat state file ──
 
 def test_state_path_distinct_per_origin():

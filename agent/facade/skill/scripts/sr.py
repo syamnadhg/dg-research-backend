@@ -367,8 +367,8 @@ def cmd_login(args) -> int:
         return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
     return _emit(body, args.json, [
         f"Open this link and sign in:  {body.get('verifyUrl')}",
-        "(Sign in to Super Research, then tap Authenticate — you'll be connected automatically.)",
-        "Say  login-done  any time if you want to confirm it went through.",
+        "Sign in to Super Research, then tap Authenticate — you'll connect automatically, "
+        "no extra step. Once you're in, just ask for your research.",
     ])
 
 
@@ -377,8 +377,9 @@ def cmd_login_wait(args) -> int:
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     state = body.get("state")
+    if state == "connected":
+        return _emit(body, args.json, [_connected_msg(body.get("email") or body.get("uid"))])
     msg = {
-        "connected": f"✓ Connected as {body.get('email') or body.get('uid')}.",
         "pending": "… not approved yet — approve it in your browser; you'll connect automatically.",
         "expired": "✗ The sign-in link expired — run login again.",
         "error": f"✗ Sign-in failed: {body.get('error', 'unknown')}",
@@ -397,12 +398,37 @@ def _update_notices(body: dict) -> list[str]:
     return out
 
 
+def _has_device() -> bool:
+    """Does the signed-in account have at least one usable device? A device is the
+    prerequisite to run research. On a transient /devices error, assume YES so we
+    never wrongly nag a paired user to pair again."""
+    try:
+        code, body = _get("/devices")
+        if code == 200:
+            return bool((body or {}).get("devices"))
+    except Exception:
+        pass
+    return True
+
+
+def _connected_msg(who) -> str:
+    """Post-sign-in confirmation, device-aware: steer a deviceless account to pair
+    one (research can't run without a device) instead of saying 'fire your research'."""
+    if _has_device():
+        return f"✓ Connected as {who} — go ahead and fire your research."
+    return (f"✓ Connected as {who} — now pair a device to get started: on the computer "
+            "running Super Research, grab its pair code and tell me  add a device <code>.")
+
+
 def cmd_status_account(args) -> int:
     code, body = _get("/status")
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     if body.get("authed"):
         lines = [f"✓ Signed in as {body.get('email') or body.get('uid')}"]
+        if not _has_device():
+            lines.append("No device paired yet — say “add a device” with the pair code from "
+                         "the computer running Super Research to get started.")
     elif body.get("remoteLogin") == "pending":
         # A sign-in is mid-flight: approve it in the browser and the bridge
         # captures it automatically (no second command needed) — #848.
@@ -537,10 +563,18 @@ def cmd_research(args) -> int:
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
     where = f" on {dev}" if dev else ""
-    return _emit(body, args.json, [
+    lines = [
         f"🚀 Started “{args.topic}”{where}.",
-        "Say “status” anytime to check progress.",
-    ])
+        "I’ll post progress here as each phase finishes — or say “status” anytime.",
+    ]
+    # Auto-arm THIS chat's run-scoped streaming watchdog so progress posts without
+    # the user asking — emit the cronjob directive inline (the gateway dedups by the
+    # fixed job name; the watchdog self-removes when the run finishes). On a prep
+    # error, skip silently: the run is fine and `status` still works.
+    arm_lines, _payload, arm_rc = _prepare_stream_arm()
+    if arm_rc == 0:
+        lines += arm_lines
+    return _emit(body, args.json, lines)
 
 
 def cmd_status(args) -> int:
@@ -796,37 +830,46 @@ def cmd_install(args) -> int:
     ])
 
 
-def cmd_arm_stream(args) -> int:
-    """Prepare THIS chat's streaming watchdog and tell the agent how to arm it.
-
-    Writes a tiny shim script that bakes in this chat's origin (the cron job
-    can't take args or read the session env) and prints the exact ``script`` +
-    ``name`` for the runtime's cronjob tool. With no chat origin in the env
-    (older gateway / a context that doesn't bridge it), falls back to the shared
-    account-wide watchdog — correct for a single chat, the same as before."""
+def _prepare_stream_arm() -> tuple[list[str], dict, int]:
+    """Prepare THIS chat's run-scoped streaming watchdog and return
+    ``(lines, payload, rc)`` — ``lines`` carry the gateway ``cronjob: create …``
+    directive that arms it. Writes a shim that bakes in this chat's origin (the
+    cron can't take args or read the session env). The watchdog SELF-REMOVES once
+    the chat's runs finish, so it's safe to (re-)emit on every research start — the
+    gateway dedups by the fixed job name. No chat origin (older gateway) → the
+    shared account-wide watchdog. A shim-write error → a single ✗ line + rc=1."""
     origin = _origin_from_env()
     if origin is None:
         payload = {"script": "sr_attention_poll.py", "name": "sr-stream",
                    "schedule": "every 1m", "scoped": False}
-        return _emit(payload, args.json, [
-            "Arm the streaming watchdog (account-wide) with the cronjob tool:",
+        return ([
+            "To stream progress here, arm the watchdog with the cronjob tool "
+            "(it auto-removes when the run finishes):",
             '  cronjob: create no_agent=true schedule="every 1m" '
             'script="sr_attention_poll.py" name="sr-stream"',
-        ])
+        ], payload, 0)
     slug = _origin_slug(origin)
     script_name = f"sr_poll_{slug}.py"
     job_name = f"sr-stream-{slug}"
     err = _write_poll_shim(_scripts_dir(), script_name, origin)
     if err:
-        return _emit({"error": err}, args.json, [f"✗ {err}"], 1)
+        return ([f"✗ {err}"], {"error": err}, 1)
     payload = {"script": script_name, "name": job_name, "schedule": "every 1m",
                "scoped": True, "origin": origin}
-    return _emit(payload, args.json, [
-        "Streaming watchdog ready for THIS chat. Arm it with the cronjob tool:",
+    return ([
+        "To stream progress here, arm the watchdog with the cronjob tool — first "
+        "check it isn't already armed; it streams only THIS chat's runs and "
+        "auto-removes when they finish:",
         f'  cronjob: create no_agent=true schedule="every 1m" '
         f'script="{script_name}" name="{job_name}"',
-        "(It streams only the runs started from this chat.)",
-    ])
+    ], payload, 0)
+
+
+def cmd_arm_stream(args) -> int:
+    """Prepare THIS chat's streaming watchdog and tell the agent how to arm it.
+    (Research auto-emits the same directive; this is the explicit/standalone form.)"""
+    lines, payload, rc = _prepare_stream_arm()
+    return _emit(payload, args.json, lines, rc)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -210,6 +210,11 @@ def _attention_line(run: dict) -> str:
             "reply “retry” to resume or “skip” to move past it (or open the app).")
 
 
+def _ended_line(run: dict) -> str:
+    return (f"⏹ “{_title(run)}” stopped — the partial results so far are kept. "
+            "Say “retry” to resume, or start a new research.")
+
+
 def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[list[str], dict]:
     """Pure core (unit-tested): (chat lines to post, new state to persist).
 
@@ -243,10 +248,22 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[l
             if not baseline or live_stuck:
                 out.append(_attention_line(run))
 
+        # Ended early — stopped / cancelled from the app or chat (NOT a normal
+        # finish, which is the 🎉 final-phase line above). Announce ONCE so a chat
+        # user who stops from the web app isn't left hanging. Gated on `prior`
+        # (we tracked this run while it was live, so this is a real transition,
+        # not an old terminal run surfacing) and never on the baseline tick.
+        had_final = any((pu.get("final") for pu in run.get("phaseUpdates", []) or []))
+        ended = (not _is_active(run)) and not had_final
+        prior_ended = bool(prior.get("ended"))
+        if ended and not prior_ended and not baseline and prior:
+            out.append(_ended_line(run))
+
         new_state[rid] = {
             "announced": sorted(announced),
             "needs": needs,
             "attention": attention,
+            "ended": ended,
         }
     return out, new_state
 

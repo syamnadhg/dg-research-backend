@@ -165,9 +165,12 @@ def test_full_chat_lifecycle(live, capsys):
     assert sr.main(["device-use", "dev-a"]) == 0
     assert "Now running on" in capsys.readouterr().out
 
-    # 7. /research → a run id immediately
+    # 7. /research → a run id immediately + auto-arm the progress watchdog so
+    #    updates stream without the user asking (#851 item 3).
     assert sr.main(["research", "Tesla 2025 outlook"]) == 0
-    assert "Started" in capsys.readouterr().out
+    research_out = capsys.readouterr().out
+    assert "Started" in research_out
+    assert "cronjob: create" in research_out and "sr-stream" in research_out  # auto-armed
     rid = FakeFS.last_rid
     assert rid and rid.startswith("agent-")
     # the agent run seeds the web app's opening chat bubbles (topic + intro)

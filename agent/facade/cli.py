@@ -250,6 +250,21 @@ def cmd_connect(args: argparse.Namespace) -> int:
     startup_pinned = _startup_step(explicit=args.startup, assume_yes=assume_yes)
 
     # ── [4/4] Sign in ─────────────────────────────────────────────────────────
+    reload_hint = connect.profile(chosen.runtime).reload_hint
+    # In a chat/agent exec (non-TTY): do NOT start sign-in or print a sign-in link
+    # here. Sign-in is a SEPARATE later step — `/sr login`, AFTER /reload-skills
+    # registers the skill; showing the link in the install message strands the
+    # user (pre-reload the skill can't act on it). Collapse to the install
+    # confirmation (step 2) + the two-step next line — no link.
+    if noninteractive:
+        print()
+        if reload_hint:
+            b.line(f"{reload_hint}, then /sr login to auth a Super Research account and get started.")
+        else:
+            b.line("Open a new chat (the skill auto-loads), then /sr login to auth a Super "
+                   "Research account and get started.")
+        return 0
+
     b.step(4, 4, "Sign in")
     # Show 'logout' (switch account) in the closing card when sign-in was STARTED
     # here OR the bridge is already authed — never the redundant 'login' the user
@@ -258,18 +273,6 @@ def cmd_connect(args: argparse.Namespace) -> int:
     logged_in = started or _bridge_authed()
 
     print()
-    reload_hint = connect.profile(chosen.runtime).reload_hint
-    # In a chat/agent exec (non-TTY) the full terminal "Next" block + device
-    # heads-up are clutter when the agent relays our stdout into chat — collapse
-    # to the one line that matters there. A real terminal still gets the full card.
-    if noninteractive:
-        if reload_hint:
-            b.line(f"Next: run {reload_hint} in chat so /sr registers, then /sr login "
-                   "to finish signing in. For help just use /sr help.")
-        else:
-            b.line("Next: open a new chat (the skill auto-loads), then /sr login to finish "
-                   "signing in. For help just use /sr help.")
-        return 0
     tail = (f"  One more step in chat: run  {reload_hint}  so  /sr  registers."
             if reload_hint
             else "  In chat the skill auto-loads — open a new chat, then use  /sr .")

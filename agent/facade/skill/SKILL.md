@@ -121,13 +121,13 @@ stay owner-only in the web app):
 
 | Action | Run | Then |
 |---|---|---|
-| login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in** to Super Research, then **click Authenticate** to connect (it turns amber → green) — then run `sr.py login-done` (repeat every few seconds while it says "still waiting"). |
+| login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in**, then **click Authenticate** (it turns amber → green) — that's it, they connect **automatically**, no extra step. Give it a few seconds, then run `sr.py login-done` ONCE **yourself** to confirm, and relay its result (it greets by email + says to fire research, or to pair a device). Do **NOT** ask the user to run `login-done`, and never tell them to repeat it. |
 | logout | `sr.py logout` | **Confirm first**, then run. Removes the agent from their account. |
 | device (list) | `sr.py devices` | Relay the list (names; → = selected). |
 | device use `<name>` | `sr.py device-use "<name>"` | Switch where research runs. Name or hostname — it resolves; on an ambiguous name it lists the matches, relay that. |
 | device add `<code>` | `sr.py device-add <code>` | Pair a new device. The 8-char code is shown on the device's own Super Research screen (the user reads it to you — accept it with or without dashes). First pair = they own it; pairing someone else's device = shared with them. If it's their first device it auto-selects, so research can start right away. |
 | device remove `<name>` | `sr.py device-remove "<name>"` | **Confirm first** ("Unlink 'Office PC'?"). Owner: unlinks — the device keeps running and can be re-paired with its code (nothing deleted). Sharer: leaves the shared device. |
-| research `<topic>` | `sr.py research "<topic>"` | Relay (it names the run by title + device), then **stream** (below). |
+| research `<topic>` | `sr.py research "<topic>"` | Relay it (names the run by title + device), then **immediately arm the progress watchdog** (see **Streaming a run's progress**) so each phase completion + any stop/blocker posts here on its own. Arm it **every** time a run starts — this is what makes updates show up without the user asking. |
 | status `[title]` | `sr.py status ["<title>"]` | Relay status + links + any **⚠ Needs you** blocker. No title = most recent. |
 | updates | `sr.py updates` | Relay all active runs + their links + any that need attention. |
 | podcast `[title]` | `sr.py podcast ["<title>"]` | It prints a local **file path**. **Attach that file as a native audio / voice message** titled with the run's title — do **not** paste the path (or any URL) into chat. No title = the most recent run. If it says the audio isn't ready, relay that and try again later. |
@@ -198,12 +198,12 @@ The watchdog is **scoped to THIS chat**: a run you start here streams back only
 here — a run started in another chat (Telegram vs WhatsApp vs the web app) never
 shows up. To arm it:
 
-1. After a research starts, prepare this chat's watchdog: run
-   `python scripts/sr.py arm-stream`. It writes a tiny per-chat script and prints
-   the exact **`script`** and **`name`** to use (e.g. `script="sr_poll_<id>.py"`,
-   `name="sr-stream-<id>"`). If it prints a `✗` error about the watchdog not
-   being installed, tell the user to re-run the connect step on the host
-   (`pipx run superresearch-agent connect`) and stop.
+1. `sr.py research` already prepared this chat's watchdog and printed the exact
+   **`cronjob: create … script="sr_poll_<id>.py" name="sr-stream-<id>"`** directive
+   in its output — use THAT (you don't need a separate `arm-stream` call). If you
+   ever need to (re)generate it, `python scripts/sr.py arm-stream` prints the same
+   directive; a `✗` error about the watchdog not being installed means re-run the
+   connect step on the host (`pipx run superresearch-agent connect`) and stop.
 2. Check it isn't already armed: `cronjob(action="list")` — look for that exact
    `name`. If absent, arm it (it auto-delivers to **this** chat) using the
    `script` + `name` arm-stream just gave you:
@@ -220,6 +220,8 @@ shows up. To arm it:
    - Phase 3 → 🔗 NotebookLM + 🔒 Podcast
    - Phase 4 → 🔗 YouTube
    - Phase 5 → 📄 the Google Doc + "pipeline complete — results emailed"
+   - **⏹ "<title>" stopped** the moment a run is stopped/cancelled — including a
+     stop done from the **web app** — so a chat user is never left hanging.
    - and **⚠ "<title>" needs you: <reason>** the moment a run blocks — reply
      **"retry"** / **"skip"** here, or open the app (some blockers — signing in
      to an AI, a "are you human" check — need an on-device step first, then

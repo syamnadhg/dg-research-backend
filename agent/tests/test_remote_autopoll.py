@@ -33,6 +33,18 @@ def isolate_store(monkeypatch):
     return mem
 
 
+@pytest.fixture(autouse=True)
+def _isolate_agent_session_write(monkeypatch):
+    """On APPROVED, `_advance_remote_flow` writes the #790 agent-session row via a
+    real Firestore POST (`_write_agent_session_connected`, 15s HTTP timeout). These
+    tests verify only the POLL→CAPTURE transition — not that row write (it has its
+    own tests) — so stub it. Without this, a slow/blocking Firestore call leaves the
+    autopoll daemon mid-write past the 2s join() in
+    test_autopoll_loop_captures_after_approval → an `is_alive()` flake. set_session
+    runs BEFORE this call, so every capture assertion still holds."""
+    monkeypatch.setattr(bridge, "_write_agent_session_connected", lambda *a, **k: None)
+
+
 def _point_exchange_at(monkeypatch, fe_base: str) -> None:
     """Route the real custom-token exchange (Identity Toolkit POST) at the mock
     FE so the decode + persist path runs for real."""

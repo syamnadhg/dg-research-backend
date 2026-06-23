@@ -544,9 +544,11 @@ def test_install_is_alias_for_connect():
     assert args.func is cli.cmd_connect
 
 
-def test_connect_non_tty_proceeds_with_defaults(monkeypatch):
+def test_connect_non_tty_proceeds_with_defaults(monkeypatch, capsys):
     # A chat exec (no TTY, no --yes) must NOT route step prompts to b.confirm/EOF —
-    # it proceeds with the install defaults and relays the sign-in link.
+    # it proceeds with the install defaults and DEFERS sign-in: it must NOT start
+    # sign-in or print a link here (that's the separate `/sr login` step, after
+    # /reload-skills), just point the user at /reload-skills → /sr login.
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
     monkeypatch.setattr(cli.connect, "detect_targets",
                         lambda: [connect.Target("hermes", "local", Path("/home/u"))])
@@ -567,7 +569,10 @@ def test_connect_non_tty_proceeds_with_defaults(monkeypatch):
     assert cli.cmd_connect(args) == 0
     assert seen["installed"] == "hermes"
     assert seen["ay"] is True and seen["startup_ay"] is True   # defaults assumed
-    assert seen["signin_ni"] is True                            # link relayed, no block
+    assert "signin_ni" not in seen                              # sign-in DEFERRED, no link in chat
+    out = capsys.readouterr().out
+    assert "/reload-skills" in out and "/sr login" in out       # the two-step next line
+    assert "Sign in here" not in out                            # the link is NOT shown here
 
 
 # ── cmd_status runtime-location rendering ─────────────────────────────────────
