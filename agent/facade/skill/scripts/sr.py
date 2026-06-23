@@ -113,18 +113,6 @@ def _fail_code(http_code: int) -> int:
     return 2 if http_code == 0 else 1
 
 
-def _fmt_links(events: list) -> list[str]:
-    out = []
-    for e in events or []:
-        # audio_file is the tokenized Firebase Storage URL — it must never reach
-        # chat (the `podcast` command delivers the audio natively instead).
-        if e.get("kind") == "audio_file":
-            continue
-        label = e.get("label") or e.get("kind")
-        out.append(f"  🔗 {label}: {e.get('url')}")
-    return out
-
-
 _SR_LINK_LABELS = {
     "brief": "Brief", "chatgpt": "ChatGPT report", "gemini": "Gemini report",
     "claude": "Claude report", "podcast": "Podcast",
@@ -147,11 +135,12 @@ def _fmt_sr_links(sr_links: dict) -> list[str]:
 
 def _fmt_phase_updates(phase_updates: list) -> list[str]:
     """Per-phase links for a status snapshot — one block per DONE phase, carrying
-    its permanent Super Research link(s) (🔒, never revoked: brief + agent reports
-    + podcast) and platform-only links (🔗 / 📄 final doc) for artifacts with NO
-    SR equivalent (NotebookLM / YouTube / Google Doc). Mirrors what the streaming
-    watchdog posts so a manual `status` shows the SAME clean links — never the raw,
-    revocable platform links for the brief/reports."""
+    ONLY its permanent Super Research link(s) (🔒, never revoked: Brief + the agent
+    reports + the Podcast). Platform links (NotebookLM / YouTube / Google Doc) are
+    intentionally omitted — they can be revoked / aren't openable when signed out.
+    Mirrors what the streaming watchdog posts so a manual `status` shows the SAME
+    clean links. This is the on-demand path: it lists the SR links available SO FAR
+    while a run is mid-flight (the proactive watchdog holds them until the end)."""
     out: list[str] = []
     for pu in phase_updates or []:
         p, name, st = pu.get("phase"), pu.get("name", "Phase"), pu.get("status")
@@ -163,9 +152,43 @@ def _fmt_phase_updates(phase_updates: list) -> list[str]:
             url = lk.get("url")
             if not url:
                 continue
-            icon = "🔒" if lk.get("permanent") else ("📄" if pu.get("final") else "🔗")
-            out.append(f"     {icon} {lk.get('label') or 'link'}: {url}")
+            out.append(f"     🔒 {lk.get('label') or 'link'}: {url}")
     return out
+
+
+# Phase numbers match the web app's pipeline (P1 Brief · P2 Deep Research ·
+# P3 Podcast · P4 Video · P5 Report/Email) so the agent can answer "is P4/P5
+# skipped?" directly from this line.
+def _fmt_pipeline_config(cfg: dict | None) -> list[str]:
+    """One compact line of which phases are ON / OFF for a run, so the agent can
+    answer "is video / podcast / email skipped?" from a status check. Reads the
+    run doc's live ``pipelineConfig`` (the FE toggle + /sr skip both write here);
+    tolerates the agent-start ``skipPhases`` alias of ``skippedPhases``. Returns
+    [] when there's no config to report (a legacy doc) rather than inventing one."""
+    if not isinstance(cfg, dict) or not cfg:
+        return []
+    skipped: set[int] = set()
+    for key in ("skippedPhases", "skipPhases"):
+        v = cfg.get(key)
+        if isinstance(v, list):
+            skipped.update(p for p in v if isinstance(p, int) and not isinstance(p, bool))
+    raw_agents = cfg.get("agents") if isinstance(cfg.get("agents"), dict) else {}
+    on_agents = [name for name, key in (("ChatGPT", "chatgpt"), ("Gemini", "gemini"), ("Claude", "claude"))
+                 if raw_agents.get(key, True)]
+
+    def _s(on: bool) -> str:
+        return "on" if on else "OFF"
+
+    research_on = (2 not in skipped) and bool(on_agents)
+    research = f"P2 Research {_s(research_on)}"
+    if research_on:
+        research += f" ({', '.join(on_agents)})"
+    return [
+        f"  ⚙ Phases: P1 Brief {_s(1 not in skipped)} · {research} · "
+        f"P3 Podcast {_s(3 not in skipped)} · "
+        f"P4 Video {_s(cfg.get('videoEnabled', True) is not False)} · "
+        f"P5 Email {_s(cfg.get('emailEnabled', True) is not False)}"
+    ]
 
 
 # ── run resolution (titles, not ids) ─────────────────────────────────────────
@@ -594,15 +617,16 @@ def cmd_status(args) -> int:
     dev = _device_names().get(r.get("deviceId") or "", "")
     where = f"  ·  {dev}" if dev else ""
     lines = [f"“{title}” — {r.get('status', '?')} (phase {r.get('phase', '?')}){where}"]
+    lines += _fmt_pipeline_config(r.get("pipelineConfig"))
     lines += _attention_lines(r)
-    # Prefer the per-phase plan (clean 🔒 SR links + platform-only for the few
-    # artifacts with no SR share). Fall back to raw links + any already-minted
-    # permanent links only if the bridge didn't supply phaseUpdates (older build).
+    # Per-phase plan = the clean, SR-only 🔒 links. If the bridge supplied none yet
+    # (no phase done, or an older build), fall back to the already-minted permanent
+    # SR links — NEVER the raw platform links (SR-only policy: no NotebookLM /
+    # YouTube / Google-Doc links in chat).
     phase_updates = b2.get("phaseUpdates")
     if phase_updates:
         lines += _fmt_phase_updates(phase_updates)
     else:
-        lines += _fmt_links(b2.get("events", []))
         lines += _fmt_sr_links(b2.get("srLinks") or {})
     return _emit(b2, args.json, lines)
 
@@ -647,12 +671,14 @@ def cmd_updates(args) -> int:
     lines = []
     for r in runs:
         lines.append(f"“{r.get('title') or r.get('topic')}” — {r.get('status')} (phase {r.get('phase')})")
+        lines += _fmt_pipeline_config(r.get("pipelineConfig"))
         lines += _attention_lines(r)
         phase_updates = r.get("phaseUpdates")
         if phase_updates:
             lines += _fmt_phase_updates(phase_updates)
         else:
-            lines += _fmt_links(r.get("links", []))
+            # SR-only: fall back to permanent SR links, never raw platform links.
+            lines += _fmt_sr_links(r.get("srLinks") or {})
     return _emit(body, args.json, lines or ["No active runs."])
 
 

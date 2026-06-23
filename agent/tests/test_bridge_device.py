@@ -440,7 +440,10 @@ def test_completed_phases_clean_completion_marks_final():
     assert done.get(5) == "complete"
 
 
-def test_phase_updates_maps_links_per_phase():
+def test_phase_updates_are_sr_only():
+    # SR-only: only the permanent Super Research links surface (Brief P1, the three
+    # reports P2, the Podcast P3). Platform links (NotebookLM, YouTube, the final
+    # Google Doc) are NEVER included — P4/P5 carry no links, just progress.
     doc = {"phase": 5, "status": "completed",
            "srShares": {"brief": "B", "chatgpt": "C", "gemini": "G", "claude": "CL", "podcast": "P"},
            "links": {
@@ -452,11 +455,14 @@ def test_phase_updates_maps_links_per_phase():
     pus = {pu["phase"]: pu for pu in bridge._phase_updates(doc, sr)}
     assert [lk["label"] for lk in pus[1]["links"]] == ["Brief"] and pus[1]["links"][0]["permanent"]
     assert {lk["label"] for lk in pus[2]["links"]} == {"ChatGPT", "Gemini", "Claude"}
+    assert all(lk["permanent"] for lk in pus[2]["links"])
     p3 = {lk["label"]: lk for lk in pus[3]["links"]}
-    assert p3["NotebookLM"]["permanent"] is False and "notebooklm.google.com" in p3["NotebookLM"]["url"]
+    assert set(p3) == {"Podcast"}  # NotebookLM (platform) dropped
     assert p3["Podcast"]["permanent"] is True and p3["Podcast"]["url"].endswith("/shared/podcast/P")
-    assert [lk["url"] for lk in pus[4]["links"]] == ["https://youtu.be/x"]
-    assert pus[5]["final"] is True and pus[5]["links"][0]["url"].endswith("/d/final")
+    assert pus[4]["links"] == []                     # YouTube (platform) dropped
+    assert pus[5]["final"] is True and pus[5]["links"] == []  # final Google Doc (platform) dropped
+    all_urls = [lk["url"] for pu in pus.values() for lk in pu["links"]]
+    assert not any(("notebooklm" in u) or ("youtu.be" in u) or ("docs.google.com" in u) for u in all_urls)
 
 
 def test_sr_mint_gap_detects_unminted_complete_phase():
@@ -481,6 +487,19 @@ def test_updates_via_agent_filters_and_builds_phase_updates(live, monkeypatch):
     pus = {pu["phase"]: pu for pu in runs[0]["phaseUpdates"]}
     assert pus[1]["status"] == "complete"
     assert any(lk["url"].endswith("/shared/doc/B") and lk["permanent"] for lk in pus[1]["links"])
+
+
+def test_updates_includes_pipeline_config(live, monkeypatch):
+    # The /updates payload carries the live pipelineConfig so a chat client can
+    # answer "is video/email/podcast skipped?" without a second round-trip.
+    base, _sel = live
+    FakeFS.researches = {
+        "a1": {"id": "a1", "title": "EV", "status": "ongoing", "phase": 2, "viaAgent": True,
+               "pipelineConfig": {"videoEnabled": False, "emailEnabled": False}},
+    }
+    monkeypatch.setattr(bridge, "_mint_sr", lambda *a, **k: None)
+    runs = requests.get(base + "/updates?via=agent").json()["runs"]
+    assert runs[0]["pipelineConfig"] == {"videoEnabled": False, "emailEnabled": False}
 
 
 def test_updates_via_agent_mints_missing_sr_link(live, monkeypatch):

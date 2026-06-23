@@ -573,9 +573,9 @@ def test_status_shows_permanent_links_and_hides_tokenized_audio(bridge_port, cap
     assert "🔒 Brief: " in out and "/shared/doc/SHARE-B" in out
     assert "/shared/doc/SHARE-C" in out      # ChatGPT report (SR share, not chatgpt.com)
     assert "/shared/podcast/SHARE-P" in out  # podcast SR share
-    # The final Google Doc is the only platform link (no SR equivalent) — 📄.
-    assert "📄 Google Doc: " in out and "docs.google.com/document/d/final" in out
-    assert "🔗" not in out                    # no raw, revocable platform links for reports
+    # SR-only: NO platform links of any kind (final Google Doc, NotebookLM, YouTube).
+    assert "🔗" not in out and "📄" not in out
+    assert "docs.google.com" not in out      # the final Google Doc platform link is dropped
     assert "token=" not in out               # tokenized Storage URL never reaches chat
     assert "firebasestorage" not in out
 
@@ -586,6 +586,66 @@ def test_status_no_permanent_block_when_not_delivered(bridge_port, capsys):
                                     "phase": 2, "links": {}}
     assert sr.main(["status", "agent-e"]) == 0
     assert "Permanent links" not in capsys.readouterr().out
+
+
+def test_status_midflight_never_leaks_platform_links(bridge_port, capsys):
+    # A run with no phase done yet (empty phaseUpdates) must NOT print raw platform
+    # links from its incremental `links` — SR-only holds even in the fallback path.
+    FakeFS.researches["agent-mid"] = {
+        "id": "agent-mid", "title": "EV", "status": "ongoing", "phase": 1,
+        "links": {
+            "chatgpt": {"url": "https://chatgpt.com/share/RAW", "phase": 2},
+            "notebooklm": {"url": "https://notebooklm.google.com/n/1", "phase": 3},
+            "doc": {"url": "https://docs.google.com/document/d/RAW", "phase": 5},
+        },
+    }
+    assert sr.main(["status", "agent-mid"]) == 0
+    out = capsys.readouterr().out
+    assert "🔗" not in out
+    assert "chatgpt.com" not in out and "notebooklm" not in out and "docs.google.com" not in out
+
+
+# ── pipeline-config visibility: the agent can answer "is P4/P5 skipped?" ───────
+
+def test_fmt_pipeline_config_renders_on_off():
+    # videoEnabled/emailEnabled false → OFF; absent → on (matches the FE's !==false).
+    s = sr._fmt_pipeline_config({"videoEnabled": False, "emailEnabled": False})[0]
+    assert "P4 Video OFF" in s and "P5 Email OFF" in s
+    assert "P1 Brief on" in s and "P2 Research on" in s and "P3 Podcast on" in s
+
+
+def test_fmt_pipeline_config_skipped_and_agents():
+    s = sr._fmt_pipeline_config(
+        {"skippedPhases": [1, 3], "agents": {"chatgpt": True, "gemini": False, "claude": True}})[0]
+    assert "P1 Brief OFF" in s and "P3 Podcast OFF" in s
+    assert "P2 Research on (ChatGPT, Claude)" in s and "Gemini" not in s  # off agent omitted
+
+
+def test_fmt_pipeline_config_all_agents_off_is_research_off():
+    assert "P2 Research OFF" in sr._fmt_pipeline_config(
+        {"agents": {"chatgpt": False, "gemini": False, "claude": False}})[0]
+
+
+def test_fmt_pipeline_config_tolerates_skipPhases_alias():
+    # Agent-start config uses skipPhases; the doc/FE use skippedPhases — read both.
+    assert "P1 Brief OFF" in sr._fmt_pipeline_config({"skipPhases": [1]})[0]
+
+
+def test_fmt_pipeline_config_empty_returns_nothing():
+    assert sr._fmt_pipeline_config(None) == [] and sr._fmt_pipeline_config({}) == []
+
+
+def test_status_includes_pipeline_config_line(bridge_port, capsys):
+    # A run with video+email toggled off shows those as OFF, so the agent can answer
+    # "are P4/P5 skipped?" from a fresh status (the FE toggle writes pipelineConfig).
+    FakeFS.researches["agent-cfg"] = {
+        "id": "agent-cfg", "title": "EV", "status": "ongoing", "phase": 2,
+        "pipelineConfig": {"videoEnabled": False, "emailEnabled": False,
+                           "agents": {"chatgpt": True, "gemini": True, "claude": True}},
+    }
+    assert sr.main(["status", "agent-cfg"]) == 0
+    out = capsys.readouterr().out
+    assert "⚙ Phases:" in out and "P4 Video OFF" in out and "P5 Email OFF" in out
 
 
 def test_status_surfaces_blocker(bridge_port, capsys):

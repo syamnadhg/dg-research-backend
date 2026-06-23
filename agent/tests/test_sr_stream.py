@@ -1,8 +1,12 @@
-"""The streaming watchdog (sr_attention_poll.py) — phase-completion de-dup core.
+"""The streaming watchdog (sr_attention_poll.py) — quiet-until-completion core.
 
 Loaded standalone (as the cron `no_agent` runner would). compute() consumes the
 bridge's per-run `phaseUpdates` (one entry per done phase, with the phase's
-permanent SR link(s)) and posts each phase once + a needs-attention blocker.
+permanent SR link(s)) but is QUIET by design: it does NOT push per-phase progress.
+The only run-progress message it posts on its own is ONE completion banner + all
+the run's permanent SR links when the final phase lands. Blockers (needs-you) and
+stop/cancel notices are the other two proactive messages. Per-phase progress is
+on-demand via sr.py `status` (covered in test_sr_client).
 """
 
 import importlib.util
@@ -31,69 +35,75 @@ def _run(rid="r1", title="EV market", status="ongoing", phase_updates=None, need
             "phaseUpdates": phase_updates or [], "needsAttention": needs, "attention": attention}
 
 
-def test_phase_complete_posts_sr_link_once_then_dedups():
+def test_non_final_phase_is_silent_but_recorded():
+    # A finished non-final phase is NOT announced proactively (per-phase progress is
+    # on-demand only) — but it IS tracked so the final completion fires exactly once.
     runs = [_run(phase_updates=[_pu(1, "Research Brief", [("Brief", "https://sr.io/shared/doc/B", True)])])]
     msgs, state = poll.compute(runs, {})
-    blob = "\n".join(msgs)
-    assert "Phase 1 (Research Brief) complete" in blob
-    assert "🔒 Brief: https://sr.io/shared/doc/B" in blob
+    assert msgs == []                      # quiet — no per-phase push
     assert state["r1"]["announced"] == [1]
+
+
+def test_completion_posts_all_sr_links_once_then_dedups():
+    # When the run finishes, ONE message: the banner + every phase's permanent SR
+    # link (Brief, the three reports, the Podcast), deduped — then silent.
+    runs = [_run(status="completed", phase_updates=[
+        _pu(1, "Research Brief", [("Brief", "https://sr.io/shared/doc/B", True)]),
+        _pu(2, "Deep Research", [("ChatGPT", "u-c", True), ("Gemini", "u-g", True), ("Claude", "u-cl", True)]),
+        _pu(3, "Audio Overview", [("Podcast", "https://sr.io/shared/podcast/P", True)]),
+        _pu(5, "Delivery", [], final=True),
+    ])]
+    msgs, state = poll.compute(runs, {})
+    blob = "\n".join(msgs)
+    assert "pipeline complete" in blob and "emailed" in blob
+    assert blob.count("🔒") == 5  # Brief + 3 reports + Podcast, each once
+    for url in ("https://sr.io/shared/doc/B", "u-c", "u-g", "u-cl", "https://sr.io/shared/podcast/P"):
+        assert url in blob
+    assert state["r1"]["announced"] == [1, 2, 3, 5]
     msgs2, _ = poll.compute(runs, state)  # nothing new
     assert msgs2 == []
 
 
-def test_each_phase_announced_incrementally():
-    s1 = {"r1": {"announced": [1], "needs": False, "attention": ""}}
-    runs = [_run(phase_updates=[
-        _pu(1, "Research Brief", [("Brief", "u-b", True)]),
-        _pu(2, "Deep Research", [("ChatGPT", "u-c", True), ("Gemini", "u-g", True), ("Claude", "u-cl", True)]),
-    ])]
-    msgs, state = poll.compute(runs, s1)
-    blob = "\n".join(msgs)
-    assert "Phase 2 (Deep Research)" in blob
-    assert "Phase 1" not in blob  # already announced
-    # all three reports, each a permanent 🔒 link
-    assert blob.count("🔒") == 3 and "ChatGPT" in blob and "Gemini" in blob and "Claude" in blob
-    assert state["r1"]["announced"] == [1, 2]
-
-
-def test_final_phase_says_emailed_with_doc_link():
+def test_final_message_excludes_platform_links():
+    # Even if a platform (non-permanent) link sneaks into phaseUpdates, the final
+    # message renders ONLY permanent SR links (the bridge already drops platform
+    # links; this is belt-and-suspenders).
     runs = [_run(status="completed", phase_updates=[
-        _pu(5, "Delivery", [("Google Doc", "https://docs.google.com/d/x", False)], final=True)])]
-    msgs, _ = poll.compute(runs, {})
-    blob = "\n".join(msgs)
-    assert "pipeline complete" in blob and "emailed" in blob
-    assert "📄 Google Doc: https://docs.google.com/d/x" in blob
-
-
-def test_p3_mixes_platform_and_permanent_icons():
-    runs = [_run(phase_updates=[_pu(3, "Audio Overview", [
-        ("NotebookLM", "https://notebooklm.google.com/n/1", False),  # platform → 🔗
-        ("Podcast", "https://sr.io/shared/podcast/P", True),         # SR → 🔒
-    ])])]
+        _pu(3, "Audio Overview", [("NotebookLM", "https://notebooklm.google.com/n/1", False),
+                                  ("Podcast", "https://sr.io/shared/podcast/P", True)]),
+        _pu(5, "Delivery", [("Google Doc", "https://docs.google.com/d/x", False)], final=True),
+    ])]
     blob = "\n".join(poll.compute(runs, {})[0])
-    assert "🔗 NotebookLM: https://notebooklm.google.com/n/1" in blob
+    assert "pipeline complete" in blob and "emailed" in blob
     assert "🔒 Podcast: https://sr.io/shared/podcast/P" in blob
+    assert "notebooklm" not in blob and "docs.google.com" not in blob  # no platform links
 
 
-def test_skipped_phase_has_no_links():
+def test_skipped_phase_is_silent_but_recorded():
+    # Skipped phases are progress → not announced proactively, just tracked so the
+    # completion still fires once.
     runs = [_run(phase_updates=[_pu(4, "Video", [], status="skipped")])]
-    msgs, _ = poll.compute(runs, {})
-    assert any("Phase 4 (Video) skipped" in m for m in msgs)
-    assert not any("http" in m for m in msgs)
+    msgs, state = poll.compute(runs, {})
+    assert msgs == []
+    assert state["r1"]["announced"] == [4]
 
 
-def test_baseline_silent_on_done_phases_but_records():
-    # First tick after arming: don't replay phases already done on pre-existing
-    # runs — record them silently so only FUTURE completions post.
+def test_baseline_silent_then_quiet_until_completion():
+    # Baseline records silently; subsequent non-final phases stay silent too (per-
+    # phase is on-demand) — only the final completion ever posts, with all SR links.
     runs = [_run(phase_updates=[_pu(1, "Research Brief", [("Brief", "u-b", True)])])]
     msgs, state = poll.compute(runs, {}, baseline=True)
     assert msgs == []
     assert state["r1"]["announced"] == [1]
     runs[0]["phaseUpdates"].append(_pu(2, "Deep Research", [("ChatGPT", "u-c", True)]))
-    msgs2, _ = poll.compute(runs, state)  # only the NEW phase posts
-    blob = "\n".join(msgs2)
-    assert "Phase 2" in blob and "Phase 1" not in blob
+    msgs2, state2 = poll.compute(runs, state)  # new non-final phase → still silent
+    assert msgs2 == []
+    assert state2["r1"]["announced"] == [1, 2]
+    runs[0]["status"] = "completed"
+    runs[0]["phaseUpdates"].append(_pu(5, "Delivery", [], final=True))
+    msgs3, _ = poll.compute(runs, state2)  # completion → one message, all SR links
+    blob = "\n".join(msgs3)
+    assert "pipeline complete" in blob and "u-b" in blob and "u-c" in blob
 
 
 def test_baseline_still_raises_a_live_blocker():

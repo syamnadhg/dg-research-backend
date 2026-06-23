@@ -127,9 +127,9 @@ stay owner-only in the web app):
 | device use `<name>` | `sr.py device-use "<name>"` | Switch where research runs. Name or hostname — it resolves; on an ambiguous name it lists the matches, relay that. |
 | device add `<code>` | `sr.py device-add <code>` | Pair a new device. The 8-char code is shown on the device's own Super Research screen (the user reads it to you — accept it with or without dashes). First pair = they own it; pairing someone else's device = shared with them. If it's their first device it auto-selects, so research can start right away. |
 | device remove `<name>` | `sr.py device-remove "<name>"` | **Confirm first** ("Unlink 'Office PC'?"). Owner: unlinks — the device keeps running and can be re-paired with its code (nothing deleted). Sharer: leaves the shared device. |
-| research `<topic>` | `sr.py research "<topic>"` | Relay it (names the run by title + device), then **immediately arm the progress watchdog** (see **Streaming a run's progress**) so each phase completion + any stop/blocker posts here on its own. Arm it **every** time a run starts — this is what makes updates show up without the user asking. |
-| status `[title]` | `sr.py status ["<title>"]` | Relay status + links + any **⚠ Needs you** blocker. No title = most recent. |
-| updates | `sr.py updates` | Relay all active runs + their links + any that need attention. |
+| research `<topic>` | `sr.py research "<topic>"` | Relay it (names the run by title + device), then **immediately arm the progress watchdog** (see **Streaming a run's progress**) so the **completion** message (all SR links) + any stop/blocker posts here on its own (per-phase progress is on-demand via `status`). Arm it **every** time a run starts — this is what makes the completion + blockers show up without the user asking. |
+| status `[title]` | `sr.py status ["<title>"]` | Relay the **current phase**, the **⚙ Phases** line (which phases are on / OFF), each finished phase's 🔒 link, and any **⚠ Needs you** blocker. No title = most recent. |
+| updates | `sr.py updates` | Relay all active runs + their phase, ⚙ Phases line, links + any that need attention. |
 | podcast `[title]` | `sr.py podcast ["<title>"]` | It prints a local **file path**. **Attach that file as a native audio / voice message** titled with the run's title — do **not** paste the path (or any URL) into chat. No title = the most recent run. If it says the audio isn't ready, relay that and try again later. |
 | stop `[title]` | `sr.py stop ["<title>"]` | **Confirm first**, then run. Stops the run at the current phase and **keeps the results so far + the chat** (it does not delete anything). No title = the latest active run. |
 | retry `[title]` | `sr.py retry ["<title>"]` | Resume a run that's waiting on a decision / hit an error. Use after the user has done any on-device step the blocker asked for (e.g. signed in). |
@@ -143,26 +143,32 @@ stay owner-only in the web app):
 `research` accepts `--no-video` and `--no-email` to skip those phases, and
 `--device <id>` to override the chosen device.
 
+**Always answer "what phase / is X skipped / how's it going" from a FRESH check.**
+Whenever the user asks about a run's phase, progress, or which phases are on/off,
+run `sr.py status` (or `sr.py updates` for all runs) RIGHT THEN and report exactly
+what it returns — the **current phase** and the **⚙ Phases** line. Never answer
+from memory or from an earlier watchdog message: a run keeps advancing and the user
+can toggle phases (e.g. video / email off) in the web app at any moment, so only a
+fresh `status` is correct. If `status` shows e.g. "P4 Video OFF · P5 Email OFF",
+say those phases are skipped.
+
 ## Which link to share
 
-`sr.py status` prints two groups of links. Pick by what the user asked for:
+`sr.py status` lists each **finished** phase with its **🔒 permanent Super Research
+link** — SR-only by design: **Brief (P1)**, the **ChatGPT / Gemini / Claude reports
+(P2)**, and the **Podcast (P3)**. These are the same links embedded in the delivered
+Google Doc: they never expire and survive even "Revoke All Shares", so they're
+always safe to hand out. Platform links (NotebookLM, YouTube, the raw chatgpt.com /
+gemini / claude pages, the final Google Doc) are deliberately **not** surfaced in
+chat — they can be revoked and don't open when the user is signed out.
 
-- **"Send/get me the podcast"** (the audio itself) → run `sr.py podcast` and
-  attach the file as a **native audio / voice message** — never a link, never a
-  file path pasted as text.
-- **"Podcast link" / "link to the brief" / "the ChatGPT (P2) doc" / "share the
-  report"** → give the matching **🔒 permanent link** from the "Permanent links"
-  block (`https://…/shared/doc/…` or `/shared/podcast/…`). These are the same
-  Super Research links embedded in the delivered Google Doc — they never expire
-  and survive even "Revoke All Shares", so they're always safe to hand out.
-  (Brief = the P1 doc; ChatGPT / Gemini / Claude reports = the P2 docs.)
-- The plain 🔗 links (Google Doc brief, chatgpt.com / gemini / claude share
-  pages, NotebookLM, YouTube, the final Doc) are live **progress** links — fine
-  to relay as the run streams, but when the user asks for a link *to keep or
-  share*, prefer the 🔒 permanent one. If no permanent link exists yet (the run
-  hasn't delivered, or an older run), fall back to the plain link and say so.
-- **Never** send a `firebasestorage` / tokenized URL into chat (the client
-  already filters these out — don't dig one out of raw JSON).
+- **"Send/get me the podcast"** (the audio itself) → run `sr.py podcast` and attach
+  the file as a **native audio / voice message** — never a link, never a file path.
+- **"Podcast link" / "link to the brief" / "the ChatGPT (P2) report"** → give the
+  matching **🔒** link from the `status` output. If it isn't there yet, that phase
+  hasn't finished — say so and offer to check again in a bit.
+- **Never** send a `firebasestorage` / tokenized URL into chat (the client already
+  filters these out — don't dig one out of raw JSON).
 
 ## First-time setup
 
@@ -211,22 +217,24 @@ shows up. To arm it:
    schedule="every 1m", name="<that name>")`.
    Re-run `arm-stream` + re-check whenever a research starts, in case the job was
    removed (it's safe to re-run; it just re-writes the same script).
-3. The watchdog then posts on its own — the user never needs to ask. It sends
-   **one clean message per phase as it completes**, carrying that phase's
-   **permanent, non-revocable** Super Research link(s) (the same ones in the
-   delivered Google Doc — never raw platform links the user can't open):
-   - Phase 1 → 🔒 Research Brief
-   - Phase 2 → 🔒 ChatGPT / Gemini / Claude reports
-   - Phase 3 → 🔗 NotebookLM + 🔒 Podcast
-   - Phase 4 → 🔗 YouTube
-   - Phase 5 → 📄 the Google Doc + "pipeline complete — results emailed"
+3. The watchdog then posts on its own — the user never needs to ask. It is
+   **quiet by design**: it does **not** narrate per-phase progress. It posts only
+   these three things:
+   - **🎉 "<title>" · pipeline complete** when a run finishes — ONE message with
+     **every** phase's **🔒 permanent Super Research link** (Brief, the three
+     reports, the Podcast) + "results have been emailed". (Platform links —
+     NotebookLM / YouTube / the Google Doc — are never sent: revocable / not
+     openable when signed out.)
    - **⏹ "<title>" stopped** the moment a run is stopped/cancelled — including a
      stop done from the **web app** — so a chat user is never left hanging.
-   - and **⚠ "<title>" needs you: <reason>** the moment a run blocks — reply
+   - **⚠ "<title>" needs you: <reason>** the moment a run blocks — reply
      **"retry"** / **"skip"** here, or open the app (some blockers — signing in
      to an AI, a "are you human" check — need an on-device step first, then
      "retry").
    The watchdog already renders + de-dups all of this — you just relay it.
+   **Per-phase progress + the links so far are ON-DEMAND, not pushed:** if the user
+   asks "how's it going / what phase / send the brief link", run `sr.py status` — it
+   returns the current phase, the ⚙ Phases line, and each finished phase's 🔒 link.
 
 The watchdog is **strictly run-linked**: once this chat's runs are all finished
 (and their final phases posted), it **removes its own cron job + shim on its own**

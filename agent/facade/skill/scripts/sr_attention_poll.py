@@ -5,20 +5,27 @@ Runs as a Hermes `no_agent` cron job (created by the /sr skill via the gateway's
 `cronjob` tool, bound to the originating chat via deliver="origin"). Each tick it
 asks the loopback bridge for the AGENT-started runs (`/updates?via=agent` — so
 web-app runs never clutter the chat) and prints — VERBATIM, for the chat — only
-what is NEW since the last tick:
+what is NEW since the last tick. It is deliberately QUIET: it does NOT narrate
+per-phase progress. The only things it posts on its own are:
 
-  • one clean message per PHASE as it completes, carrying that phase's permanent,
-    non-revocable Super Research link(s) — the same ones embedded in the delivered
-    Google Doc (Brief → reports → NotebookLM+Podcast → YouTube → final Doc), NOT
-    the raw platform links (which aren't openable when you're not logged in),
+  • ONE completion message when a run finishes — the 🎉 banner + every phase's
+    permanent, non-revocable Super Research link (Brief, the three Deep-Research
+    reports, the Podcast) + "results have been emailed". Platform links
+    (NotebookLM / YouTube / final Google Doc) are never sent (revocable / not
+    openable when signed out),
   • a run that needs the user (login / verification / a snag / an error), with how
-    to act from chat ("retry" / "skip").
+    to act from chat ("retry" / "skip"),
+  • a run that was stopped / cancelled (from chat or the web app).
+
+Per-phase progress + the links available SO FAR are ON-DEMAND only: the user asks
+"status" and sr.py returns the current phase + each finished phase's SR link. The
+watchdog never pushes those — so the chat isn't spammed phase by phase.
 
 It prints NOTHING when there's nothing new — the `no_agent` contract treats empty
 stdout as silent, so the user is never spammed. State lives in a sibling file so
-de-dup (which phases were already announced) survives across the fresh, contextless
-cron sessions. Stdlib only, loopback only (same contract as sr.py); it never
-touches Firestore, tokens, or the network.
+de-dup (which phases were already seen, whether the completion was posted) survives
+across the fresh, contextless cron sessions. Stdlib only, loopback only (same
+contract as sr.py); it never touches Firestore, tokens, or the network.
 
 Why a script (not the agent): a cron LLM session is fresh each tick with no chat
 history, so it can't remember what it already posted — only a stateful script can
@@ -183,23 +190,22 @@ def _title(run: dict) -> str:
     return t if len(t) <= 60 else t[:60].rstrip() + "…"
 
 
-def _phase_lines(run: dict, pu: dict) -> list[str]:
-    """The chat message for one completed/skipped phase."""
-    t = _title(run)
-    p, name, st = pu.get("phase"), pu.get("name", "Phase"), pu.get("status")
-    if st == "skipped":
-        return [f"⏭ “{t}” · Phase {p} ({name}) skipped"]
-    if pu.get("final"):
-        head = f"🎉 “{t}” · pipeline complete — results have been emailed."
-    else:
-        head = f"✓ “{t}” · Phase {p} ({name}) complete"
-    lines = [head]
-    for lk in pu.get("links", []) or []:
-        url = lk.get("url")
-        if not url:
-            continue
-        icon = "🔒" if lk.get("permanent") else ("📄" if pu.get("final") else "🔗")
-        lines.append(f"   {icon} {lk.get('label') or 'link'}: {url}")
+def _final_lines(run: dict) -> list[str]:
+    """The single end-of-run message: the pipeline-complete banner + EVERY phase's
+    permanent Super Research link (Brief, the three reports, the Podcast), gathered
+    across all phaseUpdates and de-duped, in phase order. Platform links are never
+    here (the bridge already excludes them). Results were also emailed."""
+    lines = [f"🎉 “{_title(run)}” · pipeline complete — results have been emailed."]
+    seen: set[str] = set()
+    for pu in run.get("phaseUpdates", []) or []:
+        for lk in pu.get("links", []) or []:
+            url = lk.get("url")
+            # SR-only: render permanent Super Research links exclusively. The bridge
+            # already excludes platform links; this is belt-and-suspenders.
+            if not url or not lk.get("permanent") or url in seen:
+                continue
+            seen.add(url)
+            lines.append(f"   🔒 {lk.get('label') or 'link'}: {url}")
     return lines
 
 
@@ -218,11 +224,15 @@ def _ended_line(run: dict) -> str:
 def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[list[str], dict]:
     """Pure core (unit-tested): (chat lines to post, new state to persist).
 
-    Phase-completion driven: each run carries `phaseUpdates` (the bridge's
-    per-phase plan with permanent SR links); we post each phase once, then a
-    needs-attention blocker. ``baseline=True`` (first tick after arming) records
-    every already-done phase SILENTLY so pre-existing runs aren't replayed — but
-    still raises a blocker on a run that is stuck RIGHT NOW."""
+    Quiet by design: per-phase progress is NEVER pushed (that's on-demand via
+    `status`). The only run-progress message posted proactively is the ONE
+    completion banner + all SR links, emitted when the run's final phase lands.
+    Each phase is still tracked in `announced` (silently) so the completion fires
+    exactly once and is never replayed; a needs-attention blocker and an
+    ended-early notice are the other two proactive messages. ``baseline=True``
+    (first tick after arming) records the current phase state SILENTLY so a
+    pre-existing run isn't announced as if it just finished — but still raises a
+    blocker on a run that is stuck RIGHT NOW."""
     out: list[str] = []
     new_state: dict = {}
     for run in runs:
@@ -235,8 +245,11 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[l
             p = pu.get("phase")
             if p is None or p in announced:
                 continue
-            if not baseline:
-                out.extend(_phase_lines(run, pu))
+            # Proactively announce ONLY the final, all-links completion message —
+            # never per-phase progress (the user gets that on demand via `status`).
+            # Non-final / skipped phases are tracked silently so completion fires once.
+            if not baseline and pu.get("final"):
+                out.extend(_final_lines(run))
             announced.add(p)
 
         needs = bool(run.get("needsAttention"))

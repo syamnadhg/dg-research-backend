@@ -538,11 +538,15 @@ def _sr_mint_gap(sr_links: dict, platform: dict, done: dict) -> bool:
 
 
 def _phase_updates(doc: dict, sr_links: dict) -> list:
-    """Ordered per-phase chat updates the watchdog streams: one entry per DONE
-    phase (1-5) with its permanent SR link(s) + the platform-only links
-    (NotebookLM / YouTube / final Doc). Skipped phases carry no links."""
+    """Ordered per-phase chat updates: one entry per DONE phase (1-5) carrying
+    ONLY that phase's permanent, non-revocable Super Research share link(s) —
+    Brief (P1), the Deep-Research reports (P2), the Podcast (P3). Platform links
+    (NotebookLM / YouTube / final Google Doc) are deliberately NOT included: they
+    can be revoked and aren't openable when you're signed out, so the chat never
+    hands them out. Phases whose only artifact is a platform link (4 Video, 5
+    Delivery) — and skipped phases — carry no links (the phase is still reported
+    as progress)."""
     done = _completed_phases(doc)
-    platform = _platform_links(doc)
     out = []
     for p in (1, 2, 3, 4, 5):
         st = done.get(p)
@@ -552,14 +556,11 @@ def _phase_updates(doc: dict, sr_links: dict) -> list:
         links = []
         if st == "complete":
             for label, src in specs:
-                if src.startswith("sr:"):
-                    url = sr_links.get(src[3:])
-                elif src == "pf:gdocs":
-                    url = platform.get("gdocs") or platform.get("doc")
-                else:
-                    url = platform.get(src[3:])
+                if not src.startswith("sr:"):
+                    continue  # SR-only: never surface platform links (pf:*) in chat
+                url = sr_links.get(src[3:])
                 if url:
-                    links.append({"label": label, "url": url, "permanent": src.startswith("sr:")})
+                    links.append({"label": label, "url": url, "permanent": True})
         out.append({"phase": p, "name": name, "status": st, "links": links, "final": p == 5})
     return out
 
@@ -1752,6 +1753,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "links": runview.flatten_links(r.get("links")),
                     "srLinks": sr,
                     "phaseUpdates": phase_updates,
+                    # The live pipeline config (which phases are on/off) so a chat
+                    # client can answer "is video/email/podcast skipped?" — the FE
+                    # toggle writes these under pipelineConfig on the run doc.
+                    "pipelineConfig": r.get("pipelineConfig"),
                     "chatOrigin": r.get("chatOrigin"),
                     "needsAttention": needs,
                     "attention": attention,
