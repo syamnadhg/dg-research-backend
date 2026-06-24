@@ -207,6 +207,12 @@ def cmd_connect(args: argparse.Namespace) -> int:
         if not matches and not continued:
             b.dim(f"{explicit} not detected — will install at the default path on this host.")
     if not targets:
+        # A runtime in a STOPPED WSL distro can't be detected — its \\wsl.localhost
+        # mount is down (detect_wsl_targets now SKIPS stopped distros so it can't
+        # wedge on an uninterruptible mount probe). Surface that as the likely cause
+        # + the fix (start the distro) instead of a misleading "nothing installed".
+        if _warn_unreachable_wsl("connect"):
+            return 1
         b.no("No chat runtime found (looked for ~/.hermes, ~/.openclaw on this host and in WSL).")
         b.dim("Install Hermes or OpenClaw first, then re-run:  python research.py agent connect")
         b.dim("A runtime inside a container or a separate VM isn't auto-detected — and a")

@@ -277,7 +277,18 @@ def detect_wsl_targets(distros: list[str] | None = None,
     if sys.platform != "win32" and distros is None:
         return []
     out: list[Target] = []
-    for distro in (distros if distros is not None else wsl_distros()):
+    if distros is None:
+        # Only probe RUNNING distros. A STOPPED distro's \\wsl.localhost mount is
+        # down, and a Windows path access on it (wsl_user_homes' .exists()/.iterdir())
+        # HANGS UNINTERRUPTIBLY — a filesystem syscall can't be broken by Ctrl-C, so
+        # probing a stopped distro wedges `connect` with no way out. Intersecting with
+        # wsl_running_distros() (timeout-bounded) caps the worst case at ~15s instead
+        # of an infinite hang; a stopped runtime is surfaced as "start it" upstream.
+        running = set(wsl_running_distros())
+        candidates = [d for d in wsl_distros() if d in running]
+    else:
+        candidates = distros
+    for distro in candidates:
         root = root_for(distro) if root_for else wsl_root(distro)
         for home in wsl_user_homes(distro, root=root):
             for rt, rel in RUNTIMES.items():
