@@ -392,10 +392,17 @@ def run_agent_in_wsl(distro: str, subcommand: str, extra_args: list[str] | None 
     package pre-PyPI — flows through so the caller can offer a manual fallback)."""
     if sys.platform != "win32":
         return 1
+    # A re-connect is how a user pulls the latest published fixes. `pipx run` caches
+    # its run-venv and will NOT pick up a newer release within that cache window, so a
+    # re-connect would silently re-run the stale cached build. Force a fresh resolve for
+    # the commands that must run current code (connect installs the skill bundle + starts
+    # the bridge; serve/resurrect (re)start it); keep the cache for frequent/idempotent
+    # calls (disconnect/retire/status/doctor) so they stay fast.
+    run_flags = ["--no-cache"] if subcommand in ("connect", "serve", "resurrect") else []
     # Prefix the continuation marker as an env var (version-safe — see CONTINUED_ENV).
     inner = f"{CONTINUED_ENV}=1 " + " ".join(
         shlex.quote(p)
-        for p in ("python3", "-m", "pipx", "run", "superresearch-agent", subcommand, *(extra_args or []))
+        for p in ("python3", "-m", "pipx", "run", *run_flags, "superresearch-agent", subcommand, *(extra_args or []))
     )
     try:
         r = subprocess.run(["wsl.exe", "-d", distro, "--", "bash", "-lc", inner])

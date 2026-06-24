@@ -558,8 +558,10 @@ def test_run_agent_in_wsl_builds_login_shell_command(monkeypatch):
     assert a[:5] == ["wsl.exe", "-d", "Ubuntu-24.04", "--", "bash"]
     assert a[5] == "-lc"
     # the in-distro command is the package's own <subcommand> with forwarded flags,
-    # prefixed by the continuation marker as an env var (version-safe)
-    assert a[6] == "SUPER_AGENT_CONNECT_CONTINUED=1 python3 -m pipx run superresearch-agent connect --yes --no-login"
+    # prefixed by the continuation marker as an env var (version-safe). connect forces
+    # --no-cache so a re-connect pulls the LATEST published build, not a stale pipx-run
+    # cache (otherwise a publish wouldn't reach the runtime within pipx's cache window).
+    assert a[6] == "SUPER_AGENT_CONNECT_CONTINUED=1 python3 -m pipx run --no-cache superresearch-agent connect --yes --no-login"
 
 
 def test_run_agent_in_wsl_uses_the_given_subcommand(monkeypatch):
@@ -568,7 +570,24 @@ def test_run_agent_in_wsl_uses_the_given_subcommand(monkeypatch):
     monkeypatch.setattr(connect.subprocess, "run",
                         lambda args, **kw: seen.update(args=args) or _Rc(0))
     connect.run_agent_in_wsl("Ubuntu-24.04", "disconnect")
+    # disconnect is frequent/idempotent — keeps the pipx-run cache for speed (no --no-cache)
     assert seen["args"][6] == "SUPER_AGENT_CONNECT_CONTINUED=1 python3 -m pipx run superresearch-agent disconnect"
+
+
+def test_run_agent_in_wsl_forces_fresh_resolve_for_run_commands(monkeypatch):
+    """serve/resurrect (re)start the bridge, so they must run current code too —
+    --no-cache, like connect. status/doctor stay cached (frequent, version-agnostic)."""
+    monkeypatch.setattr(connect.sys, "platform", "win32")
+    seen = {}
+    monkeypatch.setattr(connect.subprocess, "run",
+                        lambda args, **kw: seen.update(args=args) or _Rc(0))
+    for sub in ("serve", "resurrect"):
+        connect.run_agent_in_wsl("U", sub)
+        assert "pipx run --no-cache superresearch-agent " + sub in seen["args"][6]
+    for sub in ("status", "doctor", "retire"):
+        connect.run_agent_in_wsl("U", sub)
+        assert "--no-cache" not in seen["args"][6]
+        assert "pipx run superresearch-agent " + sub in seen["args"][6]
 
 
 def test_run_agent_in_wsl_passes_through_returncode(monkeypatch):
