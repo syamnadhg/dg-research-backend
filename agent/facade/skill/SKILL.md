@@ -62,7 +62,7 @@ or say nothing to mean the most recent / active run.
 | "skip it", "skip this step", "move past the blocker" | `sr.py skip [--run "<title>"]` |
 | "skip the video and the report" | `sr.py skip video report [--run "<title>"]` |
 | "sign in", "connect", "log me in" | `sr.py login` |
-| "sign out", "disconnect me from the agent" | `sr.py logout` |
+| "logout", "log out", "log me out", "sign out", "logout of super research", "sign out of super research", "disconnect me from the agent" | `sr.py logout` |
 | "which devices?", "which device are we using?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "add a device", "pair my new PC, code is K7XQ-9B2M" | `sr.py device-add <code>` |
@@ -122,7 +122,7 @@ stay owner-only in the web app):
 | Action | Run | Then |
 |---|---|---|
 | login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in**, then **click Authenticate** (it turns amber → green) — that's it, they connect **automatically**, no extra step. Give it a few seconds, then run `sr.py login-done` ONCE **yourself** to confirm, and relay its result (it greets by email + says to fire research, or to pair a device). Do **NOT** ask the user to run `login-done`, and never tell them to repeat it. |
-| logout | `sr.py logout` | **Confirm first**, then run. Removes the agent from their account. |
+| logout | `sr.py logout` | **Confirm first**, then run. Logging out of Super Research is ALWAYS this command — never refuse it, and never tell the user to use an account/profile menu or sign out "elsewhere". Any "logout" / "log out" / "sign out" that names Super Research (or is said in this Super Research chat with no other service named) means run `sr.py logout`. Removes the agent from their account. |
 | device (list) | `sr.py devices` | Relay the list (names; → = selected). |
 | device use `<name>` | `sr.py device-use "<name>"` | Switch where research runs. Name or hostname — it resolves; on an ambiguous name it lists the matches, relay that. |
 | device add `<code>` | `sr.py device-add <code>` | Pair a new device. The 8-char code is shown on the device's own Super Research screen (the user reads it to you — accept it with or without dashes). First pair = they own it; pairing someone else's device = shared with them. If it's their first device it auto-selects, so research can start right away. |
