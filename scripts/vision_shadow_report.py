@@ -26,7 +26,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -127,6 +126,10 @@ def coord_within(vision_x: float | None, vision_y: float | None,
 
 def report(records: list[dict], filter_hotspot: str | None,
            verbose: bool) -> int:
+    # Score ONLY the legacy miss-path / CUA-shadow population here; the success-path
+    # (source=="dom_success") is a SEPARATE population (its ground truth is the DOM's
+    # resolved target, not CUA's action) scored by report_dom_success().
+    records = [r for r in records if r.get("source") != "dom_success"]
     by_hotspot: dict[str, list[dict]] = defaultdict(list)
     for r in records:
         h = r.get("hotspot_id", "?")
@@ -135,7 +138,7 @@ def report(records: list[dict], filter_hotspot: str | None,
         by_hotspot[h].append(r)
 
     if not by_hotspot:
-        print("No events found.")
+        print("No miss-path (CUA-shadow) events found.")
         return 0
 
     print(f"\n{'Hotspot':<10}{'N':<6}{'Action Agree':<15}{'Coord Prox':<13}"
@@ -221,6 +224,78 @@ def report(records: list[dict], filter_hotspot: str | None,
     return 0
 
 
+def _coord_close(vx, vy, tx, ty) -> bool | None:
+    """Euclidean proximity of Vision's proposed click to the DOM's true target
+    (both viewport-normalized 0..1). None when either pair is missing."""
+    if vx is None or vy is None or tx is None or ty is None:
+        return None
+    return ((vx - tx) ** 2 + (vy - ty) ** 2) ** 0.5 <= COORD_PROXIMITY_THRESHOLD
+
+
+def report_dom_success(records: list[dict], filter_hotspot: str | None,
+                       verbose: bool) -> None:
+    """Score the SUCCESS-path observe population (source=="dom_success") — a SEPARATE
+    population from the miss-path/CUA-shadow records (different ground truth: the DOM's
+    resolved target, not CUA's action). Action-class agreement = Vision proposed
+    "click" (the success path always required a click); coord proximity = Vision's
+    center vs dom_ground_truth.true_x/y_ratio within COORD_PROXIMITY_THRESHOLD. A hotspot
+    with no coord ground-truth (true coords None) gates on action agreement only."""
+    succ = [r for r in records if r.get("source") == "dom_success"]
+    by_hotspot: dict[str, list[dict]] = defaultdict(list)
+    for r in succ:
+        h = r.get("hotspot_id", "?")
+        if filter_hotspot and h != filter_hotspot:
+            continue
+        by_hotspot[h].append(r)
+    if not by_hotspot:
+        return
+
+    print()
+    print("== DOM-success observe population (source=dom_success) ==")
+    print(f"{'Hotspot':<12}{'N':<6}{'Action Agree':<16}{'Coord Prox':<16}{'Decision':<12}")
+    print("-" * 62)
+    for hotspot in sorted(by_hotspot.keys()):
+        events = by_hotspot[hotspot]
+        n = len(events)
+        agree_count = agree_total = prox_count = prox_total = 0
+        for r in events:
+            v = r.get("vision", {}) or {}
+            gt = r.get("dom_ground_truth", {}) or {}
+            if "error" in v or "timeout" in v:
+                continue
+            v_action = v.get("action")
+            if v_action is None:
+                continue
+            agree_total += 1
+            if v_action == "click":
+                agree_count += 1
+            close = _coord_close(v.get("x_ratio"), v.get("y_ratio"),
+                                 gt.get("true_x_ratio"), gt.get("true_y_ratio"))
+            if close is not None:
+                prox_total += 1
+                if close:
+                    prox_count += 1
+
+        agreement_pct = (agree_count / agree_total * 100.0) if agree_total else 0.0
+        proximity_pct = (prox_count / prox_total * 100.0) if prox_total else 0.0
+        meets_n = n >= PROMOTION_MIN_EVENTS
+        meets_agree = agreement_pct >= PROMOTION_MIN_ACTION_AGREEMENT_PCT
+        meets_prox = (prox_total == 0 or proximity_pct >= PROMOTION_MIN_COORD_PROXIMITY_PCT)
+        passes = meets_n and meets_agree and meets_prox
+        decision = "PASS" if passes else "(collecting)" if not meets_n else "WAIT"
+        prox_note = "" if prox_total else " [no coord GT]"
+        print(f"{hotspot:<12}{n:<6}"
+              f"{agreement_pct:>6.1f}% ({agree_count}/{agree_total})  "
+              f"{proximity_pct:>5.1f}% ({prox_count}/{prox_total}){prox_note}  "
+              f"{decision}")
+
+    print()
+    print("DOM-success scoring: action-class = Vision proposed 'click'; coord proximity")
+    print("= Vision center vs the DOM's true target (dom_ground_truth.true_x/y_ratio)")
+    print(f"within {COORD_PROXIMITY_THRESHOLD}. Hotspots marked [no coord GT] gate on action")
+    print("agreement only — surface the clicked element's bbox to score coord proximity.")
+
+
 def main() -> int:
     args = parse_args()
     log_path = Path(args.log).resolve()
@@ -240,7 +315,9 @@ def main() -> int:
     else:
         print("Window: all-time")
 
-    return report(records, args.hotspot, args.verbose)
+    rc = report(records, args.hotspot, args.verbose)
+    report_dom_success(records, args.hotspot, args.verbose)
+    return rc
 
 
 if __name__ == "__main__":

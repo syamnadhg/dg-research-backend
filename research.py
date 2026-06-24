@@ -10226,6 +10226,27 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
                         url = clip
                 except (asyncio.TimeoutError, Exception):
                     pass
+            # Track-B success-path observe (ChatGPT share). If the DOM produced a
+            # public /share/ URL, capture the REAL target bbox from the Share/Copy
+            # handle BEFORE the modal Escape (the handles go stale after), then
+            # fire-and-forget the Vision observe. Gated so the bounding_box() await
+            # only runs when the success-observer is armed.
+            if "chatgpt.com/share" in url and _vision is not None and observe_success_enabled():
+                try:
+                    _box = None
+                    _sbtn = link_btn or share_btn
+                    if _sbtn is not None:
+                        _bb = await _sbtn.bounding_box()
+                        _vp = page.viewport_size or {}
+                        if _bb and _vp.get("width") and _vp.get("height"):
+                            _box = {"cx": _bb["x"] + _bb["width"] / 2,
+                                    "cy": _bb["y"] + _bb["height"] / 2,
+                                    "vw": _vp["width"], "vh": _vp["height"]}
+                    _observe_dom_success(page, hotspot_id="p2-share", phase=2, platform="chatgpt",
+                                         current_step="open_share_menu_and_create_link",
+                                         dom_ground_truth=_gt_from_box(_box, url=url))
+                except Exception as _obe:
+                    log(f"[{label}] p2-share observe (chatgpt) skipped: {_obe}", "DEBUG")
             # Close modal
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
@@ -11747,6 +11768,9 @@ _HOTSPOT_TO_OP = {
     "7c":      "open_activity_panel",
     "7c-p1":   "open_activity_panel_p1",
     "7d":      "open_artifact_1",
+    "p3-audio-customize": "p3_audio_customize",
+    "p3-audio-download":  "p3_audio_download",
+    "p3-share":           "p3_notebook_share",
     # Any future shadow-wrapped hotspot ID not in this map falls through
     # to the default-1 path below.
 }
@@ -11805,6 +11829,45 @@ _HOTSPOT_VISION_HINTS = {
             "top-right of the artifact. Click it to create/reveal/copy the public URL."
         ),
         "success_signals": ["a share modal with Create/Copy link", "a visible or copied public share URL", "a 'link copied' confirmation"],
+    },
+    # P3 / NotebookLM success-path observe hotspots (Track-B "P3 coverage"). These
+    # are NOT shadow-wrapped on a miss path — they are observed ONLY on DOM success
+    # via _observe_dom_success. Hints agree with make_prompt_audio_generate /
+    # make_prompt_audio_download / _set_nlm_public_and_get_link.
+    "p3-audio-customize": {
+        "expected_outcome": "NotebookLM's Audio Overview customize panel opens (Format + Length controls visible)",
+        "context_hint": (
+            "Open NotebookLM's Audio Overview customize panel. The target is the gear / "
+            "'Customise' arrow / pencil-edit affordance ON the Audio Overview card in the "
+            "Studio panel (right side) — a SEPARATE small control, NOT the card body. Do NOT "
+            "click the card body, its title, thumbnail, or play area (that fires NotebookLM's "
+            "one-click DEFAULT audio = an unwanted duplicate). Click ONLY the customize gear/arrow."
+        ),
+        "success_signals": ["a customize panel with a Format dropdown (Deep Dive / Brief)",
+                            "a Length selector", "a Generate button inside the panel"],
+    },
+    "p3-audio-download": {
+        "expected_outcome": "the requested audio overview's .m4a file begins downloading",
+        "context_hint": (
+            "Download the completed audio overview from NotebookLM's Studio panel. The target "
+            "is the download affordance for the audio card — its three-dot/⋮ menu (then "
+            "'Download') or a direct download icon on the completed audio player. Target ONLY "
+            "the requested audio entry; do NOT click another audio entry's play/menu, and do "
+            "NOT navigate away from this notebook."
+        ),
+        "success_signals": ["a three-dot menu with a Download item", "a download icon on the audio player",
+                            "a file download starting"],
+    },
+    "p3-share": {
+        "expected_outcome": "the notebook is set to 'Anyone with the link' and a public share URL is produced",
+        "context_hint": (
+            "Make the NotebookLM notebook public and copy its link. The target is the 'Share' "
+            "button (top-right of the notebook), which opens a dialog with a 'Notebook access' "
+            "dropdown — set it to 'Anyone with the link', then 'Copy link' and Save. Click the "
+            "Share button / the access dropdown / Copy link — not the source list or the Studio cards."
+        ),
+        "success_signals": ["a Share dialog with a 'Notebook access' dropdown",
+                            "an 'Anyone with the link' option", "a Copy link button + a notebooklm.google.com URL"],
     },
 }
 
@@ -11879,6 +11942,82 @@ async def _shadow_observed_cua(
         log(f"[shadow:{hotspot_id}] shadow path failed, falling back to direct CUA: {_se}",
             "WARN")
         return await cua_coro_factory()
+
+
+# Success-path Vision observer (Track B). Default OFF. ORTHOGONAL to DG_VISION_TIER:
+# the shadow tier governs the MISS path (Vision shadows CUA after a DOM miss); this
+# governs the SUCCESS path (Vision observes a step the DOM ALREADY completed, so
+# DOM-robust hotspots like 7d / p2-share — which almost never miss — still yield
+# samples). Two independent flags so one run can collect BOTH populations. Read once
+# at import (a fresh BE process picks up DG_VISION_OBSERVE_SUCCESS=1 from setx); a
+# mid-run env change can't flip behavior.
+_OBSERVE_SUCCESS = (os.environ.get("DG_VISION_OBSERVE_SUCCESS") or "").strip().lower() in ("1", "true", "yes")
+
+
+def observe_success_enabled() -> bool:
+    """True when DG_VISION_OBSERVE_SUCCESS armed the success-path Vision observer."""
+    return _OBSERVE_SUCCESS
+
+
+def _observe_dom_success(page, *, hotspot_id, phase, platform, current_step,
+                         dom_ground_truth=None, expected_outcome=""):
+    """FIRE-AND-FORGET Vision observe on a DOM-SUCCESS branch (Track B success-path
+    sampler). No-op unless the Vision module is present AND observe_success_enabled().
+
+    Builds the SAME flow_context _shadow_observed_cua does (same per-hotspot hint, so
+    the success-path and miss-path Vision calls aim at the SAME target), then schedules
+    _vision.observe_only as a DETACHED task — the synchronous poll loop must never block
+    on a ~tens-of-seconds Vision ask(). observe_only is outcome-neutral (screenshot +
+    one ask, NO page interaction) and swallows all failures; the done-callback retrieves
+    .exception() so a post-run dead-page error doesn't log "Task exception was never
+    retrieved". Scheduling itself is wrapped so it can never raise into the caller."""
+    if _vision is None or not observe_success_enabled():
+        return
+    try:
+        _hint = _HOTSPOT_VISION_HINTS.get(hotspot_id, {})
+        flow_ctx = {
+            "workflow_name": hotspot_id,
+            "phase": phase,
+            "platform": platform,
+            "current_step": current_step,
+            "expected_outcome": expected_outcome or _hint.get("expected_outcome", ""),
+            "context_hint": _hint.get("context_hint", ""),
+            "success_signals": _hint.get("success_signals", []),
+            "attempts": 1,
+        }
+        task = asyncio.ensure_future(_vision.observe_only(
+            page, flow_context=flow_ctx, hotspot_id=hotspot_id,
+            run_id=os.environ.get("DG_RUN_ID"), dom_ground_truth=dom_ground_truth or {},
+        ))
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+    except Exception as _oe:
+        log(f"[observe:{hotspot_id}] schedule failed (non-fatal): {_oe}", "WARN")
+
+
+def _gt_from_box(box, **extra) -> dict:
+    """observe_only dom_ground_truth from a {cx,cy,vw,vh} viewport box (the clicked
+    target's center). true_x_ratio/true_y_ratio = center normalized by the viewport
+    (matching Vision's viewport-relative x_ratio/y_ratio), or None when no box. Extra
+    kwargs (label/clickedTag/scope/url/...) are merged in as coarse cross-checks."""
+    box = box or {}
+    tx = ty = None
+    try:
+        if box.get("vw") and box.get("vh"):
+            tx = round(box["cx"] / box["vw"], 4)
+            ty = round(box["cy"] / box["vh"], 4)
+    except Exception:
+        tx = ty = None
+    out = {"true_x_ratio": tx, "true_y_ratio": ty}
+    out.update(extra)
+    return out
+
+
+def _dom_gt_from_res(res) -> dict:
+    """dom_ground_truth from a clickAndReturn result (7c / 7c-p1): the `bbox` it now
+    returns + label/clickedTag/scope cross-checks."""
+    res = res or {}
+    return _gt_from_box(res.get("bbox"), label=res.get("label"),
+                        clickedTag=res.get("clickedTag"), scope=res.get("scope"))
 
 
 def fail_phase(phase: int, title: str = "", details: str = "",
@@ -14285,8 +14424,11 @@ async def _open_chatgpt_activity_panel(page):
             let probe = target;
             for (let i = 0; i < 6 && probe; i++) {
                 if (probe.getAttribute && probe.getAttribute('aria-expanded') === 'true') {
+                    const er = target.getBoundingClientRect();
                     return { found: true, alreadyExpanded: true, label,
-                             candidates: candidatesCount, scope };
+                             candidates: candidatesCount, scope,
+                             bbox: { cx: er.left + er.width / 2, cy: er.top + er.height / 2,
+                                     vw: window.innerWidth, vh: window.innerHeight } };
                 }
                 probe = probe.parentElement;
             }
@@ -14295,6 +14437,7 @@ async def _open_chatgpt_activity_panel(page):
             let node = target;
             for (let i = 0; i < 6 && node; i++) { tries.push(node); node = node.parentElement; }
             let clickedTag = '';
+            let clickedBox = null;
             let lastErr = '';
             for (const n of tries) {
                 try {
@@ -14308,6 +14451,7 @@ async def _open_chatgpt_activity_panel(page):
                     n.dispatchEvent(new MouseEvent('pointerup',  opts));
                     n.dispatchEvent(new MouseEvent('mouseup',    opts));
                     n.dispatchEvent(new MouseEvent('click',      opts));
+                    clickedBox = { cx: x, cy: y, vw: window.innerWidth, vh: window.innerHeight };
                     clickedTag = (n.tagName || '') +
                                  (n.getAttribute && n.getAttribute('role')
                                      ? `[${n.getAttribute('role')}]` : '');
@@ -14315,7 +14459,8 @@ async def _open_chatgpt_activity_panel(page):
                 } catch (e) { lastErr = String(e); continue; }
             }
             return { found: true, clicked: !!clickedTag, label,
-                     candidates: candidatesCount, clickedTag, scope, error: lastErr };
+                     candidates: candidatesCount, clickedTag, scope, error: lastErr,
+                     bbox: clickedBox };
         }
 
         // 2026-04-28: PASS 1 — dialog-scoped search FIRST. The DR plan
@@ -15391,7 +15536,10 @@ async def _count_claude_artifacts(page):
 
 
 async def _click_claude_artifact(page, index=0):
-    """Click the Nth artifact card (0-indexed). Returns True if clicked.
+    """Click the Nth artifact card (0-indexed). Returns a {cx,cy,vw,vh} dict (the
+    clicked card's viewport-relative click center, for Track-B coord ground-truth)
+    on success, else False — truthy on success, so callers that only test
+    truthiness are unaffected.
     2026-04-26: same modernized selectors as _count_claude_artifacts.
     2026-05-04: same assistant-scope + user/attachment strip as
     _count_claude_artifacts so the brief.md attachment chip in the
@@ -15479,8 +15627,10 @@ async def _click_claude_artifact(page, index=0):
             }});
             const targetIdx = idx < 0 ? cards.length + idx : idx;
             if (cards.length > 0 && targetIdx >= 0 && targetIdx < cards.length) {{
+                const tr = cards[targetIdx].getBoundingClientRect();
                 cards[targetIdx].click();
-                return true;
+                return {{ cx: tr.left + tr.width / 2, cy: tr.top + tr.height / 2,
+                         vw: window.innerWidth, vh: window.innerHeight }};
             }}
             return false;
         }}""", index)
@@ -15958,10 +16108,13 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
     walker = {"steps": [], "sections": [], "source_urls": []}
 
     # Layer 1: DOM probe — open panel (if not already), read panel + DOM walker
+    _click_box = None  # Track-B: the clicked card's viewport center — ONLY when WE clicked this call
     try:
         if not already_open:
             clicked = await _click_claude_artifact(page, index=0)
             if clicked:
+                if isinstance(clicked, dict):
+                    _click_box = clicked
                 await asyncio.sleep(1.5)  # Wait for panel to render
         content = await _read_claude_artifact_panel(page)
         # Structured DOM walker — cheaper + more accurate than regex on plain text.
@@ -16045,6 +16198,7 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
         "steps": steps[:15],
         "tool_uses": [f"Analyzing: {s[:80]}" for s in sections[:5]],
         "partial_text_len": len(content or ""),
+        "click_box": _click_box,  # Track-B coord ground-truth (None unless WE clicked this call)
         "artifact_tracking": True,
         "artifact_count": artifact_count,
     }
@@ -18041,6 +18195,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             _panel_open_done = True
                             log(f"[{label}] activity panel already expanded at "
                                 f"elapsed={elapsed_sec}s — label: \"{res.get('label','')[:80]}\"")
+                            _observe_dom_success(page, hotspot_id="7c-p1", phase=phase,
+                                                 platform="chatgpt",
+                                                 current_step="open_activity_panel_p1",
+                                                 dom_ground_truth=_dom_gt_from_res(res))
                         elif res.get("clicked"):
                             await asyncio.sleep(2.0)
                             verified = await _verify_chatgpt_panel_open(page)
@@ -18048,6 +18206,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                 _panel_open_done = True
                                 log(f"[{label}] activity panel opened via DOM at "
                                     f"elapsed={elapsed_sec}s — clickedTag={res.get('clickedTag','?')}")
+                                _observe_dom_success(page, hotspot_id="7c-p1", phase=phase,
+                                                     platform="chatgpt",
+                                                     current_step="open_activity_panel_p1",
+                                                     dom_ground_truth=_dom_gt_from_res(res))
                             else:
                                 _panel_dom_misses += 1
                                 log(f"[{label}] DOM clicked but panel didn't render — "
@@ -19051,6 +19213,15 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                     share_verified = True
                     share_label = link_res.label or f"{name} public share"
                     log(f"[{name}] Inline share-link extracted ({_elapsed_share:.1f}s): {share_url}")
+                    # Track-B success-path observe (Gemini/Claude share). ChatGPT is
+                    # already observed inside extract_share_link_chatgpt, so skip it here
+                    # to avoid double-counting. URL-only ground truth (the clicked element
+                    # lives inside the extractor; no bbox surfaced for these legs).
+                    if name != "ChatGPT":
+                        _observe_dom_success(page, hotspot_id="p2-share", phase=2,
+                                             platform=agent_key,
+                                             current_step="open_share_menu_and_create_link",
+                                             dom_ground_truth=_gt_from_box(None, url=share_url))
                     # F4 / DGOPS-7451 — public share is anyone-with-link viewable.
                     # On 2026-05-05 Gemini auto-created a share at
                     # gemini.google.com/share/8e52f021efe3 that had to be
@@ -20534,6 +20705,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             log(f"[Claude] Artifact tracking: {len(artifact_data.get('source_urls', []))} URLs, "
                                 f"{len(artifact_data.get('steps', []))} steps, "
                                 f"{len(artifact_data.get('sections', []))} sections")
+                            # Track-B success-path observe (once/run — independent samples).
+                            # click_box is the true target ONLY when WE clicked this poll
+                            # (already_open=False); on later polls it's None (no fresh click).
+                            if not p.get("_obs7d_done"):
+                                p["_obs7d_done"] = True
+                                _observe_dom_success(p["page"], hotspot_id="7d", phase=2,
+                                                     platform="claude", current_step="open_artifact_1",
+                                                     dom_ground_truth=_gt_from_box(
+                                                         artifact_data.get("click_box"),
+                                                         artifact_count=artifact_data.get("artifact_count")))
                     else:
                         # No artifact detected — count as DOM miss for CUA escalation.
                         if not p.get("artifact_panel_open"):
@@ -20653,6 +20834,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         p["chatgpt_panel_dom_misses"] = 0
                         log(f"[ChatGPT] activity panel already expanded at "
                             f"elapsed={int(elapsed)}s — label: \"{res.get('label','')[:80]}\"")
+                        _observe_dom_success(p["page"], hotspot_id="7c", phase=2,
+                                             platform="chatgpt", current_step="open_activity_panel",
+                                             dom_ground_truth=_dom_gt_from_res(res))
                     elif res.get("clicked"):
                         # Verify panel actually rendered (mitigates silent click failure).
                         await asyncio.sleep(2.0)
@@ -20663,6 +20847,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             log(f"[ChatGPT] activity panel opened via DOM at "
                                 f"elapsed={int(elapsed)}s — label: \"{res.get('label','')[:80]}\" "
                                 f"clickedTag={res.get('clickedTag','?')}")
+                            _observe_dom_success(p["page"], hotspot_id="7c", phase=2,
+                                                 platform="chatgpt", current_step="open_activity_panel",
+                                                 dom_ground_truth=_dom_gt_from_res(res))
                         else:
                             p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
                             log(f"[ChatGPT] DOM clicked but panel didn't render — "
@@ -28105,6 +28292,10 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                 if nlm_share_res.verified and nlm_share_res.url:
                     notebook_url = nlm_share_res.url
                     log(f"NotebookLM public share OK: {notebook_url}")
+                    # Track-B success-path observe (P3 notebook public share).
+                    _observe_dom_success(browser.page, hotspot_id="p3-share", phase=3,
+                                         platform="notebooklm", current_step="open_share_set_public_get_link",
+                                         dom_ground_truth=_gt_from_box(None, url=notebook_url))
                 else:
                     log(f"NotebookLM public share uncertain — falling back to tab URL: {nlm_share_res.error}", "WARN")
             except Exception as e:
@@ -28313,6 +28504,13 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 if "customize-open" not in _NLM_CANARY_STATE:
                     _NLM_CANARY_STATE.add("customize-open")
                     await _dump_nlm_audio_dom(browser.page, "customize-open")
+                # Track-B success-path observe (P3 customize-open). Fire-and-forget,
+                # default-OFF; boolean ground-truth (the dup-kill arrow-click is JS,
+                # no bbox — deferred to avoid touching the #778 path).
+                _observe_dom_success(browser.page, hotspot_id="p3-audio-customize", phase=3,
+                                     platform="notebooklm", current_step="open_audio_customize_panel",
+                                     dom_ground_truth=_gt_from_box(None, label="Customise Audio Overview",
+                                                                   clickedTag="button"))
             else:
                 log("[Phase3] DOM arrow-click didn't find the Customise control — "
                     "CUA will open customize itself (fail-open)", "WARN")
@@ -28686,6 +28884,14 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # Wait up to 30s for download event
         try:
             audio_path = await asyncio.wait_for(download_future, timeout=30)
+            # Track-B success-path observe (P3 audio download). Page still alive here
+            # (before the download-listener teardown). Post-download screenshot, so
+            # action agreement is noisier — boolean ground-truth, action-only scoring.
+            if audio_path:
+                _observe_dom_success(browser.page, hotspot_id="p3-audio-download", phase=3,
+                                     platform="notebooklm", current_step="download_audio_overview",
+                                     dom_ground_truth=_gt_from_box(None, label="audio download",
+                                                                   scope="studio-panel"))
         except asyncio.TimeoutError:
             log("Download event not received — checking common download dirs...", "WARN")
             # Silent: the Downloads-folder scan below has its own fail_phase
@@ -30132,6 +30338,14 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     # Clear dedup cache — stale keys from a prior run in the same process
     # would otherwise suppress early events in this run.
     _last_progress.clear()
+    # Stamp the live per-run id into the env so Vision shadow + observe-only records
+    # carry the REAL run id (both paths read DG_RUN_ID from the env at log time).
+    # Without this they inherit whatever DG_RUN_ID was last set to in the environment
+    # (e.g. a lingering Track-A E2E value), which mislabels every record with the same
+    # stale id. Process-safe: worker parallelism is one-run-per-process (the per-process
+    # _runtime was reset just above), so the process-wide env can't collide across runs.
+    if run_id:
+        os.environ["DG_RUN_ID"] = str(run_id)
     # Defensive: clear the OS clipboard at run start. Several share-link
     # extractors (NotebookLM, ChatGPT share-URL, Claude artifact copy)
     # fall back to reading the clipboard via get_clipboard() when DOM

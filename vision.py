@@ -838,6 +838,104 @@ async def shadow_observe_then_cua(
     return cua_result
 
 
+async def observe_only(
+    page: Any,
+    *,
+    flow_context: dict,
+    hotspot_id: str,
+    vision: VisionClient | None = None,
+    run_id: str | None = None,
+    high_stakes: bool = False,
+    dom_ground_truth: dict | None = None,
+) -> dict:
+    """DOM-SUCCESS observer: run Vision PURELY as an observer on a step the DOM
+    path ALREADY completed successfully, log its proposed action for offline
+    comparison, and NEVER touch the page. There is NO CUA leg and NO gather —
+    this is the success-path sibling of ``shadow_observe_then_cua`` (which only
+    fires on a DOM MISS, so DOM-robust hotspots like 7d / p2-share almost never
+    log). Every record carries ``source: "dom_success"`` to keep this always-on
+    population separate from the legacy miss-path records (which have a ``cua``
+    block and no ``source``).
+
+    Outcome-neutral and never-raise: ONE screenshot + ONE ask()
+    (transport_retry=False, self-bounded by an outer wait_for), NO execute_action,
+    and every failure (incl. timeout / BudgetExceeded / a dead page after the run
+    ends) is swallowed into an {error}/{timeout} record. Safe to fire-and-forget
+    from inside a synchronous poll loop.
+
+    Caller enables via the success-path flag (research.py DG_VISION_OBSERVE_SUCCESS)
+    and should gate on it before calling — this helper does not read it.
+    ``dom_ground_truth`` is the caller-supplied truth the report scores Vision
+    against: ``{true_x_ratio, true_y_ratio, label, clickedTag, scope, url}``
+    (coords None where the DOM helper doesn't surface a bbox). Returns the
+    appended record (handy for tests); the append itself never raises.
+    """
+    vc = vision or default_client()
+    t0 = time.time()
+
+    async def _shot_and_ask() -> ActionResult:
+        img, meta = await vc.screenshot(page)
+        await _harvest_fixture(img, hotspot_id, run_id)
+        return await vc.ask(
+            img, meta, flow_context,
+            high_stakes=high_stakes, transport_retry=False,
+        )
+
+    try:
+        result = await asyncio.wait_for(_shot_and_ask(), timeout=DEFAULT_TIMEOUT_S + 8)
+        # Mirror shadow_observe_then_cua's record shapes so the report categorises
+        # observe-only samples the same way (timeout / transport-error / full action).
+        if result.action == "declare_failure":
+            r = (result.reason or "").lower()
+            if "timeout" in r:
+                vision_record: dict = {"timeout": True, "elapsed_ms": int(result.latency_ms),
+                                       "reason": result.reason}
+            elif (r.startswith("transport error") or r.startswith("unexpected error")
+                  or "did not return" in r):
+                vision_record = {"error": result.reason, "elapsed_ms": int(result.latency_ms)}
+            else:
+                vision_record = _observe_action_record(result)
+        else:
+            vision_record = _observe_action_record(result)
+    except asyncio.TimeoutError:
+        vision_record = {"timeout": True, "elapsed_ms": int((time.time() - t0) * 1000)}
+    except Exception as exc:  # incl. BudgetExceeded, a closed page/context post-run
+        vision_record = {"error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                         "elapsed_ms": int((time.time() - t0) * 1000)}
+
+    rec = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "run_id": run_id,
+        "hotspot_id": hotspot_id,
+        "phase": flow_context.get("phase"),
+        "agent": flow_context.get("platform"),
+        "source": "dom_success",
+        "vision": vision_record,
+        "dom_ground_truth": dom_ground_truth or {},
+    }
+    _append_shadow_record(rec)
+    return rec
+
+
+def _observe_action_record(result: ActionResult) -> dict:
+    """The full Vision action record (same shape the shadow path logs) — used by
+    observe_only(). Kept as a module helper so the success-path and the existing
+    shadow path stay byte-identical in what they record."""
+    return {
+        "action": result.action,
+        "reason": result.reason,
+        "confidence": result.confidence,
+        "next_expected_state": result.next_expected_state,
+        "x_ratio": result.x_ratio,
+        "y_ratio": result.y_ratio,
+        "model": result.model_used,
+        "latency_ms": result.latency_ms,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "low_confidence": result.low_confidence,
+    }
+
+
 async def with_vision_fallback(
     page: Any,
     primary_fn: Callable[[], Awaitable[Any]],
