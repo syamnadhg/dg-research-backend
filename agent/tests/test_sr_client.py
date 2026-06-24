@@ -123,14 +123,14 @@ def test_status_account_no_device_nudges_pairing(bridge_port, capsys):
     assert sr.main(["status-account"]) == 0
     out = capsys.readouterr().out
     assert "Signed in as e@x.y" in out
-    assert "No device paired" in out and "add a device" in out
+    assert "No device connected" in out and "access code" in out
 
 
 def test_connected_msg_is_device_aware(bridge_port):
     # #851 item 2: the post-sign-in confirmation depends on whether a device exists.
-    assert "fire your research" in sr._connected_msg("e@x.y")  # FakeFS has My PC
+    assert "all set" in sr._connected_msg("e@x.y")  # FakeFS has My PC
     FakeFS.devices = []
-    assert "pair a device" in sr._connected_msg("e@x.y").lower()
+    assert "access code" in sr._connected_msg("e@x.y").lower()
 
 
 def test_login_copy_does_not_demand_login_done():
@@ -197,30 +197,35 @@ def _no_session_bridge(monkeypatch, *, remote_state: str | None = None):
 
 
 def test_research_when_not_signed_in_steers_to_fresh_login(monkeypatch, capsys):
-    # #848 follow-up: a research attempt while not signed in must steer to a FRESH
-    # `login` (a prior link expires ~10 min, so "the link I sent" is a dead end),
-    # and never tell the user to run login-done (auto-capture removed that step).
+    # Research while not signed in → hand back a ready-to-click sign-in LINK (start a
+    # fresh remote-login) and tell the user to log in then ask again — natural language,
+    # no command word, no login-done, no auto-resume. (Mock the broker so no network.)
+    monkeypatch.setattr(bridge.devicelogin, "start", lambda **kw: {
+        "pollToken": "PT", "code": "ABCD",
+        "verifyUrl": "https://superresearch.io/c/ABCD", "expiresIn": 600,
+    })
     httpd = _no_session_bridge(monkeypatch)
     try:
         rc = sr.main(["research", "Golden retriever"])
         out = capsys.readouterr().out.lower()
         assert rc != 0
-        assert "golden retriever" in out and "login" in out
-        assert "connect automatically" in out and "login-done" not in out
+        assert "not signed in" in out and "log in here" in out
+        assert "superresearch.io/c/abcd" in out
+        assert "login-done" not in out
     finally:
         httpd.shutdown()
         httpd.server_close()
 
 
 def test_research_when_signin_in_flight_says_approve_in_browser(monkeypatch, capsys):
-    # A sign-in is mid-flight → tell the user to approve it in the browser (the
-    # bridge auto-captures), not to start a fresh login.
+    # A sign-in is mid-flight → tell the user to finish it in the browser (the bridge
+    # auto-captures), not to start a fresh login. Natural language, no command word.
     httpd = _no_session_bridge(monkeypatch, remote_state="pending")
     try:
         rc = sr.main(["research", "Golden retriever"])
         out = capsys.readouterr().out.lower()
         assert rc != 0
-        assert "approve" in out and "browser" in out
+        assert "browser" in out and ("finish" in out or "almost" in out)
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -237,7 +242,7 @@ def test_devices_empty_guides_pairing(bridge_port, capsys):
     FakeFS.devices = []
     assert sr.main(["devices"]) == 0
     out = capsys.readouterr().out
-    assert "device add" in out and "pair code" in out
+    assert "access code" in out and "superresearch --pair" in out
 
 
 def test_device_use_by_name(bridge_port, capsys):
@@ -471,8 +476,9 @@ def test_podcast(bridge_port, monkeypatch, capsys):
                         lambda url, dest_dir, rid: (dest_dir / f"{rid}.m4a", 2048))
     assert sr.main(["podcast", "agent-p"]) == 0
     out = capsys.readouterr().out
-    assert "Podcast ready" in out and "My Podcast Run" in out
-    assert "agent-p.m4a" in out
+    assert "My Podcast Run" in out  # the run title is the caption
+    assert "agent-p.m4a" in out     # the BARE local path (the gateway auto-attaches it)
+    assert "Audio:" not in out and "[[audio" not in out  # no decoration that breaks auto-attach
     assert "token=" not in out  # no tokenized URL leaks into chat
 
 

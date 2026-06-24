@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superresearch-agent"
-version = "0.1.7"
+version = "0.1.8"
 description = "Install Super Research into a chat runtime (Hermes / OpenClaw) with `pipx run superresearch-agent connect` — an account-authed loopback bridge that drives the user's own Super Research from chat."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,7 +30,11 @@ agent = "facade.cli:main"
 packages = ["facade"]
 
 [tool.setuptools.package-data]
-facade = ["web/*.html", "web/icons/*.png", "skill/SKILL.md", "skill/scripts/*.py"]
+# Explicit script list (NOT a *.py glob): the runtime generates per-chat watchdog
+# shims (sr_poll_<platform>_<hash>.py, with a baked chat_id) into this dir, and a
+# glob would bundle those stray files — junk + a chat-id leak — into the published
+# wheel. Only the two real skill scripts ship.
+facade = ["web/*.html", "web/icons/*.png", "skill/SKILL.md", "skill/scripts/sr.py", "skill/scripts/sr_attention_poll.py"]
 
 [tool.ruff]
 line-length = 100

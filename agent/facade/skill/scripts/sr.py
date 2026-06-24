@@ -252,7 +252,8 @@ def _resolve_device_arg(arg: str) -> tuple[dict | None, list[str]]:
         return None, [f"✗ {body.get('error', code)}"]
     devices = body.get("devices", [])
     if not devices:
-        return None, ["No devices on this account yet — add one with: device add <pair code>"]
+        return None, ["No devices connected yet — paste the access code from the computer "
+                      "running Super Research and I’ll connect it."]
     a = arg.strip().lower()
     for d in devices:
         if a == (d.get("id") or "").lower():
@@ -267,8 +268,8 @@ def _resolve_device_arg(arg: str) -> tuple[dict | None, list[str]]:
         return sub[0], []
     if sub:
         names = ", ".join(f"“{_dev_label(d)}”" for d in sub)
-        return None, [f"That matches more than one device ({names}) — say the full name."]
-    return None, [f"No device matching “{arg}” — say “devices” to see them."]
+        return None, [f"That matches more than one device ({names}) — tell me the full name."]
+    return None, [f"No device matching “{arg}” — ask to see your devices."]
 
 
 def _attention_lines(r: dict) -> list[str]:
@@ -284,11 +285,11 @@ def _attention_lines(r: dict) -> list[str]:
     lines = [f"  ⚠ Needs you: {text or 'a decision is needed'}"]
     kind = pd.get("kind") if isinstance(pd, dict) else None
     if kind == "login_required":
-        lines.append("  → sign in on the device, then say: retry")
+        lines.append("  → sign in on the device, then tell me to retry.")
     elif kind == "human_verification_required":
-        lines.append("  → finish the check on the device, then say: retry")
+        lines.append("  → finish the check on the device, then tell me to retry.")
     else:
-        lines.append("  → say “retry” to resume or “skip” to move past it (or open the app)")
+        lines.append("  → tell me to retry to resume, or skip to move past it (or open the app).")
     return lines
 
 
@@ -404,7 +405,7 @@ def cmd_login_wait(args) -> int:
         return _emit(body, args.json, [_connected_msg(body.get("email") or body.get("uid"))])
     msg = {
         "pending": "… not approved yet — approve it in your browser; you'll connect automatically.",
-        "expired": "✗ The sign-in link expired — run login again.",
+        "expired": "✗ The sign-in link expired — ask me to send a fresh sign-in link.",
         "error": f"✗ Sign-in failed: {body.get('error', 'unknown')}",
     }.get(state, f"state: {state}")
     return _emit(body, args.json, [msg])
@@ -435,12 +436,13 @@ def _has_device() -> bool:
 
 
 def _connected_msg(who) -> str:
-    """Post-sign-in confirmation, device-aware: steer a deviceless account to pair
-    one (research can't run without a device) instead of saying 'fire your research'."""
+    """Post-sign-in confirmation, device-aware: steer a deviceless account to connect
+    one (research can't run without a device) instead of saying 'fire your research'.
+    Natural language only — no command syntax (the user just talks to the assistant)."""
     if _has_device():
-        return f"✓ Connected as {who} — go ahead and fire your research."
-    return (f"✓ Connected as {who} — now pair a device to get started: on the computer "
-            "running Super Research, grab its pair code and tell me  add a device <code>.")
+        return f"✓ Connected as {who} — you’re all set."
+    return (f"✓ Connected as {who}. To get started, paste the access code from the computer "
+            "running Super Research and I’ll connect it.")
 
 
 def cmd_status_account(args) -> int:
@@ -450,16 +452,16 @@ def cmd_status_account(args) -> int:
     if body.get("authed"):
         lines = [f"✓ Signed in as {body.get('email') or body.get('uid')}"]
         if not _has_device():
-            lines.append("No device paired yet — say “add a device” with the pair code from "
-                         "the computer running Super Research to get started.")
+            lines.append("No device connected yet — paste the access code from the computer "
+                         "running Super Research and I’ll connect it.")
     elif body.get("remoteLogin") == "pending":
         # A sign-in is mid-flight: approve it in the browser and the bridge
         # captures it automatically (no second command needed) — #848.
         lines = ["A sign-in is in progress — approve it in your browser; you'll connect automatically."]
     elif body.get("remoteLogin") in ("error", "expired"):
-        lines = ["The last sign-in didn't complete — run login again."]
+        lines = ["The last sign-in didn't complete — just ask me to log you in again."]
     else:
-        lines = ["Not signed in — run login."]
+        lines = ["Not signed in — tell me to log you in and I'll send a link."]
     lines += _update_notices(body)
     return _emit(body, args.json, lines)
 
@@ -472,9 +474,10 @@ def cmd_devices(args) -> int:
     selected = body.get("selectedDeviceId")
     if not devices:
         return _emit(body, args.json, [
-            "No devices on this account yet.",
-            "On the computer running Super Research, grab the pair code from its "
-            "screen, then tell me:  device add <code>",
+            "No devices connected yet.",
+            "Paste the access code from the computer running Super Research and I’ll connect it.",
+            "",
+            "No backend setup? Run  pipx install superresearch  there, then  superresearch --pair.",
         ])
     lines = ["Devices:"]
     for d in devices:
@@ -482,8 +485,8 @@ def cmd_devices(args) -> int:
         kind = "owned" if d.get("owned") else "shared"
         lines.append(f"  {mark} {_dev_label(d)}  ({kind})")
     if not selected:
-        lines.append("Pick one:  device use <name>")
-    lines.append("Add one:   device add <pair code>")
+        lines.append("Tell me which one you’d like to use.")
+    lines.append("You can add, remove, or switch devices anytime — just ask.")
     return _emit(body, args.json, lines)
 
 
@@ -525,7 +528,8 @@ def cmd_device_add(args) -> int:
     kind = "yours" if action in ("initial-pair", "re-pair") else "shared with you"
     lines = [f"✓ Added “{name}” — it’s {kind} now."]
     if body.get("selected"):
-        lines.append("It’s selected — say “research <topic>” to start.")
+        lines.append("It’s selected, so you can start researching whenever you like.")
+    lines.append("You can also add, remove, or switch devices anytime — just ask.")
     return _emit(body, args.json, lines)
 
 
@@ -575,13 +579,29 @@ def cmd_research(args) -> int:
             sc, sbody = _get("/status")
             if sc == 200 and sbody.get("remoteLogin") == "pending":
                 return _emit(body, args.json, [
-                    f"Can't start “{args.topic}” yet — approve the sign-in link in your browser "
-                    "and you'll connect automatically. Then ask for it again.",
+                    "You're almost signed in — finish in your browser, then ask again.",
+                ], _fail_code(code))
+            # Hand back a ready-to-click sign-in link (start a fresh remote-login) so the
+            # user never needs a command — they click, approve, and the bridge captures it
+            # automatically (#848). Keep it simple: log in, then ask again (no auto-resume).
+            lc, lbody = _post("/login/remote/start", {})
+            link = lbody.get("verifyUrl") if lc == 200 else None
+            if link:
+                return _emit({**body, "verifyUrl": link}, args.json, [
+                    "You're not signed in yet. Log in here, then ask again:",
+                    f"  {link}",
                 ], _fail_code(code))
             return _emit(body, args.json, [
-                f"Can't start “{args.topic}” — Super Research isn't signed in.",
-                "Say  login  for a fresh sign-in link, approve it in your browser "
-                "(you connect automatically), then ask for the research again.",
+                "You're not signed in yet — tell me to log you in and I'll send a link.",
+            ], _fail_code(code))
+        # Signed in but no device on the account yet → guide connecting one, plainly.
+        err = str(body.get("error", "")).lower()
+        if "no device" in err:
+            return _emit(body, args.json, [
+                "Paste the access code to connect an existing Research Computer.",
+                "",
+                "No backend setup? Run  pipx install superresearch  on that computer, "
+                "then  superresearch --pair  to connect it.",
             ], _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
@@ -653,12 +673,14 @@ def cmd_podcast(args) -> int:
     if code != 200:
         return _emit(b2, args.json, [f"✗ {b2.get('error', code)}"], _fail_code(code))
     title = b2.get("title") or "Podcast"
-    name = b2.get("filename") or f"{title}.m4a"
+    # Emit a short caption + the audio file's BARE path on its own line. The runtime
+    # auto-detects a bare on-disk media path, delivers the file as a native audio /
+    # voice message, and STRIPS the path from the visible text — so the user sees the
+    # caption + the audio, never the path. Do NOT decorate or wrap the path (no 🔊 /
+    # "Audio:" label, no backticks, no [[audio]] markup) — that defeats the auto-attach.
     return _emit(b2, args.json, [
-        f"🎧 Podcast ready: “{title}”",
-        f"Send this file as a native audio / voice message named “{name}” "
-        "(attach the file — don’t paste the path):",
-        f"  {b2.get('localPath')}",
+        f"🎧 {title}",
+        f"{b2.get('localPath')}",
     ])
 
 
@@ -756,10 +778,20 @@ def cmd_skip(args) -> int:
 
 
 def cmd_logout(args) -> int:
+    # Capture WHO we're logging out first (the /logout response only returns ok),
+    # so we can name the account in the confirmation.
+    who = ""
+    try:
+        sc, sb = _get("/status")
+        if sc == 200 and sb.get("authed"):
+            who = sb.get("email") or sb.get("uid") or ""
+    except Exception:
+        pass
     code, body = _post("/logout")
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
-    return _emit(body, args.json, ["✓ Logged out — account session cleared."])
+    msg = f"✓ Logged out of {who}." if who else "✓ Logged out — account session cleared."
+    return _emit(body, args.json, [msg])
 
 
 def cmd_version(args) -> int:

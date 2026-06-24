@@ -190,7 +190,11 @@ def test_full_chat_lifecycle(live, capsys):
     }
     assert sr.main(["podcast", rid]) == 0
     pod_out = capsys.readouterr().out
-    assert "Podcast ready" in pod_out and f"{rid}.m4a" in pod_out
+    # New podcast output = "🎧 <title>" caption + the BARE local path on its own line
+    # (the gateway auto-attaches the bare path as native audio + strips it). No
+    # "Audio:" / "[[audio" decoration, which would break the auto-attach.
+    assert "Tesla 2025 outlook" in pod_out and f"{rid}.m4a" in pod_out
+    assert "Audio:" not in pod_out and "[[audio" not in pod_out
     assert "token=" not in pod_out  # the Storage download token never reaches chat
 
     # 10. /skip → tunes the run config (run targeted by --run; phases are positional)

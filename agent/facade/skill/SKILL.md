@@ -44,6 +44,19 @@ research, status, podcast, or any other action yourself in chat — Super Resear
 runs on the user's device, not in this conversation, and an improvised answer is
 worse than the one-line error.
 
+## How you reply — plain language, never command syntax
+
+Everything you say back to the user is plain, simple, and to the point. **Never
+show the user command syntax** — not `research <topic>`, not `/sr login`, not
+`device add <code>`, not `login-done`. Those are how *you* drive the client, not
+something the user should see or type, and placeholders like `<topic>` intimidate.
+Say "just tell me what to research", "log in here: ‹link›", or "send me the code"
+instead. The **only** commands you ever show the user are the real terminal
+commands they run on their research computer — `pipx install superresearch` and
+`superresearch --pair` — because those are unavoidable machine setup. The client's
+output is already written this way: relay it as-is, and never re-introduce command
+syntax or tack on extra steps.
+
 ## Talk to it in plain language
 
 The user rarely types exact commands — interpret what they mean and pick the
@@ -95,33 +108,32 @@ action, ask — don't guess. The same stop/logout confirmation rule applies.
 When the user sends just **`/sr`** (or asks what Super Research is / how to
 start), run `sr.py status-account`, then:
 
-- **Not signed in** → welcome them; the first step is **`/sr login`** (sign in
-  once on their phone). Then list the actions below.
-- **Signed in** → greet them by their account email, list the actions, and point
-  them at **"research <topic>"** to start (and **"which devices?"** to choose
+- **Not signed in** → welcome them; the first step is to **sign in** — tell them
+  to just say "log me in" and you'll send a sign-in link. Then list the actions below.
+- **Signed in** → greet them by their account email, list the actions, and invite
+  them to **just name a topic to research** (and to ask "which devices?" to choose
   where it runs).
 
 The actions (sharing a device with other people, revoking sharers, and resets
-stay owner-only in the web app):
+stay owner-only in the web app) — describe each in plain words, never as commands:
 
-- **sign in / out** — `/sr login` · `/sr logout`
-- **devices** — "which devices?" · switch by name · "add a device" (pair code) ·
-  "remove <name>"
-- **research a topic** — "research <topic>"
-- **check a run** — "status" (most recent) or "status <title>"
-- **what's running** — "updates"
+- **sign in / out** — "log me in" · "log me out"
+- **devices** — "which devices?" · switch by name · add one by pasting its code ·
+  "remove the old laptop"
+- **research a topic** — just name it ("research the EV battery market")
+- **check a run** — "how's it going?" (most recent) or by title
+- **what's running** — "what's running?"
 - **podcast** — "send me the podcast" (delivered as a voice message)
 - **stop a run** — "stop" (keeps the results so far)
 - **resume a blocked run** — "retry" or "skip"
 - **trim phases** — "skip the video / report"
-- **version / update** — "what version?" (shows both + any update available) ·
-  "update Super Research" (backend) · "update the agent" (the chat agent itself)
+- **version / update** — "what version?" · "update Super Research" · "update the agent"
 
 ## Action → what to run
 
 | Action | Run | Then |
 |---|---|---|
-| login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in**, then **click Authenticate** (it turns amber → green) — that's it, they connect **automatically**, no extra step. Give it a few seconds, then run `sr.py login-done` ONCE **yourself** to confirm, and relay its result (it greets by email + says to fire research, or to pair a device). Do **NOT** ask the user to run `login-done`, and never tell them to repeat it. |
+| login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in**, then **click Authenticate** (it turns amber → green) — that's it, they connect **automatically**, no extra step. Give it a few seconds, then run `sr.py login-done` ONCE **yourself** to confirm, and relay its result (it greets by email + says they're all set, or to connect a device). Do **NOT** ask the user to run `login-done`, and never tell them to repeat it. When the user instead asked to *research* while signed out, the research client already hands back a ready-to-click sign-in link — relay that link and "log in, then ask again"; don't auto-start the research. |
 | logout | `sr.py logout` | **Confirm first**, then run. Logging out of Super Research is ALWAYS this command — never refuse it, and never tell the user to use an account/profile menu or sign out "elsewhere". Any "logout" / "log out" / "sign out" that names Super Research (or is said in this Super Research chat with no other service named) means run `sr.py logout`. Removes the agent from their account. |
 | device (list) | `sr.py devices` | Relay the list (names; → = selected). |
 | device use `<name>` | `sr.py device-use "<name>"` | Switch where research runs. Name or hostname — it resolves; on an ambiguous name it lists the matches, relay that. |
@@ -130,7 +142,7 @@ stay owner-only in the web app):
 | research `<topic>` | `sr.py research "<topic>"` | Relay it (names the run by title + device), then **immediately arm the progress watchdog** (see **Streaming a run's progress**) so the **completion** message (all SR links) + any stop/blocker posts here on its own (per-phase progress is on-demand via `status`). Arm it **every** time a run starts — this is what makes the completion + blockers show up without the user asking. |
 | status `[title]` | `sr.py status ["<title>"]` | Relay the **current phase**, the **⚙ Phases** line (which phases are on / OFF), each finished phase's 🔒 link, and any **⚠ Needs you** blocker. No title = most recent. |
 | updates | `sr.py updates` | Relay all active runs + their phase, ⚙ Phases line, links + any that need attention. |
-| podcast `[title]` | `sr.py podcast ["<title>"]` | It prints a local **file path**. **Attach that file as a native audio / voice message** titled with the run's title — do **not** paste the path (or any URL) into chat. No title = the most recent run. If it says the audio isn't ready, relay that and try again later. |
+| podcast `[title]` | `sr.py podcast ["<title>"]` | **Relay the client's output verbatim.** It prints a short title line + the audio file's **bare path on its own line** — that bare path is exactly what makes the runtime deliver the file as a **native audio / voice message** (and the path is auto-hidden from the user). Do **NOT** wrap the path in backticks, decorate it (no `🔊` / "Audio:" label), split it across messages, or use any `[[audio]]` / `MEDIA:` markup — any of those break the auto-attach and dump raw text. Never replace it with a URL. No title = the most recent run. If it says the audio isn't ready, relay that and try again later. |
 | stop `[title]` | `sr.py stop ["<title>"]` | **Confirm first**, then run. Stops the run at the current phase and **keeps the results so far + the chat** (it does not delete anything). No title = the latest active run. |
 | retry `[title]` | `sr.py retry ["<title>"]` | Resume a run that's waiting on a decision / hit an error. Use after the user has done any on-device step the blocker asked for (e.g. signed in). |
 | skip `[phases] [--run title]` | `sr.py skip [phases] [--run "<title>"]` | **No phases** → skip whatever the run is currently **blocked** on (resolve the decision). **With phases** (Brief=1, Podcast=3, Video=4, Report=5, or their names) → trim those phases when reached. |
@@ -162,8 +174,10 @@ always safe to hand out. Platform links (NotebookLM, YouTube, the raw chatgpt.co
 gemini / claude pages, the final Google Doc) are deliberately **not** surfaced in
 chat — they can be revoked and don't open when the user is signed out.
 
-- **"Send/get me the podcast"** (the audio itself) → run `sr.py podcast` and attach
-  the file as a **native audio / voice message** — never a link, never a file path.
+- **"Send/get me the podcast"** (the audio itself) → run `sr.py podcast` and **relay
+  its output verbatim**: the bare file path it prints on its own line is what the
+  runtime turns into a native audio message (the path is auto-hidden). Don't decorate,
+  backtick, or `[[audio]]`-wrap it, and never send a link or a visible file path.
 - **"Podcast link" / "link to the brief" / "the ChatGPT (P2) report"** → give the
   matching **🔒** link from the `status` output. If it isn't there yet, that phase
   hasn't finished — say so and offer to check again in a bit.
@@ -183,10 +197,12 @@ login` before running research. They pick a device with `/sr device` (skipped
 automatically if they have exactly one).
 
 **No devices on the account** (a fresh account, or research errors with "no
-devices yet"): walk them through adding one — Super Research must be installed
-and running on a computer; its screen shows an 8-char **pair code**; they read
-it to you and you run `sr.py device-add <code>`. It auto-selects as their first
-device, so "research <topic>" works immediately after.
+devices yet"): the client prints the right next step — relay it. In plain words:
+ask the user to **paste the access code** shown on the computer running Super
+Research (an 8-char code; accept it with or without dashes) and you connect it
+for them. If they have **no backend set up yet**, tell them to run `pipx install
+superresearch` on that computer, then `superresearch --pair` to get the code.
+The first device auto-selects, so research works right after.
 
 ## Streaming a run's progress (arm the watchdog when a run starts)
 
