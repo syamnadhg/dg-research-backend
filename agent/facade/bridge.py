@@ -1864,7 +1864,12 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 fs.update_research(sess.uid, rid, {
                     "status": "stopped",
                     "stoppedAt": int(time.time() * 1000),
-                    "stoppedBy": "owner_stop",
+                    # "agent_stop" (not "owner_stop") so the web app attributes
+                    # this as the user's OWN stop from their agent chat and shows
+                    # "Stopped from your agent" — distinct from the device-owner
+                    # "owner_stop"/"owner_cancel" sharer-popup case. Both still
+                    # flip the run terminal; only the chat copy differs.
+                    "stoppedBy": "agent_stop",
                     "summary": "Stopped",
                 }, delete_fields=["queuePosition", "queuedBehindRunId",
                                   "queuedBehindTitle", "pendingDecision"])
