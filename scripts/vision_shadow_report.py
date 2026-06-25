@@ -89,8 +89,18 @@ def load_records(path: Path, since: datetime | None) -> list[dict]:
 
 def cua_action_class(cua_text: str) -> str:
     """Infer the CUA action class from its output text. Approximate but
-    sufficient for agreement scoring at the action-class level."""
+    sufficient for agreement scoring at the action-class level.
+
+    The miss-path recorder stores only ``cua.text_head`` — the CUA's FREEFORM
+    narration of what it did/saw (e.g. "The side panel has successfully slid
+    out…"), not a structured marker. So beyond the exact "panel: …" markers
+    (kept for back-compat / any future structured emit), we infer from common
+    CUA phrasings. Without this, every freeform record returned "unknown" and
+    was dropped from scoring (the 7c / 7c-p1 0/0 bug)."""
     t = (cua_text or "").lower()
+    if not t:
+        return "unknown"
+    # 1) Exact structured markers win.
     if "panel: open" in t:
         return "click"
     if "panel: already_open" in t:
@@ -99,6 +109,22 @@ def cua_action_class(cua_text: str) -> str:
         return "declare_failure"
     if "panel: click_failed" in t:
         return "click"  # tried but missed
+    # 2) Freeform-narration inference (the real-world shape of text_head).
+    #    Order matters: "already open" (no action) before generic "open".
+    if any(p in t for p in ("already open", "already expanded", "is already",
+                            "no action needed", "nothing to do", "no need to")):
+        return "declare_success"
+    if any(p in t for p in ("could not", "couldn't", "unable to", "can't find",
+                            "cannot find", "not found", "no panel", "did not find",
+                            "doesn't appear", "failed to find", "no such")):
+        return "declare_failure"
+    #    A click that achieved the target panel/element — the dominant miss-path
+    #    success outcome (CUA was the fallback that opened what the DOM missed).
+    if any(p in t for p in ("slid out", "slid in", "opened", "now open", "now visible",
+                            "now showing", "has appeared", "panel is", "is now",
+                            "expanded", "successfully", "clicked", "i can see",
+                            "i see the", "is visible")):
+        return "click"
     return "unknown"
 
 
@@ -162,8 +188,9 @@ def report(records: list[dict], filter_hotspot: str | None,
             v_action = v.get("action")
             v_x = v.get("x_ratio")
             v_y = v.get("y_ratio")
-            cua_text = c.get("text_head", "")
-            c_action = cua_action_class(cua_text)
+            # Prefer a structured cua.action if a future recorder emits one;
+            # otherwise infer the action class from the freeform text_head.
+            c_action = c.get("action") or cua_action_class(c.get("text_head", ""))
 
             if "error" in v or "timeout" in v:
                 continue
@@ -267,7 +294,13 @@ def report_dom_success(records: list[dict], filter_hotspot: str | None,
             if v_action is None:
                 continue
             agree_total += 1
-            if v_action == "click":
+            # The DOM ALREADY succeeded at this hotspot, so Vision "agrees" when
+            # it would have driven the same success: either it proposes the CLICK
+            # (it would act), OR it reads the achieved end-state and DECLARES
+            # SUCCESS (correct when the observe fires AFTER the DOM acted — e.g.
+            # p3-audio-customize, where the panel is already open by then). A real
+            # DISAGREEMENT is a wrong action (declare_failure / scroll / etc.).
+            if v_action in ("click", "declare_success"):
                 agree_count += 1
             close = _coord_close(v.get("x_ratio"), v.get("y_ratio"),
                                  gt.get("true_x_ratio"), gt.get("true_y_ratio"))
@@ -290,13 +323,21 @@ def report_dom_success(records: list[dict], filter_hotspot: str | None,
               f"{decision}")
 
     print()
-    print("DOM-success scoring: action-class = Vision proposed 'click'; coord proximity")
-    print("= Vision center vs the DOM's true target (dom_ground_truth.true_x/y_ratio)")
-    print(f"within {COORD_PROXIMITY_THRESHOLD}. Hotspots marked [no coord GT] gate on action")
-    print("agreement only — surface the clicked element's bbox to score coord proximity.")
+    print("DOM-success scoring: agreement = Vision proposed 'click' (it would act) OR")
+    print("'declare_success' (it correctly read the already-achieved state — the observe")
+    print("often fires AFTER the DOM acted). A real disagreement is a wrong action")
+    print("(declare_failure / scroll). Coord proximity = Vision center vs the DOM's true")
+    print(f"target within {COORD_PROXIMITY_THRESHOLD}; [no coord GT] = no clicked-bbox captured, so the")
+    print("hotspot gates on action agreement only (a valid promotion basis).")
 
 
 def main() -> int:
+    # Windows consoles default to cp1252, which can't encode the ≥ / ✓ / — glyphs
+    # this report prints (it crashed mid-output before). Force UTF-8 stdout.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     args = parse_args()
     log_path = Path(args.log).resolve()
     since = None

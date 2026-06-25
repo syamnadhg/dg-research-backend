@@ -28298,6 +28298,14 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                                          dom_ground_truth=_gt_from_box(None, url=notebook_url))
                 else:
                     log(f"NotebookLM public share uncertain — falling back to tab URL: {nlm_share_res.error}", "WARN")
+                    # Track-B: observe on the FALLBACK path too. The share FLOW ran
+                    # (dialog opened) even when the public link wasn't verified, so
+                    # Vision's read is just as valid a sample. Gating the observe on
+                    # `verified` alone made p3-share record 0 events whenever the
+                    # share fell back to the tab URL.
+                    _observe_dom_success(browser.page, hotspot_id="p3-share", phase=3,
+                                         platform="notebooklm", current_step="open_share_set_public_get_link",
+                                         dom_ground_truth=_gt_from_box(None, url=notebook_url, share="fallback"))
             except Exception as e:
                 log(f"NotebookLM public share flow error: {e} — falling back to tab URL", "WARN")
             log(f"NotebookLM: {notebook_url}")
