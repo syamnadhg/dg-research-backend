@@ -419,6 +419,21 @@ class FirestoreRest:
         body = self._request("POST", url, json_body={"fields": fields})
         return doc_id(body.get("name", ""))
 
+    def update_research(self, uid: str, rid: str, patch: dict[str, Any], *,
+                        delete_fields: list[str] | None = None) -> None:
+        """PATCH users/{uid}/researches/{rid} with `patch` (top-level fields), and
+        DELETE each field in `delete_fields` (listed in the updateMask but omitted from
+        the body → Firestore removes it). The owner writing their OWN research doc — the
+        SAME authoritative write the web app's Stop button does (saveResearch). This is
+        what makes a chat stop reach terminal status even if the BE never consumes the
+        command doc (e.g. a run paused at a decision gate). Member-permitted."""
+        delete_fields = delete_fields or []
+        paths = list(patch.keys()) + list(delete_fields)
+        mask = "&".join(f"updateMask.fieldPaths={p}" for p in paths)
+        url = f"{config.FIRESTORE_BASE}/users/{uid}/researches/{rid}?{mask}"
+        fields = {k: to_value(v) for k, v in patch.items()}
+        self._request("PATCH", url, json_body={"fields": fields})
+
 
 class FirestoreError(RuntimeError):
     """A Firestore REST call failed (HTTP error / permission denied)."""

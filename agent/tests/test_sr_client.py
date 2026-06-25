@@ -35,6 +35,7 @@ class FakeFS:
     last_cancel = None
     last_command = None
     last_pc_patch = None
+    last_update = None
     seeded = None
 
     def __init__(self, _tp):
@@ -70,6 +71,15 @@ class FakeFS:
                                "device_id": device_id, "extra": extra}
         return "CMD-1"
 
+    def update_research(self, uid, rid, patch, *, delete_fields=None):
+        FakeFS.last_update = {"rid": rid, "patch": dict(patch),
+                              "delete_fields": list(delete_fields or [])}
+        d = FakeFS.researches.get(rid)
+        if d is not None:
+            d.update(patch)
+            for f in (delete_fields or []):
+                d.pop(f, None)
+
     def delete_research(self, uid, rid):
         FakeFS.researches.pop(rid, None)
 
@@ -84,6 +94,7 @@ def bridge_port(monkeypatch):
     FakeFS.last_enqueue = None
     FakeFS.last_cancel = None
     FakeFS.last_command = None
+    FakeFS.last_update = None
     FakeFS.seeded = None
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
     sel = {"v": None}
@@ -504,20 +515,47 @@ def test_stop_running_is_graceful(bridge_port, capsys):
                                     "deviceId": "dev-a", "status": "ongoing"}
     assert sr.main(["cancel", "agent-x"]) == 0
     out = capsys.readouterr().out
-    assert "Stopping" in out and "Mars colony" in out and "kept" in out
+    assert "Stopped" in out and "Mars colony" in out and "kept" in out
     assert FakeFS.last_cancel is None  # never the destructive queue cancel
     assert FakeFS.last_command == {"uid": "u1", "rid": "agent-x", "action": "stop",
                                    "device_id": "dev-a", "extra": None}
+    # AUTHORITATIVE terminal flip — status:"stopped", NO `cancelled` (results+chat kept),
+    # gate banner cleared — so it really stops even if the command isn't consumed.
+    assert FakeFS.last_update["patch"]["status"] == "stopped"
+    assert "cancelled" not in FakeFS.last_update["patch"]
+    assert "pendingDecision" in FakeFS.last_update["delete_fields"]
 
 
 def test_stop_queued_is_preserved(bridge_port, capsys):
     # A still-QUEUED run is preserved via ownerControl:"stop" (kept, chat intact).
     FakeFS.researches["agent-z"] = {"id": "agent-z", "deviceId": "dev-a", "status": "queued"}
     assert sr.main(["stop", "agent-z"]) == 0
-    assert "Stopping" in capsys.readouterr().out
+    assert "Stopped" in capsys.readouterr().out
     assert FakeFS.last_command is None
     assert FakeFS.last_cancel == {"device_id": "dev-a", "research_id": "agent-z",
                                   "owner_control": "stop"}
+    assert FakeFS.last_update["patch"]["status"] == "stopped"  # authoritative flip for queued too
+
+
+def test_pause_is_resumable_not_terminal(bridge_port, capsys):
+    # pause writes a per-run pause command and is RESUMABLE — it must NOT write the
+    # authoritative terminal flip (that's stop's job).
+    FakeFS.researches["agent-pz"] = {"id": "agent-pz", "title": "Reef survey",
+                                     "deviceId": "dev-a", "status": "ongoing"}
+    assert sr.main(["pause", "agent-pz"]) == 0
+    out = capsys.readouterr().out
+    assert "Paused" in out and "Reef survey" in out and "resume" in out.lower()
+    assert FakeFS.last_command == {"uid": "u1", "rid": "agent-pz", "action": "pause",
+                                   "device_id": "dev-a", "extra": None}
+    assert FakeFS.last_update is None  # NOT a terminal flip — the run stays resumable
+
+
+def test_resume_writes_resume_command(bridge_port, capsys):
+    FakeFS.researches["agent-rz"] = {"id": "agent-rz", "title": "Reef survey",
+                                     "deviceId": "dev-a", "status": "paused"}
+    assert sr.main(["resume", "agent-rz"]) == 0
+    assert "Resumed" in capsys.readouterr().out
+    assert FakeFS.last_command["action"] == "resume"
 
 
 def test_stop_by_title_latest_active(bridge_port, capsys):

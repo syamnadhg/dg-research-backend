@@ -1110,6 +1110,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._research()
             elif path.startswith("/research/") and path.endswith("/stop"):
                 self._research_stop(path[len("/research/"):-len("/stop")])
+            elif path.startswith("/research/") and path.endswith("/pause"):
+                self._research_pause(path[len("/research/"):-len("/pause")])
+            elif path.startswith("/research/") and path.endswith("/resume"):
+                self._research_resume(path[len("/research/"):-len("/resume")])
             elif path.startswith("/research/") and path.endswith("/resolve"):
                 self._research_resolve(path[len("/research/"):-len("/resolve")])
             elif path.startswith("/research/") and path.endswith("/cancel"):
@@ -1844,19 +1848,84 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     fs.enqueue_cancel(device_id, uid=sess.uid, research_id=rid, owner_control="stop")
                     mode = "queued"
                 else:
-                    # Running/paused → the per-run command listener is attached;
-                    # a fresh action:"stop" command stops it at the next phase
-                    # boundary and preserves partial results (the FE Stop button).
+                    # Running/paused → also signal the per-run command listener so the
+                    # BE tears the browser down + exits cleanly when it consumes it.
                     fs.write_command(sess.uid, rid, "stop", device_id=device_id)
                     mode = "running"
+                # AUTHORITATIVE terminal flip — the loopback twin of the web app's Stop
+                # button, which writes status:"stopped" to the doc DIRECTLY. The command
+                # alone is fragile: a run paused at a decision gate (or a per-run listener
+                # whose cursor is burned / on another worker) may never consume it, so it
+                # stays PAUSED — that was the bug ("Stopped" in chat, still paused in the
+                # app). NON-destructive: status:"stopped" with NO `cancelled`, so partial
+                # results + the chat survive (mirrors _owner_control_patch oc="stop").
+                # Clearing pendingDecision dismisses the gate banner so the run reads
+                # terminal even if the gate coroutine is wedged.
+                fs.update_research(sess.uid, rid, {
+                    "status": "stopped",
+                    "stoppedAt": int(time.time() * 1000),
+                    "stoppedBy": "owner_stop",
+                    "summary": "Stopped",
+                }, delete_fields=["queuePosition", "queuedBehindRunId",
+                                  "queuedBehindTitle", "pendingDecision"])
             except RevokedError:
                 self._json(401, {"error": "session revoked — run /login again"})
                 return
             except FirestoreError as e:
                 self._firestore_502(e)
                 return
-            log.info("graceful stop requested for run %s on device %s (%s)", rid, device_id, mode)
-            self._json(200, {"ok": True, "runId": rid, "deviceId": device_id, "status": status, "mode": mode})
+            log.info("authoritative stop for run %s on device %s (%s → stopped)", rid, device_id, mode)
+            self._json(200, {"ok": True, "runId": rid, "deviceId": device_id, "status": "stopped", "mode": mode})
+
+        def _write_run_command(self, rid: str, action: str) -> None:
+            """Shared: write a per-run command (pause/resume) for a non-terminal run.
+            Unlike stop, pause/resume are best-effort + RESUMABLE — the BE owns the
+            paused state (it writes status:"paused" on consume), so we do NOT write the
+            doc authoritatively here. 404 unknown run, 409 if already finished."""
+            rid = rid.strip("/")
+            if not _RID_RE.match(rid):
+                self._json(404, {"error": "run not found"})
+                return
+            acct = self._account()
+            if acct is None:
+                return
+            sess, fs = acct
+            try:
+                doc = fs.get_research(sess.uid, rid)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            if doc is None:
+                self._json(404, {"error": "run not found"})
+                return
+            if runview.is_terminal((doc.get("status") or "").strip()):
+                self._json(409, {"error": "run already finished"})
+                return
+            device_id = (doc.get("deviceId") or "").strip()
+            if not device_id:
+                self._json(409, {"error": "run has no device"})
+                return
+            try:
+                fs.write_command(sess.uid, rid, action, device_id=device_id)
+            except RevokedError:
+                self._json(401, {"error": "session revoked — run /login again"})
+                return
+            except FirestoreError as e:
+                self._firestore_502(e)
+                return
+            log.info("%s requested for run %s on device %s", action, rid, device_id)
+            self._json(200, {"ok": True, "runId": rid, "deviceId": device_id})
+
+        def _research_pause(self, rid: str) -> None:
+            """Pause a RUNNING run (resumable). BE action:"pause" → request_pause."""
+            self._write_run_command(rid, "pause")
+
+        def _research_resume(self, rid: str) -> None:
+            """Resume a PAUSED run. BE action:"resume" → request_resume."""
+            self._write_run_command(rid, "resume")
 
         def _research_resolve(self, rid: str) -> None:
             """Resolve a BLOCKED run from chat (C1): read its pendingDecision and

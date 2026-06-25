@@ -71,6 +71,14 @@ class FakeFS:
                                "device_id": device_id, "extra": extra}
         return "CMD-1"
 
+    def update_research(self, uid, rid, patch, *, delete_fields=None):
+        FakeFS.last_update = {"rid": rid, "patch": dict(patch)}
+        d = FakeFS.researches.get(rid)
+        if d is not None:
+            d.update(patch)
+            for f in (delete_fields or []):
+                d.pop(f, None)
+
     def delete_research(self, uid, rid):
         FakeFS.researches.pop(rid, None)
 

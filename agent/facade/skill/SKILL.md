@@ -57,6 +57,13 @@ commands they run on their research computer — `pipx install superresearch` an
 output is already written this way: relay it as-is, and never re-introduce command
 syntax or tack on extra steps.
 
+**Use line breaks — never a wall of text.** The client prints its output as
+separate lines on purpose; relay them on separate lines, and break your own replies
+by **relevancy** — one idea per line/short block, not a run-on paragraph. E.g.
+"Added 'VivobookPro' — it's selected." on one line, then "You can start researching."
+on the next (the device is one idea, the research is another). Keep replies
+skimmable.
+
 ## Talk to it in plain language
 
 The user rarely types exact commands — interpret what they mean and pick the
@@ -70,8 +77,10 @@ or say nothing to mean the most recent / active run.
 | "what's running?", "list my runs" | `sr.py updates` |
 | "send me the podcast", "the audio for the Mars run" | `sr.py podcast ["<title>"]` |
 | "podcast **link**", "link to the brief / ChatGPT doc" | `sr.py status ["<title>"]` → share the 🔒 permanent link (see **Which link to share**) |
-| "stop it", "stop the EV run", "that's enough" | `sr.py stop ["<title>"]` |
-| "retry", "try again", "resume", "I signed in — continue" | `sr.py retry ["<title>"]` |
+| "stop it", "stop the EV run", "that's enough" | `sr.py stop ["<title>"]` (ENDS the run, keeps results) |
+| "pause it", "pause the run", "hold on" | `sr.py pause ["<title>"]` (resumable — does NOT end it) |
+| "resume", "unpause", "continue the paused run" | `sr.py resume ["<title>"]` |
+| "retry", "try again", "I signed in — continue" | `sr.py retry ["<title>"]` (a run BLOCKED on a decision/error) |
 | "skip it", "skip this step", "move past the blocker" | `sr.py skip [--run "<title>"]` |
 | "skip the video and the report" | `sr.py skip video report [--run "<title>"]` |
 | "sign in", "connect", "log me in" | `sr.py login` |
@@ -143,7 +152,9 @@ stay owner-only in the web app) — describe each in plain words, never as comma
 | status `[title]` | `sr.py status ["<title>"]` | Relay the **current phase**, the **⚙ Phases** line (which phases are on / OFF), each finished phase's 🔒 link, and any **⚠ Needs you** blocker. No title = most recent. |
 | updates | `sr.py updates` | Relay all active runs + their phase, ⚙ Phases line, links + any that need attention. |
 | podcast `[title]` | `sr.py podcast ["<title>"]` | **Relay the client's output verbatim.** It prints a short title line + the audio file's **bare path on its own line** — that bare path is exactly what makes the runtime deliver the file as a **native audio / voice message** (and the path is auto-hidden from the user). Do **NOT** wrap the path in backticks, decorate it (no `🔊` / "Audio:" label), split it across messages, or use any `[[audio]]` / `MEDIA:` markup — any of those break the auto-attach and dump raw text. Never replace it with a URL. No title = the most recent run. If it says the audio isn't ready, relay that and try again later. |
-| stop `[title]` | `sr.py stop ["<title>"]` | **Confirm first**, then run. Stops the run at the current phase and **keeps the results so far + the chat** (it does not delete anything). No title = the latest active run. |
+| stop `[title]` | `sr.py stop ["<title>"]` | **Confirm first**, then run. **ENDS** the run (terminal "stopped") and **keeps the results so far + the chat** (deletes nothing). Authoritative — it really stops even if the run was paused at a gate. Use for "stop"; for a temporary, resumable hold use **pause** instead. No title = the latest active run. |
+| pause `[title]` | `sr.py pause ["<title>"]` | Pause a RUNNING run — it stays **resumable** (does NOT end it). Only when the user says "pause" / "hold on", never for "stop". |
+| resume `[title]` | `sr.py resume ["<title>"]` | Resume a run the user **paused**. (For a run blocked on a decision/error, use **retry** instead.) |
 | retry `[title]` | `sr.py retry ["<title>"]` | Resume a run that's waiting on a decision / hit an error. Use after the user has done any on-device step the blocker asked for (e.g. signed in). |
 | skip `[phases] [--run title]` | `sr.py skip [phases] [--run "<title>"]` | **No phases** → skip whatever the run is currently **blocked** on (resolve the decision). **With phases** (Brief=1, Podcast=3, Video=4, Report=5, or their names) → trim those phases when reached. |
 | install | `sr.py install` | **Confirm first**. Installs the **backend** on the connected device (turns that PC into a research host) — runs in the background. Then **guide pairing**: tell them to run `superresearch --pair` on that PC; it shows an 8-char code → they read it to you → you run `device add <code>`; then they finish the API-key + browser-login steps **on the PC** (those can't be done from chat). Once done, the device shows up in `devices` and is ready. Use this when `research` reports "no devices yet". |

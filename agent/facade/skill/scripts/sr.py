@@ -390,9 +390,10 @@ def cmd_login(args) -> int:
     if code != 200:
         return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
     return _emit(body, args.json, [
-        f"Open this link and sign in:  {body.get('verifyUrl')}",
-        "Sign in to Super Research, then tap Authenticate — you'll connect automatically, "
-        "no extra step. Once you're in, just ask for your research.",
+        "Log in here:",
+        f"  {body.get('verifyUrl')}",
+        "Tap Authenticate when the page opens — you'll connect automatically.",
+        "Then just ask for your research.",
     ])
 
 
@@ -526,10 +527,12 @@ def cmd_device_add(args) -> int:
     if action in ("already-owner", "already-shared"):
         return _emit(body, args.json, [f"“{name}” is already on your account."])
     kind = "yours" if action in ("initial-pair", "re-pair") else "shared with you"
-    lines = [f"✓ Added “{name}” — it’s {kind} now."]
     if body.get("selected"):
-        lines.append("It’s selected, so you can start researching whenever you like.")
-    lines.append("You can also add, remove, or switch devices anytime — just ask.")
+        lines = [f"✓ Added “{name}” — it’s {kind} and selected."]
+        lines.append("You can start researching whenever you like.")
+    else:
+        lines = [f"✓ Added “{name}” — it’s {kind} now."]
+    lines.append("You can add, remove, or switch devices anytime — just ask.")
     return _emit(body, args.json, lines)
 
 
@@ -598,17 +601,16 @@ def cmd_research(args) -> int:
         err = str(body.get("error", "")).lower()
         if "no device" in err:
             return _emit(body, args.json, [
-                "Paste the access code to connect an existing Research Computer.",
-                "",
-                "No backend setup? Run  pipx install superresearch  on that computer, "
-                "then  superresearch --pair  to connect it.",
+                "Paste the access code from the Super Research computer first.",
+                "If it isn't set up yet, run  pipx install superresearch  on that computer, "
+                "then  superresearch --pair.",
             ], _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
     where = f" on {dev}" if dev else ""
     lines = [
         f"🚀 Started “{args.topic}”{where}.",
-        "I’ll post progress here as each phase finishes — or say “status” anytime.",
+        "I’ll post here when it’s done — and if it ever needs you. Ask how it’s going anytime.",
     ]
     # Auto-arm THIS chat's run-scoped streaming watchdog so progress posts without
     # the user asking — emit the cronjob directive inline (the gateway dedups by the
@@ -720,7 +722,50 @@ def cmd_stop(args) -> int:
         return _emit(b2, args.json, [f"✗ stop failed: {b2.get('error', code)}"], _fail_code(code))
     if b2.get("alreadyDone"):
         return _emit(b2, args.json, [f"“{title}” already finished ({b2.get('status')}) — nothing to stop."])
-    return _emit(b2, args.json, [f"✓ Stopping “{title}” — the results so far are kept."])
+    return _emit(b2, args.json, [
+        f"✓ Stopped “{title}”.",
+        "Your results so far are kept.",
+    ])
+
+
+def cmd_pause(args) -> int:
+    """Pause a running run — it stays RESUMABLE (unlike stop, which ends it)."""
+    code, body, runs = _fetch_runs()
+    if code != 200:
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    run = _pick_run(runs, args.runId, prefer_active=True)
+    if run is None:
+        which = f"matching “{args.runId}”" if args.runId else "to pause"
+        return _emit(body, args.json, [f"No run {which}."], 1)
+    rid = run.get("runId")
+    title = run.get("title") or run.get("topic") or rid
+    code, b2 = _post(f"/research/{urllib.parse.quote(rid, safe='')}/pause")
+    if code != 200:
+        return _emit(b2, args.json, [f"✗ couldn't pause: {b2.get('error', code)}"], _fail_code(code))
+    return _emit(b2, args.json, [
+        f"⏸ Paused “{title}”.",
+        "Tell me to resume it whenever you’re ready.",
+    ])
+
+
+def cmd_resume(args) -> int:
+    """Resume a paused run."""
+    code, body, runs = _fetch_runs()
+    if code != 200:
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    # Prefer a PAUSED run (that's what resume targets) before the generic newest pick,
+    # so a bare "resume" doesn't grab a newer ongoing/terminal run.
+    paused = [r for r in runs if (r.get("status") or "") == "paused"]
+    run = _pick_run(paused or runs, args.runId, prefer_active=True)
+    if run is None:
+        which = f"matching “{args.runId}”" if args.runId else "to resume"
+        return _emit(body, args.json, [f"No run {which}."], 1)
+    rid = run.get("runId")
+    title = run.get("title") or run.get("topic") or rid
+    code, b2 = _post(f"/research/{urllib.parse.quote(rid, safe='')}/resume")
+    if code != 200:
+        return _emit(b2, args.json, [f"✗ couldn't resume: {b2.get('error', code)}"], _fail_code(code))
+    return _emit(b2, args.json, [f"▶ Resumed “{title}”."])
 
 
 def cmd_retry(args) -> int:
@@ -983,6 +1028,14 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(_name, help=_help)
         sp.add_argument("runId", nargs="?")
         sp.set_defaults(func=cmd_stop)
+
+    pa = sub.add_parser("pause", help="pause a running run (stays resumable)")
+    pa.add_argument("runId", nargs="?")
+    pa.set_defaults(func=cmd_pause)
+
+    rsm = sub.add_parser("resume", help="resume a paused run")
+    rsm.add_argument("runId", nargs="?")
+    rsm.set_defaults(func=cmd_resume)
 
     rt = sub.add_parser("retry", help="resume a run waiting on a decision / error")
     rt.add_argument("runId", nargs="?")
