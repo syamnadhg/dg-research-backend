@@ -144,7 +144,7 @@ stay owner-only in the web app) — describe each in plain words, never as comma
 
 | Action | Run | Then |
 |---|---|---|
-| login | `sr.py login` | Relay the sign-in link. Tell them to open it, **sign in**, then **click Authenticate** (it turns amber → green) — that's it, they connect **automatically**, no extra step. Give it a few seconds, then run `sr.py login-done` ONCE **yourself** to confirm, and relay its result (it greets by email + says they're all set, or to connect a device). Do **NOT** ask the user to run `login-done`, and never tell them to repeat it. When the user instead asked to *research* while signed out, the research client already hands back a ready-to-click sign-in link — relay that link and "log in, then ask again"; don't auto-start the research. |
+| login | `sr.py login` | Relay the sign-in link the client returns; the user opens it, signs in, and clicks Authenticate — they connect **automatically**. `sr.py login` also arms this chat's watchdog, so the bridge posts a proactive **"✓ Signed in as …"** here the moment the approval is captured — you do **not** need to poll `login-done` yourself or ask the user to. When the user instead asked to *research* while signed out, the client hands back the same ready-to-click link and remembers the topic; relay the link — after they sign in the watchdog asks **"continue with '…'?"**, and on a "yes"/"continue" you fire that research. |
 | logout | `sr.py logout` | **Confirm first**, then run. Logging out of Super Research is ALWAYS this command — never refuse it, and never tell the user to use an account/profile menu or sign out "elsewhere". Any "logout" / "log out" / "sign out" that names Super Research (or is said in this Super Research chat with no other service named) means run `sr.py logout`. Removes the agent from their account. |
 | device (list) | `sr.py devices` | Relay the list (names; → = selected). |
 | device use `<name>` | `sr.py device-use "<name>"` | Switch where research runs. Name or hostname — it resolves; on an ambiguous name it lists the matches, relay that. |
@@ -229,11 +229,15 @@ assumes a `cronjob`-style tool is available to you.
 
 The runtime does **not** wake you on a timer — so to push progress + alerts into
 this chat the moment they happen (instead of the user having to ask for status),
-arm a small recurring **cron watchdog**. Arm it **right after the first `/sr
-research` succeeds in this chat** (not at login — there's nothing to stream until
-a run exists). Each minute it posts only what's **new** and stays silent
-otherwise: no spam, no tokens. Its very first tick baselines quietly (it never
-replays already-done phases; it only raises a run that is stuck right now).
+arm a small recurring **cron watchdog**. Both `sr.py research` **and** `sr.py
+login` prepare it and print the `cronjob: create …` directive: research so the
+completion + blockers stream, login so the **"✓ Signed in"** (and "continue with
+'…'?" when a research was waiting) posts the instant the browser approval is
+captured. Arm it whenever either prints that directive. Each minute it posts only
+what's **new** and stays silent otherwise: no spam, no tokens; while a sign-in is
+still pending it waits quietly, and it self-removes once its work is done. Its very
+first tick baselines quietly (it never replays already-done phases; it only raises
+a run that is stuck right now).
 
 The watchdog is **scoped to THIS chat**: a run you start here streams back only
 here — a run started in another chat (Telegram vs WhatsApp vs the web app) never

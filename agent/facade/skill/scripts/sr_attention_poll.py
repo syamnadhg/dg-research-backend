@@ -54,6 +54,12 @@ _STATE_FILE = Path(__file__).with_name(".sr_stream_state.json")
 # on the BASELINE tick. A long-dead errored run is history the user already saw.
 _LIVE_STUCK = ("queued", "ongoing", "paused_backend_restart", "paused_backend_restart_failed")
 
+# A login-listener watchdog (armed at /sr login or a signed-out research) polls
+# before the user has signed in → the bridge returns 401. Stay silent + alive so we
+# can announce the instant they do, but give up after this many minute-ticks (well
+# past the ~15-min sign-in TTL) so a sign-in that never completes can't poll forever.
+_LOGIN_WAIT_LIMIT = 18
+
 
 def _base() -> str:
     raw = os.environ.get("SUPER_AGENT_BRIDGE_PORT", "9876")
@@ -85,7 +91,11 @@ def _state_path(origin: dict | None) -> Path:
     return Path(__file__).with_name(f".sr_poll_{_origin_slug(origin)}.state.json")
 
 
-def _get_updates(origin: dict | None = None) -> list:
+def _get_updates(origin: dict | None = None) -> tuple[list, dict | None]:
+    """``(runs, signedIn)`` from the bridge. ``signedIn`` is the one-shot
+    "just signed in" event (or None) the bridge delivers once after a remote-login
+    capture — so an armed watchdog announces the sign-in (and any pending topic)
+    proactively. Raises on HTTP/transport error (main() handles a 401 specially)."""
     q = "/updates?via=agent&limit=20"
     if origin:
         q += "&platform=" + urllib.parse.quote(origin.get("platform", ""), safe="")
@@ -93,7 +103,10 @@ def _get_updates(origin: dict | None = None) -> list:
     req = urllib.request.Request(_base() + q, method="GET")
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
         body = json.loads(resp.read() or b"{}")
-    return body.get("runs", []) if isinstance(body, dict) else []
+    if not isinstance(body, dict):
+        return [], None
+    si = body.get("signedIn")
+    return body.get("runs", []), (si if isinstance(si, dict) else None)
 
 
 def _load_state(path: Path | None = None) -> dict | None:
@@ -281,6 +294,41 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[l
     return out, new_state
 
 
+def _signed_in_line(signed_in: dict) -> str:
+    """The proactive sign-in announce. With a pending topic (a research fired while
+    signed out) it OFFERS to continue — confirm-first, never a silent auto-start —
+    so the user replies "yes" and the assistant fires that research. With no pending
+    topic it just confirms the connection and invites a topic."""
+    who = signed_in.get("email") or "your account"
+    # Show the FULL topic (bounded to 500 chars at ingest) — not a truncated preview —
+    # so the assistant fires the exact research the user originally asked when they
+    # reply "yes" (the topic isn't retained anywhere else after this one-shot delivery).
+    topic = (signed_in.get("pendingTopic") or "").strip()
+    if topic:
+        return f"✓ Signed in as {who} — continue with “{topic}”? Reply “yes” to start."
+    return f"✓ Signed in as {who}. Just tell me what to research."
+
+
+def _tick_unauthed(origin: dict | None, state_file: Path) -> int:
+    """A 401 while a login-listener is armed: the user hasn't signed in yet. Stay
+    SILENT + alive so we can announce the moment they do — but bound the wait
+    (``_LOGIN_WAIT_LIMIT`` ticks) so a sign-in that never completes can't poll
+    forever. Bounds SCOPED watchdogs only; the shared account-wide watchdog
+    (origin=None) is never self-removed (its script serves every chat), so it just
+    no-ops here and keeps polling — acceptable since the modern gateway always
+    supplies an origin (so login-listeners are scoped + bounded)."""
+    if not origin:
+        return 0
+    prior = _load_state(state_file) or {}
+    waited = int(prior.get("__login_wait__", 0) or 0) + 1
+    if waited > _LOGIN_WAIT_LIMIT:
+        _teardown(origin)
+        return 0
+    prior["__login_wait__"] = waited
+    _save_state(prior, state_file)
+    return 0
+
+
 def main(origin: dict | None = None) -> int:
     """One watchdog tick. ``origin`` (passed by a generated per-chat shim) scopes
     the bridge query + the de-dup state file to one chat; None = the shared,
@@ -289,26 +337,57 @@ def main(origin: dict | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    try:
-        runs = _get_updates(origin)
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
-        # Bridge down / unreachable — stay SILENT (exit 0). A non-zero exit would
-        # trip the cron error alert every minute while the host bridge is off.
-        return 0
     state_file = _state_path(origin)
+    try:
+        fetched = _get_updates(origin)
+    except urllib.error.HTTPError as e:
+        # 401 = a login-listener armed before the user signed in: wait quietly.
+        # Any other HTTP error → silent (a non-zero exit would trip the cron error
+        # alert every minute while the host bridge is off).
+        if getattr(e, "code", None) == 401:
+            return _tick_unauthed(origin, state_file)
+        return 0
+    except (urllib.error.URLError, OSError, ValueError):
+        return 0
+    # Back-compat unpack: real fetch returns (runs, signedIn); a test/monkeypatch or
+    # an older shim may hand back just the runs list.
+    runs, signed_in = fetched if isinstance(fetched, tuple) else (fetched, None)
     prior = _load_state(state_file)
-    lines, new_state = compute(runs, prior or {}, baseline=prior is None)
+    pdict = prior or {}
+
+    out: list[str] = []
+    # Proactive "signed in" announce — one-shot. The bridge already clears it after
+    # one delivery; __signed_in_ts__ is a belt-and-suspenders de-dup across ticks.
+    announced_login = False
+    si_ts = pdict.get("__signed_in_ts__")
+    if isinstance(signed_in, dict) and signed_in.get("ts") and signed_in.get("ts") != si_ts:
+        out.append(_signed_in_line(signed_in))
+        si_ts = signed_in.get("ts")
+        announced_login = True
+
+    # Baseline = we've never recorded this chat's RUNS before. A state file that
+    # holds only reserved keys (e.g. __login_wait__ written by unauthed login-wait
+    # ticks) is NOT a real run-baseline — without this, the first authed tick after
+    # sign-in would replay an OLD finished/stuck run as if it just happened.
+    seen_runs_before = any(not str(k).startswith("__") for k in pdict)
+    run_lines, new_state = compute(runs, pdict, baseline=not seen_runs_before)
+    out += run_lines
+    # compute() rebuilds new_state from runs only, so re-stamp the de-dup key (and
+    # drop __login_wait__ now that we're authed).
+    if si_ts is not None:
+        new_state["__signed_in_ts__"] = si_ts
     _save_state(new_state, state_file)
-    if lines:
-        print("\n".join(lines))
-    # Strict run-linkage: once this chat has runs but NONE are live AND there's
-    # nothing new to post (every completed phase was delivered on a prior tick),
-    # the work is done — stop polling and remove our own cron + shim + state. A
-    # later research in this chat simply re-arms a fresh watchdog. Scoped only;
-    # never tear down on an empty window (a run that hasn't appeared yet) or while
-    # we're still posting (so the final phase always lands first).
-    if origin and runs and not lines and not any(_is_active(r) for r in runs):
-        _teardown(origin)
+    if out:
+        print("\n".join(out))
+
+    # Strict teardown (scoped only): a login-listener stops once it has made its one
+    # announce and nothing is running (a later research re-arms a fresh watchdog);
+    # a run watchdog stops once this chat has runs but NONE are live and there's
+    # nothing new to post. Never tear down on an empty window or while still posting.
+    if origin:
+        no_active = not any(_is_active(r) for r in runs)
+        if (announced_login and no_active) or (runs and not out and no_active):
+            _teardown(origin)
     return 0
 
 

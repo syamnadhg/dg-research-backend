@@ -78,6 +78,37 @@ def test_advance_captures_on_approved(isolate_store, mock_fe, monkeypatch):
     assert state.session is not None and state.session.uid == "u-auto"
 
 
+def test_advance_records_signed_in_event(isolate_store, mock_fe, monkeypatch):
+    """On capture, a one-shot 'signed in' event is recorded for the chat watchdog —
+    carrying the email + any topic the user fired while signed out + the chat origin
+    that started the flow (so the proactive announce is scoped + can offer to
+    continue that research)."""
+    state = bridge.BridgeState()
+    idt = make_jwt({"user_id": "u-si", "email": "si@x.y"})
+    fe = mock_fe(
+        poll_script=[(200, {"status": "approved", "customToken": "CT"})],
+        exchange_resp={"idToken": idt, "refreshToken": "RT-si", "expiresIn": "3600"},
+    )
+    _point_exchange_at(monkeypatch, fe)
+    flow = _pending_flow()
+    flow.pending_topic = "EV battery market"
+    flow.origin = {"platform": "telegram", "chat_id": "-100"}
+    state.set_remote(flow)
+
+    with state.remote_lock:
+        bridge._advance_remote_flow(state)
+
+    ev = state.signed_in
+    assert ev is not None
+    assert ev["email"] == "si@x.y"
+    assert ev["pendingTopic"] == "EV battery market"
+    assert ev["origin"] == {"platform": "telegram", "chat_id": "-100"}
+    assert isinstance(ev["ts"], int)
+    # A sign-out invalidates a not-yet-delivered announce.
+    state.set_session(None)
+    assert state.signed_in is None
+
+
 def test_advance_is_noop_on_absent_or_terminal_flow(monkeypatch):
     """No flow, or a flow already terminal, must never hit the broker."""
     calls = {"n": 0}

@@ -93,6 +93,44 @@ def test_remote_poll_without_start_is_400(live):
     assert requests.post(base + "/login/remote/poll").status_code == 400
 
 
+def test_start_stashes_pending_topic_and_origin(live, mock_fe, monkeypatch):
+    """A research fired while signed out starts the sign-in carrying its topic +
+    chat origin, so the post-login announce can offer to continue it (in the right
+    chat)."""
+    base, state, _ = live
+    fe = mock_fe(start_resp={"code": "X", "pollToken": "PT", "verifyUrl": "https://x/c", "expiresIn": 600})
+    monkeypatch.setattr(config, "FE_BASE", fe)
+    r = requests.post(base + "/login/remote/start", json={
+        "pending_topic": "the EV battery market",
+        "origin": {"platform": "telegram", "chat_id": "111"},
+    })
+    assert r.status_code == 200
+    assert state.remote.pending_topic == "the EV battery market"
+    assert state.remote.origin == {"platform": "telegram", "chat_id": "111"}
+
+
+def test_pending_attaches_topic_to_in_flight_flow(live, mock_fe, monkeypatch):
+    """A user who started login, then fired a research before approving: the topic
+    attaches to the EXISTING flow (no fresh flow that would void their link)."""
+    base, state, _ = live
+    fe = mock_fe(start_resp={"code": "X", "pollToken": "PT", "verifyUrl": "https://x/c", "expiresIn": 600})
+    monkeypatch.setattr(config, "FE_BASE", fe)
+    requests.post(base + "/login/remote/start", json={})
+    same_token = state.remote.poll_token
+    r = requests.post(base + "/login/remote/pending", json={
+        "pending_topic": "Mars colonization", "origin": {"platform": "telegram", "chat_id": "9"},
+    })
+    assert r.status_code == 200 and r.json().get("ok") is True
+    assert state.remote.pending_topic == "Mars colonization"
+    assert state.remote.poll_token == same_token  # SAME flow — link stays valid
+
+
+def test_pending_without_flow_is_409(live):
+    base, _, _ = live
+    r = requests.post(base + "/login/remote/pending", json={"pending_topic": "x"})
+    assert r.status_code == 409
+
+
 def test_remote_login_expired(live, mock_fe, monkeypatch):
     base, state, _ = live
     fe = mock_fe(

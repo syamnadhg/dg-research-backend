@@ -326,3 +326,97 @@ def test_main_no_teardown_account_wide(monkeypatch):
     # The shared (origin=None) watchdog is never self-removed (its script serves all chats).
     torn = _main_with(monkeypatch, runs=[{"runId": "r1", "status": "completed"}], lines=[], origin=None)
     assert "o" not in torn
+
+
+# ── post-login proactive "signed in" announce ─────────────────────────────────
+
+def test_signed_in_line_offers_to_continue_pending_topic():
+    line = poll._signed_in_line({"email": "e@x.y", "pendingTopic": "the EV battery market"})
+    assert "Signed in as e@x.y" in line
+    assert "continue" in line.lower() and "the EV battery market" in line
+
+
+def test_signed_in_line_without_topic_invites_a_topic():
+    line = poll._signed_in_line({"email": "e@x.y", "pendingTopic": ""})
+    assert "Signed in as e@x.y" in line and "what to research" in line.lower()
+
+
+def test_main_announces_signed_in_once_then_dedups(monkeypatch, capsys):
+    origin = {"platform": "telegram", "chat_id": "111"}
+    saved = {"s": None}
+    si = {"ts": 5, "email": "e@x.y", "pendingTopic": "EV market"}
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([], si))
+    monkeypatch.setattr(poll, "_load_state", lambda path=None: saved["s"])
+    monkeypatch.setattr(poll, "_save_state", lambda state, path=None: saved.__setitem__("s", state))
+    monkeypatch.setattr(poll, "_teardown", lambda o: None)  # don't wipe the de-dup state
+    poll.main(origin)
+    out1 = capsys.readouterr().out
+    assert "Signed in as e@x.y" in out1 and "EV market" in out1
+    # the same event ts is now recorded → a later tick is silent (belt-and-suspenders
+    # on top of the bridge's one-shot clear).
+    poll.main(origin)
+    assert "Signed in" not in capsys.readouterr().out
+
+
+def test_main_tears_down_after_signed_in_when_idle(monkeypatch):
+    origin = {"platform": "telegram", "chat_id": "111"}
+    monkeypatch.setattr(poll, "_get_updates",
+                        lambda o=None: ([], {"ts": 1, "email": "e@x.y", "pendingTopic": ""}))
+    monkeypatch.setattr(poll, "_load_state", lambda path=None: None)
+    monkeypatch.setattr(poll, "_save_state", lambda *a, **k: None)
+    torn = {}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("o", o))
+    poll.main(origin)
+    assert torn.get("o") == origin  # one announce + nothing running → login-listener stops
+
+
+def test_main_keeps_running_after_signed_in_if_a_run_is_active(monkeypatch):
+    origin = {"platform": "telegram", "chat_id": "111"}
+    monkeypatch.setattr(poll, "_get_updates",
+                        lambda o=None: ([{"runId": "r1", "status": "ongoing"}],
+                                        {"ts": 2, "email": "e@x.y", "pendingTopic": ""}))
+    monkeypatch.setattr(poll, "_load_state", lambda path=None: None)
+    monkeypatch.setattr(poll, "_save_state", lambda *a, **k: None)
+    torn = {}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("o", o))
+    poll.main(origin)
+    assert "o" not in torn  # a live run → keep streaming after the sign-in announce
+
+
+def test_tick_unauthed_waits_then_gives_up(monkeypatch, tmp_path):
+    origin = {"platform": "telegram", "chat_id": "111"}
+    sf = tmp_path / "st.json"
+    torn = {}
+    monkeypatch.setattr(poll, "_teardown", lambda o: torn.__setitem__("o", o))
+    for _ in range(poll._LOGIN_WAIT_LIMIT):
+        poll._tick_unauthed(origin, sf)
+        assert "o" not in torn  # still within the wait window → stay armed, silent
+    poll._tick_unauthed(origin, sf)  # one past the limit
+    assert torn.get("o") == origin  # a sign-in that never completes can't poll forever
+
+
+def test_main_reserved_only_state_is_baseline_not_a_replay(monkeypatch, capsys):
+    # After unauthed login-wait ticks the state file holds ONLY __login_wait__; the
+    # first authed tick must treat that as baseline and NOT replay an already-finished
+    # run as "just completed".
+    origin = {"platform": "telegram", "chat_id": "111"}
+    run = _run(status="completed", phase_updates=[_pu(5, "Delivery", [], final=True)])
+    monkeypatch.setattr(poll, "_get_updates", lambda o=None: ([run], None))
+    monkeypatch.setattr(poll, "_load_state", lambda path=None: {"__login_wait__": 3})
+    monkeypatch.setattr(poll, "_save_state", lambda *a, **k: None)
+    monkeypatch.setattr(poll, "_teardown", lambda o: None)
+    poll.main(origin)
+    assert "pipeline complete" not in capsys.readouterr().out  # silent baseline
+
+
+def test_main_401_routes_to_unauthed_wait(monkeypatch):
+    origin = {"platform": "telegram", "chat_id": "111"}
+    seen = {}
+
+    def _raise_401(o=None):
+        raise poll.urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(poll, "_get_updates", _raise_401)
+    monkeypatch.setattr(poll, "_tick_unauthed", lambda o, sf: seen.__setitem__("o", o) or 0)
+    assert poll.main(origin) == 0
+    assert seen.get("o") == origin  # 401 → login-listener waiting path, not an error exit

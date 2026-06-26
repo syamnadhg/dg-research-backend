@@ -648,6 +648,71 @@ def test_oversized_post_body_rejected_413(live):
     assert r.status_code == 413
 
 
+# ── post-login proactive "signed in" event surfaced via /updates ──
+
+def _live_with_state(monkeypatch):
+    """A bridge server like the `live` fixture but returning `state`, so a test can
+    set the one-shot signed-in event directly (the fixture doesn't expose state)."""
+    monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
+    FakeFS.researches = {}
+    FakeFS.devices = []
+    state = bridge.BridgeState()
+    state.set_session(SimpleNamespace(uid="u1", email="e@x.y", id_token=lambda force=False: "tok"))
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._make_handler(state))
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{port}", state, httpd
+
+
+def test_updates_surfaces_then_clears_signed_in(monkeypatch):
+    base, state, httpd = _live_with_state(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 123, "email": "e@x.y", "uid": "u1",
+                             "pendingTopic": "EV market", "origin": None})
+        r1 = requests.get(base + "/updates?via=agent").json()
+        assert r1["signedIn"]["pendingTopic"] == "EV market"
+        assert r1["signedIn"]["email"] == "e@x.y"
+        # one-shot: a second read no longer carries it (a fresh watchdog can't replay).
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_updates_signed_in_only_for_via_agent(monkeypatch):
+    # Only the watchdog (?via=agent) consumes the one-shot event; an ordinary client
+    # /updates call must NOT silently swallow it.
+    base, state, httpd = _live_with_state(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 7, "email": "e@x.y", "uid": "u1",
+                             "pendingTopic": "EV market", "origin": None})
+        plain = requests.get(base + "/updates").json()  # no via=agent → leaves it untouched
+        assert "signedIn" not in plain
+        agent = requests.get(base + "/updates?via=agent").json()
+        assert agent["signedIn"]["pendingTopic"] == "EV market"  # still there for the watchdog
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_updates_signed_in_scoped_to_origin(monkeypatch):
+    base, state, httpd = _live_with_state(monkeypatch)
+    try:
+        state.set_signed_in({"ts": 9, "email": "e@x.y", "uid": "u1", "pendingTopic": "",
+                             "origin": {"platform": "telegram", "chat_id": "111"}})
+        # mismatched chat → not delivered, and NOT cleared (waits for its watchdog).
+        assert "signedIn" not in requests.get(base + "/updates?via=agent&platform=telegram&chat=999").json()
+        # an unscoped query also can't claim a chat-scoped event.
+        assert "signedIn" not in requests.get(base + "/updates?via=agent").json()
+        # the matching chat gets it, then it's cleared.
+        hit = requests.get(base + "/updates?via=agent&platform=telegram&chat=111").json()
+        assert hit["signedIn"]["email"] == "e@x.y"
+        assert "signedIn" not in requests.get(base + "/updates?via=agent&platform=telegram&chat=111").json()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 # ── P6 /skip (POST /research/<rid>/skip) ──
 
 def test_skip_phases_1_and_3_merge_into_skippedPhases(live):

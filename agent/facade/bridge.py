@@ -310,6 +310,11 @@ class RemoteFlow:
         self.expires_at = expires_at  # epoch seconds
         self.state = "pending"
         self.error = ""
+        # A research topic the user fired while signed out (so we can offer to
+        # continue it once they sign in) + the chat origin that started this flow
+        # (so the proactive "signed in" announce is delivered to the right chat).
+        self.pending_topic = ""
+        self.origin: dict | None = None
 
 
 class BridgeState:
@@ -330,6 +335,10 @@ class BridgeState:
         # without blocking /status or other reads.
         self._remote: RemoteFlow | None = None
         self.remote_lock = threading.Lock()
+        # One-shot "just signed in" event for the chat watchdog to announce
+        # proactively (set on remote-login capture, delivered + cleared by a
+        # single /updates read). Carries the email + any pending research topic.
+        self._signed_in: dict | None = None
 
     @property
     def session(self) -> AccountSession | None:
@@ -339,6 +348,31 @@ class BridgeState:
     def set_session(self, sess: AccountSession | None) -> None:
         with self._lock:
             self._session = sess
+            # A sign-out invalidates any not-yet-delivered "signed in" announce.
+            if sess is None:
+                self._signed_in = None
+
+    @property
+    def signed_in(self) -> dict | None:
+        with self._lock:
+            return self._signed_in
+
+    def set_signed_in(self, event: dict | None) -> None:
+        with self._lock:
+            self._signed_in = event
+
+    def take_signed_in(self) -> dict | None:
+        """Atomically read AND clear the one-shot event in one critical section, so
+        a /updates delivery consumes it exactly once even under concurrent reads
+        (the caller re-stashes it via set_signed_in if the scope didn't match)."""
+        with self._lock:
+            ev = self._signed_in
+            self._signed_in = None
+            return ev
+
+    def clear_signed_in(self) -> None:
+        with self._lock:
+            self._signed_in = None
 
     def rotate_login_token(self) -> None:
         with self._lock:
@@ -869,6 +903,17 @@ def _advance_remote_flow(state: BridgeState) -> str | None:
         flow.state = "connected"
         # #790 identity row — explicit human sign-in, so clear any prior revoke.
         _write_agent_session_connected(sess, clear_revoked=True)
+        # One-shot event for the chat watchdog: announce "signed in" the moment the
+        # browser approval is captured, and (if a research was fired while signed
+        # out) carry its topic so chat can offer to continue it. Delivered + cleared
+        # by a single /updates read; the FE/poll never sees the token.
+        state.set_signed_in({
+            "ts": int(time.time() * 1000),
+            "email": sess.email or "",
+            "uid": sess.uid,
+            "pendingTopic": flow.pending_topic or "",
+            "origin": flow.origin if isinstance(flow.origin, dict) else None,
+        })
         log.info("remote login connected as %s", sess.email or sess.uid)
     elif status == devicelogin.EXPIRED:
         flow.state = "expired"
@@ -1098,6 +1143,8 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._login_remote_start()
             elif path == "/login/remote/poll":
                 self._login_remote_poll()
+            elif path == "/login/remote/pending":
+                self._login_remote_pending()
             elif path == "/logout":
                 self._logout()
             elif path == "/device/select":
@@ -1199,10 +1246,21 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 verify_url=flow["verifyUrl"],
                 expires_at=time.time() + ttl,
             )
+            # Optional: a topic fired while signed out (offer to continue post-login)
+            # + the chat origin (scope the proactive "signed in" announce to it).
+            pt = body.get("pending_topic")
+            if isinstance(pt, str):
+                rf.pending_topic = pt[:500]
+            og = body.get("origin")
+            if isinstance(og, dict):
+                rf.origin = og
             # Take remote_lock so a start can't swap the flow out from under an
             # in-flight poll (and vice-versa); start/poll are mutually exclusive.
             with state.remote_lock:
                 state.set_remote(rf)
+            # A fresh sign-in supersedes any prior, not-yet-delivered "signed in"
+            # announce (e.g. a re-login) so the watchdog can't replay a stale one.
+            state.clear_signed_in()
             log.info("remote login started — code shown to user, expires in %ss", ttl)
             self._json(200, {"code": flow["code"], "verifyUrl": flow["verifyUrl"], "expiresIn": ttl})
 
@@ -1223,6 +1281,27 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 if transient:
                     payload["transient"] = transient
                 self._json(200, payload)
+
+        def _login_remote_pending(self) -> None:
+            """Attach a pending research topic (+ chat origin) to a sign-in that is
+            ALREADY in flight — for the case where the user started login, then fired
+            a research before approving. Unlike /login/remote/start it never mints a
+            new flow (which would invalidate the link they're about to approve); it
+            just decorates the current pending flow so the post-login announce can
+            offer to continue. A no-op 409 when nothing is pending."""
+            body = self._read_json()
+            topic = body.get("pending_topic")
+            origin = body.get("origin")
+            with state.remote_lock:
+                flow = state.remote
+                if flow is None or flow.state != "pending":
+                    self._json(409, {"error": "no sign-in in progress"})
+                    return
+                if isinstance(topic, str):
+                    flow.pending_topic = topic[:500]
+                if isinstance(origin, dict):
+                    flow.origin = origin
+                self._json(200, {"ok": True})
 
         def _status(self) -> None:
             # Carry the pip-style update notices so the welcome / a bare /sr can
@@ -1765,7 +1844,32 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "needsAttention": needs,
                     "attention": attention,
                 })
-            self._json(200, {"runs": runs})
+            out: dict[str, Any] = {"runs": runs}
+            # One-shot "just signed in" announce for the chat watchdog. Only the
+            # watchdog reads it (it always sets ?via=agent) — so an ordinary client
+            # /updates call can't silently consume it. Take-and-clear is atomic; if
+            # this query's scope doesn't own the event, put it back for the watchdog
+            # that does. Delivered to the chat that started the sign-in (origin
+            # match), or to any agent watchdog if it carried no origin.
+            if via_agent:
+                ev = state.take_signed_in()
+                if isinstance(ev, dict):
+                    ev_origin = ev.get("origin")
+                    deliver = (
+                        not ev_origin
+                        or (scope_chat and isinstance(ev_origin, dict)
+                            and (ev_origin.get("platform") or "").strip().lower() == want_platform
+                            and (ev_origin.get("chat_id") or "").strip() == want_chat)
+                    )
+                    if deliver:
+                        out["signedIn"] = {
+                            "ts": ev.get("ts"),
+                            "email": ev.get("email") or "",
+                            "pendingTopic": ev.get("pendingTopic") or "",
+                        }
+                    else:
+                        state.set_signed_in(ev)  # not this chat's — leave it for its watchdog
+            self._json(200, out)
 
         def _research_cancel(self, rid: str) -> None:
             """Cancel a run (the chat /sr-cancel): one action:"cancel" to the run's

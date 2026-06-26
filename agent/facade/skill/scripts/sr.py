@@ -386,15 +386,24 @@ def _write_poll_shim(scripts_dir: Path, name: str, origin: dict) -> str | None:
 # ── commands ────────────────────────────────────────────────────────────────
 
 def cmd_login(args) -> int:
-    code, body = _post("/login/remote/start", {"runtime": args.runtime or "", "label": args.label or ""})
+    payload = {"runtime": args.runtime or "", "label": args.label or ""}
+    origin = _origin_from_env()
+    if origin:
+        payload["origin"] = origin
+    code, body = _post("/login/remote/start", payload)
     if code != 200:
         return _emit(body, args.json, [f"✗ couldn't start sign-in: {body.get('error', code)}"], _fail_code(code))
-    return _emit(body, args.json, [
+    lines = [
         "Log in here:",
         f"  {body.get('verifyUrl')}",
         "Tap Authenticate when the page opens — you'll connect automatically.",
-        "Then just ask for your research.",
-    ])
+    ]
+    # Arm THIS chat's watchdog so the moment the browser approval is captured the
+    # bridge's "✓ signed in" lands here on its own — no need to poll for completion.
+    arm_lines, _payload, arm_rc = _prepare_stream_arm()
+    if arm_rc == 0:
+        lines += arm_lines
+    return _emit(body, args.json, lines)
 
 
 def cmd_login_wait(args) -> int:
@@ -583,21 +592,35 @@ def cmd_research(args) -> int:
         # is already mid-flight, say so (the bridge auto-captures on approval —
         # #848, no `login-done` needed).
         if code == 401:
+            # Remember the topic + this chat so that, once the user signs in, the
+            # watchdog can offer to continue THIS research (confirm-first, never a
+            # silent auto-start). Arm the watchdog so the "✓ signed in — continue
+            # with '…'?" lands here on its own.
+            stash = {"pending_topic": args.topic}
+            if origin:
+                stash["origin"] = origin
+            arm_lines, _ap, arm_rc = _prepare_stream_arm()
             sc, sbody = _get("/status")
             if sc == 200 and sbody.get("remoteLogin") == "pending":
-                return _emit(body, args.json, [
-                    "You're almost signed in — finish in your browser, then ask again.",
-                ], _fail_code(code))
-            # Hand back a ready-to-click sign-in link (start a fresh remote-login) so the
-            # user never needs a command — they click, approve, and the bridge captures it
-            # automatically (#848). Keep it simple: log in, then ask again (no auto-resume).
-            lc, lbody = _post("/login/remote/start", {})
+                # A sign-in is already in flight — attach the topic to it (don't mint
+                # a fresh flow, which would void the link they're about to approve).
+                _post("/login/remote/pending", stash)
+                lines = ["You're almost signed in — finish in your browser and I'll pick this up."]
+                if arm_rc == 0:
+                    lines += arm_lines
+                return _emit(body, args.json, lines, _fail_code(code))
+            # No flow yet: start one carrying the topic, hand back the click-to-approve
+            # link, and the bridge captures it automatically on approval (#848).
+            lc, lbody = _post("/login/remote/start", stash)
             link = lbody.get("verifyUrl") if lc == 200 else None
             if link:
-                return _emit({**body, "verifyUrl": link}, args.json, [
-                    "You're not signed in yet. Log in here, then ask again:",
+                lines = [
+                    "You're not signed in yet. Log in here and I'll pick this up:",
                     f"  {link}",
-                ], _fail_code(code))
+                ]
+                if arm_rc == 0:
+                    lines += arm_lines
+                return _emit({**body, "verifyUrl": link}, args.json, lines, _fail_code(code))
             return _emit(body, args.json, [
                 "You're not signed in yet — tell me to log you in and I'll send a link.",
             ], _fail_code(code))

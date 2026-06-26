@@ -242,6 +242,48 @@ def test_research_when_signin_in_flight_says_approve_in_browser(monkeypatch, cap
         httpd.server_close()
 
 
+def test_login_arms_watchdog_and_passes_origin(monkeypatch, capsys):
+    # /sr login arms this chat's watchdog so the bridge's "✓ signed in" announce
+    # posts proactively on capture, and passes the chat origin so it's scoped.
+    posts = []
+    monkeypatch.setattr(sr, "_post",
+                        lambda path, body=None: posts.append((path, body)) or (200, {"verifyUrl": "https://x/c"}))
+    monkeypatch.setattr(sr, "_origin_from_env", lambda: {"platform": "telegram", "chat_id": "111"})
+    armed = {"n": 0}
+    monkeypatch.setattr(sr, "_prepare_stream_arm",
+                        lambda: armed.__setitem__("n", armed["n"] + 1) or (["cronjob: create …"], {}, 0))
+    rc = sr.main(["login"])
+    assert rc == 0
+    start = [b for (p, b) in posts if p == "/login/remote/start"]
+    assert start and start[0].get("origin") == {"platform": "telegram", "chat_id": "111"}
+    assert armed["n"] == 1
+    assert "cronjob: create" in capsys.readouterr().out
+
+
+def test_research_401_stashes_topic_and_arms_watchdog(monkeypatch, capsys):
+    # Research while signed out: the topic is stashed on the sign-in start (so the
+    # post-login watchdog can offer to continue it) and the watchdog is armed.
+    calls = []
+
+    def fake_post(path, body=None):
+        calls.append((path, body))
+        if path == "/research":
+            return 401, {"error": "unauthorized"}
+        if path == "/login/remote/start":
+            return 200, {"verifyUrl": "https://superresearch.io/c/XYZ"}
+        return 200, {}
+
+    monkeypatch.setattr(sr, "_post", fake_post)
+    monkeypatch.setattr(sr, "_get", lambda path: (200, {"authed": False}))  # no in-flight login
+    monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: (["cronjob: create …"], {}, 0))
+    rc = sr.main(["research", "the EV battery market"])
+    assert rc != 0
+    start = [b for (p, b) in calls if p == "/login/remote/start"]
+    assert start and start[0].get("pending_topic") == "the EV battery market"
+    out = capsys.readouterr().out.lower()
+    assert "log in here" in out and "pick this up" in out
+
+
 def test_devices(bridge_port, capsys):
     assert sr.main(["devices"]) == 0
     out = capsys.readouterr().out
