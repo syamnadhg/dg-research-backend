@@ -442,8 +442,8 @@ def _connected_msg(who) -> str:
     Natural language only — no command syntax (the user just talks to the assistant)."""
     if _has_device():
         return f"✓ Connected as {who} — you’re all set."
-    return (f"✓ Connected as {who}. To get started, paste the access code from the computer "
-            "running Super Research and I’ll connect it.")
+    return (f"✓ Connected as {who}. To get started, paste the access code from your "
+            "research node and I’ll connect it.")
 
 
 def cmd_status_account(args) -> int:
@@ -453,8 +453,8 @@ def cmd_status_account(args) -> int:
     if body.get("authed"):
         lines = [f"✓ Signed in as {body.get('email') or body.get('uid')}"]
         if not _has_device():
-            lines.append("No device connected yet — paste the access code from the computer "
-                         "running Super Research and I’ll connect it.")
+            lines.append("No device connected yet — paste the access code from your "
+                         "research node and I’ll connect it.")
     elif body.get("remoteLogin") == "pending":
         # A sign-in is mid-flight: approve it in the browser and the bridge
         # captures it automatically (no second command needed) — #848.
@@ -476,9 +476,13 @@ def cmd_devices(args) -> int:
     if not devices:
         return _emit(body, args.json, [
             "No devices connected yet.",
-            "Paste the access code from the computer running Super Research and I’ll connect it.",
+            "Paste the access code from your research node and I’ll connect it.",
             "",
-            "No backend setup? Run  pipx install superresearch  there, then  superresearch --pair.",
+            "No backend yet? On that machine, run:",
+            "```",
+            "pipx install superresearch",
+            "superresearch --pair",
+            "```",
         ])
     lines = ["Devices:"]
     for d in devices:
@@ -601,9 +605,12 @@ def cmd_research(args) -> int:
         err = str(body.get("error", "")).lower()
         if "no device" in err:
             return _emit(body, args.json, [
-                "Paste the access code from the Super Research computer first.",
-                "If it isn't set up yet, run  pipx install superresearch  on that computer, "
-                "then  superresearch --pair.",
+                "Paste the access code from your research node first.",
+                "If it isn’t set up yet, run this on that machine:",
+                "```",
+                "pipx install superresearch",
+                "superresearch --pair",
+                "```",
             ], _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
@@ -926,10 +933,13 @@ def cmd_install(args) -> int:
             "Say “update” to upgrade it, or “devices” to see/pair it.",
         ])
     return _emit(body, args.json, [
-        "⬇️ Installing Super Research (the backend) on this device in the background.",
-        "When it finishes, pair it on that PC:  run  superresearch --pair  there —",
-        "it shows an 8-char code; read it to me and I’ll add it (then finish the",
-        "API-key + browser-login steps on the PC, and it’s ready to run research).",
+        "⬇️ Installing Super Research on this device in the background.",
+        "When it finishes, pair it — run this on that PC:",
+        "```",
+        "superresearch --pair",
+        "```",
+        "It shows an 8-char code; read it to me and I’ll add it.",
+        "(Then finish the API-key + browser-login steps on the PC and it’s ready.)",
     ])
 
 

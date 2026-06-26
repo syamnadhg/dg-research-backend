@@ -21,3 +21,10 @@ session.json
 
 # Logs (the bridge log lives in ~/.super-agent, outside the repo; guard anyway)
 *.log
+
+# Generated per-chat streaming-watchdog shims + their de-dup state. The runtime
+# writes sr_poll_<platform>_<hash>.py (baked chat_id) next to the real scripts,
+# and the watchdog writes .sr_*state.json — never commit these (the published
+# wheel ships only sr.py + sr_attention_poll.py; see pyproject package-data).
+facade/skill/scripts/sr_poll_*.py
+facade/skill/scripts/.sr_*.json
