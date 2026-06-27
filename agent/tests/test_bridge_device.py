@@ -129,6 +129,19 @@ def test_select_unknown_device_404(live):
     assert r.status_code == 404 and sel["v"] is None
 
 
+def test_research_clears_stale_selection_when_device_gone(live):
+    # A saved selection points at a device the account no longer has (removed in the
+    # app). /research must NOT enqueue to it — 409 + drop the stale pref so a later
+    # run can auto-pick a live device.
+    base, sel = live
+    FakeFS.devices = []      # account has no (pair-confirmed) devices anymore
+    sel["v"] = "ghost"       # but the local selection persists from before
+    r = requests.post(base + "/research", json={"topic": "the EV battery market"})
+    assert r.status_code == 409
+    assert sel["v"] is None              # stale selection cleared
+    assert FakeFS.last_enqueue is None   # nothing queued to the phantom device
+
+
 def test_select_requires_device_id(live):
     base, _ = live
     assert requests.post(base + "/device/select", json={}).status_code == 400

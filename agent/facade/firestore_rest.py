@@ -98,6 +98,20 @@ def doc_id(name: str) -> str:
     return name.rsplit("/", 1)[-1]
 
 
+def is_pair_confirmed(d: dict[str, Any]) -> bool:
+    """Whether a device doc is a usable, pair-confirmed member — mirrors the web
+    app's ``isPairConfirmed`` (firestore.ts). A device must be confirmed paired
+    (``pairConfirmedAt`` is True) or currently online (a positive ``lastHeartbeat``).
+    The owner-unlink the app performs DELETES ``pairConfirmedAt`` (and ownerUid /
+    sharedWith) but leaves the device doc, so without this gate the agent would keep
+    showing — and enqueueing research to — a device the app already considers gone.
+    """
+    if d.get("pairConfirmedAt") is True:
+        return True
+    hb = d.get("lastHeartbeat")
+    return isinstance(hb, (int, float)) and not isinstance(hb, bool) and hb > 0
+
+
 # ── client ──────────────────────────────────────────────────────────────────
 
 class FirestoreRest:
@@ -207,6 +221,11 @@ class FirestoreRest:
 
         Two structured queries unioned by deviceId (Firestore has no native OR
         across distinct fields). Returns each device's decoded fields + id.
+
+        Pair-confirmed only (``is_pair_confirmed``) — matching the web app's device
+        list exactly, so the agent never shows or enqueues to a device the app
+        considers gone/not-ready (an owner-unlinked doc persists with
+        pairConfirmedAt deleted).
         """
         seen: dict[str, dict[str, Any]] = {}
         for field, op in (("ownerUid", "EQUAL"), ("sharedWith", "ARRAY_CONTAINS")):
@@ -234,7 +253,7 @@ class FirestoreRest:
                     fields = fields_to_dict(doc)
                     fields["id"] = did
                     seen[did] = fields
-        return list(seen.values())
+        return [d for d in seen.values() if is_pair_confirmed(d)]
 
     # ── writes ──
     def upsert_research(self, uid: str, rid: str, fields: dict[str, Any]) -> None:

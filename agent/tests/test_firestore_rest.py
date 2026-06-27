@@ -87,11 +87,13 @@ def _capture_client():
             if field == "ownerUid":
                 return [{"document": {
                     "name": ".../devices/own1",
-                    "fields": {"ownerUid": {"stringValue": "u1"}},
+                    "fields": {"ownerUid": {"stringValue": "u1"},
+                               "pairConfirmedAt": {"booleanValue": True}},
                 }}]
             return [{"document": {
                 "name": ".../devices/shared1",
-                "fields": {"sharedWith": {"arrayValue": {"values": [{"stringValue": "u1"}]}}},
+                "fields": {"sharedWith": {"arrayValue": {"values": [{"stringValue": "u1"}]}},
+                           "lastHeartbeat": {"integerValue": "1730000000000"}},
             }}]
         if method == "POST":  # enqueue
             return {"name": ".../queue/Q42"}
@@ -130,6 +132,40 @@ def test_list_devices_unions_owned_and_shared():
     qcalls = [x for x in calls if x["url"].endswith(":runQuery")]
     ops = {x["body"]["structuredQuery"]["where"]["fieldFilter"]["op"] for x in qcalls}
     assert ops == {"EQUAL", "ARRAY_CONTAINS"}
+
+
+def test_is_pair_confirmed_matches_fe_gate():
+    from facade.firestore_rest import is_pair_confirmed
+    assert is_pair_confirmed({"pairConfirmedAt": True})           # confirmed paired
+    assert is_pair_confirmed({"lastHeartbeat": 1730000000000})    # online
+    assert not is_pair_confirmed({"ownerUid": "u1"})              # owned but unconfirmed/offline
+    assert not is_pair_confirmed({"pairConfirmedAt": False})
+    assert not is_pair_confirmed({"lastHeartbeat": 0})
+    assert not is_pair_confirmed({"lastHeartbeat": True})         # bool is not a heartbeat
+
+
+def test_list_devices_drops_unconfirmed_unlinked_device():
+    # An owner-unlinked device persists in Firestore (ownerUid still matched a stale
+    # query, pairConfirmedAt deleted) — the agent must NOT list it, matching the app,
+    # so research never enqueues to a phantom device.
+    def fake_request(method, url, *, json_body=None):
+        if url.endswith(":runQuery"):
+            field = json_body["structuredQuery"]["where"]["fieldFilter"]["field"]["fieldPath"]
+            if field == "ownerUid":
+                # confirmed live one + an unconfirmed leftover (no pairConfirmedAt / heartbeat)
+                return [
+                    {"document": {"name": ".../devices/live",
+                                  "fields": {"ownerUid": {"stringValue": "u1"},
+                                             "pairConfirmedAt": {"booleanValue": True}}}},
+                    {"document": {"name": ".../devices/stale",
+                                  "fields": {"ownerUid": {"stringValue": "u1"}}}},
+                ]
+            return []
+        return {}
+
+    c = FirestoreRest(lambda: "tok")
+    c._request = fake_request  # type: ignore[method-assign]
+    assert {d["id"] for d in c.list_devices("u1")} == {"live"}
 
 
 def test_enqueue_start_payload_matches_fe_contract():

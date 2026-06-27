@@ -1560,6 +1560,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if selected:
                 if selected in ids:
                     return selected
+                # The saved selection points at a device that's no longer a
+                # pair-confirmed account member (e.g. removed/unlinked in the app) —
+                # drop the stale pref so we never enqueue to a phantom device and a
+                # later run can auto-pick a live one.
+                prefs.clear_selected_device()
                 self._json(409, {"error": "selected device no longer reachable — "
                                           "pick another from the device list"})
                 return None
