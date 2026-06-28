@@ -16,7 +16,7 @@ every run shows up in the web app like a normal chat.
 ## Install
 
 One command, run in your chat runtime's environment — or grab it from the page at
-**https://superresearch.io/agent-install**:
+**https://superresearch.io/skills** (the old `/agent-install` 308-redirects there):
 
 ```sh
 pipx run superresearch-agent connect      # the published package
