@@ -571,16 +571,26 @@ def _sr_mint_gap(sr_links: dict, platform: dict, done: dict) -> bool:
     return False
 
 
+# pf: source → the platform link kind(s) to resolve (first hit wins). The final
+# Google Doc is stored under kind "doc" (runview.KIND_ORDER); accept "gdocs" too
+# defensively. NotebookLM/YouTube map 1:1.
+_PF_KIND_ALIASES: dict[str, tuple[str, ...]] = {"gdocs": ("doc", "gdocs")}
+
+
 def _phase_updates(doc: dict, sr_links: dict) -> list:
-    """Ordered per-phase chat updates: one entry per DONE phase (1-5) carrying
-    ONLY that phase's permanent, non-revocable Super Research share link(s) —
-    Brief (P1), the Deep-Research reports (P2), the Podcast (P3). Platform links
-    (NotebookLM / YouTube / final Google Doc) are deliberately NOT included: they
-    can be revoked and aren't openable when you're signed out, so the chat never
-    hands them out. Phases whose only artifact is a platform link (4 Video, 5
-    Delivery) — and skipped phases — carry no links (the phase is still reported
-    as progress)."""
+    """Ordered per-phase chat updates: one entry per DONE phase (1-5) carrying that
+    phase's link(s). Link policy:
+      • Brief (P1), the Deep-Research reports (P2), the Podcast (P3 audio overview)
+        → the PERMANENT Super Research share links (🔒) — they never expire and
+        survive "Revoke All Shares".
+      • the NotebookLM notebook (P3), the YouTube video (P4) and the final Google
+        Doc (P5) → their REAL platform links — NotebookLM is public, the upload is
+        unlisted, and the Doc is shareable, so all open fine even signed out (and
+        there is no SR snapshot for them).
+    The tokenized Storage audio URL (kind audio/audio_file) is NOT in any phase's
+    plan, so it never reaches chat. Skipped phases carry no links."""
     done = _completed_phases(doc)
+    platform = _platform_links(doc)
     out = []
     for p in (1, 2, 3, 4, 5):
         st = done.get(p)
@@ -590,11 +600,18 @@ def _phase_updates(doc: dict, sr_links: dict) -> list:
         links = []
         if st == "complete":
             for label, src in specs:
-                if not src.startswith("sr:"):
-                    continue  # SR-only: never surface platform links (pf:*) in chat
-                url = sr_links.get(src[3:])
+                if src.startswith("sr:"):
+                    url = sr_links.get(src[3:])
+                    permanent = True
+                else:  # pf:* — a real platform link (NotebookLM / YouTube / Doc)
+                    kind = src[3:]
+                    url = next(
+                        (platform[k] for k in _PF_KIND_ALIASES.get(kind, (kind,)) if k in platform),
+                        None,
+                    )
+                    permanent = False
                 if url:
-                    links.append({"label": label, "url": url, "permanent": True})
+                    links.append({"label": label, "url": url, "permanent": permanent})
         out.append({"phase": p, "name": name, "status": st, "links": links, "final": p == 5})
     return out
 
@@ -1679,10 +1696,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return
             # Mint the permanent SR shares for any COMPLETE phase whose artifact
             # exists but isn't minted yet, so a MANUAL `status` returns the same
-            # clean, never-revoked per-phase links the streaming watchdog does —
-            # not the raw, revocable platform links. Idempotent + best-effort
-            # (mints only docTypes whose content already exists; falls back to
-            # whatever's already minted on failure).
+            # per-phase links the streaming watchdog does — the 🔒 SR shares for the
+            # brief / reports / podcast (never the raw chatgpt/gemini/claude pages),
+            # alongside the 🔗 NotebookLM / YouTube / Doc platform links. Idempotent +
+            # best-effort (mints only docTypes whose content already exists; falls
+            # back to whatever's already minted on failure).
             sr = _sr_links(doc)
             done = _completed_phases(doc)
             if _sr_mint_gap(sr, _platform_links(doc), done):

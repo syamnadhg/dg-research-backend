@@ -205,20 +205,19 @@ def _title(run: dict) -> str:
 
 def _final_lines(run: dict) -> list[str]:
     """The single end-of-run message: the pipeline-complete banner + EVERY phase's
-    permanent Super Research link (Brief, the three reports, the Podcast), gathered
-    across all phaseUpdates and de-duped, in phase order. Platform links are never
-    here (the bridge already excludes them). Results were also emailed."""
+    link, gathered across all phaseUpdates, de-duped, in phase order — the SR
+    permanent links (🔒: Brief, the three reports, the Podcast) AND the real platform
+    links (🔗: NotebookLM, YouTube, the Google Doc). Results were also emailed."""
     lines = [f"🎉 “{_title(run)}” · pipeline complete — results have been emailed."]
     seen: set[str] = set()
     for pu in run.get("phaseUpdates", []) or []:
         for lk in pu.get("links", []) or []:
             url = lk.get("url")
-            # SR-only: render permanent Super Research links exclusively. The bridge
-            # already excludes platform links; this is belt-and-suspenders.
-            if not url or not lk.get("permanent") or url in seen:
+            if not url or url in seen:
                 continue
             seen.add(url)
-            lines.append(f"   🔒 {lk.get('label') or 'link'}: {url}")
+            glyph = "🔒" if lk.get("permanent") else "🔗"
+            lines.append(f"   {glyph} {lk.get('label') or 'link'}: {url}")
     return lines
 
 

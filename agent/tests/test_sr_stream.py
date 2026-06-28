@@ -64,19 +64,22 @@ def test_completion_posts_all_sr_links_once_then_dedups():
     assert msgs2 == []
 
 
-def test_final_message_excludes_platform_links():
-    # Even if a platform (non-permanent) link sneaks into phaseUpdates, the final
-    # message renders ONLY permanent SR links (the bridge already drops platform
-    # links; this is belt-and-suspenders).
+def test_final_message_includes_sr_and_platform_links():
+    # Policy: SR permanent links (🔒) for Brief/reports/Podcast PLUS the real
+    # platform links (🔗) for NotebookLM / YouTube / Google Doc (public / unlisted /
+    # shareable — they open fine signed out).
     runs = [_run(status="completed", phase_updates=[
         _pu(3, "Audio Overview", [("NotebookLM", "https://notebooklm.google.com/n/1", False),
                                   ("Podcast", "https://sr.io/shared/podcast/P", True)]),
+        _pu(4, "Video", [("YouTube", "https://youtu.be/abc", False)]),
         _pu(5, "Delivery", [("Google Doc", "https://docs.google.com/d/x", False)], final=True),
     ])]
     blob = "\n".join(poll.compute(runs, {})[0])
     assert "pipeline complete" in blob and "emailed" in blob
     assert "🔒 Podcast: https://sr.io/shared/podcast/P" in blob
-    assert "notebooklm" not in blob and "docs.google.com" not in blob  # no platform links
+    assert "🔗 NotebookLM: https://notebooklm.google.com/n/1" in blob
+    assert "🔗 YouTube: https://youtu.be/abc" in blob
+    assert "🔗 Google Doc: https://docs.google.com/d/x" in blob
 
 
 def test_skipped_phase_is_silent_but_recorded():

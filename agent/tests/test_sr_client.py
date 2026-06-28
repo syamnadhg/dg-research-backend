@@ -550,6 +550,30 @@ def test_updates_json(bridge_port, capsys):
     assert "runs" in payload and payload["runs"]
 
 
+def test_list_shows_all_researches(bridge_port, capsys):
+    # `list` is account-wide (every status), so the user can ask for any one by name.
+    FakeFS.researches = {
+        "r1": {"id": "r1", "title": "EV battery market", "status": "completed", "links": {}},
+        "r2": {"id": "r2", "title": "Mars colonization", "status": "ongoing", "links": {}},
+    }
+    assert sr.main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "EV battery market" in out and "completed" in out
+    assert "Mars colonization" in out and "ongoing" in out
+
+
+def test_list_alias_researches(bridge_port, capsys):
+    FakeFS.researches = {"r1": {"id": "r1", "title": "Reef survey", "status": "stopped", "links": {}}}
+    assert sr.main(["researches"]) == 0
+    assert "Reef survey" in capsys.readouterr().out
+
+
+def test_list_empty_invites_a_topic(bridge_port, capsys):
+    FakeFS.researches = {}
+    assert sr.main(["list"]) == 0
+    assert "don't have any researches" in capsys.readouterr().out.lower()
+
+
 def test_stop_running_is_graceful(bridge_port, capsys):
     # `stop` (and its `cancel` alias) on a RUNNING run writes a per-run stop
     # command (keeps results + chat) — NOT the destructive queue cancel.
@@ -639,10 +663,10 @@ def test_skip_blocker_resolves_decision(bridge_port, capsys):
     assert FakeFS.last_command["extra"] == {"agent": "gemini", "decision": "skip"}
 
 
-def test_status_shows_permanent_links_and_hides_tokenized_audio(bridge_port, capsys):
-    # The 🔒 permanent share links (srShares, minted at P5 delivery — the same
-    # never-expiring links embedded in the delivered Google Doc) must surface in
-    # status; the tokenized Storage audio_file URL must NEVER print into chat.
+def test_status_shows_sr_and_platform_links_but_hides_tokenized_audio(bridge_port, capsys):
+    # Policy: 🔒 SR permanent shares for Brief/reports/Podcast AND 🔗 the real
+    # platform links for the final Google Doc (and NotebookLM/YouTube when present).
+    # The tokenized Storage audio_file URL must NEVER print into chat.
     FakeFS.researches["agent-d"] = {
         "id": "agent-d", "title": "EV market", "status": "completed", "phase": 5,
         "srShares": {"podcast": "SHARE-P", "brief": "SHARE-B", "chatgpt": "SHARE-C"},
@@ -654,16 +678,15 @@ def test_status_shows_permanent_links_and_hides_tokenized_audio(bridge_port, cap
     }
     assert sr.main(["status", "agent-d"]) == 0
     out = capsys.readouterr().out
-    # Rendered per-phase: 🔒 permanent SR links for the brief + reports + podcast.
+    # 🔒 permanent SR links for the brief + reports + podcast.
     assert "Phase 1 (Research Brief) complete" in out
     assert "🔒 Brief: " in out and "/shared/doc/SHARE-B" in out
     assert "/shared/doc/SHARE-C" in out      # ChatGPT report (SR share, not chatgpt.com)
     assert "/shared/podcast/SHARE-P" in out  # podcast SR share
-    # SR-only: NO platform links of any kind (final Google Doc, NotebookLM, YouTube).
-    assert "🔗" not in out and "📄" not in out
-    assert "docs.google.com" not in out      # the final Google Doc platform link is dropped
-    assert "token=" not in out               # tokenized Storage URL never reaches chat
-    assert "firebasestorage" not in out
+    # 🔗 the real final Google Doc link now surfaces (shareable — opens signed out).
+    assert "🔗 Google Doc: " in out and "docs.google.com/document/d/final" in out
+    # But the tokenized Storage audio URL must NEVER reach chat (not in any phase plan).
+    assert "token=" not in out and "firebasestorage" not in out
 
 
 def test_status_no_permanent_block_when_not_delivered(bridge_port, capsys):
@@ -674,9 +697,10 @@ def test_status_no_permanent_block_when_not_delivered(bridge_port, capsys):
     assert "Permanent links" not in capsys.readouterr().out
 
 
-def test_status_midflight_never_leaks_platform_links(bridge_port, capsys):
-    # A run with no phase done yet (empty phaseUpdates) must NOT print raw platform
-    # links from its incremental `links` — SR-only holds even in the fallback path.
+def test_status_midflight_shows_no_links_until_a_phase_completes(bridge_port, capsys):
+    # A run with no phase done yet (phase 1, ongoing) surfaces NO links — a phase's
+    # link (SR or platform) only appears once that phase COMPLETES. So even though
+    # the incremental `links` already hold a notebooklm/doc URL, nothing is rendered.
     FakeFS.researches["agent-mid"] = {
         "id": "agent-mid", "title": "EV", "status": "ongoing", "phase": 1,
         "links": {
@@ -687,7 +711,7 @@ def test_status_midflight_never_leaks_platform_links(bridge_port, capsys):
     }
     assert sr.main(["status", "agent-mid"]) == 0
     out = capsys.readouterr().out
-    assert "🔗" not in out
+    assert "🔗" not in out and "🔒" not in out
     assert "chatgpt.com" not in out and "notebooklm" not in out and "docs.google.com" not in out
 
 

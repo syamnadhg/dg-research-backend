@@ -453,29 +453,35 @@ def test_completed_phases_clean_completion_marks_final():
     assert done.get(5) == "complete"
 
 
-def test_phase_updates_are_sr_only():
-    # SR-only: only the permanent Super Research links surface (Brief P1, the three
-    # reports P2, the Podcast P3). Platform links (NotebookLM, YouTube, the final
-    # Google Doc) are NEVER included — P4/P5 carry no links, just progress.
+def test_phase_updates_sr_for_p1_p2_podcast_platform_for_notebook_yt_doc():
+    # Policy: SR permanent links (🔒) for Brief (P1), the three reports (P2) and the
+    # Podcast (P3); the REAL platform links (🔗) for NotebookLM (P3), YouTube (P4)
+    # and the final Google Doc (P5) — public / unlisted / shareable, open fine.
     doc = {"phase": 5, "status": "completed",
            "srShares": {"brief": "B", "chatgpt": "C", "gemini": "G", "claude": "CL", "podcast": "P"},
            "links": {
                "notebooklm": {"url": "https://notebooklm.google.com/n", "phase": 3},
                "youtube": {"url": "https://youtu.be/x", "phase": 4},
-               "gdocs": {"url": "https://docs.google.com/d/final", "phase": 5},
+               "doc": {"url": "https://docs.google.com/d/final", "phase": 5},
            }}
     sr = bridge._sr_links(doc)
     pus = {pu["phase"]: pu for pu in bridge._phase_updates(doc, sr)}
+    # P1 / P2 → SR permanent
     assert [lk["label"] for lk in pus[1]["links"]] == ["Brief"] and pus[1]["links"][0]["permanent"]
     assert {lk["label"] for lk in pus[2]["links"]} == {"ChatGPT", "Gemini", "Claude"}
     assert all(lk["permanent"] for lk in pus[2]["links"])
+    # P3 → NotebookLM (platform) + Podcast (SR permanent)
     p3 = {lk["label"]: lk for lk in pus[3]["links"]}
-    assert set(p3) == {"Podcast"}  # NotebookLM (platform) dropped
+    assert set(p3) == {"NotebookLM", "Podcast"}
     assert p3["Podcast"]["permanent"] is True and p3["Podcast"]["url"].endswith("/shared/podcast/P")
-    assert pus[4]["links"] == []                     # YouTube (platform) dropped
-    assert pus[5]["final"] is True and pus[5]["links"] == []  # final Google Doc (platform) dropped
-    all_urls = [lk["url"] for pu in pus.values() for lk in pu["links"]]
-    assert not any(("notebooklm" in u) or ("youtu.be" in u) or ("docs.google.com" in u) for u in all_urls)
+    assert p3["NotebookLM"]["permanent"] is False
+    assert p3["NotebookLM"]["url"] == "https://notebooklm.google.com/n"
+    # P4 → YouTube platform link; P5 → final Google Doc platform link
+    assert pus[4]["links"][0]["label"] == "YouTube" and pus[4]["links"][0]["permanent"] is False
+    assert pus[4]["links"][0]["url"] == "https://youtu.be/x"
+    assert pus[5]["final"] is True
+    assert pus[5]["links"][0]["label"] == "Google Doc" and pus[5]["links"][0]["permanent"] is False
+    assert pus[5]["links"][0]["url"] == "https://docs.google.com/d/final"
 
 
 def test_sr_mint_gap_detects_unminted_complete_phase():

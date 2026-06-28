@@ -3,7 +3,8 @@ name: sr
 description: >-
   Run Super Research from chat. Invoke with /sr (or just ask naturally) to
   research a topic, run a deep-research report, get a brief / podcast / audio
-  overview / video on a subject, to check, track, skip, stop, or resume a
+  overview / video on a subject, to list all your researches and fetch any one's
+  links or podcast by name, to check, track, skip, stop, or resume a
   Super Research run, to sign in, to manage devices (list, switch, add by
   pair code, remove), or to check the version / update Super Research. A bare
   /sr is the welcome + help. Drives the user's OWN
@@ -75,10 +76,11 @@ or say nothing to mean the most recent / active run.
 | The user says (examples) | You run |
 |---|---|
 | "research the EV battery market", "look into X", "deep dive on Y" | `sr.py research "<topic>"` |
-| "how's it going?", "status?", "where's the Tesla one at?" | `sr.py status ["<title>"]` |
-| "what's running?", "list my runs" | `sr.py updates` |
+| "how's it going?", "status?", "where's the Tesla one at?", "results of the EV research" | `sr.py status ["<title>"]` (current phase + that run's 🔒 SR links) |
+| "what researches do I have?", "list all my researches", "my past research" | `sr.py list` (EVERY research, any status — then ask for any one by name) |
+| "what's running?", "what's active right now?" | `sr.py updates` (ACTIVE runs only) |
 | "send me the podcast", "the audio for the Mars run" | `sr.py podcast ["<title>"]` |
-| "podcast **link**", "link to the brief / ChatGPT doc" | `sr.py status ["<title>"]` → share the 🔒 permanent link (see **Which link to share**) |
+| "the brief link / a report link / the audio-overview (NotebookLM) link for X" | `sr.py status ["<title>"]` → relay the matching 🔒 link (audio overview = the **Podcast**; see **Which link to share**) |
 | "stop it", "stop the EV run", "that's enough" | `sr.py stop ["<title>"]` (ENDS the run, keeps results) |
 | "pause it", "pause the run", "hold on" | `sr.py pause ["<title>"]` (resumable — does NOT end it) |
 | "resume", "unpause", "continue the paused run" | `sr.py resume ["<title>"]` |
@@ -132,8 +134,9 @@ stay owner-only in the web app) — describe each in plain words, never as comma
 - **devices** — "which devices?" · switch by name · add one by pasting its code ·
   "remove the old laptop"
 - **research a topic** — just name it ("research the EV battery market")
+- **your researches** — "what researches do I have?" → then ask for any one's results, a specific 🔒 link, or its podcast by name
 - **check a run** — "how's it going?" (most recent) or by title
-- **what's running** — "what's running?"
+- **what's running** — "what's running?" (active only)
 - **podcast** — "send me the podcast" (delivered as a voice message)
 - **stop a run** — "stop" (keeps the results so far)
 - **resume a blocked run** — "retry" or "skip"
@@ -152,7 +155,8 @@ stay owner-only in the web app) — describe each in plain words, never as comma
 | device remove `<name>` | `sr.py device-remove "<name>"` | **Confirm first** ("Unlink 'Office PC'?"). Owner: unlinks — the device keeps running and can be re-paired with its code (nothing deleted). Sharer: leaves the shared device. |
 | research `<topic>` | `sr.py research "<topic>"` | Relay it (names the run by title + device), then **immediately arm the progress watchdog** (see **Streaming a run's progress**) so the **completion** message (all SR links) + any stop/blocker posts here on its own (per-phase progress is on-demand via `status`). Arm it **every** time a run starts — this is what makes the completion + blockers show up without the user asking. |
 | status `[title]` | `sr.py status ["<title>"]` | Relay the **current phase**, the **⚙ Phases** line (which phases are on / OFF), each finished phase's 🔒 link, and any **⚠ Needs you** blocker. No title = most recent. |
-| updates | `sr.py updates` | Relay all active runs + their phase, ⚙ Phases line, links + any that need attention. |
+| updates | `sr.py updates` | Relay all active runs + their phase, ⚙ Phases line, links + any that need attention. ACTIVE runs only — for the FULL history use `list`. |
+| list / researches | `sr.py list` | Relay the account's recent researches (every status, newest first) for "what researches do I have?". Then the user can ask for any one BY NAME — its results / a specific 🔒 link via `status "<title>"`, or its `podcast "<title>"`. Both already resolve any research from this list by title, finished ones included. |
 | podcast `[title]` | `sr.py podcast ["<title>"]` | **Relay the client's output verbatim.** It prints a short title line + the audio file's **bare path on its own line** — that bare path is exactly what makes the runtime deliver the file as a **native audio / voice message** (and the path is auto-hidden from the user). Do **NOT** wrap the path in backticks, decorate it (no `🔊` / "Audio:" label), split it across messages, or use any `[[audio]]` / `MEDIA:` markup — any of those break the auto-attach and dump raw text. Never replace it with a URL. No title = the most recent run. If it says the audio isn't ready, relay that and try again later. |
 | stop `[title]` | `sr.py stop ["<title>"]` | **Confirm first**, then run. **ENDS** the run (terminal "stopped") and **keeps the results so far + the chat** (deletes nothing). Authoritative — it really stops even if the run was paused at a gate. Use for "stop"; for a temporary, resumable hold use **pause** instead. No title = the latest active run. |
 | pause `[title]` | `sr.py pause ["<title>"]` | Pause a RUNNING run — it stays **resumable** (does NOT end it). Only when the user says "pause" / "hold on", never for "stop". |
@@ -179,29 +183,32 @@ say those phases are skipped.
 
 ## Which link to share
 
-`sr.py status` lists each **finished** phase with its **🔒 permanent Super Research
-link** — SR-only by design: **Brief (P1)**, the **ChatGPT / Gemini / Claude reports
-(P2)**, and the **Podcast (P3)**. These are the same links embedded in the delivered
-Google Doc: they never expire and survive even "Revoke All Shares", so they're
-always safe to hand out. Platform links (NotebookLM, YouTube, the raw chatgpt.com /
-gemini / claude pages, the final Google Doc) are deliberately **not** surfaced in
-chat — they can be revoked and don't open when the user is signed out.
+`sr.py status` lists each **finished** phase with its link(s). Two kinds, both safe
+to hand out — just relay them as the client prints them:
+
+- **🔒 SR permanent links** — **Brief (P1)**, the **ChatGPT / Gemini / Claude reports
+  (P2)**, and the **Podcast (P3 audio overview)**. Same links embedded in the
+  delivered Google Doc: they never expire and survive "Revoke All Shares".
+- **🔗 platform links** — the **NotebookLM** notebook (P3), the **YouTube** video
+  (P4), and the **final Google Doc** (P5). These open fine for anyone — NotebookLM is
+  public, the upload is unlisted, the Doc is shareable — so they're surfaced directly.
+
+Hand over whichever the user asks for: "the brief link" → 🔒 Brief; "a report link" →
+the 🔒 report; "the podcast / audio overview" → the 🔒 Podcast (its audio comes from
+`podcast`); "the NotebookLM link" → 🔗 NotebookLM; "the video" → 🔗 YouTube; "the
+doc" → 🔗 Google Doc. "Results of X" → all of that run's links from `status`.
 
 - **"Send/get me the podcast"** (the audio itself) → run `sr.py podcast` and **relay
   its output verbatim**: the bare file path it prints on its own line is what the
   runtime turns into a native audio message (the path is auto-hidden). Don't decorate,
   backtick, or `[[audio]]`-wrap it, and never send a link or a visible file path.
-- **"Podcast link" / "link to the brief" / "the ChatGPT (P2) report"** → give the
-  matching **🔒** link from the `status` output. If it isn't there yet, that phase
-  hasn't finished — say so and offer to check again in a bit.
-- **Never** send a `firebasestorage` / tokenized URL into chat (the client already
-  filters these out — don't dig one out of raw JSON).
-- **No noise about absent links.** SR-only is BY DESIGN — Phase 4 (Video) and
-  Phase 5 (Delivery / final Google Doc) have **no** shareable link, and that's
-  correct, not missing. Just give the SR links that exist (Brief / reports /
-  Podcast); do **NOT** add commentary like "I don't see a final doc link" or
-  "no separate report link." When a run finishes, the only message is the
-  links + "results have been emailed" — nothing else.
+- **A specific link** → give the matching one from the `status` output. If it isn't
+  there yet, that phase hasn't finished — say so and offer to check again in a bit.
+- **Never** send a `firebasestorage` / tokenized Storage URL into chat — that's the
+  raw audio file (the client filters it out; don't dig one out of raw JSON). The
+  podcast goes out as native audio via `podcast`, or as its 🔒 SR link.
+- When a run finishes, the message is just the links + "results have been emailed" —
+  no extra commentary about any link being absent.
 
 ## First-time setup
 
@@ -260,10 +267,10 @@ shows up. To arm it:
    **quiet by design**: it does **not** narrate per-phase progress. It posts only
    these three things:
    - **🎉 "<title>" · pipeline complete** when a run finishes — ONE message with
-     **every** phase's **🔒 permanent Super Research link** (Brief, the three
-     reports, the Podcast) + "results have been emailed". (Platform links —
-     NotebookLM / YouTube / the Google Doc — are never sent: revocable / not
-     openable when signed out.)
+     **every** phase's link: the **🔒 SR permanent links** (Brief, the three reports,
+     the Podcast) and the **🔗 platform links** (NotebookLM notebook, YouTube video,
+     final Google Doc) + "results have been emailed". (Only the raw tokenized audio
+     Storage URL is ever withheld — the podcast goes out as native audio / its 🔒 link.)
    - **⏹ "<title>" stopped** the moment a run is stopped/cancelled — including a
      stop done from the **web app** — so a chat user is never left hanging.
    - **⚠ "<title>" needs you: <reason>** the moment a run blocks — reply

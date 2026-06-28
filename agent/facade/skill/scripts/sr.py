@@ -134,13 +134,12 @@ def _fmt_sr_links(sr_links: dict) -> list[str]:
 
 
 def _fmt_phase_updates(phase_updates: list) -> list[str]:
-    """Per-phase links for a status snapshot — one block per DONE phase, carrying
-    ONLY its permanent Super Research link(s) (🔒, never revoked: Brief + the agent
-    reports + the Podcast). Platform links (NotebookLM / YouTube / Google Doc) are
-    intentionally omitted — they can be revoked / aren't openable when signed out.
-    Mirrors what the streaming watchdog posts so a manual `status` shows the SAME
-    clean links. This is the on-demand path: it lists the SR links available SO FAR
-    while a run is mid-flight (the proactive watchdog holds them until the end)."""
+    """Per-phase links for a status snapshot — one block per DONE phase. Carries the
+    SR permanent links (🔒: Brief + the agent reports + the Podcast) AND the real
+    platform links (🔗: NotebookLM + YouTube + the Google Doc). Mirrors what the
+    streaming watchdog posts so a manual `status` shows the SAME links. On-demand
+    path: lists the links available SO FAR while a run is mid-flight (the proactive
+    watchdog holds the full set until the end)."""
     out: list[str] = []
     for pu in phase_updates or []:
         p, name, st = pu.get("phase"), pu.get("name", "Phase"), pu.get("status")
@@ -152,7 +151,8 @@ def _fmt_phase_updates(phase_updates: list) -> list[str]:
             url = lk.get("url")
             if not url:
                 continue
-            out.append(f"     🔒 {lk.get('label') or 'link'}: {url}")
+            glyph = "🔒" if lk.get("permanent") else "🔗"
+            out.append(f"     {glyph} {lk.get('label') or 'link'}: {url}")
     return out
 
 
@@ -671,10 +671,10 @@ def cmd_status(args) -> int:
     lines = [f"“{title}” — {r.get('status', '?')} (phase {r.get('phase', '?')}){where}"]
     lines += _fmt_pipeline_config(r.get("pipelineConfig"))
     lines += _attention_lines(r)
-    # Per-phase plan = the clean, SR-only 🔒 links. If the bridge supplied none yet
-    # (no phase done, or an older build), fall back to the already-minted permanent
-    # SR links — NEVER the raw platform links (SR-only policy: no NotebookLM /
-    # YouTube / Google-Doc links in chat).
+    # Per-phase plan = the curated links (🔒 SR for Brief/reports/Podcast, 🔗 platform
+    # for NotebookLM/YouTube/Doc). If the bridge supplied none yet (no phase done, or
+    # an older build), fall back to the minted permanent SR links — never the raw,
+    # tokenized Storage audio URL.
     phase_updates = b2.get("phaseUpdates")
     if phase_updates:
         lines += _fmt_phase_updates(phase_updates)
@@ -731,9 +731,29 @@ def cmd_updates(args) -> int:
         if phase_updates:
             lines += _fmt_phase_updates(phase_updates)
         else:
-            # SR-only: fall back to permanent SR links, never raw platform links.
+            # Fallback (older build / no phaseUpdates): the minted permanent SR links.
             lines += _fmt_sr_links(r.get("srLinks") or {})
     return _emit(body, args.json, lines or ["No active runs."])
+
+
+def cmd_list(args) -> int:
+    """List the account's recent researches (newest first), so the user can ask for
+    any one's links or podcast BY NAME. Account-wide — EVERY research, not just the
+    agent-started ones (that's `updates`, the active-only streaming view). The
+    per-run links/podcast are then fetched on demand via `status` / `podcast`,
+    which already resolve any of these by title."""
+    code, body, runs = _fetch_runs(limit=30)
+    if code != 200:
+        return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
+    if not runs:
+        return _emit(body, args.json,
+                     ["You don't have any researches yet — just name a topic to start one."])
+    lines = ["Your researches (newest first):"]
+    for r in runs:
+        title = r.get("title") or r.get("topic") or r.get("runId")
+        lines.append(f"  • “{title}” — {r.get('status', '?')}")
+    lines.append("Ask for any one’s results, a specific link (brief / a report / podcast), or its podcast.")
+    return _emit(body, args.json, lines)
 
 
 def cmd_stop(args) -> int:
@@ -1053,6 +1073,10 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("updates", help="active runs + current links (streaming cron)")
     up.add_argument("--active", action="store_true")
     up.set_defaults(func=cmd_updates)
+
+    sub.add_parser("list", aliases=["researches"],
+                   help="list ALL recent researches (any status) to pick one by name") \
+        .set_defaults(func=cmd_list)
 
     # Graceful stop (keeps results + chat). `cancel` is an alias for the same
     # graceful behavior so an old habit never triggers a destructive delete.
