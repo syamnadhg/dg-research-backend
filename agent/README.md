@@ -38,7 +38,8 @@ just ask ("install Super Research"), and the agent runs `pipx run
 superresearch-agent connect` and relays the sign-in link. (The runtime's
 `/skills` marketplace command is terminal-only and doesn't work over a chat
 platform — *running the command* does.) The machine-readable companion is at
-**https://superresearch.io/agent-install.json** (command + flags + steps).
+**https://superresearch.io/skills.json** (command + flags + steps; the legacy
+`/agent-install.json` 308-redirects there).
 
 **No backend host yet?** The agent orchestrates from chat; the research pipeline
 runs on a paired computer. If you don't have one, say **"install Super Research
