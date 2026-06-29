@@ -666,6 +666,7 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     # ── [1/2] Remove the skill ────────────────────────────────────────────────
     b.step(1, 2, "Remove the skill")
     removed_any = False
+    reload_hints: set[str] = set()
     for rt, home in _disconnect_pairs(explicit, dest_override):
         try:
             with b.spinner(f"Removing the skill from {rt}"):
@@ -677,8 +678,17 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
             where = f"  ({home})" if home else ""
             b.ok(f"Removed the Super Research skill from {rt}{where}")
             removed_any = True
+            # Hermes caches its skill scan, so /sr lingers until a reload — symmetric
+            # with connect telling the user to reload so it registers. OpenClaw
+            # auto-watches the skill dir (reload_hint None) → no prompt needed.
+            hint = connect.profile(rt).reload_hint
+            if hint:
+                reload_hints.add(hint)
     if not removed_any:
         b.dim("No Super Research skill was installed (nothing to remove).")
+    else:
+        for hint in sorted(reload_hints):
+            b.dim(f"     Run {hint} in your chat so /sr unregisters.")
 
     # ── [2/2] Sign out ────────────────────────────────────────────────────────
     b.step(2, 2, "Sign out")
