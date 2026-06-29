@@ -11414,7 +11414,21 @@ async def verified_paste_brief(page, brief_text, platform, label, max_retries=1)
                 await asyncio.sleep(0.1)
                 await page.keyboard.press("Delete")
                 await asyncio.sleep(0.1)
-                await page.keyboard.type(brief_text, delay=2)
+                # insert_text dispatches ONE insertText event with the literal
+                # string — newlines stay literal text, never Enter keypresses. A
+                # raw keyboard.type() here fires Enter per "\n", and Gemini binds
+                # Enter to SUBMIT, so a multi-line brief gets sent one tiny message
+                # per line (the "brief in pieces, endlessly" submit-storm that
+                # blocks Deep Research). Mirror the proven insert_text -> fill ->
+                # type idiom used elsewhere in this file; the newline-stripped
+                # type() is a can't-fire-submit last resort.
+                try:
+                    await page.keyboard.insert_text(brief_text)
+                except Exception:
+                    try:
+                        await ta.fill(brief_text)
+                    except Exception:
+                        await page.keyboard.type(brief_text.replace("\n", " "), delay=2)
                 await asyncio.sleep(1.5)
             except Exception as e:
                 log(f"[{label}] Strategy B (keyboard) raised: {e}", "WARN")
