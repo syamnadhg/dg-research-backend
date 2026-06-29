@@ -104,7 +104,8 @@ or say nothing to mean the most recent / active run.
 | "skip it", "skip this step", "move past the blocker" | `sr.py skip [--run "<title>"]` |
 | "skip the video and the report" | `sr.py skip video report [--run "<title>"]` |
 | "sign in", "connect", "log me in" | `sr.py login` |
-| "logout", "log out", "log me out", "sign out", "logout of super research", "sign out of super research", "disconnect me from the agent" | `sr.py logout` |
+| "logout", "log out", "log me out", "sign out", "logout of super research" | `sr.py logout` (signs the agent OUT of the account — KEEPS the skill + bridge installed; for full removal see the next row) |
+| "remove Super Research", "uninstall it", "take it down", "disconnect it entirely", "get rid of the skill" | **confirm**, then run `pipx run superresearch-agent disconnect --yes` (FULL teardown: removes the /sr skill, signs out, AND stops the background bridge), then tell them to run **/reload-skills** so /sr unregisters. This is the ONLY way to take the bridge down from chat — do **NOT** use the runtime's own "remove skill" / catalog removal (that just deletes the skill file and leaves the bridge running), and **NOT** `sr.py logout` (sign-out only). A bare "disconnect" is ambiguous → ask "just sign out, or fully remove it (skill + bridge)?" |
 | "which devices?", "which device are we using?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "add a device", "pair my new PC, code is K7XQ-9B2M" | `sr.py device-add <code>` |
@@ -161,12 +162,21 @@ stay owner-only in the web app) — describe each in plain words, never as comma
 
 ## After a sign-in link
 
-When you've sent a sign-in link (for "log me in", OR for a research the user asked
-while signed out), the user signs in in their browser. The bridge *tries* to post
-a proactive "✓ Signed in" on its own, but that depends on the runtime's scheduler —
-so **never wait on it and never say "what should I continue?"**. The moment the
-user replies anything ("done", "continue", "yes", "I signed in", or even a brand
-new message):
+**When you send a sign-in link** (for "log me in", OR for a research the user asked
+while signed out), do BOTH of these in the SAME turn:
+
+1. Relay the click-to-approve link the client returned.
+2. **Arm the proactive watchdog.** The client prints a directive line like
+   `cronjob: create no_agent=true schedule="every 1m" script="…" name="…"` —
+   immediately call your **cronjob tool** with exactly those args. This is the ONLY
+   thing that lets the bridge post a proactive "✓ Signed in" here on its own once
+   the user approves; the Python can't self-schedule it. (If your runtime has no
+   cronjob tool, skip this — the follow-up below still works.)
+
+The proactive announce is best-effort (it needs the runtime's scheduler), so
+**never wait on it and never say "what should I continue?"**. The moment the user
+replies anything ("done", "continue", "yes", "I signed in", or even a brand new
+message):
 
 1. Run `sr.py login-done`. It confirms the session and relays **"✓ Connected as
    <email>"**.

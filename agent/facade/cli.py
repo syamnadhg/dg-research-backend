@@ -653,9 +653,17 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     if explicit and explicit not in connect.RUNTIMES:
         b.no(f"Unknown runtime '{explicit}'. Choose: {', '.join(connect.RUNTIMES)}")
         return 1
+    # Non-interactive (chat exec / --yes): do the FULL teardown — including the
+    # background bridge — without prompting. This is what lets a chat "remove /
+    # disconnect Super Research" actually take the bridge down (not just delete the
+    # skill file, which the runtime's own skill-removal does).
+    noninteractive = bool(getattr(args, "yes", False)) or not sys.stdin.isatty()
     # A WSL runtime's skill + bridge + session + prefs all live in the distro — run
-    # the whole teardown there (mirror connect's hand-off), not on Windows.
-    rc = _delegate_lifecycle("disconnect", (["--runtime", explicit] if explicit else []),
+    # the whole teardown there (mirror connect's hand-off), not on Windows. Forward
+    # --yes so the in-distro disconnect is non-interactive too.
+    rc = _delegate_lifecycle("disconnect",
+                             (["--runtime", explicit] if explicit else [])
+                             + (["--yes"] if getattr(args, "yes", False) else []),
                              label="Disconnect", explicit=explicit)
     if rc is not None:
         return rc
@@ -714,7 +722,9 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     kept_bridge = False  # set only if the user DECLINED tearing down a running bridge
     if autostart.is_installed() or _bridge_up():
         print()
-        if b.confirm("Also stop the background bridge + remove it from startup?", default=True):
+        # _decide: --yes / non-TTY → True (stop it, the full-teardown intent);
+        # a real terminal still gets the prompt.
+        if _decide(None, noninteractive, "Also stop the background bridge + remove it from startup?", default=True):
             _retire_bridge()
         else:
             kept_bridge = True
@@ -1519,6 +1529,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "(the app's Revoke now only signs out; this is the only full teardown)")
     dc.add_argument("runtime", nargs="?", help="hermes or openclaw (defaults to every connected one)")
     dc.add_argument("--dest", help="explicit install dir (default: the runtime's skills dir)")
+    dc.add_argument("--yes", "-y", action="store_true",
+                    help="non-interactive: assume yes AND stop the background bridge "
+                         "(full teardown) without asking — for chat-driven disconnect")
     dc.set_defaults(func=cmd_disconnect)
 
     sub.add_parser("serve", parents=[common],

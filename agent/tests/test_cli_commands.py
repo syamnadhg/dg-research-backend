@@ -209,6 +209,9 @@ def _disconnect_teardown_fixture(monkeypatch):
     monkeypatch.setattr(cli, "_bridge_up", lambda: False)
     retired = {"v": False}
     monkeypatch.setattr(cli, "_retire_bridge", lambda: retired.__setitem__("v", True))
+    # Default to a real terminal so the bridge-teardown PROMPT path runs (the tests
+    # below mock b.confirm). The non-TTY / --yes auto-teardown has its own test.
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
     return retired
 
 
@@ -255,6 +258,18 @@ def test_cmd_disconnect_next_shows_retire_only_when_bridge_kept(monkeypatch):
     monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: False)
     _, out = _cap(cli.cmd_disconnect, _ns())
     assert "retire" in out
+
+
+def test_cmd_disconnect_yes_auto_tears_down_bridge(monkeypatch):
+    # Non-interactive (--yes, e.g. chat-driven "remove Super Research"): stop the
+    # bridge WITHOUT prompting, so a chat disconnect actually takes the bridge down.
+    retired = _disconnect_teardown_fixture(monkeypatch)
+    asked = {"v": False}
+    monkeypatch.setattr(cli.b, "confirm", lambda *a, **k: asked.__setitem__("v", True) or False)
+    _, out = _cap(cli.cmd_disconnect, _ns(yes=True))
+    assert asked["v"] is False        # never prompted
+    assert retired["v"] is True       # bridge torn down anyway (full teardown)
+    assert "retire" not in out        # nothing left to retire
 
 
 # ── reachability: _ensure_reachable (co-located only; WSL is delegated) ───────
