@@ -26882,8 +26882,9 @@ async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=2
                         if (isInComposerOrToolbar(b)) continue;
                         if (!isVisible(b)) continue;
                         const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                        const title = (b.getAttribute('title') || '').toLowerCase();
                         const txt = (b.textContent || '').trim().toLowerCase();
-                        if (!(retryWords.test(aria) || retryWords.test(txt))) continue;
+                        if (!(retryWords.test(aria) || retryWords.test(title) || retryWords.test(txt))) continue;
                         // Require either assistant-scope OR a fail-text token
                         // inside the nearest block. Without one of those a
                         // composer regenerate icon outside the toolbar can
@@ -26893,7 +26894,7 @@ async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=2
                             if (!parent || !failPattern.test(parent.innerText || '')) continue;
                         }}
                         b.click();
-                        return aria || txt || 'matched';
+                        return aria || title || txt || 'matched';
                     }}
                     return '';
                 }}"""
@@ -27455,28 +27456,62 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             return False
 
         if not await _gemini_landed(15.0):
-            log(f"[{label}] Gemini submission not confirmed (URL still bare /app) — re-submitting once", "WARN")
-            try:
-                resent = False
-                for _sel in _send_sels:
+            # The conversation URL hasn't advanced to /app/<id>. Under concurrent
+            # Deep-Research load Gemini is often just SLOW, or it errors ("Sorry,
+            # something went wrong" / "I encountered an error … try again") — in
+            # which case the brief DID enter but the URL never advances on an error.
+            # The old code re-submitted ONCE then failed fast at ~2 min, skipping
+            # [2D] and silently dropping Gemini (no gemini.md, run still "done").
+            # Instead, loop a few times: click Gemini's own Retry/Regenerate when an
+            # error is showing (it can take >90s to appear under load), else re-submit
+            # a genuinely-dropped send; wait LONGER for the URL to land after each.
+            # Only when every attempt is exhausted do we give up — and then with a
+            # real Retry/Skip blocker, never a silent skip.
+            _max_attempts = 4
+            _landed = False
+            log(f"[{label}] Gemini submission not confirmed (URL still bare /app) — retrying", "WARN")
+            for _att in range(1, _max_attempts + 1):
+                if _controls.is_stop() or _gemini_in_conversation():
+                    break
+                _retried = await _try_inpage_retry_on_research_fail(
+                    page, platform, label, max_wait_s=20)
+                if _retried:
+                    log(f"[{label}] Gemini error → clicked in-page Retry "
+                        f"(attempt {_att}/{_max_attempts})")
+                elif not _gemini_in_conversation():
+                    log(f"[{label}] Gemini URL still bare, no error yet — re-submitting "
+                        f"(attempt {_att}/{_max_attempts})", "WARN")
                     try:
-                        _b = await page.query_selector(_sel)
-                        if _b and await _b.is_enabled():
-                            await _b.click()
-                            resent = True
-                            break
-                    except Exception:
-                        continue
-                if not resent:
-                    try:
-                        await page.keyboard.press("Enter")  # composer submit as a last resort
-                    except Exception:
-                        pass
-            except Exception as _se:
-                log(f"[{label}] Gemini re-submit raised (non-fatal): {_se}", "DEBUG")
-            if not await _gemini_landed(15.0):
-                log(f"[{label}] Gemini brief never entered a conversation — failing fast "
-                    f"(skips the 10-min plan wait)", "ERROR")
+                        resent = False
+                        for _sel in _send_sels:
+                            try:
+                                _b = await page.query_selector(_sel)
+                                if _b and await _b.is_enabled():
+                                    await _b.click()
+                                    resent = True
+                                    break
+                            except Exception:
+                                continue
+                        if not resent:
+                            try:
+                                await page.keyboard.press("Enter")  # last-resort composer submit
+                            except Exception:
+                                pass
+                    except Exception as _se:
+                        log(f"[{label}] Gemini re-submit raised (non-fatal): {_se}", "DEBUG")
+                if await _gemini_landed(40.0):
+                    _landed = True
+                    break
+            if not _landed and not _gemini_in_conversation():
+                log(f"[{label}] Gemini brief never started a research plan after "
+                    f"{_max_attempts} retries — surfacing a Retry/Skip blocker (no silent skip)", "ERROR")
+                try:
+                    fail_agent("gemini", "Gemini couldn't start its research plan",
+                               "Gemini's Deep Research kept erroring (e.g. \"something went wrong\") "
+                               "and never started a research plan after several automatic retries. "
+                               "Retry to try again, or Skip to continue with the other agents.")
+                except Exception:
+                    pass
                 return page, False
         log(f"[{label}] Gemini submission confirmed ✓ (conversation started)")
     return page, True
