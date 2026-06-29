@@ -85,7 +85,10 @@ def _request(method: str, path: str, body: dict | None = None,
         except ValueError:
             return e.code, {"error": f"HTTP {e.code}"}
     except urllib.error.URLError as e:
-        return 0, {"error": f"bridge unreachable ({e.reason}) — is `agent serve` running?"}
+        return 0, {"error": f"bridge unreachable ({e.reason}) — the Super Research bridge "
+                            "isn't running on this machine yet. Set it up with `pipx run "
+                            "superresearch-agent connect` (it starts the bridge + keeps it "
+                            "on login), then sign in."}
 
 
 def _get(path: str, timeout: float | None = None) -> tuple[int, dict]:

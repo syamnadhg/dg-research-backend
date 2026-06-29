@@ -30,11 +30,24 @@ client's output verbatim (it prints chat-ready text):
 python scripts/sr.py <command> [args]
 ```
 
-If a command prints ``✗ bridge unreachable … is `agent serve` running?``, tell
-the user the host bridge isn't running, and stop. The fix is to (re-)run the
-connect step on the computer that runs Super Research — `pipx run
-superresearch-agent connect` (or `python research.py agent connect` from a backend checkout) — which
-starts the bridge there.
+If a command reports ``✗ bridge unreachable …``, the local Super Research bridge
+isn't running on this machine yet, so nothing can reach the account — don't
+improvise around it, get it set up. This is normal the **first time** right after
+the skill was added from the runtime's skill catalog: copying the skill files does
+NOT start the bridge — **`connect` is the one-time setup that does** (it also pins
+the bridge to start on every login). `connect` runs on **this machine** — the same
+place you run `sr.py` — so **run it yourself**, then tell the user you're doing the
+one-time setup:
+
+```
+pipx run superresearch-agent connect
+```
+
+(or `python research.py agent connect` from a backend checkout). It installs +
+starts + pins the bridge and prints the reload-skills + sign-in next step — relay
+that and guide sign-in. Only if you genuinely can't run it (no shell / it errors),
+show the user the command above to run on the machine their chat agent runs on.
+Once it's set up the bridge stays up on its own.
 
 **Hard rule — NEVER improvise the research, ever.** A "research X" / "Super
 Research on X" / "deep dive on Y" request is ALWAYS satisfied by running
@@ -103,7 +116,8 @@ or say nothing to mean the most recent / active run.
 | "continue" / "yes" / "done" / "I signed in" — **right after you sent a sign-in link** | `sr.py login-done`, then continue the pending topic (see **After a sign-in link**) — NOT `retry` |
 | "skip it", "skip this step", "move past the blocker" | `sr.py skip [--run "<title>"]` |
 | "skip the video and the report" | `sr.py skip video report [--run "<title>"]` |
-| "sign in", "connect", "log me in" | `sr.py login` |
+| "set up Super Research", "finish the setup", "run connect", "get the bridge running" | run `pipx run superresearch-agent connect` **yourself** (one-time: installs + starts + pins the local bridge), then guide sign-in — see **A bare `/sr`** / **bridge unreachable**. This is the bridge SETUP, distinct from sign-in below. |
+| "sign in", "log me in" | `sr.py login` |
 | "logout", "log out", "log me out", "sign out", "logout of super research" | `sr.py logout` (signs the agent OUT of the account — KEEPS the skill + bridge installed; for full removal see the next row) |
 | "remove Super Research", "uninstall it", "take it down", "disconnect it entirely", "get rid of the skill" | **confirm**, then run `pipx run superresearch-agent disconnect --yes` (FULL teardown: removes the /sr skill, signs out, AND stops the background bridge), then tell them to run **/reload-skills** so /sr unregisters. This is the ONLY way to take the bridge down from chat — do **NOT** use the runtime's own "remove skill" / catalog removal (that just deletes the skill file and leaves the bridge running), and **NOT** `sr.py logout` (sign-out only). A bare "disconnect" is ambiguous → ask "just sign out, or fully remove it (skill + bridge)?" |
 | "which devices?", "which device are we using?" | `sr.py devices` (the → marks the selected one) |
@@ -136,10 +150,25 @@ action, ask — don't guess. The same stop/logout confirmation rule applies.
 ## A bare `/sr` — start here
 
 When the user sends just **`/sr`** (or asks what Super Research is / how to
-start), run `sr.py status-account`, then:
+start), run `sr.py status-account`, then branch on what it reports:
 
-- **Not signed in** → welcome them; the first step is to **sign in** — tell them
-  to just say "log me in" and you'll send a sign-in link. Then list the actions below.
+- **Bridge unreachable** (`✗ bridge unreachable …` — the very first time, right
+  after the skill was added from the catalog: the files were copied but the local
+  bridge was never started) → this is the **one-time setup**. Tell the user you're
+  setting it up, then **run it yourself** (it's on this machine):
+
+  ```
+  pipx run superresearch-agent connect
+  ```
+
+  It starts the bridge, keeps it on login, and prints the reload-skills + sign-in
+  next step — relay that and guide sign-in. (So a **natural-language / catalog
+  install needs BOTH** — set up, then sign in; an install done with the **`connect`
+  command already did the setup** and only needs the sign-in.) Only if you can't
+  run it, show them the command to run on the machine their chat agent runs on.
+- **Bridge up, not signed in** → welcome them; the first step is to **sign in** —
+  tell them to just say "log me in" and you'll send a sign-in link. Then list the
+  actions below.
 - **Signed in** → greet them by their account email, list the actions, and invite
   them to **just name a topic to research** (and to ask "which devices?" to choose
   where it runs).
@@ -257,6 +286,11 @@ doc" → 🔗 Google Doc. "Results of X" → all of that run's links from `statu
   no extra commentary about any link being absent.
 
 ## First-time setup
+
+If `sr.py status-account` reports the **bridge is unreachable** (skill files
+copied from the catalog, but the bridge was never started), the very first step is
+the one-time `pipx run superresearch-agent connect` to set it up — see **A bare
+`/sr`**. Only once the bridge is up can sign-in or research work.
 
 If `sr.py status-account` says "Not signed in", guide the user through `/sr
 login` before running research. They pick a device with `/sr device` (skipped
