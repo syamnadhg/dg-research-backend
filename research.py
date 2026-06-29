@@ -18947,6 +18947,14 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         # verified=False keeps the tab in the round-robin (it doesn't drop a
         # not-verified agent) so the wall-clock cap can surface an honest failure.
         if not start_clicked:
+            # The user-retry's fresh chat ALSO failed to produce a startable plan
+            # — re-raise the Retry/Skip alert immediately (close the gap where a
+            # second failure silently dropped to the wall-clock cap). dedup-safe.
+            if not _controls.is_stop():
+                fail_agent(
+                    "gemini", "Gemini couldn't start its research plan",
+                    "The retried Gemini run still didn't produce a startable research "
+                    "plan. Retry re-asks in a fresh chat; Skip continues without Gemini.")
             return (new_page, False)
         verified = await wait_until_verified(
             verify_gemini_generating, new_page, "2B-retry",
@@ -19675,6 +19683,115 @@ _GEMINI_COMPLETION_RE = re.compile(
     r"feel\s+free\s+to\s+ask\s+me\s+follow[\s-]?up)",
     re.IGNORECASE,
 )
+
+# If NONE of these conversation/DR markers are in the DOM, the page is the empty
+# "new chat" home (the periodic reload drifted off the conversation) rather than a
+# live Deep-Research run. Mirrors the scrape + completion-detector selectors
+# (message-content / model-response / immersive-panel / deep-research-panel).
+_GEMINI_CONVERSATION_PRESENT_JS = (
+    "() => !!document.querySelector("
+    "'user-query, model-response, message-content, .model-response-text,"
+    " .response-container, immersive-panel, deep-research-panel')"
+)
+
+
+def _gemini_conversation_id(url: str) -> str:
+    """The Gemini conversation id from an ``/app/<id>`` URL (``''`` if bare/none)."""
+    if not url:
+        return ""
+    m = re.search(r"/app/([A-Za-z0-9_-]{6,})", url)
+    return m.group(1) if m else ""
+
+
+async def _gemini_conversation_present(page) -> bool:
+    """True if a Gemini conversation / DR panel is mounted (vs. the empty home).
+    On a probe error, assume present so we never thrash recovery on a flake."""
+    try:
+        return bool(await page.evaluate(_GEMINI_CONVERSATION_PRESENT_JS))
+    except Exception:
+        return True
+
+
+async def _gemini_reopen_from_sidebar(page, conv_id: str) -> bool:
+    """Re-open a Gemini conversation by CLICKING it in the left sidebar's recent
+    list — an in-SPA open that reliably rehydrates the conversation, unlike a cold
+    ``goto(/app/<id>)`` which often re-renders the empty home. Expands the sidebar
+    first if the recent list isn't mounted. Returns True iff a matching item was
+    clicked; the caller verifies the conversation actually mounted afterwards."""
+    if not conv_id:
+        return False
+    js = """
+    (cid) => {
+      const find = () => Array.from(
+        document.querySelectorAll('a[href*="/app/"], [role="link"], [data-test-id*="conversation"]'))
+        .find(el => (((el.getAttribute && el.getAttribute('href')) || el.href || '') + '')
+          .includes(cid));
+      let a = find();
+      if (!a) {
+        // Sidebar may be collapsed — click an expand/menu button, then retry.
+        const btn = document.querySelector(
+          '[data-test-id="side-nav-menu-button"], button[aria-label*="main menu" i],'
+          + ' button[aria-label*="expand" i], button[aria-label*="menu" i]');
+        if (btn) { btn.click(); }
+        a = find();
+      }
+      if (a) { a.click(); return true; }
+      return false;
+    }
+    """
+    try:
+        clicked = bool(await page.evaluate(js, conv_id))
+        if not clicked:
+            # The expand click above may reveal the link only on the next frame.
+            await asyncio.sleep(1.0)
+            clicked = bool(await page.evaluate(js, conv_id))
+        if clicked:
+            await asyncio.sleep(2.0)
+        return clicked
+    except Exception:
+        return False
+
+
+async def _gemini_recover_if_empty(page, url_pre_reload: str, log_fn) -> bool:
+    """After a periodic reload, ensure the conversation is still mounted. If the
+    reload drifted to the empty home, recover IN-CHAT: click the conversation in
+    the sidebar (PRIMARY — the reliable in-SPA path), else ``goto(/app/<id>)``
+    (FALLBACK). Returns True if the conversation is present at the end (never lost
+    or recovered), False if it's STILL empty — the caller then leaves the
+    stuck-watchdog baselines untouched so it escalates to a Retry/Skip card,
+    rather than silently polling a dead page (the empty-chat hang)."""
+    if await _gemini_conversation_present(page):
+        return True
+    conv_id = _gemini_conversation_id(url_pre_reload)
+    log_fn(
+        f"[Gemini] post-reload landed on the empty home (conversation not mounted) "
+        f"— recovering conv={conv_id or '?'}",
+        "WARN",
+    )
+    # PRIMARY: in-SPA sidebar open (a cold goto often re-renders empty).
+    if conv_id and await _gemini_reopen_from_sidebar(page, conv_id):
+        if await _gemini_conversation_present(page):
+            log_fn("[Gemini] recovered the conversation via the sidebar", "INFO")
+            return True
+    # FALLBACK: cold navigate back to the conversation URL.
+    if conv_id:
+        try:
+            await page.goto(
+                f"https://gemini.google.com/app/{conv_id}",
+                wait_until="domcontentloaded", timeout=20000,
+            )
+            await asyncio.sleep(3.0)
+        except Exception as _e:
+            log_fn(f"[Gemini] recovery goto raised (non-fatal): {_e}", "WARN")
+        if await _gemini_conversation_present(page):
+            log_fn("[Gemini] recovered the conversation via goto fallback", "INFO")
+            return True
+    log_fn(
+        "[Gemini] could not recover the conversation after reload — leaving the "
+        "stuck-watchdog to escalate (Retry/Skip)",
+        "WARN",
+    )
+    return False
 
 
 async def _gemini_kickoff_pending(page):
@@ -20519,6 +20636,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 name == "Gemini"
                 and (time.time() - p.get("last_refresh", p["start_time"])) >= GEMINI_REFRESH_INTERVAL
                 and not p.get("dns_retry_at")
+                # Stop reloading once CUA has seen the DR finish at least once
+                # (done_count resets to 0 on any "still generating"/false-done, so
+                # this only holds for a genuinely-complete panel): a reload then
+                # would WIPE the rendered completed panel before CUA lands its 2nd
+                # confirmation + extracts — the empty-chat hang the user hit (CUA
+                # said "done 1/2", the next reload reset it to the empty home).
+                and p.get("done_count", 0) < 1
             ):
                 p["last_refresh"] = time.time()
                 try:
@@ -20565,41 +20689,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 "WARN",
                             )
                         await asyncio.sleep(5.0)
-                        # If the reload drifted us off the conversation
-                        # URL, navigate back. Only attempt if the
-                        # pre-reload URL had a path component beyond
-                        # the bare app root.
-                        try:
-                            _url_post_reload = p["page"].url or ""
-                            _pre_meaningful = (
-                                _url_pre_reload
-                                and _url_pre_reload != _url_post_reload
-                                and ("/app/" in _url_pre_reload
-                                     or "/chat/" in _url_pre_reload)
-                                and _url_pre_reload.rstrip("/").split("/")[-1] != "app"
-                            )
-                            if _pre_meaningful:
-                                log(
-                                    f"[Gemini] post-reload URL drifted: "
-                                    f"{_url_pre_reload} → {_url_post_reload} "
-                                    f"— navigating back to preserve conversation",
-                                    "WARN",
-                                )
-                                try:
-                                    await p["page"].goto(
-                                        _url_pre_reload,
-                                        wait_until="domcontentloaded",
-                                        timeout=20000,
-                                    )
-                                    await asyncio.sleep(3.0)
-                                except Exception as _gge:
-                                    log(
-                                        f"[Gemini] safety-net goto back "
-                                        f"raised (non-fatal): {_gge}",
-                                        "WARN",
-                                    )
-                        except Exception:
-                            pass
+                        # The reload can land on Gemini's empty "new chat" home
+                        # (a redirect, or a timed-out reload) instead of rehydrating
+                        # the conversation — and trusting page.url to detect that is
+                        # unreliable (Playwright caches the pre-reload /app/<id> while
+                        # the DOM shows the home). Probe the DOM directly; if empty,
+                        # recover IN-CHAT by clicking the conversation in the SIDEBAR
+                        # (a cold goto often re-renders empty again), goto as fallback.
+                        _recovered = await _gemini_recover_if_empty(
+                            p["page"], _url_pre_reload, log
+                        )
                         try:
                             await inject_agent_observer(p["page"], "gemini")
                         except Exception as _inj_err:
@@ -20608,13 +20707,19 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 f"failed (non-fatal): {_inj_err}",
                                 "DEBUG",
                             )
-                        # Reset baselines so the no-growth + stuck
-                        # watchdog don't fire from the reload window.
-                        _now = time.time()
-                        p["last_growth_time"] = _now
-                        p["last_heartbeat"] = _now
-                        p["stuck_warned_at"] = 0
-                        p["last_cua_check"] = _now
+                        # Reset the no-growth/stuck baselines ONLY when the
+                        # conversation is actually present (clean reload or a
+                        # successful recovery). If recovery FAILED (still the empty
+                        # home), DON'T reset — let the stuck-watchdog escalate to a
+                        # Retry/Skip card instead of polling a dead page forever
+                        # (the old code reset unconditionally, which is exactly why
+                        # the empty-chat run hung indefinitely).
+                        if _recovered:
+                            _now = time.time()
+                            p["last_growth_time"] = _now
+                            p["last_heartbeat"] = _now
+                            p["stuck_warned_at"] = 0
+                            p["last_cua_check"] = _now
                 except Exception as _gre:
                     log(
                         f"[Gemini] periodic refresh raised "
@@ -27826,7 +27931,23 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         await asyncio.sleep(2)
 
         start_clicked = False
-        _start_wait_max_sec = 10 * 60
+        # Cap the plan-draft wait near the user's "Start research in 3-5 min max"
+        # expectation (was a flat 10 min, which felt far too long on a stuck plan).
+        # Env-overridable for a genuinely slow-but-healthy plan. After this window
+        # the bounded CUA recovery runs, then an honest fail_agent (Retry/Skip).
+        _start_wait_max_sec = int(os.environ.get("GEMINI_PLAN_WAIT_SEC", str(5 * 60)))
+        # Shared JS: click the "Start research" button, and a sibling probe for
+        # whether it's STILL present (used to confirm a click actually took).
+        _click_start_js = (
+            "() => { for (const b of document.querySelectorAll('button')) {"
+            " if (((b.textContent)||'').trim().toLowerCase().includes('start research'))"
+            " { b.click(); return true; } } return false; }"
+        )
+        _start_present_js = (
+            "() => { for (const b of document.querySelectorAll('button')) {"
+            " if (((b.textContent)||'').trim().toLowerCase().includes('start research'))"
+            " return true; } return false; }"
+        )
         _loop_start = time.time()
         _last_plan_emit = 0.0
         # #755 (2026-06-02): Gemini sometimes fails to draft the research plan
@@ -27853,19 +27974,34 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # 1. Check Start-research button on Gemini and click if present
             try:
                 await browser.switch_to_page(gemini_page)
-                clicked = await gemini_page.evaluate("""() => {
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        const txt = b.textContent.trim().toLowerCase();
-                        if (txt.includes('start research')) { b.click(); return true; }
-                    }
-                    return false;
-                }""")
+                clicked = await gemini_page.evaluate(_click_start_js)
                 if clicked:
-                    log("[2D] Clicked 'Start research' via JS ✓")
-                    start_clicked = True
-                    await asyncio.sleep(5)
-                    break
+                    # Guard: confirm the click actually TOOK — the button should
+                    # vanish as the research begins. A JS click occasionally
+                    # doesn't register (overlay / not-yet-bound handler), which
+                    # would falsely mark a not-started plan as clicked. Re-click up
+                    # to 2× until "Start research" is gone before trusting it.
+                    _took = False
+                    for _vi in range(3):
+                        await asyncio.sleep(2)
+                        try:
+                            _still = await gemini_page.evaluate(_start_present_js)
+                        except Exception:
+                            _still = False
+                        if not _still:
+                            _took = True
+                            break
+                        try:
+                            await gemini_page.evaluate(_click_start_js)  # re-click
+                        except Exception:
+                            pass
+                    if _took:
+                        log("[2D] Clicked 'Start research' via JS ✓ (confirmed it took)")
+                        start_clicked = True
+                        await asyncio.sleep(5)
+                        break
+                    log("[2D] 'Start research' click didn't take after 2 re-clicks "
+                        "— continuing to poll", "WARN")
             except Exception:
                 pass
 
@@ -27945,11 +28081,12 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 except Exception:
                     pass
 
-            # 2. Emit a Gemini planning heartbeat every ~60s so the frontend
-            # knows Gemini is still drafting the plan. No rotation — we do
-            # NOT scrape ChatGPT/Claude here; they kept their first-wave
-            # state and will refresh on the official round-robin.
-            if time.time() - _last_plan_emit >= 60:
+            # 2. Emit a Gemini planning heartbeat every ~15s so the frontend
+            # shows smooth live motion while Gemini drafts the plan (was 60s,
+            # which read as frozen during the wait). No rotation — we do NOT
+            # scrape ChatGPT/Claude here; they kept their first-wave state and
+            # will refresh on the official round-robin.
+            if time.time() - _last_plan_emit >= 15:
                 try:
                     _gm = await scrape_progress_gemini(gemini_page) or {}
                     _gm_status = (_gm.get("status") or "generating")
@@ -27968,7 +28105,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     pass
 
             log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
-            await asyncio.sleep(30)
+            # Tighter tick (was 30s) so a "Start research" button is clicked within
+            # ~10s of appearing and the wait feels responsive, not stalled.
+            await asyncio.sleep(10)
 
         # CUA recovery for "Start research" (#776 + #755). #755: skip on Stop —
         # agent_loop would just return status='stopped' and the round-robin is
@@ -28049,6 +28188,17 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             if not start_clicked:
                 log(f"[2D] CUA recovery exhausted ({_FALLBACK_MAX_REGEN} attempts) — "
                     f"plan never produced a clickable 'Start research'", "WARN")
+                # Surface the Retry/Skip alert NOW — don't make the user wait for
+                # the wall-clock cap. Per spec: after the bounded plan retries fail
+                # (or 'Start research' never appears), raise skip/retry. Retry runs
+                # a HARD retry = fresh Gemini chat + re-submitted topic. fail_agent
+                # dedups by alert_id, so a later wall-clock re-assert is harmless.
+                if not _controls.is_stop():
+                    fail_agent(
+                        "gemini", "Gemini couldn't start its research plan",
+                        f"No startable research plan after {_start_wait_max_sec // 60} min "
+                        f"+ {_FALLBACK_MAX_REGEN} plan retries. Retry re-asks in a fresh "
+                        "Gemini chat; Skip continues with the other agents.")
 
         # Verify Gemini is actually researching. #755: on Stop, skip the ~45s
         # DOM-verify retry churn — record not-verified and let the stop-aware
