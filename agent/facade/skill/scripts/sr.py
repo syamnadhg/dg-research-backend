@@ -412,7 +412,19 @@ def cmd_login_wait(args) -> int:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     state = body.get("state")
     if state == "connected":
-        return _emit(body, args.json, [_connected_msg(body.get("email") or body.get("uid"))])
+        who = body.get("email") or body.get("uid")
+        topic = (body.get("pendingTopic") or "").strip()
+        if topic:
+            # The user asked to research this before signing in. Confirm + name the
+            # topic; per SKILL.md "After a sign-in link" the assistant now runs
+            # `research "<topic>"`, which starts it (or surfaces the pair-a-device
+            # prompt if there's no device). Don't also print _connected_msg's
+            # no-device prompt here — running the research handles that once.
+            return _emit(body, args.json, [
+                f"✓ Connected as {who}.",
+                f"Continuing your research on “{topic}”…",
+            ])
+        return _emit(body, args.json, [_connected_msg(who)])
     msg = {
         "pending": "… not approved yet — approve it in your browser; you'll connect automatically.",
         "expired": "✗ The sign-in link expired — ask me to send a fresh sign-in link.",

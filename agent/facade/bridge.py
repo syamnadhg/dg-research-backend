@@ -918,6 +918,12 @@ def _advance_remote_flow(state: BridgeState) -> str | None:
         # current state.remote here — no superseded-flow capture is possible.
         state.set_session(sess)
         flow.state = "connected"
+        # Intentionally LEAVE state.remote in place (do NOT null it on capture):
+        # a later `login-done` (/login/remote/poll) must still find the flow to
+        # return state==connected + pendingTopic so chat can continue the topic
+        # the user asked before signing in (the reliable, scheduler-independent
+        # path). Token reuse is already prevented by the connected/expired/error
+        # state-guard at the top of _advance_remote_flow — leaving the flow is safe.
         # #790 identity row — explicit human sign-in, so clear any prior revoke.
         _write_agent_session_connected(sess, clear_revoked=True)
         # One-shot event for the chat watchdog: announce "signed in" the moment the
@@ -1238,6 +1244,11 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             if flow.state == "connected" and sess is not None:
                 out["email"] = sess.email
                 out["uid"] = sess.uid
+                # Surface any research topic the user asked before signing in, so a
+                # `login-done` follow-up can continue it even when the proactive
+                # watchdog never armed (the reliable, scheduler-independent path).
+                if flow.pending_topic:
+                    out["pendingTopic"] = flow.pending_topic
             if flow.error:
                 out["error"] = flow.error
             return out

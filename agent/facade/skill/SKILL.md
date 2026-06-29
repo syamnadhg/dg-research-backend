@@ -36,14 +36,29 @@ connect step on the computer that runs Super Research — `pipx run
 superresearch-agent connect` (or `python research.py agent connect` from a backend checkout) — which
 starts the bridge there.
 
-**Hard failure rule — never improvise the research.** If anything about this
-skill is broken — `scripts/sr.py` is missing, running it errors out, the skill
-content/tooling won't load, or the bridge keeps failing — tell the user plainly
-that the Super Research skill isn't correctly installed (fix: re-run the connect
-step on the host — `pipx run superresearch-agent connect`) and **STOP**. Do **not** attempt to perform the
-research, status, podcast, or any other action yourself in chat — Super Research
-runs on the user's device, not in this conversation, and an improvised answer is
-worse than the one-line error.
+**Hard rule — NEVER improvise the research, ever.** A "research X" / "Super
+Research on X" / "deep dive on Y" request is ALWAYS satisfied by running
+`sr.py research "<topic>"` — **never** by answering from your own knowledge, not
+even a quick summary, not even a few bullet points, and **not even when you
+easily could**. The only thing you may show for a research request is what the
+client prints — Super Research runs on the user's device, not in this chat. This
+holds in EVERY case, including when the skill is working perfectly:
+
+- **Working normally** → relay the run the client started. Never answer the topic
+  yourself, however tempting or "quick".
+- **No device on the account** → `sr.py research` does NOT fail silently; it
+  returns the **pair-a-device** next step. RELAY that and walk the user through
+  pairing (paste the access code shown on their research node, or run
+  `pipx install superresearch` + `superresearch --pair` to set one up). Never
+  substitute an improvised answer just because there's no device yet.
+- **Skill genuinely broken** (`scripts/sr.py` missing / it errors out / the skill
+  won't load / the bridge keeps failing) → tell the user plainly that the Super
+  Research skill isn't correctly installed (fix: re-run the connect step on the
+  host — `pipx run superresearch-agent connect`) and **STOP**.
+
+An improvised answer is always worse than running the client (or the one-line
+error). The same rule applies to status, podcast, list, and every other action —
+run the client, relay its output; do not perform any of it yourself in chat.
 
 ## How you reply — plain, natural, brief
 
@@ -84,7 +99,8 @@ or say nothing to mean the most recent / active run.
 | "stop it", "stop the EV run", "that's enough" | `sr.py stop ["<title>"]` (ENDS the run, keeps results) |
 | "pause it", "pause the run", "hold on" | `sr.py pause ["<title>"]` (resumable — does NOT end it) |
 | "resume", "unpause", "continue the paused run" | `sr.py resume ["<title>"]` |
-| "retry", "try again", "I signed in — continue" | `sr.py retry ["<title>"]` (a run BLOCKED on a decision/error) |
+| "retry", "try again" | `sr.py retry ["<title>"]` (a run BLOCKED on a decision/error — NOT the agent's own account sign-in; for "I signed in" right after you sent a sign-in link, see **After a sign-in link**) |
+| "continue" / "yes" / "done" / "I signed in" — **right after you sent a sign-in link** | `sr.py login-done`, then continue the pending topic (see **After a sign-in link**) — NOT `retry` |
 | "skip it", "skip this step", "move past the blocker" | `sr.py skip [--run "<title>"]` |
 | "skip the video and the report" | `sr.py skip video report [--run "<title>"]` |
 | "sign in", "connect", "log me in" | `sr.py login` |
@@ -143,11 +159,31 @@ stay owner-only in the web app) — describe each in plain words, never as comma
 - **trim phases** — "skip the video / report"
 - **version / update** — "what version?" · "update Super Research" · "update the agent"
 
+## After a sign-in link
+
+When you've sent a sign-in link (for "log me in", OR for a research the user asked
+while signed out), the user signs in in their browser. The bridge *tries* to post
+a proactive "✓ Signed in" on its own, but that depends on the runtime's scheduler —
+so **never wait on it and never say "what should I continue?"**. The moment the
+user replies anything ("done", "continue", "yes", "I signed in", or even a brand
+new message):
+
+1. Run `sr.py login-done`. It confirms the session and relays **"✓ Connected as
+   <email>"**.
+2. If they asked to research something before signing in, `login-done` reports that
+   **pending topic** — immediately run `sr.py research "<that topic>"` to start it
+   (this also surfaces the pair-a-device prompt if they have no device yet).
+3. If there's no pending topic, greet them and invite a topic.
+
+You DID send them a sign-in link, so a follow-up like "continue" always means
+"run `sr.py login-done` and pick up from there" — never `retry`, never a question
+back to the user.
+
 ## Action → what to run
 
 | Action | Run | Then |
 |---|---|---|
-| login | `sr.py login` | Relay the sign-in link the client returns; the user opens it, signs in, and clicks Authenticate — they connect **automatically**. `sr.py login` also arms this chat's watchdog, so the bridge posts a proactive **"✓ Signed in as …"** here the moment the approval is captured — you do **not** need to poll `login-done` yourself or ask the user to. When the user instead asked to *research* while signed out, the client hands back the same ready-to-click link and remembers the topic; relay the link — after they sign in the watchdog asks **"continue with '…'?"**, and on a "yes"/"continue" you fire that research. |
+| login | `sr.py login` | Relay the sign-in link the client returns; the user opens it, signs in, and taps Authenticate — they connect **automatically**. The bridge *tries* to post a proactive **"✓ Signed in as …"** here once the approval is captured, but that depends on the runtime's scheduler — **do not rely on it**. The moment the user replies anything next ("done", "continue", "yes", "I signed in"), run `sr.py login-done` to confirm + pick up where they left off (see **After a sign-in link**). When the user asked to *research* while signed out, run `sr.py research "<topic>"` (NOT `sr.py login`) — its reply hands back the same ready-to-click link AND remembers the topic, so after sign-in you continue it. |
 | logout | `sr.py logout` | **Confirm first**, then run. Logging out of Super Research is ALWAYS this command — never refuse it, and never tell the user to use an account/profile menu or sign out "elsewhere". Any "logout" / "log out" / "sign out" that names Super Research (or is said in this Super Research chat with no other service named) means run `sr.py logout`. Removes the agent from their account. |
 | device (list) | `sr.py devices` | Relay the list (names; → = selected). |
 | device use `<name>` | `sr.py device-use "<name>"` | Switch where research runs. Name or hostname — it resolves; on an ambiguous name it lists the matches, relay that. |
