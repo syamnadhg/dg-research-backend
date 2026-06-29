@@ -37,12 +37,17 @@ class FakeFS:
     last_pc_patch = None
     last_update = None
     seeded = None
+    last_page_size = None
 
     def __init__(self, _tp):
         pass
 
     def list_researches(self, uid, *, page_size=50):
-        return [dict(d) for d in FakeFS.researches.values()]
+        # Honor page_size like the real Firestore list (newest-first window) so a
+        # test can prove a run buried beyond the window is/ isn't returned — not
+        # just that the right page_size was requested.
+        FakeFS.last_page_size = page_size
+        return [dict(d) for d in list(FakeFS.researches.values())[:page_size]]
 
     def list_devices(self, uid):
         return [dict(d) for d in FakeFS.devices]
@@ -96,6 +101,7 @@ def bridge_port(monkeypatch):
     FakeFS.last_command = None
     FakeFS.last_update = None
     FakeFS.seeded = None
+    FakeFS.last_page_size = None
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
     sel = {"v": None}
     monkeypatch.setattr(bridge.prefs, "get_selected_device", lambda uid: sel["v"])
@@ -888,3 +894,53 @@ def test_bad_port_env_falls_back(monkeypatch, capsys):
     monkeypatch.setenv("SUPER_AGENT_BRIDGE_PORT", "not-a-port")
     sr.main(["devices"])  # must not crash; uses 9876 (nothing there → unreachable)
     assert "9876" in capsys.readouterr().err
+
+
+# ── deep run-lookup window: older runs resolve by name (the "Rocky Port" bug) ──
+
+def test_resolution_commands_scan_a_deep_window(bridge_port, monkeypatch, capsys):
+    # status / podcast / list must scan a DEEP window so a run buried >20 back
+    # (named, not active) still resolves by title — the bug where `podcast
+    # "Rocky Port…"` silently found nothing and the agent improvised. End-to-end:
+    # sr.py asks for _LOOKUP_LIMIT and the bridge honors it (page_size on the list).
+    assert sr._LOOKUP_LIMIT == 100
+    monkeypatch.setattr(bridge, "_download_podcast_audio",
+                        lambda url, dest_dir, rid: (dest_dir / f"{rid}.m4a", 8))
+    # 25 newer runs come first, then the target buried at index 25 — OUTSIDE the
+    # old 20-window, INSIDE the new 100-window. (FakeFS slices by page_size.)
+    for i in range(25):
+        FakeFS.researches[f"agent-{i:02d}"] = {
+            "id": f"agent-{i:02d}", "title": f"Filler {i}", "status": "completed", "links": {}}
+    FakeFS.researches["agent-rocky"] = {
+        "id": "agent-rocky", "title": "Rocky Port Incident", "status": "completed",
+        "links": {"audio_file": {"url": "https://firebasestorage.googleapis.com/v0/b/x/o/"
+                                        "a.m4a?alt=media&token=zz", "phase": 3}},
+    }
+    # Proof the run really is beyond the OLD window: a 20-run page wouldn't see it.
+    assert "agent-rocky" not in [r["id"] for r in FakeFS(None).list_researches("u1", page_size=20)]
+    # …but every by-title command now resolves it (deep window + honored cap).
+    for argv in (["status", "rocky port"], ["podcast", "rocky port"]):
+        FakeFS.last_page_size = None
+        assert sr.main(argv) == 0, argv          # found + acted (not "No runs yet")
+        assert FakeFS.last_page_size == 100, argv  # deep window, not the old 20
+        assert "Rocky Port Incident" in capsys.readouterr().out, argv
+    assert sr.main(["list"]) == 0
+    assert "Rocky Port Incident" in capsys.readouterr().out  # also visible in the listing
+
+
+def test_updates_keeps_the_shallow_window(bridge_port):
+    # `updates` runs the via=agent path (per-phase SR-link minting) — it must STAY
+    # at the default shallow window so it never mints across 100 runs every tick.
+    sr.main(["updates"])
+    assert FakeFS.last_page_size == 20
+
+
+def test_updates_limit_cap_clamps_to_100(bridge_port):
+    # The bridge caps ?limit so a huge value can't pull the whole account, but the
+    # ceiling is now 100 (was 50) so the deep by-title window is honored end-to-end.
+    sr._get("/updates?limit=100")
+    assert FakeFS.last_page_size == 100
+    sr._get("/updates?limit=500")          # above the cap
+    assert FakeFS.last_page_size == 100    # clamped to the ceiling, not 50, not 500
+    sr._get("/updates?limit=5")            # below → honored verbatim
+    assert FakeFS.last_page_size == 5

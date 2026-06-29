@@ -73,6 +73,16 @@ An improvised answer is always worse than running the client (or the one-line
 error). The same rule applies to status, podcast, list, and every other action —
 run the client, relay its output; do not perform any of it yourself in chat.
 
+**On a FAILURE, relay the error — never substitute.** When the client returns an
+error, a "not ready / not found", or times out (a podcast, a link, a status, the
+list — anything), relay that message as-is and stop. Do **not** stand in a
+replacement: **never generate or send TTS / your own audio in place of a podcast**,
+never invent or guess a link, never write the report or brief yourself. The user
+asked for the Super Research artifact specifically — they get the real one the
+client returns, or the client's plain error, **never a look-alike you produced**.
+"I couldn't fetch that podcast" is a correct answer; a 2-minute voice note you
+synthesized is not.
+
 ## How you reply — plain, natural, brief
 
 Use your own natural voice — don't recite a script or fixed phrasings. Just keep it
@@ -232,7 +242,7 @@ back to the user.
 | status `[title]` | `sr.py status ["<title>"]` | Relay the **current phase**, the **⚙ Phases** line (which phases are on / OFF), each finished phase's 🔒 link, and any **⚠ Needs you** blocker. No title = most recent. |
 | updates | `sr.py updates` | Relay all active runs + their phase, ⚙ Phases line, links + any that need attention. ACTIVE runs only — for the FULL history use `list`. |
 | list / researches | `sr.py list` | Relay the account's recent researches (every status, newest first) for "what researches do I have?". Then the user can ask for any one BY NAME — its results / a specific 🔒 link via `status "<title>"`, or its `podcast "<title>"`. Both already resolve any research from this list by title, finished ones included. |
-| podcast `[title]` | `sr.py podcast ["<title>"]` | **Relay the client's output verbatim.** It prints a short title line + the audio file's **bare path on its own line** — that bare path is exactly what makes the runtime deliver the file as a **native audio / voice message** (and the path is auto-hidden from the user). Do **NOT** wrap the path in backticks, decorate it (no `🔊` / "Audio:" label), split it across messages, or use any `[[audio]]` / `MEDIA:` markup — any of those break the auto-attach and dump raw text. Never replace it with a URL. No title = the most recent run. If it says the audio isn't ready, relay that and try again later. |
+| podcast `[title]` | `sr.py podcast ["<title>"]` | **Relay the client's output verbatim.** It prints a short title line + the audio file's **bare path on its own line** — that bare path is exactly what makes the runtime deliver the file as a **native audio / voice message** (and the path is auto-hidden from the user). Do **NOT** wrap the path in backticks, decorate it (no `🔊` / "Audio:" label), split it across messages, or use any `[[audio]]` / `MEDIA:` markup — any of those break the auto-attach and dump raw text. Never replace it with a URL. No title = the most recent run. **If it returns an error, or says the audio isn't ready / wasn't found, relay that line verbatim and STOP — never send a TTS / substitute audio, a link, or any stand-in** (see the Hard rule). Offer to "try again in a bit" only when it literally says the audio *isn't ready yet*. |
 | stop `[title]` | `sr.py stop ["<title>"]` | **Confirm first**, then run. **ENDS** the run (terminal "stopped") and **keeps the results so far + the chat** (deletes nothing). Authoritative — it really stops even if the run was paused at a gate. Use for "stop"; for a temporary, resumable hold use **pause** instead. No title = the latest active run. |
 | pause `[title]` | `sr.py pause ["<title>"]` | Pause a RUNNING run — it stays **resumable** (does NOT end it). Only when the user says "pause" / "hold on", never for "stop". |
 | resume `[title]` | `sr.py resume ["<title>"]` | Resume a run the user **paused**. (For a run blocked on a decision/error, use **retry** instead.) |

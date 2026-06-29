@@ -51,6 +51,13 @@ import urllib.request
 from pathlib import Path
 
 _TIMEOUT = 30
+# By-title run resolution scans the newest N runs (status / podcast / list / the
+# resume verbs). 20 was too shallow — a run a few weeks back (named, not active)
+# fell outside the window, so `podcast "Rocky Port…"` silently found nothing and
+# the agent improvised. 100 covers a deep history; it's a plain Firestore list
+# (no per-phase minting — that's only the via=agent `updates` path, left at 20).
+# Mirrors the bridge's /updates limit cap (bridge.py `_updates`).
+_LOOKUP_LIMIT = 100
 
 
 def _base() -> str:
@@ -668,7 +675,7 @@ def cmd_research(args) -> int:
 
 
 def cmd_status(args) -> int:
-    code, body, runs = _fetch_runs()
+    code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     run = _pick_run(runs, args.runId, prefer_active=True)
@@ -699,7 +706,7 @@ def cmd_status(args) -> int:
 
 
 def cmd_podcast(args) -> int:
-    code, body, runs = _fetch_runs()
+    code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     if args.runId:
@@ -757,7 +764,7 @@ def cmd_list(args) -> int:
     agent-started ones (that's `updates`, the active-only streaming view). The
     per-run links/podcast are then fetched on demand via `status` / `podcast`,
     which already resolve any of these by title."""
-    code, body, runs = _fetch_runs(limit=30)
+    code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     if not runs:
@@ -773,7 +780,7 @@ def cmd_list(args) -> int:
 
 def cmd_stop(args) -> int:
     """Graceful stop (the chat /sr stop) — keeps the results so far + the chat."""
-    code, body, runs = _fetch_runs()
+    code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     run = _pick_run(runs, args.runId, prefer_active=True)
@@ -795,7 +802,7 @@ def cmd_stop(args) -> int:
 
 def cmd_pause(args) -> int:
     """Pause a running run — it stays RESUMABLE (unlike stop, which ends it)."""
-    code, body, runs = _fetch_runs()
+    code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     run = _pick_run(runs, args.runId, prefer_active=True)
@@ -815,7 +822,7 @@ def cmd_pause(args) -> int:
 
 def cmd_resume(args) -> int:
     """Resume a paused run."""
-    code, body, runs = _fetch_runs()
+    code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     # Prefer a PAUSED run (that's what resume targets) before the generic newest pick,
@@ -835,7 +842,7 @@ def cmd_resume(args) -> int:
 
 def cmd_retry(args) -> int:
     """Resume a run that's waiting on a decision / hit an error (C1)."""
-    code, body, runs = _fetch_runs()
+    code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     run = _pick_run(runs, args.runId, prefer_active=True)
@@ -854,7 +861,7 @@ _SKIP_NAMES = {"brief": 1, "podcast": 3, "audio": 3, "video": 4, "youtube": 4, "
 
 
 def cmd_skip(args) -> int:
-    code, body, runs = _fetch_runs()
+    code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
     if code != 200:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     run = _pick_run(runs, args.run or None, prefer_active=True)

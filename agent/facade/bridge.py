@@ -64,7 +64,7 @@ _MAX_BODY_BYTES = 1 << 20  # 1 MiB
 # host (it is not in the response, so it can't land in chat history).
 _PODCAST_DIR_NAME = "podcasts"
 _PODCAST_MAX_BYTES = 200 * 1024 * 1024  # 200 MiB — generous for a long audio overview
-_PODCAST_MAX_AGE_SECONDS = 24 * 60 * 60  # prune cached audio older than a day
+_PODCAST_MAX_AGE_SECONDS = 7 * 24 * 60 * 60  # prune cached audio older than a week
 _AUDIO_EXT_MIME = {
     ".m4a": "audio/mp4",
     ".mp4": "audio/mp4",
@@ -1814,7 +1814,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             want_chat = (qs.get("chat", [""])[0] or "").strip()
             scope_chat = bool(via_agent and want_platform and want_chat)
             try:
-                limit = max(1, min(int(qs.get("limit", ["20"])[0]), 50))
+                limit = max(1, min(int(qs.get("limit", ["20"])[0]), 100))
             except ValueError:
                 limit = 20
             try:

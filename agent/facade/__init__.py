@@ -26,6 +26,6 @@ try:
     try:
         __version__ = _pkg_version("superresearch-agent")
     except PackageNotFoundError:
-        __version__ = "0.1.12"
+        __version__ = "0.1.13"
 except Exception:
-    __version__ = "0.1.12"
+    __version__ = "0.1.13"

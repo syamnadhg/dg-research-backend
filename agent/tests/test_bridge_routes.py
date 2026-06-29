@@ -339,6 +339,21 @@ def test_prune_age_only_keeps_recent_siblings(tmp_path):
     assert not aged.exists()                    # only the aged-out file is pruned
 
 
+def test_podcast_cache_ttl_is_at_least_a_week(tmp_path):
+    # TTL was extended 24h→7d so a podcast re-requested within a week is an instant
+    # cache hit (not a needless re-download). A file aged ~2 days — stale under the
+    # OLD day-long TTL — must now SURVIVE pruning.
+    assert bridge._PODCAST_MAX_AGE_SECONDS >= 7 * 24 * 60 * 60
+    keep = tmp_path / "agent-1-keep.m4a"
+    twodays = tmp_path / "agent-2-2d.m4a"
+    for f in (keep, twodays):
+        f.write_bytes(b"x")
+    past = time.time() - 2 * 24 * 60 * 60  # 2 days old: > old 24h TTL, < new 7d TTL
+    os.utime(twodays, (past, past))
+    bridge._prune_podcast_dir(tmp_path, keep_name=keep.name)
+    assert twodays.exists()  # survives under the week-long TTL
+
+
 def test_audio_file_url_prefers_media_not_page():
     assert bridge._audio_file_url({"audio_file": {"url": _M4A}}) == _M4A
     assert bridge._audio_file_url({"audio_file": _M4A}) == _M4A  # bare string tolerated
