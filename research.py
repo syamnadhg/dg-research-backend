@@ -5821,6 +5821,27 @@ def start_firestore_start_listener(job_queue, loop):
                 if p.exists():
                     try: p.unlink()
                     except Exception: pass
+                # Atomic single-worker claim — every worker process runs its OWN
+                # on_snapshot listener on the shared devices/{id}/queue collection,
+                # so all workers receive this one resume doc. Without a claim each
+                # would flip status + enqueue → the SAME run fires on every worker
+                # (the reported 3-workers → 3 duplicate runs on Retry). Mirror the
+                # `start` path's compare-and-swap; only the CAS winner proceeds to
+                # flip status / delete the doc / enqueue. Placed AFTER validation
+                # (so a doomed resume isn't claimed-then-orphaned) and BEFORE the
+                # status flip + delete below.
+                _resume_claim = _try_claim_queue_doc(
+                    doc.reference, WORKER_ID, log_prefix="[resume]")
+                if _resume_claim is None:
+                    # CAS errored after retries — skip rather than risk a duplicate
+                    # enqueue; the doc lingers and replays on the next BE restart.
+                    log(f"[resume] worker {WORKER_ID}: claim error — skipping {backend_run_id} "
+                        f"(replays on restart)", "WARN")
+                    continue
+                if _resume_claim is False:
+                    log(f"[resume] worker {WORKER_ID}: resume doc claimed by a sibling worker — "
+                        f"skipping {backend_run_id}", "INFO")
+                    continue
                 # Merge config into config.json if provided.
                 payload_config = data.get("config") or {}
                 if payload_config:
