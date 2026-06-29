@@ -832,7 +832,7 @@ def resolve_api_key(cli_key=None):
 
     Logs which source was chosen so mismatches are debuggable."""
     if cli_key:
-        log(f"[resolve_api_key] using --api-key CLI argument", "INFO")
+        log("[resolve_api_key] using --api-key CLI argument", "INFO")
         return cli_key
     # Hot-path cache. Without it: every narrator tick (6s in P1/P2) triggers
     # a Firestore RPC + a PowerShell subprocess spawn + an INFO log line.
@@ -849,7 +849,7 @@ def resolve_api_key(cli_key=None):
     # 2. Firestore Account page key
     fs_keys = _read_firestore_api_keys()
     if fs_keys.get("anthropic"):
-        log(f"[resolve_api_key] using apiKeys.anthropic from Firestore (Account page)", "INFO")
+        log("[resolve_api_key] using apiKeys.anthropic from Firestore (Account page)", "INFO")
         _RESOLVED_KEY_CACHE.update(key=fs_keys["anthropic"], ts=time.time())
         return fs_keys["anthropic"]
     # 3. User-scope persistence (Windows User-scope env or POSIX env file)
@@ -5101,7 +5101,8 @@ def _download_user_source_via_storage_rest(storage_path: str, dest_path: "Path")
         # owner is wrong, or the path's owner just isn't in scope.
         if resp.status_code == 403:
             try:
-                import base64 as _b64, json as _j
+                import base64 as _b64
+                import json as _j
                 # Decode the ID-token middle segment (no signature verify
                 # — we're just reading claims for diagnostic purposes).
                 _claims = {}
@@ -5784,7 +5785,7 @@ def start_firestore_start_listener(job_queue, loop):
                             or "Missing or insufficient permissions" in err_str
                         ):
                             log(
-                                f"Resume: read denied on research doc + no backendRunId in payload — drop queue entry",
+                                "Resume: read denied on research doc + no backendRunId in payload — drop queue entry",
                                 "WARN",
                             )
                         else:
@@ -6768,7 +6769,8 @@ def _schedule_server_exit(source: str, delay_sec: float = 3.0):
     _clear_current_run_id_best_effort(f"exit-{source}")
     import threading as _threading
     def _runner():
-        import time as _t, os as _os
+        import time as _t
+        import os as _os
         # Brief grace for the async cleanup path (pipeline finally:
         # browser.close + dispatcher_task.cancel + teardown_firestore_run)
         # to complete on its own. The `_active_browser_ref` close that the
@@ -7573,7 +7575,7 @@ def _start_command_listener(uid, research_id, loop):
                 if resume_cfg:
                     loop.call_soon_threadsafe(_controls.update_config, resume_cfg)
                     _write_config_to_disk(resume_cfg)
-                    log(f"Command received: RESUME (with config update)")
+                    log("Command received: RESUME (with config update)")
                 else:
                     log("Command received: RESUME")
                 loop.call_soon_threadsafe(_controls.request_resume)
@@ -7649,7 +7651,7 @@ def _start_command_listener(uid, research_id, loop):
                         emit_event("config_updated", config=cfg)
                     except Exception:
                         pass
-                    log(f"Command received: CONFIG update (written to disk + ack emitted)")
+                    log("Command received: CONFIG update (written to disk + ack emitted)")
             # ── Human-intervention contract (DGOPS-2026-05-18) ──────────
             # Any action that acknowledges a paused alert MUST call
             # request_resume() in addition to setting its action-specific
@@ -9816,7 +9818,7 @@ async def pause_and_close_browser(browser, queue_dir, phase, extra_kwargs=None):
     if browser is not None:
         try:
             if browser.context is not None:
-                log(f"[pause] Closing browser for resource-efficient pause...")
+                log("[pause] Closing browser for resource-efficient pause...")
                 await browser.close()
         except Exception as e:
             log(f"[pause] Browser close error: {e}", "WARN")
@@ -10296,7 +10298,7 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
                 result = await _shadow_observed_cua(
                     page, hotspot_id="p2-share", phase=2, platform="chatgpt",
                     current_step="open_share_menu_and_create_link",
-                    context_hint=f"P2 ChatGPT share-link extraction (DR iframe path)",
+                    context_hint="P2 ChatGPT share-link extraction (DR iframe path)",
                     expected_outcome="public-share URL on clipboard",
                     cua_coro_factory=_chatgpt_share_cua)
             except asyncio.TimeoutError:
@@ -15251,7 +15253,7 @@ async def detect_completion_chatgpt(page):
         if has_stop:
             return (False, f"stop_btn_present (text={partial_len}, src={sources}, st={steps})", snap)
         if not has_done_marker:
-            return (False, f"no_done_marker (Thought-for badge AND Research-complete text both missing)", snap)
+            return (False, "no_done_marker (Thought-for badge AND Research-complete text both missing)", snap)
         return (True, f"no_stop + done_marker={which_marker}", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
@@ -15344,12 +15346,12 @@ async def detect_completion_claude(page):
         snap = {"text_len": text_len, "sources": sources, "steps": steps}
 
         if data.get("liveActive"):
-            return (False, f"live_sources_counting", snap)
+            return (False, "live_sources_counting", snap)
         if data.get("hasStop"):
             return (False, f"stop_btn_present (text={text_len})", snap)
         if not (data.get("researchDone") or data.get("researchCardDone")):
-            return (False, f"no_done_marker (no research_complete text/card)", snap)
-        return (True, f"no_stop + research_complete_marker", snap)
+            return (False, "no_done_marker (no research_complete text/card)", snap)
+        return (True, "no_stop + research_complete_marker", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
 
@@ -15427,8 +15429,8 @@ async def detect_completion_gemini(page):
         if data.get("hasStop"):
             return (False, f"stop_btn_present (text={text_len})", snap)
         if not data.get("hasShareExport"):
-            return (False, f"no_done_marker (Share/Export button missing)", snap)
-        return (True, f"no_stop + share_export_visible", snap)
+            return (False, "no_done_marker (Share/Export button missing)", snap)
+        return (True, "no_stop + share_export_visible", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
 
@@ -15566,7 +15568,7 @@ async def _click_claude_artifact(page, index=0):
     _count_claude_artifacts so the brief.md attachment chip in the
     user-message bubble can't be the click target."""
     try:
-        return await page.evaluate(f"""(idx) => {{
+        return await page.evaluate("""(idx) => {
             const selectors = [
                 'button[data-testid*="artifact"]',
                 '[data-testid*="artifact-preview"]',
@@ -15587,15 +15589,15 @@ async def _click_claude_artifact(page, index=0):
             ];
             // 2026-05-12: self-strip helper for Flow B attached files.
             // See _count_claude_artifacts for full rationale. f-string
-            // braces doubled (`{{`/`}}`) per the surrounding pattern.
+            // braces doubled (`{`/`}`) per the surrounding pattern.
             const _fileExtRe = /\\.(?:md|pdf|docx?|txt|csv|json|html?|rtf|odt|markdown)\\b/i;
-            const _looksLikeFile = (el) => {{
+            const _looksLikeFile = (el) => {
                 const t = (el.textContent || '').trim().toLowerCase();
                 const a = (el.getAttribute('aria-label') || '').toLowerCase();
                 if (_fileExtRe.test(t) || _fileExtRe.test(a)) return true;
                 if (/^(open|view)\\s+(?:file|attachment|document)\\b/i.test(a)) return true;
                 return false;
-            }};
+            };
             const isUserOrAttachment = (el) => !!el.closest(
                 '[data-testid="user-message"], [data-message-author-role="user"], ' +
                 '[data-testid*="attachment"], [data-testid*="file"], [class*="attachment" i], ' +
@@ -15606,21 +15608,21 @@ async def _click_claude_artifact(page, index=0):
             const isInAssistant = (el) => !!el.closest('.font-claude-message');
             let cards = [];
             // Pass 1: prefer matches inside assistant message scope.
-            for (const sel of selectors) {{
+            for (const sel of selectors) {
                 const found = Array.from(document.querySelectorAll(sel))
                     .filter(el => isInAssistant(el) && !isUserOrAttachment(el));
-                if (found.length > 0) {{ cards = found; break; }}
-            }}
+                if (found.length > 0) { cards = found; break; }
+            }
             // Pass 2: fallback to broad scan if assistant scope returned
             // nothing — still strips user-message + attachment matches.
-            if (!cards.length) {{
-                for (const sel of selectors) {{
+            if (!cards.length) {
+                for (const sel of selectors) {
                     const found = Array.from(document.querySelectorAll(sel))
                         .filter(el => !isUserOrAttachment(el));
-                    if (found.length > 0) {{ cards = found; break; }}
-                }}
-            }}
-            if (!cards.length) {{
+                    if (found.length > 0) { cards = found; break; }
+                }
+            }
+            if (!cards.length) {
                 // Text-content fallback: legacy "Research complete · …" or
                 // 2026-05+ Boom! marker. Scoped + user/attachment-stripped.
                 const textHits = Array.from(document.querySelectorAll(
@@ -15629,32 +15631,32 @@ async def _click_claude_artifact(page, index=0):
                   .filter(el => /research\\s+complete(?:d)?\\s*[\\s·•—\\-]/i.test(el.textContent || '')
                              || /\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(el.textContent || ''));
                 if (textHits.length > 0) cards = textHits;
-            }}
-            if (!cards.length) {{
+            }
+            if (!cards.length) {
                 const fallback = Array.from(document.querySelectorAll(
                     '.font-claude-message button[class*="block"], ' +
                     '.font-claude-message [class*="artifact"]'
                 )).filter(el => !isUserOrAttachment(el));
                 cards = fallback;
-            }}
+            }
             // 2026-04-26: visibility + dialog-modal filter — a publish/share
             // dialog left over from a prior turn can match the same selectors;
             // skip zero-bbox elements and anything inside [role="dialog"].
-            cards = cards.filter(c => {{
+            cards = cards.filter(c => {
                 const r = c.getBoundingClientRect();
                 if (r.width < 20 || r.height < 20) return false;
                 if (c.closest('[role="dialog"], [aria-modal="true"]')) return false;
                 return true;
-            }});
+            });
             const targetIdx = idx < 0 ? cards.length + idx : idx;
-            if (cards.length > 0 && targetIdx >= 0 && targetIdx < cards.length) {{
+            if (cards.length > 0 && targetIdx >= 0 && targetIdx < cards.length) {
                 const tr = cards[targetIdx].getBoundingClientRect();
                 cards[targetIdx].click();
-                return {{ cx: tr.left + tr.width / 2, cy: tr.top + tr.height / 2,
-                         vw: window.innerWidth, vh: window.innerHeight }};
-            }}
+                return { cx: tr.left + tr.width / 2, cy: tr.top + tr.height / 2,
+                         vw: window.innerWidth, vh: window.innerHeight };
+            }
             return false;
-        }}""", index)
+        }""", index)
     except Exception as e:
         log(f"Artifact click failed: {e}", "WARN")
         return False
@@ -18056,7 +18058,6 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                           browser=None, cua_client=None, verbose=False, phase=2):
     """Poll page until response is complete. Smart: uses CUA to check if DOM selectors fail."""
     wait_start = time.time()
-    max_wait = max_wait_min * 60
     paused_total = 0.0  # accumulator: time spent in wait_if_paused (pause-aware)
     consecutive_not_generating = 0
     cua_checked = False
@@ -18616,7 +18617,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     elif has_response:
                         is_complete = True
                     else:
-                        is_complete = True  # Default: if unclear, assume complete (don't get stuck) — SAFE only via the verify_fn re-check below
+                        is_complete = True  # noqa: F841 — default: if unclear, assume complete (don't get stuck); SAFE only via the verify_fn re-check below
 
                 if is_generating:
                     log(f"[{label}] CUA says still generating — continuing poll")
@@ -21786,7 +21787,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 await browser.switch_to_page(p["page"])
                                 await paste_followup(p["page"], nudge_art, "claude",
                                                      label="Claude-nudge-artifact")
-                                log(f"[Claude] Sent artifact-2 nudge — waiting 90s")
+                                log("[Claude] Sent artifact-2 nudge — waiting 90s")
                                 await asyncio.sleep(90)
                             except Exception as _ne:
                                 log(f"[Claude] Artifact nudge failed: {_ne}", "WARN")
@@ -24161,7 +24162,7 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             log("Trying CUA for PDF attachment...")
             browser.set_upload_file(str(pdf))
             await agent_loop(cua_client, browser, PROMPT_ATTACH_PDF,
-                f"Attach the file. The file dialog will auto-select it — just click the attachment button.",
+                "Attach the file. The file dialog will auto-select it — just click the attachment button.",
                 model=CUA_MODEL, max_iterations=10, verbose=verbose)
             browser.clear_upload_file()
 
@@ -26402,7 +26403,7 @@ async def detect_session_expiry(page, platform: str, label: str) -> tuple[bool, 
         }
         markers = url_markers.get(platform.lower(), ("/login", "/signin", "/signup"))
         if any(m in url for m in markers):
-            return True, f"redirect_to_login_url"
+            return True, "redirect_to_login_url"
 
         # DOM markers: visible password field + no active chat UI
         result = await page.evaluate("""() => {
@@ -26694,7 +26695,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                            platform=platform_key,
                            platformLabel=platform.capitalize(),
                            reason=reason or "Human verification challenge",
-                           message=f"The check isn't cleared yet. Finish it in the open browser, then Resume.",
+                           message="The check isn't cleared yet. Finish it in the open browser, then Resume.",
                            alert_id=_hv_alert_id)
                 # Re-set target_agent (request_resume cleared it on the
                 # initial resume) so CLI `s` still targets this platform.
@@ -27003,7 +27004,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     else:
         # Playwright failed — try original CUA setup as a first fallback (tight iterations)
         log(f"[{label}] Playwright setup failed — CUA fallback setup (tight)...")
-        result = await agent_loop(cua_client, browser, prompt_system, prompt_user,
+        await agent_loop(cua_client, browser, prompt_system, prompt_user,
             model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
     # LAYER 2: CUA visual validation — confirms options are ACTUALLY active.
@@ -28207,7 +28208,7 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
         _docs = queue_dir / "documents"
         if _docs.exists():
             _on_disk = [(f.name, f.stat().st_size) for f in sorted(_docs.glob("*.md"))]
-            log(f"Phase 3: queue MDs on disk: " +
+            log("Phase 3: queue MDs on disk: " +
                 (", ".join(f"{n}={s}b" for n, s in _on_disk) if _on_disk else "(none)"))
         else:
             log("Phase 3: queue_dir/documents does not exist — no MDs", "WARN")
@@ -30877,7 +30878,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         try:
             emit_event(
                 "pipeline_warning", phase=phase,
-                message=f"This step is taking a while",
+                message="This step is taking a while",
                 details=(
                     "This step is still running and may just be a long one. "
                     "Keep waiting, or restart it / skip it."
@@ -31256,7 +31257,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # logged in, emit `login_required` scoped to THAT platform and
         # wait for user retry before touching the next one. This mirrors
         # how the --pair script already walks setup Step 2.
-        label_by_key = {key: label for label, key in preflight_platforms}
         _preflight_tabs: dict[str, object] = {}
         _pf_opened = 0  # Counts real tab-opens across the whole sequence for stagger pacing
         _global_skip = False
@@ -31365,7 +31365,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # the user's skip signal. Mirrors the login_required
                     # pattern at line ~21700.
                     if _controls.skip_init_verify:
-                        log(f"Phase 0: SKIP_INIT_VERIFY during cua_unavailable — bailing CUA loop", "INFO")
+                        log("Phase 0: SKIP_INIT_VERIFY during cua_unavailable — bailing CUA loop", "INFO")
                         _global_skip = True
                         break
                     # retry — clear flag + loop continues, fresh CUA call
@@ -31427,7 +31427,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 continue  # re-run the while loop for this platform
                             if _controls.consume_continue_anyway():
                                 _controls.pro_warning_acknowledged = True
-                                log(f"Phase 0: user opted into Free — suppressing further Pro alerts this run", "INFO")
+                                log("Phase 0: user opted into Free — suppressing further Pro alerts this run", "INFO")
                                 # F3: clear stale pro_required alert documents
                                 # from FE store BEFORE the resumed event fires
                                 # (resumed triggers the FE auto-clear sweep).
@@ -31442,7 +31442,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 # as acknowledgement (user dismissed the alert
                                 # then resumed via chat-box).
                                 _controls.pro_warning_acknowledged = True
-                                log(f"Phase 0: pro_required pause resumed without explicit choice — treating as Free-acknowledged", "INFO")
+                                log("Phase 0: pro_required pause resumed without explicit choice — treating as Free-acknowledged", "INFO")
                                 # F3: same clear pattern — even on a generic
                                 # resume the user has effectively acknowledged
                                 # Free, so the actionable alert must go away.
@@ -32642,7 +32642,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             _p2_links.append({"label": f"Read {n} report", "url": in_app,
                                               "verified": True, "primary": True})
                     emit_event("phase_complete", phase=2, links=_p2_links,
-                               summary=f"Phase 2 regenerated with user input")
+                               summary="Phase 2 regenerated with user input")
 
         # ── Check we have research output to continue ──
         # ARCHITECTURE 2026-04-18 (never-die): no retries_left cap. If
@@ -33355,7 +33355,6 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # whatever phase context we have so the frontend can route the
         # error to the correct phase tile instead of silently dropping it.
         import traceback
-        tb = traceback.format_exc()
         log(f"Fatal: {e}", "ERROR")
         traceback.print_exc()
         # _runtime.phase is the most-recently-entered phase — use it as
@@ -34692,7 +34691,7 @@ async def run_server(port=8000):
             research_id = (d.get("researchId") or "").strip()
             topic = (d.get("topic") or "").strip()
             if not uid or not research_id or not topic:
-                log(f"[idle-rescan] claimed doc missing required fields — deleting", "WARN")
+                log("[idle-rescan] claimed doc missing required fields — deleting", "WARN")
                 try:
                     await asyncio.to_thread(snap.reference.delete)
                 except Exception:
@@ -35327,12 +35326,12 @@ async def run_server(port=8000):
     # Banner shows localhost so users can copy-click; uvicorn still binds
     # to 0.0.0.0 below so the FE web app can reach this BE.
     log(f"Starting API server on http://localhost:{port}")
-    log(f"  GET  /api/runs                     — List all runs")
-    log(f"  POST /api/runs                     — Start new run {{topic, email}}")
-    log(f"  GET  /api/runs/{{id}}                — Run details + meta")
-    log(f"  GET  /api/runs/{{id}}/documents/{{type}} — Document content (brief/chatgpt/gemini/claude)")
-    log(f"  GET  /api/runs/{{id}}/events         — Progress events")
-    log(f"  WS   /ws/{{run_id}}                  — Real-time event stream")
+    log("  GET  /api/runs                     — List all runs")
+    log("  POST /api/runs                     — Start new run {topic, email}")
+    log("  GET  /api/runs/{id}                — Run details + meta")
+    log("  GET  /api/runs/{id}/documents/{type} — Document content (brief/chatgpt/gemini/claude)")
+    log("  GET  /api/runs/{id}/events         — Progress events")
+    log("  WS   /ws/{run_id}                  — Real-time event stream")
     # Start worker directly (don't rely on @app.on_event which is deprecated and
     # sometimes doesn't fire reliably with newer FastAPI versions)
     # Initialize Firebase Admin SDK for Firestore bridge
@@ -39360,7 +39359,7 @@ def run_daemon_loop(port: int = 8000):
         except Exception as e:
             log(f"[daemon-loop] Subprocess launch failed: {e}", "WARN")
         restarts += 1
-        log(f"[daemon-loop] Restarting in 5s…")
+        log("[daemon-loop] Restarting in 5s…")
         try:
             _time.sleep(5)
         except KeyboardInterrupt:
@@ -39423,7 +39422,7 @@ def _write_supervised_flag(enabled: bool):
     if _pair_patch_device(device_id, {"supervised": bool(enabled)}):
         log(f"Supervised flag = {enabled} written to device doc.")
     else:
-        log(f"Could not update supervised flag (REST patch failed)", "WARN")
+        log("Could not update supervised flag (REST patch failed)", "WARN")
 
 
 def _apply_supervisor_respawn_policy() -> "tuple[bool, str]":
@@ -39515,7 +39514,6 @@ def _arm_supervisor_quiet_windows() -> "tuple[bool, int | None, str, int]":
     the live spawn did not appear — the next login will still fire it, so
     On Startup mode is enabled for the future even if this turn didn't
     catch the process handoff."""
-    import sys as _sys
     import subprocess as _subprocess
     import platform as _platform
     import time as _time
@@ -39708,9 +39706,7 @@ def run_resurrect():
     """Install a Windows Scheduled Task that launches `python research.py
     --serve` at user logon. Idempotent — re-running overwrites the existing
     task. Prints actionable output on success/failure."""
-    import sys as _sys
     import subprocess as _subprocess
-    import platform as _platform
 
     _branded_header("resurgam", _BOLD + _BRIGHT, "the backend rises")
 
@@ -40123,7 +40119,6 @@ def run_retire():
          --serve every ~5s between deaths) still gets caught.
       3. Flip the Firestore On Startup flag to off + verify stragglers."""
     import subprocess as _subprocess
-    import platform as _platform
 
     _branded_header("requiescat", _BOLD + _RED, "let the loop rest")
 
@@ -40454,7 +40449,6 @@ def run_unpair(deep: bool = False):
       4. Local artifacts summary.
       5. Verify no related process survived."""
     import subprocess as _subprocess
-    import platform as _platform
     import time as _time
 
     _branded_header("absolvo", _BOLD + _ACCENT, "the bond dissolves")
@@ -41147,9 +41141,9 @@ def run_doctor():
                         capture_output=True, text=True, timeout=5)
             state = (r.stdout or "").strip()
             if state == "active":
-                _ok(f"systemctl is-active", state)
+                _ok("systemctl is-active", state)
             else:
-                _warn(f"systemctl is-active", state or "unknown")
+                _warn("systemctl is-active", state or "unknown")
                 try:
                     _sp.run(["systemctl", "--user", "restart", _SUPERVISOR_UNIT_NAME],
                             capture_output=True, text=True, timeout=15)
@@ -41218,12 +41212,12 @@ def run_doctor():
     daemon_pids = [pid for pid, _c2, role in procs if role == "daemon-loop"]
     serve_pids  = [pid for pid, _c2, role in procs if role == "serve"]
     if daemon_pids:
-        _ok(f"daemon-loop running", f"PID {daemon_pids[0]}")
+        _ok("daemon-loop running", f"PID {daemon_pids[0]}")
     else:
         _warn("daemon-loop not running",
               "supervisor inactive — see Supervisor section above")
     if serve_pids:
-        _ok(f"--serve running", f"PID {serve_pids[0]}")
+        _ok("--serve running", f"PID {serve_pids[0]}")
     else:
         _fail("--serve not running", "no API server → FE will show offline")
     # Port 8000 ownership
@@ -41698,7 +41692,7 @@ def main():
     parser.add_argument("--daemon-loop", action="store_true",
         help="Internal: wrapper that keeps --serve alive by relaunching it on any exit. Used by the On Startup scheduled task.")
     parser.add_argument("--env-file", default=None,
-        help=f"Path to KEY=value env file. Default: <script_dir>/.dg-supervisor.env (silently skipped if missing).")
+        help="Path to KEY=value env file. Default: <script_dir>/.dg-supervisor.env (silently skipped if missing).")
     parser.add_argument("--doctor", action="store_true",
         help="Diagnose + auto-repair common Super Research issues (pair state / Firebase / "
              "Chromium binary / supervisor unit / port 8000 / Linux DISPLAY propagation). "
