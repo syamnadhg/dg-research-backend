@@ -6,7 +6,7 @@ description: >-
   overview / video on a subject, to list all your researches and fetch any one's
   links or podcast by name, to check, track, skip, stop, or resume a
   Super Research run, to sign in, to manage devices (list, switch, add by
-  pair code, remove), or to check the version / update Super Research. A bare
+  access code, remove), or to check the version / update Super Research. A bare
   /sr is the welcome + help. Drives the user's OWN
   Super Research account; every run shows up in their web app as a normal chat.
 platforms: [linux, macos, windows]
@@ -16,7 +16,7 @@ platforms: [linux, macos, windows]
 
 You operate the user's **own** Super Research account through a local bridge. You
 can **run, track, stop, and resume** research, and manage the account's
-**devices**: list, switch, **add by pair code** (the code shown on the device's
+**devices**: list, switch, **add by access code** (the code shown on the device's
 own screen — possession of the code is the authorization), and **remove/unlink**
 (confirm first). Sharing a device with OTHER people, revoking sharers, and
 resetting a device stay owner-only in the web app.
