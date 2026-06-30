@@ -59,6 +59,21 @@ _TIMEOUT = 30
 # Mirrors the bridge's /updates limit cap (bridge.py `_updates`).
 _LOOKUP_LIMIT = 100
 
+# How to install Super Research on a fresh research node (no backend yet): the
+# SAME one-line installer the web app's "Set up your own Research node" tile uses
+# (auto-installs Python + pipx + superresearch), then `--pair`. Kept in ONE place
+# so the `devices`-empty and `research`-no-device prompts stay identical + in sync
+# with the web app. (Older builds said `pipx install superresearch`.)
+_SETUP_NODE_LINES = [
+    "No backend on that machine yet? Run one line there (pick your OS):",
+    "```",
+    "irm https://superresearch.io/install.ps1 | iex      # Windows",
+    "curl -fsSL https://superresearch.io/install.sh | sh  # macOS / Linux",
+    "superresearch --pair",
+    "```",
+    "It installs Super Research and prints an 8-char access code — read it to me.",
+]
+
 
 def _base() -> str:
     # Read the port lazily so the env can be set per invocation. Always loopback;
@@ -509,11 +524,7 @@ def cmd_devices(args) -> int:
             "No devices connected yet.",
             "Paste the access code from your research node and I’ll connect it.",
             "",
-            "No backend yet? On that machine, run:",
-            "```",
-            "pipx install superresearch",
-            "superresearch --pair",
-            "```",
+            *_SETUP_NODE_LINES,
         ])
     lines = ["Devices:"]
     for d in devices:
@@ -651,11 +662,8 @@ def cmd_research(args) -> int:
         if "no device" in err:
             return _emit(body, args.json, [
                 "Paste the access code from your research node first.",
-                "If it isn’t set up yet, run this on that machine:",
-                "```",
-                "pipx install superresearch",
-                "superresearch --pair",
-                "```",
+                "",
+                *_SETUP_NODE_LINES,
             ], _fail_code(code))
         return _emit(body, args.json, [f"✗ couldn't start: {body.get('error', code)}"], _fail_code(code))
     dev = _device_names().get(body.get("deviceId") or "", body.get("deviceId") or "")
