@@ -53,6 +53,26 @@ def test_periodic_reload_stops_once_cua_confirms_done():
     )
 
 
+def test_reload_holds_during_active_generation_grace():
+    # A live run (Golden Retriever, 3 workers) lost its Gemini DR: the periodic
+    # reload fired ~11 min in WHILE the DR was still generating, dropped the SPA to
+    # the empty home, and recovery couldn't restore it. The reload must wait out a
+    # grace (CUA tracks progress in that window) before it can fire.
+    assert "GEMINI_REFRESH_GRACE" in MODSRC
+    assert 'os.environ.get("GEMINI_REFRESH_GRACE_SEC"' in MODSRC
+    assert "(time.time() - p[\"start_time\"]) >= GEMINI_REFRESH_GRACE" in MODSRC, (
+        "the periodic reload must be gated on the active-generation grace"
+    )
+
+
+def test_sidebar_recovery_matches_real_gemini_controls():
+    # The recovery failed because the expand-button selector only matched
+    # menu/expand — Gemini's real controls are "Open sidebar" + "Toggle Recent".
+    src = inspect.getsource(research._gemini_reopen_from_sidebar)
+    assert "open sidebar" in src.lower(), "must click Gemini's 'Open sidebar' control"
+    assert "recent" in src.lower(), "must expand Gemini's 'Toggle Recent' list"
+
+
 def test_reload_recovers_empty_home_and_helpers_exist():
     assert hasattr(research, "_gemini_recover_if_empty")
     assert hasattr(research, "_gemini_reopen_from_sidebar")

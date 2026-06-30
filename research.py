@@ -19728,11 +19728,22 @@ async def _gemini_reopen_from_sidebar(page, conv_id: str) -> bool:
           .includes(cid));
       let a = find();
       if (!a) {
-        // Sidebar may be collapsed — click an expand/menu button, then retry.
-        const btn = document.querySelector(
-          '[data-test-id="side-nav-menu-button"], button[aria-label*="main menu" i],'
-          + ' button[aria-label*="expand" i], button[aria-label*="menu" i]');
-        if (btn) { btn.click(); }
+        // The conversation lives in the left rail's "Recent" list, which is
+        // usually collapsed during a run. Gemini's real controls are
+        // aria-labelled "Open sidebar" (open the rail) and "Toggle Recent"
+        // (expand the recent list) — the old selector only matched menu/expand
+        // and missed both, so recovery never found the link. Click every
+        // plausible open/expand control, then retry.
+        const sels = [
+          '[data-test-id="side-nav-menu-button"]',
+          'button[aria-label*="open sidebar" i]',
+          'button[aria-label*="sidebar" i]',
+          'button[aria-label*="recent" i]',
+          'button[aria-label*="main menu" i]',
+          'button[aria-label*="expand" i]',
+          'button[aria-label*="menu" i]',
+        ];
+        for (const s of sels) { const b = document.querySelector(s); if (b) { b.click(); } }
         a = find();
       }
       if (a) { a.click(); return true; }
@@ -19880,6 +19891,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     # done-marker on its own. Replaces the old one-shot 10-min reload +
     # 15-min "Is the Research completed?" paste crutch (removed 2026-05-26).
     GEMINI_REFRESH_INTERVAL = int(os.environ.get("GEMINI_REFRESH_INTERVAL_SEC", str(10 * 60)))
+    # Don't fire the periodic reload during the typical active-generation window —
+    # a reload on a still-running DR can drop Gemini's SPA to the empty "new chat"
+    # home and lose the conversation (worse under 3-worker CPU contention). CUA
+    # tracks progress fine in that window; the reload is only the hedge for a
+    # done-but-DOM-frozen run (Gemini doesn't push the done-marker live), so hold
+    # it until the DR has run long enough that completion is plausible. Measured
+    # from research-start (p["start_time"] == research_started_at).
+    GEMINI_REFRESH_GRACE = int(os.environ.get("GEMINI_REFRESH_GRACE_SEC", str(20 * 60)))
     ARTIFACT_SCRAPE_INTERVAL = 60   # 1 min between Claude artifact-tracking scrapes (was 180; iteration #1 must pass — see init at last_artifact_scrape=0 below)
 
     pending = {}
@@ -20634,6 +20653,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # multi-shot nudge (~17421-17485, elapsed ≤ 600s only).
             if (
                 name == "Gemini"
+                # Grace: don't reload during the typical active-generation window
+                # (CUA tracks it there) — only once the DR has run long enough that
+                # completion is plausible, so a still-running DR isn't nuked to the
+                # empty home. p["start_time"] == research_started_at.
+                and (time.time() - p["start_time"]) >= GEMINI_REFRESH_GRACE
                 and (time.time() - p.get("last_refresh", p["start_time"])) >= GEMINI_REFRESH_INTERVAL
                 and not p.get("dns_retry_at")
                 # Stop reloading once CUA has seen the DR finish at least once
