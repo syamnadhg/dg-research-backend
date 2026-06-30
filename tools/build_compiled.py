@@ -43,6 +43,7 @@ cp314-cp314-win_amd64) — build it on EACH OS/python you want to publish for.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -134,7 +135,19 @@ def main() -> None:
     ap.add_argument("--keep-build", action="store_true", help="keep the temp work dir for inspection")
     ap.add_argument("--compile-auth", action="store_true",
                     help="also compile auth/ submodules (experimental — verify PyInit resolution)")
+    ap.add_argument("--macos-target", default="11.0",
+                    help="macOS deployment target for the wheel's platform tag (default: 11.0 = "
+                         "Big Sur). WITHOUT this, building on a new macOS tags the wheel "
+                         "macosx_<that version>_arm64 and it WON'T install on older Macs.")
     args = ap.parse_args()
+
+    # On macOS, pin the deployment target BEFORE compiling so both the Nuitka/clang
+    # build AND sysconfig.get_platform() (which sets the wheel's platform tag) use it.
+    # Otherwise the tag inherits the build machine's macOS (e.g. macosx_26_0), which
+    # pip refuses to install on any older Mac. 11.0 back-deploys broadly.
+    if sys.platform == "darwin" and not os.environ.get("MACOSX_DEPLOYMENT_TARGET"):
+        os.environ["MACOSX_DEPLOYMENT_TARGET"] = args.macos_target
+        print(f"[build] MACOSX_DEPLOYMENT_TARGET={args.macos_target} (broad-compat tag)")
 
     outdir = (REPO / args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
