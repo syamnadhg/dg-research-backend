@@ -18,6 +18,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import threading
@@ -183,6 +184,163 @@ def _new_research_fields(
     if chat_origin:
         fields["chatOrigin"] = chat_origin
     return fields
+
+
+class _EnqueueFailed(Exception):
+    """``enqueue_start`` failed AFTER the research doc was created (the orphan doc
+    has been best-effort deleted). Carries the original error so an HTTP caller can
+    map it to the right response."""
+
+    def __init__(self, original: Exception):
+        super().__init__(str(original))
+        self.original = original
+        self.revoked = isinstance(original, RevokedError)
+
+
+class _NoResearchNode(Exception):
+    """The account has no research node — a run has nowhere to go (→ pair-a-node)."""
+
+
+def _device_label(d: dict[str, Any]) -> str:
+    """Friendly device name (mirrors sr.py `_dev_label`): name → hostname → id."""
+    return d.get("name") or d.get("hostname") or d.get("id") or "your node"
+
+
+def _resolve_run_config(fs: FirestoreRest, sess: AccountSession,
+                        chat_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    """The run-config for an agent-fired run: the account's saved pipeline Settings
+    (resolved HERE because sr.py can't read Firestore), overlaid by any explicit
+    chat flags. An advisory settings read — never blocks the run."""
+    pipe: dict[str, Any] = {}
+    try:
+        _settings = fs.get_user_settings(sess.uid)
+        if isinstance(_settings, dict) and isinstance(_settings.get("pipeline"), dict):
+            pipe = _settings["pipeline"]
+    except Exception as e:  # advisory — never block a run on it
+        # Log the type only (not the value) — this file's convention, so an
+        # upstream body never lands in logs.
+        log.warning("agent run: couldn't read account settings (%s) — using defaults",
+                    type(e).__name__)
+    return {**_config_from_settings(pipe), **(chat_cfg or {})}
+
+
+def _enqueue_research_run(fs: FirestoreRest, sess: AccountSession, *, topic: str,
+                          device_id: str, cfg: dict[str, Any],
+                          origin: dict[str, str] | None) -> tuple[str, str]:
+    """Create the research (chat) doc, enqueue the start on ``device_id``, and seed
+    the chat bubbles. Returns ``(research_id, queue_id)``.
+
+    The SINGLE Firestore write path shared by the HTTP ``/research`` route AND the
+    sign-in auto-start, so an agent run and an auto-started run are byte-identical
+    on the wire (viaAgent=True, same doc shape, same queue doc). Raises
+    ``RevokedError`` / ``FirestoreError`` if the doc create fails; ``_EnqueueFailed``
+    if the enqueue fails (the orphan doc is cleaned up first)."""
+    rid = "agent-" + uuid.uuid4().hex[:16]
+    fs.upsert_research(sess.uid, rid,
+                       _new_research_fields(topic, device_id, sess.uid, cfg, origin))
+    try:
+        qid = fs.enqueue_start(
+            device_id, uid=sess.uid, research_id=rid,
+            topic=topic, email=sess.email, config_obj=cfg or {},
+        )
+    except (RevokedError, FirestoreError) as e:
+        # The chat doc is already created; the enqueue failed (e.g. the device isn't
+        # a member / went away). Best-effort delete so we don't orphan a chat with
+        # no run behind it.
+        try:
+            fs.delete_research(sess.uid, rid)
+        except Exception:
+            log.debug("orphan research %s cleanup failed", rid)
+        raise _EnqueueFailed(e) from e
+    # Seed the topic + "Researching …" bubbles the web app writes client-side at
+    # run start, so an agent-started run's chat opens like a web-started one (the
+    # BE pipeline only writes pipeline_events). Best-effort — never fail the run.
+    try:
+        fs.seed_chat_messages(sess.uid, rid, topic=topic, title=topic)
+    except Exception as e:
+        log.debug("chat-message seed for %s failed (non-fatal): %s", rid, type(e).__name__)
+    log.info("enqueued run %s on device %s", rid, device_id)
+    return rid, qid
+
+
+def _autostart_pick_device(fs: FirestoreRest, sess: AccountSession) -> tuple[str | None, str | None]:
+    """Pick the device for a sign-in auto-start WITHOUT a chat round-trip: the
+    persisted selection if it's still a member, else the sole device. Returns
+    ``(device_id, label)``; ``(None, None)`` when the account has devices but the
+    pick is ambiguous (multiple, none selected) — leave that to the chat. Raises
+    ``_NoResearchNode`` when the account has NO device (→ the pair-a-node prompt)."""
+    devs = fs.list_devices(sess.uid)
+    if not devs:
+        raise _NoResearchNode()
+    by_id = {d.get("id"): d for d in devs if d.get("id")}
+    selected = prefs.get_selected_device(sess.uid)
+    if selected and selected in by_id:
+        return selected, _device_label(by_id[selected])
+    if len(devs) == 1:
+        return devs[0].get("id"), _device_label(devs[0])
+    return None, None  # ambiguous — don't guess; the chat picks
+
+
+def _autostart_enabled() -> bool:
+    """``DG_AGENT_AUTOSTART`` (default ON) — in-field kill-switch for sign-in
+    auto-start. Off → fully reverts to the legacy confirm-then-run ("reply yes")."""
+    return os.environ.get("DG_AGENT_AUTOSTART", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _spawn(target, *args) -> None:
+    """Start a daemon thread. Indirected through one helper so tests can run the
+    work synchronously (monkeypatch ``bridge._spawn``)."""
+    threading.Thread(target=target, args=args, daemon=True).start()
+
+
+def _run_autostart(sess: AccountSession, topic: str,
+                   origin: dict[str, str] | None) -> dict[str, Any]:
+    """Start a pending research server-side (device-resolve → enqueue) so a run no
+    longer depends on the chat agent correctly interpreting a "yes" (the fragile
+    handoff that kept misfiring live). Returns announce hints:
+
+      {autoStarted: True, runId, deviceName, topic}  — started; watchdog will stream
+      {needsDevice: True, topic}                     — no research node yet (pair prompt)
+      {}                                             — ambiguous device / any error
+                                                       → caller falls back to "reply yes"
+
+    Pure I/O, takes the topic BY VALUE (never touches the remote flow), and NEVER
+    raises — so it is safe to run in a worker thread off the remote_lock."""
+    try:
+        fs = FirestoreRest(sess.id_token)
+        try:
+            device_id, label = _autostart_pick_device(fs, sess)
+        except _NoResearchNode:
+            return {"needsDevice": True, "topic": topic}
+        if not device_id:
+            return {}  # ambiguous device pick — let the chat choose
+        cfg = _resolve_run_config(fs, sess, None)
+        rid, _qid = _enqueue_research_run(fs, sess, topic=topic, device_id=device_id,
+                                          cfg=cfg, origin=_clean_origin(origin))
+    except Exception as e:
+        log.warning("sign-in auto-start failed (%s) — falling back to confirm-then-run",
+                    type(e).__name__)
+        return {}
+    log.info("sign-in auto-started research %s on device %s", rid, device_id)
+    return {"autoStarted": True, "runId": rid, "deviceName": label or "", "topic": topic}
+
+
+def _autostart_worker(state: BridgeState, sess: AccountSession, topic: str,
+                      origin: dict[str, str] | None, base_ev: dict[str, Any]) -> None:
+    """Run the auto-start I/O OFF the remote_lock, then publish the final one-shot
+    announce. Runs in a daemon thread so a concurrent sign-in poll is never stalled
+    behind ~1-2s of Firestore I/O. The topic was already CLAIMED (nulled on the
+    flow) under the lock before this was spawned, so this can't double-start. A
+    failure degrades to the confirm-then-run announce; a sign-out before completion
+    suppresses the (now stale) announce."""
+    result = _run_autostart(sess, topic, origin)
+    ev = dict(base_ev)
+    # The "reply yes" offer rides along ONLY in the fallback case; started / no-node
+    # carry their own rendered message. The topic always rides along for the renderer.
+    ev["pendingTopic"] = "" if (result.get("autoStarted") or result.get("needsDevice")) else topic
+    ev.update(result)
+    if state.session is not None:  # don't resurrect an announce after a sign-out
+        state.set_signed_in(ev)
 
 
 def _audio_file_url(links: Any) -> str:
@@ -926,17 +1084,32 @@ def _advance_remote_flow(state: BridgeState) -> str | None:
         # state-guard at the top of _advance_remote_flow — leaving the flow is safe.
         # #790 identity row — explicit human sign-in, so clear any prior revoke.
         _write_agent_session_connected(sess, clear_revoked=True)
-        # One-shot event for the chat watchdog: announce "signed in" the moment the
-        # browser approval is captured, and (if a research was fired while signed
-        # out) carry its topic so chat can offer to continue it. Delivered + cleared
-        # by a single /updates read; the FE/poll never sees the token.
-        state.set_signed_in({
+        # One-shot event for the chat watchdog: announce the moment approval is
+        # captured (delivered + cleared by a single /updates read; the FE/poll never
+        # sees the token). ``origin`` scopes delivery to the chat that started sign-in.
+        origin = flow.origin if isinstance(flow.origin, dict) else None
+        base_ev = {
             "ts": int(time.time() * 1000),
             "email": sess.email or "",
             "uid": sess.uid,
-            "pendingTopic": flow.pending_topic or "",
-            "origin": flow.origin if isinstance(flow.origin, dict) else None,
-        })
+            "origin": origin,
+        }
+        topic = (flow.pending_topic or "").strip()
+        if topic and _autostart_enabled():
+            # A research was fired while signed out → START it server-side rather
+            # than asking the chat to interpret a "yes" (the fragile handoff that
+            # kept misfiring live). CLAIM the topic atomically under remote_lock
+            # (null it so a racing login-done can't double-start), then run the
+            # ~1-2s of Firestore I/O OFF the lock in a worker thread so a concurrent
+            # sign-in poll isn't stalled. The worker publishes the final announce
+            # (started / pair-a-node / fallback "reply yes") when it's done.
+            flow.pending_topic = None
+            _spawn(_autostart_worker, state, sess, topic, origin, base_ev)
+        else:
+            # No pending research (or auto-start disabled) → announce immediately,
+            # exactly as before. With a topic + autostart off, OFFER to continue.
+            base_ev["pendingTopic"] = topic
+            state.set_signed_in(base_ev)
         log.info("remote login connected as %s", sess.email or sess.uid)
     elif status == devicelogin.EXPIRED:
         flow.state = "expired"
@@ -1622,66 +1795,29 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             device_id = self._resolve_device(body, sess, fs)
             if device_id is None:
                 return  # _resolve_device already sent the error
-            rid = "agent-" + uuid.uuid4().hex[:16]
-            # Honor the account's saved pipeline Settings (which agents, skip
-            # brief/podcast/video/email, podcast length, skipInitVerify) — the
-            # web app ships these in its start config, but sr.py (the chat client)
-            # can't read Firestore, so resolve the account's settings doc HERE.
-            # Explicit chat flags (--no-video / --no-email) override the defaults.
+            # Honor the account's saved pipeline Settings; explicit chat flags
+            # (--no-video / --no-email) override. The chat origin (sr.py reads it
+            # from the gateway's per-session env) tags the doc so the streaming
+            # watchdog can scope updates to this chat. Same write path as the
+            # sign-in auto-start (`_enqueue_research_run`), so the two can't drift.
             chat_cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
-            pipe: dict[str, Any] = {}
-            try:
-                _settings = fs.get_user_settings(sess.uid)
-                if isinstance(_settings, dict) and isinstance(_settings.get("pipeline"), dict):
-                    pipe = _settings["pipeline"]
-            except Exception as e:  # advisory read — never block a run on it
-                # Log the type only (not the value) — this file's convention,
-                # so an upstream body never lands in logs.
-                log.warning("agent run: couldn't read account settings (%s) — using defaults",
-                            type(e).__name__)
-            cfg = {**_config_from_settings(pipe), **chat_cfg}
-            # The chat this run was fired from (sr.py reads it from the gateway's
-            # per-session env) — tags the doc so the streaming watchdog can scope
-            # updates to this chat only. Absent for a CLI / older-gateway fire.
+            cfg = _resolve_run_config(fs, sess, chat_cfg)
             origin = _clean_origin(body.get("origin"))
             try:
-                fs.upsert_research(sess.uid, rid,
-                                   _new_research_fields(topic, device_id, sess.uid, cfg, origin))
+                rid, qid = _enqueue_research_run(fs, sess, topic=topic,
+                                                 device_id=device_id, cfg=cfg, origin=origin)
             except RevokedError:
                 self._json(401, {"error": "session revoked — run /login again"})
                 return
             except FirestoreError as e:
                 self._firestore_502(e)
                 return
-            try:
-                qid = fs.enqueue_start(
-                    device_id, uid=sess.uid, research_id=rid,
-                    topic=topic, email=sess.email, config_obj=cfg or {},
-                )
-            except (RevokedError, FirestoreError) as e:
-                # The chat doc is already created; the enqueue failed (e.g. the
-                # device isn't a member / went away). Best-effort delete so we
-                # don't leave an orphan chat with no run behind it.
-                try:
-                    fs.delete_research(sess.uid, rid)
-                except Exception:
-                    log.debug("orphan research %s cleanup failed", rid)
-                if isinstance(e, RevokedError):
+            except _EnqueueFailed as ef:
+                if ef.revoked:
                     self._json(401, {"error": "session revoked — run /login again"})
                 else:
-                    self._firestore_502(e)
+                    self._firestore_502(ef.original)
                 return
-            # Seed the topic + "Researching …" chat bubbles the web app writes
-            # client-side at run start — so an agent-started run's in-app chat
-            # opens consistently with a web-started one (the BE pipeline only
-            # writes pipeline_events, never the messages subcollection). The
-            # title at creation == topic (_new_research_fields); the FE refines
-            # it later. Best-effort — a seed failure must not fail the run.
-            try:
-                fs.seed_chat_messages(sess.uid, rid, topic=topic, title=topic)
-            except Exception as e:
-                log.debug("chat-message seed for %s failed (non-fatal): %s", rid, type(e).__name__)
-            log.info("enqueued run %s on device %s", rid, device_id)
             self._json(200, {"runId": rid, "queueId": qid, "deviceId": device_id})
 
         def _research_status(self, rid: str) -> None:
@@ -1900,6 +2036,14 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                             "ts": ev.get("ts"),
                             "email": ev.get("email") or "",
                             "pendingTopic": ev.get("pendingTopic") or "",
+                            # Sign-in auto-start hints (the bridge started/blocked the
+                            # pending research server-side; the watchdog renders the
+                            # right line). Absent on a plain sign-in.
+                            "autoStarted": bool(ev.get("autoStarted")),
+                            "needsDevice": bool(ev.get("needsDevice")),
+                            "runId": ev.get("runId") or "",
+                            "deviceName": ev.get("deviceName") or "",
+                            "topic": ev.get("topic") or "",
                         }
                     else:
                         state.set_signed_in(ev)  # not this chat's — leave it for its watchdog

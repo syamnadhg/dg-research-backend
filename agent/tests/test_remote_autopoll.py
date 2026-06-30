@@ -45,6 +45,16 @@ def _isolate_agent_session_write(monkeypatch):
     monkeypatch.setattr(bridge, "_write_agent_session_connected", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _autostart_off_by_default(monkeypatch):
+    """Sign-in auto-start (DG_AGENT_AUTOSTART — default ON in production) makes a
+    Firestore call at capture to start a pending research server-side. Default it
+    OFF for this file so the bare transition tests stay network-free + deterministic
+    (they assert only the poll→capture→announce transition). The dedicated
+    auto-start tests below re-enable it with a mocked FirestoreRest."""
+    monkeypatch.setenv("DG_AGENT_AUTOSTART", "0")
+
+
 def _point_exchange_at(monkeypatch, fe_base: str) -> None:
     """Route the real custom-token exchange (Identity Toolkit POST) at the mock
     FE so the decode + persist path runs for real."""
@@ -79,10 +89,11 @@ def test_advance_captures_on_approved(isolate_store, mock_fe, monkeypatch):
 
 
 def test_advance_records_signed_in_event(isolate_store, mock_fe, monkeypatch):
-    """On capture, a one-shot 'signed in' event is recorded for the chat watchdog —
-    carrying the email + any topic the user fired while signed out + the chat origin
-    that started the flow (so the proactive announce is scoped + can offer to
-    continue that research)."""
+    """On capture (auto-start OFF — the fallback path), a one-shot 'signed in' event
+    is recorded for the chat watchdog — carrying the email + any topic the user fired
+    while signed out + the chat origin that started the flow (so the proactive
+    announce is scoped + can offer to continue that research). The auto-start ON
+    behavior is covered in the dedicated section below."""
     state = bridge.BridgeState()
     idt = make_jwt({"user_id": "u-si", "email": "si@x.y"})
     fe = mock_fe(
@@ -232,3 +243,200 @@ def test_autopoll_loop_survives_a_throwing_tick(monkeypatch):
     t.join(timeout=2)
     assert not t.is_alive()  # a throwing tick must not kill the thread
     assert calls["n"] >= 2  # it kept ticking past the first exception
+
+
+# ── sign-in auto-start: the bridge starts a pending research server-side ───────
+# A research fired while signed out used to depend on the chat agent interpreting
+# a "yes" after sign-in — which kept misfiring live (the agent answered from its
+# own knowledge / asked "yes to what?"). The bridge now starts it itself at the
+# moment sign-in is captured, so the chat agent is off the critical path.
+
+class _AutostartFS:
+    """Minimal FirestoreRest stand-in for the sign-in auto-start path."""
+
+    devices: list[dict] = []
+    settings: dict | None = None
+    enqueue_raises = False
+    upserts: list[dict] = []
+    enqueued: list[dict] = []
+    deleted: list[str] = []
+    seeded: list[str] = []
+
+    def __init__(self, _token):
+        pass
+
+    def list_devices(self, uid):
+        return [dict(d) for d in type(self).devices]
+
+    def get_user_settings(self, uid):
+        return type(self).settings
+
+    def upsert_research(self, uid, rid, fields):
+        type(self).upserts.append({"uid": uid, "rid": rid, "fields": fields})
+
+    def enqueue_start(self, device_id, **kw):
+        if type(self).enqueue_raises:
+            raise bridge.FirestoreError("enqueue denied")
+        type(self).enqueued.append({"device_id": device_id, **kw})
+        return "Q-auto"
+
+    def seed_chat_messages(self, uid, rid, *, topic, title):
+        type(self).seeded.append(rid)
+
+    def delete_research(self, uid, rid):
+        type(self).deleted.append(rid)
+
+
+@pytest.fixture()
+def autostart(isolate_store, mock_fe, monkeypatch):
+    """Arm sign-in auto-start with a controllable fake Firestore. Returns the fake
+    class so a test sets `.devices` / `.enqueue_raises`. Re-enables the flag the
+    autouse fixture defaulted off."""
+    monkeypatch.setenv("DG_AGENT_AUTOSTART", "1")
+    _AutostartFS.devices = []
+    _AutostartFS.settings = None
+    _AutostartFS.enqueue_raises = False
+    _AutostartFS.upserts = []
+    _AutostartFS.enqueued = []
+    _AutostartFS.deleted = []
+    _AutostartFS.seeded = []
+    monkeypatch.setattr(bridge, "FirestoreRest", _AutostartFS)
+    monkeypatch.setattr(bridge.prefs, "get_selected_device", lambda uid: None)
+    # The auto-start I/O runs in a worker thread off the remote_lock; run it
+    # synchronously in tests so the one-shot event is set by the time _advance returns.
+    monkeypatch.setattr(bridge, "_spawn", lambda target, *args: target(*args))
+    idt = make_jwt({"user_id": "u-as", "email": "as@x.y"})
+    fe = mock_fe(
+        poll_script=[(200, {"status": "approved", "customToken": "CT"})],
+        exchange_resp={"idToken": idt, "refreshToken": "RT-as", "expiresIn": "3600"},
+    )
+    _point_exchange_at(monkeypatch, fe)
+    return _AutostartFS
+
+
+def _approve(state):
+    with state.remote_lock:
+        bridge._advance_remote_flow(state)
+
+
+def test_autostart_fires_pending_research_when_a_node_exists(autostart):
+    autostart.devices = [{"id": "d1", "name": "Laptop"}]
+    state = bridge.BridgeState()
+    flow = _pending_flow()
+    flow.pending_topic = "Golden Retriever"
+    flow.origin = {"platform": "telegram", "chat_id": "-77"}
+    state.set_remote(flow)
+
+    _approve(state)
+
+    # Enqueued server-side — no chat round-trip, no "reply yes".
+    assert len(autostart.enqueued) == 1
+    assert autostart.enqueued[0]["topic"] == "Golden Retriever"
+    ev = state.signed_in
+    assert ev["autoStarted"] is True
+    assert ev["runId"].startswith("agent-")
+    assert ev["topic"] == "Golden Retriever"
+    assert ev["deviceName"] == "Laptop"
+    # The "reply yes" offer is suppressed + the topic consumed so login-done can't
+    # double-fire it.
+    assert ev["pendingTopic"] == ""
+    assert state.remote.pending_topic is None
+    # Tagged viaAgent + chatOrigin so the EXISTING watchdog streams it (no extra arm).
+    fields = autostart.upserts[0]["fields"]
+    assert fields["viaAgent"] is True
+    assert fields["chatOrigin"] == {"platform": "telegram", "chat_id": "-77"}
+
+
+def test_autostart_picks_the_selected_device(autostart, monkeypatch):
+    autostart.devices = [{"id": "d1", "name": "Laptop"}, {"id": "d2", "name": "Office PC"}]
+    monkeypatch.setattr(bridge.prefs, "get_selected_device", lambda uid: "d2")
+    state = bridge.BridgeState()
+    flow = _pending_flow()
+    flow.pending_topic = "Mars colonization"
+    state.set_remote(flow)
+
+    _approve(state)
+
+    assert autostart.enqueued[0]["device_id"] == "d2"
+    assert state.signed_in["deviceName"] == "Office PC"
+
+
+def test_autostart_signals_needs_device_when_account_has_no_node(autostart):
+    autostart.devices = []  # no research node on the account
+    state = bridge.BridgeState()
+    flow = _pending_flow()
+    flow.pending_topic = "Golden Retriever"
+    state.set_remote(flow)
+
+    _approve(state)
+
+    assert autostart.enqueued == []  # nothing to enqueue
+    ev = state.signed_in
+    assert ev["needsDevice"] is True
+    assert not ev.get("autoStarted")
+    assert ev["topic"] == "Golden Retriever"
+    assert ev["pendingTopic"] == ""  # the pair-a-node message covers it
+
+
+def test_autostart_is_ambiguous_with_multiple_unselected_devices(autostart):
+    autostart.devices = [{"id": "d1", "name": "A"}, {"id": "d2", "name": "B"}]
+    # no selection (fixture default) → can't guess → fall back to confirm-then-run
+    state = bridge.BridgeState()
+    flow = _pending_flow()
+    flow.pending_topic = "EV market"
+    state.set_remote(flow)
+
+    _approve(state)
+
+    assert autostart.enqueued == []
+    ev = state.signed_in
+    assert not ev.get("autoStarted")
+    # Topic was claimed under the lock (nulled on the flow), but re-offered via the
+    # announce so the legacy "reply yes" handoff still works.
+    assert ev["pendingTopic"] == "EV market"
+    assert state.remote.pending_topic is None
+
+
+def test_autostart_falls_back_to_reply_yes_when_enqueue_fails(autostart):
+    autostart.devices = [{"id": "d1", "name": "Laptop"}]
+    autostart.enqueue_raises = True
+    state = bridge.BridgeState()
+    flow = _pending_flow()
+    flow.pending_topic = "Golden Retriever"
+    state.set_remote(flow)
+
+    _approve(state)
+
+    ev = state.signed_in
+    assert not ev.get("autoStarted")
+    # Degrade to confirm-then-run: re-offered via the announce (topic was claimed).
+    assert ev["pendingTopic"] == "Golden Retriever"
+    assert state.remote.pending_topic is None
+    assert autostart.deleted  # the orphan research doc was cleaned up
+
+
+def test_autostart_disabled_by_env_uses_reply_yes(autostart, monkeypatch):
+    monkeypatch.setenv("DG_AGENT_AUTOSTART", "0")
+    autostart.devices = [{"id": "d1", "name": "Laptop"}]
+    state = bridge.BridgeState()
+    flow = _pending_flow()
+    flow.pending_topic = "Golden Retriever"
+    state.set_remote(flow)
+
+    _approve(state)
+
+    assert autostart.enqueued == []
+    assert state.signed_in["pendingTopic"] == "Golden Retriever"
+
+
+def test_autostart_no_pending_topic_just_confirms(autostart):
+    autostart.devices = [{"id": "d1", "name": "Laptop"}]
+    state = bridge.BridgeState()
+    state.set_remote(_pending_flow())  # no pending_topic
+
+    _approve(state)
+
+    assert autostart.enqueued == []
+    ev = state.signed_in
+    assert not ev.get("autoStarted") and not ev.get("needsDevice")
+    assert ev["pendingTopic"] == ""

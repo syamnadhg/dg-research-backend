@@ -344,6 +344,29 @@ def test_signed_in_line_without_topic_invites_a_topic():
     assert "Signed in as e@x.y" in line and "what to research" in line.lower()
 
 
+def test_signed_in_line_announces_an_auto_started_run():
+    """Bridge started the pending research server-side → report it as started, NOT
+    a 'reply yes' offer (no fragile handoff)."""
+    line = poll._signed_in_line({
+        "email": "e@x.y", "autoStarted": True, "runId": "agent-abc",
+        "deviceName": "Office PC", "topic": "Golden Retriever", "pendingTopic": "",
+    })
+    assert "starting" in line.lower()
+    assert "Golden Retriever" in line and "Office PC" in line
+    assert "reply" not in line.lower()  # never asks to confirm — it already ran
+
+
+def test_signed_in_line_prompts_to_pair_a_node_when_none():
+    """No research node on the account → surface the pair-a-node step (the flow the
+    agent failed to show), not a 'reply yes' offer."""
+    line = poll._signed_in_line({
+        "email": "e@x.y", "needsDevice": True, "topic": "Golden Retriever", "pendingTopic": "",
+    })
+    assert "no research node" in line.lower()
+    assert "access code" in line.lower() and "superresearch --pair" in line
+    assert "reply" not in line.lower()
+
+
 def test_main_announces_signed_in_once_then_dedups(monkeypatch, capsys):
     origin = {"platform": "telegram", "chat_id": "111"}
     saved = {"s": None}

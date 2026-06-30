@@ -294,16 +294,34 @@ def compute(runs: list, prior_state: dict, *, baseline: bool = False) -> tuple[l
 
 
 def _signed_in_line(signed_in: dict) -> str:
-    """The proactive sign-in announce. With a pending topic (a research fired while
-    signed out) it OFFERS to continue — confirm-first, never a silent auto-start —
-    so the user replies "yes" and the assistant fires that research. With no pending
-    topic it just confirms the connection and invites a topic."""
+    """The proactive sign-in announce. When a research was fired while signed out,
+    the BRIDGE starts it server-side at sign-in and reports it here — no fragile
+    "reply yes" round-trip that depends on the assistant interpreting a bare "yes".
+    If the account has no research node, this surfaces the pair-a-node step. Only
+    when the bridge couldn't auto-start (older bridge / ambiguous device) does it
+    fall back to OFFERING to continue ("reply yes"). With no pending research it
+    just confirms the connection."""
     who = signed_in.get("email") or "your account"
-    # Show the FULL topic (bounded to 500 chars at ingest) — not a truncated preview —
-    # so the assistant fires the exact research the user originally asked when they
-    # reply "yes" (the topic isn't retained anywhere else after this one-shot delivery).
-    topic = (signed_in.get("pendingTopic") or "").strip()
-    if topic:
+    # Full topic (bounded to 500 chars at ingest), never a truncated preview.
+    topic = (signed_in.get("topic") or signed_in.get("pendingTopic") or "").strip()
+    quoted = f"“{topic}”" if topic else "your research"
+    if signed_in.get("autoStarted"):
+        dev = (signed_in.get("deviceName") or "").strip()
+        on_dev = f" on {dev}" if dev else ""
+        return (f"✓ Signed in — starting {quoted}{on_dev} now. "
+                f"I'll post progress here as each phase finishes.")
+    if signed_in.get("needsDevice"):
+        return (
+            f"✓ Signed in as {who} — but there's no research node on your account "
+            f"yet, so {quoted} has nowhere to run. Add one: on a computer running "
+            f"Super Research, grab its access code and tell me to add it. No node "
+            f"yet? Set one up with a single line — Windows: "
+            f"irm https://superresearch.io/install.ps1 | iex · macOS/Linux: "
+            f"curl -fsSL https://superresearch.io/install.sh | sh — then run "
+            f"superresearch --pair to get the code."
+        )
+    # Fallback: bridge couldn't auto-start — OFFER to continue (legacy handoff).
+    if (signed_in.get("pendingTopic") or "").strip():
         return f"✓ Signed in as {who} — continue with “{topic}”? Reply “yes” to start."
     return f"✓ Signed in as {who}. Just tell me what to research."
 
