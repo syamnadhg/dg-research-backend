@@ -69,8 +69,37 @@ def test_device_add_is_unambiguous_in_the_skill():
     assert "telegram" in skill or "platform" in skill
 
 
-def test_skill_is_lean():
-    # The whole point — keep it small so Hermes reads little per turn. The lean
-    # rewrite is ~205 lines; guard against silent bloat back toward the old 401.
+def test_skill_within_sanity_bound():
+    # NOTE: the aggressive 401->205 trim (0.1.14) regressed multiple flows live
+    # (sign-in handoff, never-improvise, podcast substitution, device-add) because
+    # the LLM relies on the explicit/emphatic wording — so we REVERTED to the
+    # proven verbose version (reliability > a smaller file). This is just a loose
+    # upper bound to catch unbounded growth, NOT a trim mandate.
     n = len((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").splitlines())
-    assert n < 260, f"SKILL.md grew to {n} lines — keep it lean (was ~205 after the rewrite)"
+    assert n < 460, f"SKILL.md grew to {n} lines — unexpectedly large"
+
+
+def test_signin_handoff_continues_from_the_announce_topic():
+    # Bug 1 (live, 2026-06-29): "yes" after the watchdog's "continue with
+    # '<topic>'?" produced "what should I do with that?" — the lean trim dropped
+    # the point that the topic is already in that announce. The handoff must tell
+    # the agent to fire research with THAT topic directly, and never ask back.
+    low = " ".join((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").lower().split())
+    assert "continue with" in low and "already in hand" in low, (
+        "sign-in handoff must say the topic from the 'continue with <topic>?' "
+        "announce is in hand → run research directly"
+    )
+    assert "what should i continue" in low, (
+        "must explicitly forbid asking 'what should I continue?' after a sign-in link"
+    )
+
+
+def test_never_improvise_research_is_a_hard_rule():
+    # Bug 2 (live, 2026-06-29): a re-sent "super research on X" got answered from
+    # the model's own knowledge. The trim had softened the never-improvise rule;
+    # the emphatic research-specific framing must be restored.
+    low = " ".join((_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").lower().split())
+    assert "hard rule" in low and "never improvise the research" in low
+    assert "not even when you easily could" in low, (
+        "restore the emphatic clause that directly catches the observed improvise"
+    )
