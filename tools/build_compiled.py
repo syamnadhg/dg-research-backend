@@ -58,6 +58,13 @@ REPO = Path(__file__).resolve().parent.parent  # tools/ -> repo root
 TOP_MODULES = ["models", "prompts", "vision", "narrate"]
 AUTH_SUBMODULES = ["v2_flow", "keystore", "credentials", "pairing"]
 
+# Local-only admin/diagnostic scripts that sit in scripts/ but must NEVER ship in a
+# wheel. They're untracked, so a clean clone (e.g. the Mac build) doesn't have them —
+# shipping them from a working-tree build (Win/Linux) makes those wheels cosmetically
+# differ from the Mac one. Dropped from the unpacked tree so EVERY wheel (compiled +
+# the source fallback, every OS) is byte-consistent.
+DROP_FROM_WHEEL = ("scripts/dump_push_audit.py", "scripts/admin_cleanup_stale_ongoing.py")
+
 SHIM = '''#!/usr/bin/env python3
 """Launcher shim for the COMPILED Super Research build.
 
@@ -139,6 +146,10 @@ def main() -> None:
                     help="macOS deployment target for the wheel's platform tag (default: 11.0 = "
                          "Big Sur). WITHOUT this, building on a new macOS tags the wheel "
                          "macosx_<that version>_arm64 and it WON'T install on older Macs.")
+    ap.add_argument("--also-source", action="store_true",
+                    help="ALSO emit the universal py3-none-any SOURCE-fallback wheel (installs "
+                         "on any Python 3.11+/OS — un-hidden source). Build it ONCE on any one "
+                         "platform; it's platform-independent.")
     args = ap.parse_args()
 
     # On macOS, pin the deployment target BEFORE compiling so both the Nuitka/clang
@@ -167,6 +178,25 @@ def main() -> None:
     run([sys.executable, "-m", "wheel", "unpack", str(src_whl), "-d", str(work / "unpacked")])
     tree = next((work / "unpacked").glob("superresearch-*"))
     print(f"[build] tree={tree}")
+
+    # 2a. Drop local-only admin scripts so EVERY wheel is byte-consistent — a
+    # working-tree build (Win/Linux) must match a clean-clone build (Mac) exactly.
+    for rel in DROP_FROM_WHEEL:
+        f = tree / rel
+        if f.exists():
+            f.unlink()
+            print(f"[build] dropped local-only {rel}")
+
+    # 2b. Optional py3-none-any SOURCE fallback — pack the CLEANED tree BEFORE
+    # compiling (pure readable source, universal). Identical to the compiled wheel
+    # except the first-party modules aren't Nuitka-compiled. pip uses the compiled
+    # wheel where it matches, this otherwise (any Python 3.11+/OS).
+    if args.also_source:
+        (work / "fallback").mkdir()
+        run([sys.executable, "-m", "wheel", "pack", str(tree), "-d", str(work / "fallback")])
+        fb = next((work / "fallback").glob("*.whl"))
+        shutil.copy(fb, outdir / fb.name)
+        print(f"[build] source fallback -> {outdir / fb.name}")
 
     # 3a. research.py -> _sr_core.<abi>.pyd, then replace research.py with the shim
     core_src = comp / "_sr_core.py"
