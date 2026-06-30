@@ -363,8 +363,12 @@ def test_signed_in_line_prompts_to_pair_a_node_when_none():
         "email": "e@x.y", "needsDevice": True, "topic": "Golden Retriever", "pendingTopic": "",
     })
     assert "no research node" in line.lower()
-    assert "access code" in line.lower() and "superresearch --pair" in line
+    # Points at the reliable web-app path + the exact one-message chat form.
+    assert "superresearch --pair" in line
+    assert "Add Device" in line and "/sr device-add" in line
     assert "reply" not in line.lower()
+    # Multi-line / readable (the user complained the old one was a wall of text).
+    assert line.count("\n") >= 4
 
 
 def test_main_announces_signed_in_once_then_dedups(monkeypatch, capsys):

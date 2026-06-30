@@ -308,22 +308,31 @@ def _signed_in_line(signed_in: dict) -> str:
     if signed_in.get("autoStarted"):
         dev = (signed_in.get("deviceName") or "").strip()
         on_dev = f" on {dev}" if dev else ""
-        return (f"✓ Signed in — starting {quoted}{on_dev} now. "
-                f"I'll post progress here as each phase finishes.")
-    if signed_in.get("needsDevice"):
         return (
-            f"✓ Signed in as {who} — but there's no research node on your account "
-            f"yet, so {quoted} has nowhere to run. Add one: on a computer running "
-            f"Super Research, grab its access code and tell me to add it. No node "
-            f"yet? Set one up with a single line — Windows: "
-            f"irm https://superresearch.io/install.ps1 | iex · macOS/Linux: "
-            f"curl -fsSL https://superresearch.io/install.sh | sh — then run "
-            f"superresearch --pair to get the code."
+            f"✓ Signed in.\n\n"
+            f"Starting {quoted}{on_dev} now — I'll post progress here as each phase finishes."
+        )
+    if signed_in.get("needsDevice"):
+        # Multi-line + a Rocky-free path FIRST (scan the QR), then the exact one-line
+        # chat form (code + command together — the reliable shape for the gateway).
+        return (
+            f"✓ Signed in as {who}.\n\n"
+            f"There's no research node on your account yet, so {quoted} has nowhere to run.\n\n"
+            f"On a computer with Super Research, run:\n"
+            f"      superresearch --pair\n"
+            f"It shows an 8-char code. Then add the node either way:\n\n"
+            f"1) In the web app (most reliable):\n"
+            f"      superresearch.io → Account → Pipeline Connection → Add Device\n\n"
+            f"2) Or from here — send the code with the command, in ONE message:\n"
+            f"      /sr device-add YOUR-CODE\n\n"
+            f"No Super Research on any computer yet? Install it first:\n"
+            f"  • Windows:      irm https://superresearch.io/install.ps1 | iex\n"
+            f"  • macOS/Linux:  curl -fsSL https://superresearch.io/install.sh | sh"
         )
     # Fallback: bridge couldn't auto-start — OFFER to continue (legacy handoff).
     if (signed_in.get("pendingTopic") or "").strip():
-        return f"✓ Signed in as {who} — continue with “{topic}”? Reply “yes” to start."
-    return f"✓ Signed in as {who}. Just tell me what to research."
+        return f"✓ Signed in as {who}.\n\nContinue with “{topic}”? Reply “yes” to start."
+    return f"✓ Signed in as {who}.\n\nJust tell me what to research."
 
 
 def _tick_unauthed(origin: dict | None, state_file: Path) -> int:

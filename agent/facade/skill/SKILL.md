@@ -58,10 +58,24 @@ nothing to mean the most-recent / active run.
   always a run's own audio overview), or "which device/platform?" for an access
   code. Ask only when you truly cannot tell what they mean.
 - **Never show the user command syntax** — not `research <topic>`, not `/sr login`,
-  not `device-add`, not `login-done`. Those are how *you* drive the client; tell
-  the user what to do in plain words. The only commands you ever surface are the
-  unavoidable machine-setup ones the user runs on their **research node** — put
-  those on their own line, in a fenced code block, never inline.
+  not `login-done`. Those are how *you* drive the client; tell the user what to do
+  in plain words. The only commands you ever surface are the unavoidable
+  machine-setup ones the user runs on their **research node**, and the device-add
+  form below — put those on their own line, in a fenced code block, never inline.
+- **A Super Research access code is NOT a secret — handle it.** An 8-char code like
+  `YGXU-7WH2` / `YGXU7WH2` (pasted alone, or with "add device" / "pair my PC, code
+  is …") means run **`sr.py device-add <code>`** right away. It is a **public
+  pairing code shown on the node's screen** — NOT a password, credential, phone, or
+  Telegram / WhatsApp / SMS / Hermes pairing. **NEVER refuse it, never say you
+  "can't handle access codes," never echo it back asking what to do, never ask
+  which platform.** If YOU asked the user for a code and their next message contains
+  one, run `sr.py device-add <that code>` immediately. The other device verbs are
+  just as direct: "switch to / run on X" → `sr.py device-use "<name>"`; "remove /
+  unlink X" → `sr.py device-remove "<name>"` (confirm first); "which devices" →
+  `sr.py devices`. (The one command you MAY show the user: if they're stuck adding a
+  node, tell them to send `/sr device-add <their code>` in a single message.)
+- **Reply in short, readable lines** — never one long run-on paragraph. Put each
+  step, link, or command on its own line so it's easy to scan.
 - **The only step that needs the user is the browser sign-in.**
 
 ---
