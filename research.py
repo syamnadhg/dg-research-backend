@@ -36504,18 +36504,26 @@ async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
     while True:
         try:
             raw = await asyncio.to_thread(_getpass.getpass, prompt)
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print()
             return ""
+        except KeyboardInterrupt:
+            # Ctrl+C = cancel the pair (not "skip this key" — type s to skip).
+            # Propagate so Stage 3 / cmd_pair_v2 revert the partial pair.
+            print()
+            raise
         except _getpass.GetPassWarning:
             # No-echo support unavailable on this terminal — fall back to
             # echoed input rather than crashing. User loses the privacy
             # benefit but the prompt still works.
             try:
                 raw = await asyncio.to_thread(input, prompt)
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 print()
                 return ""
+            except KeyboardInterrupt:
+                print()
+                raise
         s = (raw or "").strip()
         # Strip surrounding quotes — users often copy from .env-style snippets
         if len(s) >= 2 and s[0] in ('"', "'") and s[-1] == s[0]:
@@ -36602,9 +36610,12 @@ async def _pair_prompt_one_key_with_verify(
                 f"  {_c(_ACCENT, '>')}  Save this key anyway "
                 f"{_c(_DIM, '[y/N]:')} ",
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print()
             return ""
+        except KeyboardInterrupt:
+            print()
+            raise
         if (ans or "").strip().lower() in ("y", "yes"):
             print(
                 f"  {_c(_WARN, '⚠')}  Saving unverified key. "
@@ -37043,7 +37054,7 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
         # browser logins, Ready/supervisor. The helper writes per-platform
         # login progress to devices/{deviceId}.logins via the user-scoped
         # Firestore client (rule permits synth user updates of `logins`).
-        await _continue_pair_stages_2_to_5(
+        _pair_ok = await _continue_pair_stages_2_to_5(
             profile_dir or str(PROFILE_DIR),
             linked_uid=owner_uid,
             linked_email=owner_email or owner_label or owner_uid[:8],
@@ -37051,10 +37062,12 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             token="",
             device_id_for_progress=result["device_id"],
         )
-        # Reached only if Stages 2-5 returned cleanly (no Ctrl+C, no
-        # exception). The finally below uses this sentinel to decide
-        # whether to run server-side cleanup.
-        pair_completed = True
+        # _continue returns True when the pair completed (incl. partial / zero
+        # logins) or was intentionally refused, and False only when the user
+        # cancelled mid-Stage-4. On cancel we leave pair_completed=False so the
+        # finally reverts the partial pair (device doc + token) — no ghost tile
+        # left in the app. (Fixes: Ctrl+C at Stage 4 used to keep the device.)
+        pair_completed = bool(_pair_ok)
     finally:
         if captured_device_id and not pair_completed:
             print()
@@ -37069,137 +37082,6 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
                 "again from a clean slate.",
                 "INFO",
             )
-
-
-async def run_warm_profile():
-    """Open each worker's REAL browser profile (headed, patchright + Chrome)
-    so YOU can sign in to ChatGPT / Gemini / Claude / NotebookLM by hand — and,
-    crucially, clear any Cloudflare "verify you are human" (Turnstile) check
-    ONCE, with a human clicking it.
-
-    Why this exists
-    ───────────────
-    A fresh install starts with a COLD browser profile
-    (`~/.super-research/browser-profile*/`). It holds no Cloudflare trust cookie
-    (`cf_clearance`), so ChatGPT's Turnstile can loop even for a real person the
-    first time through `--pair`. Signing in here — as a human, at your own pace —
-    mints that trust INSIDE the exact profile the pipeline drives, so a later
-    `--pair` and every research run reuse it and sail through.
-
-    It automates NOTHING and solves NOTHING for you: no CUA, no CAPTCHA-solving.
-    It just hands you the tool's own browser with the right tabs open; you log
-    in, you solve any check, you press Enter. (We never bypass a human check.)
-
-    Multi-profile: warms every worker profile this device has
-    (`load_worker_count()` → `_profile_dir(1..N)`), one profile at a time — the
-    same profiles pair Stage 4 and the runtime use — so each concurrent-run slot
-    ends up trusted, not just profile 1.
-
-    Runnable from a source checkout (`python research.py --warm-profile`) or the
-    installed command (`superresearch --warm-profile`) — no publish needed.
-
-    HONEST scope: this fixes a COLD profile. If a site still loops AFTER you sign
-    in by hand, the block is your network/IP (VPN / flagged address), not the
-    profile — warming can't fix that; switch networks.
-    """
-    _branded_header("focus", _BOLD + _ACCENT, "kindle the hearth")
-    print()
-    print(f"  {_c(_DIM, 'Sign in to each platform by hand — including any')} "
-          f"{_c(_BOLD, 'human check')}{_c(_DIM, '.')}")
-    print(f"  {_c(_DIM, 'That teaches this browser profile the sites trust you, so')} "
-          f"{_c(_BOLD, '--pair')} {_c(_DIM, 'and every run stop hitting the loop.')}")
-    print()
-    print(f"  {_c(_DIM, 'Tip: if the backend is serving, stop it first — warming uses the')}")
-    print(f"  {_c(_DIM, 'same browser profiles.')}")
-
-    # The exact platforms the pipeline drives, so the trust we mint here is the
-    # trust the runtime reuses. Same set as pair Stage 4 (research.py:37510).
-    services = [
-        ("ChatGPT",    "https://chatgpt.com"),
-        ("Gemini",     "https://gemini.google.com"),
-        ("Claude",     "https://claude.ai"),
-        ("NotebookLM", "https://notebooklm.google.com"),
-    ]
-
-    n_workers = load_worker_count()
-
-    for n in range(1, n_workers + 1):
-        _setup_step(n, n_workers, f"Browser profile {n}")
-        browser = Browser(_profile_dir(n), headless=False)
-        try:
-            await browser.start()
-        except Exception as e:
-            log(f"warm-profile: could not open profile {n} ({_profile_dir(n)}): {e}", "WARN")
-            print(f"  {_c(_WARN, 'Could not open this profile — skipping.')} {_c(_DIM, str(e))}")
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            continue
-
-        # Open every platform tab in this profile's window. Stagger the opens
-        # (human-paced, not a robotic burst) — a simultaneous N-tab open reads
-        # as automation to Cloudflare scoring, the very thing we're defeating.
-        pages = []
-        for idx, (name, url) in enumerate(services):
-            if idx > 0:
-                await asyncio.sleep(random.uniform(2.0, 3.5))
-            try:
-                if idx == 0:
-                    # Reuse the blank tab start() already created.
-                    log(f"New tab: {url}")
-                    await browser.page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    pages.append(browser.page)
-                else:
-                    pages.append(await browser.new_tab(url))
-                print(f"  {_c(_OK, '›')}  {_c(_BOLD, name)} {_c(_DIM, '— opened')}")
-            except Exception as e:
-                log(f"warm-profile: failed to open {name} ({url}): {e}", "WARN")
-                print(f"  {_c(_WARN, '·')}  {_c(_BOLD, name)} {_c(_DIM, 'could not open — open it yourself in the window')}")
-
-        # Focus ChatGPT (the platform that loops) so you start there.
-        if pages:
-            try:
-                await pages[0].bring_to_front()
-            except Exception:
-                pass
-
-        print()
-        print(f"  {_c(_BOLD, 'In the browser window that just opened:')}")
-        print(f"    {_c(_DIM, '1.')} Sign in to each platform (ChatGPT, Gemini, Claude, NotebookLM).")
-        print(f"    {_c(_DIM, '2.')} If a site shows a \"verify you are human\" check, complete it yourself.")
-        print(f"    {_c(_DIM, '3.')} Take your time — nothing here is automated or rushed.")
-        print()
-        try:
-            await asyncio.to_thread(
-                input,
-                f"  {_c(_ACCENT, '>')}  Press Enter when every tab is signed in and clear ",
-            )
-        except (EOFError, KeyboardInterrupt):
-            print()
-            log("Warm-profile cancelled by user", "INFO")
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            print(f"  {_c(_WARN, 'Stopped.')} {_c(_DIM, 'Re-run')} {_c(_BOLD, _PROG + ' --warm-profile')} {_c(_DIM, 'any time.')}")
-            return
-
-        try:
-            await browser.close()
-        except Exception:
-            pass
-        print(f"  {_c(_OK, '✓')}  {_c(_DIM, 'Saved sign-ins + trust cookies for this profile.')}")
-
-    print()
-    print(f"  {_c(_OK, '✓')}  {_c(_BOLD, 'Done — your profiles are warm.')}")
-    print()
-    print(f"  {_c(_ACCENT, 'Next')}")
-    print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --pair')}   {_c(_DIM, '# should now pass ChatGPT without the loop')}")
-    print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --serve')}  {_c(_DIM, '# run the backend')}")
-    print()
-    print(f"  {_c(_DIM, 'Still looping after you signed in? Then it is the network/IP, not the')}")
-    print(f"  {_c(_DIM, 'profile — try a different network or a non-VPN residential connection.')}")
 
 
 async def _walk_platform_logins(
@@ -37265,9 +37147,14 @@ async def _walk_platform_logins(
         print(f"  {_c(_BOLD, name)}  {_c(_DIM, '— log in on the tab that just opened.')}")
 
         platform_ok = False
+        skipped = False
+        fail_count = 0  # failed checks on THIS platform — surfaces the "you can skip" hint
         while True:
             try:
-                await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Press Enter when done ")
+                _walk_ans = (await asyncio.to_thread(
+                    input,
+                    f"  {_c(_ACCENT, '>')}  Press Enter to check  {_c(_DIM, '·  [s] skip  ·  [r] reopen tab')}  ",
+                )).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print("")
                 log("Setup cancelled by user", "INFO")
@@ -37277,6 +37164,31 @@ async def _walk_platform_logins(
                 except Exception:
                     pass
                 break
+
+            # [s] skip — user opts out of this platform. Pairing still completes
+            # (see the caller: partial/zero logins no longer strand pairing); the
+            # platform is left un-logged-in and Phase 0 re-verifies it at run time.
+            # This is the user choosing to skip, never a bypass of the check.
+            if _walk_ans in ("s", "skip"):
+                log(f"    Setup: user skipped {name} login", "INFO")
+                skipped = True
+                platform_ok = False
+                break
+            # [r] reopen — fresh tab, for when the login tab is wedged (a looping
+            # human-verification wall, a dead redirect, an expired page).
+            if _walk_ans in ("r", "reopen"):
+                print(f"  {_c(_DIM, 'Reopening ' + name + '…')}")
+                try:
+                    await tab.close()
+                except Exception:
+                    pass
+                try:
+                    tab = await browser.new_tab(url)
+                    await asyncio.sleep(4.0)
+                except Exception as e:
+                    log(f"    Failed to reopen {name}: {e}", "WARN")
+                    print(f"  {_c(_WARN, 'Could not reopen — press [s] to skip this platform.')}")
+                continue
 
             # 2026-04-30: cookie + Playwright DOM shortcuts REMOVED. Both
             # raised false positives — cookies survive server-side session
@@ -37292,7 +37204,10 @@ async def _walk_platform_logins(
             except Exception:
                 current_url = ""
             if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
+                fail_count += 1
                 print(f"  {_c(_WARN, 'Not logged in yet — finish the flow and press Enter again.')}")
+                if fail_count >= 2:
+                    print(f"  {_c(_DIM, 'Stuck? [s] skips this platform — pairing still finishes without it.')}")
                 continue
 
             # Vision verification is the gate. URL already cleared the
@@ -37407,7 +37322,10 @@ async def _walk_platform_logins(
                     # CUA confirmed login — that's enough.
                     platform_ok = True
                     break
-            print(f"  {_c(_WARN, 'CUA could not confirm login — try again and press Enter.')}")
+            fail_count += 1
+            print(f"  {_c(_WARN, 'Could not confirm login yet — try again and press Enter.')}")
+            if fail_count >= 2:
+                print(f"  {_c(_DIM, 'Stuck? [s] skips this platform — pairing still finishes without it.')}")
 
         if cancelled:
             break
@@ -37418,7 +37336,7 @@ async def _walk_platform_logins(
             pass
 
         results[key] = platform_ok
-        emit_row(name, platform_ok)
+        emit_row(name, platform_ok, "skipped" if skipped else "")
         if push_progress:
             push_progress()
 
@@ -37471,12 +37389,19 @@ async def _continue_pair_stages_2_to_5(
         _ans = _startup_typed.strip().lower()
         if _ans in ("", "y", "yes"):
             enable_on_startup = True
-    except (EOFError, KeyboardInterrupt):
-        # Ctrl+C at the prompt — safer default is to skip arming, so a
-        # user who meant to abort doesn't end up with a silently-armed
-        # supervisor if they continue through the rest of --pair anyway.
+    except EOFError:
+        # No stdin (piped / non-interactive) — keep the safe default (skip
+        # arming) and continue, rather than aborting a scripted pair.
         enable_on_startup = False
         print()
+    except KeyboardInterrupt:
+        # Ctrl+C = cancel the whole pair. Universal rule: Ctrl+C always cancels
+        # the command; use the explicit prompt options to skip a step. The
+        # browser isn't open yet; returning False makes cmd_pair_v2 revert the
+        # partial pair (device doc + token) so no ghost device is left.
+        print()
+        log("Pairing cancelled by user (Stage 2 — On Startup)", "INFO")
+        return False
     print()
     if enable_on_startup:
         print(f"  {_c(_OK, '✓')}  On Startup will be enabled after the logins finish.")
@@ -37509,7 +37434,14 @@ async def _continue_pair_stages_2_to_5(
     print(f"  {_c(_DIM, 'Anthropic powers the agents (CUA + Vision).  Gemini powers narration.')}")
     print(f"  {_c(_DIM, 'Already-set keys are detected and reused. Skip to set later via the web app.')}")
     print()
-    await _pair_prompt_api_keys(linked_uid)
+    try:
+        await _pair_prompt_api_keys(linked_uid)
+    except KeyboardInterrupt:
+        # Ctrl+C during API-key entry = cancel the pair (universal Ctrl+C rule).
+        # Return False so cmd_pair_v2 reverts the partial pair.
+        print()
+        log("Pairing cancelled by user (Stage 3 — API keys)", "INFO")
+        return False
     print()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -37597,7 +37529,10 @@ async def _continue_pair_stages_2_to_5(
                            sample=prior.get("sample", []))
             except Exception:
                 pass
-            return
+            # Intentional refusal — keep the device; the user completes the
+            # account switch via --unpair --deep. Return True so cmd_pair_v2
+            # does NOT treat this as a cancel and wipe the device.
+            return True
         # First-pair or same-account re-pair — allow cookies through with
         # a passive notice. The Google session is presumed to belong to
         # the user about to authenticate, not a leaked third-party login.
@@ -37825,17 +37760,31 @@ async def _continue_pair_stages_2_to_5(
                 break
         print("")
 
-    if all_ok:
+    if not cancelled:
         # ══════════════════════════════════════════════════════════════════════
         # [5/5] READY — pair is complete. If the user opted into On Startup
-        #       back in step 2, arm the supervisor NOW (deferred from step 2
-        #       so an aborted login couldn't leave Firestore flagged as
-        #       supervised while platforms were half-logged-in). Final
-        #       message branches on whether the supervisor is live.
+        #       back in step 2, arm the supervisor NOW (deferred from step 2).
+        #
+        #       PARTIAL / ZERO logins STILL complete the pair (user direction
+        #       2026-06-30): a stuck Stage-4 login must not strand pairing. The
+        #       device link (Stages 1-3) is real; Phase 0 re-verifies logins at
+        #       run time, so the missing ones can be signed in later. Supervisor
+        #       is armed per the On-Startup choice regardless of login count —
+        #       an armed backend just idles until a run needs a logged-in tab.
         # ══════════════════════════════════════════════════════════════════════
+        _logged_in = [n for n, _u, k in services if results.get(k, False)]
+        _not_logged_in = [n for n, _u, k in services if not results.get(k, False)]
         _setup_step(5, 5, "Ready")
         print(f"  {_c(_OK, '✓')}  Paired with {_c(_BOLD, linked_email or '—')}")
-        print(f"  {_c(_OK, '✓')}  All {len(services)} platforms logged in")
+        if not _not_logged_in:
+            print(f"  {_c(_OK, '✓')}  All {len(services)} platforms logged in")
+        elif _logged_in:
+            print(f"  {_c(_OK, '✓')}  {len(_logged_in)}/{len(services)} platforms logged in")
+            print(f"  {_c(_WARN, '⚠')}  Not logged in yet: {_c(_BOLD, ', '.join(_not_logged_in))}")
+            print(f"  {_c(_DIM, '     Phase 0 re-checks logins at run time — sign in to these in the browser when a run needs them.')}")
+        else:
+            print(f"  {_c(_WARN, '⚠')}  No platforms logged in yet")
+            print(f"  {_c(_DIM, '     Pairing is complete. Phase 0 verifies logins at run time — sign in when a run needs them.')}")
         print(f"  {_c(_OK, '✓')}  Browser closed")
 
         supervised_armed = False
@@ -37927,19 +37876,24 @@ async def _continue_pair_stages_2_to_5(
     else:
         print()
         print(f"  {_rule('━', _WARN)}")
-        print(f"  {_c(_WARN, 'Setup cancelled — not all platforms logged in yet.')}")
+        print(f"  {_c(_WARN, 'Pairing cancelled — reverting this partial setup.')}")
         print(f"  {_rule('━', _WARN)}")
         print("")
         if last_results:
-            print(f"  {_c(_DIM, 'Last check:')}")
+            print(f"  {_c(_DIM, 'Signed in before you cancelled:')}")
             for name, _u, key in services:
                 ok = last_results.get(key)
                 mark = _c(_OK, "[ok]") if ok else _c(_DIM, "[  ]")
                 print(f"        {mark}  {name if ok else _c(_DIM, name)}")
             print("")
-        print(f"  {_c(_DIM, 'Your token is saved. Re-run when ready:')}")
-        print(f"        {_c(_BOLD, f'{_PROG} --pair')}")
+        print(f"  {_c(_DIM, 'Re-run when ready:')}  {_c(_BOLD, f'{_PROG} --pair')}")
         print("")
+
+    # True = pair completed (incl. partial / zero logins) or was intentionally
+    # refused; False = user cancelled mid-flow (Ctrl+C). cmd_pair_v2 maps False
+    # to pair_completed=False so its finally reverts the partial pair (device doc
+    # + token) — no ghost device is left in the app.
+    return not cancelled
 
 
 # ── Supervised mode (--resurrect / --retire) ───────────────────────────
@@ -42019,11 +41973,6 @@ def main():
     parser.add_argument("--api-key", "-k", help="CUA API key")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--pair", action="store_true", help="First-time login setup")
-    parser.add_argument("--warm-profile", action="store_true", dest="warm_profile",
-        help="Open each browser profile headed so you can sign in to ChatGPT/Gemini/Claude/NotebookLM "
-             "by hand and clear any 'verify you are human' check once. Warms the profile's Cloudflare "
-             "trust cookies so --pair and every run stop hitting the Turnstile loop. Run it if pairing "
-             "gets stuck at ChatGPT's human-verification wall.")
     parser.add_argument("--resume", "-r", help="Resume from a previous queue directory (name or full path)")
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
     parser.add_argument("--port", type=int, default=None,
@@ -42132,10 +42081,6 @@ def main():
 
     if args.daemon_loop:
         run_daemon_loop(_resolved_port)
-        return
-
-    if args.warm_profile:
-        asyncio.run(run_warm_profile())
         return
 
     if args.pair:
