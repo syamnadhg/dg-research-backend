@@ -37197,10 +37197,13 @@ def _find_chrome_executable() -> "str | None":
     return None
 
 
-def _kill_chrome_for_profile(profile_dir: str) -> None:
+def _kill_chrome_for_profile(profile_dir: str, graceful: bool = False) -> None:
     """Kill any Chrome (plain OR patchright) whose command line references THIS
     profile dir, so the profile lock is released before the next launcher opens
-    it. Boundary-safe via _profile_matches_cmdline — never touches the user's
+    it. `graceful=True` sends SIGTERM (proc.terminate) instead of SIGKILL so
+    Chrome flushes cookies/session to disk before exiting — used by the macOS
+    close path where the Popen handle is the `open -na` launcher, not Chrome.
+    Boundary-safe via _profile_matches_cmdline — never touches the user's
     personal Chrome (different --user-data-dir) or a sibling worker's profile.
     Best-effort; silent if psutil is absent.
 
@@ -37223,7 +37226,10 @@ def _kill_chrome_for_profile(profile_dir: str) -> None:
                 continue
             cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
             if any(_profile_matches_cmdline(t, cmdline) for t in targets):
-                proc.kill()
+                if graceful:
+                    proc.terminate()  # SIGTERM — Chrome flushes cookies, then exits
+                else:
+                    proc.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
         except Exception:
@@ -37263,21 +37269,32 @@ async def _close_chrome_gracefully(proc, profile_dir: str) -> None:
     (Chrome shuts down cleanly on it). Waits a few seconds for a clean exit, then
     hard-kills any remnant + releases the profile lock."""
     import subprocess as _sp
+    plat = _supervisor_platform()
     try:
-        if _supervisor_platform() == "Windows":
+        if plat == "Windows":
             _sp.run(["taskkill", "/PID", str(proc.pid), "/T"],
                     capture_output=True, timeout=15, creationflags=_PS_NO_WINDOW)
-        else:
+        elif plat == "Darwin":
+            # `proc` here is the `open -na` launcher (it exits the moment Chrome
+            # spawns), so SIGTERM-ing proc.pid does nothing to Chrome. SIGTERM the
+            # real Chrome bound to THIS profile so it flushes cookies before exit.
+            _kill_chrome_for_profile(profile_dir, graceful=True)
+        else:  # Linux — proc.pid IS the Chrome process
             proc.terminate()  # SIGTERM — Chrome flushes + exits cleanly
     except Exception:
         pass
-    for _ in range(16):  # up to ~8s for a clean flush + exit
-        try:
-            if proc.poll() is not None:
+    if plat == "Darwin":
+        # No launcher pid to poll (it's already gone) — give the SIGTERM'd Chrome
+        # a few seconds to flush + exit before the hard-kill sweep below.
+        await asyncio.sleep(6.0)
+    else:
+        for _ in range(16):  # up to ~8s for a clean flush + exit
+            try:
+                if proc.poll() is not None:
+                    break
+            except Exception:
                 break
-        except Exception:
-            break
-        await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)
     # Hard-kill any remnant (detached child, stuck window) + free the lock.
     _kill_chrome_for_profile(profile_dir)
     await asyncio.sleep(1.5)
@@ -37299,12 +37316,26 @@ async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", 
     # Make sure the profile isn't already open (a live Chrome on this dir would
     # make our launch attach to it / no-op, and would hold the lock).
     _kill_chrome_for_profile(profile_dir)
-    args = [
-        chrome,
+    chrome_args = [
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
     ] + list(service_urls)
+    if _supervisor_platform() == "Darwin":
+        # macOS: launching the Chrome BINARY directly while the user's normal
+        # Chrome is running is intercepted by the app singleton broker — it
+        # forwards the URLs to the ALREADY-RUNNING Chrome (their personal default
+        # profile) and IGNORES --user-data-dir. The sign-in then lands in the wrong
+        # profile, and phase-2 verify (patchright, which bypasses the broker)
+        # reopens an EMPTY dedicated profile. `open -na <app> --args …` forces a
+        # brand-new instance bound to our dedicated profile dir. Derive the .app
+        # bundle from the binary path (…/Google Chrome.app/Contents/MacOS/…).
+        app = chrome.split("/Contents/MacOS/")[0] if "/Contents/MacOS/" in chrome else chrome
+        args = ["open", "-na", app, "--args"] + chrome_args
+    else:
+        # Windows + Linux: a direct binary launch honors --user-data-dir — a
+        # distinct data-dir gets its own instance even if the user's Chrome runs.
+        args = [chrome] + chrome_args
     if reopen:
         print(f"  {_c(_DIM, 'Reopening your real Chrome — fix the flagged platforms (sign in / switch to Pro).')}")
     else:
@@ -37486,17 +37517,22 @@ async def run_login_flow(
     *,
     cua_client=None,
     device_id_for_progress: "str | None" = None,
+    allow_add: bool = False,
 ) -> "tuple[dict[int, dict], bool]":
     """The two-phase login flow shared by `--login` and (later) pair Step 4:
       Phase 1 — plain Chrome (no automation): human signs in + clears any check.
       Phase 2 — patchright reopens the profile + verifies logins + Pro tier.
-    Runs for each worker profile in `profile_indices`. Returns
+    Runs for each worker profile in `profile_indices` (the existing workers). With
+    `allow_add=True` (used by `--login`), it then offers pair-Stage-4-style
+    "Add another browser profile?" prompts — running the SAME sign-in+verify per
+    added profile and bumping workerCount (save_worker_count) as each FULLY
+    verifies — so `--login` can grow the multi-worker profile set exactly like
+    pairing does, not just re-login the single existing one. Returns
     ({profile_n: {key: bool}}, seeded_any) — seeded_any=False means no profile's
     Chrome could even be launched (e.g. Google Chrome not installed)."""
     services = _LOGIN_SERVICES
     pad = max(len(n) for n, _u, _k in services)
     profile_list = list(profile_indices)
-    multi = len(profile_list) > 1
     all_results: "dict[int, dict]" = {}
     seeded_any = False
 
@@ -37505,25 +37541,25 @@ async def run_login_flow(
         sfx = f"  {_c(_DIM, lbl)}" if lbl else ""
         print(f"        {mark}  {nm.ljust(pad)}{sfx}")
 
-    for n in profile_list:
+    async def _do_profile(n: int, total: int) -> "tuple[dict, str]":
+        nonlocal seeded_any
         profile_dir = str(_profile_dir(n))
-        label = "profile" if not multi else f"profile {n}"
-        _setup_step(n, (max(profile_list) if multi else 1), f"Sign in — {label}")
-
+        label = "profile" if total <= 1 else f"profile {n}"
+        _setup_step(n, total, f"Sign in — {label}")
         results: "dict[str, bool]" = {}
         try:
             status = await _login_one_profile(
                 profile_dir, cua_client, label=label, results=results, emit_row=_row)
         except (EOFError, KeyboardInterrupt):
-            raise  # standalone --login: propagate the cancel to main's handler
+            raise  # propagate the cancel (caller/main handles it)
         except Exception as e:
             log(f"login: profile {n} failed: {e}", "WARN")
             print(f"  {_c(_WARN, 'Could not complete this profile: ' + str(e)[:120])}")
             status = "error"
         if status != "no_chrome":
             seeded_any = True
-        # Write the FE login badges (paired devices only; best-effort).
-        if status == "ok" and device_id_for_progress and _firebase_db:
+        # FE login badges are bound to profile 1 (paired devices only; best-effort).
+        if n == 1 and status == "ok" and device_id_for_progress and _firebase_db:
             try:
                 _firebase_db.collection("devices").document(device_id_for_progress).update({
                     "logins": {k: bool(results.get(k, False)) for _n, _u, k in services},
@@ -37531,6 +37567,58 @@ async def run_login_flow(
             except Exception:
                 pass
         all_results[n] = results
+        return results, status
+
+    total = max(profile_list) if len(profile_list) > 1 else 1
+    for n in profile_list:
+        await _do_profile(n, total)
+
+    # `--login` add-loop: offer to set up ADDITIONAL worker profiles, pair-style,
+    # so a single-worker install can grow to multi-worker from --login (matching
+    # pair Stage 4). Only after at least one profile's Chrome launched.
+    if allow_add and seeded_any:
+        base = max(profile_list) if profile_list else 1
+        try:
+            save_worker_count(base)  # anchor the floor (also handles a downgrade)
+        except Exception as _wc_err:
+            log(f"save_worker_count({base}) failed (continuing): {_wc_err}", "WARN")
+        print()
+        print(f"  {_c(_DIM, 'Each browser profile = 1 concurrent run slot. Recommended: 2 total.')}")
+        print(f"  {_c(_DIM, 'Past your slot count, fired runs go into the queue.')}")
+        print()
+        next_n = base + 1
+        while True:
+            try:
+                ans = (await asyncio.to_thread(
+                    input,
+                    f"  {_c(_ACCENT, '>')}  Add another browser profile (profile {next_n})? {_c(_DIM, '[y/N]')}: ",
+                )).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                log(f"login add-loop: cancel at profile {next_n} prompt — keeping workerCount={next_n - 1}", "INFO")
+                break
+            if ans not in ("y", "yes"):
+                break
+            try:
+                results, status = await _do_profile(next_n, next_n)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                log(f"login add-loop: cancel during profile {next_n} — keeping workerCount={next_n - 1}", "INFO")
+                break
+            n_all_ok = status == "ok" and all(results.get(k, False) for _n, _u, k in services)
+            print()
+            if n_all_ok:
+                try:
+                    save_worker_count(next_n)
+                except Exception as _wc_err:
+                    log(f"save_worker_count({next_n}) failed (continuing): {_wc_err}", "WARN")
+                print(f"  {_c(_OK, '✓')}  Profile {next_n} verified — concurrent capacity is now {next_n}.")
+                next_n += 1
+            else:
+                # Don't increment — the dir may hold partial cookies; user can wipe
+                # via --unpair --deep and retry that slot.
+                print(f"  {_c(_WARN, '⚠')}  Profile {next_n} not fully verified — keeping workerCount={next_n - 1}.")
+
     return all_results, seeded_any
 
 
@@ -37585,6 +37673,7 @@ async def run_login() -> None:
         range(1, n_workers + 1),
         cua_client=cua_client,
         device_id_for_progress=device_id,
+        allow_add=True,  # offer the pair-style "add another profile?" loop
     )
 
     # Summary across all profiles.
