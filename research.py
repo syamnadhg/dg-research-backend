@@ -37237,7 +37237,7 @@ async def _close_chrome_gracefully(proc, profile_dir: str) -> None:
     await asyncio.sleep(1.5)
 
 
-async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", label: str) -> bool:
+async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", label: str, reopen: bool = False) -> bool:
     """Phase 1: open the user's REAL Chrome (NO automation/CDP) on `profile_dir`
     with the platform tabs, so the human signs in + clears any human-check on the
     one surface where automation is blocked. Blocks on Enter, then fully closes
@@ -37259,7 +37259,10 @@ async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", 
         "--no-first-run",
         "--no-default-browser-check",
     ] + list(service_urls)
-    print(f"  {_c(_DIM, 'Opening your real Chrome — ' + label + '. This is NOT automated; sign in normally.')}")
+    if reopen:
+        print(f"  {_c(_DIM, 'Reopening your real Chrome — fix the flagged platforms (sign in / switch to Pro).')}")
+    else:
+        print(f"  {_c(_DIM, 'Opening your real Chrome — ' + label + '. Sign in normally.')}")
     try:
         proc = _sp.Popen(args)
     except Exception as e:
@@ -37284,11 +37287,12 @@ async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", 
     return True
 
 
-async def _verify_platform_logins(browser, services, cua_client, *, results, emit_row) -> None:
+async def _verify_platform_logins(browser, services, cua_client, *, results, emit_row, flags=None) -> None:
     """Phase 2: on the now-signed-in profile, verify each platform is logged in
-    (+ soft Pro-tier warning where it applies) with patchright + CUA. This only
-    NAVIGATES authenticated pages — never a sign-in form — so it isn't hit by the
-    automation block. Records per-platform bool into `results` (mutated)."""
+    (+ soft Pro-tier where it applies) with patchright + CUA. This only NAVIGATES
+    authenticated pages — never a sign-in form — so it isn't hit by the automation
+    block. Records per-platform bool into `results` (mutated); if `flags` is given,
+    records per-platform status: 'ok' | 'free' | 'missing' | 'no_check'."""
     for idx, (name, url, key) in enumerate(services):
         if idx > 0:
             await asyncio.sleep(random.uniform(1.5, 3.0))
@@ -37302,48 +37306,108 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
             emit_row(name, False, "could not open")
             continue
         await asyncio.sleep(4.0)  # SPA hydration (matches Phase 0 / pair timing)
-        ok = False
-        label = ""
+        status, label = "missing", ""
         try:
             current_url = (tab.url or "").lower()
         except Exception:
             current_url = ""
         if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
-            ok, label = False, "not signed in"
+            status, label = "missing", "not signed in"
         elif not cua_client:
-            ok, label = True, "no vision check (no API key)"
+            status, label = "no_check", "no vision check (no API key)"
         else:
             try:
                 async with _async_spinner_ctx(f"Verifying {name}"):
-                    ok = await verify_login_cua(tab, key, cua_client)
+                    _ok = await verify_login_cua(tab, key, cua_client)
             except CuaUnavailableError as _cua_err:
                 # AI service down / key rate-limited / over cap — NOT a logout.
                 # Accept on the URL pass (login-host negatives already cleared)
                 # and flag it, rather than falsely reporting "not signed in".
                 log(f"verify: CUA unavailable for {key} ({_cua_err}) — URL-only accept", "WARN")
-                ok, label = True, "signed in (vision check unavailable)"
+                status, label = "no_check", "signed in (vision check unavailable)"
             except Exception as e:
                 log(f"verify: CUA error {key}: {e}", "WARN")
-                ok, label = False, "not signed in"
+                status, label = "missing", "not signed in"
             else:
-                if not ok:
-                    label = "not signed in"
+                if not _ok:
+                    status, label = "missing", "not signed in"
                 elif key in _PRO_TIER_PLATFORMS:
-                    # Soft Pro-tier check — warn only. The sign-in already
-                    # happened in phase 1; the fix for Free is to re-run --login
-                    # on a Pro account, so there's no interactive c/r/s here.
                     try:
                         tier = await _cua_pro_tier_call(tab, key, cua_client)
                     except Exception:
                         tier = "unsure"
                     if tier == "free":
-                        label = "Free tier — Phase 1/2 quality will be degraded"
+                        status, label = "free", "Free tier — Phase 1/2 quality will be degraded"
+                    else:
+                        status = "ok"
+                else:
+                    status = "ok"
         try:
             await tab.close()
         except Exception:
             pass
-        results[key] = ok
-        emit_row(name, ok, label)
+        results[key] = (status != "missing")
+        if flags is not None:
+            flags[key] = status
+        emit_row(name, status != "missing", label)
+
+
+async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_row, security_check=None) -> str:
+    """Sign in + verify ONE profile — the shared engine for `--login` and pair
+    Step 4. Phase 1 = the user's plain Chrome (human signs in on the un-detected
+    surface); phase 2 = patchright reopens the now-warm profile, runs an optional
+    `security_check(browser) -> refuse-bool`, then verifies each login + Pro tier.
+    Mutates `results`. Returns 'ok' | 'no_chrome' | 'refused'. Raises
+    KeyboardInterrupt on Ctrl+C (universal cancel) — the caller handles it."""
+    service_urls = [u for _n, u, _k in _LOGIN_SERVICES]
+    reopen = False
+    while True:
+        # Phase 1 — plain Chrome sign-in (all tabs). On a reopen the user just
+        # fixes the flagged platforms.
+        seeded = await _seed_login_plain_chrome(profile_dir, service_urls, label, reopen=reopen)  # may raise KeyboardInterrupt
+        if not seeded:
+            return "no_chrome"
+        # Phase 2 — patchright reopens the now-warm profile + verifies.
+        flags: "dict[str, str]" = {}
+        browser = Browser(profile_dir, headless=False)
+        try:
+            async with _async_spinner_ctx("Reopening the profile to verify"):
+                await browser.start()
+            if security_check is not None:
+                try:
+                    if await security_check(browser):
+                        return "refused"
+                except Exception as _sec_err:
+                    log(f"login: security check errored (continuing): {_sec_err}", "WARN")
+            print(f"  {_c(_DIM, 'Checking each sign-in…')}")
+            await _verify_platform_logins(
+                browser, _LOGIN_SERVICES, cua_client, results=results, emit_row=emit_row, flags=flags)
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        # Anything needing attention: not-signed-in OR Free tier. Offer to reopen
+        # the REAL Chrome to fix (retry), or continue as-is (keep Free / skip the
+        # missing ones) — the intended retry / continue-with-free / skip flows.
+        _missing = [nm for nm, _u, k in _LOGIN_SERVICES if flags.get(k) == "missing"]
+        _free = [nm for nm, _u, k in _LOGIN_SERVICES if flags.get(k) == "free"]
+        if not _missing and not _free:
+            return "ok"
+        print()
+        if _missing:
+            print(f"  {_c(_WARN, 'Not signed in:')} {_c(_BOLD, ', '.join(_missing))}")
+        if _free:
+            print(f"  {_c(_WARN, 'On Free tier')} {_c(_DIM, '(Phase 1/2 quality degraded):')} {_c(_BOLD, ', '.join(_free))}")
+        print(f"  {_c(_DIM, '[r] reopen Chrome to fix   ·   [Enter] continue as-is (keep Free / skip missing)')}")
+        try:
+            _ans = (await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Choose ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise
+        if _ans in ("r", "reopen", "retry"):
+            reopen = True
+            continue
+        return "ok"  # continue-with-free / skip missing → accept current state
 
 
 async def run_login_flow(
@@ -37359,9 +37423,9 @@ async def run_login_flow(
     ({profile_n: {key: bool}}, seeded_any) — seeded_any=False means no profile's
     Chrome could even be launched (e.g. Google Chrome not installed)."""
     services = _LOGIN_SERVICES
-    service_urls = [u for _n, u, _k in services]
     pad = max(len(n) for n, _u, _k in services)
-    multi = len(list(profile_indices)) > 1
+    profile_list = list(profile_indices)
+    multi = len(profile_list) > 1
     all_results: "dict[int, dict]" = {}
     seeded_any = False
 
@@ -37370,37 +37434,31 @@ async def run_login_flow(
         sfx = f"  {_c(_DIM, lbl)}" if lbl else ""
         print(f"        {mark}  {nm.ljust(pad)}{sfx}")
 
-    for n in profile_indices:
+    for n in profile_list:
         profile_dir = str(_profile_dir(n))
         label = "profile" if not multi else f"profile {n}"
-        _setup_step(n, (max(profile_indices) if multi else 1), f"Sign in — {label}")
+        _setup_step(n, (max(profile_list) if multi else 1), f"Sign in — {label}")
 
         results: "dict[str, bool]" = {}
-        seeded = await _seed_login_plain_chrome(profile_dir, service_urls, label)
-        if seeded:
+        try:
+            status = await _login_one_profile(
+                profile_dir, cua_client, label=label, results=results, emit_row=_row)
+        except (EOFError, KeyboardInterrupt):
+            raise  # standalone --login: propagate the cancel to main's handler
+        except Exception as e:
+            log(f"login: profile {n} failed: {e}", "WARN")
+            print(f"  {_c(_WARN, 'Could not complete this profile: ' + str(e)[:120])}")
+            status = "error"
+        if status != "no_chrome":
             seeded_any = True
-            browser = Browser(profile_dir, headless=False)
+        # Write the FE login badges (paired devices only; best-effort).
+        if status == "ok" and device_id_for_progress and _firebase_db:
             try:
-                async with _async_spinner_ctx("Reopening the profile to verify"):
-                    await browser.start()
-                print(f"  {_c(_DIM, 'Checking each sign-in…')}")
-                await _verify_platform_logins(browser, services, cua_client, results=results, emit_row=_row)
-            except Exception as e:
-                log(f"login: phase-2 verify failed for profile {n}: {e}", "WARN")
-                print(f"  {_c(_WARN, 'Could not verify this profile: ' + str(e)[:120])}")
-            finally:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-            # Write the FE login badges (paired devices only; best-effort).
-            if device_id_for_progress and _firebase_db:
-                try:
-                    _firebase_db.collection("devices").document(device_id_for_progress).update({
-                        "logins": {k: bool(results.get(k, False)) for _n, _u, k in services},
-                    })
-                except Exception:
-                    pass
+                _firebase_db.collection("devices").document(device_id_for_progress).update({
+                    "logins": {k: bool(results.get(k, False)) for _n, _u, k in services},
+                })
+            except Exception:
+                pass
         all_results[n] = results
     return all_results, seeded_any
 
@@ -37415,8 +37473,8 @@ async def run_login() -> None:
     source checkout or the installed command."""
     _branded_header("aditus", _BOLD + _ACCENT, "sign in on a real browser")
     print()
-    print(f"  {_c(_DIM, 'Automated browsers get blocked at sign-in, so we use your')} {_c(_BOLD, 'real Chrome')}{_c(_DIM, '.')}")
-    print(f"  {_c(_DIM, 'You sign in by hand; the tool then verifies + saves it to the profile.')}")
+    print(f"  {_c(_DIM, 'We open your real Chrome — sign in to each platform (+ solve any check).')}")
+    print(f"  {_c(_DIM, 'Then each sign-in is verified + saved to the profile.')}")
 
     # Guard: --login frees + reopens each profile, which closes the browser a
     # running backend is using. Warn before disrupting an active research.
@@ -37483,265 +37541,6 @@ async def run_login() -> None:
     print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --serve')}   {_c(_DIM, '# run the backend')}")
     print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --login')}   {_c(_DIM, '# re-run anytime a sign-in expires')}")
     print()
-
-
-async def _walk_platform_logins(
-    browser,
-    services: "list[tuple[str, str, str]]",
-    cua_client,
-    *,
-    results: "dict[str, bool]",
-    emit_row,
-    push_progress=None,
-    initial_pro_acknowledged: bool = False,
-) -> "tuple[bool, bool]":
-    """Sequentially walk per-platform login during pair Stage 4.
-
-    Extracted from `_continue_pair_stages_2_to_5` so the multi-profile
-    Stage 4 outer loop (2026-05-21) can reuse the exact same flow on
-    additional browser profiles without duplicating ~180 lines. Behavior
-    is byte-identical to the pre-extraction inline loop — same pacing
-    jitter, same URL/CUA gates, same Pro-tier branches.
-
-    SETUP-2026-04-19 design rationale (still applies): one platform at a
-    time, never bulk-open. Two problems with the earlier batch flow:
-    (1) opening many tabs within seconds reads as a robotic burst to
-    Cloudflare scoring, and (2) asking the user to juggle N simultaneous
-    login flows is overwhelming. This walk opens → settles → URL check
-    → CUA verify → closes, one platform at a time.
-
-    `results` is mutated in-place (not returned) so the caller's
-    `push_progress` closure sees fresh state without re-passing the dict
-    on every callback invocation.
-    """
-    cancelled = False
-    pair_pro_acknowledged = initial_pro_acknowledged
-
-    for idx, (name, url, key) in enumerate(services):
-        # 2026-04-30: cookie fast-path REMOVED. Was raising false positives —
-        # cookies persist past server-side session invalidation, so
-        # cookie_login_hit returned "logged in" when the session was actually
-        # dead. Mirrors the same removal init/Phase 0 made on 2026-04-24
-        # (research.py:16894-16902). Always open tab → settle → URL check →
-        # CUA. Slower but it looks at what's actually on screen.
-
-        # Stagger tab opens just like the probe paths — a user clicking
-        # through bookmarks takes a beat between each one.
-        if idx > 0:
-            await asyncio.sleep(random.uniform(2.5, 4.5))
-
-        try:
-            tab = await browser.new_tab(url)
-        except Exception as e:
-            log(f"    Failed to open {name}: {e}", "WARN")
-            results[key] = False
-            emit_row(name, False, f"could not open ({e})")
-            if push_progress:
-                push_progress()
-            continue
-
-        # SPA hydration — matches Phase 0 / probe timing. CUA misreads
-        # the neutral loading shell as a login wall if we peek too early.
-        await asyncio.sleep(4.0)
-
-        print("")
-        print(f"  {_c(_BOLD, name)}  {_c(_DIM, '— log in on the tab that just opened.')}")
-
-        platform_ok = False
-        skipped = False
-        fail_count = 0  # failed checks on THIS platform — surfaces the "you can skip" hint
-        while True:
-            try:
-                _walk_ans = (await asyncio.to_thread(
-                    input,
-                    f"  {_c(_ACCENT, '>')}  Press Enter to check  {_c(_DIM, '·  [s] skip  ·  [r] reopen tab')}  ",
-                )).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("")
-                log("Setup cancelled by user", "INFO")
-                cancelled = True
-                try:
-                    await tab.close()
-                except Exception:
-                    pass
-                break
-
-            # [s] skip — user opts out of this platform. Pairing still completes
-            # (see the caller: partial/zero logins no longer strand pairing); the
-            # platform is left un-logged-in and Phase 0 re-verifies it at run time.
-            # This is the user choosing to skip, never a bypass of the check.
-            if _walk_ans in ("s", "skip"):
-                log(f"    Setup: user skipped {name} login", "INFO")
-                skipped = True
-                platform_ok = False
-                break
-            # [r] reopen — fresh tab, for when the login tab is wedged (a looping
-            # human-verification wall, a dead redirect, an expired page).
-            if _walk_ans in ("r", "reopen"):
-                print(f"  {_c(_DIM, 'Reopening ' + name + '…')}")
-                try:
-                    await tab.close()
-                except Exception:
-                    pass
-                try:
-                    tab = await browser.new_tab(url)
-                    await asyncio.sleep(4.0)
-                except Exception as e:
-                    log(f"    Failed to reopen {name}: {e}", "WARN")
-                    print(f"  {_c(_WARN, 'Could not reopen — press [s] to skip this platform.')}")
-                continue
-
-            # 2026-04-30: cookie + Playwright DOM shortcuts REMOVED. Both
-            # raised false positives — cookies survive server-side session
-            # invalidation, and strict DOM selectors match cached sidebar
-            # fragments on logged-out landings. Mirror init's gate
-            # (research.py:16934-16947): URL host negative signal first,
-            # then CUA as the single source of truth.
-
-            # Cheap negative signal first: URL on a known login host →
-            # definitely not logged in. Skip the CUA call to save budget.
-            try:
-                current_url = (tab.url or "").lower()
-            except Exception:
-                current_url = ""
-            if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
-                fail_count += 1
-                print(f"  {_c(_WARN, 'Not logged in yet — finish the flow and press Enter again.')}")
-                if fail_count >= 2:
-                    print(f"  {_c(_DIM, 'Stuck? [s] skips this platform — pairing still finishes without it.')}")
-                continue
-
-            # Vision verification is the gate. URL already cleared the
-            # cheap "obvious login wall" case; everything else is a CUA
-            # decision. If no CUA client (Anthropic key missing/disabled),
-            # accept on URL pass — that mirrors init's behavior in the
-            # CuaUnavailableError fallback path.
-            if not cua_client:
-                platform_ok = True
-                break
-            try:
-                async with _async_spinner_ctx("Verifying sign-in"):
-                    cua_ok = await verify_login_cua(tab, key, cua_client)
-            except Exception as e:
-                log(f"    CUA verify error for {key}: {e}", "WARN")
-                cua_ok = False
-            if cua_ok:
-                # Pro-tier verify (DGOPS-7357 re-open). Login-OK is no longer
-                # the final gate for ChatGPT/Claude/Gemini — the OAuth-side-
-                # effect cookie can hydrate Gemini as the WORK account when
-                # the user wanted the personal one, and CUA only answers
-                # "logged in?", not "as whom?". Trust the user to fix the
-                # account in-tab; the Pro check at least catches the most
-                # common silent miscompare (work=Free, personal=Pro).
-                #
-                # Control-flow contract (refactored 2026-05-07 to address
-                # PR review C4 — original was correct but reviewers misread
-                # the break-then-fall-through pattern as a skip-bug).
-                # Each branch below now sets platform_ok + break EXPLICITLY,
-                # eliminating the dangling unconditional `platform_ok = True`
-                # at the end of the if cua_ok body that previously read as
-                # "always set True after any cua_ok=True". No behavior change.
-                if (key in _PRO_TIER_PLATFORMS
-                        and not pair_pro_acknowledged):
-                    print(f"  {_c(_DIM, 'Verifying subscription tier…')}")
-                    try:
-                        tier = await _cua_pro_tier_call(tab, key, cua_client)
-                    except CuaUnavailableError as cua_err:
-                        # Pre-pipeline: Phase 0 will re-check with the same
-                        # client and surface its own canonical alert. Don't
-                        # block setup on a transient billing/cap blip.
-                        log(f"    Setup pro_tier: CUA unavailable for {key} ({cua_err}) — skipping tier check", "WARN")
-                        tier = "unsure"
-                    except Exception as e:
-                        log(f"    Setup pro_tier: unexpected error for {key} ({e}) — assuming Pro (fail-open)", "WARN")
-                        tier = "unsure"
-                    if tier == "free":
-                        # 3-option terminal prompt. Free-tier was caught;
-                        # the user picks how to handle it.
-                        title, _details = _PRO_TIER_DETAILS_BY_KEY.get(
-                            key, (f"{name} Pro required", ""))
-                        print("")
-                        print(f"  {_c(_WARN, title)}")
-                        print(f"  {_c(_DIM, 'This account is on Free — Phase 1/2 quality will be degraded.')}")
-                        print(f"  {_c(_DIM, '  [c] continue with Free   [r] retry (sign in with Pro)   [s] skip this platform')}")
-                        choice = ""
-                        while True:
-                            try:
-                                choice = (await asyncio.to_thread(
-                                    input, f"  {_c(_ACCENT, '>')}  Choose [c/r/s] ")
-                                ).strip().lower()
-                            except (EOFError, KeyboardInterrupt):
-                                print("")
-                                log("Setup cancelled by user during Pro alert", "INFO")
-                                cancelled = True
-                                try:
-                                    await tab.close()
-                                except Exception:
-                                    pass
-                                break
-                            if choice in ("c", "continue", ""):
-                                pair_pro_acknowledged = True
-                                log(f"    Setup: user chose Continue with Free for {name}", "INFO")
-                                platform_ok = True
-                                break
-                            if choice in ("r", "retry"):
-                                log(f"    Setup: user chose Retry on {name} Free-tier alert — re-running login walk", "INFO")
-                                # Stay on this platform: same tab, user signs
-                                # out / signs back in with Pro, presses Enter
-                                # again. Fall through to the outer press-Enter
-                                # loop below via `continue`.
-                                platform_ok = False
-                                break
-                            if choice in ("s", "skip"):
-                                log(f"    Setup: user chose Skip for {name} (Free-tier)", "INFO")
-                                platform_ok = False
-                                break
-                            print(f"  {_c(_WARN, 'Pick c, r, or s.')}")
-                        if cancelled:
-                            break
-                        if choice in ("r", "retry"):
-                            # Don't break the press-Enter loop — `continue`
-                            # so the user gets the Press Enter prompt again
-                            # on the same tab after switching accounts.
-                            continue
-                        # c or s: leave the press-Enter loop with platform_ok
-                        # already set (True for c, False for s).
-                        break
-                    elif tier == "pro":
-                        log(f"    Setup: {name} Pro detected", "INFO")
-                        platform_ok = True
-                        break
-                    else:  # unsure → fail open
-                        log(f"    Setup: {name} tier UNSURE — assuming Pro (fail-open)", "INFO")
-                        platform_ok = True
-                        break
-                else:
-                    # Either pair_pro_acknowledged is True (user already
-                    # chose Continue-with-Free on a prior platform), or
-                    # this platform isn't in _PRO_TIER_PLATFORMS (e.g.,
-                    # NotebookLM, where the pro-tier prompt doesn't apply).
-                    # CUA confirmed login — that's enough.
-                    platform_ok = True
-                    break
-            fail_count += 1
-            print(f"  {_c(_WARN, 'Could not confirm login yet — try again and press Enter.')}")
-            if fail_count >= 2:
-                print(f"  {_c(_DIM, 'Stuck? [s] skips this platform — pairing still finishes without it.')}")
-
-        if cancelled:
-            break
-
-        try:
-            await tab.close()
-        except Exception:
-            pass
-
-        results[key] = platform_ok
-        emit_row(name, platform_ok, "skipped" if skipped else "")
-        if push_progress:
-            push_progress()
-
-    return cancelled, pair_pro_acknowledged
 
 
 async def _continue_pair_stages_2_to_5(
@@ -37851,9 +37650,8 @@ async def _continue_pair_stages_2_to_5(
     #       or falls back to Playwright-only if user skipped.
     # ══════════════════════════════════════════════════════════════════════
     _setup_step(4, 5, "Browser logins")
-    print(f"  {_c(_DIM, 'Walking through logins one platform at a time.')}")
-    print(f"  {_c(_DIM, 'Each tab opens, you log in, then press Enter — vision verifies the session.')}")
-    print(f"  {_c(_DIM, 'If a Pro-tier check trips, you decide whether to continue, retry, or skip.')}")
+    print(f"  {_c(_DIM, 'We open your real Chrome — sign in to each platform (+ solve any check).')}")
+    print(f"  {_c(_DIM, 'Then each sign-in is verified.')}")
     print("")
 
     # Make sure the browser the pipeline drives is actually launchable before we
@@ -37876,78 +37674,6 @@ async def _continue_pair_stages_2_to_5(
         print(f"       {_c(_DIM, 'If logins fail to open:')}  {_c(_BOLD, _chrome_install_hint())}")
     print("")
 
-    browser = Browser(profile_dir, headless=False)
-    async with _async_spinner_ctx("Launching the browser"):
-        await browser.start()
-
-    # F4 / DGOPS-7451 — refuse to add a Google account to a profile that
-    # already has one signed in. Multi-account state in this profile is
-    # the root enabler of the session-inheritance class of incident this
-    # safety check defends against; full incident context lives in
-    # DGOPS-7451. Detect read-only first; if a prior Google auth is
-    # present AND it points to a different account than the one just
-    # claimed (account_switch case), surface a clear unpair-first message
-    # and exit before walking Stage 4 logins. First-pair / same-account
-    # re-pair pass through with a passive notice.
-    try:
-        prior = await _detect_persisted_google_auth(browser.context)
-    except Exception as _de:
-        log(f"[security] pair preflight detection failed (continuing): {_de}", "WARN")
-        prior = None
-    if prior:
-        # F4 / DGOPS-7451 relaxation (2026-05-18): refuse pair only when the
-        # device was previously paired to a DIFFERENT account. That's the
-        # actual incident-class risk (silent account switch mid-life). On
-        # first-pair (no prior `_initial_paired_uid`) OR re-pair to the
-        # same account, the existing cookies are presumably from the user
-        # about to claim THIS link — refusing here creates a catch-22 with
-        # --unpair preserving the profile.
-        _account_mismatch = bool(_initial_paired_uid) and (_initial_paired_uid != linked_uid)
-        if _account_mismatch:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            print("")
-            print(f"  {_c(_BOLD, 'Refusing to pair: switching to a different account, but prior Google auth still present.')}")
-            print(f"  {_c(_DIM,  'Multi-account state is unsafe — agents inherit any persisted Google session and can')}")
-            print(f"  {_c(_DIM,  'navigate to Workspace-protected resources silently. See DGOPS-7451 for context.')}")
-            print("")
-            print(f"  Detected: {prior['cookieMatches']} Google auth cookie(s)  ·  prior uid: {_initial_paired_uid[:8]}…  ·  new uid: {linked_uid[:8]}…")
-            for s in prior.get("sample", []):
-                print(f"    • {s}")
-            print("")
-            print(f"  {_c(_BOLD, 'To complete this account switch:')}")
-            print(f"    1. {_c(_BOLD, f'{_PROG} --unpair --deep')}  {_c(_DIM, '(clears pairing state + browser profile)')}")
-            print(f"    2. {_c(_BOLD, f'{_PROG} --pair')}  {_c(_DIM, '(re-runs the full flow with a fresh browser)')}")
-            print("")
-            try:
-                emit_event("security_pair_refused",
-                           reason="account_switch_with_prior_cookies",
-                           cookieMatches=prior["cookieMatches"],
-                           priorPairedUid=_initial_paired_uid,
-                           newLinkedUid=linked_uid,
-                           sample=prior.get("sample", []))
-            except Exception:
-                pass
-            # Intentional refusal — keep the device; the user completes the
-            # account switch via --unpair --deep. Return True so cmd_pair_v2
-            # does NOT treat this as a cancel and wipe the device.
-            return True
-        # First-pair or same-account re-pair — allow cookies through with
-        # a passive notice. The Google session is presumed to belong to
-        # the user about to authenticate, not a leaked third-party login.
-        _reason = "first_pair" if not _initial_paired_uid else "same_account_repair"
-        log(f"[security] {prior['cookieMatches']} prior Google auth cookie(s) detected — "
-            f"allowing pair through ({_reason}). Account-switch refusal still active for "
-            f"future re-pair to a different uid.", "INFO")
-        try:
-            emit_event("security_pair_allowed_with_prior_cookies",
-                       reason=_reason,
-                       cookieMatches=prior["cookieMatches"],
-                       linkedUid=linked_uid)
-        except Exception:
-            pass
 
     # CUA client for visual double-verification. Best-effort: if no key is
     # available, Stage 4 (Browser logins) falls back to Playwright-only
@@ -37974,28 +37700,11 @@ async def _continue_pair_stages_2_to_5(
     else:
         log("Setup Stage 4: No ANTHROPIC_API_KEY — Playwright-only verification (less rigorous). Re-run --pair and paste a key at Stage 3 to enable CUA.", "WARN")
 
-    services = [
-        ("ChatGPT",        "https://chatgpt.com",           "chatgpt"),
-        ("Gemini",         "https://gemini.google.com",     "gemini"),
-        ("Claude",         "https://claude.ai",             "claude"),
-        ("NotebookLM",     "https://notebooklm.google.com", "notebooklm"),
-        # YouTube Studio dropped 2026-05-10 — P4 is FE-owned (Data API
-        # via OAuth refresh token), BE no longer uploads. Gmail + Google
-        # Docs dropped 2026-04-30 — P5 is FE-owned.
-    ]
-    # Per-platform login walk runs in _walk_platform_logins (above) —
-    # design rationale + sequencing notes live in that helper's docstring.
+    services = _LOGIN_SERVICES
     pad = max(len(n) for n, _u, _k in services)
     results: dict[str, bool] = {}
     cancelled = False
     all_ok = False
-    # Pair-local "user already opted into Free" flag. Mirrors
-    # _controls.pro_warning_acknowledged in init/Phase 0 but stays
-    # scoped to this pair invocation — pair exits before any
-    # pipeline_run, so no cross-coupling. Continue-with-Free on one
-    # Pro platform suppresses the alert for the remaining platforms
-    # in the same setup pass. (DGOPS-7357 follow-up, 2026-05-05.)
-    pair_pro_acknowledged = False
 
     def _emit_row(_name, ok, label=""):
         mark = _c(_OK, "[ok]") if ok else _c(_WARN, "[--]")
@@ -38008,10 +37717,6 @@ async def _continue_pair_stages_2_to_5(
         logins_map = {k: bool(results.get(k, False)) for _n, _u, k in services}
         try:
             if device_id_for_progress:
-                # Track D user-mode: top-level devices doc. The synth-user
-                # rule allows updates only of [lastHeartbeat, status,
-                # logins, authMode], so we drop setupState + lastSetupCheck
-                # (legacy-only telemetry).
                 _firebase_db.collection("devices").document(device_id_for_progress).update({
                     "logins": logins_map,
                 })
@@ -38024,22 +37729,74 @@ async def _continue_pair_stages_2_to_5(
         except Exception:
             pass
 
-    cancelled, pair_pro_acknowledged = await _walk_platform_logins(
-        browser,
-        services,
-        _setup_cua_client,
-        results=results,
-        emit_row=_emit_row,
-        push_progress=_push_firestore_progress,
-        initial_pro_acknowledged=pair_pro_acknowledged,
-    )
+    # F4 / DGOPS-7451 account-mismatch guard — runs in phase 2 on the patchright
+    # context. Refuse (return True) only when re-pairing to a DIFFERENT account
+    # with prior Google auth; first-pair / same-account pass with a notice.
+    # Dormant for user-mode pair (initial uid None).
+    async def _p1_security(browser) -> bool:
+        try:
+            prior = await _detect_persisted_google_auth(browser.context)
+        except Exception as _de:
+            log(f"[security] pair preflight detection failed (continuing): {_de}", "WARN")
+            return False
+        if not prior:
+            return False
+        if bool(_initial_paired_uid) and (_initial_paired_uid != linked_uid):
+            print("")
+            print(f"  {_c(_BOLD, 'Refusing to pair: switching to a different account, but prior Google auth still present.')}")
+            print(f"  {_c(_DIM,  'Multi-account state is unsafe — agents inherit any persisted Google session and can')}")
+            print(f"  {_c(_DIM,  'navigate to Workspace-protected resources silently. See DGOPS-7451 for context.')}")
+            print("")
+            print(f"  Detected: {prior['cookieMatches']} Google auth cookie(s)  ·  prior uid: {_initial_paired_uid[:8]}…  ·  new uid: {linked_uid[:8]}…")
+            for s in prior.get("sample", []):
+                print(f"    • {s}")
+            print("")
+            print(f"  {_c(_BOLD, 'To complete this account switch:')}")
+            print(f"    1. {_c(_BOLD, f'{_PROG} --unpair --deep')}  {_c(_DIM, '(clears pairing state + browser profile)')}")
+            print(f"    2. {_c(_BOLD, f'{_PROG} --pair')}  {_c(_DIM, '(re-runs the full flow with a fresh browser)')}")
+            print("")
+            try:
+                emit_event("security_pair_refused", reason="account_switch_with_prior_cookies",
+                           cookieMatches=prior["cookieMatches"], priorPairedUid=_initial_paired_uid,
+                           newLinkedUid=linked_uid, sample=prior.get("sample", []))
+            except Exception:
+                pass
+            return True
+        _reason = "first_pair" if not _initial_paired_uid else "same_account_repair"
+        log(f"[security] {prior['cookieMatches']} prior Google auth cookie(s) detected — allowing pair through ({_reason}).", "INFO")
+        try:
+            emit_event("security_pair_allowed_with_prior_cookies", reason=_reason,
+                       cookieMatches=prior["cookieMatches"], linkedUid=linked_uid)
+        except Exception:
+            pass
+        return False
+
+    # Profile 1 — real-Chrome sign-in + verify via the shared exception-safe
+    # engine (same as profile 2+). F4 runs in phase 2 via the security check.
+    try:
+        _p1_status = await _login_one_profile(
+            profile_dir, _setup_cua_client, label="profile",
+            results=results, emit_row=_emit_row, security_check=_p1_security)
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        log("Setup cancelled by user (Stage 4 sign-in)", "INFO")
+        return False  # real cancel → cmd_pair_v2 reverts the partial pair
+    except Exception as e:
+        # A transient launch/verify failure must NOT destroy a real pairing
+        # (invariant: partial/zero logins still complete). Complete with current
+        # logins; the user can add the rest via --login.
+        log(f"Setup: profile-1 login/verify failed ({e}) — completing pair with current logins", "WARN")
+        print(f"  {_c(_WARN, 'Could not verify sign-ins: ' + str(e)[:120])}")
+        _p1_status = "error"
+    if _p1_status == "no_chrome":
+        return False  # no Google Chrome — revert cleanly (hint already shown)
+    if _p1_status == "refused":
+        return True   # F4 refusal — keep device; user runs --unpair --deep
 
     if not cancelled:
         all_ok = all(results.get(k, False) for _n, _u, k in services)
     last_results = dict(results)
-
     _push_firestore_progress()
-    await browser.close()
 
     print("")
 
@@ -38052,11 +37809,10 @@ async def _continue_pair_stages_2_to_5(
     # workerCount stays at 2). PR 2 (daemon-loop) reads workerCount to
     # spawn N --serve workers, each pinned to _profile_dir(k).
     #
-    # Reuses _walk_platform_logins (above) so the per-platform UX is
-    # byte-identical to profile-1's walk. push_progress is None for
-    # profile-2+ — Firestore's devices/{deviceId}.logins map stays as
-    # the canonical profile-1 set (FE-visible login status); per-profile
-    # logins are tracked locally only.
+    # Each added profile runs the SAME real-Chrome sign-in + verify flow as
+    # profile 1 (_login_one_profile). Firestore's devices/{deviceId}.logins map
+    # stays bound to profile-1 (FE-visible status); per-profile logins are
+    # tracked locally only.
     # ══════════════════════════════════════════════════════════════════════
     if all_ok and not cancelled:
         # Anchor profile-1 as the baseline (covers the downgrade path: a
@@ -38087,57 +37843,27 @@ async def _continue_pair_stages_2_to_5(
             if ans not in ("y", "yes"):
                 break
 
-            prof_path = _profile_dir(next_profile_n)
+            prof_path = str(_profile_dir(next_profile_n))
             print(f"  {_c(_DIM, f'Profile {next_profile_n} at {prof_path}')}")
-            try:
-                browser_n = Browser(str(prof_path), headless=False)
-                # Same spinner as profile-1's "Launching the browser" — without it,
-                # profiles 2+ looked frozen during the (slow) Chrome launch.
-                async with _async_spinner_ctx(f"Launching browser profile {next_profile_n}"):
-                    await browser_n.start()
-            except Exception as e:
-                log(f"Setup: failed to open browser for profile {next_profile_n}: {e}", "ERROR")
-                print(f"  {_c(_WARN, f'Could not launch browser for profile {next_profile_n}: {e}')}")
-                print(f"  {_c(_DIM, 'Stopping multi-profile loop. Pair continues with the profiles already set up.')}")
-                break
-
-            # F4 / DGOPS-7451 awareness — profile-N is fresh on first setup,
-            # but a re-pair may find leftover cookies. We surface a passive
-            # notice; the device is already paired to linked_uid, so prior
-            # cookies likely belong to the same account. A stricter "refuse
-            # if account_mismatch" gate would need to read the cookie's
-            # account_id which Stage 4 doesn't do either — keep symmetric.
-            try:
-                prior_n = await _detect_persisted_google_auth(browser_n.context)
-            except Exception as _de:
-                log(f"[security] profile {next_profile_n} preflight detection failed (continuing): {_de}", "WARN")
-                prior_n = None
-            if prior_n:
-                _n_cookies = prior_n.get("cookieMatches", 0) if isinstance(prior_n, dict) else 0
-                _msg = f"Profile {next_profile_n}: {_n_cookies} prior Google auth cookie(s) detected — continuing (presumed same account)."
-                print(f"  {_c(_DIM, _msg)}")
-
-            # Fresh results dict per profile — push_progress=None so the
-            # canonical Firestore logins map stays bound to profile-1.
+            # Same real-Chrome sign-in + patchright verify as profile 1
+            # (_login_one_profile runs both phases + closes the browser).
             profile_n_results: "dict[str, bool]" = {}
-            n_cancelled, pair_pro_acknowledged = await _walk_platform_logins(
-                browser_n,
-                services,
-                _setup_cua_client,
-                results=profile_n_results,
-                emit_row=_emit_row,
-                push_progress=None,
-                initial_pro_acknowledged=pair_pro_acknowledged,
-            )
+            n_cancelled = False
+            try:
+                await _login_one_profile(
+                    prof_path, _setup_cua_client, label=f"profile {next_profile_n}",
+                    results=profile_n_results, emit_row=_emit_row)
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                log(f"Multi-profile loop: Ctrl+C during profile {next_profile_n} — keeping workerCount={next_profile_n - 1}", "INFO")
+                n_cancelled = True
+            except Exception as e:
+                log(f"Setup: profile {next_profile_n} failed: {e}", "ERROR")
+                print(f"  {_c(_WARN, f'Could not set up profile {next_profile_n}: {e}')}")
 
             n_all_ok = (not n_cancelled) and all(
                 profile_n_results.get(k, False) for _n, _u, k in services
             )
-
-            try:
-                await browser_n.close()
-            except Exception:
-                pass
 
             print("")
             if n_all_ok:
