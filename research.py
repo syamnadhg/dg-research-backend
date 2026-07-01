@@ -37071,6 +37071,137 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             )
 
 
+async def run_warm_profile():
+    """Open each worker's REAL browser profile (headed, patchright + Chrome)
+    so YOU can sign in to ChatGPT / Gemini / Claude / NotebookLM by hand — and,
+    crucially, clear any Cloudflare "verify you are human" (Turnstile) check
+    ONCE, with a human clicking it.
+
+    Why this exists
+    ───────────────
+    A fresh install starts with a COLD browser profile
+    (`~/.super-research/browser-profile*/`). It holds no Cloudflare trust cookie
+    (`cf_clearance`), so ChatGPT's Turnstile can loop even for a real person the
+    first time through `--pair`. Signing in here — as a human, at your own pace —
+    mints that trust INSIDE the exact profile the pipeline drives, so a later
+    `--pair` and every research run reuse it and sail through.
+
+    It automates NOTHING and solves NOTHING for you: no CUA, no CAPTCHA-solving.
+    It just hands you the tool's own browser with the right tabs open; you log
+    in, you solve any check, you press Enter. (We never bypass a human check.)
+
+    Multi-profile: warms every worker profile this device has
+    (`load_worker_count()` → `_profile_dir(1..N)`), one profile at a time — the
+    same profiles pair Stage 4 and the runtime use — so each concurrent-run slot
+    ends up trusted, not just profile 1.
+
+    Runnable from a source checkout (`python research.py --warm-profile`) or the
+    installed command (`superresearch --warm-profile`) — no publish needed.
+
+    HONEST scope: this fixes a COLD profile. If a site still loops AFTER you sign
+    in by hand, the block is your network/IP (VPN / flagged address), not the
+    profile — warming can't fix that; switch networks.
+    """
+    _branded_header("focus", _BOLD + _ACCENT, "kindle the hearth")
+    print()
+    print(f"  {_c(_DIM, 'Sign in to each platform by hand — including any')} "
+          f"{_c(_BOLD, 'human check')}{_c(_DIM, '.')}")
+    print(f"  {_c(_DIM, 'That teaches this browser profile the sites trust you, so')} "
+          f"{_c(_BOLD, '--pair')} {_c(_DIM, 'and every run stop hitting the loop.')}")
+    print()
+    print(f"  {_c(_DIM, 'Tip: if the backend is serving, stop it first — warming uses the')}")
+    print(f"  {_c(_DIM, 'same browser profiles.')}")
+
+    # The exact platforms the pipeline drives, so the trust we mint here is the
+    # trust the runtime reuses. Same set as pair Stage 4 (research.py:37510).
+    services = [
+        ("ChatGPT",    "https://chatgpt.com"),
+        ("Gemini",     "https://gemini.google.com"),
+        ("Claude",     "https://claude.ai"),
+        ("NotebookLM", "https://notebooklm.google.com"),
+    ]
+
+    n_workers = load_worker_count()
+
+    for n in range(1, n_workers + 1):
+        _setup_step(n, n_workers, f"Browser profile {n}")
+        browser = Browser(_profile_dir(n), headless=False)
+        try:
+            await browser.start()
+        except Exception as e:
+            log(f"warm-profile: could not open profile {n} ({_profile_dir(n)}): {e}", "WARN")
+            print(f"  {_c(_WARN, 'Could not open this profile — skipping.')} {_c(_DIM, str(e))}")
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            continue
+
+        # Open every platform tab in this profile's window. Stagger the opens
+        # (human-paced, not a robotic burst) — a simultaneous N-tab open reads
+        # as automation to Cloudflare scoring, the very thing we're defeating.
+        pages = []
+        for idx, (name, url) in enumerate(services):
+            if idx > 0:
+                await asyncio.sleep(random.uniform(2.0, 3.5))
+            try:
+                if idx == 0:
+                    # Reuse the blank tab start() already created.
+                    log(f"New tab: {url}")
+                    await browser.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    pages.append(browser.page)
+                else:
+                    pages.append(await browser.new_tab(url))
+                print(f"  {_c(_OK, '›')}  {_c(_BOLD, name)} {_c(_DIM, '— opened')}")
+            except Exception as e:
+                log(f"warm-profile: failed to open {name} ({url}): {e}", "WARN")
+                print(f"  {_c(_WARN, '·')}  {_c(_BOLD, name)} {_c(_DIM, 'could not open — open it yourself in the window')}")
+
+        # Focus ChatGPT (the platform that loops) so you start there.
+        if pages:
+            try:
+                await pages[0].bring_to_front()
+            except Exception:
+                pass
+
+        print()
+        print(f"  {_c(_BOLD, 'In the browser window that just opened:')}")
+        print(f"    {_c(_DIM, '1.')} Sign in to each platform (ChatGPT, Gemini, Claude, NotebookLM).")
+        print(f"    {_c(_DIM, '2.')} If a site shows a \"verify you are human\" check, complete it yourself.")
+        print(f"    {_c(_DIM, '3.')} Take your time — nothing here is automated or rushed.")
+        print()
+        try:
+            await asyncio.to_thread(
+                input,
+                f"  {_c(_ACCENT, '>')}  Press Enter when every tab is signed in and clear ",
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            log("Warm-profile cancelled by user", "INFO")
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            print(f"  {_c(_WARN, 'Stopped.')} {_c(_DIM, 'Re-run')} {_c(_BOLD, _PROG + ' --warm-profile')} {_c(_DIM, 'any time.')}")
+            return
+
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        print(f"  {_c(_OK, '✓')}  {_c(_DIM, 'Saved sign-ins + trust cookies for this profile.')}")
+
+    print()
+    print(f"  {_c(_OK, '✓')}  {_c(_BOLD, 'Done — your profiles are warm.')}")
+    print()
+    print(f"  {_c(_ACCENT, 'Next')}")
+    print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --pair')}   {_c(_DIM, '# should now pass ChatGPT without the loop')}")
+    print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --serve')}  {_c(_DIM, '# run the backend')}")
+    print()
+    print(f"  {_c(_DIM, 'Still looping after you signed in? Then it is the network/IP, not the')}")
+    print(f"  {_c(_DIM, 'profile — try a different network or a non-VPN residential connection.')}")
+
+
 async def _walk_platform_logins(
     browser,
     services: "list[tuple[str, str, str]]",
@@ -41888,6 +42019,11 @@ def main():
     parser.add_argument("--api-key", "-k", help="CUA API key")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--pair", action="store_true", help="First-time login setup")
+    parser.add_argument("--warm-profile", action="store_true", dest="warm_profile",
+        help="Open each browser profile headed so you can sign in to ChatGPT/Gemini/Claude/NotebookLM "
+             "by hand and clear any 'verify you are human' check once. Warms the profile's Cloudflare "
+             "trust cookies so --pair and every run stop hitting the Turnstile loop. Run it if pairing "
+             "gets stuck at ChatGPT's human-verification wall.")
     parser.add_argument("--resume", "-r", help="Resume from a previous queue directory (name or full path)")
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
     parser.add_argument("--port", type=int, default=None,
@@ -41996,6 +42132,10 @@ def main():
 
     if args.daemon_loop:
         run_daemon_loop(_resolved_port)
+        return
+
+    if args.warm_profile:
+        asyncio.run(run_warm_profile())
         return
 
     if args.pair:

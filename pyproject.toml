@@ -47,27 +47,36 @@ classifiers = [
 ]
 # Runtime deps mirror requirements.txt (minus the test-only ones, which move to
 # the [dev] extra). Keep this list and requirements.txt in sync.
+#
+# Floors bumped 2026-06-30 to the versions we actually run + test against
+# (dropping the old ancient minimums). The backend installs via pipx into an
+# ISOLATED venv, so a modern floor never clashes with anything else on the
+# user's machine, and `>=` still lets a fresh install pull anything newer.
 dependencies = [
-    "anthropic>=0.40",
-    "playwright>=1.40",
-    "patchright>=1.59",
-    "markdownify>=0.14",
-    "requests>=2.31",
+    "anthropic>=0.85",
+    # patchright/playwright carry the stealth layer that gets past ChatGPT's
+    # Cloudflare Turnstile. Being releases behind is when detection catches up,
+    # so floor to the current line (2026-06-30: patchright 1.61.1 / playwright
+    # 1.61.0). Keep in sync with requirements.txt.
+    "playwright>=1.61",
+    "patchright>=1.61",
+    "markdownify>=1.2",
+    "requests>=2.32",
     "pypdf>=4.0",
-    "python-docx>=1.1",
-    "Pillow>=10.0",
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.34",
-    "websockets>=13.0",
-    "pydantic>=2.0",
-    "google-cloud-firestore>=2.20",
-    "google-auth>=2.30",
-    "keyring>=25",
-    "qrcode>=7.4",
+    "python-docx>=1.2",
+    "Pillow>=11.0",
+    "fastapi>=0.136",
+    "uvicorn[standard]>=0.46",
+    "websockets>=14.0",
+    "pydantic>=2.11",
+    "google-cloud-firestore>=2.27",
+    "google-auth>=2.50",
+    "keyring>=25.7",
+    "qrcode>=8.0",
     # Process hygiene (orphan-Chrome cleanup, sibling-spawn detection, unpair
     # sweep). Guarded imports degrade gracefully if absent, but declare it so
     # a fresh install gets full process hygiene. Keep in sync with requirements.txt.
-    "psutil>=5.9",
+    "psutil>=6.0",
 ]
 
 [project.optional-dependencies]

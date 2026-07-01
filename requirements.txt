@@ -1,16 +1,26 @@
 # Multi-Agent Deep Research Pipeline
+#
+# Version floors bumped 2026-06-30 to the versions we actually run + test
+# against (see pyproject.toml — kept in sync). `>=` still lets a fresh install
+# pull anything newer.
 # Core
-anthropic>=0.40
-playwright>=1.40
+anthropic>=0.85
+playwright>=1.61
 # patchright is a stealth drop-in for playwright's async API — used in
 # start_browser_session at research.py:8186 since the 2026-04-19 stealth
 # migration. Without this, every fresh `--pair` install crashes after
 # stage 2 with ModuleNotFoundError.
-patchright>=1.59
+#
+# Floor bumped 2026-06-30 to the current line (patchright 1.61.1 /
+# playwright 1.61.0). patchright's whole value is up-to-date stealth
+# patches that track bot-detection; running ~3 releases behind is exactly
+# when Cloudflare's Turnstile starts looping. Upgrade an existing source
+# checkout with:  pip install -U patchright playwright && patchright install chrome
+patchright>=1.61
 
 # Extraction
-markdownify>=0.14
-requests>=2.31
+markdownify>=1.2
+requests>=2.32
 # Phase-2 source-doc inlining for Gemini (paste path): when P1 is skipped
 # and the user attaches .pdf/.docx sources, Gemini gets their text pasted
 # (it silently drops file uploads). md/txt need no lib; these cover the
@@ -18,39 +28,39 @@ requests>=2.31
 # degrades to "source not inlined" (WARN) rather than crashing, so an
 # un-upgraded venv still runs.
 pypdf>=4.0
-python-docx>=1.1
+python-docx>=1.2
 
 # Image/video
-Pillow>=10.0
+Pillow>=11.0
 
 # Server (for web app)
-fastapi>=0.115
-uvicorn[standard]>=0.34
-websockets>=13.0
-pydantic>=2.0
+fastapi>=0.136
+uvicorn[standard]>=0.46
+websockets>=14.0
+pydantic>=2.11
 
 # Firestore client — BE authenticates as a per-user synthetic device
 # user via refresh-token credentials from the OS keystore (no Admin
 # SDK, no service-account JSON). `Client(credentials=...)` is stable
 # from 2.20+.
-google-cloud-firestore>=2.20
+google-cloud-firestore>=2.27
 # Carries the `Credentials` base class that auth/credentials.py's
 # RefreshTokenCredentials subclasses.
-google-auth>=2.30
+google-auth>=2.50
 # Cross-platform OS keystore for the refresh-token slot rotation in
 # auth/keystore.py. Falls back to a chmod-0600 file under
 # ~/.super-research/ on headless Linux without secret-service.
-keyring>=25
+keyring>=25.7
 
 # Process hygiene — orphan-Chrome cleanup after Stop/respawn, sibling
 # dual-spawn detection (worker-lock PID-liveness), and the unpair process
 # sweep. Every `import psutil` is try/except-guarded (a missing psutil
 # degrades those features rather than crashing), but it IS a real runtime
 # dep, so declare it — a fresh install should get full process hygiene.
-psutil>=5.9
+psutil>=6.0
 
 # Setup QR code rendering
-qrcode>=7.4
+qrcode>=8.0
 
 # Testing — added 2026-05-07 to support F4 security tests (DGOPS-7451).
 # tests/test_f4_security.py runs pure-unit + mocked-context tests for
