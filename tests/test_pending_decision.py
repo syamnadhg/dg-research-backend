@@ -15,6 +15,7 @@ Fix (BE half): mirror the decision onto the ROOT research doc via
 guards on research.py.
 """
 import inspect
+import re
 
 import research
 
@@ -123,6 +124,81 @@ def test_pro_required_suppresses_generic_mirror():
         "_emit_pro_required_alert must pass suppress_generic_mirror=True to "
         "emit_event (#715)."
     )
+
+
+def test_skip_agent_command_clears_pending_decision():
+    # E2E 2026-07-01: a Phase-2 agent that FAILED TO LAUNCH (fail_agent →
+    # added to skipped_agents but NOT in `pending`) never emits agent_skipped,
+    # so the central clear seam in emit_event never fires. fail_agent had already
+    # persisted a durable pipeline_error pendingDecision mirror, so on Skip the
+    # mirror lingered and the FE AgentAlertPanel fallback (decisionToCard) kept
+    # re-rendering the "Hit a snag" card even though the agent showed SKIPPED.
+    # retry_agent already retracts the mirror at its command chokepoint (#777);
+    # skip_agent must do the same. Isolate the skip_agent dispatcher block and
+    # assert the clear call is present.
+    mod_src = inspect.getsource(research)
+    m = re.search(
+        r'elif action == "skip_agent":(.*?)elif action == "skip_phase":',
+        mod_src, re.DOTALL,
+    )
+    assert m, "skip_agent dispatcher block not found (has the handler moved?)."
+    block = m.group(1)
+    assert "_clear_pending_decision" in block, (
+        "the skip_agent command handler must call _clear_pending_decision so the "
+        "durable 'Hit a snag' pendingDecision mirror is retracted the instant the "
+        "user clicks Skip — a launch-failed agent emits no agent_skipped, so the "
+        "central seam never fires and the snag card lingered (#777 parity)."
+    )
+    # Symmetry guard: the retry_agent chokepoint (#777) must ALSO clear — this
+    # locks both resolve paths so a future refactor can't silently drop one.
+    mr = re.search(
+        r'elif action == "retry_agent":(.*?)elif action == "continue_partial_agent":',
+        mod_src, re.DOTALL,
+    )
+    assert mr and "_clear_pending_decision" in mr.group(1), (
+        "the retry_agent handler must also clear the pendingDecision mirror (#777)."
+    )
+
+
+def test_clear_pending_decision_is_agent_scoped(monkeypatch):
+    # Reviewer-confirmed cross-agent clobber: fail_agent's mirror is NON-blocking,
+    # so a launch-failed ChatGPT mirror can be OVERWRITTEN by a later blocking
+    # Claude decision on the single pendingDecision field. Skipping/​retrying the
+    # still-visible ChatGPT card must NOT delete Claude's live mirror. A
+    # command-time clear scoped to an agent only fires when the live mirror
+    # targets THAT agent; the universal (no-agent) resolve path always fires.
+    writes = []
+    monkeypatch.setattr(research, "_update_firestore_research",
+                        lambda patch: writes.append(patch))
+    monkeypatch.setattr(research, "_pending_decision_active", False, raising=False)
+    monkeypatch.setattr(research, "_pending_decision_agent", None, raising=False)
+
+    # Claude's blocking decision is the live mirror.
+    research._persist_pending_decision(
+        {"kind": "pipeline_error", "phase": 2, "agent": "claude",
+         "alert_id": "agent_claude_error"})
+    assert research._pending_decision_agent == "claude"
+
+    writes.clear()
+    # Skipping a DIFFERENT agent (ChatGPT) must leave Claude's mirror intact.
+    research._clear_pending_decision("chatgpt")
+    assert writes == [], (
+        "skipping chatgpt must NOT DELETE_FIELD claude's still-live mirror"
+    )
+    assert research._pending_decision_agent == "claude"
+
+    # Skipping the SAME agent retracts it.
+    research._clear_pending_decision("claude")
+    assert len(writes) == 1 and "pendingDecision" in writes[0]
+    assert research._pending_decision_agent is None
+
+    # A universal (no-agent) clear always fires — central seam / login gates.
+    research._persist_pending_decision(
+        {"kind": "login_required", "phase": 0,
+         "alert_id": "phase0_login_required_x"})
+    writes.clear()
+    research._clear_pending_decision()
+    assert len(writes) == 1, "the no-agent resolve path must clear unconditionally"
 
 
 def test_pending_decision_cleared_on_universal_resolve_signal():

@@ -6950,6 +6950,13 @@ def _update_firestore_research(updates):
 # NOT load-bearing for correctness (the Firestore field is the source of truth;
 # the DELETE_FIELD always runs regardless of this flag).
 _pending_decision_active = False
+# Which agent (lowercased) the live mirror targets, or None for a non-agent
+# decision (login_required / env-check). Lets `_clear_pending_decision(agent=…)`
+# retract ONLY the acting agent's card at a skip/retry command chokepoint — a
+# launch-failed agent's mirror is NON-blocking, so a later agent's blocking
+# decision can overwrite the single pendingDecision field, and a blanket clear
+# would delete the newer agent's still-live card (reviewer-confirmed clobber).
+_pending_decision_agent = None
 
 
 def _persist_pending_decision(payload: dict):
@@ -6969,10 +6976,11 @@ def _persist_pending_decision(payload: dict):
     which retracts it the instant the gate resolves (resume / skip / stop) so a
     stale card can never re-appear on a later open. Best-effort; never blocks
     the run."""
-    global _pending_decision_active
+    global _pending_decision_active, _pending_decision_agent
     try:
         _update_firestore_research({"pendingDecision": payload})
         _pending_decision_active = True
+        _pending_decision_agent = (payload.get("agent") or "").lower() or None
         # E2E-observable lifecycle: confirms the durable mirror was written.
         log(f"[pending-decision] persisted kind={payload.get('kind')} "
             f"phase={payload.get('phase')} agent={payload.get('agent')} "
@@ -6981,18 +6989,39 @@ def _persist_pending_decision(payload: dict):
         log(f"[pending-decision] persist failed (non-fatal): {e}", "DEBUG")
 
 
-def _clear_pending_decision():
+def _clear_pending_decision(agent: "str | None" = None):
     """Retract a previously-persisted `pendingDecision` once the gate resolves.
     Idempotent — harmless when none was set. Must be paired with every
     `_persist_pending_decision` call so a resolved decision cannot linger on the
-    doc and re-surface on a later cold chat-open."""
-    global _pending_decision_active
+    doc and re-surface on a later cold chat-open.
+
+    `agent` scopes a COMMAND-time retraction (skip_agent / retry_agent) to the
+    agent the user acted on. A launch-failed agent's fail_agent mirror is
+    NON-blocking (the run proceeds to the next agent), so a LATER agent's
+    blocking decision can OVERWRITE the single pendingDecision field; a blanket
+    clear on any skip/retry would then delete the NEWER agent's still-live card
+    (reviewer-confirmed cross-agent clobber — the loss surfaces on a chat
+    close/reopen). When `agent` is given, clear ONLY if the live mirror targets
+    that agent (or isn't agent-scoped / is unknown). The universal resolve path
+    (central emit_event seam, login gates) passes no agent and clears
+    unconditionally, exactly as before."""
+    global _pending_decision_active, _pending_decision_agent
+    a = (agent or "").lower() or None
+    if (a is not None and _pending_decision_active
+            and _pending_decision_agent is not None
+            and _pending_decision_agent != a):
+        # A different agent's decision is the live mirror — leave it intact so
+        # its card can still re-surface on a cold reopen.
+        log(f"[pending-decision] keep — {a} skip/retry but live mirror targets "
+            f"{_pending_decision_agent}", "DEBUG")
+        return
     try:
         from google.cloud.firestore import DELETE_FIELD
         _update_firestore_research({"pendingDecision": DELETE_FIELD})
         if _pending_decision_active:
             log("[pending-decision] cleared (decision resolved)", "INFO")
             _pending_decision_active = False
+        _pending_decision_agent = None
     except Exception as e:
         log(f"[pending-decision] clear failed (non-fatal): {e}", "DEBUG")
 
@@ -7688,6 +7717,18 @@ def _start_command_listener(uid, research_id, loop):
                 if _ag in ("chatgpt", "gemini", "claude", "notebooklm", "youtube"):
                     loop.call_soon_threadsafe(_controls.request_skip_agent, _ag)
                     loop.call_soon_threadsafe(_controls.request_resume)
+                    # #777 parity: retract any durable "Hit a snag" pendingDecision
+                    # mirror the instant the user clicks Skip. A launch-failed agent
+                    # (fail_agent → skipped_agents but NOT in `pending`) never emits
+                    # agent_skipped, so the central clear seam (~11606) never fires and
+                    # the fail_agent mirror lingered → the FE AgentAlertPanel fallback
+                    # (decisionToCard) re-rendered the snag card even after the agent
+                    # was skipped. Symmetric to the retry_agent clear at ~7787/7805;
+                    # idempotent DELETE_FIELD; one chokepoint covers every skip_agent
+                    # site (P2 fail_agent Skip + P3/P4 verify-gate Skip). Agent-scoped
+                    # (pass _ag) so skipping ONE agent's card can't retract a DIFFERENT
+                    # agent's still-live mirror on the single pendingDecision field.
+                    loop.call_soon_threadsafe(_clear_pending_decision, _ag)
                     log(f"Command received: SKIP_AGENT agent={_ag}")
                 else:
                     log(f"Command received: SKIP_AGENT rejected — unknown agent '{_ag}'", "WARN")
@@ -7784,7 +7825,9 @@ def _start_command_listener(uid, research_id, loop):
                     # ONE chokepoint covers EVERY Phase-2 fail_agent→retry site
                     # (re-auth, missing-artifact, empty-response, stuck, extraction).
                     # Idempotent DELETE_FIELD; harmless if no decision was pending.
-                    loop.call_soon_threadsafe(_clear_pending_decision)
+                    # Agent-scoped (_ag_norm) so retrying ONE agent's card can't
+                    # retract a DIFFERENT agent's still-live mirror.
+                    loop.call_soon_threadsafe(_clear_pending_decision, _ag_norm)
                     if _agent_pre_failed:
                         # Drop the pre-fail skip marker so the hard-retry path
                         # doesn't see Gemini as still-skipped.
@@ -7801,8 +7844,9 @@ def _start_command_listener(uid, research_id, loop):
                     _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent, _ag)
                     loop.call_soon_threadsafe(_controls.request_resume)
-                    # #777: see hard-branch note — retract the snag mirror on Retry.
-                    loop.call_soon_threadsafe(_clear_pending_decision)
+                    # #777: see hard-branch note — retract the snag mirror on Retry
+                    # (agent-scoped so it can't clobber another agent's live card).
+                    loop.call_soon_threadsafe(_clear_pending_decision, _ag_norm)
                     log(f"Command received: RETRY_AGENT agent={_ag} mode=soft")
                 else:
                     log("Command received: RETRY_AGENT rejected — no agent", "WARN")
@@ -37277,6 +37321,12 @@ async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", 
     print()
     try:
         await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Press Enter when you are signed in and done  ")
+        # Give Chrome a beat to flush a just-completed sign-in / cleared security
+        # check to the profile's cookie DB before we close it — a login finished a
+        # moment before Enter may not be on disk yet, and phase 2 reopens the SAME
+        # profile immediately. Cheap insurance on top of the graceful-close flush.
+        # Only on the normal path — Ctrl+C must cancel instantly (skips this).
+        await asyncio.sleep(2.5)
     except (EOFError, KeyboardInterrupt):
         print()
         raise
@@ -37306,12 +37356,29 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
             emit_row(name, False, "could not open")
             continue
         await asyncio.sleep(4.0)  # SPA hydration (matches Phase 0 / pair timing)
+        # A Cloudflare / human-verification interstitial serves on the CANONICAL
+        # host (e.g. claude.ai with no /login path), so it slips past
+        # _LOGIN_HOST_NEGATIVES and then reads to vision as "no authenticated app"
+        # → a FALSE "not signed in" that nags the user to re-log-in an account that
+        # is actually fine (the Claude first-login-didn't-persist E2E). A challenge
+        # is NOT a logout — the user already signed in on the plain-Chrome pass.
+        # Detect it, give it one beat to settle (managed challenges auto-clear; a
+        # freshly-warmed cf_clearance often validates on the second look), and if it
+        # still blocks, record no_check ("likely still signed in") instead of missing
+        # so we never force a bogus re-login. We never bypass the check — we just
+        # refuse to misreport it as a logout.
+        _blocked, _cf = await detect_human_verification(tab, key, name)
+        if _blocked:
+            await asyncio.sleep(6.0)
+            _blocked, _cf = await detect_human_verification(tab, key, name)
         status, label = "missing", ""
         try:
             current_url = (tab.url or "").lower()
         except Exception:
             current_url = ""
-        if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
+        if _blocked:
+            status, label = "no_check", f"couldn't verify — {_cf} check in the way (you're likely still signed in)"
+        elif any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
             status, label = "missing", "not signed in"
         elif not cua_client:
             status, label = "no_check", "no vision check (no API key)"
