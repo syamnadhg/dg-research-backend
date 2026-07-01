@@ -1,7 +1,7 @@
 # Super Agent — test matrix (P7)
 
 What each surface is covered by, and what only a live run can prove. Run the
-suite with `pytest` (502 tests; ruff clean). The bridge is the single owner of
+suite with `pytest` (585 tests; ruff clean). The bridge is the single owner of
 the account session — every CLI/skill command routes through it over loopback.
 
 ## Coverage
@@ -43,7 +43,8 @@ spend); run them once after `agent login`:
 
 1. `agent connect <runtime>` → skill lands in the runtime's skills dir.
 2. `agent serve` → bridge up; `agent doctor` all-green.
-3. `agent login` (or chat `/sr-login`) → real Google sign-in → connected.
+3. `agent login` (or chat `/sr login`) → real Google sign-in → connected.
+   Note: after `agent connect`, run `/reload-skills` once before `/sr` registers.
 4. `agent device` → real devices listed; `agent device use <id>`.
 5. **The one live enqueue:** `agent research "<topic>" --no-video --no-email`
    (light smoke; skips P4 video to spare YouTube quota) → returns a run id <1s.

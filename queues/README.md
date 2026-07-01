@@ -7,6 +7,9 @@ queues/<topic>_<timestamp>/
   meta.json              — Frontend Research object (updated each phase)
   config.json            — Pipeline config (skipped phases, agents, video/email flags)
   delivery.json          — Live links (updated incrementally)
+  owner.json             — {uid, researchId}; identifies the run owner so queue
+                           cleanup can cascade the Firestore delete of
+                           users/{uid}/researches/{rid}. Written at run creation.
   documents/
     brief.md             — Phase 1: Research brief
     chatgpt.md           — Phase 2: ChatGPT deep research

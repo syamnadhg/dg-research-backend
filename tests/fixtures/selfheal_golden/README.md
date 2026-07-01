@@ -3,8 +3,9 @@
 This directory is the **seed** of the resolver-eval corpus described in
 `PhoenixRecipe.md` §9. Each file is one captured (platform, ui_fingerprint,
 intent) example that the PX-2 `semantic_match` resolver is evaluated against
-(`scripts/eval_resolver.py`, built at PX-2) — it must re-find each intent's
-control from durable signals and clear a pass bar before any heal activates.
+(`tests/test_selfheal_resolver.py`, added at PX-2) — for each seed,
+`semantic_match` must re-find the intended control and `selector_inference`
+must reproduce its `known_good_selector`.
 
 **Status (PX-0):** scaffolding only. The three files here are **synthetic but
 schema-correct** seeds derived from the real diagnostic-dump shapes

@@ -72,7 +72,7 @@ superresearch --serve
 superresearch "your topic"
 ```
 
-> **`superresearch <flags>` is a pure drop-in for `python research.py <flags>`** — identical flags, identical branded UI, and the same `--pair` / `--serve` / `--resurrect` / `--retire` / `--unpair` / `--doctor` / `--commands` / `agent` verbs. Help is invocation-aware: it shows `superresearch …` when launched from the installed command, `python research.py …` from a source checkout. So every `python research.py …` example below works verbatim as `superresearch …` on an installed build.
+> **`superresearch <flags>` is a pure drop-in for `python research.py <flags>`** — identical flags, identical branded UI, and the same `--pair` / `--login` / `--serve` / `--resurrect` / `--retire` / `--unpair` / `--doctor` / `--commands` / `agent` verbs. Help is invocation-aware: it shows `superresearch …` when launched from the installed command, `python research.py …` from a source checkout. So every `python research.py …` example below works verbatim as `superresearch …` on an installed build.
 
 ### Option B — From source (developers)
 
@@ -122,7 +122,9 @@ command (no extra install — the two deps are already in `requirements.txt`):
 ```bash
 python research.py agent connect      # install the skill into your runtime (auto-detects hermes/openclaw)
 python research.py agent serve        # start the bridge that holds your account session (keep running)
-# then, in chat:  /superresearch  →  /sr-login  →  /sr-research <topic>
+# then, in chat:  /reload-skills once (the gateway caches its skill scan),
+#                 then  /sr login  →  /sr research <topic>  →  /sr status
+#                 (there's one /sr command — actions follow it; bare /sr = welcome/help)
 ```
 
 > On an installed build, the same front door is `superresearch agent connect` (and the other `agent` verbs). The chat-runtime agent is a **separate package** — the installed `superresearch agent <verb>` delegates to `pipx run superresearch-agent <verb>`, which installs the `/sr` skill into Hermes/OpenClaw; a source checkout runs the in-tree agent instead.
@@ -240,7 +242,7 @@ pip install -r requirements.txt
 python -m patchright install chrome
 ```
 
-Requires **Python 3.11+** and a working **real Google Chrome** install. `research.py` launches via `patchright` (a stealth Playwright fork) with `channel="chrome"` — it uses your installed Chrome binary, NOT bundled Chromium, so anti-bot heuristics see a real browser fingerprint.
+Requires **Python 3.11+** and a working **real Google Chrome** install, plus `patchright>=1.61` and `playwright>=1.61` (floors bumped 2026-06-30 — both are pinned in `requirements.txt`). `research.py` launches via `patchright` (a stealth Playwright fork) with `channel="chrome"` — it uses your installed Chrome binary, NOT bundled Chromium, so anti-bot heuristics see a real browser fingerprint.
 
 If Chrome itself isn't installed, install it first:
 - **Windows:** [google.com/chrome](https://www.google.com/chrome/) → run the installer.
@@ -332,15 +334,21 @@ On verified paste, the BE writes the key to **BE-local persistence**: Windows Us
 Skip is first-class per key — pair finishes regardless. Missing Anthropic falls back to **Playwright-only** verification in Stage 4 (less rigorous; no Pro-tier check) and surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
 
 **`[4/5] Browser logins`**
-Opens 4 browser tabs in a persistent Playwright profile and auto-verifies login state every 30 seconds. With the Anthropic key set or detected in Stage 3, each platform passes BOTH Playwright DOM checks AND CUA vision before clearing — matches Phase 0 init rigor. Without the key, falls back to Playwright-only (logged in the BE as "Setup Stage 4: No ANTHROPIC_API_KEY — Playwright-only verification (less rigorous)"):
+Runs the same real-Chrome two-phase engine `--login` uses:
+- **Phase 1 — real Chrome sign-in.** Opens your *real, non-automated* Chrome (a plain subprocess) on the profile, pointed at the ChatGPT / Gemini / Claude / NotebookLM sign-in pages. You sign into each and solve any human-verification, then press Enter. Real Chrome is used here because Google BotGuard / Cloudflare block the automated browser on sign-in pages.
+- **Phase 2 — patchright verify.** Patchright reopens the same warm profile and verifies each platform is signed in, plus checks Pro tier (ChatGPT / Claude / Gemini).
+
+The four platforms:
 - ChatGPT (chatgpt.com)
 - Gemini (gemini.google.com)
 - Claude (claude.ai)
 - NotebookLM (notebooklm.google.com)
 
+If any platform is not-signed-in or on Free, an interactive prompt offers **[r]** reopen your real Chrome to fix (sign in / switch to Pro) or **[Enter]** continue as-is (keep Free / skip a missing platform). Verify also TOLERATES a Cloudflare / human-verification interstitial — it records "couldn't verify (likely still signed in)" instead of a false "not signed in". Ctrl+C cancels. The pair completes and the supervisor arms even on partial or zero logins — a login hiccup no longer blocks pairing.
+
 > Phases 4 + 5 run in the frontend now (YouTube via Data API, Doc + email via Docs API + Resend), so YouTube Studio, Gmail, and Google Docs are no longer in the BE login checklist.
 
-The checklist re-renders only when a platform flips — `[ok]` for logged in, `[  ]` for not yet. It also mirrors the live state to the BE-owned `devices/{deviceId}.logins` map so the app can show your progress. Default timeout is 10 minutes; Ctrl+C cancels.
+It mirrors the resulting login state to the BE-owned `devices/{deviceId}.logins` map so the app can show your progress.
 
 > **Markers only tick after real auth.** `verify_login()` checks only auth-specific DOM (profile menus, account chips, chat-history lists). Generic chat-input elements are excluded because they show up on logged-out landing pages too.
 
@@ -656,7 +664,7 @@ research-automate/
 ├── vision.py                   # Anthropic Sonnet vision client (tier-2 acting): take_screenshot, vision_action, with_vision_fallback, shadow_observe_then_cua
 ├── narrate.py           # Vision-tier panel narrator (PHASE_BUDGET=0 by default; retired 2026-04-30 — re-enable via DG_VISION_NARRATE=1)
 ├── vision_test.py              # Fixture replay tool: --capture saves PNG+JSON, --fixtures replays + asserts action-class agreement + bbox containment
-├── requirements.txt            # Python dependencies (now includes patchright>=1.59)
+├── requirements.txt            # Python dependencies (now includes patchright>=1.61 + playwright>=1.61; floors bumped 2026-06-30)
 ├── research_config.json        # deviceId + pollSecret + pairedUid (generated by --pair; keep gitignored)
 ├── run_analytics.json          # Historical phase durations (auto-updated)
 ├── ARCHITECTURE.md             # Backend architecture + Frontend ↔ Backend API contract
@@ -678,7 +686,7 @@ research-automate/
 
 **"No PipeToken found"** — Run `python research.py --pair` first.
 
-**`ModuleNotFoundError: No module named 'patchright'`** — Run `pip install -r requirements.txt` again (patchright was added 2026-04-30 as `patchright>=1.59`). Then `python -m patchright install chrome`.
+**`ModuleNotFoundError: No module named 'patchright'`** — Run `pip install -r requirements.txt` again (patchright was added 2026-04-30; floor bumped to `patchright>=1.61` alongside `playwright>=1.61` on 2026-06-30). Then `python -m patchright install chrome`.
 
 **`patchright` launches but Chrome doesn't open** — Patchright launches with `channel="chrome"` (real Chrome, not bundled Chromium). If real Chrome isn't installed on this machine, install it from google.com/chrome (Windows), `brew install --cask google-chrome` (macOS), or your distro's Chrome package (Linux).
 
@@ -688,7 +696,7 @@ research-automate/
 
 **Two researches running at once on one PC** — Expected under `workerCount > 1`. See § Multi-Worker above. Not a bug.
 
-**Browser sessions expired** — Re-run `python research.py --pair` to log in again.
+**Browser sessions expired** — The lighter path is now `python research.py --login`: it opens your real Chrome per worker profile to (re-)sign into the 4 platforms and clear Google / Cloudflare human-checks, then patchright verifies each login + Pro tier and refreshes the paired device login badges — no re-pair needed. Shares the same real-Chrome two-phase engine as pair Stage 4. Re-running `python research.py --pair` also logs you in again.
 
 **NotebookLM login expired mid-run** — Surfaces as a Phase 3 alert with `login_expired` detail (distinct from generic upload failure). Re-run `--pair` to refresh that session; hit `[Skip]` on the alert if you want to move past Phase 3 and still get Phase 5 report/email.
 
