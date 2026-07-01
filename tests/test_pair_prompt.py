@@ -284,14 +284,17 @@ class TestPairPromptOneKey:
         result = self._run(_pair_prompt_one_key("Anthropic", "sk-ant-...", "https://x"))
         assert result == ""
 
-    def test_ctrl_c_returns_empty(self, monkeypatch, silent_log):
-        """Ctrl+C during input must NOT propagate — pair finishes the
-        remaining steps (Gemini prompt + supervisor arm)."""
+    def test_ctrl_c_propagates(self, monkeypatch, silent_log):
+        """Ctrl+C = universal cancel: _pair_prompt_one_key RE-RAISES the
+        KeyboardInterrupt so the caller (Stage 3 / cmd_pair_v2) reverts the
+        partial pair. Typing 's' is how you skip a single key (see the skip
+        tests above) — Ctrl+C is not "skip this key". pytest.raises contains
+        the KI so it never escapes to the session."""
         from research import _pair_prompt_one_key
         monkeypatch.setattr("research.asyncio.to_thread",
                             mock.AsyncMock(side_effect=KeyboardInterrupt))
-        result = self._run(_pair_prompt_one_key("Anthropic", "sk-ant-...", "https://x"))
-        assert result == ""
+        with pytest.raises(KeyboardInterrupt):
+            self._run(_pair_prompt_one_key("Anthropic", "sk-ant-...", "https://x"))
 
     def test_eof_returns_empty(self, monkeypatch, silent_log):
         """Pipe-fed pair (echo '' | python research.py --pair) reaches

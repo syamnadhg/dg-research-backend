@@ -36529,7 +36529,9 @@ def _verify_gemini_key(key: str) -> str:
 async def _pair_prompt_one_key(label: str, example: str, help_url: str) -> str:
     """Single-key paste loop for --pair Stage 4/5.
 
-    Returns the trimmed key string on paste, or "" on skip / Ctrl+C / EOF.
+    Returns the trimmed key string on paste, or "" on skip / EOF. Ctrl+C is
+    RE-RAISED (universal cancel — the caller reverts the partial pair); type
+    's' to skip a single key instead.
     Skip is first-class — pair completes regardless; missing keys surface
     at first-job via the cua_unavailable / narrator-disabled paths (both
     already user-recoverable from the FE alert).
