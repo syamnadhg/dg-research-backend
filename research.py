@@ -37338,8 +37338,10 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
                         tier = "unsure"
                     if tier == "free":
                         status, label = "free", "Free tier — Phase 1/2 quality will be degraded"
-                    else:
-                        status = "ok"
+                    elif tier == "pro":
+                        status, label = "ok", "Pro ✓"
+                    else:  # unsure — fail-open (assume Pro), but show it ran
+                        status, label = "ok", "signed in · tier unconfirmed"
                 else:
                     status = "ok"
         try:
