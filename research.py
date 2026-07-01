@@ -37084,6 +37084,407 @@ async def cmd_pair_v2(profile_dir: "str | None" = None):
             )
 
 
+# ── Login flow: plain-Chrome sign-in → patchright verify ──────────────────────
+#
+# WHY (2026-06-30 investigation): Google BotGuard + Cloudflare Turnstile run
+# their heaviest automation checks on the SIGN-IN / challenge page specifically.
+# A CDP-driven browser (patchright/Playwright) is detected there — Google shows
+# "this browser or app may not be secure", Cloudflare loops — so a FRESH login
+# through the pipeline's own browser is blocked even with patchright's stealth
+# (which still can't pass Google sign-in). Once a profile is ALREADY signed in,
+# patchright only NAVIGATES those authenticated pages (never a sign-in form), so
+# it isn't gated — which is exactly why a warm profile runs clean.
+#
+# The fix is two-phase: do the SIGN-IN in the user's REAL Chrome with NO
+# automation attached (phase 1 — a normal browser Google/Cloudflare accept),
+# then reopen the now-warm profile with patchright and VERIFY logins + Pro tier
+# (phase 2). Both phases use the SAME on-disk profile dir the pipeline drives,
+# so the saved cookies are exactly what a run reuses. Shared by `--login` and
+# (later) pair Step 4.
+
+_LOGIN_SERVICES = [
+    ("ChatGPT",    "https://chatgpt.com",           "chatgpt"),
+    ("Gemini",     "https://gemini.google.com",     "gemini"),
+    ("Claude",     "https://claude.ai",             "claude"),
+    ("NotebookLM", "https://notebooklm.google.com", "notebooklm"),
+]
+
+
+def _find_chrome_executable() -> "str | None":
+    """Absolute path to the user's REAL Google Chrome binary, for launching a
+    PLAIN (non-automated) Chrome — the one surface Google/Cloudflare let a human
+    sign in on. Distinct from patchright's channel='chrome' (which drives Chrome
+    under CDP = the browser that gets BLOCKED at sign-in). Checks standard
+    per-OS install locations + PATH. None if not found."""
+    import shutil as _shutil
+    plat = _supervisor_platform()
+    candidates: "list[str]" = []
+    if plat == "Windows":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pfx86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
+        ]
+        if local:
+            candidates.append(os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"))
+    elif plat == "Darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+    else:  # Linux — real Google Chrome only: phase-2 patchright uses
+        # channel='chrome' (resolves to Google Chrome, not Chromium), so seeding
+        # Chromium would just fail verify — better to surface the install hint.
+        for name in ("google-chrome", "google-chrome-stable"):
+            p = _shutil.which(name)
+            if p:
+                return p
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    for name in ("chrome", "google-chrome", "google-chrome-stable"):
+        p = _shutil.which(name)
+        if p:
+            return p
+    return None
+
+
+def _kill_chrome_for_profile(profile_dir: str) -> None:
+    """Kill any Chrome (plain OR patchright) whose command line references THIS
+    profile dir, so the profile lock is released before the next launcher opens
+    it. Boundary-safe via _profile_matches_cmdline — never touches the user's
+    personal Chrome (different --user-data-dir) or a sibling worker's profile.
+    Best-effort; silent if psutil is absent.
+
+    Matches on BOTH the raw profile path (as Chrome is launched: the un-resolved
+    Path.home()-based `--user-data-dir=`) AND its resolved form, so a home dir
+    behind a junction/symlink/8.3-short-name still matches the live Chrome."""
+    try:
+        import psutil
+    except Exception:
+        return
+    raw = str(profile_dir).lower().replace("\\", "/")
+    try:
+        resolved = str(Path(profile_dir).resolve()).lower().replace("\\", "/")
+    except Exception:
+        resolved = raw
+    targets = {t for t in (raw, resolved) if t}
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if not (proc.info["name"] and "chrom" in proc.info["name"].lower()):
+                continue
+            cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
+            if any(_profile_matches_cmdline(t, cmdline) for t in targets):
+                proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        except Exception:
+            pass
+
+
+def _backend_is_running() -> bool:
+    """True if a Super Research backend (--serve / --daemon-loop) looks like it's
+    running on this machine — so --login can warn before it disrupts an active
+    run (killing the profile's Chrome mid-research). Best-effort process scan;
+    False if psutil is absent."""
+    try:
+        import psutil
+    except Exception:
+        return False
+    me = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.info["pid"] == me:
+                continue
+            cl = " ".join(proc.info["cmdline"] or [])
+            if ("--serve" in cl or "--daemon-loop" in cl) and (
+                "research.py" in cl.lower() or "superresearch" in cl.lower()
+            ):
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        except Exception:
+            pass
+    return False
+
+
+async def _close_chrome_gracefully(proc, profile_dir: str) -> None:
+    """Close the seed Chrome so it FLUSHES cookies/session to disk before exit —
+    a hard TerminateProcess can drop auth cookies the user just set. Windows uses
+    `taskkill /T` WITHOUT /F (a real WM_CLOSE to the tree); POSIX uses SIGTERM
+    (Chrome shuts down cleanly on it). Waits a few seconds for a clean exit, then
+    hard-kills any remnant + releases the profile lock."""
+    import subprocess as _sp
+    try:
+        if _supervisor_platform() == "Windows":
+            _sp.run(["taskkill", "/PID", str(proc.pid), "/T"],
+                    capture_output=True, timeout=15, creationflags=_PS_NO_WINDOW)
+        else:
+            proc.terminate()  # SIGTERM — Chrome flushes + exits cleanly
+    except Exception:
+        pass
+    for _ in range(16):  # up to ~8s for a clean flush + exit
+        try:
+            if proc.poll() is not None:
+                break
+        except Exception:
+            break
+        await asyncio.sleep(0.5)
+    # Hard-kill any remnant (detached child, stuck window) + free the lock.
+    _kill_chrome_for_profile(profile_dir)
+    await asyncio.sleep(1.5)
+
+
+async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", label: str) -> bool:
+    """Phase 1: open the user's REAL Chrome (NO automation/CDP) on `profile_dir`
+    with the platform tabs, so the human signs in + clears any human-check on the
+    one surface where automation is blocked. Blocks on Enter, then fully closes
+    Chrome so patchright can reopen the profile for phase-2 verify. Returns True
+    if Chrome was launched (False = no Chrome found). Re-raises KeyboardInterrupt
+    (universal Ctrl+C cancel) after closing Chrome."""
+    import subprocess as _sp
+    chrome = _find_chrome_executable()
+    if not chrome:
+        print(f"  {_c(_WARN, 'Google Chrome not found — cannot open a real browser to sign in.')}")
+        print(f"  {_c(_DIM, '     ' + _chrome_install_hint())}")
+        return False
+    # Make sure the profile isn't already open (a live Chrome on this dir would
+    # make our launch attach to it / no-op, and would hold the lock).
+    _kill_chrome_for_profile(profile_dir)
+    args = [
+        chrome,
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ] + list(service_urls)
+    print(f"  {_c(_DIM, 'Opening your real Chrome — ' + label + '. This is NOT automated; sign in normally.')}")
+    try:
+        proc = _sp.Popen(args)
+    except Exception as e:
+        log(f"login: failed to launch plain Chrome: {e}", "WARN")
+        print(f"  {_c(_WARN, 'Could not launch Chrome: ' + str(e)[:120])}")
+        return False
+    print()
+    print(f"  {_c(_BOLD, 'In the Chrome window that just opened:')}")
+    print(f"    {_c(_DIM, '1.')} Sign in to each platform (ChatGPT, Gemini, Claude, NotebookLM).")
+    print(f"    {_c(_DIM, '2.')} Complete any \"verify you are human\" check yourself.")
+    print(f"    {_c(_DIM, '3.')} Use your Pro / paid account where you have one.")
+    print()
+    try:
+        await asyncio.to_thread(input, f"  {_c(_ACCENT, '>')}  Press Enter when you are signed in and done  ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise
+    finally:
+        # Always close the seed Chrome (gracefully, so cookies flush) so the
+        # profile is free for phase 2.
+        await _close_chrome_gracefully(proc, profile_dir)
+    return True
+
+
+async def _verify_platform_logins(browser, services, cua_client, *, results, emit_row) -> None:
+    """Phase 2: on the now-signed-in profile, verify each platform is logged in
+    (+ soft Pro-tier warning where it applies) with patchright + CUA. This only
+    NAVIGATES authenticated pages — never a sign-in form — so it isn't hit by the
+    automation block. Records per-platform bool into `results` (mutated)."""
+    for idx, (name, url, key) in enumerate(services):
+        if idx > 0:
+            await asyncio.sleep(random.uniform(1.5, 3.0))
+        try:
+            # open_isolated_tab (not new_tab) so self.page isn't clobbered by a
+            # tab we immediately close (documented anti-pattern at :16891).
+            tab = await browser.open_isolated_tab(url)
+        except Exception as e:
+            log(f"verify: failed to open {name}: {e}", "WARN")
+            results[key] = False
+            emit_row(name, False, "could not open")
+            continue
+        await asyncio.sleep(4.0)  # SPA hydration (matches Phase 0 / pair timing)
+        ok = False
+        label = ""
+        try:
+            current_url = (tab.url or "").lower()
+        except Exception:
+            current_url = ""
+        if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
+            ok, label = False, "not signed in"
+        elif not cua_client:
+            ok, label = True, "no vision check (no API key)"
+        else:
+            try:
+                async with _async_spinner_ctx(f"Verifying {name}"):
+                    ok = await verify_login_cua(tab, key, cua_client)
+            except CuaUnavailableError as _cua_err:
+                # AI service down / key rate-limited / over cap — NOT a logout.
+                # Accept on the URL pass (login-host negatives already cleared)
+                # and flag it, rather than falsely reporting "not signed in".
+                log(f"verify: CUA unavailable for {key} ({_cua_err}) — URL-only accept", "WARN")
+                ok, label = True, "signed in (vision check unavailable)"
+            except Exception as e:
+                log(f"verify: CUA error {key}: {e}", "WARN")
+                ok, label = False, "not signed in"
+            else:
+                if not ok:
+                    label = "not signed in"
+                elif key in _PRO_TIER_PLATFORMS:
+                    # Soft Pro-tier check — warn only. The sign-in already
+                    # happened in phase 1; the fix for Free is to re-run --login
+                    # on a Pro account, so there's no interactive c/r/s here.
+                    try:
+                        tier = await _cua_pro_tier_call(tab, key, cua_client)
+                    except Exception:
+                        tier = "unsure"
+                    if tier == "free":
+                        label = "Free tier — Phase 1/2 quality will be degraded"
+        try:
+            await tab.close()
+        except Exception:
+            pass
+        results[key] = ok
+        emit_row(name, ok, label)
+
+
+async def run_login_flow(
+    profile_indices,
+    *,
+    cua_client=None,
+    device_id_for_progress: "str | None" = None,
+) -> "tuple[dict[int, dict], bool]":
+    """The two-phase login flow shared by `--login` and (later) pair Step 4:
+      Phase 1 — plain Chrome (no automation): human signs in + clears any check.
+      Phase 2 — patchright reopens the profile + verifies logins + Pro tier.
+    Runs for each worker profile in `profile_indices`. Returns
+    ({profile_n: {key: bool}}, seeded_any) — seeded_any=False means no profile's
+    Chrome could even be launched (e.g. Google Chrome not installed)."""
+    services = _LOGIN_SERVICES
+    service_urls = [u for _n, u, _k in services]
+    pad = max(len(n) for n, _u, _k in services)
+    multi = len(list(profile_indices)) > 1
+    all_results: "dict[int, dict]" = {}
+    seeded_any = False
+
+    def _row(nm, ok, lbl=""):
+        mark = _c(_OK, "[ok]") if ok else _c(_WARN, "[--]")
+        sfx = f"  {_c(_DIM, lbl)}" if lbl else ""
+        print(f"        {mark}  {nm.ljust(pad)}{sfx}")
+
+    for n in profile_indices:
+        profile_dir = str(_profile_dir(n))
+        label = "profile" if not multi else f"profile {n}"
+        _setup_step(n, (max(profile_indices) if multi else 1), f"Sign in — {label}")
+
+        results: "dict[str, bool]" = {}
+        seeded = await _seed_login_plain_chrome(profile_dir, service_urls, label)
+        if seeded:
+            seeded_any = True
+            browser = Browser(profile_dir, headless=False)
+            try:
+                async with _async_spinner_ctx("Reopening the profile to verify"):
+                    await browser.start()
+                print(f"  {_c(_DIM, 'Checking each sign-in…')}")
+                await _verify_platform_logins(browser, services, cua_client, results=results, emit_row=_row)
+            except Exception as e:
+                log(f"login: phase-2 verify failed for profile {n}: {e}", "WARN")
+                print(f"  {_c(_WARN, 'Could not verify this profile: ' + str(e)[:120])}")
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            # Write the FE login badges (paired devices only; best-effort).
+            if device_id_for_progress and _firebase_db:
+                try:
+                    _firebase_db.collection("devices").document(device_id_for_progress).update({
+                        "logins": {k: bool(results.get(k, False)) for _n, _u, k in services},
+                    })
+                except Exception:
+                    pass
+        all_results[n] = results
+    return all_results, seeded_any
+
+
+async def run_login() -> None:
+    """`--login`: open a REAL (non-automated) Chrome per worker profile so you can
+    sign in to the platforms by hand — the reliable way past Google's
+    "browser may not be secure" + Cloudflare's human-check, which block the
+    pipeline's automated browser at the sign-in page. Then verifies each login
+    (+ Pro tier) and, if this machine is paired, refreshes the app's login
+    badges. Re-run whenever a session expires. No pairing required; runs from a
+    source checkout or the installed command."""
+    _branded_header("aditus", _BOLD + _ACCENT, "sign in on a real browser")
+    print()
+    print(f"  {_c(_DIM, 'Automated browsers get blocked at sign-in, so we use your')} {_c(_BOLD, 'real Chrome')}{_c(_DIM, '.')}")
+    print(f"  {_c(_DIM, 'You sign in by hand; the tool then verifies + saves it to the profile.')}")
+
+    # Guard: --login frees + reopens each profile, which closes the browser a
+    # running backend is using. Warn before disrupting an active research.
+    if _backend_is_running():
+        print()
+        print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'A Super Research backend is running.')}")
+        print(f"  {_c(_DIM, '     --login will close the browser it uses and interrupt any active research.')}")
+        print(f"  {_c(_DIM, '     Best to stop it first; it will pick up the new logins on its next run.')}")
+        try:
+            _ans = (await asyncio.to_thread(
+                input, f"  {_c(_ACCENT, '>')}  Continue anyway? {_c(_DIM, '[y/N]')}: ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if _ans not in ("y", "yes"):
+            print(f"  {_c(_DIM, 'Aborted. Stop the backend, then re-run')}  {_c(_BOLD, _PROG + ' --login')}{_c(_DIM, '.')}")
+            return
+
+    # CUA vision verifier (optional — verify degrades to a URL-only check without it).
+    cua_client = None
+    _key = resolve_api_key()
+    if _key:
+        try:
+            import anthropic as _anthropic
+            cua_client = _anthropic.Anthropic(api_key=_key)
+        except Exception as e:
+            log(f"login: could not init CUA client ({e}) — URL-only verification", "WARN")
+
+    device_id = None
+    try:
+        device_id = load_device_id()
+    except Exception:
+        device_id = None
+
+    n_workers = load_worker_count()
+    results, seeded_any = await run_login_flow(
+        range(1, n_workers + 1),
+        cua_client=cua_client,
+        device_id_for_progress=device_id,
+    )
+
+    # Summary across all profiles.
+    print()
+    _any_ok = any(any(r.values()) for r in results.values())
+    _missing_names = sorted({
+        name
+        for _n, r in results.items()
+        for name, _u, key in _LOGIN_SERVICES if not r.get(key, False)
+    })
+    if _any_ok:
+        print(f"  {_c(_OK, '✓')}  {_c(_BOLD, 'Done.')} {_c(_DIM, 'Signed-in platforms are saved to the profile — runs will reuse them.')}")
+        if _missing_names:
+            print(f"  {_c(_WARN, '⚠')}  Not verified: {_c(_BOLD, ', '.join(_missing_names))}")
+            print(f"  {_c(_DIM, '     Re-run')}  {_c(_BOLD, _PROG + ' --login')}  {_c(_DIM, 'to finish those (or sign in during the next run).')}")
+    elif not seeded_any:
+        print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'Could not open Google Chrome.')}")
+        print(f"  {_c(_DIM, '     ' + _chrome_install_hint())}")
+    else:
+        print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'No platforms verified as signed in.')}")
+        print(f"  {_c(_DIM, '     If Chrome kept looping the human-check, it is likely your network/IP')}")
+        print(f"  {_c(_DIM, '     (VPN / datacenter). Try a residential, non-VPN connection and re-run.')}")
+    print()
+    print(f"  {_c(_ACCENT, 'Next')}")
+    print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --serve')}   {_c(_DIM, '# run the backend')}")
+    print(f"    {_c(_DIM, '›')} {_c(_BOLD, _PROG + ' --login')}   {_c(_DIM, '# re-run anytime a sign-in expires')}")
+    print()
+
+
 async def _walk_platform_logins(
     browser,
     services: "list[tuple[str, str, str]]",
@@ -37781,10 +38182,10 @@ async def _continue_pair_stages_2_to_5(
         elif _logged_in:
             print(f"  {_c(_OK, '✓')}  {len(_logged_in)}/{len(services)} platforms logged in")
             print(f"  {_c(_WARN, '⚠')}  Not logged in yet: {_c(_BOLD, ', '.join(_not_logged_in))}")
-            print(f"  {_c(_DIM, '     Phase 0 re-checks logins at run time — sign in to these in the browser when a run needs them.')}")
+            print(f"  {_c(_DIM, '     Sign the rest in with')}  {_c(_BOLD, _PROG + ' --login')}  {_c(_DIM, '(a real browser — no re-pair needed).')}")
         else:
             print(f"  {_c(_WARN, '⚠')}  No platforms logged in yet")
-            print(f"  {_c(_DIM, '     Pairing is complete. Phase 0 verifies logins at run time — sign in when a run needs them.')}")
+            print(f"  {_c(_DIM, '     Sign in with')}  {_c(_BOLD, _PROG + ' --login')}  {_c(_DIM, '(a real browser), then')}  {_c(_BOLD, _PROG + ' --serve')}{_c(_DIM, '. No re-pair needed.')}")
         print(f"  {_c(_OK, '✓')}  Browser closed")
 
         supervised_armed = False
@@ -41973,6 +42374,12 @@ def main():
     parser.add_argument("--api-key", "-k", help="CUA API key")
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--pair", action="store_true", help="First-time login setup")
+    parser.add_argument("--login", action="store_true",
+        help="Open your REAL Chrome (not automated) per browser profile so you can sign in to "
+             "ChatGPT/Gemini/Claude/NotebookLM by hand — the reliable way past Google's "
+             "'browser may not be secure' + Cloudflare's human-check, which block the pipeline's "
+             "automated browser at sign-in. Verifies each login (+ Pro tier) and refreshes the app "
+             "login badges if paired. Re-run whenever a session expires. No pairing required.")
     parser.add_argument("--resume", "-r", help="Resume from a previous queue directory (name or full path)")
     parser.add_argument("--serve", action="store_true", help="Start web app API server")
     parser.add_argument("--port", type=int, default=None,
@@ -42081,6 +42488,10 @@ def main():
 
     if args.daemon_loop:
         run_daemon_loop(_resolved_port)
+        return
+
+    if args.login:
+        asyncio.run(run_login())
         return
 
     if args.pair:
