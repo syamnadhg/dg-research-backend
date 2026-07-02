@@ -6,6 +6,7 @@ proving the chat slash-command path works over the loopback HTTP contract.
 """
 
 import importlib.util
+import re
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -536,8 +537,11 @@ def test_podcast(bridge_port, monkeypatch, capsys):
     assert sr.main(["podcast", "agent-p"]) == 0
     out = capsys.readouterr().out
     assert "My Podcast Run" in out  # the run title is the caption
-    assert "agent-p.m4a" in out     # the BARE local path (the gateway auto-attaches it)
-    assert "Audio:" not in out and "[[audio" not in out  # no decoration that breaks auto-attach
+    # #895: an explicit MEDIA:<path> tag — the gateway's AUDIO partition
+    # (native playable player). A BARE path routes to document delivery
+    # (the "📎 File" attachment of the 2026-07-02 live failure).
+    assert re.search(r"^MEDIA:.*agent-p\.m4a$", out, re.M)
+    assert "[[audio" not in out  # audio_as_voice would suppress the title text
     assert "token=" not in out  # no tokenized URL leaks into chat
 
 

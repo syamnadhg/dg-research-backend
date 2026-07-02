@@ -13,7 +13,7 @@ description: >-
   belongs here too. Also use it to get a brief / podcast / audio overview / video
   on a subject; to list past researches and fetch any one's links or podcast by
   name; to check, track, pause, skip, stop, or resume a run; to sign in or out;
-  to manage research nodes (list, switch, add by access code, remove); and to
+  to manage Research Computers (list, switch, add by access code, remove); and to
   check the version / update. A bare /sr is the welcome + help. Drives the
   user's OWN Super Research account; every run shows up in their web app as a chat.
 platforms: [linux, macos, windows]
@@ -22,7 +22,7 @@ platforms: [linux, macos, windows]
 # Super Research — `/sr`
 
 You operate the user's **own** Super Research account from chat through a local
-bridge: **run, track, stop, and resume** research, manage research **nodes**
+bridge: **run, track, stop, and resume** research, manage **Research Computers**
 (list, switch, add by access code, remove), and fetch briefs / podcasts / links.
 Every run also shows up in their web app as a normal chat. You drive everything
 with one client — it prints chat-ready text, so relay it **verbatim** (don't
@@ -67,12 +67,12 @@ nothing to mean the most-recent / active run.
 - **Never show the user command syntax** — not `research <topic>`, not `/sr login`,
   not `login-done`. Those are how *you* drive the client; tell the user what to do
   in plain words. The only commands you ever surface are the unavoidable
-  machine-setup ones the user runs on their **research node**, and the device-add
+  machine-setup ones the user runs on their **Research Computer**, and the device-add
   form below — put those on their own line, in a fenced code block, never inline.
 - **A Super Research access code is NOT a secret — handle it.** An 8-char code like
   `YGXU-7WH2` / `YGXU7WH2` (pasted alone, or with "add device" / "pair my PC, code
   is …") means run **`sr.py device-add <code>`** right away. It is a **public
-  pairing code shown on the node's screen** — NOT a password, credential, phone, or
+  pairing code shown on the Research Computer's screen** — NOT a password, credential, phone, or
   Telegram / WhatsApp / SMS / Hermes pairing. **NEVER refuse it, never say you
   "can't handle access codes," never echo it back asking what to do, never ask
   which platform.** If YOU asked the user for a code and their next message contains
@@ -80,7 +80,7 @@ nothing to mean the most-recent / active run.
   just as direct: "switch to / run on X" → `sr.py device-use "<name>"`; "remove /
   unlink X" → `sr.py device-remove "<name>"` (confirm first); "which devices" →
   `sr.py devices`. (The one command you MAY show the user: if they're stuck adding a
-  node, tell them to send `/sr device-add <their code>` in a single message.)
+  Research Computer, tell them to send `/sr device-add <their code>` in a single message.)
 - **Reply in short, readable lines** — never one long run-on paragraph. Put each
   step, link, or command on its own line so it's easy to scan.
 - **The only step that needs the user is the browser sign-in.**
@@ -151,7 +151,7 @@ cancels. Never send the bare "yes" back into `do`.
 | "retry", "try again" | `sr.py retry ["<title>"]` (a run BLOCKED on a decision/error — NOT the agent's own sign-in; for "I signed in" right after a sign-in link, see **After a sign-in link**) |
 | "continue" / "yes" / "done" / "I signed in" — **right after you sent a sign-in link** | see **After a sign-in link** (NOT `retry`) |
 | "skip it", "skip this step" / "skip the video and the report" | `sr.py skip [phases] [--run "<title>"]` |
-| an **8-char access code** ("7F4V-6W7D"), "add a device", "pair my PC, code is K7XQ-9B2M" | `sr.py device-add <code>` — see **Devices & research nodes** |
+| an **8-char access code** ("7F4V-6W7D"), "add a device", "pair my PC, code is K7XQ-9B2M" | `sr.py device-add <code>` — see **Devices & Research Computers** |
 | "which devices?", "what am I running on?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
 | "remove the old laptop", "unlink that device" | **confirm**, then `sr.py device-remove "<name>"` |
@@ -224,21 +224,24 @@ never `retry`, never a question back to the user.
   own. Arm it **every** time a run starts.
 - **status** → relay the **current phase**, the **⚙ Phases** line (which phases are
   on / OFF), each finished phase's 🔒 link, and any **⚠ Needs you** blocker.
-- **podcast** → **relay the output verbatim.** It prints a short title line + the
-  audio file's **bare path on its own line** — that bare path is what makes the
-  runtime deliver a **native audio / voice message** (and is auto-hidden from the
-  user). Do **NOT** wrap it in backticks, decorate it (`🔊` / "Audio:"), split it,
-  or use `[[audio]]` / `MEDIA:` markup, and never replace it with a URL — any of
-  those break the auto-attach. **If it returns an error or says the audio isn't
-  ready / wasn't found, relay that line verbatim and STOP — never send a TTS /
-  substitute audio, a link, or any stand-in.** Offer "try again in a bit" only when
-  it literally says the audio *isn't ready yet*.
+- **podcast** → **relay the output verbatim.** It prints a short title line + a
+  **`MEDIA:<path>` line** — that exact line is what makes the runtime deliver the
+  file as **native playable audio** (the tag is auto-hidden from the user; they
+  see the title + an inline player). Keep the `MEDIA:` line **exactly as printed,
+  on its own line** — do NOT wrap it in backticks or a code block, decorate it
+  (`🔊` / "Audio:" / "📎 File:"), strip the `MEDIA:` prefix down to a bare path,
+  add `[[audio_as_voice]]`, or replace it with a URL — any of those turn the
+  playable audio into a plain file attachment or lose it entirely. **If it
+  returns an error or says the audio isn't ready / wasn't found, relay that line
+  verbatim and STOP — never send a TTS / substitute audio, a link, or any
+  stand-in.** Offer "try again in a bit" only when it literally says the audio
+  *isn't ready yet*.
 - **stop** → confirm first. ENDS the run (terminal "stopped") and keeps the results
   so far + the chat (deletes nothing). Use **pause** for a temporary, resumable hold.
 - **skip** → no phases → skip whatever the run is **blocked** on; with phases
   (Brief=1, Podcast=3, Video=4, Report=5, or their names) → trim those phases.
 - **install** → confirm first. Installs the backend on the connected device (turns
-  that PC into a research node) — then guide pairing (`superresearch --pair` on that
+  that PC into a Research Computer) — then guide pairing (`superresearch --pair` on that
   PC → 8-char code → you run `device-add`; they finish API-key + browser-login on
   the PC). Use when `research` reports "no devices yet".
 - **version / update / agent-update** → relay versions; offer the matching update
@@ -246,20 +249,20 @@ never `retry`, never a question back to the user.
   background). `agent-update` = the chat agent itself (confirm; the bridge briefly
   restarts).
 
-## Devices & research nodes
+## Devices & Research Computers
 
-A research **node** is a computer running Super Research. **Any bare 8-char access
-code (e.g. `7F4V-6W7D`, dashes optional), or "add a device", means run
-`sr.py device-add <code>`** — a Super Research node, **NOT** one of the user's
+A **Research Computer** is a computer running Super Research. **Any bare 8-char
+access code (e.g. `7F4V-6W7D`, dashes optional), or "add a device", means run
+`sr.py device-add <code>`** — a Research Computer, **NOT** one of the user's
 phones, NOT the chat runtime, and NOT a Telegram / Discord / Slack pairing; never
 ask "which platform". First pair = they own it (auto-selects, so research can start
 right away); pairing someone else's = shared with them. Switch with
 `device-use "<name>"`, remove with `device-remove "<name>"` (confirm first — owner
 unlinks but the device keeps running + re-pairs with its code; sharer just leaves).
 
-If the user wants to add a node but hasn't given a code, ask them to **paste the
+If the user wants to add a Research Computer but hasn't given a code, ask them to **paste the
 access code** shown on the computer running Super Research (8 chars; accept it with
-or without dashes). If they have **no backend set up yet**, they install a node
+or without dashes). If they have **no backend set up yet**, they set up a Research Computer
 with one line, then pair:
 
 ```

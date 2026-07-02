@@ -217,7 +217,7 @@ class _NoResearchNode(Exception):
 
 def _device_label(d: dict[str, Any]) -> str:
     """Friendly device name (mirrors sr.py `_dev_label`): name → hostname → id."""
-    return d.get("name") or d.get("hostname") or d.get("id") or "your node"
+    return d.get("name") or d.get("hostname") or d.get("id") or "your Research Computer"
 
 
 def _resolve_run_config(fs: FirestoreRest, sess: AccountSession,

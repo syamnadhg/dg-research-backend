@@ -59,11 +59,11 @@ _TIMEOUT = 30
 # Mirrors the bridge's /updates limit cap (bridge.py `_updates`).
 _LOOKUP_LIMIT = 100
 
-# How to install Super Research on a fresh research node (no backend yet): the
-# SAME one-line installer the web app's "Set up your own Research node" tile uses
-# (auto-installs Python + pipx + superresearch), then `--pair`. Kept in ONE place
-# so the `devices`-empty and `research`-no-device prompts stay identical + in sync
-# with the web app. (Older builds said `pipx install superresearch`.)
+# How to install Super Research on a fresh Research Computer (no backend yet):
+# the SAME one-line installer the web app's "Set up your own Research Computer"
+# tile uses (auto-installs Python + pipx + superresearch), then `--pair`. Kept in
+# ONE place so the `devices`-empty and `research`-no-device prompts stay identical
+# + in sync with the web app. (Older builds said `pipx install superresearch`.)
 _SETUP_NODE_LINES = [
     "No backend on that machine yet? Run one line there (pick your OS):",
     "```",
@@ -489,7 +489,7 @@ def _connected_msg(who) -> str:
     if _has_device():
         return f"✓ Connected as {who} — you’re all set."
     return (f"✓ Connected as {who}. To get started, paste the access code from your "
-            "research node and I’ll connect it.")
+            "Research Computer and I’ll connect it.")
 
 
 def cmd_status_account(args) -> int:
@@ -500,7 +500,7 @@ def cmd_status_account(args) -> int:
         lines = [f"✓ Signed in as {body.get('email') or body.get('uid')}"]
         if not _has_device():
             lines.append("No device connected yet — paste the access code from your "
-                         "research node and I’ll connect it.")
+                         "Research Computer and I’ll connect it.")
     elif body.get("remoteLogin") == "pending":
         # A sign-in is mid-flight: approve it in the browser and the bridge
         # captures it automatically (no second command needed) — #848.
@@ -522,7 +522,7 @@ def cmd_devices(args) -> int:
     if not devices:
         return _emit(body, args.json, [
             "No devices connected yet.",
-            "Paste the access code from your research node and I’ll connect it.",
+            "Paste the access code from your Research Computer and I’ll connect it.",
             "",
             *_SETUP_NODE_LINES,
         ])
@@ -661,7 +661,7 @@ def cmd_research(args) -> int:
         err = str(body.get("error", "")).lower()
         if "no device" in err:
             return _emit(body, args.json, [
-                "Paste the access code from your research node first.",
+                "Paste the access code from your Research Computer first.",
                 "",
                 *_SETUP_NODE_LINES,
             ], _fail_code(code))
@@ -742,14 +742,18 @@ def cmd_podcast(args) -> int:
     if code != 200:
         return _emit(b2, args.json, [f"✗ {b2.get('error', code)}"], _fail_code(code))
     title = b2.get("title") or "Podcast"
-    # Emit a short caption + the audio file's BARE path on its own line. The runtime
-    # auto-detects a bare on-disk media path, delivers the file as a native audio /
-    # voice message, and STRIPS the path from the visible text — so the user sees the
-    # caption + the audio, never the path. Do NOT decorate or wrap the path (no 🔊 /
-    # "Audio:" label, no backticks, no [[audio]] markup) — that defeats the auto-attach.
+    # Emit a short caption + an explicit MEDIA:<path> tag on its own line. The
+    # runtime's gateway extracts MEDIA: tags into its AUDIO partition, which
+    # delivers the file as native PLAYABLE audio (Telegram sendAudio for
+    # mp3/m4a; other platforms' voice/audio sender) and strips the tag from
+    # the visible text — so the user sees the title + an inline player. A BARE
+    # path is NOT equivalent: bare paths route to document delivery (a "📎
+    # File" attachment, not playable — the 2026-07-02 live failure). Do NOT
+    # add [[audio_as_voice]]: it suppresses the text body (voice-reply dedup)
+    # and only matters for .ogg/.opus voice bubbles.
     return _emit(b2, args.json, [
         f"🎧 {title}",
-        f"{b2.get('localPath')}",
+        f"MEDIA:{b2.get('localPath')}",
     ])
 
 

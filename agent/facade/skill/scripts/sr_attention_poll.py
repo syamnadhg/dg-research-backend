@@ -317,10 +317,10 @@ def _signed_in_line(signed_in: dict) -> str:
         # chat form (code + command together — the reliable shape for the gateway).
         return (
             f"✓ Signed in as {who}.\n\n"
-            f"There's no research node on your account yet, so {quoted} has nowhere to run.\n\n"
+            f"There's no Research Computer on your account yet, so {quoted} has nowhere to run.\n\n"
             f"On a computer with Super Research, run:\n"
             f"      superresearch --pair\n"
-            f"It shows an 8-char code. Then add the node either way:\n\n"
+            f"It shows an 8-char code. Then add the Research Computer either way:\n\n"
             f"1) In the web app (most reliable):\n"
             f"      superresearch.io → Account → Pipeline Connection → Add Device\n\n"
             f"2) Or from here — send the code with the command, in ONE message:\n"

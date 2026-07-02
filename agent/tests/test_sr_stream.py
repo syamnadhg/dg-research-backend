@@ -357,12 +357,12 @@ def test_signed_in_line_announces_an_auto_started_run():
 
 
 def test_signed_in_line_prompts_to_pair_a_node_when_none():
-    """No research node on the account → surface the pair-a-node step (the flow the
+    """No Research Computer on the account → surface the pair step (the flow the
     agent failed to show), not a 'reply yes' offer."""
     line = poll._signed_in_line({
         "email": "e@x.y", "needsDevice": True, "topic": "Golden Retriever", "pendingTopic": "",
     })
-    assert "no research node" in line.lower()
+    assert "no research computer" in line.lower()  # #894 terminology
     # Points at the reliable web-app path + the exact one-message chat form.
     assert "superresearch --pair" in line
     assert "Add Device" in line and "/sr device-add" in line
