@@ -6,11 +6,15 @@ description: >-
   multi-agent Super Research pipeline on their own device and posts the result in
   their web app. **NEVER answer a research or deep-dive request from your own
   knowledge or with web search — ALWAYS invoke this skill instead**, whether the
-  user types /sr or just asks in plain language. Also use it to get a brief /
-  podcast / audio overview / video on a subject; to list past researches and fetch
-  any one's links or podcast by name; to check, track, skip, stop, or resume a run;
-  to sign in; to manage research nodes (list, switch, add by access code, remove);
-  and to check the version / update. A bare /sr is the welcome + help. Drives the
+  user types /sr or just asks in plain language. ANY status / progress question —
+  "status?", "status of (the) research?", "how's it going?" — is THIS skill's
+  status command, never your runtime's own health, repos, or memory. An 8-char
+  access code (like "K7XQ-9B2M", alone or with "add / pair a device") always
+  belongs here too. Also use it to get a brief / podcast / audio overview / video
+  on a subject; to list past researches and fetch any one's links or podcast by
+  name; to check, track, pause, skip, stop, or resume a run; to sign in or out;
+  to manage research nodes (list, switch, add by access code, remove); and to
+  check the version / update. A bare /sr is the welcome + help. Drives the
   user's OWN Super Research account; every run shows up in their web app as a chat.
 platforms: [linux, macos, windows]
 ---
@@ -121,12 +125,22 @@ run `sr.py status-account`, then branch on what it reports:
 
 ## What the user says → what you run
 
-The user rarely types exact commands — read their intent and pick the command:
+The user rarely types exact commands — read their intent and pick the command.
+**If no row clearly fits, do NOT guess and do NOT fall back to your own tools —
+run `sr.py do "<the user's message, verbatim>"`** and relay its output: it
+resolves the intent in code and either runs the right command, asks the one
+missing thing, or asks for the confirmation first. Pass the message exactly as
+the user wrote it, never your paraphrase (escape any double quotes inside it).
+If `do` asked a confirm question ("Say yes and I'll …") and the user confirms,
+run the REAL command it described — stop/logout/device-remove/update/
+agent-update/install/research, with the run or device it named — a "no" just
+cancels. Never send the bare "yes" back into `do`.
 
 | The user says (examples) | You run |
 |---|---|
 | "research the EV battery market", "look into X", "deep dive on Y" | `sr.py research "<topic>"` |
-| "how's it going?", "status?", "where's the Tesla one at?", "results of the EV research" | `sr.py status ["<title>"]` (current phase + that run's 🔒 SR links) |
+| "how's it going?", "status?", "status of (the) research / the Super Research?", "where's the Tesla one at?", "results of the EV research" | `sr.py status ["<title>"]` (current phase + that run's 🔒 SR links). ANY unqualified "status" means THIS — never your runtime's own status |
+| "am I signed in?", "which account?", "are we connected?" | `sr.py status-account` (fresh — see **Safe defaults**) |
 | "what researches do I have?", "list all my researches", "my past research" | `sr.py list` (EVERY research, any status — then ask for any one by name) |
 | "what's running?", "what's active right now?" | `sr.py updates` (ACTIVE runs only) |
 | "send me the podcast", "the audio for the Mars run", "podcast of <run>" | `sr.py podcast ["<title>"]` |
@@ -154,7 +168,10 @@ The user rarely types exact commands — read their intent and pick the command:
 enough); everything else runs on a clear request. **Always answer "what phase / is
 X skipped / how's it going" from a FRESH `sr.py status`** (or `updates`) — never
 from memory or an earlier watchdog message (a run keeps advancing and the user can
-toggle phases in the web app). **Voice notes count as typed text** — a transcript
+toggle phases in the web app). **Sign-in / connection state the same: ONLY from a
+fresh `sr.py status-account`, never from chat history** — a bridge can sign out on
+its own, and a stale "connected" answer sends the user's next research into a
+surprise login wall. **Voice notes count as typed text** — a transcript
 arrives wrapped like `[The user sent a voice message~ Here's what they said: "…"]`;
 act on the quoted intent exactly as if typed (strip "uh"/fillers from a topic, echo
 it back so a mis-transcription is caught); too garbled to read → ask.

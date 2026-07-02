@@ -698,7 +698,14 @@ def cmd_status(args) -> int:
     title = r.get("title") or r.get("topic") or rid
     dev = _device_names().get(r.get("deviceId") or "", "")
     where = f"  ·  {dev}" if dev else ""
-    lines = [f"“{title}” — {r.get('status', '?')} (phase {r.get('phase', '?')}){where}"]
+    # A queued run has no phase yet (the BE stamps it at start) — show the
+    # place in line instead of a confusing "queued (phase ?)".
+    if r.get("status") == "queued":
+        qp = r.get("queuePosition")
+        stat = f"queued — #{qp} in line" if qp else "queued — waiting for a free worker"
+    else:
+        stat = f"{r.get('status', '?')} (phase {r.get('phase', '?')})"
+    lines = [f"“{title}” — {stat}{where}"]
     lines += _fmt_pipeline_config(r.get("pipelineConfig"))
     lines += _attention_lines(r)
     # Per-phase plan = the curated links (🔒 SR for Brief/reports/Podcast, 🔗 platform
@@ -754,7 +761,13 @@ def cmd_updates(args) -> int:
         return _emit(body, args.json, [f"✗ {body.get('error', code)}"], _fail_code(code))
     lines = []
     for r in runs:
-        lines.append(f"“{r.get('title') or r.get('topic')}” — {r.get('status')} (phase {r.get('phase')})")
+        # A queued run has no phase yet — show its place in line (mirrors status).
+        if r.get("status") == "queued":
+            _qp = r.get("queuePosition")
+            _stat = f"queued — #{_qp} in line" if _qp else "queued — waiting for a free worker"
+        else:
+            _stat = f"{r.get('status')} (phase {r.get('phase')})"
+        lines.append(f"“{r.get('title') or r.get('topic')}” — {_stat}")
         lines += _fmt_pipeline_config(r.get("pipelineConfig"))
         lines += _attention_lines(r)
         phase_updates = r.get("phaseUpdates")
@@ -1058,6 +1071,263 @@ def cmd_arm_stream(args) -> int:
     return _emit(payload, args.json, lines, rc)
 
 
+# ── `do` — deterministic natural-language fallback (#891) ───────────────────
+# SKILL.md sends any message the AI can't confidently map to a command here
+# VERBATIM. The text→command mapping then lives in CODE (ordered, unit-tested
+# rules) instead of the chat AI's judgment — the live failures were exactly
+# mis-picks ("Status of the Super Research?" → account status; "add device
+# <code>" → refused). Contract: every printed line is USER-SAFE (sr.py output
+# is relayed verbatim). Non-destructive intents run immediately; destructive
+# ones print the confirm question and the AI runs the real command on "yes".
+
+# Both alternatives REQUIRE a digit — every real access code has one, and
+# without it ordinary hyphenated words ("real-time", "high-tech") match the
+# dashed form and hijack the message into device-add.
+_NL_CODE_RE = re.compile(
+    r"\b((?=[A-Z0-9-]*\d)[A-Z0-9]{4}-[A-Z0-9]{4})\b|\b((?=[A-Z]*\d)[A-Z0-9]{8})\b", re.I)
+# Double quotes only (straight + curly). Apostrophes are NOT delimiters — a
+# contraction + possessive ("what's … Tesla's …") would otherwise extract the
+# garbage between them as a run title.
+_NL_QUOTED_RE = re.compile(r"[\"“]([^\"“”]+)[\"”]")
+# The research-verb pattern, anchored at message start. Checked EARLY (before
+# the control/status rules) so a research request whose TOPIC contains words
+# like stop/pause/status/podcast ("research how to stop smoking") can never be
+# hijacked into a run-control or status command.
+_NL_RESEARCH_RE = re.compile(
+    r"^(?:please |can you |could you |would you |hey |ok |okay |go |now )*"
+    r"(?:(?:do|run|start|fire|kick ?off|launch|begin) (?:a |another |the )?)?"
+    r"(?:super ?research|deep[- ]?research|deep[- ]?dive|research|look into|"
+    r"investigate|dig into|analy[sz]e)\b(?: on| into| about| for| of)?\s*(.*)$",
+    re.I)
+# Words that mean "the current run", not a run name — drop, don't pass as title.
+_NL_GENERIC_RUN = {"it", "that", "this", "them", "run", "the run", "this run",
+                   "that run", "the current run", "current run", "the research",
+                   "research", "the last one", "everything",
+                   # the product's own name is never a run title
+                   "super", "super research", "the super research"}
+_NL_PHASE_WORDS = ("brief", "podcast", "video", "report", "email")
+# Destructive verbs → the user-facing confirm question (AI runs the real
+# command on "yes"; mirrors the SKILL.md Safety confirm-first list).
+_NL_CONFIRMS = {
+    "stop": "Stop {name}? It ends the run — everything finished so far is kept. Say yes and I’ll stop it.",
+    "logout": "Sign out of Super Research? (The skill stays installed — you can sign back in anytime.) Say yes and I’ll sign you out.",
+    "device-remove": "Unlink {name}? Nothing gets deleted — an owner’s device can re-pair with its code. Say yes and I’ll remove it.",
+    "update": "Update the Super Research backend now? It restarts in the background. Say yes and I’ll update it.",
+    "agent-update": "Update the chat agent itself? The bridge restarts briefly. Say yes and I’ll update it.",
+    "install": "Install the Super Research backend on the connected device? Say yes and I’ll set it up.",
+}
+
+
+def _nl_run_name(t: str, verb_tail: str = "") -> "str | None":
+    """A run name from free text: a quoted title wins; else the words after
+    of/for/on/about (minus articles + 'run/one/research' tails). Generic
+    references ('it', 'the run') → None → the command defaults to the
+    most-recent run."""
+    m = _NL_QUOTED_RE.search(t)
+    name = None
+    if m:
+        name = m.group(1)
+    else:
+        src = verb_tail if verb_tail else t
+        m2 = re.search(r"\b(?:of|for|on|about)\s+(?:the\s+|my\s+)?(.+)$", src, re.I) or \
+            (re.search(r"^(?:the\s+|my\s+)?(.+)$", verb_tail, re.I) if verb_tail else None)
+        if m2:
+            name = m2.group(1)
+    if not name:
+        return None
+    name = re.sub(r"[?.!,]+$", "", name).strip()
+    name = re.sub(r"\s+(run|one|research|research run)$", "", name, flags=re.I).strip()
+    if not name or name.lower() in _NL_GENERIC_RUN:
+        return None
+    return name
+
+
+def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
+    """Map a verbatim user message to (argv, None) to execute, or
+    (None, user-safe lines) to relay. Ordered — most specific first."""
+    t = " ".join((text or "").split())
+    low = t.lower().rstrip("?!. ")
+    if not low:
+        return None, ["What would you like? I can research a topic, check a run’s "
+                      "status, fetch its podcast or links, or manage your devices."]
+
+    # 1. An access code = pair a device (never a secret — see SKILL.md). Wins
+    #    only when the message IS the code, or says device/pair/add/code — a
+    #    code-shaped token inside a sentence ("research iphone17 pricing")
+    #    must not hijack the request into a bogus pairing attempt.
+    code_m = _NL_CODE_RE.search(t)
+    if code_m:
+        tok = code_m.group(1) or code_m.group(2)
+        _kw = re.search(r"\b(device|node|pair|add|code|machine|pc|computer)\b", low)
+        _bare = re.fullmatch(r"[^A-Za-z0-9]*" + re.escape(tok) + r"[^A-Za-z0-9]*", t, re.I)
+        if _kw or _bare:
+            return ["device-add", tok], None
+    if re.search(r"\b(add|pair|connect)\b.*\b(device|node|machine|pc|computer)\b", low) or \
+            re.search(r"\bpair (my|a|the|this)\b", low):
+        return None, ["Paste the access code shown on the computer running Super "
+                      "Research (8 characters — dashes optional) and I’ll add it."]
+
+    # 2. Sign-in / connection questions — always a FRESH account check.
+    if re.search(r"\b(am i|are we|is (it|this|the agent))\b.*\b(signed?[ -]?in|logg?ed[ -]?in|connected|authenticated)\b", low) or \
+            re.search(r"\b(which|what) account\b", low) or "account status" in low or \
+            "connection status" in low:
+        return ["status-account"], None
+
+    # 2b. A message that STARTS with a research verb is a research request —
+    #     resolved before every remaining rule so control/status/phase words in
+    #     the TOPIC ("research how to stop smoking", "research the history of
+    #     the podcast industry") can't hijack it. A trailing "without/no video|
+    #     email" clause maps to the run flags; a bare "research status" tail
+    #     falls through (that's a progress ask, not a topic).
+    rm = _NL_RESEARCH_RE.match(t)
+    if rm:
+        topic = re.sub(r"[?.!]+$", "", rm.group(1)).strip().strip("\"“”'‘’")
+        if topic and not re.fullmatch(r"(?:the |my )?(?:status|progress|updates?)", topic, re.I):
+            flags: list[str] = []
+            ex = re.search(
+                r"[,;\s]*\b(?:without|minus|skip(?:ping)?|drop(?:ping)?|leave out|no)\s+"
+                r"(?:the\s+|a\s+|any\s+)?(?:video|email|podcast|brief|report)s?\b",
+                topic, re.I)
+            if ex:
+                clause = topic[ex.start():].lower()
+                topic = topic[:ex.start()].rstrip(" ,;.")
+                hard = []
+                for p in _NL_PHASE_WORDS:
+                    if p not in clause:
+                        continue
+                    if p == "video":
+                        flags.append("--no-video")
+                    elif p == "email":
+                        flags.append("--no-email")
+                    else:
+                        hard.append(p)
+                if hard and topic:
+                    # No research-time flag exists for these phases — offer the
+                    # honest two-step instead of silently ignoring the ask.
+                    return None, [
+                        f"I can start “{topic}” right away — the {', '.join(hard)} "
+                        "can be trimmed once the run starts (just ask me to skip "
+                        "it then). Say yes to start."]
+            if topic:
+                return ["research", topic] + flags, None
+            return None, ["Happy to fire a Super Research — what topic?"]
+        if not topic:
+            return None, ["Happy to fire a Super Research — what topic?"]
+
+    # 3. Run controls (before the broad status rules).
+    if re.search(r"\b(stop|end|abort|cancel)\b", low) or re.search(r"\bthat.?s enough\b", low):
+        name = _nl_run_name(t, re.sub(r"^.*?\b(?:stop|end|abort|cancel)\b", "", t, flags=re.I).strip())
+        return None, [_NL_CONFIRMS["stop"].format(name=f"“{name}”" if name else "the current run")]
+    if re.search(r"\bpause\b|\bhold (on|it)\b", low):
+        name = _nl_run_name(t, re.sub(r"^.*?\bpause\b", "", t, flags=re.I).strip())
+        return ["pause"] + ([name] if name else []), None
+    if re.search(r"\b(resume|unpause)\b|\bcontinue the paused\b", low):
+        name = _nl_run_name(t, re.sub(r"^.*?\b(?:resume|unpause)\b", "", t, flags=re.I).strip())
+        return ["resume"] + ([name] if name else []), None
+    if re.search(r"\b(retry|try again)\b", low):
+        name = _nl_run_name(t, re.sub(r"^.*?\b(?:retry|try again)\b", "", t, flags=re.I).strip())
+        return ["retry"] + ([name] if name else []), None
+    # skip / drop phases ("skip the video and the report", "remove the video",
+    # "no email") — phase nouns keep this ahead of device-remove.
+    if re.search(r"\b(skip|drop|remove|cut|leave out|without|no)\b", low) and \
+            any(p in low for p in _NL_PHASE_WORDS):
+        phases = [p for p in _NL_PHASE_WORDS if p in low]
+        return ["skip"] + phases, None
+    if re.search(r"^skip\b|\bskip (it|this|that|the step|the blocker)\b", low):
+        return ["skip"], None
+
+    # 4. Devices.
+    if re.search(r"\b(which|what|list|show|my)\b.*\b(devices?|nodes?)\b", low) or \
+            low in ("devices", "device list") or "what am i running on" in low:
+        return ["devices"], None
+    m = re.search(r"\b(?:switch to|run (?:it |everything )?on|use)\s+(?:the\s+|my\s+)?(.+)$", t, flags=re.I)
+    if m and re.search(r"\b(switch to|run (it |everything )?on)\b", low):
+        name = re.sub(r"[?.!,]+$", "", m.group(1)).strip()
+        return (["device-use", name] if name else ["devices"]), None
+    if re.search(r"\b(remove|unlink|forget|delete)\b", low) and \
+            re.search(r"\b(device|node|laptop|pc|computer|machine|phone|desktop)\b", low):
+        m = re.search(r"\b(?:remove|unlink|forget|delete)\s+(?:the\s+|my\s+)?(.+)$", t, flags=re.I)
+        name = re.sub(r"[?.!,]+$", "", m.group(1)).strip() if m else ""
+        name = re.sub(r"^(old|other)\s+", "", name, flags=re.I)
+        return None, [_NL_CONFIRMS["device-remove"].format(name=f"“{name}”" if name else "that device")]
+
+    # 5. Session + maintenance.
+    if re.search(r"\b(uninstall|tear ?down)\b", low) or \
+            re.search(r"\b(remove|disconnect)\b.*\b(entirely|completely|fully|everything)\b", low):
+        return None, ["Just sign out, or fully remove the skill + bridge from this "
+                      "machine? (Sign-out keeps everything installed.)"]
+    if re.search(r"\b(sign|log)\s?(me\s)?out\b|\blogout\b", low):
+        return None, [_NL_CONFIRMS["logout"]]
+    if re.search(r"\b(sign|log)\s?(me\s)?in\b|\blogin\b|\bauthenticate\b", low):
+        return ["login"], None
+    if re.search(r"\b(i('m| am)? (signed|logged) in|i did it|signed in now)\b", low):
+        return ["login-done"], None
+    if re.search(r"\b(update|upgrade)\b", low):
+        # "update me / any update on X / give me an update" is a PROGRESS ask,
+        # not software maintenance — routing it to the update confirm made a
+        # reflexive "yes" restart the backend mid-run.
+        if re.search(r"\bupdates? (me|on|about|regarding|for)\b|\bany updates?\b"
+                     r"|\b(give|got|have|send)\b.*\bupdates?\b|\blatest updates?\b", low):
+            name = _nl_run_name(t)
+            return ["status"] + ([name] if name else []), None
+        if re.search(r"\b(agent|skill|yourself)\b", low):
+            return None, [_NL_CONFIRMS["agent-update"]]
+        return None, [_NL_CONFIRMS["update"]]
+    if re.search(r"\bversions?\b", low):
+        return ["version"], None
+    if re.search(r"\b(install|host|set ?up)\b.*\b(backend|super research|here|this (pc|machine|computer))\b", low):
+        return None, [_NL_CONFIRMS["install"]]
+
+    # 6. Listing + progress (before research — "results of X" is a status ask).
+    if re.search(r"\bwhat('s| is) (running|active)\b|\bactive runs?\b|\banything running\b", low):
+        return ["updates"], None
+    if re.search(r"\b(list|show|what)\b.*\b(researches|research history|past research(es)?)\b", low) or \
+            low in ("list", "my researches", "researches"):
+        return ["list"], None
+    if re.search(r"\bpodcast\b|\baudio( overview)?\b", low):
+        name = _nl_run_name(t)
+        return ["podcast"] + ([name] if name else []), None
+    if re.search(r"\bstatus\b|\bprogress\b|\bhow('s| is) (it|that|the .{1,40}) (going|coming|doing)\b"
+                 r"|\bhow far\b|\bwhere('s| is) .{1,40} at\b|\bresults? (of|for)\b"
+                 r"|\b(any|latest) updates?\b", low):
+        name = _nl_run_name(t)
+        return ["status"] + ([name] if name else []), None
+
+    # 7. Nothing matched — user-safe capabilities line (never guess a command).
+    #    (Research phrasings were resolved at 2b, before the control rules.)
+    return None, ["I didn’t catch a Super Research request in that. I can research "
+                  "a topic, check a run’s status, fetch its podcast or links, list "
+                  "your researches, or manage your devices — what would you like?"]
+
+
+# The only option flags _nl_resolve ever emits — everything else in a resolved
+# argv is a positional. cmd_do uses this to place the `--` separator.
+_DO_FLAGS = frozenset({"--no-video", "--no-email"})
+
+
+def cmd_do(args) -> int:
+    """Resolve a verbatim user message to a command and run it (or print the
+    one confirm/clarify question). The AI relays whatever this prints."""
+    argv, lines = _nl_resolve(" ".join(args.text))
+    if argv is None:
+        return _emit({}, args.json, lines or [])
+    # `--` before the free-text positionals: a topic/name that happens to start
+    # with a dash ("research --help") must reach the command as a literal value,
+    # never dump argparse usage into the chat relay.
+    cmd, rest = argv[0], argv[1:]
+    flags = [a for a in rest if a in _DO_FLAGS]
+    pos = [a for a in rest if a not in _DO_FLAGS]
+    final = (["--json"] if args.json else []) + [cmd] + flags + (["--"] + pos if pos else [])
+    try:
+        ns = build_parser().parse_args(final)
+    except SystemExit:
+        # A resolved arg the parser refused (shouldn't happen) — never crash the
+        # chat turn; fall back to the ask-what-you-want line.
+        return _emit({}, args.json, ["I didn’t catch a Super Research request in "
+                                     "that — name a topic, a run, or a device."])
+    return ns.func(ns)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sr", description="Super Research skill client")
     p.add_argument("--json", action="store_true", help="print the raw bridge JSON")
@@ -1152,6 +1422,13 @@ def build_parser() -> argparse.ArgumentParser:
         "arm-stream",
         help="prepare this chat's streaming watchdog (prints the cron script + name to arm)",
     ).set_defaults(func=cmd_arm_stream)
+
+    do = sub.add_parser("do", aliases=["nl"],
+                        help="resolve a verbatim user message to a command and run it")
+    # REMAINDER: capture the whole message even when a token starts with "-"
+    # ("do research --help") — the message is data, never options of `do`.
+    do.add_argument("text", nargs=argparse.REMAINDER)
+    do.set_defaults(func=cmd_do)
     return p
 
 
