@@ -2717,6 +2717,54 @@ import threading as _threading_for_eta_lock  # noqa: E402
 _ETA_RECOMPUTE_LOCK = _threading_for_eta_lock.Lock()
 
 
+def _local_pending_owner_entries() -> "list[dict]":
+    """Owner-pill (`queueOwners`) entries for LOCALLY-claimed queued jobs —
+    this worker's in-memory deque, exposed via ``_QUEUE_STATE["queue_ref"]``.
+
+    Why (#890): a busy SINGLE-worker install claims every submit immediately
+    (research doc stamped status="queued", queue doc deleted at claim), so
+    locally-queued runs are invisible to the `devices/{id}/queue` scan below —
+    the owner's "Shared with" popup never showed the amber #N badge for them.
+    Agent-fired runs surfaced it (their queue always lands this way), but a
+    web-fired sharer run on a busy single-worker device had the same gap.
+
+    Positions are 1..N: a locally-claimed job always runs before any
+    Firestore-deferred doc (deferral only happens while every worker is busy,
+    and the local deque drains first). SINGLE-WORKER ONLY: sibling workers'
+    local deques live in other PROCESSES and are invisible here, and every
+    worker publishes queueOwners as a full-array overwrite — so in a
+    multi-worker install a sibling's publish (e.g. after a restart restored
+    a pending queue into one worker's deque) would ERASE another worker's
+    local entries. Multi-worker keeps the deferred-only behavior (its busy
+    submits are DEFERRED — visible to the scan — not locally queued, so
+    nothing is lost). Resume-dir jobs (no uid/researchId) are skipped."""
+    try:
+        if int(load_worker_count() or 1) > 1:
+            return []
+    except Exception:
+        return []
+    q = _QUEUE_STATE.get("queue_ref")
+    if q is None:
+        return []
+    try:
+        pending = list(q._queue)
+    except Exception:
+        return []
+    out: "list[dict]" = []
+    for job in pending:
+        uid_v = (job.get("uid") or "").strip()
+        rid_v = (job.get("research_id") or "").strip()
+        if not (uid_v and rid_v):
+            continue
+        out.append({
+            "uid": uid_v,
+            "runId": rid_v,
+            "title": (job.get("topic") or "")[:60],
+            "position": len(out) + 1,
+        })
+    return out
+
+
 def _recompute_deferred_queue_positions() -> None:
     """Re-write `queuePosition` / `queuedBehindRunId` / `queuedBehindTitle`
     on every research doc whose queue entry is still deferred in
@@ -2773,6 +2821,11 @@ def _recompute_deferred_queue_positions_locked() -> None:
     device_id = load_device_id()
     if not device_id:
         return
+    # #890: locally-claimed queued jobs (single-worker busy claims) lead the
+    # published queueOwners union — the subcollection scan below can't see
+    # them (their queue docs were deleted at claim). Snapshot here, as close
+    # to the publish as possible, so a just-picked-up job drops out promptly.
+    _local_owners = _local_pending_owner_entries()
     col = _firebase_db.collection("devices").document(device_id).collection("queue")
     try:
         candidates = list(col.limit(50).stream())
@@ -2780,10 +2833,11 @@ def _recompute_deferred_queue_positions_locked() -> None:
         log(f"[deferred-recompute] scan failed (best-effort): {e}", "DEBUG")
         return
     if not candidates:
-        # Queue subcollection empty — clear any stale queueOwners (amber
-        # badges) left from a drained/cancelled queue. Best-effort.
+        # Queue subcollection empty — publish the local-only union (clears
+        # stale amber badges when the local deque drained too). Best-effort.
         try:
-            _firebase_db.collection("devices").document(device_id).update({"queueOwners": []})
+            _firebase_db.collection("devices").document(device_id).update(
+                {"queueOwners": _local_owners})
         except Exception:
             pass
         return
@@ -2811,10 +2865,12 @@ def _recompute_deferred_queue_positions_locked() -> None:
         queue.append((snap.id, d))
 
     if not queue:
-        # All candidates filtered out (claimed/processed) — the queue just
-        # drained, so clear amber badges. Best-effort.
+        # All candidates filtered out (claimed/processed) — the deferred set
+        # just drained; publish the local-only union (clears amber badges when
+        # the local deque is empty too). Best-effort.
         try:
-            _firebase_db.collection("devices").document(device_id).update({"queueOwners": []})
+            _firebase_db.collection("devices").document(device_id).update(
+                {"queueOwners": _local_owners})
         except Exception:
             pass
         return
@@ -2843,6 +2899,11 @@ def _recompute_deferred_queue_positions_locked() -> None:
 
     _now_ms_recompute = int(time.time() * 1000)
 
+    # #890: deferred docs sit BEHIND any locally-claimed queued jobs — offset
+    # their published positions so the amber badges + banner numbers reflect
+    # the true device-wide order (offset is 0 in the common multi-worker case,
+    # where busy submits defer instead of queueing locally).
+    _local_offset = len(_local_owners)
     patches: "list[tuple[str, str, dict]]" = []
     _queue_owners: "list[dict]" = []
     for idx, (_sid, d) in enumerate(queue):
@@ -2850,7 +2911,7 @@ def _recompute_deferred_queue_positions_locked() -> None:
         rid_v = (d.get("researchId") or "").strip()
         if not (uid_v and rid_v):
             continue
-        new_pos = idx + 1
+        new_pos = _local_offset + idx + 1
         # 2026-05-28: per-sharer amber-badge source for the "Shared with"
         # popup. submittedBy is the sharer who queued the run (uid fallback);
         # position is the 1-indexed global FIFO slot the FE joins on by uid.
@@ -2860,9 +2921,15 @@ def _recompute_deferred_queue_positions_locked() -> None:
             "title": (d.get("topic") or "")[:60],
             "position": new_pos,
         })
-        # Per-doc ahead-by-account breakdown (uses each doc's own uid).
+        # Per-doc ahead-by-account breakdown (uses each doc's own uid) —
+        # locally-claimed queued jobs count as "ahead" too (#890).
         _ahead_self = 0
         _ahead_others = 0
+        for _lo in _local_owners:
+            if _lo.get("uid") == uid_v and uid_v:
+                _ahead_self += 1
+            else:
+                _ahead_others += 1
         for _ji, (_jsid, _jd) in enumerate(queue[:idx]):
             _ju = (_jd.get("submittedBy") or _jd.get("uid") or "")
             if _ju == uid_v and uid_v:
@@ -2877,6 +2944,20 @@ def _recompute_deferred_queue_positions_locked() -> None:
                 "queuePosition": new_pos,
                 "queuedBehindRunId": (prev_d.get("researchId") or ""),
                 "queuedBehindTitle": (prev_d.get("topic") or "")[:60],
+                "queueTotalAhead": new_pos - 1,
+                "queueAheadFromSelf": _ahead_self,
+                "queueAheadFromOthers": _ahead_others,
+                "queueEtaMs": _eta_ms_r,
+                "queueEtaComputedAt": _now_ms_recompute,
+            }
+        elif _local_owners:
+            # Head of the DEFERRED set but locally-claimed jobs are ahead —
+            # point "behind" at the local tail so the banner names the run
+            # it actually waits on (#890), not the currently-running one.
+            patch = {
+                "queuePosition": new_pos,
+                "queuedBehindRunId": _local_owners[-1]["runId"],
+                "queuedBehindTitle": _local_owners[-1]["title"],
                 "queueTotalAhead": new_pos - 1,
                 "queueAheadFromSelf": _ahead_self,
                 "queueAheadFromOthers": _ahead_others,
@@ -2906,10 +2987,11 @@ def _recompute_deferred_queue_positions_locked() -> None:
     # owner's "Shared with" popup shows amber "#N" badges per sharer (joined
     # by uid). Full-array overwrite — this single-flight recompute is the
     # authoritative snapshot; positions shift as the queue drains, so a
-    # partial merge would leak stale entries. Best-effort / non-fatal.
+    # partial merge would leak stale entries. #890: locally-claimed queued
+    # jobs lead the union (they run first). Best-effort / non-fatal.
     try:
         _firebase_db.collection("devices").document(device_id).update({
-            "queueOwners": _queue_owners,
+            "queueOwners": _local_owners + _queue_owners,
         })
     except Exception as _qo_err:
         log(f"[deferred-recompute] queueOwners publish failed (best-effort): {_qo_err}", "DEBUG")
@@ -34449,11 +34531,26 @@ async def run_server(port=8000):
         this is one batch; safety chunk at 450 ops if ever exceeded."""
         if not _firebase_db:
             return
+        # #890: ALWAYS refresh the device-doc queueOwners union afterwards —
+        # including when the local deque just drained (last queued job picked
+        # up / cancelled): the publisher then drops it from the amber #N
+        # badges as the green workers.{id} pill takes over. Threaded because
+        # this fn runs on the asyncio loop (call_soon_threadsafe / completion
+        # flow) while the publisher does blocking Firestore I/O; it is
+        # single-flight guarded so concurrent kicks skip, not pile up.
+        def _kick_owner_publish():
+            try:
+                _threading.Thread(
+                    target=_recompute_deferred_queue_positions, daemon=True
+                ).start()
+            except Exception as _kop_err:
+                log(f"[queue-pos] owner-publish kick failed (best-effort): {_kop_err}", "DEBUG")
         try:
             pending = list(_job_queue._queue)
         except Exception:
             return
         if not pending:
+            _kick_owner_publish()
             return
         try:
             from google.cloud.firestore import DELETE_FIELD
@@ -34522,6 +34619,8 @@ async def run_server(port=8000):
                 _grpc_write_with_heal(_commit_chunk, what=f"queue-pos batch [{i}:{i+CHUNK}]")
             except Exception as e:
                 log(f"Failed to commit queue-position batch [{i}:{i+CHUNK}]: {e}", "WARN")
+        # #890: publish the refreshed queueOwners union (local + deferred).
+        _kick_owner_publish()
 
     # Expose the recompute helper to the module-level Firestore listener so
     # the cancel-queued action can also trigger a position refresh.
@@ -35140,6 +35239,16 @@ async def run_server(port=8000):
                     f"[device] busyWorkerIds claim (w{WORKER_ID}) failed (non-fatal): {_bw_pub_err}",
                     "DEBUG",
                 )
+            # #890: refresh the device-doc queueOwners union — this job just
+            # left the local pending deque (amber #N badge) for a worker slot
+            # (green workers.{id} pill above). Best-effort daemon thread; the
+            # publisher is single-flight guarded and reads the deque fresh.
+            try:
+                _threading.Thread(
+                    target=_recompute_deferred_queue_positions, daemon=True
+                ).start()
+            except Exception:
+                pass
             log(f"Starting queued job: {job['topic'][:60]}")
             # Publish currentRunId on the device doc so sharers / sibling
             # tabs can see "device is busy with run X" and render the

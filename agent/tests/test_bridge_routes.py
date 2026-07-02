@@ -114,10 +114,15 @@ def test_research_enqueue_route(live):
     # the enqueue carried the owner uid as submittedBy and the topic
     assert FakeFS.last_enqueue["uid"] == "u1"
     assert FakeFS.last_enqueue["topic"] == "Tesla 2025"
-    # the research doc rendered as a real chat (phase 0, platforms, arrays)
+    # the research doc rendered as a real chat (platforms, arrays) and queued
     f = FakeFS.last_upsert["fields"]
-    assert f["phase"] == 0 and f["viaAgent"] is True
+    assert f["status"] == "queued" and f["viaAgent"] is True
     assert f["platforms"] and f["documents"] == [] and f["audios"] == []
+    # #890: NO phase field — the web app strips it (BE-owned); a bridge-stamped
+    # phase:0 flipped the FE to "run started" (Stop/Pause) while still queued.
+    assert "phase" not in f
+    # #890: sharer display name mirrored like the FE (email local-part fallback)
+    assert f["submittedByDisplayName"]
 
 
 def test_research_applies_account_pipeline_settings(live):

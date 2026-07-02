@@ -150,13 +150,21 @@ def _config_from_settings(pipe: dict[str, Any] | None) -> dict[str, Any]:
 def _new_research_fields(
     topic: str, device_id: str, uid: str, cfg: dict[str, Any] | None,
     chat_origin: dict[str, str] | None = None,
+    display_name: str = "",
 ) -> dict[str, Any]:
     """The research (chat) doc a fresh agent run creates.
 
-    Mirrors enough of the web app's fresh-chat shape (research-app/web
-    saveResearch / usePipeline) that it renders as a normal chat immediately —
-    phase 0, the platform list, empty doc/audio arrays — rather than a sparse
-    placeholder. The BE backfills the rest as the pipeline runs.
+    Mirrors the web app's fresh-chat shape (research-app/web saveResearch /
+    usePipeline) so it renders as a normal chat immediately — the platform
+    list, empty doc/audio arrays — rather than a sparse placeholder. The BE
+    backfills the rest as the pipeline runs.
+
+    NO ``phase`` field on purpose (#890): the web app strips it before every
+    write (saveResearch — "phase is BE-owned"), and the FE's list-page
+    hydration reads it into the pipeline's currentPhase. A bridge-stamped
+    ``phase: 0`` on a still-QUEUED run made the chat flip to "run started"
+    (Stop/Pause controls up) before the run ever left the queue. The BE
+    stamps phase itself the moment the run really starts.
     """
     now_ms = int(time.time() * 1000)
     agents = cfg.get("agents") if isinstance(cfg, dict) else None
@@ -169,9 +177,9 @@ def _new_research_fields(
         "title": topic,
         "summary": "",
         "status": "queued",
-        "phase": 0,
         "deviceId": device_id,
         "submittedBy": uid,
+        "submittedByDisplayName": display_name,
         "viaAgent": True,
         "platforms": platforms,
         "documents": [],
@@ -236,12 +244,18 @@ def _enqueue_research_run(fs: FirestoreRest, sess: AccountSession, *, topic: str
     ``RevokedError`` / ``FirestoreError`` if the doc create fails; ``_EnqueueFailed``
     if the enqueue fails (the orphan doc is cleaned up first)."""
     rid = "agent-" + uuid.uuid4().hex[:16]
+    # The web app stamps submittedByDisplayName (displayName || email local-
+    # part) on both docs; the bridge only knows the email — mirror the FE's
+    # local-part fallback so owner-side surfaces label the sharer identically.
+    display_name = (sess.email or "").split("@")[0]
     fs.upsert_research(sess.uid, rid,
-                       _new_research_fields(topic, device_id, sess.uid, cfg, origin))
+                       _new_research_fields(topic, device_id, sess.uid, cfg, origin,
+                                            display_name=display_name))
     try:
         qid = fs.enqueue_start(
             device_id, uid=sess.uid, research_id=rid,
             topic=topic, email=sess.email, config_obj=cfg or {},
+            display_name=display_name,
         )
     except (RevokedError, FirestoreError) as e:
         # The chat doc is already created; the enqueue failed (e.g. the device isn't
@@ -2002,6 +2016,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     "topic": r.get("topic"),
                     "status": status,
                     "phase": r.get("phase"),
+                    # A queued run's place in line — sr.py renders "queued —
+                    # #N in line" from this (#890; absent once the run starts).
+                    "queuePosition": r.get("queuePosition"),
                     "updatedAt": r.get("updatedAt"),
                     "links": runview.flatten_links(r.get("links")),
                     "srLinks": sr,
