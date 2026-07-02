@@ -37,7 +37,7 @@ The supervisor (`--resurrect` / `--retire`) is cross-platform first-class on all
   - **ChatGPT Pro** ($200/mo per seat) — Phase 1 brief uses Pro + Extended Thinking.
   - **Claude Pro** ($20/mo per seat) — Phase 2 Claude agent uses Opus 4.8 + Max effort + Adaptive Thinking + Research tool (Free tiers don't expose Opus or Research).
   - **Gemini Advanced** ($20/mo per seat, via Google One AI Premium) — Phase 2 Gemini agent uses 2.5 Pro / Deep Think + Deep Research.
-  - The pipeline will *run* end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower. **Phase 0 vision-checks each platform's tier after login-verify and hard-flags the first non-Pro account it finds** with a `[Continue with Free] [Retry]` alert — sign out, sign in with a Pro account in the same browser, then click Retry to re-verify. Opting into Free for one platform suppresses the prompt for the rest of the run, so verify Pro is active in each platform's account/billing page before pairing to avoid surprises. (Stop is always reachable from the chat-box during a paused pipeline — no separate Stop button on the alert.)
+  - The pipeline will *run* end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower. **A non-Pro account is flagged with a `[Continue with Free] [Retry]` alert** — via the in-phase tier tells by default (ChatGPT's P1 Pro selector, Gemini's P2 DOM read), or Phase 0's vision check when the opt-in "Verify sign-ins before each run" Setting is on — sign in with a Pro account in the same browser, then click Retry. Opting into Free for one platform suppresses the prompt for the rest of the run, so verify Pro is active in each platform's account/billing page before pairing to avoid surprises. (Stop is always reachable from the chat-box during a paused pipeline — no separate Stop button on the alert.)
 - *(Optional)* Gemini API key for the narrator's Flash fallback. (Phase 4 — YouTube upload — and Phase 5 — Google Doc creation + email — both run entirely in the frontend; no BE-side Resend / YouTube / Docs setup needed.)
 
 ## Quick Start
@@ -334,9 +334,9 @@ On verified paste, the BE writes the key to **BE-local persistence**: Windows Us
 Skip is first-class per key — pair finishes regardless. Missing Anthropic falls back to **Playwright-only** verification in Stage 4 (less rigorous; no Pro-tier check) and surfaces a `cua_unavailable` alert at first job (recoverable via the chat-side `[Retry]` button once you add the key); missing Gemini silently disables narration.
 
 **`[4/5] Browser logins`**
-Runs the same real-Chrome two-phase engine `--login` uses:
-- **Phase 1 — real Chrome sign-in.** Opens your *real, non-automated* Chrome (a plain subprocess) on the profile, pointed at the ChatGPT / Gemini / Claude / NotebookLM sign-in pages. You sign into each and solve any human-verification, then press Enter. Real Chrome is used here because Google BotGuard / Cloudflare block the automated browser on sign-in pages.
-- **Phase 2 — patchright verify.** Patchright reopens the same warm profile and verifies each platform is signed in, plus checks Pro tier (ChatGPT / Claude / Gemini).
+Runs the same real-Chrome sign-in engine `--login` uses:
+- **Phase 1 — real Chrome sign-in.** Opens your *real, non-automated* Chrome (a plain subprocess) on the profile, pointed at the ChatGPT / Gemini / Claude / NotebookLM sign-in pages. You sign into each and solve any human-verification, then press Enter. Real Chrome is used here because Google BotGuard / Cloudflare block the automated browser on sign-in pages — and a human sign-in also *warms* the fresh profile's trust.
+- **Verification is optional (2026-07-02).** Pair then asks `Skip the verification step? [Y/n]` — **Enter skips** (recommended: automated verify navigations on a brand-new profile are the strongest bot-score signal, and runs recheck logins at phase time anyway). Your per-platform state is still recorded truthfully via a local cookie read (zero page loads). Answer `n` to run the old patchright verify pass (sign-in + Pro tier per platform). `--login` never verifies — it's Phase 1 + the add-another-profile loop only.
 
 The four platforms:
 - ChatGPT (chatgpt.com)
@@ -344,7 +344,7 @@ The four platforms:
 - Claude (claude.ai)
 - NotebookLM (notebooklm.google.com)
 
-If any platform is not-signed-in or on Free, an interactive prompt offers **[r]** reopen your real Chrome to fix (sign in / switch to Pro) or **[Enter]** continue as-is (keep Free / skip a missing platform). Verify also TOLERATES a Cloudflare / human-verification interstitial — it records "couldn't verify (likely still signed in)" instead of a false "not signed in". Ctrl+C cancels. The pair completes and the supervisor arms even on partial or zero logins — a login hiccup no longer blocks pairing.
+When the optional verify pass runs and a platform is not-signed-in or on Free, an interactive prompt offers **[r]** reopen your real Chrome to fix (sign in / switch to Pro) or **[Enter]** continue as-is (keep Free / skip a missing platform). Verify also TOLERATES a Cloudflare / human-verification interstitial — it records "couldn't verify (likely still signed in)" instead of a false "not signed in". Ctrl+C cancels. The pair completes and the supervisor arms even on partial or zero logins — a login hiccup no longer blocks pairing.
 
 > Phases 4 + 5 run in the frontend now (YouTube via Data API, Doc + email via Docs API + Resend), so YouTube Studio, Gmail, and Google Docs are no longer in the BE login checklist.
 
@@ -532,7 +532,7 @@ Per-user scoping is enforced by Firestore rules + the BE's custom claim. Sharers
 | 4. YouTube | FE-owned: Data API (ffmpeg encode + `youtube.videos.insert` via OAuth) | ~1-2 min |
 | 5. Report | FE-owned: Docs API + Resend | ~3 min |
 
-Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT Pro, Claude Pro, and Gemini Advanced are the assumed baseline — see [Before you start](#before-you-start-prerequisites-checklist) for per-seat costs. Phase 0 vision-checks each platform's tier after login-verify and hard-flags non-Pro accounts with `[Continue with Free] [Retry]` before Phase 1 starts; Retry re-verifies after you sign in with a Pro account in the same browser. If you `Continue with Free` (or have Phase 0 verification disabled in Settings), the pipeline runs end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower than what the per-agent timings, prompts, and waits were tuned against, so per-agent output is much shallower.
+Times based on real run analytics. Total: ~1h 50m for a full pipeline. ChatGPT Pro, Claude Pro, and Gemini Advanced are the assumed baseline — see [Before you start](#before-you-start-prerequisites-checklist) for per-seat costs. Non-Pro accounts are flagged with `[Continue with Free] [Retry]` — by the in-phase tier tells by default (verification is opt-in since 2026-07-02), or by Phase 0's vision check when that Setting is on; Retry re-checks after you sign in with a Pro account in the same browser. If you `Continue with Free`, the pipeline runs end-to-end on Free tiers, but Deep Research depth, image quality, and turn limits are far lower than what the per-agent timings, prompts, and waits were tuned against, so per-agent output is much shallower.
 
 ## Phase + per-agent narration (consolidated 2026-04-30)
 
@@ -546,15 +546,15 @@ Long quiet stretches in Phases 1–3 are expected (ChatGPT Pro thinks for ~3 min
 
 > **Narration brain envs:** `DG_NARRATOR_USE_GEMINI` (default `1`; set `0` to skip Gemini and go straight to the Haiku fallback — renamed from `DG_NARRATOR_USE_HAIKU` on 2026-05-28 when the primary swapped, with the old name honored as a backwards-compat alias for one release), `GEMINI_TEXT_MODEL` (default `gemini-3.5-flash`, also drives narrator primary), `DG_NARRATOR_HAIKU_MODEL` (default `claude-haiku-4-5`, the cross-vendor fallback), `DG_VISION_NARRATE` (default `0`; set `1` to re-enable the retired vision narrator). All optional.
 
-## Phase 0 verification (sequential, Apr 19; 2026-04-24 simplified)
+## Phase 0 verification (OPT-IN since 2026-07-02)
 
-Preflight walks platforms one at a time instead of opening all tabs at once. For each enabled platform:
+**Login verification is off by default for every account** — proactive verify navigations are the strongest bot-score signal on fresh profiles (live evidence: a verify pass sailed through and the Cloudflare challenge hit the *work* page seconds later). Turn it back on per-account via Settings → Pipeline → "Verify sign-ins before each run" (`verifyLogins`). What replaces it:
 
-1. **Tab open** — opens that one tab, waits 4s for SPA hydration, checks URL for known login hosts.
-2. **CUA vision verification** if URL check is ambiguous.
-3. **`login_required`** scoped to that ONE platform if still not logged in. Pause for user retry. The next platform does NOT open until the current one is resolved (Cloudflare stealth + less user overwhelm).
+- **Phase-time cookie trust** — before each phase touches a platform, a local cookie read (zero page loads) confirms the profile still holds that platform's session cookie. Cookie present → trusted; genuinely missing → the full tab+vision gate + `login_required` card runs, exactly as before.
+- **Stale-cookie honesty** — a session that died server-side (cookie present but invalid) is caught by the phase's own failure paths, which now probe the already-open page for a login wall and surface an actionable "looks signed out" card (never the old generic "didn't start"); that platform is then re-verified for real on Retry.
+- **Tier tells without navigation** — ChatGPT: the P1 Pro-selector backstop; Gemini: a DOM tier read on its P2 work page; Claude: the chat-mode card (Free Claude lacks the Research tool).
 
-Cookie-only fast-path was removed 2026-04-24 — cookies lie when sessions are server-side invalidated. Phase 0 is now the only login gate; per-phase cookie probes were also removed. Mid-run session drift is caught by the active-platform CUA loop's session-expiry detector (2× consecutive confirms 2 min apart).
+When verification IS enabled, preflight walks platforms one at a time (tab open → 4s hydration → URL check → CUA vision → per-platform `login_required`), exactly the 2026-04-24 sequential design.
 
 ## Phase 2 — per-agent extraction rules (Apr 19 late-late)
 

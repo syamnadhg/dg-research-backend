@@ -8160,6 +8160,11 @@ class PipelineControls:
         # Phase 0: user hit Retry on the login_required banner — triggers a
         # fresh phase_start emit so the frontend can render a new tile below.
         self.retry_init_verify: bool = False
+        # #893: platforms whose trusted session cookie was FALSIFIED mid-run
+        # (a login wall appeared on their work page). The phase-time gate's
+        # cookie fast path skips these, so a post-sign-in Retry runs the full
+        # verify instead of re-trusting the stale jar.
+        self.cookie_trust_broken: set[str] = set()
         # Phase 2: per-agent skip requests. Sent by the watchdog's
         # BackendSilentBanner (when a specific agent is picked mid-stall) and
         # by HumanVerifyBanner's "Skip agent" button. Lower-case agent keys
@@ -8389,6 +8394,7 @@ class PipelineControls:
         self.pending_agent_decision = None
         self.skip_init_verify = False
         self.retry_init_verify = False
+        self.cookie_trust_broken.clear()
         self.skipped_agents.clear()
         self.skipped_phases.clear()
         self.continue_anyway = False
@@ -12421,6 +12427,99 @@ _PLATFORM_LABEL_BY_KEY = {
     "notebooklm": "NotebookLM",
 }
 
+# The SESSION cookie each platform sets only while signed in — the gate's
+# trust-first probe (below). EXPLICIT names on purpose: loose prefixes
+# (__Secure-*) match consent/teleletry cookies Google + OpenAI set logged-OUT,
+# which would make the probe lie in the dangerous direction. If a platform
+# rotates its cookie name the probe just returns False and the full verify
+# gate runs — slower, never wrong-side.
+_PHASE_GATE_AUTH_COOKIES = {
+    "chatgpt":    ("chatgpt.com", ("__Secure-next-auth.session-token",)),
+    "claude":     ("claude.ai", ("sessionKey",)),
+    "gemini":     ("google.com", _SECURITY_GOOGLE_AUTH_COOKIE_NAMES),
+    "notebooklm": ("google.com", _SECURITY_GOOGLE_AUTH_COOKIE_NAMES),
+}
+
+
+async def _platform_auth_cookie_present(browser, agent_key: str) -> bool:
+    """Trust-first probe for the phase-time gate (2026-07-02, bot-score work):
+    does the profile still HOLD the platform's session cookie? Read-only on
+    the browser context — NO navigation, which is the whole point (the gate's
+    proactive verify tab was the top bot-score signal on fresh profiles; live
+    evidence 2026-07-02: verify PASSED at 00:31:24, the Cloudflare challenge
+    hit the WORK page 16s later — the verify tab was pure extra exposure).
+
+    A present cookie CAN lie (server-side-invalidated session) — that trade is
+    deliberate now that verification is off by default (user direction
+    2026-07-02, inverting the 2026-04-24 "Phase 0 is the only gate and must
+    not lie" premise): the phase's own failure handling + the human-verify
+    cascade catch the rare stale-cookie case, while every healthy run saves
+    up to 5 proactive navigations. A MISSING cookie stays reliable — genuinely
+    signed out → the caller falls through to the full verify gate + its
+    login_required card."""
+    spec = _PHASE_GATE_AUTH_COOKIES.get(agent_key)
+    if spec is None:
+        return False
+    domain_suffix, names = spec
+    try:
+        cookies = await browser.context.cookies()
+    except Exception as e:
+        log(f"[gate] cookie probe failed ({e}) — falling back to full verify", "DEBUG")
+        return False
+    now = time.time()
+    for c in cookies:
+        cd = (c.get("domain") or "").lstrip(".").lower()
+        if not (cd == domain_suffix or cd.endswith("." + domain_suffix)):
+            continue
+        _cn = c.get("name") or ""
+        # Exact name, or a CHUNKED variant ("<name>.0"/"<name>.1" — NextAuth
+        # splits session JWEs over ~4KB; without this, chunked-cookie ChatGPT
+        # accounts would fall through to the verify tab on every run, quietly
+        # reinstating the exposure #893 removes). The dot-suffix rule cannot
+        # match the logged-out lookalikes (callback-url etc. share no prefix).
+        if _cn not in names and not any(_cn.startswith(n + ".") for n in names):
+            continue
+        exp = c.get("expires")
+        if isinstance(exp, (int, float)) and exp > 0 and exp < now:
+            continue  # expired-but-not-yet-purged
+        if c.get("value"):
+            return True
+    return False
+
+
+async def _page_shows_login_wall(page) -> "str | None":
+    """Zero-navigation signed-out probe on an ALREADY-OPEN page (#893): a
+    login-host URL, or ChatGPT's anonymous-landing Log in / Sign up buttons
+    (chatgpt.com serves the logged-out UI on its canonical host, so the URL
+    check alone misses it). Returns a short detail string when a wall is
+    visible, else None.
+
+    Why: the cookie-trust gate can pass a session that died SERVER-side
+    (cookie present, session invalidated — the documented 2026-04-24 lie).
+    This is the failure-path tell that turns a generic "didn't start" card
+    into an actionable "signed out" one, and flips the platform into
+    _controls.cookie_trust_broken so the next gate check runs the FULL
+    verify instead of re-trusting the stale jar. Best-effort, never raises."""
+    if page is None:
+        return None
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        return None
+    for h in _LOGIN_HOST_NEGATIVES:
+        if h in url:
+            return f"login page ({h})"
+    try:
+        if await page.evaluate(
+            "() => !!document.querySelector('"
+            "[data-testid=\"login-button\"], [data-testid=\"signup-button\"], "
+            "a[href*=\"/auth/login\"]')"
+        ):
+            return "logged-out landing (Log in button visible)"
+    except Exception:
+        pass
+    return None
+
 
 async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) -> str:
     """Phase-time login + pro-tier re-verification gate. Triggered ONLY when
@@ -12468,7 +12567,24 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
     label = _PLATFORM_LABEL_BY_KEY.get(agent_key, agent_key.title())
     info = LOGIN_PLATFORMS.get(agent_key)
     root = info["root"] if info else "about:blank"
-    log(f"Phase {phase}: re-verifying {label} (init was skipped — phase-time gate)", "INFO")
+
+    # Trust-first fast path (2026-07-02): session cookie present → trust the
+    # sign-in with ZERO navigations (no verify tab, no CUA call, no gate
+    # tier check). The tier tells that remain: ChatGPT = the P1 Pro-selector
+    # backstop (phase1/setup_pro_backstop); Gemini = the 2C DOM-tier read on
+    # its work page (phase2/setup_pro_backstop); Claude = the chat-mode card
+    # (Free Claude lacks the Research tool, which that card surfaces). A
+    # platform whose trusted cookie later turned out STALE (a mid-phase
+    # login wall was seen — _page_shows_login_wall) is in cookie_trust_broken
+    # and skips this path, so the post-sign-in Retry re-verifies for real.
+    if agent_key not in getattr(_controls, "cookie_trust_broken", set()) \
+            and await _platform_auth_cookie_present(browser, agent_key):
+        log(f"Phase {phase}: {label} session cookie present — trusting sign-in (no verify tab)", "INFO")
+        emit_event("agent_progress", phase=phase, agent=agent_key,
+                   status="verified", progress=f"{label}: sign-in trusted ✓")
+        return "ok"
+
+    log(f"Phase {phase}: re-verifying {label} (no session cookie — phase-time gate)", "INFO")
 
     while True:
         if _controls.is_stop():
@@ -24351,10 +24467,39 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                     f"silent retry {_pro_silent_retries}/{_PRO_SILENT_RETRY_MAX} before escalating", "INFO")
                 await asyncio.sleep(2)
                 continue
-            # Silent retries exhausted — this is a genuine downgrade (or a
-            # persistent detection failure). Log the exact CUA verdict so a
-            # post-E2E review can confirm it wasn't a transient miss, then
-            # escalate to the Tier-2 pro_required decision card.
+            # Silent retries exhausted. #893: with verification off by default
+            # a STALE trusted cookie serves ChatGPT's ANONYMOUS landing (which
+            # has a composer) — a signed-out session reads as "no Pro". Probe
+            # the already-open page (zero navigations) and surface the honest
+            # login_required card instead of misattributing it to the tier.
+            _p1_wall = await _page_shows_login_wall(browser.page)
+            if _p1_wall:
+                _controls.cookie_trust_broken.add("chatgpt")
+                log(f"Phase 1: ChatGPT shows {_p1_wall} — the no-Pro verdict is a signed-out session; surfacing login_required", "WARN")
+                _p1_login_msg = ("ChatGPT is showing its sign-in page — the saved session expired. "
+                                 "Sign in using the open browser (or run the login command on the device), then Retry.")
+                _p1_login_alert_id = "phase1_login_required_chatgpt"
+                emit_event("login_required", phase=1, platforms=["chatgpt"],
+                           platformLabels=["ChatGPT"], machineName=socket.gethostname(),
+                           attempt=1, message=_p1_login_msg, alert_id=_p1_login_alert_id)
+                _controls.request_pause("login_required")
+                emit_event("pipeline_paused", phase=1, reason="login_required")
+                _persist_pending_decision({
+                    "kind": "login_required", "phase": 1, "platforms": ["chatgpt"],
+                    "platformLabels": ["ChatGPT"], "machineName": socket.gethostname(),
+                    "attempt": 1, "message": _p1_login_msg, "alert_id": _p1_login_alert_id,
+                })
+                await _controls.wait_if_paused()
+                _clear_pending_decision()
+                if _controls.is_stop():
+                    emit_event("pipeline_stopped", phase=1, reason="stopped during login_required")
+                    return None
+                _controls.consume_retry_phase(1)
+                emit_event("pipeline_resumed", phase=1, reason="retry")
+                continue  # re-run the Pro selector on the now-signed-in page
+            # A genuine downgrade (or a persistent detection failure). Log the
+            # exact CUA verdict so a post-E2E review can confirm it wasn't a
+            # transient miss, then escalate to the Tier-2 pro_required card.
             log(f"Phase 1: Pro mode not available (cua verdict: {last[:120]!r}) — Phase 0 was skipped or Pro was revoked; surfacing alert", "WARN")
             _emit_pro_required_alert(phase=1, agent="chatgpt", source="phase1/setup_pro_backstop")
             _controls.request_pause("pro_required")
@@ -27882,8 +28027,19 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # forever waiting for events that will never arrive.
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
                            progress="ChatGPT setup/paste failed — agent did not start.")
-                fail_agent("chatgpt", "ChatGPT didn't start",
-                           "ChatGPT failed to launch after two tries. Retry to start it fresh, or Skip it.")
+                # #893: a stale trusted cookie lands here via a login wall —
+                # name the real cause so Retry is winnable (the generic card
+                # sent users into an identical losing retry loop).
+                _cg_wall = await _page_shows_login_wall(chatgpt_page)
+                if _cg_wall:
+                    _controls.cookie_trust_broken.add("chatgpt")
+                    log(f"[2A] ChatGPT shows {_cg_wall} — session expired (stale cookie)", "WARN")
+                    fail_agent("chatgpt", "ChatGPT looks signed out",
+                               "ChatGPT is showing its sign-in page — the saved session expired. "
+                               "Sign in using the open browser (or run the login command on the device), then Retry.")
+                else:
+                    fail_agent("chatgpt", "ChatGPT didn't start",
+                               "ChatGPT failed to launch after two tries. Retry to start it fresh, or Skip it.")
                 try:
                     _controls.skipped_agents.add("chatgpt")
                 except Exception:
@@ -27891,14 +28047,19 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     else:
         log("\n--- 2A: ChatGPT SKIPPED (disabled in config) ---")
 
-    # ── Startup gap: 30s before opening the next agent ──
+    # ── Startup gap before opening the next agent ──
     # Human-cadence stagger reduces anti-bot signal and lets ChatGPT's DR
     # iframe settle before we start issuing Claude commands. User-locked
-    # 2026-04 overhaul: sequential 30s gaps, each agent verify-started
-    # before moving on.
+    # 2026-04 overhaul: sequential gaps, each agent verify-started before
+    # moving on. Env-tunable (2026-07-02, bot-score work): DG_P2_STAGGER_SEC.
+    try:
+        _p2_stagger_sec = int(os.environ.get("DG_P2_STAGGER_SEC", "30"))
+    except ValueError:
+        log("DG_P2_STAGGER_SEC is not an integer — using 30", "WARN")
+        _p2_stagger_sec = 30
     if enabled_agents is None or "claude" in enabled_agents:
-        log("\n[Startup gap] Waiting 30s before opening Claude...")
-        await asyncio.sleep(30)
+        log(f"\n[Startup gap] Waiting {_p2_stagger_sec}s before opening Claude...")
+        await asyncio.sleep(_p2_stagger_sec)
 
     # ── Step 2 (2B): Claude — Opus 4.8 + Max effort + Adaptive Thinking + Research tool ──
     if enabled_agents is None or "claude" in enabled_agents:
@@ -27953,8 +28114,17 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2B] Claude setup failed", "ERROR")
                 emit_event("agent_progress", phase=2, agent="claude", status="failed",
                            progress="Claude setup/paste failed — agent did not start.")
-                fail_agent("claude", "Claude didn't start",
-                           "Claude failed to launch after two tries. Retry to start it fresh, or Skip it.")
+                # #893: stale-cookie login wall → honest signed-out card.
+                _cl_wall = await _page_shows_login_wall(claude_page)
+                if _cl_wall:
+                    _controls.cookie_trust_broken.add("claude")
+                    log(f"[2B] Claude shows {_cl_wall} — session expired (stale cookie)", "WARN")
+                    fail_agent("claude", "Claude looks signed out",
+                               "Claude is showing its sign-in page — the saved session expired. "
+                               "Sign in using the open browser (or run the login command on the device), then Retry.")
+                else:
+                    fail_agent("claude", "Claude didn't start",
+                               "Claude failed to launch after two tries. Retry to start it fresh, or Skip it.")
                 try:
                     _controls.skipped_agents.add("claude")
                 except Exception:
@@ -27962,10 +28132,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     else:
         log("\n--- 2B: Claude SKIPPED (disabled in config) ---")
 
-    # ── Startup gap: 30s before opening Gemini ──
+    # ── Startup gap before opening Gemini (same DG_P2_STAGGER_SEC knob) ──
     if enabled_agents is None or "gemini" in enabled_agents:
-        log("\n[Startup gap] Waiting 30s before opening Gemini...")
-        await asyncio.sleep(30)
+        log(f"\n[Startup gap] Waiting {_p2_stagger_sec}s before opening Gemini...")
+        await asyncio.sleep(_p2_stagger_sec)
 
     # ── Step 3 (2C): Gemini — submit brief, let it generate plan (don't click Start yet) ──
     gemini_setup_ok = False
@@ -27981,6 +28151,34 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         if gemini_setup_ok:
             log("[2C] Gemini brief submitted — letting it generate research plan")
             emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini generating research plan...")
+            # #893 tier backstop: with verification off by default, the P0
+            # walk + gate tier checks no longer run — this DOM read on the
+            # ALREADY-OPEN work page (zero navigations, no CUA) is Gemini's
+            # only Free-tier tell. Free output silently degrades DR quality,
+            # which is exactly what pro_required exists to surface. Fail-open
+            # ("unsure" → no card), one-shot, respects prior consent.
+            if (not _controls.pro_warning_acknowledged
+                    and not _controls.free_tier_consent.get("gemini", False)
+                    and "gemini" not in _controls.skipped_agents):
+                try:
+                    _gm_tier = await _gemini_dom_tier(gemini_page)
+                except Exception:
+                    _gm_tier = "unsure"
+                if _gm_tier == "free":
+                    log("[2C] Gemini DOM tier reads FREE — surfacing pro_required (verification is off by default)", "WARN")
+                    _emit_pro_required_alert(phase=2, agent="gemini", source="phase2/setup_pro_backstop")
+                    _controls.request_pause("pro_required")
+                    emit_event("pipeline_paused", phase=2, reason="pro_required")
+                    await _controls.wait_if_paused()
+                    if not _controls.is_stop():
+                        if _controls.consume_retry_phase(2):
+                            emit_event("pipeline_resumed", phase=2, reason="pro_retry")
+                        elif "gemini" not in _controls.skipped_agents:
+                            _controls.consume_continue_anyway()
+                            _controls.pro_warning_acknowledged = True
+                            log("[2C] user opted into Free-tier Gemini — continuing", "INFO")
+                            _clear_pro_required_alerts(triggered_at_phase=2)
+                            emit_event("pipeline_resumed", phase=2, reason="continue_with_free")
         else:
             # Setup or paste failed — start_agent_no_gemini_wait already emitted
             # pipeline_error with Retry/Skip actions. Mark Gemini terminally
@@ -27989,6 +28187,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             log("[2C] Gemini setup/brief delivery failed — marking agent failed, skipping [2D] plan wait", "ERROR")
             emit_event("agent_progress", phase=2, agent="gemini", status="failed",
                        progress="Gemini setup/brief delivery failed — agent did not start.")
+            # #893: stale-cookie login wall → record it so the next gate check
+            # runs the full verify (the pipeline_error card already offers
+            # Retry/Skip; a Google login redirect is the giveaway here).
+            _gm_wall = await _page_shows_login_wall(gemini_page)
+            if _gm_wall:
+                _controls.cookie_trust_broken.add("gemini")
+                log(f"[2C] Gemini shows {_gm_wall} — session expired (stale cookie)", "WARN")
             try:
                 _controls.skipped_agents.add("gemini")
             except Exception:
@@ -31129,7 +31334,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # disk-config value, and the Phase 0 entry block primes
         # _controls.skip_init_verify from it before the verify loop
         # starts.
-        siv = bool(pipeline_config.get("skipInitVerify", False))
+        # 2026-07-02: default flipped to TRUE — init verification is OFF for
+        # every account unless it explicitly set skipInitVerify=false. On a
+        # fresh profile the proactive verify navigations are the strongest
+        # bot-score signal; the phase-time gate (now on the work page) and the
+        # human-verify cascade still cover a genuinely logged-out platform.
+        siv = bool(pipeline_config.get("skipInitVerify", True))
         return sp, ac, ve, ee, pl, siv
 
     skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length, skip_init_verify_cfg = reload_config()
@@ -31590,7 +31800,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # login verification, plus any per-run override in pipeline_config).
         # When on, we skip the per-platform CUA round entirely: browser is
         # already running, Phase 1 will navigate itself to ChatGPT.
-        _skip_verify_pref = bool(pipeline_config.get("skipInitVerify", False)) if isinstance(pipeline_config, dict) else False
+        # 2026-07-02: default TRUE — verification is opt-IN (explicit false).
+        _skip_verify_pref = bool(pipeline_config.get("skipInitVerify", True)) if isinstance(pipeline_config, dict) else True
         if _skip_verify_pref:
             log("Phase 0: skipInitVerify=true — bypassing login verification per user pref", "INFO")
             emit_event("agent_progress", phase=0, agent="system", status="Skipped",
@@ -33326,12 +33537,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                                 "downstream link may be private", "WARN")
                         break
                     log(f"Phase 3: no verified NotebookLM URL after retries — awaiting user decision ({nb_res.error})", "ERROR")
-                    fail_phase(
-                        phase=3,
-                        error="Couldn't get the NotebookLM link",
-                        reason="NotebookLM finished but we couldn't get its share link. Retry to try again, or Skip it.",
-                        agent="notebooklm",
-                    )
+                    # #893: a stale trusted Google cookie lands here as a
+                    # sign-in redirect — name the real cause so the card is
+                    # actionable (and re-verify for real on the next gate).
+                    _nb_wall = await _page_shows_login_wall(getattr(browser, "page", None))
+                    if _nb_wall:
+                        _controls.cookie_trust_broken.add("notebooklm")
+                        log(f"[NotebookLM] shows {_nb_wall} — Google session expired (stale cookie)", "WARN")
+                        fail_phase(
+                            phase=3,
+                            error="NotebookLM looks signed out",
+                            reason="Google is asking to sign in again — the saved session expired. "
+                                   "Sign in using the open browser (or run the login command on the device), then Retry.",
+                            agent="notebooklm",
+                        )
+                    else:
+                        fail_phase(
+                            phase=3,
+                            error="Couldn't get the NotebookLM link",
+                            reason="NotebookLM finished but we couldn't get its share link. Retry to try again, or Skip it.",
+                            agent="notebooklm",
+                        )
                     decision = await _controls.await_phase_decision(3)
                     if decision == "retry":
                         # 2026-05-07 (Bug A1): if the URL we have isn't even on
@@ -37563,21 +37789,93 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
         emit_row(name, status != "missing", label)
 
 
-async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_row, security_check=None) -> str:
-    """Sign in + verify ONE profile — the shared engine for `--login` and pair
-    Step 4. Phase 1 = the user's plain Chrome (human signs in on the un-detected
-    surface); phase 2 = patchright reopens the now-warm profile, runs an optional
-    `security_check(browser) -> refuse-bool`, then verifies each login + Pro tier.
+async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_row,
+                             security_check=None, verify_mode="verify") -> str:
+    """Sign in ONE profile — the shared engine for `--login` and pair Step 4.
+    Phase 1 = the user's plain Chrome (human signs in on the un-detected surface,
+    and can clear any Cloudflare check by hand — a REAL human interaction that
+    WARMS the profile). Phase 2 (verification) is now OPTIONAL (2026-07-02):
+    automated verify navigations on a brand-new profile are the riskiest bot
+    signal, and runs recheck logins at phase time anyway.
+
+    verify_mode:
+      'verify' — Phase 2 as before: patchright reopens the profile, runs the
+                 optional ``security_check(browser) -> refuse-bool``, verifies
+                 each login + Pro tier, offers the reopen-to-fix loop.
+      'skip'   — trust the sign-in: no platform navigations at all. Every
+                 service is recorded True (the human just signed in). The
+                 ``security_check`` still runs (a cookie read on the patchright
+                 context — zero page loads, so no bot exposure; DGOPS-7451 must
+                 not be skippable).
+      'ask'    — after Phase 1, ask "Skip the verification step? [Y/n]" —
+                 Enter/y ⇒ 'skip' (default: verification is the bot-score
+                 risk), n ⇒ 'verify'.
+
     Mutates `results`. Returns 'ok' | 'no_chrome' | 'refused'. Raises
     KeyboardInterrupt on Ctrl+C (universal cancel) — the caller handles it."""
     service_urls = [u for _n, u, _k in _LOGIN_SERVICES]
     reopen = False
+    resolved_mode: "str | None" = None  # 'ask' answers once, then sticks
     while True:
         # Phase 1 — plain Chrome sign-in (all tabs). On a reopen the user just
         # fixes the flagged platforms.
         seeded = await _seed_login_plain_chrome(profile_dir, service_urls, label, reopen=reopen)  # may raise KeyboardInterrupt
         if not seeded:
             return "no_chrome"
+        mode = resolved_mode or verify_mode
+        if mode == "ask":
+            print()
+            print(f"  {_c(_DIM, 'Optional: verify each sign-in with the automated browser (opens every')}")
+            print(f"  {_c(_DIM, 'platform once). On a fresh profile this can trip bot checks — skipping')}")
+            print(f"  {_c(_DIM, 'is recommended; runs recheck logins at phase time anyway.')}")
+            ans = (await asyncio.to_thread(
+                input, f"  {_c(_ACCENT, '>')}  Skip the verification step? {_c(_DIM, '[Y/n]')}: "
+            )).strip().lower()  # Ctrl+C propagates — universal cancel
+            mode = "verify" if ans in ("n", "no") else "skip"
+        # Pin the answer for the [r] reopen-to-fix loop — re-asking there let a
+        # habitual Enter (default skip) silently defeat the re-verify the user
+        # explicitly chose one prompt earlier.
+        resolved_mode = mode
+        if mode == "skip":
+            # Trust the human sign-in — no platform NAVIGATIONS. But record
+            # TRUTHFUL per-platform state via a cookie read on the profile
+            # (zero page loads): a user who closed Chrome without signing in
+            # must not mint green login badges or a worker slot. The security
+            # check (pair F4, DGOPS-7451) rides the same context open.
+            _probe_ok = False
+            browser = Browser(profile_dir, headless=False)
+            try:
+                async with _async_spinner_ctx("Checking the profile"):
+                    await browser.start()
+                if security_check is not None:
+                    try:
+                        if await security_check(browser):
+                            return "refused"
+                    except Exception as _sec_err:
+                        log(f"login: security check errored (continuing): {_sec_err}", "WARN")
+                for _n2, _u2, _k2 in _LOGIN_SERVICES:
+                    results[_k2] = await _platform_auth_cookie_present(browser, _k2)
+                _probe_ok = True
+            except Exception as _pr_err:
+                log(f"login: cookie probe unavailable ({_pr_err}) — trusting the sign-in", "WARN")
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            if not _probe_ok:
+                # Probe itself failed (not "cookies absent") — fail open: the
+                # human just signed in, and phase time rechecks anyway.
+                for _n2, _u2, _k2 in _LOGIN_SERVICES:
+                    results.setdefault(_k2, True)
+            _held = [nm for nm, _u, k in _LOGIN_SERVICES if results.get(k)]
+            _absent = [nm for nm, _u, k in _LOGIN_SERVICES if not results.get(k)]
+            if _held:
+                print(f"  {_c(_DIM, 'Sessions found: ' + ', '.join(_held) + ' — trusting your sign-in (no automated verification).')}")
+            if _absent:
+                print(f"  {_c(_WARN, 'No session found for:')} {_c(_BOLD, ', '.join(_absent))}")
+                print(f"  {_c(_DIM, '     Sign in there with another pass, or continue without — runs recheck at phase time.')}")
+            return "ok"
         # Phase 2 — patchright reopens the now-warm profile + verifies.
         flags: "dict[str, str]" = {}
         browser = Browser(profile_dir, headless=False)
@@ -37627,16 +37925,19 @@ async def run_login_flow(
     cua_client=None,
     device_id_for_progress: "str | None" = None,
     allow_add: bool = False,
+    verify_mode: str = "skip",
 ) -> "tuple[dict[int, dict], bool]":
-    """The two-phase login flow shared by `--login` and (later) pair Step 4:
+    """The login flow shared by `--login` and pair Step 4:
       Phase 1 — plain Chrome (no automation): human signs in + clears any check.
-      Phase 2 — patchright reopens the profile + verifies logins + Pro tier.
+      Phase 2 — OPTIONAL verification (see _login_one_profile.verify_mode;
+      `--login` uses 'skip' — automated verify navigations on fresh profiles are
+      the top bot-score signal, and runs recheck logins at phase time anyway).
     Runs for each worker profile in `profile_indices` (the existing workers). With
     `allow_add=True` (used by `--login`), it then offers pair-Stage-4-style
-    "Add another browser profile?" prompts — running the SAME sign-in+verify per
-    added profile and bumping workerCount (save_worker_count) as each FULLY
-    verifies — so `--login` can grow the multi-worker profile set exactly like
-    pairing does, not just re-login the single existing one. Returns
+    "Add another browser profile?" prompts — running the SAME sign-in per added
+    profile and bumping workerCount (save_worker_count) as each COMPLETES
+    (sign-in done; verified too when verify_mode ran a verify) — so `--login`
+    can grow the multi-worker profile set exactly like pairing does. Returns
     ({profile_n: {key: bool}}, seeded_any) — seeded_any=False means no profile's
     Chrome could even be launched (e.g. Google Chrome not installed)."""
     services = _LOGIN_SERVICES
@@ -37658,7 +37959,8 @@ async def run_login_flow(
         results: "dict[str, bool]" = {}
         try:
             status = await _login_one_profile(
-                profile_dir, cua_client, label=label, results=results, emit_row=_row)
+                profile_dir, cua_client, label=label, results=results, emit_row=_row,
+                verify_mode=verify_mode)
         except (EOFError, KeyboardInterrupt):
             raise  # propagate the cancel (caller/main handles it)
         except Exception as e:
@@ -37721,12 +38023,12 @@ async def run_login_flow(
                     save_worker_count(next_n)
                 except Exception as _wc_err:
                     log(f"save_worker_count({next_n}) failed (continuing): {_wc_err}", "WARN")
-                print(f"  {_c(_OK, '✓')}  Profile {next_n} verified — concurrent capacity is now {next_n}.")
+                print(f"  {_c(_OK, '✓')}  Profile {next_n} ready — concurrent capacity is now {next_n}.")
                 next_n += 1
             else:
                 # Don't increment — the dir may hold partial cookies; user can wipe
                 # via --unpair --deep and retry that slot.
-                print(f"  {_c(_WARN, '⚠')}  Profile {next_n} not fully verified — keeping workerCount={next_n - 1}.")
+                print(f"  {_c(_WARN, '⚠')}  Profile {next_n} incomplete — keeping workerCount={next_n - 1}.")
 
     return all_results, seeded_any
 
@@ -37735,14 +38037,17 @@ async def run_login() -> None:
     """`--login`: open a REAL (non-automated) Chrome per worker profile so you can
     sign in to the platforms by hand — the reliable way past Google's
     "browser may not be secure" + Cloudflare's human-check, which block the
-    pipeline's automated browser at the sign-in page. Then verifies each login
-    (+ Pro tier) and, if this machine is paired, refreshes the app's login
-    badges. Re-run whenever a session expires. No pairing required; runs from a
-    source checkout or the installed command."""
+    pipeline's automated browser at the sign-in page. Signing in (and solving
+    any human-check) in real Chrome also WARMS the profile's trust. There is no
+    automated verification pass (2026-07-02 — verify navigations on a fresh
+    profile are the top bot-score signal; runs recheck logins at phase time);
+    after each profile it offers the pair-style "add another profile?" loop.
+    Re-run whenever a session expires. No pairing required; runs from a source
+    checkout or the installed command."""
     _branded_header("aditus", _BOLD + _ACCENT, "sign in on a real browser")
     print()
     print(f"  {_c(_DIM, 'We open your real Chrome — sign in to each platform (+ solve any check).')}")
-    print(f"  {_c(_DIM, 'Then each sign-in is verified + saved to the profile.')}")
+    print(f"  {_c(_DIM, 'Your sign-ins are saved to the profile; runs pick them up directly.')}")
 
     # Guard: --login frees + reopens each profile, which closes the browser a
     # running backend is using. Warn before disrupting an active research.
@@ -37783,9 +38088,10 @@ async def run_login() -> None:
         cua_client=cua_client,
         device_id_for_progress=device_id,
         allow_add=True,  # offer the pair-style "add another profile?" loop
+        verify_mode="skip",  # Phase 1 only — no automated verify navigations (2026-07-02)
     )
 
-    # Summary across all profiles.
+    # Summary across all profiles (results = cookie-probed session presence).
     print()
     _any_ok = any(any(r.values()) for r in results.values())
     _missing_names = sorted({
@@ -37796,13 +38102,13 @@ async def run_login() -> None:
     if _any_ok:
         print(f"  {_c(_OK, '✓')}  {_c(_BOLD, 'Done.')} {_c(_DIM, 'Signed-in platforms are saved to the profile — runs will reuse them.')}")
         if _missing_names:
-            print(f"  {_c(_WARN, '⚠')}  Not verified: {_c(_BOLD, ', '.join(_missing_names))}")
-            print(f"  {_c(_DIM, '     Re-run')}  {_c(_BOLD, _PROG + ' --login')}  {_c(_DIM, 'to finish those (or sign in during the next run).')}")
+            print(f"  {_c(_WARN, '⚠')}  No session found for: {_c(_BOLD, ', '.join(_missing_names))}")
+            print(f"  {_c(_DIM, '     Re-run')}  {_c(_BOLD, _PROG + ' --login')}  {_c(_DIM, 'to sign in there (or sign in during the next run).')}")
     elif not seeded_any:
         print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'Could not open Google Chrome.')}")
         print(f"  {_c(_DIM, '     ' + _chrome_install_hint())}")
     else:
-        print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'No platforms verified as signed in.')}")
+        print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'Sign-in did not complete.')}")
         print(f"  {_c(_DIM, '     If Chrome kept looping the human-check, it is likely your network/IP')}")
         print(f"  {_c(_DIM, '     (VPN / datacenter). Try a residential, non-VPN connection and re-run.')}")
     print()
@@ -37920,7 +38226,7 @@ async def _continue_pair_stages_2_to_5(
     # ══════════════════════════════════════════════════════════════════════
     _setup_step(4, 5, "Browser logins")
     print(f"  {_c(_DIM, 'We open your real Chrome — sign in to each platform (+ solve any check).')}")
-    print(f"  {_c(_DIM, 'Then each sign-in is verified.')}")
+    print(f"  {_c(_DIM, 'Your sign-ins are saved to the profile (verification optional afterwards).')}")
     print("")
 
     # Make sure the browser the pipeline drives is actually launchable before we
@@ -38040,12 +38346,16 @@ async def _continue_pair_stages_2_to_5(
             pass
         return False
 
-    # Profile 1 — real-Chrome sign-in + verify via the shared exception-safe
-    # engine (same as profile 2+). F4 runs in phase 2 via the security check.
+    # Profile 1 — real-Chrome sign-in via the shared exception-safe engine
+    # (same as profile 2+). Verification is OPTIONAL (ask, default skip): pair
+    # is exactly when the profile is brand-new, where automated verify
+    # navigations are the strongest bot-score signal (user direction
+    # 2026-07-02). The F4 security check runs either way (cookie read only).
     try:
         _p1_status = await _login_one_profile(
             profile_dir, _setup_cua_client, label="profile",
-            results=results, emit_row=_emit_row, security_check=_p1_security)
+            results=results, emit_row=_emit_row, security_check=_p1_security,
+            verify_mode="ask")
     except (EOFError, KeyboardInterrupt):
         print("")
         log("Setup cancelled by user (Stage 4 sign-in)", "INFO")
@@ -38121,7 +38431,7 @@ async def _continue_pair_stages_2_to_5(
             try:
                 await _login_one_profile(
                     prof_path, _setup_cua_client, label=f"profile {next_profile_n}",
-                    results=profile_n_results, emit_row=_emit_row)
+                    results=profile_n_results, emit_row=_emit_row, verify_mode="ask")
             except (EOFError, KeyboardInterrupt):
                 print("")
                 log(f"Multi-profile loop: Ctrl+C during profile {next_profile_n} — keeping workerCount={next_profile_n - 1}", "INFO")
