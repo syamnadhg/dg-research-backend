@@ -127,20 +127,37 @@ def test_research_enqueue_route(live):
 
 def test_research_applies_account_pipeline_settings(live):
     # The bug fix: an agent run must honor the account's saved pipeline Settings.
+    # verifyLogins=True (the opt-in verification toggle) → skipInitVerify False.
     base, _ = live
     FakeFS.user_settings = {"pipeline": {
-        "skipInitVerify": True, "agentGemini": False, "sendEmail": False,
+        "verifyLogins": True, "agentGemini": False, "sendEmail": False,
     }}
     r = requests.post(base + "/research", json={"topic": "T", "deviceId": "dev1"})
     assert r.status_code == 200
     cfg = FakeFS.last_enqueue["config_obj"]
-    assert cfg["skipInitVerify"] is True            # the reported bug — now honored
+    assert cfg["skipInitVerify"] is False           # user opted INTO verification
     assert cfg["agents"] == {"chatgpt": True, "gemini": False, "claude": True}
     assert cfg["emailEnabled"] is False
     # the research doc mirrors it: pipelineConfig + platforms drop the off agent
     f = FakeFS.last_upsert["fields"]
-    assert f["pipelineConfig"]["skipInitVerify"] is True
+    assert f["pipelineConfig"]["skipInitVerify"] is False
     assert "gemini" not in f["platforms"] and "chatgpt" in f["platforms"]
+
+
+def test_verification_is_opt_in_by_default(live):
+    # 2026-07-02: no settings at all → skipInitVerify True (verification off —
+    # proactive verify navigations are the top bot-score signal).
+    base, _ = live
+    FakeFS.user_settings = {}
+    r = requests.post(base + "/research", json={"topic": "T", "deviceId": "dev1"})
+    assert r.status_code == 200
+    assert FakeFS.last_enqueue["config_obj"]["skipInitVerify"] is True
+    # legacy skipInitVerify:false persisted by the old Settings auto-save is
+    # IGNORED (field renamed to verifyLogins precisely so it stops applying)
+    FakeFS.user_settings = {"pipeline": {"skipInitVerify": False}}
+    r = requests.post(base + "/research", json={"topic": "T2", "deviceId": "dev1"})
+    assert r.status_code == 200
+    assert FakeFS.last_enqueue["config_obj"]["skipInitVerify"] is True
 
 
 def test_research_chat_flag_overrides_account_settings(live):
@@ -166,7 +183,8 @@ def test_research_settings_read_failure_falls_back_to_defaults(live, monkeypatch
     r = requests.post(base + "/research", json={"topic": "T", "deviceId": "dev1"})
     assert r.status_code == 200
     cfg = FakeFS.last_enqueue["config_obj"]
-    assert cfg["skipInitVerify"] is False and cfg["agents"]["chatgpt"] is True
+    # defaults: verification opt-in (skip True since 2026-07-02), agents all on
+    assert cfg["skipInitVerify"] is True and cfg["agents"]["chatgpt"] is True
 
 
 def test_research_requires_topic(live):

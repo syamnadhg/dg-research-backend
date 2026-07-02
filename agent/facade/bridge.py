@@ -118,9 +118,11 @@ def _config_from_settings(pipe: dict[str, Any] | None) -> dict[str, Any]:
 
     Mirrors the web app's Settings→config derivation (ChatInput.tsx): which
     agents run, which phases are skipped (brief; podcast+video when NotebookLM is
-    off), whether video/email run, the podcast length, and skipInitVerify. Field
-    defaults match the app's DEFAULT_SETTINGS, so an absent field behaves exactly
-    as it does in the app (e.g. a settings-less account → verify + all agents)."""
+    off), whether video/email run, the podcast length, and skipInitVerify (from
+    the opt-in ``verifyLogins`` toggle — verification is OFF by default since
+    2026-07-02). Field defaults match the app's DEFAULT_SETTINGS, so an absent
+    field behaves exactly as it does in the app (a settings-less account →
+    skip verification + all agents)."""
     p = pipe if isinstance(pipe, dict) else {}
     agents = {
         "chatgpt": bool(p.get("agentChatGPT", True)),
@@ -143,7 +145,11 @@ def _config_from_settings(pipe: dict[str, Any] | None) -> dict[str, Any]:
         "videoEnabled": bool(video_enabled),
         "emailEnabled": bool(p.get("sendEmail", True)),
         "podcastLength": p.get("podcastLength") or "long",
-        "skipInitVerify": bool(p.get("skipInitVerify", False)),
+        # 2026-07-02: verification is OPT-IN. The Settings field is now
+        # `verifyLogins` (renamed+inverted from skipInitVerify so stale
+        # auto-saved falses stop applying); the BE payload keeps the legacy
+        # skipInitVerify key. Absent/off → skip verification.
+        "skipInitVerify": not bool(p.get("verifyLogins", False)),
     }
 
 

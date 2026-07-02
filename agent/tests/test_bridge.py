@@ -61,21 +61,27 @@ def test_port_holder_is_bridge_false_on_connection_error(monkeypatch):
 # same defaults. Field defaults must match the app's DEFAULT_SETTINGS.
 
 def test_config_from_settings_defaults_verify_all():
+    # 2026-07-02: verification is OPT-IN — skipInitVerify defaults True.
     assert bridge._config_from_settings({}) == {
         "skipPhases": [],
         "agents": {"chatgpt": True, "gemini": True, "claude": True},
         "videoEnabled": True,
         "emailEnabled": True,
         "podcastLength": "long",
-        "skipInitVerify": False,
+        "skipInitVerify": True,
     }
 
 
 def test_config_from_settings_none_is_defaults():
-    assert bridge._config_from_settings(None)["skipInitVerify"] is False
+    assert bridge._config_from_settings(None)["skipInitVerify"] is True
 
 
-def test_config_from_settings_skip_init_verify():
+def test_config_from_settings_verify_logins_opt_in():
+    # The renamed+inverted Settings field: verifyLogins True → verification runs.
+    assert bridge._config_from_settings({"verifyLogins": True})["skipInitVerify"] is False
+    # The legacy skipInitVerify field is inert either way (renamed so the old
+    # Settings auto-save's persisted false stops applying).
+    assert bridge._config_from_settings({"skipInitVerify": False})["skipInitVerify"] is True
     assert bridge._config_from_settings({"skipInitVerify": True})["skipInitVerify"] is True
 
 
