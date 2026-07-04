@@ -196,6 +196,84 @@ class TestDetectPersistedGoogleAuth:
 # _scrub_persisted_google_auth — post-DGOPS-7451 narrowed scrub
 # ─────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────
+# #898b — platform-session hard allow-list in the scrub
+# ─────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestScrubPlatformAllowList:
+    """#898b: the invariant is "worker profiles are never cleared except
+    --unpair --deep". Even a misconfigured DG_SECURITY_DENY_HOSTS that
+    suffix-matches a platform-session domain (e.g. a bare "google.com" or
+    "claude.ai" entry) must NEVER let the scrub clear a platform cookie —
+    that silently signs the worker out and resets its human-check trust.
+    M4's network-layer route block stays the load-bearing F4 defense."""
+
+    async def test_misconfigured_denylist_cannot_clear_platform_cookies(self, monkeypatch):
+        import research
+        from research import _scrub_persisted_google_auth
+        monkeypatch.setattr(research, "_SECURITY_DENY_HOSTS",
+                            ("google.com", "claude.ai", "chatgpt.com", "web.app"))
+        ctx = _MockContext([
+            {"name": "__Secure-1PSID", "domain": "gemini.google.com", "value": "g"},
+            {"name": "sessionKey", "domain": ".claude.ai", "value": "c"},
+            {"name": "session-token", "domain": ".chatgpt.com", "value": "o"},
+            {"name": "auth", "domain": "dg-security-monitor.web.app", "value": "x"},
+        ])
+        summary = await _scrub_persisted_google_auth(ctx, scope="test")
+        remaining = {c["domain"] for c in ctx._cookies}
+        assert "gemini.google.com" in remaining, "platform cookie scrubbed — allow-list broken"
+        assert ".claude.ai" in remaining, "platform cookie scrubbed — allow-list broken"
+        assert ".chatgpt.com" in remaining, "platform cookie scrubbed — allow-list broken"
+        assert "dg-security-monitor.web.app" not in remaining, (
+            "the real deny-host must still be cleared — the allow-list must not disable M3"
+        )
+        assert summary["cookiesCleared"] == 1
+
+    async def test_misconfigured_denylist_cannot_clear_apex_google_session(self, monkeypatch):
+        # Review catch (MAJOR): the Google/YouTube session lives in APEX
+        # cookies (SID / __Secure-1PSID on .google.com), not on
+        # gemini.google.com — the scrub's preserve list must cover the
+        # parent domains or the fix fails its own motivating scenario.
+        import research
+        from research import _scrub_persisted_google_auth
+        monkeypatch.setattr(research, "_SECURITY_DENY_HOSTS",
+                            ("google.com", "youtube.com", "web.app"))
+        ctx = _MockContext([
+            {"name": "SID", "domain": ".google.com", "value": "s"},
+            {"name": "__Secure-1PSID", "domain": ".google.com", "value": "p"},
+            {"name": "LSID", "domain": "accounts.google.com", "value": "l"},
+            {"name": "VISITOR_INFO1_LIVE", "domain": ".youtube.com", "value": "y"},
+            {"name": "auth", "domain": "dg-security-monitor.web.app", "value": "x"},
+        ])
+        summary = await _scrub_persisted_google_auth(ctx, scope="test")
+        remaining = {c["domain"] for c in ctx._cookies}
+        assert ".google.com" in remaining, "apex Google session cookies scrubbed — worker signed out"
+        assert "accounts.google.com" in remaining
+        assert ".youtube.com" in remaining
+        assert "dg-security-monitor.web.app" not in remaining
+        assert summary["cookiesCleared"] == 1
+
+    async def test_scrub_preserve_stays_out_of_m2_detection(self):
+        # The scrub-only list must NOT loosen M2: pair-flow second-account
+        # detection still flags apex .google.com auth cookies.
+        from research import _detect_persisted_google_auth
+        ctx = _MockContext([
+            {"name": "__Secure-1PSID", "domain": ".google.com", "value": "secret"},
+        ])
+        assert await _detect_persisted_google_auth(ctx) is not None
+
+    async def test_normal_denylist_behavior_unchanged(self):
+        from research import _scrub_persisted_google_auth
+        ctx = _MockContext([
+            {"name": "sessionKey", "domain": ".claude.ai", "value": "c"},
+            {"name": "auth", "domain": "dg-security-monitor.web.app", "value": "x"},
+        ])
+        summary = await _scrub_persisted_google_auth(ctx, scope="test")
+        assert {c["domain"] for c in ctx._cookies} == {".claude.ai"}
+        assert summary["cookiesCleared"] == 1
+
+
 @pytest.mark.asyncio
 class TestScrubPersistedGoogleAuth:
     """Post-DGOPS-7451 the scrub:

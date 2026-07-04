@@ -8165,6 +8165,13 @@ class PipelineControls:
         # cookie fast path skips these, so a post-sign-in Retry runs the full
         # verify instead of re-trusting the stale jar.
         self.cookie_trust_broken: set[str] = set()
+        # #896: agents whose page is confirmed behind a human-verification
+        # wall (key → short reason like "Cloudflare"). Set when the HV
+        # cascade exhausts or a setup/paste fail-path probe finds a wall;
+        # cleared on clearance. Lets outer fail handlers name the real
+        # cause even when their page reference is already closed (the HV
+        # kill-tab tier replaces the page object locally).
+        self.hv_blocked: dict[str, str] = {}
         # Phase 2: per-agent skip requests. Sent by the watchdog's
         # BackendSilentBanner (when a specific agent is picked mid-stall) and
         # by HumanVerifyBanner's "Skip agent" button. Lower-case agent keys
@@ -8395,6 +8402,7 @@ class PipelineControls:
         self.skip_init_verify = False
         self.retry_init_verify = False
         self.cookie_trust_broken.clear()
+        self.hv_blocked.clear()
         self.skipped_agents.clear()
         self.skipped_phases.clear()
         self.continue_anyway = False
@@ -9865,7 +9873,13 @@ async def is_agent_generating(page, platform):
     try:
         sel_map = {
             "chatgpt": 'button[data-testid="stop-button"], button[aria-label*="Stop"], [data-testid*="loading"]',
-            "gemini": 'button[aria-label*="Stop"], [jsname] [role="progressbar"]',
+            # #897b: Gemini's collapsed composer often shows NO stop button
+            # mid-run — without the broader new-UI running signals the
+            # dispatcher would read a live DR as "finished" and silently
+            # drop the user's mid-run chat (review catch).
+            "gemini": ('button[aria-label*="Stop"], [role="button"][aria-label*="stop" i], '
+                       '[jsname] [role="progressbar"], [data-is-streaming="true"], '
+                       '.loading-indicator, .streaming'),
             "claude": 'button[aria-label*="Stop"], [data-testid*="stop"]',
         }
         sel = sel_map.get(platform.lower(), 'button[aria-label*="Stop"]')
@@ -10121,6 +10135,19 @@ _SECURITY_PRESERVE_PLATFORM_DOMAINS = (
     "claude.site",
 )
 
+# #898b — scrub-only preserve list. Google/YouTube sessions live in APEX
+# cookies (SID / __Secure-1PSID on .google.com, not gemini.google.com), so
+# the scrub's "never clear a platform session" guarantee must cover the
+# parent domains too. Kept SEPARATE from the tuple above: M2's pair-flow
+# second-account detection (_detect_persisted_google_auth) must keep
+# flagging apex .google.com auth cookies, so it stays on the narrow list.
+# M4's route block makes a deliberate google.com/youtube.com deny entry
+# unusable for this pipeline anyway — preserving them here costs nothing.
+_SECURITY_SCRUB_PRESERVE_DOMAINS = _SECURITY_PRESERVE_PLATFORM_DOMAINS + (
+    "google.com",
+    "youtube.com",
+)
+
 
 def _matches_security_deny_host(host: str) -> str | None:
     """Return the matching F4 deny-list pattern if the host endswith any of
@@ -10201,7 +10228,20 @@ async def _scrub_persisted_google_auth(context, *, scope: str = "run", reason: s
     to_clear: list[dict] = []
     for c in cookies:
         domain = (c.get("domain") or "").lower()
-        if _matches_security_deny_host(domain.lstrip(".")):
+        # #898b hard allow-list: platform-session domains can NEVER be
+        # scrubbed, even if a misconfigured DG_SECURITY_DENY_HOSTS ever
+        # named one (e.g. a bare "google.com" entry). Uses the SCRUB list
+        # (platform subdomains + apex google.com/youtube.com — the Google
+        # session actually lives in apex SID/__Secure-1PSID cookies).
+        # Clearing a platform cookie silently signs a worker out and resets
+        # the trust the user built — the invariant is "profiles are never
+        # cleared except --unpair --deep". M4's network-layer route block
+        # stays the load-bearing F4 defense.
+        _bare = domain.lstrip(".")
+        if any(_bare == d or _bare.endswith("." + d)
+               for d in _SECURITY_SCRUB_PRESERVE_DOMAINS):
+            continue
+        if _matches_security_deny_host(_bare):
             to_clear.append(c)
     for c in to_clear:
         try:
@@ -15618,18 +15658,33 @@ async def detect_completion_gemini(page):
 
     2026-04-25 strictness rewrite: done=True ONLY when:
       • Stop button gone + Start-research button gone (post-planning)
-      • Share & Export button visible (definitive done — only renders
-        after research finishes)
+      • a definitive done-marker is visible
     Removed: text_len>5000+!active_kw fallback (transient no-active-keyword
-    windows mid-stream caused false positives). Caller handles 2-cycle flat."""
+    windows mid-stream caused false positives). Caller handles 2-cycle flat.
+
+    #897b (2026-07-04, user-confirmed live new UI): Gemini's collapsed
+    composer removed the persistent bottom input box — a small launcher
+    button becomes the input only when clicked — so "stop button lives in
+    the composer" is no longer a reliable running-signal, and the done-state
+    now renders in the LIVE DOM (no reload needed). Done-markers, keyed on
+    visible TEXT/labels (never class selectors):
+      • report button ROW "Contents" · "Share & Export" · "Create" (trio)
+      • chat line "I've completed your research. Feel free to ask me
+        follow-up questions or request changes."
+      • "Share & Export" alone (the pre-2026-07 marker, kept as-is)
+    Running-signal: stop-button scan broadened to [role=button]/aria on the
+    report card, plus the guarded running-CSS-animation tier (offsetParent
+    + getAnimations().playState — see scrape_progress_gemini 2026-05-14
+    note on persisted-but-finished animations)."""
     try:
         data = await page.evaluate("""() => {
             let hasStop = false;
             const stopSels = 'button[aria-label="Stop"], button[aria-label*="stop"], ' +
-                             'button[aria-label="Cancel"], button[title*="Stop"]';
+                             'button[aria-label="Cancel"], button[title*="Stop"], ' +
+                             '[role="button"][aria-label*="stop" i]';
             if (document.querySelector(stopSels)) hasStop = true;
             if (!hasStop) {
-                for (const b of document.querySelectorAll('button')) {
+                for (const b of document.querySelectorAll('button, [role="button"]')) {
                     const txt = (b.textContent || '').trim().toLowerCase();
                     if (txt === 'stop' || txt === 'stop generating' || txt === 'cancel') {
                         hasStop = true; break;
@@ -15639,6 +15694,21 @@ async def detect_completion_gemini(page):
             if (!hasStop && document.querySelector(
                 '[data-is-streaming="true"], .loading-indicator, .streaming'
             )) hasStop = true;
+            // #897b: running-animation tier promoted into the completion
+            // detector — with the composer collapsed there may be NO stop
+            // button while the DR spinner still runs. Same guards as
+            // scrape_progress_gemini: visible (offsetParent) + an animation
+            // actually RUNNING (playState), so persisted/finished animations
+            // on UI chrome can't hold completion hostage.
+            if (!hasStop) {
+                const animated = document.querySelectorAll('[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"]');
+                for (const el of animated) {
+                    if (el.offsetParent === null) continue;
+                    if (typeof el.getAnimations !== 'function') continue;
+                    const anims = el.getAnimations();
+                    if (anims.some(a => a.playState === 'running')) { hasStop = true; break; }
+                }
+            }
 
             let hasStartBtn = false;
             for (const b of document.querySelectorAll('button')) {
@@ -15649,21 +15719,48 @@ async def detect_completion_gemini(page):
             }
 
             let hasShareExport = false;
+            let hasContentsBtn = false;
+            let hasCreateBtn = false;
             const shareKws = ['share & export', 'share and export'];
             for (const b of document.querySelectorAll('button, [role="button"]')) {
-                const txt = (b.textContent || '').trim().toLowerCase();
+                const txt = (b.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
                 const al  = (b.getAttribute('aria-label') || '').toLowerCase();
-                if (shareKws.some(k => txt === k || al.includes(k))) {
-                    hasShareExport = true; break;
+                if (shareKws.some(k => txt === k || txt.includes(k) || al.includes(k))) {
+                    hasShareExport = true;
                 }
                 if (txt === 'share' || txt === 'export' ||
                     al === 'share' || al === 'export') {
-                    hasShareExport = true; break;
+                    hasShareExport = true;
+                }
+                // #897b trio members — EXACT text so composer tools like
+                // "Create image" can't satisfy the "Create" leg.
+                if (txt === 'contents' || al === 'contents') hasContentsBtn = true;
+                if (txt === 'create'   || al === 'create')   hasCreateBtn = true;
+            }
+            // The completed report's button row, left→right:
+            // "Contents" · "Share & Export" · "Create" (user-confirmed live).
+            const reportButtonTrio = hasContentsBtn && hasShareExport && hasCreateBtn;
+
+            // Gemini's own completion chat line, rendered above the report
+            // tile: "I've completed your research. Feel free to ask me
+            // follow-up questions or request changes."
+            // Review catch (#752-755 lesson — never body-scan a phrase the
+            // run itself can type): the pasted brief / mid-run user chat
+            // sits in user-query bubbles inside body.innerText, so scope the
+            // scan to MODEL-response nodes (user-query ancestry excluded)
+            // and anchor on Gemini's exact line, apostrophe-normalized.
+            let completedChatText = false;
+            const responses = document.querySelectorAll('message-content, .model-response-text');
+            for (const r of responses) {
+                if (r.closest('user-query, [class*="user-query"], .query-text')) continue;
+                const rt = (r.innerText || '').toLowerCase().replace(/[\\u2018\\u2019]/g, "'");
+                if (rt.includes("i've completed your research") ||
+                    rt.includes('completed your research. feel free')) {
+                    completedChatText = true; break;
                 }
             }
 
             let textLen = 0;
-            const responses = document.querySelectorAll('message-content, .model-response-text');
             if (responses.length > 0) textLen = responses[responses.length-1].innerText.length;
 
             const sources = document.querySelectorAll(
@@ -15672,7 +15769,8 @@ async def detect_completion_gemini(page):
             const steps = document.querySelectorAll(
                 '[class*="research-step"], [class*="thought"]'
             ).length;
-            return { hasStop, hasStartBtn, hasShareExport, textLen, sources, steps };
+            return { hasStop, hasStartBtn, hasShareExport, reportButtonTrio,
+                     completedChatText, textLen, sources, steps };
         }""")
 
         text_len = int(data.get("textLen") or 0)
@@ -15684,9 +15782,13 @@ async def detect_completion_gemini(page):
             return (False, "start_research_btn_visible (pre-research)", snap)
         if data.get("hasStop"):
             return (False, f"stop_btn_present (text={text_len})", snap)
-        if not data.get("hasShareExport"):
-            return (False, "no_done_marker (Share/Export button missing)", snap)
-        return (True, "no_stop + share_export_visible", snap)
+        if data.get("reportButtonTrio"):
+            return (True, "no_stop + report_button_trio (Contents/Share & Export/Create)", snap)
+        if data.get("completedChatText"):
+            return (True, "no_stop + completed_chat_text", snap)
+        if data.get("hasShareExport"):
+            return (True, "no_stop + share_export_visible", snap)
+        return (False, "no_done_marker (trio/completion-text/Share & Export all missing)", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
 
@@ -16695,6 +16797,7 @@ class Browser:
                 serve_start_ts = psutil.Process(os.getpid()).create_time()
             except Exception:
                 serve_start_ts = 0.0
+            _orphans = []
             for proc in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
                     if proc.info["name"] and "chrome" in proc.info["name"].lower():
@@ -16707,10 +16810,35 @@ class Browser:
                             if serve_start_ts > 0 and chrome_start_ts >= serve_start_ts:
                                 log(f"Sparing sibling Chrome PID {proc.info['pid']} (younger than --serve, our profile)")
                                 continue
-                            log(f"Killing orphaned Chrome PID {proc.info['pid']} (our profile)")
-                            proc.kill()
+                            # #898b: close GRACEFULLY first — a hard kill can
+                            # drop a seconds-old sign-in (e.g. the user just
+                            # ran --login) before Chrome flushes it to disk.
+                            # Windows needs taskkill /T WITHOUT /F for a real
+                            # WM_CLOSE (psutil terminate() is hard there).
+                            log(f"Closing orphaned Chrome PID {proc.info['pid']} (our profile) — graceful, hard-kill fallback")
+                            try:
+                                if sys.platform == "win32":
+                                    subprocess.run(
+                                        ["taskkill", "/PID", str(proc.info["pid"]), "/T"],
+                                        capture_output=True, timeout=10,
+                                        creationflags=_PS_NO_WINDOW)
+                                else:
+                                    proc.terminate()
+                            except Exception:
+                                pass
+                            _orphans.append(proc)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+            if _orphans:
+                # Bounded flush grace, then hard-kill whatever survived so the
+                # profile lock is still guaranteed free for our launch.
+                _gone, _alive = await asyncio.to_thread(psutil.wait_procs, _orphans, 5)
+                for _p in _alive:
+                    try:
+                        log(f"Killing orphaned Chrome PID {_p.pid} (didn't exit within the graceful window)")
+                        _p.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
             await asyncio.sleep(1)
         except ImportError:
             pass
@@ -19926,125 +20054,11 @@ _GEMINI_COMPLETION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# If NONE of these conversation/DR markers are in the DOM, the page is the empty
-# "new chat" home (the periodic reload drifted off the conversation) rather than a
-# live Deep-Research run. Mirrors the scrape + completion-detector selectors
-# (message-content / model-response / immersive-panel / deep-research-panel).
-_GEMINI_CONVERSATION_PRESENT_JS = (
-    "() => !!document.querySelector("
-    "'user-query, model-response, message-content, .model-response-text,"
-    " .response-container, immersive-panel, deep-research-panel')"
-)
-
-
-def _gemini_conversation_id(url: str) -> str:
-    """The Gemini conversation id from an ``/app/<id>`` URL (``''`` if bare/none)."""
-    if not url:
-        return ""
-    m = re.search(r"/app/([A-Za-z0-9_-]{6,})", url)
-    return m.group(1) if m else ""
-
-
-async def _gemini_conversation_present(page) -> bool:
-    """True if a Gemini conversation / DR panel is mounted (vs. the empty home).
-    On a probe error, assume present so we never thrash recovery on a flake."""
-    try:
-        return bool(await page.evaluate(_GEMINI_CONVERSATION_PRESENT_JS))
-    except Exception:
-        return True
-
-
-async def _gemini_reopen_from_sidebar(page, conv_id: str) -> bool:
-    """Re-open a Gemini conversation by CLICKING it in the left sidebar's recent
-    list — an in-SPA open that reliably rehydrates the conversation, unlike a cold
-    ``goto(/app/<id>)`` which often re-renders the empty home. Expands the sidebar
-    first if the recent list isn't mounted. Returns True iff a matching item was
-    clicked; the caller verifies the conversation actually mounted afterwards."""
-    if not conv_id:
-        return False
-    js = """
-    (cid) => {
-      const find = () => Array.from(
-        document.querySelectorAll('a[href*="/app/"], [role="link"], [data-test-id*="conversation"]'))
-        .find(el => (((el.getAttribute && el.getAttribute('href')) || el.href || '') + '')
-          .includes(cid));
-      let a = find();
-      if (!a) {
-        // The conversation lives in the left rail's "Recent" list, which is
-        // usually collapsed during a run. Gemini's real controls are
-        // aria-labelled "Open sidebar" (open the rail) and "Toggle Recent"
-        // (expand the recent list) — the old selector only matched menu/expand
-        // and missed both, so recovery never found the link. Click every
-        // plausible open/expand control, then retry.
-        const sels = [
-          '[data-test-id="side-nav-menu-button"]',
-          'button[aria-label*="open sidebar" i]',
-          'button[aria-label*="sidebar" i]',
-          'button[aria-label*="recent" i]',
-          'button[aria-label*="main menu" i]',
-          'button[aria-label*="expand" i]',
-          'button[aria-label*="menu" i]',
-        ];
-        for (const s of sels) { const b = document.querySelector(s); if (b) { b.click(); } }
-        a = find();
-      }
-      if (a) { a.click(); return true; }
-      return false;
-    }
-    """
-    try:
-        clicked = bool(await page.evaluate(js, conv_id))
-        if not clicked:
-            # The expand click above may reveal the link only on the next frame.
-            await asyncio.sleep(1.0)
-            clicked = bool(await page.evaluate(js, conv_id))
-        if clicked:
-            await asyncio.sleep(2.0)
-        return clicked
-    except Exception:
-        return False
-
-
-async def _gemini_recover_if_empty(page, url_pre_reload: str, log_fn) -> bool:
-    """After a periodic reload, ensure the conversation is still mounted. If the
-    reload drifted to the empty home, recover IN-CHAT: click the conversation in
-    the sidebar (PRIMARY — the reliable in-SPA path), else ``goto(/app/<id>)``
-    (FALLBACK). Returns True if the conversation is present at the end (never lost
-    or recovered), False if it's STILL empty — the caller then leaves the
-    stuck-watchdog baselines untouched so it escalates to a Retry/Skip card,
-    rather than silently polling a dead page (the empty-chat hang)."""
-    if await _gemini_conversation_present(page):
-        return True
-    conv_id = _gemini_conversation_id(url_pre_reload)
-    log_fn(
-        f"[Gemini] post-reload landed on the empty home (conversation not mounted) "
-        f"— recovering conv={conv_id or '?'}",
-        "WARN",
-    )
-    # PRIMARY: in-SPA sidebar open (a cold goto often re-renders empty).
-    if conv_id and await _gemini_reopen_from_sidebar(page, conv_id):
-        if await _gemini_conversation_present(page):
-            log_fn("[Gemini] recovered the conversation via the sidebar", "INFO")
-            return True
-    # FALLBACK: cold navigate back to the conversation URL.
-    if conv_id:
-        try:
-            await page.goto(
-                f"https://gemini.google.com/app/{conv_id}",
-                wait_until="domcontentloaded", timeout=20000,
-            )
-            await asyncio.sleep(3.0)
-        except Exception as _e:
-            log_fn(f"[Gemini] recovery goto raised (non-fatal): {_e}", "WARN")
-        if await _gemini_conversation_present(page):
-            log_fn("[Gemini] recovered the conversation via goto fallback", "INFO")
-            return True
-    log_fn(
-        "[Gemini] could not recover the conversation after reload — leaving the "
-        "stuck-watchdog to escalate (Retry/Skip)",
-        "WARN",
-    )
-    return False
+# #897a (2026-07-04): the periodic-reload recovery subsystem
+# (_GEMINI_CONVERSATION_PRESENT_JS / _gemini_conversation_id /
+# _gemini_conversation_present / _gemini_reopen_from_sidebar /
+# _gemini_recover_if_empty) was deleted along with the reload itself —
+# Gemini is never reloaded mid-run anymore, so there is nothing to recover.
 
 
 async def _gemini_kickoff_pending(page):
@@ -20126,21 +20140,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     _min_agent_wait = int(os.environ.get("MIN_AGENT_WAIT_MIN", "5")) * 60
     MIN_WAIT = {"ChatGPT": _min_agent_wait, "Gemini": _min_agent_wait, "Claude": _min_agent_wait}
     CUA_CHECK_INTERVAL = 300   # 5 min between CUA completion checks
-    # Gemini-only periodic refresh. Post-2026-05 Gemini does NOT push the
-    # completed Deep-Research panel into the live DOM — the done-state
-    # ("Share & Export" button + completion text) only renders after a page
-    # reload. Reload every ~10 min so detect_completion_gemini can see the
-    # done-marker on its own. Replaces the old one-shot 10-min reload +
-    # 15-min "Is the Research completed?" paste crutch (removed 2026-05-26).
-    GEMINI_REFRESH_INTERVAL = int(os.environ.get("GEMINI_REFRESH_INTERVAL_SEC", str(10 * 60)))
-    # Don't fire the periodic reload during the typical active-generation window —
-    # a reload on a still-running DR can drop Gemini's SPA to the empty "new chat"
-    # home and lose the conversation (worse under 3-worker CPU contention). CUA
-    # tracks progress fine in that window; the reload is only the hedge for a
-    # done-but-DOM-frozen run (Gemini doesn't push the done-marker live), so hold
-    # it until the DR has run long enough that completion is plausible. Measured
-    # from research-start (p["start_time"] == research_started_at).
-    GEMINI_REFRESH_GRACE = int(os.environ.get("GEMINI_REFRESH_GRACE_SEC", str(20 * 60)))
+    # #897a: GEMINI_REFRESH_INTERVAL / GEMINI_REFRESH_GRACE deleted with the
+    # periodic reload — Gemini is never reloaded mid-run (its SPA no longer
+    # restores the conversation on reload; it lands on the empty home).
     ARTIFACT_SCRAPE_INTERVAL = 60   # 1 min between Claude artifact-tracking scrapes (was 180; iteration #1 must pass — see init at last_artifact_scrape=0 below)
 
     pending = {}
@@ -20184,16 +20186,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "claude_clarification_replied": False,  # one-shot flag for clarification-defer reply
             "gemini_kickoff_nudge_count": 0,        # multi-shot nudge counter (max 3, 3min apart) for Gemini kickoff-stall
             "gemini_last_kickoff_nudge_at": 0.0,    # timestamp gate enforcing 3min spacing between Gemini kickoff nudges
-            # 2026-05-26 Gemini periodic refresh. Post-2026-05 Gemini does
-            # NOT push the completed Deep-Research panel into the live DOM —
-            # the done-state only renders after a reload. We reload every
-            # GEMINI_REFRESH_INTERVAL (~10 min) so detect_completion_gemini
-            # can see the done-marker on its own. Seeded to research start so
-            # the first refresh fires ~10 min in (matches the old one-shot
-            # 10-min reload). Replaces the prior one-shot reload + 15-min
-            # "Is the Research completed?" paste crutch — Flash 3.5 completes
-            # cleanly and needs no nudge (user-validated 2026-05-26).
-            "last_refresh": _research_t,
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -20343,11 +20335,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              "claude_artifact_dom_misses": 0,
                                              "claude_artifact_cua_attempts": 0,
                                              "observer_text_len": 0,
-                                             "claude_clarification_replied": False,
-                                             # Periodic-refresh gate — a post-resume Gemini
-                                             # run gets a fresh refresh clock relative to its
-                                             # reconstructed start_time.
-                                             "last_refresh": time.time() - results[name]["elapsed_sec"]}
+                                             "claude_clarification_replied": False}
                             del results[name]
                             log(f"  [{name}] Restored to polling")
                         else:
@@ -20444,7 +20432,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "empty_retries": 0,
                     "hard_retry_count": 0,
                     "claude_clarification_replied": False,
-                    "last_refresh": time.time(),
                 }
             p = pending[_agent_name]
             _hard_count = int(p.get("hard_retry_count", 0)) + 1
@@ -20550,9 +20537,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 "empty_retries": 0,
                 "hard_retry_count": _hard_count,
                 "claude_clarification_replied": False,
-                # Periodic-refresh gate — a hard-retried Gemini run gets a
-                # fresh refresh clock relative to its new start_time.
-                "last_refresh": _now,
             }
             _runtime.register_page(_agent_key, new_page,
                                     new_page.url if new_page else "")
@@ -20862,137 +20846,42 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         # Refresh the tab so the agent's (now logged-in) session cookie
                         # lands, then reset polling state. Don't extend budget — this
                         # is the user's re-auth, not a new research run.
+                        # #897a: never reload a MOUNTED Gemini conversation — the SPA
+                        # no longer restores it on reload (lands on the empty "new
+                        # chat" home); the fresh cookie applies on Gemini's own
+                        # background requests in place. But if the tab itself was
+                        # redirected off gemini.google.com (a login URL), there is no
+                        # conversation left to lose and the reload is what un-sticks
+                        # the login page via its post-auth redirect.
+                        _cur_url = ""
                         try:
-                            await p["page"].reload(wait_until="domcontentloaded", timeout=15000)
-                            await asyncio.sleep(3)
-                        except Exception as _e:
-                            log(f"[{name}] Reload after re-auth failed: {_e}", "WARN")
+                            _cur_url = (p["page"].url or "").lower()
+                        except Exception:
+                            pass
+                        _gemini_mounted = name == "Gemini" and "gemini.google.com" in _cur_url
+                        if not _gemini_mounted:
+                            try:
+                                await p["page"].reload(wait_until="domcontentloaded", timeout=15000)
+                                await asyncio.sleep(3)
+                            except Exception as _e:
+                                log(f"[{name}] Reload after re-auth failed: {_e}", "WARN")
                         p["last_auth_check"] = time.time()
                         continue
                     # 'continue_partial' / 'timeout' — user idle; keep polling
                     # with the stale session (likely 30min re-grace from platforms)
                     continue
 
-            # ── Gemini periodic refresh (every GEMINI_REFRESH_INTERVAL) ──
-            # Post-2026-05 Gemini does NOT push the completed Deep-Research
-            # panel into the live DOM — the "Share & Export" done-marker +
-            # completion text only render after a page reload (verified in
-            # backend-2.log: a 123-min Golden Retriever run sat on 20 straight
-            # CUA "still generating" reads until a manual refresh surfaced the
-            # finished report). So we reload every GEMINI_REFRESH_INTERVAL
-            # (~10 min); detect_completion_gemini then sees the done-state on
-            # its own and extracts, instead of leaning on the CUA visual check.
-            #
-            # Replaces the prior one-shot 10-min reload + 15-min
-            # paste_followup("Is the Research completed?") crutch: on 3.1 Pro
-            # the DOM froze for the whole 1-2h run and needed a manual nudge,
-            # but Flash 3.5 completes cleanly and the periodic reload alone
-            # surfaces the done-state (user-validated 2026-05-26).
-            #
-            # Race-safe: if completion text is already on page we skip the
-            # reload and let the detector extract on the next tick. Gated to
-            # Gemini, never during a DNS retry. Orthogonal to the kickoff-stall
-            # multi-shot nudge (~17421-17485, elapsed ≤ 600s only).
-            if (
-                name == "Gemini"
-                # Grace: don't reload during the typical active-generation window
-                # (CUA tracks it there) — only once the DR has run long enough that
-                # completion is plausible, so a still-running DR isn't nuked to the
-                # empty home. p["start_time"] == research_started_at.
-                and (time.time() - p["start_time"]) >= GEMINI_REFRESH_GRACE
-                and (time.time() - p.get("last_refresh", p["start_time"])) >= GEMINI_REFRESH_INTERVAL
-                and not p.get("dns_retry_at")
-                # Stop reloading once CUA has seen the DR finish at least once
-                # (done_count resets to 0 on any "still generating"/false-done, so
-                # this only holds for a genuinely-complete panel): a reload then
-                # would WIPE the rendered completed panel before CUA lands its 2nd
-                # confirmation + extracts — the empty-chat hang the user hit (CUA
-                # said "done 1/2", the next reload reset it to the empty home).
-                and p.get("done_count", 0) < 1
-            ):
-                p["last_refresh"] = time.time()
-                try:
-                    _body_text_10 = await p["page"].evaluate(
-                        "() => (document.body.innerText || '').slice(0, 8000)"
-                    )
-                    if _GEMINI_COMPLETION_RE.search(_body_text_10 or ""):
-                        # Completion text already on page — skip this reload;
-                        # detect_completion_gemini extracts on the next tick.
-                        log(
-                            "[Gemini] periodic refresh: completion text "
-                            "already on page — skipping reload"
-                        )
-                    else:
-                        _url_pre_reload = ""
-                        try:
-                            _url_pre_reload = p["page"].url or ""
-                        except Exception:
-                            _url_pre_reload = ""
-                        log(
-                            "[Gemini] periodic refresh firing — "
-                            f"page.reload() so the completed DR panel + "
-                            f"done-marker can render. URL pre-reload={_url_pre_reload}"
-                        )
-                        try:
-                            emit_event(
-                                "agent_progress", phase=2, agent="gemini",
-                                status="generating",
-                                progress=(
-                                    "Refreshing Gemini so the finished "
-                                    "research panel can load."
-                                ),
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            await p["page"].reload(
-                                wait_until="domcontentloaded", timeout=20000
-                            )
-                        except Exception as _re:
-                            log(
-                                f"[Gemini] periodic reload raised "
-                                f"(non-fatal): {_re}",
-                                "WARN",
-                            )
-                        await asyncio.sleep(5.0)
-                        # The reload can land on Gemini's empty "new chat" home
-                        # (a redirect, or a timed-out reload) instead of rehydrating
-                        # the conversation — and trusting page.url to detect that is
-                        # unreliable (Playwright caches the pre-reload /app/<id> while
-                        # the DOM shows the home). Probe the DOM directly; if empty,
-                        # recover IN-CHAT by clicking the conversation in the SIDEBAR
-                        # (a cold goto often re-renders empty again), goto as fallback.
-                        _recovered = await _gemini_recover_if_empty(
-                            p["page"], _url_pre_reload, log
-                        )
-                        try:
-                            await inject_agent_observer(p["page"], "gemini")
-                        except Exception as _inj_err:
-                            log(
-                                f"[Gemini] post-reload observer re-inject "
-                                f"failed (non-fatal): {_inj_err}",
-                                "DEBUG",
-                            )
-                        # Reset the no-growth/stuck baselines ONLY when the
-                        # conversation is actually present (clean reload or a
-                        # successful recovery). If recovery FAILED (still the empty
-                        # home), DON'T reset — let the stuck-watchdog escalate to a
-                        # Retry/Skip card instead of polling a dead page forever
-                        # (the old code reset unconditionally, which is exactly why
-                        # the empty-chat run hung indefinitely).
-                        if _recovered:
-                            _now = time.time()
-                            p["last_growth_time"] = _now
-                            p["last_heartbeat"] = _now
-                            p["stuck_warned_at"] = 0
-                            p["last_cua_check"] = _now
-                except Exception as _gre:
-                    log(
-                        f"[Gemini] periodic refresh raised "
-                        f"(non-fatal): {_gre}",
-                        "WARN",
-                    )
-                continue
+            # ── Gemini periodic refresh: REMOVED (#897a, 2026-07-04) ──
+            # The 2026-05-26 ~10-min reload existed because Gemini then didn't
+            # push the completed DR panel into the live DOM. The 2026-07 Gemini
+            # SPA no longer restores the conversation on reload AT ALL — every
+            # reload landed on the empty "new chat" home (image-verified live),
+            # so the reload + its sidebar-reopen recovery subsystem were pure
+            # hazard. Do NOT reload Gemini mid-run for any reason; completion
+            # is detected in-place by detect_completion_gemini (new-UI text
+            # signals) + the CUA visual check. If extraction ever comes back
+            # short, fix it with an in-place DOM re-read/scroll at EXTRACTION
+            # time — never by restoring the reload.
 
             # DOM scrape (primary); MutationObserver handles token-level stream separately.
             scrape_fn = SCRAPE_FNS.get(name)
@@ -21925,8 +21814,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             "(embedded in the chat, looks like a document panel). The stop button and progress "
                             "indicator live ON THAT CARD, not in the composer. Scroll down to find the card and "
                             "check if it still shows 'Researching...', a progress bar, or a stop button on the card."),
-                "Gemini": ("Gemini Deep Research shows a stop button in the composer/input area and a progress "
-                            "indicator in the message. Check the composer + the latest message area."),
+                "Gemini": ("Gemini's 2026-07 UI has NO persistent bottom input box — a small launcher button "
+                            "becomes the input only when clicked, so don't judge by the composer. A COMPLETED "
+                            "deep research shows a report panel with a button row 'Contents', 'Share & Export', "
+                            "'Create' (left to right) and a chat line \"I've completed your research. Feel free "
+                            "to ask me follow-up questions or request changes.\" above the report tile. Say "
+                            "'response complete' ONLY if those are visible AND there is no running spinner or "
+                            "progress indicator; otherwise say 'still generating'."),
                 "Claude": ("Claude shows a stop button in the composer/input area while generating. After completion, "
                             "two document artifact buttons/cards may appear. Check composer for stop button; absence "
                             "means done."),
@@ -26749,9 +26643,23 @@ async def detect_human_verification(page, platform: str, label: str) -> tuple[bo
     Never raises — on any detection error, returns (False, "").
     """
     try:
-        result = await page.evaluate("""() => {
+        result = await page.evaluate("""(platformKey) => {
             const findings = [];
-            const text = (document.body?.innerText || '').toLowerCase();
+            let text = (document.body?.innerText || '').toLowerCase();
+            // #896 review catch: composer content is part of body.innerText,
+            // and the paste-fail probes run exactly when the pasted research
+            // BRIEF may still sit in the composer — a brief about
+            // bot-mitigation can quote the very phrases these markers key on
+            // (#751/#752 lesson: never substring-match text the pipeline
+            // itself typed). Scan the page text MINUS composer subtrees;
+            // the structural iframe/selector checks are unaffected.
+            try {
+                for (const c of document.querySelectorAll(
+                        'div[contenteditable="true"], .ProseMirror, rich-textarea, textarea')) {
+                    const t = ((c.innerText || c.value) || '').toLowerCase();
+                    if (t && t.length > 20) text = text.split(t).join(' ');
+                }
+            } catch (e) {}
 
             // Cloudflare Turnstile / "Just a moment..."
             if (document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile, .cf-challenge')) {
@@ -26761,6 +26669,22 @@ async def detect_human_verification(page, platform: str, label: str) -> tuple[bo
                 findings.push('Cloudflare');
             }
             if (text.includes('checking your browser') || text.includes('checking if the site connection is secure')) {
+                findings.push('Cloudflare');
+            }
+            // #896 (2026-07-02 live): Claude's IN-APP Cloudflare gate. The
+            // parent shell says "Performing security verification" while the
+            // "Verify you are human" checkbox text lives inside the
+            // cross-origin Turnstile iframe — invisible to body.innerText.
+            // Without this marker the gate reads as a generic setup failure.
+            // Scoped hard (review catch): the phrase is generic English that
+            // can appear in research CONTENT (a security-topic brief in a
+            // composer, a NotebookLM notebook titled from the topic), and
+            // Claude is the only platform behind Cloudflare — so require
+            // platform==claude AND the composer to be unmounted (the gate
+            // removes it; live signature was "Composer not found").
+            if (platformKey === 'claude' &&
+                text.includes('performing security verification') &&
+                !document.querySelector('div[contenteditable="true"], .ProseMirror')) {
                 findings.push('Cloudflare');
             }
 
@@ -26787,7 +26711,7 @@ async def detect_human_verification(page, platform: str, label: str) -> tuple[bo
             }
 
             return { findings: [...new Set(findings)] };
-        }""")
+        }""", platform.lower())
         findings = result.get("findings", []) if isinstance(result, dict) else []
         if findings:
             return True, findings[0]
@@ -26846,6 +26770,77 @@ async def detect_session_expiry(page, platform: str, label: str) -> tuple[bool, 
         return False, ""
 
 
+def _hv_fail_copy(platform: str, reason: str) -> tuple[str, str]:
+    """#896: user-facing (title, details) for a human-verification failure.
+
+    Cloudflare gets its own copy because its checkbox is an ATTESTATION, not
+    a click test: the automation browser fails the browser-integrity check,
+    so the challenge re-issues after every click — solving it in the
+    automation window is a losing loop. The winnable move is signing in via
+    the real-Chrome login window, which builds Cloudflare's trust in this
+    profile+IP until the challenge stops being issued at all."""
+    _names = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
+    plat = _names.get(platform.lower(), platform.capitalize())
+    if "cloudflare" in (reason or "").lower():
+        return (
+            f"{plat} hit Cloudflare's human check",
+            f"Cloudflare re-issues its 'Verify you are human' check every time it's "
+            f"clicked in the automation window, so clicking there won't clear it. "
+            f"Skip {plat} for this run. To make these checks go away: run the login "
+            f"command on this computer and sign in to {plat} in the real Chrome window "
+            f"it opens — each clean sign-in builds Cloudflare's trust in this computer "
+            f"until it stops asking. Retry gives it one more shot now.",
+        )
+    return (
+        f"{plat} needs a human check",
+        f"{plat} is showing a human-verification challenge"
+        f"{f' ({reason})' if reason else ''}. Solve it in the open browser window, "
+        f"then Retry — or Skip {plat} for this run.",
+    )
+
+
+async def _hv_setup_fail_card(page, platform: str, label: str) -> bool:
+    """#896: when setup/paste fails, check whether the REAL cause is a
+    human-verification wall and, if so, emit an honest HV card instead of
+    the caller's generic "didn't start" card.
+
+    Probes the already-open page (zero navigations) plus the sticky
+    `_controls.hv_blocked` verdict — the HV cascade's kill-tab tier closes
+    the caller's page object, so a live probe alone can go blind exactly
+    when the wall was worst. Returns True iff an HV card was emitted
+    (caller must then skip its generic fail_agent)."""
+    platform_key = platform.lower()
+    reason = _controls.hv_blocked.get(platform_key, "")
+    if not reason:
+        try:
+            blocked, reason = await detect_human_verification(page, platform, label)
+            if not blocked:
+                return False
+            reason = reason or "Human verification challenge"
+            _controls.hv_blocked[platform_key] = reason
+        except Exception:
+            return False
+    title, details = _hv_fail_copy(platform, reason)
+    # #896 review catch: a stale-cookie login redirect can be SERVED WITH
+    # Cloudflare's challenge (managed challenge at /login for a distrusted
+    # client), so an HV verdict does not rule out "also signed out". Keep the
+    # HV card (its real-Chrome guidance is the winnable move either way) but
+    # preserve #893's bookkeeping so the next gate check runs the full verify
+    # instead of re-trusting the stale cookie jar.
+    try:
+        _wall = await _page_shows_login_wall(page)
+    except Exception:
+        _wall = None
+    if _wall:
+        _controls.cookie_trust_broken.add(platform_key)
+        log(f"[{label}] HV wall coincides with {_wall} — session also looks signed out; cookie trust broken", "WARN")
+        details += (" This profile also looks signed out, so the sign-in via the "
+                    "login command is required, not optional.")
+    log(f"[{label}] setup failed ON a human-verification wall ({reason}) — emitting HV card, not the generic fail", "WARN")
+    fail_agent(platform_key, title, details)
+    return True
+
+
 async def _playwright_hv_click(page, label: str) -> bool:
     """Cheap DOM-based HV click. Returns True iff we actually clicked
     something. No budget for image-puzzles — those fall through to CUA.
@@ -26893,7 +26888,7 @@ async def _playwright_hv_click(page, label: str) -> bool:
 
 async def wait_for_verification_clearance(browser, cua_client, page, platform: str, label: str,
                                           verbose=False, max_wait_loops: int = 120,
-                                          phase: int = 2) -> bool:
+                                          phase: int = 2, initial_reason: str = "") -> bool:
     """Handle a human-verification gate on an agent page.
 
     Flow (NEVER-DIE-MIGRATION-2026-04-18, full HV chain):
@@ -26918,8 +26913,48 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     """
     # Detect the specific challenge for banner copy AND to confirm there
     # IS one to solve before bothering CUA.
-    _, reason = await detect_human_verification(page, platform, label)
+    # #896 review catch: this single top probe can land in a detection gap
+    # (the in-app gate transitions between its parent-shell-text phase and
+    # its iframe phase; a probe error fails open to "") — so seed from the
+    # caller's already-confirmed reason and let every later probe REFRESH
+    # the value. An empty reason is treated as UNKNOWN, never as "not
+    # Cloudflare" — unknown gets the settled double-probe.
+    _, _top_reason = await detect_human_verification(page, platform, label)
+    reason = _top_reason or initial_reason
     platform_key = platform.lower()
+
+    async def _settled_clear() -> bool:
+        """#896: Cloudflare re-issues its checkbox seconds after a click that
+        fails browser attestation — a single probe can land in the gap
+        between re-issues and report a false clear, after which the run
+        burns its setup/paste budget against a walled page (live
+        2026-07-02). Only a POSITIVELY-known non-Cloudflare challenge gets
+        the single-probe fast path; Cloudflare AND unknown get a second
+        probe ~5s later. A closed page can never certify a clear (its
+        probes fail open to "no challenge"). Reads the enclosing `page` and
+        refreshes the enclosing `reason`, so it follows the kill-tab tier's
+        fresh tab and the gate's phase transitions automatically."""
+        nonlocal reason
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            return False
+        blocked_now, _fresh = await detect_human_verification(page, platform, label)
+        if _fresh:
+            reason = _fresh
+        if blocked_now:
+            return False
+        if reason and "cloudflare" not in reason.lower():
+            return True
+        await asyncio.sleep(5)
+        blocked_now, _fresh = await detect_human_verification(page, platform, label)
+        if _fresh:
+            reason = _fresh
+        return not blocked_now
+
+    def _mark_cleared():
+        _controls.hv_blocked.pop(platform_key, None)
 
     # ── Tier 0: Playwright cheap-click ──
     # Most Cloudflare gates are a single checkbox. A direct Playwright
@@ -26929,10 +26964,10 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         clicked = await _playwright_hv_click(page, label)
         if clicked:
             await asyncio.sleep(3)
-            blocked, _ = await detect_human_verification(page, platform, label)
-            if not blocked:
+            if await _settled_clear():
                 log(f"[{label}] Playwright cleared verification ✓ — CUA not needed")
                 emit_event("agent_verified", phase=phase, agent=platform_key)
+                _mark_cleared()
                 return True
             log(f"[{label}] Playwright click didn't clear — escalating to CUA", "WARN")
     except Exception as e:
@@ -26957,11 +26992,11 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             model=CUA_MODEL, max_iterations=3, verbose=verbose)
         # Give the page a moment to re-render after a successful click
         await asyncio.sleep(3)
-        blocked, _ = await detect_human_verification(page, platform, label)
-        if not blocked:
+        if await _settled_clear():
             log(f"[{label}] CUA cleared verification ✓ — proceeding silently")
             # Clear the dropdown badge immediately so the user sees recovery.
             emit_event("agent_verified", phase=phase, agent=platform_key)
+            _mark_cleared()
             return True
         _cua_text = (result.get("text") or "")[:120]
         log(f"[{label}] CUA first pass didn't clear ({_cua_text}) — cooldown + reload + retry", "WARN")
@@ -26988,22 +27023,24 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         except Exception as e:
             log(f"[{label}] Reload failed: {e} — escalating to user", "WARN")
 
-        blocked, _ = await detect_human_verification(page, platform, label)
+        blocked, _fresh_r = await detect_human_verification(page, platform, label)
+        if _fresh_r:
+            reason = _fresh_r  # keep the verdict/copy tracking the latest observed wall
         if blocked:
             log(f"[{label}] Turnstile still present after cooldown — CUA 5-iter retry")
             await browser.switch_to_page(page)
             await agent_loop(cua_client, browser, sys_prompt, user_prompt,
                 model=CUA_MODEL, max_iterations=5, verbose=verbose)
             await asyncio.sleep(3)
-            blocked, _ = await detect_human_verification(page, platform, label)
 
-        if not blocked:
+        if await _settled_clear():
             # Page just reloaded — re-run platform-specific setup so the
             # caller's subsequent paste/send logic still finds Deep Research
             # pill / Opus Adaptive + Research tool / Pro Extended Thinking
             # active on the fresh page.
             log(f"[{label}] CUA retry cleared verification ✓ — re-running setup")
             emit_event("agent_verified", phase=phase, agent=platform_key)
+            _mark_cleared()
             pl = platform.lower()
             try:
                 if pl == "claude":
@@ -27034,10 +27071,10 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             pass
         page = await browser.new_tab(original_url)
         await asyncio.sleep(4)
-        blocked, _ = await detect_human_verification(page, platform, label)
-        if not blocked:
+        if await _settled_clear():
             log(f"[{label}] Fresh tab cleared verification ✓ — re-running setup")
             emit_event("agent_verified", phase=phase, agent=platform_key)
+            _mark_cleared()
             pl = platform.lower()
             try:
                 if pl == "claude":
@@ -27055,8 +27092,25 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
 
     # ── User manual fallback — pause pipeline, banner with Resume/Skip ──
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
+    _controls.hv_blocked[platform_key] = reason or "Human verification challenge"
     _hv_alert_id = f"phase{phase}_human_verify_{platform_key}"
-    _hv_msg = f"Solve the check ({platform.capitalize()}'s 'are you human' prompt) in the open browser, then Resume — or Skip {platform.capitalize()}."
+    if "cloudflare" in (reason or "").lower():
+        # #896: Cloudflare's checkbox is a browser attestation the automation
+        # window can't pass — it re-issues after every click there. Point the
+        # user at the winnable move (real-Chrome sign-in = trust building)
+        # instead of inviting them into the losing click loop.
+        _hv_plat = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}.get(
+            platform_key, platform.capitalize())
+        _hv_msg = (
+            f"{_hv_plat} hit Cloudflare's 'Verify you are human' check. "
+            f"Clicking it in the automation window makes it re-issue — don't keep clicking there. "
+            f"Skip {_hv_plat} for this run; to make these checks go away, run the "
+            f"login command on this computer and sign in to {_hv_plat} in the real "
+            f"Chrome window it opens — each clean sign-in builds Cloudflare's trust until it "
+            f"stops asking. If the check clears here on its own, the run resumes automatically."
+        )
+    else:
+        _hv_msg = f"Solve the check ({platform.capitalize()}'s 'are you human' prompt) in the open browser, then Resume — or Skip {platform.capitalize()}."
     emit_event("human_verification_required", phase=phase, agent=platform_key,
                platform=platform_key,
                platformLabel=platform.capitalize(),
@@ -27102,8 +27156,8 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             return False
         if not _controls.is_pause():
             # User tapped Resume — verify the challenge is actually cleared
-            blocked, _ = await detect_human_verification(page, platform, label)
-            if blocked:
+            # (#896: settled probe — a Cloudflare re-issue gap must not pass)
+            if not await _settled_clear():
                 log(f"[{label}] Resume tapped but verification still present — re-pausing", "WARN")
                 emit_event("human_verification_required", phase=phase, agent=platform_key,
                            platform=platform_key,
@@ -27117,12 +27171,14 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
                 _controls.request_pause("human_verification_required")
                 continue
             log(f"[{label}] Verification cleared ✓")
+            _mark_cleared()
             emit_event("pipeline_resumed", phase=phase, reason="human_verification_cleared", agent=platform_key)
             return True
         # Auto-detect clearance even without explicit resume
-        blocked, _ = await detect_human_verification(page, platform, label)
-        if not blocked:
+        # (#896: settled probe — a Cloudflare re-issue gap must not pass)
+        if await _settled_clear():
             log(f"[{label}] Verification auto-cleared ✓")
+            _mark_cleared()
             _controls.request_resume()
             emit_event("pipeline_resumed", phase=phase, reason="human_verification_cleared", agent=platform_key)
             return True
@@ -27183,6 +27239,10 @@ async def check_hv_gate(browser, cua_client, platform: str, label: str,
                 browser, cua_client, browser.page,
                 platform=platform, label=label,
                 verbose=verbose, phase=phase,
+                # #896: seed the confirmed reason — the chain's own top probe
+                # can land in a detection gap (post-click re-issue window on
+                # the retry pass) and must not run "unknown" as "no Cloudflare".
+                initial_reason=reason,
             )
         except Exception as e:
             log(f"[{label}] wait_for_verification_clearance errored "
@@ -27336,12 +27396,23 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # in the browser, then auto-resume when cleared.
     platform_l = platform.lower()
     blocked, reason = await detect_human_verification(page, platform, label)
+    if not blocked:
+        # #896: fresh nav landed clean — drop any stale wall verdict from a
+        # previous attempt so later fail paths don't blame a wall that's gone.
+        # (A wall that re-raises MID-setup is re-detected live by the
+        # post-setup-fail probes below, which rebuild the verdict.)
+        _controls.hv_blocked.pop(platform_l, None)
     if blocked:
-        cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
+        cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label,
+                                                        verbose=verbose, initial_reason=reason)
         if not cleared:
-            fail_agent(platform_l,
-                       f"{platform.capitalize()} verification not cleared",
-                       f"We couldn't get past {platform.capitalize()}'s verification check. Retry to try {platform.capitalize()} again, or Skip it.")
+            # #896: reason-aware card — Cloudflare gets the real-Chrome
+            # trust-building guidance, not "try again in the open browser".
+            # Prefer the cascade's refreshed verdict (hv_blocked) over our
+            # possibly-stale pre-cascade probe.
+            _hv_title, _hv_details = _hv_fail_copy(
+                platform, _controls.hv_blocked.get(platform_l, reason))
+            fail_agent(platform_l, _hv_title, _hv_details)
             return page, False
         # Settle after clearance — page often reloads to the real content
         await asyncio.sleep(2)
@@ -27397,13 +27468,16 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # visible (it can appear mid-setup when Claude's automation detection trips),
     # pause and wait before falling back to CUA.
     if not setup_ok:
-        blocked, _ = await detect_human_verification(page, platform, label)
+        blocked, _hv_reason = await detect_human_verification(page, platform, label)
         if blocked:
-            cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label, verbose=verbose)
+            cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label,
+                                                            verbose=verbose, initial_reason=_hv_reason)
             if not cleared:
-                fail_agent(platform_l,
-                           f"Couldn't clear human verification for {platform.capitalize()}",
-                           "The human-verification challenge couldn't be cleared. Retry to relaunch the agent; Skip to drop it.")
+                # #896: reason-aware card (Cloudflare → real-Chrome guidance);
+                # prefer the cascade's refreshed verdict over our pre-probe.
+                _hv_title, _hv_details = _hv_fail_copy(
+                    platform, _controls.hv_blocked.get(platform_l, _hv_reason))
+                fail_agent(platform_l, _hv_title, _hv_details)
                 return page, False
             await asyncio.sleep(2)
             # Retry Playwright setup once, now that the challenge is gone
@@ -27476,8 +27550,13 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                                      brief_to_paste, platform, label, verbose)
             if not paste_ok:
                 log(f"[{label}] CRITICAL: Both attach and paste (DOM+CUA) failed — skipping this agent", "ERROR")
-                fail_agent(platform_l, f"Couldn't send the brief to {label}",
-                           f"We couldn't hand the research brief to {label}. Retry to try again, or Skip it.")
+                # #896: attach+paste failing together is the live signature of
+                # a human-verification wall raised mid-setup (Composer absent,
+                # Clipboard API blocked by the challenge page's permissions
+                # policy). Name the real cause instead of the generic card.
+                if not await _hv_setup_fail_card(page, platform, label):
+                    fail_agent(platform_l, f"Couldn't send the brief to {label}",
+                               f"We couldn't hand the research brief to {label}. Retry to try again, or Skip it.")
                 return page, False
     else:
         # Inline paste path — engaged in two cases:
@@ -27505,8 +27584,11 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                                  brief_to_paste, platform, label, verbose)
         if not paste_ok:
             log(f"[{label}] CRITICAL: Brief paste failed (DOM + CUA) — skipping this agent", "ERROR")
-            fail_agent(platform_l, f"Couldn't send the brief to {label}",
-                       f"We couldn't hand the research brief to {label}. Retry to try again, or Skip it.")
+            # #896: paste-blocked can mean a human-verification wall is up —
+            # probe before blaming the paste machinery.
+            if not await _hv_setup_fail_card(page, platform, label):
+                fail_agent(platform_l, f"Couldn't send the brief to {label}",
+                           f"We couldn't hand the research brief to {label}. Retry to try again, or Skip it.")
             return page, False
 
     # ── Just-before-send: ensure the required mode is STILL active ──
@@ -28027,19 +28109,25 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # forever waiting for events that will never arrive.
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
                            progress="ChatGPT setup/paste failed — agent did not start.")
-                # #893: a stale trusted cookie lands here via a login wall —
-                # name the real cause so Retry is winnable (the generic card
-                # sent users into an identical losing retry loop).
-                _cg_wall = await _page_shows_login_wall(chatgpt_page)
-                if _cg_wall:
-                    _controls.cookie_trust_broken.add("chatgpt")
-                    log(f"[2A] ChatGPT shows {_cg_wall} — session expired (stale cookie)", "WARN")
-                    fail_agent("chatgpt", "ChatGPT looks signed out",
-                               "ChatGPT is showing its sign-in page — the saved session expired. "
-                               "Sign in using the open browser (or run the login command on the device), then Retry.")
+                # #896: a human-verification wall is the most specific cause —
+                # probe it before the login-wall check (the sticky hv_blocked
+                # verdict also survives a dead page reference).
+                if await _hv_setup_fail_card(chatgpt_page, "chatgpt", "2A"):
+                    pass
                 else:
-                    fail_agent("chatgpt", "ChatGPT didn't start",
-                               "ChatGPT failed to launch after two tries. Retry to start it fresh, or Skip it.")
+                    # #893: a stale trusted cookie lands here via a login wall —
+                    # name the real cause so Retry is winnable (the generic card
+                    # sent users into an identical losing retry loop).
+                    _cg_wall = await _page_shows_login_wall(chatgpt_page)
+                    if _cg_wall:
+                        _controls.cookie_trust_broken.add("chatgpt")
+                        log(f"[2A] ChatGPT shows {_cg_wall} — session expired (stale cookie)", "WARN")
+                        fail_agent("chatgpt", "ChatGPT looks signed out",
+                                   "ChatGPT is showing its sign-in page — the saved session expired. "
+                                   "Sign in using the open browser (or run the login command on the device), then Retry.")
+                    else:
+                        fail_agent("chatgpt", "ChatGPT didn't start",
+                                   "ChatGPT failed to launch after two tries. Retry to start it fresh, or Skip it.")
                 try:
                     _controls.skipped_agents.add("chatgpt")
                 except Exception:
@@ -28114,17 +28202,23 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2B] Claude setup failed", "ERROR")
                 emit_event("agent_progress", phase=2, agent="claude", status="failed",
                            progress="Claude setup/paste failed — agent did not start.")
-                # #893: stale-cookie login wall → honest signed-out card.
-                _cl_wall = await _page_shows_login_wall(claude_page)
-                if _cl_wall:
-                    _controls.cookie_trust_broken.add("claude")
-                    log(f"[2B] Claude shows {_cl_wall} — session expired (stale cookie)", "WARN")
-                    fail_agent("claude", "Claude looks signed out",
-                               "Claude is showing its sign-in page — the saved session expired. "
-                               "Sign in using the open browser (or run the login command on the device), then Retry.")
+                # #896: human-verification wall first — Claude's in-app
+                # Cloudflare gate is exactly what used to land here as the
+                # misleading generic "didn't start" card (live 2026-07-02).
+                if await _hv_setup_fail_card(claude_page, "claude", "2B"):
+                    pass
                 else:
-                    fail_agent("claude", "Claude didn't start",
-                               "Claude failed to launch after two tries. Retry to start it fresh, or Skip it.")
+                    # #893: stale-cookie login wall → honest signed-out card.
+                    _cl_wall = await _page_shows_login_wall(claude_page)
+                    if _cl_wall:
+                        _controls.cookie_trust_broken.add("claude")
+                        log(f"[2B] Claude shows {_cl_wall} — session expired (stale cookie)", "WARN")
+                        fail_agent("claude", "Claude looks signed out",
+                                   "Claude is showing its sign-in page — the saved session expired. "
+                                   "Sign in using the open browser (or run the login command on the device), then Retry.")
+                    else:
+                        fail_agent("claude", "Claude didn't start",
+                                   "Claude failed to launch after two tries. Retry to start it fresh, or Skip it.")
                 try:
                     _controls.skipped_agents.add("claude")
                 except Exception:
@@ -28190,10 +28284,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # #893: stale-cookie login wall → record it so the next gate check
             # runs the full verify (the pipeline_error card already offers
             # Retry/Skip; a Google login redirect is the giveaway here).
-            _gm_wall = await _page_shows_login_wall(gemini_page)
-            if _gm_wall:
-                _controls.cookie_trust_broken.add("gemini")
-                log(f"[2C] Gemini shows {_gm_wall} — session expired (stale cookie)", "WARN")
+            # #896: skip the wall probe when a human-verification wall is the
+            # known cause — the inner fail path already named it.
+            if "gemini" not in _controls.hv_blocked:
+                _gm_wall = await _page_shows_login_wall(gemini_page)
+                if _gm_wall:
+                    _controls.cookie_trust_broken.add("gemini")
+                    log(f"[2C] Gemini shows {_gm_wall} — session expired (stale cookie)", "WARN")
             try:
                 _controls.skipped_agents.add("gemini")
             except Exception:
@@ -37532,15 +37629,18 @@ def _find_chrome_executable() -> "str | None":
     return None
 
 
-def _kill_chrome_for_profile(profile_dir: str, graceful: bool = False) -> None:
+def _kill_chrome_for_profile(profile_dir: str, graceful: bool = False) -> int:
     """Kill any Chrome (plain OR patchright) whose command line references THIS
     profile dir, so the profile lock is released before the next launcher opens
-    it. `graceful=True` sends SIGTERM (proc.terminate) instead of SIGKILL so
-    Chrome flushes cookies/session to disk before exiting — used by the macOS
-    close path where the Popen handle is the `open -na` launcher, not Chrome.
+    it. `graceful=True` asks Chrome to exit CLEANLY so it flushes cookies /
+    session to disk first: SIGTERM (proc.terminate) on POSIX, `taskkill /T`
+    WITHOUT /F on Windows (#898b — psutil's terminate() is an alias for the
+    hard kill() on Windows, so a real WM_CLOSE is required there).
     Boundary-safe via _profile_matches_cmdline — never touches the user's
     personal Chrome (different --user-data-dir) or a sibling worker's profile.
-    Best-effort; silent if psutil is absent.
+    Best-effort; silent if psutil is absent. Returns the number of processes
+    signaled (0 = nothing was running on this profile), so callers can skip
+    the flush-grace wait when there was nothing to close.
 
     Matches on BOTH the raw profile path (as Chrome is launched: the un-resolved
     Path.home()-based `--user-data-dir=`) AND its resolved form, so a home dir
@@ -37548,13 +37648,14 @@ def _kill_chrome_for_profile(profile_dir: str, graceful: bool = False) -> None:
     try:
         import psutil
     except Exception:
-        return
+        return 0
     raw = str(profile_dir).lower().replace("\\", "/")
     try:
         resolved = str(Path(profile_dir).resolve()).lower().replace("\\", "/")
     except Exception:
         resolved = raw
     targets = {t for t in (raw, resolved) if t}
+    signaled = 0
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             if not (proc.info["name"] and "chrom" in proc.info["name"].lower()):
@@ -37562,13 +37663,22 @@ def _kill_chrome_for_profile(profile_dir: str, graceful: bool = False) -> None:
             cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
             if any(_profile_matches_cmdline(t, cmdline) for t in targets):
                 if graceful:
-                    proc.terminate()  # SIGTERM — Chrome flushes cookies, then exits
+                    if sys.platform == "win32":
+                        # WM_CLOSE to the tree (no /F) — Chrome flushes, then exits.
+                        subprocess.run(
+                            ["taskkill", "/PID", str(proc.info["pid"]), "/T"],
+                            capture_output=True, timeout=10,
+                            creationflags=_PS_NO_WINDOW)
+                    else:
+                        proc.terminate()  # SIGTERM — Chrome flushes cookies, then exits
                 else:
                     proc.kill()
+                signaled += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
         except Exception:
             pass
+    return signaled
 
 
 def _backend_is_running() -> bool:
@@ -37650,7 +37760,13 @@ async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", 
         return False
     # Make sure the profile isn't already open (a live Chrome on this dir would
     # make our launch attach to it / no-op, and would hold the lock).
-    _kill_chrome_for_profile(profile_dir)
+    # #898b: graceful first — a hard kill here can drop a seconds-old sign-in
+    # before Chrome flushes it to disk (the "had to relogin" report). Only if
+    # something was actually running: give it a short flush grace, then
+    # hard-sweep any remnant so the profile lock is still guaranteed free.
+    if _kill_chrome_for_profile(profile_dir, graceful=True):
+        await asyncio.sleep(4.0)
+        _kill_chrome_for_profile(profile_dir)
     chrome_args = [
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
@@ -37955,7 +38071,11 @@ async def run_login_flow(
         nonlocal seeded_any
         profile_dir = str(_profile_dir(n))
         label = "profile" if total <= 1 else f"profile {n}"
-        _setup_step(n, total, f"Sign in — {label}")
+        # #898a: pair-Stage-4 style — a plain per-profile header, NOT the
+        # "[n/total]" step chrome. Profiles are a walk (one after another,
+        # open-ended via the add-loop), not a fixed count of setup steps.
+        print()
+        print(f"  {_c(_BOLD, f'Profile {n}')}  {_c(_DIM, profile_dir)}")
         results: "dict[str, bool]" = {}
         try:
             status = await _login_one_profile(
@@ -37981,6 +38101,13 @@ async def run_login_flow(
         return results, status
 
     total = max(profile_list) if len(profile_list) > 1 else 1
+    # #898a: one-line walk intro — the existing profiles are being CHECKED
+    # (eyeball each sign-in, solve any human-check), not re-created.
+    if profile_list:
+        _n_prof = len(profile_list)
+        print()
+        print(f"  {_c(_BOLD, str(_n_prof))} browser profile{'s' if _n_prof != 1 else ''} detected — "
+              f"walking through each so you can check its sign-ins and solve any human-check.")
     for n in profile_list:
         await _do_profile(n, total)
 

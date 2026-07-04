@@ -1,25 +1,24 @@
-"""Phase-2 Gemini robustness — periodic-reload empty-chat recovery (2A) and
-plan-generation wait timing + Start-Research guard + alert (2B/2C).
+"""Phase-2 Gemini robustness — NEVER-reload invariant (#897a), completion
+detection under the collapsed-composer UI (#897b), and the plan-generation
+wait timing + Start-Research guard + alert (2B/2C).
 
-Root-caused 2026-06-29 from a live stuck run ("OpenShell vs NemoClaw", conv
-/app/1f44b0c0faafb512): the DR FINISHED (CUA said "done 1/2"), but the ~10-min
-periodic page.reload() then re-rendered Gemini's empty "What's the vibe" home,
-wiping the completed panel before the 2nd CUA confirmation → it looped forever.
-Separately, the [2D] plan-draft wait was a flat 10 min (+6 min CUA recovery) with
-a 30s/60s tick, far past the user's "Start research in 3-5 min max" + it felt
-frozen, and a never-started plan dropped to the wall-clock cap instead of a prompt
-Retry/Skip.
+History: a ~10-min periodic page.reload() was added 2026-05-26 because Gemini
+then didn't push the completed DR panel into the live DOM without a reload.
+The 2026-07 Gemini SPA no longer restores the conversation on reload AT ALL —
+every reload landed on the empty "new chat" home (image-verified live
+2026-07-04) — so #897a DELETED the reload and its sidebar-reopen recovery
+subsystem outright. The inverse is now the invariant this file guards:
+Gemini is NEVER reloaded mid-run, for any reason.
 
-Guards:
-  2A  - the periodic reload STOPS once CUA confirms done (done_count >= 1) so a
-        finished panel isn't wiped;
-      - after a reload it probes the DOM (not the stale URL) for the empty home and
-        recovers IN-CHAT via the sidebar (primary) then goto (fallback);
-      - the stuck-watchdog baselines reset ONLY when the conversation is present,
-        so an unrecoverable empty home escalates instead of polling a dead page.
-  2B/2C - the plan wait caps near ~5 min (env GEMINI_PLAN_WAIT_SEC), the heartbeat
-        + poll tick tighten, the Start-Research click is verified (re-click if it
-        didn't take), and exhaustion (here AND on a user-retry) raises fail_agent.
+Completion under the new UI (#897b, user-confirmed live): the collapsed
+composer removed the persistent bottom input box (a launcher button becomes
+the input only when clicked), so "stop button lives in the composer" is no
+longer a running-signal. Done-markers key on visible TEXT:
+  - the report button row "Contents" · "Share & Export" · "Create"
+  - the chat line "I've completed your research. Feel free to ask me
+    follow-up questions or request changes."
+  - "Share & Export" alone (the pre-2026-07 marker, kept)
+Running-signal: guarded running-CSS-animation tier (offsetParent + playState).
 """
 import inspect
 
@@ -28,76 +27,107 @@ import research
 MODSRC = inspect.getsource(research)
 
 
-# ── 2A: conversation-id helper (pure) ────────────────────────────────────────
+# ── #897a: Gemini is NEVER reloaded mid-run ──────────────────────────────────
 
-def test_conversation_id_extracted_from_app_url():
-    f = research._gemini_conversation_id
-    assert f("https://gemini.google.com/app/1f44b0c0faafb512") == "1f44b0c0faafb512"
-    assert f("https://gemini.google.com/app/1f44b0c0faafb512?hl=en") == "1f44b0c0faafb512"
-
-
-def test_conversation_id_blank_for_bare_or_missing():
-    f = research._gemini_conversation_id
-    assert f("https://gemini.google.com/app") == ""   # bare new-chat home
-    assert f("") == ""
-    assert f("https://gemini.google.com/") == ""
+def test_periodic_reload_block_is_gone():
+    assert "Gemini periodic refresh (every GEMINI_REFRESH_INTERVAL)" not in MODSRC, (
+        "the periodic-reload block must stay deleted — reloads land on the empty home"
+    )
+    assert "GEMINI_REFRESH_INTERVAL_SEC" not in MODSRC
+    assert "GEMINI_REFRESH_GRACE_SEC" not in MODSRC
+    assert '"last_refresh"' not in MODSRC, "the reload gate state must stay deleted"
 
 
-# ── 2A: reload hardening wiring ──────────────────────────────────────────────
+def test_reload_recovery_subsystem_is_gone():
+    # Sole caller was the reload block — the whole subsystem goes with it.
+    for sym in ("_gemini_recover_if_empty", "_gemini_reopen_from_sidebar",
+                "_gemini_conversation_present", "_gemini_conversation_id",
+                "_GEMINI_CONVERSATION_PRESENT_JS"):
+        assert not hasattr(research, sym), f"{sym} should be deleted with the reload"
 
-def test_periodic_reload_stops_once_cua_confirms_done():
-    # The empty-chat hang: CUA said "done 1/2", the NEXT reload wiped the panel.
-    # Once done_count >= 1, the periodic reload must be suppressed.
-    assert 'p.get("done_count", 0) < 1' in MODSRC, (
-        "periodic Gemini reload must skip once CUA has a done confirmation"
+
+def test_reauth_reload_is_guarded_for_gemini():
+    # The shared mid-run session-expiry Retry branch reloads the tab so the
+    # fresh cookie lands — for a MOUNTED Gemini conversation that reload would
+    # drop the SPA to the empty home, so it's guarded off (the cookie applies
+    # on Gemini's own background requests in place). A Gemini tab redirected
+    # OFF gemini.google.com (login URL) has nothing left to lose — the reload
+    # is what un-sticks it, so the guard keys on the current URL, not just
+    # the platform name.
+    assert '_gemini_mounted = name == "Gemini" and "gemini.google.com" in _cur_url' in MODSRC
+    assert "if not _gemini_mounted:" in MODSRC, (
+        "the re-auth retry reload must never fire on a mounted Gemini conversation"
     )
 
 
-def test_reload_holds_during_active_generation_grace():
-    # A live run (Golden Retriever, 3 workers) lost its Gemini DR: the periodic
-    # reload fired ~11 min in WHILE the DR was still generating, dropped the SPA to
-    # the empty home, and recovery couldn't restore it. The reload must wait out a
-    # grace (CUA tracks progress in that window) before it can fire.
-    assert "GEMINI_REFRESH_GRACE" in MODSRC
-    assert 'os.environ.get("GEMINI_REFRESH_GRACE_SEC"' in MODSRC
-    assert "(time.time() - p[\"start_time\"]) >= GEMINI_REFRESH_GRACE" in MODSRC, (
-        "the periodic reload must be gated on the active-generation grace"
+def test_completion_re_survives_the_deletion():
+    # _GEMINI_COMPLETION_RE is still used by the kickoff-stall nudge
+    # suppressor — it must NOT go down with the reload subsystem.
+    assert hasattr(research, "_GEMINI_COMPLETION_RE")
+    assert research._GEMINI_COMPLETION_RE.search(
+        "I've completed your research. Feel free to ask me follow-up questions."
     )
 
 
-def test_sidebar_recovery_matches_real_gemini_controls():
-    # The recovery failed because the expand-button selector only matched
-    # menu/expand — Gemini's real controls are "Open sidebar" + "Toggle Recent".
-    src = inspect.getsource(research._gemini_reopen_from_sidebar)
-    assert "open sidebar" in src.lower(), "must click Gemini's 'Open sidebar' control"
-    assert "recent" in src.lower(), "must expand Gemini's 'Toggle Recent' list"
+# ── #897b: completion detection under the collapsed-composer UI ──────────────
+
+DETECT_SRC = inspect.getsource(research.detect_completion_gemini)
 
 
-def test_reload_recovers_empty_home_and_helpers_exist():
-    assert hasattr(research, "_gemini_recover_if_empty")
-    assert hasattr(research, "_gemini_reopen_from_sidebar")
-    assert hasattr(research, "_gemini_conversation_present")
-    # the reload block calls the recovery (not the old stale-URL drift check)
-    assert "_gemini_recover_if_empty(" in MODSRC
-    # recovery probes the DOM for conversation markers, not page.url
-    assert "_GEMINI_CONVERSATION_PRESENT_JS" in MODSRC
-    assert "post-reload URL drifted" not in MODSRC, (
-        "the unreliable stale-URL drift recovery should be replaced by the DOM probe"
-    )
+def test_detector_keys_on_report_button_trio():
+    # "Contents" · "Share & Export" · "Create" together = research complete
+    # (user-confirmed live 2026-07-04). Text/label match, never class selectors.
+    assert "reportButtonTrio" in DETECT_SRC
+    lower = DETECT_SRC.lower()
+    for kw in ("'contents'", "'create'", "share & export"):
+        assert kw in lower, f"trio member {kw} missing from the detector"
 
 
-def test_sidebar_is_the_primary_recovery():
-    src = inspect.getsource(research._gemini_recover_if_empty)
-    # sidebar reopen is attempted BEFORE the goto fallback
-    assert src.index("_gemini_reopen_from_sidebar") < src.index("page.goto"), (
-        "sidebar click must be the PRIMARY recovery (a cold goto often re-renders empty)"
-    )
+def test_detector_trio_members_are_exact_text():
+    # EXACT text so composer tools like "Create image" can't satisfy the
+    # "Create" leg and a table of contents heading can't satisfy "Contents".
+    assert "txt === 'contents'" in DETECT_SRC
+    assert "txt === 'create'" in DETECT_SRC
 
 
-def test_watchdog_baselines_reset_only_when_conversation_present():
-    # If recovery failed (still empty home), DON'T reset the stuck-watchdog
-    # baselines — let it escalate, instead of polling a dead page forever.
-    assert "if _recovered:" in MODSRC
+def test_detector_keys_on_completed_chat_text():
+    # Gemini's own completion chat line, rendered above the report tile —
+    # anchored on the exact live line, apostrophe-normalized.
+    assert "i've completed your research" in DETECT_SRC
+
+
+def test_completed_chat_text_cannot_be_satisfied_by_user_text():
+    # Review catch (MAJOR, #752-755 lesson): the pasted brief / mid-run user
+    # chat sits in user-query bubbles inside body.innerText — a brief ending
+    # "…once you have completed your research, compile a table" must never
+    # read as Gemini's own completion line. The scan is scoped to MODEL
+    # response nodes with user-query ancestry excluded; no body-wide scan.
+    assert "closest('user-query" in DETECT_SRC
+    assert "document.body && document.body.innerText" not in DETECT_SRC
+
+
+def test_detector_has_guarded_running_animation_tier():
+    # With the composer collapsed there may be NO stop button while the DR
+    # spinner still runs — the animation tier must hold completion back, and
+    # must carry the 2026-05-14 guards (visible + actually RUNNING) so
+    # persisted/finished animations on UI chrome can't hold it hostage.
+    assert "getAnimations" in DETECT_SRC
+    assert "offsetParent" in DETECT_SRC
+    assert "playState === 'running'" in DETECT_SRC
+
+
+def test_detector_still_gates_on_start_button():
+    # The planning-gate: "Start research" visible = pre-research, never done.
+    assert "start research" in DETECT_SRC.lower()
+    assert "start_research_btn_visible" in DETECT_SRC
+
+
+def test_cua_completion_hint_describes_new_ui():
+    # The round-robin CUA fallback hint must describe the collapsed composer
+    # + the trio/chat-line markers, and keep the "response complete" /
+    # "still generating" phrase anchors the parser keys on.
+    assert "NO persistent bottom input box" in MODSRC
+    assert "Contents', 'Share & Export'" in MODSRC
 
 
 # ── 2B/2C: plan-wait timing + guard + alert ──────────────────────────────────
