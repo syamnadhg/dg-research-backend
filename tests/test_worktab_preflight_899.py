@@ -22,6 +22,7 @@ WORK page (an IdP landing is wall-free but proves nothing); a Skip landing
 mid-probe beats a simultaneous 'ok'; Google's modern /v3/signin resting URLs
 count as walls (the legacy /servicelogin is just a 302 hop).
 """
+import inspect
 import types
 
 import pytest
@@ -180,7 +181,7 @@ async def test_google_signin_hosts_count_as_walls():
 def test_session_expiry_markers_are_lowercase_and_know_v3():
     # The old "accounts.google.com/serviceLogin" camelCase marker was matched
     # against a LOWERCASED url — dead code that could never fire.
-    src = __import__("inspect").getsource(research.detect_session_expiry)
+    src = inspect.getsource(research.detect_session_expiry)
     assert '"accounts.google.com/serviceLogin"' not in src  # the dead marker itself
     assert "accounts.google.com/v3/signin" in src
 
@@ -191,8 +192,82 @@ def test_cli_skip_routes_login_required_pause_to_skip_agent():
     # not to request_skip_phase (wrong set: the loop would re-card until
     # timeout AND leave a stale skipped_phases entry that await_phase_decision
     # later eats as a silent 'skip').
-    src = __import__("inspect").getsource(research)
+    src = inspect.getsource(research)
     assert 'pr == "login_required" and (getattr(_controls, "pause_target_agent", "") or "")' in src
+
+
+# ── phase B: P2 wiring ────────────────────────────────────────────────────────
+
+def test_p2_preflight_probes_before_setup():
+    # Layer 0.5: the signed-out probe must run on the work tab BEFORE any
+    # setup_*_dr clicks are spent on a logged-out page, and its card must use
+    # the honest signed-out copy (matching the outer fail paths). Non-blocking
+    # by design: a per-agent fail card + (page, False) — never a pipeline
+    # pause (the other agents keep starting; Retry re-enters fresh).
+    src = inspect.getsource(research.start_agent_no_gemini_wait)
+    assert "_work_tab_signed_out(page, platform_l, label)" in src
+    probe_at = src.index("_work_tab_signed_out")
+    setup_at = src.index("setup_chatgpt_dr")
+    assert probe_at < setup_at
+    # The wall branch must card-and-BAIL. Dropping the early return would
+    # burn setup clicks on the confirmed-walled page — the exact failure
+    # Layer 0.5 exists to prevent — while the rest of the suite stayed green
+    # (mutation-verified in review). Scope the pins to the branch itself.
+    branch = src[probe_at:setup_at]
+    assert "return page, False" in branch
+    assert 'status="needs_login"' in branch
+    assert 'fail_agent(platform_l, f"{platform} looks signed out"' in branch
+    assert "_work_tab_login_pause" not in src
+
+
+def test_chatgpt_gets_a_zero_navigation_tier_backstop():
+    # ChatGPT parity with 2C's Gemini DOM-tier read: with verification off by
+    # default and the gate's isolated-tab tier check retired, this is
+    # ChatGPT's Free-tier tell on runs where the P1 Pro-selector backstop
+    # never runs (skip-P1 / attached-sources runs).
+    src = inspect.getsource(research.run_phase2)
+    assert "_chatgpt_dom_tier(chatgpt_page)" in src
+    assert '_emit_pro_required_alert(phase=2, agent="chatgpt", source="phase2/setup_pro_backstop")' in src
+    # POSITION is load-bearing (review MAJOR): the read must sit AFTER 2C so
+    # its pro_required pause can only delay round-robin polling — a pause
+    # inside 2A would freeze Claude + Gemini startup behind a fail-open DOM
+    # heuristic (2/3 of the phase never launching on an unattended run).
+    assert src.index("_chatgpt_dom_tier(chatgpt_page)") > src.index("_gemini_dom_tier(gemini_page)")
+    _idx = src.index("_chatgpt_dom_tier(chatgpt_page)")
+    _blk = src[_idx - 900:_idx + 3400]
+    # all three guards (consent ×2 + liveness), the pause machinery, and a
+    # resolution for EVERY path — Skip must close the paused/resumed pair
+    # (mutation-verified gaps in review: each of these was droppable green).
+    assert "pro_warning_acknowledged" in _blk
+    assert 'free_tier_consent.get("chatgpt"' in _blk
+    assert '"chatgpt" not in _controls.skipped_agents' in _blk
+    assert '_controls.request_pause("pro_required")' in _blk
+    assert "wait_if_paused" in _blk
+    assert 'reason="agent_skipped"' in _blk
+
+
+def test_p2_tier_backstop_skip_closes_pause_pair():
+    # BOTH tier backstops (2C Gemini + post-2C ChatGPT) must emit
+    # pipeline_resumed on the Skip path. Every other pro_required wait site
+    # closes the paused/resumed pair; an unclosed pipeline_paused leaves the
+    # FE pause chrome stale (the F3/DGOPS-7449 stale-alert class).
+    src = inspect.getsource(research.run_phase2)
+    assert src.count('emit_event("pipeline_resumed", phase=2, reason="agent_skipped")') >= 2
+
+
+def test_chatgpt_tier_retry_actually_re_verifies():
+    # The pro_required card promises 'sign in with Pro, then Retry' — Retry
+    # must RE-READ the tier (review MAJOR: it was a silent no-op that left
+    # the card unresolved). A still-free re-read resolves to
+    # Free-acknowledged + alert clear, never an unbounded re-card loop.
+    src = inspect.getsource(research.run_phase2)
+    assert src.count("_chatgpt_dom_tier(chatgpt_page)") >= 2
+    # the first pro_retry AFTER the ChatGPT tier read (the 2C Gemini block
+    # has its own, earlier pro_retry — don't pin that one)
+    _retry_at = src.index('reason="pro_retry"', src.index("_chatgpt_dom_tier(chatgpt_page)"))
+    _retry_blk = src[_retry_at:_retry_at + 1200]
+    assert "_chatgpt_dom_tier(chatgpt_page)" in _retry_blk
+    assert "_clear_pro_required_alerts(triggered_at_phase=2)" in _retry_blk
 
 
 # ── _work_tab_login_pause: the FE contract on entry ───────────────────────────

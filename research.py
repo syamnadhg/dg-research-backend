@@ -12798,7 +12798,8 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
     # Trust-first fast path (2026-07-02): session cookie present → trust the
     # sign-in with ZERO navigations (no verify tab, no CUA call, no gate
     # tier check). The tier tells that remain: ChatGPT = the P1 Pro-selector
-    # backstop (phase1/setup_pro_backstop); Gemini = the 2C DOM-tier read on
+    # backstop (phase1/setup_pro_backstop) + the post-2C DOM-tier read on its
+    # work page (#899, covers skip-P1 runs); Gemini = the 2C DOM-tier read on
     # its work page (phase2/setup_pro_backstop); Claude = the chat-mode card
     # (Free Claude lacks the Research tool, which that card surfaces). A
     # platform whose trusted cookie later turned out STALE (a mid-phase
@@ -27620,7 +27621,24 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         # Settle after clearance — page often reloads to the real content
         await asyncio.sleep(2)
 
-    # LAYER 0.5 (Gemini-only): force fresh chat. `https://gemini.google.com`
+    # LAYER 0.5 (#899 work-tab preflight): confirmed signed-out probe on the
+    # tab we're about to work in — the isolated verify tab's replacement
+    # (that proactive tab was the top bot-score signal; the cookie fast path
+    # can't catch a session that died SERVER-side). Non-blocking at P2 by
+    # design: a per-agent fail card (Retry/Skip) instead of a pipeline pause,
+    # so the other agents keep starting. The card's Retry (hard) re-enters
+    # this function fresh and re-probes naturally; the outer 2A/2B/2C fail
+    # paths keep their reactive wall probes as backstop.
+    _preflight_wall = await _work_tab_signed_out(page, platform_l, label)
+    if _preflight_wall:
+        emit_event("agent_progress", phase=2, agent=platform_l, status="needs_login",
+                   progress=f"{platform}: signed out — not started (sign in, then Retry)")
+        fail_agent(platform_l, f"{platform} looks signed out",
+                   f"{platform} is showing its sign-in page — the saved session expired. "
+                   "Sign in using the open browser (or run the login command on the device), then Retry.")
+        return page, False
+
+    # LAYER 0.6 (Gemini-only): force fresh chat. `https://gemini.google.com`
     # natural-redirects to `/app` and Google then auto-routes to the most
     # recent `/app/<chat-id>` for accounts with history. Pasting the brief
     # into a past conversation produces the "stuck in past run" symptom
@@ -28476,6 +28494,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                             log("[2C] user opted into Free-tier Gemini — continuing", "INFO")
                             _clear_pro_required_alerts(triggered_at_phase=2)
                             emit_event("pipeline_resumed", phase=2, reason="continue_with_free")
+                        else:
+                            # Skip → the dispatcher already put gemini in
+                            # skipped_agents; close the paused/resumed pair
+                            # (#899 review — every other pro_required site
+                            # does; an unclosed pipeline_paused leaves the
+                            # FE pause chrome stale).
+                            emit_event("pipeline_resumed", phase=2, reason="agent_skipped")
         else:
             # Setup or paste failed — start_agent_no_gemini_wait already emitted
             # pipeline_error with Retry/Skip actions. Mark Gemini terminally
@@ -28500,6 +28525,61 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 pass
     else:
         log("\n--- 2C: Gemini SKIPPED (disabled in config) ---")
+
+    # ── #899 tier backstop (ChatGPT) — deliberately positioned AFTER 2C, once
+    # all three agents have launched. A pro_required pause here only delays
+    # the round-robin polling start (the DRs generate server-side) — pausing
+    # inside 2A would freeze Claude + Gemini startup behind a fail-open DOM
+    # heuristic, the exact phase-blocking the Layer 0.5 preflight design
+    # forbids. With verification off by default and the gate's isolated-tab
+    # tier check retired, this DOM read on the ALREADY-OPEN work page (zero
+    # navigations, no CUA) is ChatGPT's Free-tier tell on runs where the P1
+    # Pro-selector backstop never runs (skip-P1 / attached-sources runs).
+    # Fail-open ("unsure" → no card), one-shot, respects prior consent.
+    if (agents.get("ChatGPT", {}).get("verified")
+            and not _controls.pro_warning_acknowledged
+            and not _controls.free_tier_consent.get("chatgpt", False)
+            and "chatgpt" not in _controls.skipped_agents):
+        try:
+            _cg_tier = await _chatgpt_dom_tier(chatgpt_page)
+        except Exception:
+            _cg_tier = "unsure"
+        if _cg_tier == "free":
+            log("[2A] ChatGPT DOM tier reads FREE — surfacing pro_required (verification is off by default)", "WARN")
+            _emit_pro_required_alert(phase=2, agent="chatgpt", source="phase2/setup_pro_backstop")
+            _controls.request_pause("pro_required")
+            emit_event("pipeline_paused", phase=2, reason="pro_required")
+            await _controls.wait_if_paused()
+            if not _controls.is_stop():
+                if _controls.consume_retry_phase(2):
+                    # Honest Retry: the card promises a re-verify, so re-read
+                    # the tier. The DR already submitted on this session — a
+                    # still-free re-read resolves to Free-acknowledged (with
+                    # the alert cleared) rather than re-carding a decision
+                    # that can't change the already-running research.
+                    emit_event("pipeline_resumed", phase=2, reason="pro_retry")
+                    try:
+                        _cg_tier2 = await _chatgpt_dom_tier(chatgpt_page)
+                    except Exception:
+                        _cg_tier2 = "unsure"
+                    if _cg_tier2 == "free":
+                        _controls.free_tier_consent["chatgpt"] = True
+                        _controls.pro_warning_acknowledged = True
+                        log("[2A] ChatGPT still reads Free after Retry — continuing with the already-running DR (Free-acknowledged)", "WARN")
+                    else:
+                        log("[2A] ChatGPT tier re-read after Retry: not Free ✓", "INFO")
+                    _clear_pro_required_alerts(triggered_at_phase=2)
+                elif "chatgpt" not in _controls.skipped_agents:
+                    _controls.consume_continue_anyway()
+                    _controls.pro_warning_acknowledged = True
+                    log("[2A] user opted into Free-tier ChatGPT — continuing", "INFO")
+                    _clear_pro_required_alerts(triggered_at_phase=2)
+                    emit_event("pipeline_resumed", phase=2, reason="continue_with_free")
+                else:
+                    # Skip → the dispatcher already put chatgpt in
+                    # skipped_agents; close the paused/resumed pair (gate
+                    # parity — the FE pause chrome keys on it).
+                    emit_event("pipeline_resumed", phase=2, reason="agent_skipped")
 
     # ── First wave: 60s sequential per agent (2026-04 overhaul) ──
     # Instead of one instant snapshot, dwell on each agent's tab for 60s and
