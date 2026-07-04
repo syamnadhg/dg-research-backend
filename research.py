@@ -8094,6 +8094,19 @@ def _start_cli_command_reader(loop):
                     if tgt:
                         loop.call_soon_threadsafe(_controls.request_skip_agent, tgt)
                     loop.call_soon_threadsafe(_controls.request_resume)
+                elif pr == "login_required" and (getattr(_controls, "pause_target_agent", "") or ""):
+                    # #899: the work-tab login pause names its platform via
+                    # pause_target_agent and its poll loop watches
+                    # skipped_agents — plain request_skip_phase would hit the
+                    # wrong set (the loop re-cards until timeout) AND leave a
+                    # stale skipped_phases entry that await_phase_decision
+                    # later consumes as a silent 'skip'. Targetless
+                    # login_required pauses (P0 walk, legacy gate) fall
+                    # through to the branches below unchanged.
+                    tgt = getattr(_controls, "pause_target_agent", "") or ""
+                    log(f"[CMD] skip → skip {tgt} agent (login_required pause)")
+                    loop.call_soon_threadsafe(_controls.request_skip_agent, tgt)
+                    loop.call_soon_threadsafe(_controls.request_resume)
                 elif pr == "cua_unavailable":
                     # #705: cua_unavailable is a fail-closed INFRA gate — the P0
                     # probe loop (research.py:28426) re-probes and ignores
@@ -12561,6 +12574,180 @@ async def _page_shows_login_wall(page) -> "str | None":
     return None
 
 
+async def _work_tab_signed_out(page, agent_key: str, label: str) -> "str | None":
+    """#899 work-tab preflight: confirmed signed-out probe on the phase's OWN
+    work tab — the isolated verify tab's replacement (that proactive tab was
+    the top bot-score signal; see _platform_auth_cookie_present). Double-probe:
+    a wall must survive a +3s settle re-probe before it counts, so a slow SPA
+    hydration that briefly paints the logged-out shell can't false-alarm
+    (the #896 settled-clear philosophy, pointed the other way).
+
+    On a CONFIRMED wall: flips the platform into cookie_trust_broken (the
+    trusted jar lied — the next gate check must not re-trust it) and returns
+    the wall detail for the caller's card copy. Returns None when signed in.
+    Best-effort, never raises."""
+    wall = await _page_shows_login_wall(page)
+    if not wall:
+        return None
+    await asyncio.sleep(3.0)
+    wall = await _page_shows_login_wall(page)
+    if not wall:
+        log(f"[{label}] login-wall read cleared on the settle re-probe — treating as signed in", "DEBUG")
+        return None
+    _controls.cookie_trust_broken.add(agent_key)
+    log(f"[{label}] work tab shows {wall} — session is signed out (survived settle re-probe)", "WARN")
+    return wall
+
+
+_WORK_TAB_LOGIN_MAX_LOOPS = 120  # × 5s ≈ 10 min, same bound as the HV pause
+
+
+async def _work_tab_login_pause(page, agent_key: str, phase: int, label: str,
+                                *, work_url: str) -> str:
+    """#899: the phase-time login_required contract moved onto the WORK tab
+    (P1/P3 — P2 stays non-blocking with per-agent fail cards). Emits the same
+    events / alert_id / pendingDecision mirror as the isolated-tab gate did,
+    then holds the phase in an HV-style 5s poll loop instead of a pure event
+    wait, so signing in INSIDE the open tab resumes the run without a button
+    press. Returns:
+
+      'ok'      — sign-in CONFIRMED on the work page (auto-detected in-tab
+                  sign-in, or Retry after signing in — either way the tab is
+                  navigated back to work_url and settled-probed there before
+                  resolving). cookie_trust_broken is lifted — the only
+                  mid-run remover; trust restored by direct observation.
+      'skipped' — user tapped Skip, or the pause timed out unattended
+                  (mirrors the HV timeout-skip: drop the agent, not the run).
+                  agent_key stays in skipped_agents so later phases/gates
+                  respect the decision, exactly like the gate's contract.
+      'stop'    — pipeline stop received.
+    """
+    _wt_login_msg = (f"{label} is signed out. Sign in using the open browser window — "
+                     f"the run resumes automatically once you're back in — or Skip {label}.")
+    _wt_alert_id = f"phase{phase}_login_required_{agent_key}"
+
+    async def _wall_settled_gone() -> bool:
+        # Sign-IN mirror of the #896 settled probe: "wall gone" must survive
+        # a +3s re-probe so a mid-redirect blank can't fake a sign-in. A dead
+        # page can't confirm anything — it reads as still-walled (the wrong-
+        # side lie would be returning 'ok' on a tab the user closed).
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            pass
+        if await _page_shows_login_wall(page):
+            return False
+        await asyncio.sleep(3.0)
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            pass
+        return not await _page_shows_login_wall(page)
+
+    async def _confirm_on_work_page() -> bool:
+        # 'ok' must mean signed-in ON THE WORK PAGE, not merely wall-free:
+        # a finished sign-in can rest wall-free on an IdP landing
+        # (myaccount.google.com) or wherever the user wandered. Navigate to
+        # the work url first, then settled-probe there.
+        try:
+            await page.goto(work_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(4.0)  # SPA hydration settle, same as the gate used
+        except Exception as nav_err:
+            log(f"[{label}] login-pause reload failed ({nav_err}) — probing in place", "WARN")
+        return await _wall_settled_gone()
+
+    def _restore_trust():
+        # Trust restored by direct observation — the only mid-run remover.
+        _controls.cookie_trust_broken.discard(agent_key)
+        _clear_pending_decision()
+        emit_event("agent_progress", phase=phase, agent=agent_key,
+                   status="verified",
+                   progress=f"{label}: sign-in confirmed on the work page ✓")
+
+    def _card_and_pause(message: str):
+        # Single emission point for card + pause + durable mirror, used at
+        # entry AND on every still-walled re-pause (gate parity: the FE's
+        # Retry click optimistically un-pauses, so each re-pause must re-emit
+        # pipeline_paused; the mirror is re-persisted with the live copy so a
+        # cold chat-open never resurrects stale text). The payload's `agent`
+        # key engages _clear_pending_decision's keep-guard — a Skip/Retry
+        # click on a DIFFERENT agent's card must not retract this mirror.
+        emit_event("agent_progress", phase=phase, agent=agent_key,
+                   status="needs_login",
+                   progress=f"{label}: login required ✗ (work-page check)")
+        emit_event("login_required", phase=phase, platforms=[agent_key],
+                   platformLabels=[label], machineName=socket.gethostname(),
+                   attempt=1, message=message, alert_id=_wt_alert_id)
+        # target_agent → the CLI dispatcher's `s` routes to request_skip_agent
+        # for THIS platform (login_required branch added with this helper;
+        # request_resume clears it again).
+        _controls.pause_target_agent = agent_key
+        _controls.request_pause("login_required")
+        emit_event("pipeline_paused", phase=phase, reason="login_required")
+        _persist_pending_decision({
+            "kind": "login_required", "phase": phase, "agent": agent_key,
+            "platforms": [agent_key], "platformLabels": [label],
+            "machineName": socket.gethostname(), "attempt": 1,
+            "message": message, "alert_id": _wt_alert_id,
+        })
+
+    _card_and_pause(_wt_login_msg)
+
+    for _ in range(_WORK_TAB_LOGIN_MAX_LOOPS):
+        await asyncio.sleep(5)
+        if _controls.is_stop():
+            _clear_pending_decision()
+            emit_event("pipeline_stopped", phase=phase, reason="stopped during login_required")
+            return "stop"
+        if agent_key in _controls.skipped_agents:
+            _clear_pending_decision()
+            # A re-pause can re-arm the pause AFTER the dispatcher's skip
+            # already resumed — release it (idempotent; HV-loop parity).
+            _controls.request_resume()
+            emit_event("pipeline_resumed", phase=phase, reason="agent_skipped")
+            return "skipped"
+        if not _controls.is_pause():
+            # User tapped Retry/Resume — acknowledge the resume (gate parity;
+            # also retracts the mirror via emit_event's universal clear, which
+            # matches the now-unpaused FE), then confirm on the work page.
+            _controls.consume_retry_phase(phase)
+            _controls.retry_init_verify = False
+            emit_event("pipeline_resumed", phase=phase, reason="retry")
+            if await _confirm_on_work_page():
+                if agent_key in _controls.skipped_agents:
+                    continue  # Skip landed mid-probe — the user's word wins; resolve next tick
+                log(f"[{label}] sign-in confirmed after Retry ✓", "INFO")
+                _restore_trust()
+                return "ok"
+            log(f"[{label}] Retry tapped but the sign-in page is still showing — re-pausing", "WARN")
+            _card_and_pause(f"{label} still shows its sign-in page. "
+                            f"Finish signing in using the open browser, then Retry.")
+            continue
+        # Auto-detect: the user signing in inside the open tab clears the
+        # wall without any button press (mirrors the HV auto-clear tick).
+        # Cheap in-place probe first; only a wall-free read pays for the
+        # work-page navigate + settled re-confirm.
+        if await _wall_settled_gone() and await _confirm_on_work_page():
+            if agent_key in _controls.skipped_agents:
+                continue  # Skip landed mid-probe — the user's word wins; resolve next tick
+            log(f"[{label}] sign-in auto-detected on the work tab ✓", "INFO")
+            _restore_trust()
+            _controls.request_resume()
+            emit_event("pipeline_resumed", phase=phase, reason="login_cleared")
+            return "ok"
+
+    log(f"[{label}] login_required timed out ({_WORK_TAB_LOGIN_MAX_LOOPS * 5}s) — skipping {label}", "WARN")
+    _controls.skipped_agents.add(agent_key)
+    _clear_pending_decision()
+    emit_event("agent_skipped", phase=phase, agent=agent_key,
+               reason="login_required_timeout")
+    emit_event("pipeline_resumed", phase=phase, reason="login_required_timeout")
+    _controls.request_resume()
+    return "skipped"
+
+
 async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) -> str:
     """Phase-time login + pro-tier re-verification gate. Triggered ONLY when
     init verification was skipped (`_controls.skip_init_verify=True`). Each
@@ -14096,6 +14283,16 @@ def stop_narrator():
 
 _LOGIN_HOST_NEGATIVES = (
     "auth.openai.com", "accounts.google.com/signin",
+    # Google's sign-in surfaces (#899). These are the ONLY signed-out tell
+    # for Gemini/NotebookLM (the DOM probes below are ChatGPT-specific), so
+    # they must cover where the flow actually RESTS, not just the entry hop:
+    # /servicelogin is a legacy 302 redirector; the flow lands and sits on
+    # /v3/signin/* (identifier + challenge/password pages — a mid-sign-in
+    # user is still "walled"). Every consumer lowercases before matching.
+    "accounts.google.com/servicelogin",
+    "accounts.google.com/v3/signin",
+    "accounts.google.com/interactivelogin",
+    "accounts.google.com/accountchooser",
     "login.live.com", "claude.ai/login", "claude.ai/signup",
 )
 
@@ -26734,10 +26931,16 @@ async def detect_session_expiry(page, platform: str, label: str) -> tuple[bool, 
         url = (page.url or "").lower()
         # URL markers for known login routes per platform
         url_markers = {
+            # NB: matched against a LOWERCASED url — markers must be lowercase
+            # (the old "…/serviceLogin" camelCase marker could never fire).
+            # /v3/signin is where Google's sign-in flow actually RESTS; the
+            # legacy /servicelogin is a 302 hop toward it.
             "chatgpt":    ("/auth/login", "/auth/signin", "auth.openai.com"),
-            "gemini":     ("accounts.google.com/signin", "accounts.google.com/serviceLogin"),
+            "gemini":     ("accounts.google.com/signin", "accounts.google.com/servicelogin",
+                           "accounts.google.com/v3/signin"),
             "claude":     ("/login", "/sign-in", "/auth/"),
-            "notebooklm": ("accounts.google.com/signin", "accounts.google.com/serviceLogin"),
+            "notebooklm": ("accounts.google.com/signin", "accounts.google.com/servicelogin",
+                           "accounts.google.com/v3/signin"),
         }
         markers = url_markers.get(platform.lower(), ("/login", "/signin", "/signup"))
         if any(m in url for m in markers):
