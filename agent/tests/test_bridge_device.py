@@ -20,6 +20,7 @@ class FakeFS:
     researches: dict = {}
     last_cancel = None
     last_pc_patch = None
+    last_commands: list = []
     get_raises = False
     seeded = None
 
@@ -62,6 +63,11 @@ class FakeFS:
     def patch_pipeline_config(self, uid, rid, pc_updates):
         FakeFS.last_pc_patch = {"rid": rid, "updates": pc_updates}
 
+    def write_command(self, uid, research_id, action, *, device_id, extra=None):
+        FakeFS.last_commands.append({"rid": research_id, "action": action,
+                                     "device_id": device_id, "extra": extra})
+        return "CMD-1"
+
 
 @pytest.fixture()
 def live(monkeypatch):
@@ -73,6 +79,7 @@ def live(monkeypatch):
     FakeFS.researches = {}
     FakeFS.last_cancel = None
     FakeFS.last_pc_patch = None
+    FakeFS.last_commands = []
     FakeFS.get_raises = False
     FakeFS.seeded = None
     monkeypatch.setattr(bridge, "FirestoreRest", FakeFS)
@@ -786,3 +793,104 @@ def test_skip_tolerates_malformed_existing_skippedPhases(live):
     r = requests.post(base + "/research/r1/skip", json={"phases": [3]})
     assert r.status_code == 200
     assert FakeFS.last_pc_patch["updates"]["skippedPhases"] == [3]
+
+
+# ── P2 per-agent skip ("skip Claude in P2", live 2026-07-02) — app parity ──
+
+def test_skip_agent_writes_agents_map(live):
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "queued",
+                                "pipelineConfig": {"agents": {"chatgpt": True, "gemini": True, "claude": True}}}}
+    r = requests.post(base + "/research/r1/skip", json={"agents": ["claude"]})
+    assert r.status_code == 200 and r.json()["agentsOff"] == ["claude"]
+    u = FakeFS.last_pc_patch["updates"]
+    assert u["agents"] == {"chatgpt": True, "gemini": True, "claude": False}
+    assert "skippedPhases" not in u  # two agents still on — P2 stays
+
+
+def test_skip_all_three_agents_also_skips_phase_2(live):
+    # FE parity (researches/page.tsx syncConfigToStore): all agents off → P2 off.
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "queued",
+                                "pipelineConfig": {"agents": {"chatgpt": False, "gemini": True, "claude": True}}}}
+    r = requests.post(base + "/research/r1/skip", json={"agents": ["gemini", "claude"]})
+    assert r.status_code == 200
+    u = FakeFS.last_pc_patch["updates"]
+    assert u["agents"] == {"chatgpt": False, "gemini": False, "claude": False}
+    assert 2 in u["skippedPhases"]
+
+
+def test_skip_agent_on_ongoing_run_sends_config_command(live):
+    # The doc patch alone only lands at the next queue pickup / restart — an
+    # ongoing run must ALSO get the FE tile's {action:"config"} command.
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "ongoing", "phase": 1,
+                                "deviceId": "dev-9",
+                                "pipelineConfig": {"agents": {"chatgpt": True, "gemini": True, "claude": True}}}}
+    r = requests.post(base + "/research/r1/skip", json={"agents": ["claude"]})
+    assert r.status_code == 200 and r.json()["commandSent"] is True
+    cmds = [c for c in FakeFS.last_commands if c["action"] == "config"]
+    assert len(cmds) == 1 and cmds[0]["device_id"] == "dev-9"
+    cfg = cmds[0]["extra"]["config"]
+    assert cfg["agents"]["claude"] is False and cfg["agents"]["chatgpt"] is True
+    # Phase 1 (not yet in P2) → config gating is enough; no skip_agent needed.
+    assert not [c for c in FakeFS.last_commands if c["action"] == "skip_agent"]
+
+
+def test_skip_agent_mid_p2_also_sends_skip_agent_command(live):
+    # A RUNNING agent isn't dropped by config (it gates P2 entry only) — the
+    # decision card's skip_agent command is what drops it mid-flight.
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "ongoing", "phase": 2,
+                                "deviceId": "dev-9", "pipelineConfig": {}}}
+    r = requests.post(base + "/research/r1/skip", json={"agents": ["claude"]})
+    assert r.status_code == 200
+    skips = [c for c in FakeFS.last_commands if c["action"] == "skip_agent"]
+    assert len(skips) == 1 and skips[0]["extra"] == {"agent": "claude"}
+
+
+def test_skip_agents_and_phases_mix(live):
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "queued", "pipelineConfig": {}}}
+    r = requests.post(base + "/research/r1/skip", json={"phases": [4], "agents": ["chatgpt"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["skipped"] == [4] and body["agentsOff"] == ["chatgpt"]
+    u = FakeFS.last_pc_patch["updates"]
+    assert u["videoEnabled"] is False
+    assert u["agents"]["chatgpt"] is False
+
+
+def test_skip_rejects_unknown_agent_names(live):
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1"}}
+    assert requests.post(base + "/research/r1/skip",
+                         json={"agents": ["copilot"]}).status_code == 400
+    assert FakeFS.last_pc_patch is None
+
+
+def test_skip_unions_fire_time_skipPhases_alias(live):
+    # Review catch (major): fire-time config stores skips under the BE alias
+    # `skipPhases` (_config_from_settings). The mid-run config command is a
+    # FULL snapshot the BE merges wholesale — if the handler read only
+    # `skippedPhases`, a later "skip the brief" would ERASE the Settings-
+    # derived podcast/video skips (P3 would run despite podcast-off).
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "ongoing", "phase": 1,
+                                "deviceId": "dev-9",
+                                "pipelineConfig": {"skipPhases": [3, 4], "videoEnabled": False}}}
+    r = requests.post(base + "/research/r1/skip", json={"phases": [1]})
+    assert r.status_code == 200
+    assert FakeFS.last_pc_patch["updates"]["skippedPhases"] == [1, 3, 4]
+    cmds = [c for c in FakeFS.last_commands if c["action"] == "config"]
+    assert cmds and cmds[0]["extra"]["config"]["skipPhases"] == [1, 3, 4]
+    assert cmds[0]["extra"]["config"]["videoEnabled"] is False
+
+
+def test_skip_no_command_for_non_ongoing_run(live):
+    base, _ = live
+    FakeFS.researches = {"r1": {"id": "r1", "status": "queued", "deviceId": "dev-9",
+                                "pipelineConfig": {}}}
+    r = requests.post(base + "/research/r1/skip", json={"agents": ["claude"]})
+    assert r.status_code == 200 and r.json()["commandSent"] is False
+    assert FakeFS.last_commands == []

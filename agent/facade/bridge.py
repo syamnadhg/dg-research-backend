@@ -2034,6 +2034,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                     # toggle writes these under pipelineConfig on the run doc.
                     "pipelineConfig": r.get("pipelineConfig"),
                     "chatOrigin": r.get("chatOrigin"),
+                    # Agent-fired flag — sr.py's watchdog self-heal only re-arms
+                    # for runs the watchdog would actually stream (via-agent).
+                    "viaAgent": bool(r.get("viaAgent")),
                     "needsAttention": needs,
                     "attention": attention,
                 })
@@ -2289,25 +2292,37 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                              "intent": intent, "action": action})
 
         def _research_skip(self, rid: str) -> None:
-            """Skip phases of a run (the chat /sr-skip). Writes pipelineConfig so the
-            BE's reload_config overlay applies it at the next phase boundary:
-            phases 1 (Brief) / 3 (Podcast) → skippedPhases (additive); 4 → video
-            off; 5 → email off. Phases 0/2 aren't whole-phase-skippable → 400."""
+            """Skip phases and/or P2 agents of a run (the chat /sr-skip). Writes
+            pipelineConfig so the BE's reload_config overlay applies it at the
+            next phase boundary: phases 1 (Brief) / 3 (Podcast) → skippedPhases
+            (additive); 4 → video off; 5 → email off; agents
+            (chatgpt/gemini/claude) → pipelineConfig.agents[k]=False — the SAME
+            write the web app's per-agent P2 toggles make; all three off also
+            adds phase 2 to skippedPhases (FE parity, researches/page.tsx
+            syncConfigToStore). An ONGOING run additionally gets the FE tile's
+            {action:"config"} command so the BE applies the change mid-run, and
+            a run already IN P2 gets a skip_agent command per named agent so a
+            RUNNING agent is dropped now (config alone only gates P2 entry).
+            Phase 2 itself isn't whole-phase-skippable by number → name agents."""
             rid = rid.strip("/")
             if not _RID_RE.match(rid):
                 self._json(404, {"error": "run not found"})
                 return
             body = self._read_json()
             raw = body.get("phases")
-            if not isinstance(raw, list):
-                self._json(400, {"error": "phases (a list of phase numbers) is required"})
-                return
+            raw_agents = body.get("agents")
             # Only genuine integers (JSON true/1.0 are not phase numbers — bool is
             # an int subclass, so exclude it explicitly).
-            phases = {p for p in raw if isinstance(p, int) and not isinstance(p, bool)
-                      and p in (1, 3, 4, 5)}
-            if not phases:
-                self._json(400, {"error": "no skippable phases — choose 1=brief, 3=podcast, 4=video, 5=report"})
+            phases = ({p for p in raw if isinstance(p, int) and not isinstance(p, bool)
+                       and p in (1, 3, 4, 5)} if isinstance(raw, list) else set())
+            agents_off = ({str(a).strip().lower() for a in raw_agents
+                           if isinstance(a, str)
+                           and str(a).strip().lower() in _DEFAULT_AGENTS}
+                          if isinstance(raw_agents, list) else set())
+            if not phases and not agents_off:
+                self._json(400, {"error": "nothing skippable — choose phases "
+                                          "(1=brief, 3=podcast, 4=video, 5=report) "
+                                          "and/or agents (chatgpt/gemini/claude)"})
                 return
             acct = self._account()
             if acct is None:
@@ -2326,17 +2341,35 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 return
             pc = doc.get("pipelineConfig") if isinstance(doc.get("pipelineConfig"), dict) else {}
             updates: dict[str, Any] = {}
-            phase_skips = phases & {1, 3}
-            if phase_skips:
-                raw_sp = pc.get("skippedPhases")
-                existing = ({int(x) for x in raw_sp
-                             if isinstance(x, (int, float)) and not isinstance(x, bool)}
-                            if isinstance(raw_sp, list) else set())
-                updates["skippedPhases"] = sorted(existing | phase_skips)
+            # Review catch (major): fire-time config stores skips under the BE
+            # alias `skipPhases` (_config_from_settings), while this handler
+            # historically wrote `skippedPhases`. The mid-run config command
+            # below is a FULL snapshot the BE merges wholesale — reading only
+            # one key would ERASE the other's fire-time skips (e.g. Settings'
+            # podcast-off). Union BOTH keys so the snapshot is actually full.
+            skipped_existing: set[int] = set()
+            for _sp_key in ("skippedPhases", "skipPhases"):
+                _raw_sp = pc.get(_sp_key)
+                if isinstance(_raw_sp, list):
+                    skipped_existing |= {int(x) for x in _raw_sp
+                                         if isinstance(x, (int, float)) and not isinstance(x, bool)}
+            skipped_new = set(skipped_existing) | (phases & {1, 3})
             if 4 in phases:
                 updates["videoEnabled"] = False
             if 5 in phases:
                 updates["emailEnabled"] = False
+            merged_agents: dict[str, bool] | None = None
+            if agents_off:
+                cur = pc.get("agents") if isinstance(pc.get("agents"), dict) else {}
+                # Absent key = ON (an older doc without `agents` runs all three).
+                merged_agents = {k: (False if k in agents_off else bool(cur.get(k, True)))
+                                 for k in _DEFAULT_AGENTS}
+                updates["agents"] = merged_agents
+                # FE parity: all three agents off = the whole research phase off.
+                if not any(merged_agents.values()):
+                    skipped_new.add(2)
+            if skipped_new != skipped_existing:
+                updates["skippedPhases"] = sorted(skipped_new)
             try:
                 fs.patch_pipeline_config(sess.uid, rid, updates)
             except RevokedError:
@@ -2345,8 +2378,42 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             except FirestoreError as e:
                 self._firestore_502(e)
                 return
-            log.info("skip requested for run %s: phases %s", rid, sorted(phases))
-            self._json(200, {"ok": True, "runId": rid, "skipped": sorted(phases)})
+            # Mid-run parity with the FE tile: an ongoing run also gets the
+            # {action:"config"} command (same shape researches/page.tsx writes)
+            # so the BE applies the change NOW — the doc write alone is only
+            # re-read at a queue pickup / serve restart. Best-effort: the doc
+            # write above already landed, so a command failure isn't fatal.
+            command_sent = False
+            device_id = (doc.get("deviceId") or "").strip()
+            if doc.get("status") == "ongoing" and device_id:
+                cur_agents = pc.get("agents") if isinstance(pc.get("agents"), dict) else {}
+                cfg_cmd = {
+                    "skipPhases": sorted(skipped_new),
+                    "agents": merged_agents or {k: bool(cur_agents.get(k, True))
+                                                for k in _DEFAULT_AGENTS},
+                    "videoEnabled": False if 4 in phases else pc.get("videoEnabled") is not False,
+                    "emailEnabled": False if 5 in phases else pc.get("emailEnabled") is not False,
+                }
+                try:
+                    fs.write_command(sess.uid, rid, "config", device_id=device_id,
+                                     extra={"config": cfg_cmd})
+                    command_sent = True
+                except (RevokedError, FirestoreError):
+                    pass
+                # Already inside P2 → config gates only P2 ENTRY; a running
+                # agent needs the decision card's skip_agent command (the same
+                # write the FE's Skip button does) to be dropped mid-flight.
+                if agents_off and doc.get("phase") == 2:
+                    for a in sorted(agents_off):
+                        try:
+                            fs.write_command(sess.uid, rid, "skip_agent",
+                                             device_id=device_id, extra={"agent": a})
+                        except (RevokedError, FirestoreError):
+                            pass
+            log.info("skip requested for run %s: phases %s agents %s (cmd=%s)",
+                     rid, sorted(phases), sorted(agents_off), command_sent)
+            self._json(200, {"ok": True, "runId": rid, "skipped": sorted(phases),
+                             "agentsOff": sorted(agents_off), "commandSent": command_sent})
 
         def _shutdown(self) -> None:
             """Stop the bridge (the host `agent stop`). Loopback + Host/Origin

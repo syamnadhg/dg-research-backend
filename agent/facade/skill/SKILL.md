@@ -150,7 +150,7 @@ cancels. Never send the bare "yes" back into `do`.
 | "resume", "unpause", "continue the paused run" | `sr.py resume ["<title>"]` |
 | "retry", "try again" | `sr.py retry ["<title>"]` (a run BLOCKED on a decision/error — NOT the agent's own sign-in; for "I signed in" right after a sign-in link, see **After a sign-in link**) |
 | "continue" / "yes" / "done" / "I signed in" — **right after you sent a sign-in link** | see **After a sign-in link** (NOT `retry`) |
-| "skip it", "skip this step" / "skip the video and the report" | `sr.py skip [phases] [--run "<title>"]` |
+| "skip it", "skip this step" / "skip the video and the report" / "skip Claude (in P2)", "drop ChatGPT from the research" | `sr.py skip [phases\|agents] [--run "<title>"]` — phases (brief/podcast/video/report) AND the P2 research agents (chatgpt/gemini/claude), same as the app's per-agent toggles |
 | an **8-char access code** ("7F4V-6W7D"), "add a device", "pair my PC, code is K7XQ-9B2M" | `sr.py device-add <code>` — see **Devices & Research Computers** |
 | "which devices?", "what am I running on?" | `sr.py devices` (the → marks the selected one) |
 | "switch to the office PC", "run it on my laptop" | `sr.py device-use "<name>"` |
@@ -238,8 +238,11 @@ never `retry`, never a question back to the user.
   *isn't ready yet*.
 - **stop** → confirm first. ENDS the run (terminal "stopped") and keeps the results
   so far + the chat (deletes nothing). Use **pause** for a temporary, resumable hold.
-- **skip** → no phases → skip whatever the run is **blocked** on; with phases
-  (Brief=1, Podcast=3, Video=4, Report=5, or their names) → trim those phases.
+- **skip** → no args → skip whatever the run is **blocked** on; with phases
+  (Brief=1, Podcast=3, Video=4, Report=5, or their names) → trim those phases;
+  with research-agent names (chatgpt / gemini / claude) → turn those P2 agents
+  off for the run — the same thing the app's per-agent toggles do ("skip Claude
+  in P2" → `sr.py skip claude`). Mix freely: `sr.py skip claude video`.
 - **install** → confirm first. Installs the backend on the connected device (turns
   that PC into a Research Computer) — then guide pairing (`superresearch --pair` on that
   PC → 8-char code → you run `device-add`; they finish API-key + browser-login on

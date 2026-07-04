@@ -45,10 +45,21 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+# The version of the agent package THIS script copy shipped with. The runtime
+# executes its own installed COPY of this file (HERMES_HOME/scripts), which a
+# `pip install -U` on the host does NOT refresh — only `agent connect` /
+# `update` redeploys it. cmd_version compares this against the live bridge's
+# version so a stale chat-side copy names itself instead of misbehaving
+# silently (live 2026-07-02: a stale copy predating the podcast MEDIA: fix
+# kept sending bare audio paths). Bumped together with pyproject.toml —
+# guarded by tests/test_skill_build_version.py.
+_SKILL_BUILD = "0.1.21"
 
 _TIMEOUT = 30
 # By-title run resolution scans the newest N runs (status / podcast / list / the
@@ -717,6 +728,9 @@ def cmd_status(args) -> int:
         lines += _fmt_phase_updates(phase_updates)
     else:
         lines += _fmt_sr_links(b2.get("srLinks") or {})
+    # Watchdog self-heal: if an agent run is live but this chat's watchdog
+    # isn't ticking, re-emit the arming directive (see _stream_health_lines).
+    lines += _stream_health_lines(runs)
     return _emit(b2, args.json, lines)
 
 
@@ -780,7 +794,9 @@ def cmd_updates(args) -> int:
         else:
             # Fallback (older build / no phaseUpdates): the minted permanent SR links.
             lines += _fmt_sr_links(r.get("srLinks") or {})
-    return _emit(body, args.json, lines or ["No active runs."])
+    # Watchdog self-heal: re-emit the arming directive when a live agent run
+    # has no ticking watchdog in this chat (see _stream_health_lines).
+    return _emit(body, args.json, (lines or ["No active runs."]) + _stream_health_lines(runs))
 
 
 def cmd_list(args) -> int:
@@ -884,6 +900,12 @@ def cmd_retry(args) -> int:
 
 _SKIP_NAMES = {"brief": 1, "podcast": 3, "audio": 3, "video": 4, "youtube": 4, "report": 5, "email": 5}
 
+# P2 agents skippable BY NAME — parity with the web app's per-agent Research
+# toggles ("skip Claude in P2" was un-doable from chat, live 2026-07-02).
+_SKIP_AGENTS = {"chatgpt": "chatgpt", "gpt": "chatgpt", "openai": "chatgpt",
+                "claude": "claude", "anthropic": "claude", "gemini": "gemini"}
+_AGENT_DISPLAY = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
+
 
 def cmd_skip(args) -> int:
     code, body, runs = _fetch_runs(limit=_LOOKUP_LIMIT)
@@ -904,19 +926,41 @@ def cmd_skip(args) -> int:
                          [f"✗ couldn’t skip the blocker on “{title}”: {b2.get('error', code)}"],
                          _fail_code(code))
         return _emit(b2, args.json, [f"⏭ Skipping the current blocker on “{title}”."])
-    # Phases given → tune the run's config (skip whole phases when reached).
+    # Phases and/or P2 agents given → tune the run's config (skip whole phases
+    # when reached; turn named agents off — the app's per-agent toggle write).
     phases = []
+    agents = []
     for p in args.phases:
+        lp = p.lower()
         if p.isdigit():
             phases.append(int(p))
-        elif p.lower() in _SKIP_NAMES:
-            phases.append(_SKIP_NAMES[p.lower()])
+        elif lp in _SKIP_NAMES:
+            phases.append(_SKIP_NAMES[lp])
+        elif lp in _SKIP_AGENTS:
+            agents.append(_SKIP_AGENTS[lp])
         else:
-            return _emit({}, args.json, [f"✗ unknown phase '{p}' (1/3/4/5 or brief/podcast/video/report)"], 1)
-    code, b2 = _post(f"/research/{q}/skip", {"phases": phases})
+            return _emit({}, args.json,
+                         [f"✗ unknown phase '{p}' (1/3/4/5, brief/podcast/video/report, "
+                          f"or a Research agent: chatgpt/gemini/claude)"], 1)
+    payload: dict = {}
+    if phases:
+        payload["phases"] = phases
+    if agents:
+        payload["agents"] = sorted(set(agents))
+    code, b2 = _post(f"/research/{q}/skip", payload)
     if code != 200:
         return _emit(b2, args.json, [f"✗ skip failed: {b2.get('error', code)}"], _fail_code(code))
-    return _emit(b2, args.json, [f"✓ Will skip phase(s) {b2.get('skipped')} of “{title}” when reached."])
+    parts = []
+    if b2.get("skipped"):
+        parts.append(f"phase(s) {b2.get('skipped')}")
+    if b2.get("agentsOff"):
+        parts.append(" + ".join(_AGENT_DISPLAY.get(a, a) for a in b2["agentsOff"])
+                     + " in Research (P2)")
+    what = " and ".join(parts) or "that"
+    # commandSent = the run is ongoing and the mid-run config command landed —
+    # the change applies NOW, not just at the next phase boundary.
+    tail = " — applied to the running pipeline too." if b2.get("commandSent") else " when reached."
+    return _emit(b2, args.json, [f"✓ Will skip {what} of “{title}”{tail}"])
 
 
 def cmd_logout(args) -> int:
@@ -955,6 +999,13 @@ def cmd_version(args) -> int:
                      + (f"   ⬆️ v{b_new} available — say “update”" if b_new else ""))
     else:
         lines.append("Super Research backend  (not installed on the connected device)")
+    # Stale chat-side copy tell: the runtime executes its own installed COPY of
+    # these scripts, which only `agent connect` / “update the agent” redeploys —
+    # a host pip upgrade alone leaves the chat side on old behavior (live
+    # 2026-07-02: a stale copy predated the podcast MEDIA: fix). Name it.
+    if agent not in ("?", _SKILL_BUILD):
+        lines.append(f"⚠ This chat's scripts are v{_SKILL_BUILD} but the agent is v{agent} — "
+                     "say “update the agent” to redeploy them.")
     return _emit(body, args.json, lines)
 
 
@@ -1075,6 +1126,61 @@ def cmd_arm_stream(args) -> int:
     return _emit(payload, args.json, lines, rc)
 
 
+# Statuses that mean "the watchdog should be ticking for this run" — mirrors
+# sr_attention_poll._LIVE_STUCK (+ ongoing/queued are its _ACTIVE core).
+_LIVE_RUN_STATUSES = ("queued", "ongoing", "paused_backend_restart",
+                      "paused_backend_restart_failed")
+# An armed watchdog rewrites its state file EVERY 1-min tick; older than this
+# (or missing) while an agent run is live = the watchdog is NOT ticking.
+_STREAM_STALE_SEC = 180
+
+
+def _stream_health_lines(runs: list) -> list[str]:
+    """Deterministic watchdog self-heal. The streaming watchdog — the thing that
+    posts '⚠ needs you' / '🎉 done' WITHOUT being asked — is armed by the chat
+    AI acting on a directive printed at research-fire; if that one message is
+    missed (or the cron job was removed), the chat goes silent and a blocked
+    run just sits until the user happens to ask for status (live 2026-07-02:
+    'ChatGPT stopped responding' surfaced only on a manual ask, ~50 min late).
+    Every armed tick rewrites the watchdog's state file, so a missing/stale
+    file while an agent-fired run is live == not ticking → re-emit the arming
+    directive so the AI re-arms right from this status/updates reply. Silent
+    on any doubt — never nag a healthy chat.
+
+    Review catch: only counts runs THIS chat's watchdog would actually stream
+    (chatOrigin matches this chat — the same platform+chat scope the per-chat
+    shim queries with). Without that, a status ask from a DIFFERENT chat would
+    arm a scoped watchdog that can never see the run — it posts nothing and,
+    per the poll's never-tear-down-on-empty rule, never removes itself."""
+    try:
+        origin = _origin_from_env()
+
+        def _mine(r: dict) -> bool:
+            if not (r.get("viaAgent")
+                    and (r.get("status") in _LIVE_RUN_STATUSES or r.get("needsAttention"))):
+                return False
+            if origin is None:
+                return True  # account-wide watchdog streams every agent run
+            co = r.get("chatOrigin")
+            return (isinstance(co, dict)
+                    and (co.get("platform") or "").strip().lower()
+                    == (origin.get("platform") or "").strip().lower()
+                    and (co.get("chat_id") or "").strip()
+                    == (origin.get("chat_id") or "").strip())
+
+        if not any(_mine(r) for r in runs):
+            return []
+        name = (f".sr_poll_{_origin_slug(origin)}.state.json" if origin
+                else ".sr_stream_state.json")
+        state = _scripts_dir() / name
+        if state.exists() and (time.time() - state.stat().st_mtime) < _STREAM_STALE_SEC:
+            return []  # ticking — healthy, say nothing
+        arm_lines, _payload, rc = _prepare_stream_arm()
+        return arm_lines if rc == 0 else []
+    except Exception:
+        return []
+
+
 # ── `do` — deterministic natural-language fallback (#891) ───────────────────
 # SKILL.md sends any message the AI can't confidently map to a command here
 # VERBATIM. The text→command mapping then lives in CODE (ordered, unit-tested
@@ -1110,6 +1216,9 @@ _NL_GENERIC_RUN = {"it", "that", "this", "them", "run", "the run", "this run",
                    # the product's own name is never a run title
                    "super", "super research", "the super research"}
 _NL_PHASE_WORDS = ("brief", "podcast", "video", "report", "email")
+# P2 agent nouns for skip asks ("skip Claude in P2"). Ordered longest-first so
+# "chatgpt" wins its substring "gpt" when rendering back into skip args.
+_NL_AGENT_WORDS = ("chatgpt", "claude", "gemini", "gpt")
 # Destructive verbs → the user-facing confirm question (AI runs the real
 # command on "yes"; mirrors the SKILL.md Safety confirm-first list).
 _NL_CONFIRMS = {
@@ -1190,7 +1299,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
             flags: list[str] = []
             ex = re.search(
                 r"[,;\s]*\b(?:without|minus|skip(?:ping)?|drop(?:ping)?|leave out|no)\s+"
-                r"(?:the\s+|a\s+|any\s+)?(?:video|email|podcast|brief|report)s?\b",
+                r"(?:the\s+|a\s+|any\s+)?(?:video|email|podcast|brief|report|chatgpt|gpt|claude|gemini)s?\b",
                 topic, re.I)
             if ex:
                 clause = topic[ex.start():].lower()
@@ -1204,12 +1313,19 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                     elif p == "email":
                         flags.append("--no-email")
                     else:
-                        hard.append(p)
+                        hard.append("the " + p)
+                # P2 agents have no research-time flag either — same honest
+                # two-step (skip them right after the run starts).
+                for a in _NL_AGENT_WORDS:
+                    if a in clause:
+                        disp = _AGENT_DISPLAY.get(_SKIP_AGENTS.get(a, a), a)
+                        if disp not in hard:
+                            hard.append(disp)
                 if hard and topic:
-                    # No research-time flag exists for these phases — offer the
+                    # No research-time flag exists for these — offer the
                     # honest two-step instead of silently ignoring the ask.
                     return None, [
-                        f"I can start “{topic}” right away — the {', '.join(hard)} "
+                        f"I can start “{topic}” right away — {', '.join(hard)} "
                         "can be trimmed once the run starts (just ask me to skip "
                         "it then). Say yes to start."]
             if topic:
@@ -1231,12 +1347,34 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
     if re.search(r"\b(retry|try again)\b", low):
         name = _nl_run_name(t, re.sub(r"^.*?\b(?:retry|try again)\b", "", t, flags=re.I).strip())
         return ["retry"] + ([name] if name else []), None
-    # skip / drop phases ("skip the video and the report", "remove the video",
-    # "no email") — phase nouns keep this ahead of device-remove.
-    if re.search(r"\b(skip|drop|remove|cut|leave out|without|no)\b", low) and \
-            any(p in low for p in _NL_PHASE_WORDS):
+    # skip / drop phases or P2 agents ("skip the video and the report",
+    # "remove the video", "no email", "skip Claude in P2"). Guards (review
+    # catches — skip is NOT confirm-gated, so a mis-route silently
+    # reconfigures a live run):
+    #   • questions bail ("did claude skip anything?" is not an order);
+    #   • device nouns bail ("remove claude's laptop" = device-remove, which
+    #     keeps its confirm);
+    #   • agent nouns need the verb ADJACENT ("skip claude"), never bare
+    #     co-occurrence, never a possessive/compound ("claude's", "claude-pc"),
+    #     and never when folded into a phase noun ("the gemini video" is the
+    #     video, not the agent);
+    #   • a research ask in the same message bails ("no gpt needed, research
+    #     solar panels" must not eat the research and drop ChatGPT).
+    _q_start = re.match(r"\s*(why|is|are|did|does|has|have|what|when|where|who|how)\b", low)
+    _device_noun = re.search(r"\b(device|node|laptop|pc|computer|machine|phone|desktop)\b", low)
+    if not _q_start and not _device_noun and \
+            re.search(r"\b(skip|drop|remove|cut|leave out|without|no)\b", low):
         phases = [p for p in _NL_PHASE_WORDS if p in low]
-        return ["skip"] + phases, None
+        agents: list = []
+        _agent_adjacent = re.search(
+            r"\b(?:skip(?:ping)?|drop(?:ping)?|remove|cut|leave\s+out|without|minus|no)\s+"
+            r"(?:the\s+|a\s+|any\s+)?(?:chatgpt|gpt|claude|gemini)\b(?!['’-])"
+            r"(?!\s+(?:video|podcast|report|brief|email)\b)", low)
+        if _agent_adjacent and not re.search(r"\b(?:research|look into|deep dive on|investigate)\s+\w+", low):
+            agents = [a for a in _NL_AGENT_WORDS
+                      if re.search(rf"\b{a}\b(?!['’-])(?!\s+(?:video|podcast|report|brief|email)\b)", low)]
+        if phases or agents:
+            return ["skip"] + phases + agents, None
     if re.search(r"^skip\b|\bskip (it|this|that|the step|the blocker)\b", low):
         return ["skip"], None
 
@@ -1402,8 +1540,9 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("runId", nargs="?")
     rt.set_defaults(func=cmd_retry)
 
-    # No phases → skip whatever the run is blocked on; phases → trim those phases.
-    sk = sub.add_parser("skip", help="skip a run's current blocker, or named phases")
+    # No args → skip whatever the run is blocked on; phases → trim those
+    # phases; agent names (chatgpt/gemini/claude) → turn those P2 agents off.
+    sk = sub.add_parser("skip", help="skip a run's current blocker, named phases, or P2 agents")
     sk.add_argument("phases", nargs="*")
     sk.add_argument("--run", default="", help="run title or id (default: newest active run)")
     sk.set_defaults(func=cmd_skip)
