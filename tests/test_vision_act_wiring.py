@@ -205,3 +205,73 @@ def test_read_only_hints_ban_clicks():
     # poll-fix acts but must never type.
     fix = research._HOTSPOT_VISION_HINTS["poll-fix"]["context_hint"].lower()
     assert "never type" in fix or "click only" in fix
+
+
+# ── P3 NotebookLM wiring ─────────────────────────────────────────────────────
+
+def test_nlm_upload_sites_preserve_upload_bracket():
+    src = _src(research.run_phase3_upload)
+    (create,) = _block_for(src, "nlm-create-upload")
+    (add,) = _block_for(src, "nlm-add-source")
+    assert "mission_prompt=PROMPT_NOTEBOOKLM_UPLOAD" in create
+    assert "mission_prompt=PROMPT_NOTEBOOKLM_UPLOAD" in add
+    # set/clear_upload_file bracket + filechooser auto-handler stay intact.
+    assert "set_upload_file(" in src and "clear_upload_file()" in src
+
+
+def test_nlm_rename_wrapped():
+    (blk,) = _block_for(_src(research.run_phase3_upload), "nlm-rename")
+    assert "mission_prompt=PROMPT_NOTEBOOKLM_RENAME" in blk
+
+
+def test_audio_generate_wrapped_778_guard():
+    (blk,) = _block_for(_src(research.run_phase3_audio), "audio-generate")
+    assert "mission_prompt=" in blk and "make_prompt_audio_generate" not in blk.split("mission_prompt=")[0][-50:]
+    # #778: the hint must forbid touching the card body.
+    assert "duplicate" in blk.lower() or "card body" in blk.lower()
+    assert "read_only" not in blk  # generate ACTS (Format/Length + Generate)
+
+
+def test_audio_check_is_read_only():
+    (blk,) = _block_for(_src(research.run_phase3_audio), "audio-check")
+    assert "read_only=True" in blk  # #778: a single click fires the duplicate
+
+
+def test_audio_download_preserves_listener_scaffolding():
+    src = _src(research.run_phase3_audio)
+    (blk,) = _block_for(src, "audio-download")
+    assert "read_only" not in blk  # download acts
+    # the page.on('download') + future + remove_listener scaffolding survives
+    assert 'browser.page.on("download"' in src
+    assert "download_future" in src
+    assert "target_ordinal" in blk or "entry #" in blk  # #778 target-only threading
+
+
+def test_audio_check_and_generate_use_length_aware_missions():
+    src = _src(research.run_phase3_audio)
+    # the length-aware factories still drive the mission text
+    assert "make_prompt_audio_check(podcast_length)" in src
+    assert "make_prompt_audio_download(podcast_length" in src
+
+
+def test_nlm_share_fallback_wrapped():
+    (blk,) = _block_for(_src(research.extract_notebooklm_url), "nlm-share")
+    assert "mission_prompt=" in blk
+
+
+def test_verify_sources_read_only_reupload_acts():
+    src = _src(research._verify_and_repair_nlm_sources)
+    (verify,) = _block_for(src, "nlm-verify-sources")
+    assert "read_only=True" in verify  # health probe must never click
+    assert "mission_prompt=PROMPT_NOTEBOOKLM_VERIFY_SOURCES" in verify
+    (reup,) = _block_for(src, "nlm-reupload")
+    assert "mission_prompt=PROMPT_NOTEBOOKLM_REUPLOAD" in reup
+    assert "read_only" not in reup
+
+
+def test_p3_read_only_sites_never_execute():
+    """The audio-check + verify-sources hotspots are the #778 read-only ones;
+    a Vision proposal there must escalate, never act (proven at the loop level
+    in test_vision_act_loop; here we pin the CALL SITES pass read_only=True)."""
+    audio = _block_for(_src(research.run_phase3_audio), "audio-check")
+    assert all("read_only=True" in b for b in audio)

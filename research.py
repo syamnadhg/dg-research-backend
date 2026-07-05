@@ -11256,12 +11256,32 @@ async def extract_notebooklm_url(browser, cua_client=None, verbose=False, **_):
         # CUA fallback if DOM didn't work
         if not url or "notebooklm.google.com/notebook" not in url:
             if cua_client:
-                result = await agent_loop(cua_client, browser,
-                    "Share this NotebookLM notebook publicly.",
+                _nlm_share_mission = (
                     "Click the Share button. In the share dialog, change 'Notebook access' to "
                     "'Anyone with the link'. Then click 'Copy link' to get the URL. Click Save. "
-                    "Tell me the EXACT URL.",
-                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                    "Tell me the EXACT URL.")
+
+                async def _nlm_share_cua():
+                    return await agent_loop(cua_client, browser,
+                        "Share this NotebookLM notebook publicly.",
+                        _nlm_share_mission,
+                        model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+                # #839 act tier: DOM-primary already ran; this is the fallback.
+                # A Vision success must put the notebook URL in the returned text
+                # (mission's "Tell me the EXACT URL" → declare_success reason) or
+                # on the clipboard — both read below. public_verified stays False
+                # on this path (only the DOM helper can confirm access), same as
+                # the CUA contract.
+                result = await _shadow_observed_cua(
+                    page, hotspot_id="nlm-share", phase=3, platform="notebooklm",
+                    current_step="share_set_public_get_link",
+                    context_hint="the DOM share attempt didn't yield a public link — click "
+                                 "Share, set 'Notebook access' to 'Anyone with the link', Copy "
+                                 "link, Save, and report the notebooklm.google.com/notebook URL",
+                    expected_outcome="a public notebooklm.google.com/notebook share URL",
+                    cua_coro_factory=_nlm_share_cua,
+                    mission_prompt=_nlm_share_mission) or {}
                 m = re.search(r'https://notebooklm\.google\.com/notebook/[^\s]+', (result.get("text") or ""))
                 if m:
                     url = m.group(0)
@@ -29461,10 +29481,24 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
     for _round in range(1, max_rounds + 1):
         # Let async ingestion settle before judging (spinners → ✓ or red).
         await asyncio.sleep(8)
-        verdict = await agent_loop(
-            cua_client, browser, PROMPT_NOTEBOOKLM_VERIFY_SOURCES,
-            "Check the Sources panel and report any source in a failed/error (red) state.",
-            model=CUA_MODEL, max_iterations=8, verbose=verbose)
+        async def _verify_sources_cua():
+            return await agent_loop(
+                cua_client, browser, PROMPT_NOTEBOOKLM_VERIFY_SOURCES,
+                "Check the Sources panel and report any source in a failed/error (red) state.",
+                model=CUA_MODEL, max_iterations=8, verbose=verbose)
+
+        # #839 act tier — READ_ONLY: this is a source-health probe (returns
+        # 'ALL OK' / 'FAILED: <filename>'); it must never click. The FAILED:
+        # verdict is token-parsed below in every mode.
+        verdict = await _shadow_observed_cua(
+            browser.page, hotspot_id="nlm-verify-sources", phase=3, platform="notebooklm",
+            current_step="verify_sources_health",
+            context_hint="READ ONLY — do not click. Check the Sources panel; report any "
+                         "source in a failed/error (red) state BY FILENAME, or say 'ALL OK'.",
+            expected_outcome="an honest 'ALL OK' or 'FAILED: <filename>' verdict",
+            cua_coro_factory=_verify_sources_cua,
+            mission_prompt=PROMPT_NOTEBOOKLM_VERIFY_SOURCES,
+            read_only=True) or {}
         text = (verdict.get("text") if isinstance(verdict, dict) else "") or ""
         low = text.lower()
         # Conservative parse: only act on an explicit "FAILED:" verdict. "ALL
@@ -29499,11 +29533,27 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
             md_path = by_name[name]
             browser.set_upload_file(str(md_path))
             try:
-                await agent_loop(
-                    cua_client, browser, PROMPT_NOTEBOOKLM_REUPLOAD,
-                    f"The source '{name}' failed to import. Retry it in place if possible, "
-                    f"otherwise remove that one failed source and re-add the file (dialog auto-handled).",
-                    model=CUA_MODEL, max_iterations=12, verbose=verbose)
+                async def _reupload_cua():
+                    return await agent_loop(
+                        cua_client, browser, PROMPT_NOTEBOOKLM_REUPLOAD,
+                        f"The source '{name}' failed to import. Retry it in place if possible, "
+                        f"otherwise remove that one failed source and re-add the file (dialog auto-handled).",
+                        model=CUA_MODEL, max_iterations=12, verbose=verbose)
+
+                # #839 act tier: repairs ONE named failed source; the OS file
+                # dialog is auto-answered (set/clear_upload_file bracket + the
+                # filechooser handler), so Vision only drives the retry/re-add
+                # clicks — never the native dialog.
+                await _shadow_observed_cua(
+                    browser.page, hotspot_id="nlm-reupload", phase=3, platform="notebooklm",
+                    current_step=f"reupload_failed_source_{name}",
+                    context_hint=f"the source '{name}' failed to import — use its in-place "
+                                 "Retry if present, else remove ONLY that one failed source "
+                                 "and re-add it (the OS file dialog auto-selects the file)",
+                    expected_outcome=f"the source '{name}' is re-imported successfully",
+                    cua_coro_factory=_reupload_cua,
+                    mission_prompt=PROMPT_NOTEBOOKLM_REUPLOAD,
+                    act_timeout_s=150.0)
             finally:
                 browser.clear_upload_file()
             await asyncio.sleep(3)
@@ -29604,13 +29654,40 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     interval=20)
                 try:
                     if i == 0:
-                        await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
-                            "Create a new notebook and upload the first file. File dialog is auto-handled.",
-                            model=CUA_MODEL, max_iterations=15, verbose=verbose)
+                        async def _nlm_create_cua():
+                            return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
+                                "Create a new notebook and upload the first file. File dialog is auto-handled.",
+                                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+
+                        # #839 act tier: the OS file chooser is auto-answered
+                        # (filechooser handler + upload queue) — Vision clicks
+                        # the create/Add-source control only. set/clear bracket
+                        # stays; success is judged by _verify_and_repair below.
+                        await _shadow_observed_cua(
+                            browser.page, hotspot_id="nlm-create-upload", phase=3, platform="notebooklm",
+                            current_step="create_notebook_upload_first",
+                            context_hint="create a NEW NotebookLM notebook and upload the first "
+                                         "source — click Create/New then the Add source/Upload "
+                                         "control; the OS file dialog auto-selects the file",
+                            expected_outcome="a new notebook exists with the first source uploading",
+                            cua_coro_factory=_nlm_create_cua,
+                            mission_prompt=PROMPT_NOTEBOOKLM_UPLOAD,
+                            act_timeout_s=180.0)
                     else:
-                        await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
-                            f"Add another source (file {i+1}). Click 'Add source' or '+'. File dialog is auto-handled.",
-                            model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                        async def _nlm_add_cua():
+                            return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
+                                f"Add another source (file {i+1}). Click 'Add source' or '+'. File dialog is auto-handled.",
+                                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+                        await _shadow_observed_cua(
+                            browser.page, hotspot_id="nlm-add-source", phase=3, platform="notebooklm",
+                            current_step=f"add_source_{i+1}",
+                            context_hint=f"add source file {i+1} — click 'Add source' or the '+' "
+                                         "control; the OS file dialog auto-selects the file",
+                            expected_outcome=f"source {i+1} is added to the notebook",
+                            cua_coro_factory=_nlm_add_cua,
+                            mission_prompt=PROMPT_NOTEBOOKLM_UPLOAD,
+                            act_timeout_s=150.0)
                 finally:
                     await stop_narration_ticker(_stop, _task)
 
@@ -29637,9 +29714,23 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             emit_event("agent_progress", phase=3, agent="notebooklm",
                        status="renaming",
                        progress=f"Renaming notebook to '{title}'…")
-            await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
-                f"Rename this notebook to: {title}",
-                model=CUA_MODEL, max_iterations=8, verbose=verbose)
+            async def _nlm_rename_cua():
+                return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
+                    f"Rename this notebook to: {title}",
+                    model=CUA_MODEL, max_iterations=8, verbose=verbose)
+
+            # #839 act tier: this site TYPES (the only P3 upload-family site that
+            # types into the page). Best-effort — nothing downstream gates on the
+            # notebook name, so a Vision miss is as silent as the CUA contract.
+            await _shadow_observed_cua(
+                browser.page, hotspot_id="nlm-rename", phase=3, platform="notebooklm",
+                current_step="rename_notebook",
+                context_hint=f"rename the notebook to '{title}': click the notebook title, "
+                             "clear it, type the new name, press Enter",
+                expected_outcome=f"the notebook is titled '{title}'",
+                cua_coro_factory=_nlm_rename_cua,
+                mission_prompt=PROMPT_NOTEBOOKLM_RENAME,
+                act_timeout_s=90.0)
 
             # C1: make notebook public (Share → "Anyone with the link" → Save)
             # BEFORE emitting the URL, so the frontend's link is always viewable.
@@ -29924,8 +30015,29 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # length-dropdown→select→Generate) can legitimately need ~10 iters —
             # capping at 6 would truncate a valid run BEFORE Generate and produce
             # NO audio at all, a worse failure than a detectable duplicate.
-            _ag_result = await agent_loop(cua_client, browser, _prompt, _task_str,
-                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+            async def _audio_generate_cua():
+                return await agent_loop(cua_client, browser, _prompt, _task_str,
+                    model=CUA_MODEL, max_iterations=15, verbose=verbose)
+
+            # #839 act tier — HIGHEST-RISK P3 hotspot. #778: NEVER click the
+            # Audio Overview card body/title/thumbnail/gear/arrow once the panel
+            # is open (fires an undeletable DEFAULT-audio duplicate). The full
+            # make_prompt_audio_generate mission (with the panel_already_open
+            # step-neutralization + the terminal "STOP — no clicks after
+            # Generate") is passed verbatim, and its 'abort:' contract is parsed
+            # from the returned text below in EVERY mode. A Vision success returns
+            # the same {text} shape; CUA is the safety net on anything else.
+            _ag_result = await _shadow_observed_cua(
+                browser.page, hotspot_id="audio-generate", phase=3, platform="notebooklm",
+                current_step=("configure_generate_audio_panel_open" if _panel_opened
+                              else "configure_generate_audio_full"),
+                context_hint=(_task_str + " CRITICAL: only touch the Format/Length "
+                              "controls and the Generate button — NEVER the audio card "
+                              "body/title/thumbnail (that makes an undeletable duplicate)."),
+                expected_outcome="one audio overview starts generating with the requested format/length",
+                cua_coro_factory=_audio_generate_cua,
+                mission_prompt=f"{_prompt}\n\nTASK: {_task_str}",
+                act_timeout_s=180.0) or {}
         finally:
             await stop_narration_ticker(_stop, _task)
 
@@ -30130,10 +30242,29 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         # 2026-05-14: prompt is length-aware so CUA looks at the SAME
         # card the generate step produced (not a hardcoded Long + Deep
         # Dive that doesn't exist for short/default runs).
-        diag = await agent_loop(cua_client, browser, make_prompt_audio_check(podcast_length),
-            "Check: Has audio generation FINISHED? Is there a completed audio player "
-            "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
-            model=CUA_MODEL, max_iterations=3, verbose=verbose)
+        _audio_check_mission = make_prompt_audio_check(podcast_length)
+
+        async def _audio_check_cua():
+            return await agent_loop(cua_client, browser, _audio_check_mission,
+                "Check: Has audio generation FINISHED? Is there a completed audio player "
+                "with NO progress indicator? Answer 'audio complete' ONLY if fully done.",
+                model=CUA_MODEL, max_iterations=3, verbose=verbose)
+
+        # #839 act tier — STRICTLY READ_ONLY (#778): a single click on any audio
+        # card here fires the DEFAULT-audio duplicate, so Vision may only READ
+        # and return a verdict; any proposed action defers to CUA unexecuted.
+        # The 'audio complete' marker is parsed from the returned text below in
+        # every mode; DOM (_check_audio_complete_dom) above is authoritative.
+        diag = await _shadow_observed_cua(
+            browser.page, hotspot_id="audio-check", phase=3, platform="notebooklm",
+            current_step="poll_audio_complete",
+            context_hint="READ ONLY — do not click anything. Is there a COMPLETED audio "
+                         "player with NO progress indicator/spinner? Say 'audio complete' "
+                         "only if fully done, otherwise say it is still generating.",
+            expected_outcome="an honest 'audio complete' verdict only when fully done",
+            cua_coro_factory=_audio_check_cua,
+            mission_prompt=_audio_check_mission,
+            read_only=True) or {}
         diag_text = (diag.get("text") or "").lower()
 
         if "audio complete" in diag_text:
@@ -30253,9 +30384,31 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # / Long Deep Dive), not the hardcoded Long + Deep Dive that
             # would either not exist (short) or pick the wrong card if a
             # parallel Deep Dive misclick existed (default).
-            _dl_result = await agent_loop(cua_client, browser,
-                make_prompt_audio_download(podcast_length, target_ordinal=_target_ord),
-                "Download the audio file.", model=CUA_MODEL, max_iterations=8, verbose=verbose)
+            _audio_dl_mission = make_prompt_audio_download(podcast_length, target_ordinal=_target_ord)
+
+            async def _audio_download_cua():
+                return await agent_loop(cua_client, browser,
+                    _audio_dl_mission,
+                    "Download the audio file.", model=CUA_MODEL, max_iterations=8, verbose=verbose)
+
+            # #839 act tier: the page.on('download', _on_download) listener +
+            # 30s Future + Downloads-folder fallback (registered ABOVE, torn
+            # down below) are the real capture mechanism — the act path keeps
+            # them intact and only drives the download click. #778: target ONLY
+            # the requested card (target_ordinal), never another entry's
+            # play/menu, never navigate away. 'abort:' is diagnostic-only below.
+            _dl_result = await _shadow_observed_cua(
+                browser.page, hotspot_id="audio-download", phase=3, platform="notebooklm",
+                current_step="download_audio_overview",
+                context_hint=("download the completed audio overview via its ⋮/three-dot "
+                              "menu → Download (or a direct download icon)"
+                              + (f" — target ONLY entry #{_target_ord} from the top"
+                                 if _target_ord else "")
+                              + ". Never click another entry's play/menu; never leave this notebook."),
+                expected_outcome="the requested audio overview's .m4a file begins downloading",
+                cua_coro_factory=_audio_download_cua,
+                mission_prompt=_audio_dl_mission,
+                act_timeout_s=120.0)
             # Fix A (2026-05-27): the download agent_loop return was previously
             # ignored, so the new "abort: not on notebook" guard would be
             # swallowed. Surface it in the log for diagnostics — the existing
