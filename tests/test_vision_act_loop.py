@@ -284,7 +284,7 @@ def test_act_steps_logged_with_source_act(monkeypatch, tmp_path):
         _res("declare_success", reason="panel: open"),
     ])
     _run(vc, run_id="r1")
-    recs = [json.loads(l) for l in log.read_text().splitlines()]
+    recs = [json.loads(line) for line in log.read_text().splitlines()]
     assert all(r["source"] == "act" for r in recs)
     assert all(r["run_id"] == "r1" for r in recs)
     finals = [r for r in recs if r.get("final")]
@@ -300,7 +300,7 @@ def test_synthesized_final_logged_as_escalate(monkeypatch, tmp_path):
     page = _FakePage()
     vc = _FakeVC([_res("click", x=0.5, y=0.5, conf=0.2)])
     _run(vc, page)
-    recs = [json.loads(l) for l in log.read_text().splitlines()]
+    recs = [json.loads(line) for line in log.read_text().splitlines()]
     finals = [r for r in recs if r.get("final")]
     assert len(finals) == 1 and finals[0]["outcome"] == "escalate"
 
