@@ -12125,27 +12125,55 @@ def _attempts_for_hotspot(hotspot_id: str, platform: str) -> int:
 async def _shadow_observed_cua(
     page, *, hotspot_id, phase, platform, current_step,
     context_hint, cua_coro_factory, expected_outcome="",
+    mission_prompt="", success_text="", high_stakes=False,
+    read_only=False, act_timeout_s=90.0, act_max_steps=0,
 ):
-    """Run a CUA call, optionally shadowed by Vision (DG_VISION_TIER=shadow).
+    """The Vision↔CUA dispatch point for every hotspot (name kept for
+    grep-stability across logs/memory even though it now covers more than
+    shadowing). Mode comes from DG_VISION_TIER:
 
-    Default behavior (flag off / module unavailable): just runs CUA. Shadow
-    mode: Vision runs in PARALLEL with CUA via asyncio.gather, logs Vision's
-    proposed action to logs/vision_shadow.jsonl, but CUA's output is what's
-    returned. Vision NEVER touches the page — zero pipeline risk.
+    - off / module unavailable (DEFAULT): just runs CUA — byte-identical to
+      the pre-Vision pipeline.
+    - shadow: Vision runs in PARALLEL with CUA via asyncio.gather, logs its
+      proposed action to the shadow JSONL, but CUA's output is what's
+      returned. Vision NEVER touches the page.
+    - act (alias tier2 — Track B #839): Vision DRIVES the page first via
+      vision.act_loop (same mission text CUA would get); only if it can't
+      finish (escalate / failure / low confidence / any rail) does the real
+      CUA run — the tier-3 safety net is always reachable.
 
     cua_coro_factory: a no-arg async function returning the CUA result.
     Defining it as a closure at the call site lets us reuse the existing
-    asyncio.wait_for + agent_loop wrapping per-site.
+    asyncio.wait_for + agent_loop wrapping per-site; exceptions it raises
+    (incl. each site's wait_for TimeoutError) propagate to the call site's
+    own handler in EVERY mode.
+
+    Act-mode extras (all optional → older call sites unchanged):
+    - mission_prompt: the SAME system-prompt text the CUA call uses; the act
+      loop adapts say-the-status instructions into declare_success's reason.
+    - success_text: the exact marker the caller greps from CUA text (e.g.
+      "panel: open"). Prepended to the returned text only when Vision
+      declared success (≥0.6 confidence) without echoing it — protocol
+      translation at CUA's own trust level, since CUA's marker is equally a
+      model claim.
+    - read_only: hotspot contract forbids page interaction (#778 audio-check
+      etc.) — Vision may only return a verdict; any proposed action defers
+      to CUA unexecuted.
+    - act_timeout_s / act_max_steps: wall-clock + step bounds; on timeout the
+      act attempt is abandoned and CUA runs.
+
+    Act success returns {"status": "vision_success", "text": ..., "vision_acted":
+    True} — the agent_loop dict shape every caller already parses.
 
     Failure modes (Vision side) are silently logged — never re-raised.
-    Hotspot ids match scratch/vision_hotspots.md (#7c, #7c-p1, #7d, #2c, #2d).
     """
     if _vision is None:
         return await cua_coro_factory()
     try:
-        if _vision.is_vision_enabled() != "shadow":
-            return await cua_coro_factory()
+        _mode = _vision.is_vision_enabled()
     except Exception:
+        _mode = "off"
+    if _mode not in ("shadow", "tier2"):
         return await cua_coro_factory()
 
     # Enrich with the per-hotspot target description so Vision can locate the
@@ -12166,6 +12194,42 @@ async def _shadow_observed_cua(
         "success_signals": _hint.get("success_signals", []),
         "attempts": _attempts_for_hotspot(hotspot_id, platform),
     }
+
+    if _mode == "tier2":
+        # ── ACT: Vision drives; CUA is the safety net ──
+        _final = None
+        try:
+            _steps = 1 if read_only else (act_max_steps or _vision.ACT_MAX_STEPS_DEFAULT)
+            _final = await asyncio.wait_for(_vision.act_loop(
+                page,
+                flow_context=flow_ctx,
+                hotspot_id=hotspot_id,
+                mission_prompt=(mission_prompt or None),
+                run_id=os.environ.get("DG_RUN_ID"),
+                high_stakes=high_stakes,
+                max_steps=_steps,
+                read_only=read_only,
+                should_abort=lambda: _controls.is_stop() or _controls.is_pause(),
+            ), timeout=act_timeout_s)
+        except Exception as _ae:
+            log(f"[act:{hotspot_id}] act path failed "
+                f"({type(_ae).__name__}: {str(_ae)[:120]}) — CUA safety net takes over",
+                "WARN")
+        if _controls.is_stop():
+            # Mirror agent_loop's stop shape so callers see a stop, not a fail.
+            return {"status": "stopped", "text": ""}
+        if _final is not None and getattr(_final, "action", "") == "declare_success":
+            _txt = getattr(_final, "reason", "") or ""
+            if success_text and success_text.lower() not in _txt.lower():
+                _txt = f"{success_text} | vision: {_txt}"
+            log(f"[act:{hotspot_id}] Vision completed the mission — CUA not needed")
+            return {"status": "vision_success", "text": _txt, "vision_acted": True}
+        if _final is not None:
+            log(f"[act:{hotspot_id}] Vision → {getattr(_final, 'action', '?')} "
+                f"({(getattr(_final, 'reason', '') or '')[:120]}) — CUA safety net takes over")
+        return await cua_coro_factory()
+
+    # ── SHADOW: observe-only, CUA acts ──
     try:
         return await _vision.shadow_observe_then_cua(
             page, cua_coro_factory,

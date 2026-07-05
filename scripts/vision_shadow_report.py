@@ -152,10 +152,13 @@ def coord_within(vision_x: float | None, vision_y: float | None,
 
 def report(records: list[dict], filter_hotspot: str | None,
            verbose: bool) -> int:
-    # Score ONLY the legacy miss-path / CUA-shadow population here; the success-path
+    # Score ONLY the legacy miss-path / CUA-shadow population here. The success-path
     # (source=="dom_success") is a SEPARATE population (its ground truth is the DOM's
-    # resolved target, not CUA's action) scored by report_dom_success().
-    records = [r for r in records if r.get("source") != "dom_success"]
+    # resolved target, not CUA's action) scored by report_dom_success(), and act-mode
+    # records (source=="act", Vision DRIVING under DG_VISION_TIER=act) are outcomes,
+    # not agreement samples — scored by report_act(). Select positively so a future
+    # record kind can never silently inflate the promotion-gate N column.
+    records = [r for r in records if r.get("source") not in ("dom_success", "act")]
     by_hotspot: dict[str, list[dict]] = defaultdict(list)
     for r in records:
         h = r.get("hotspot_id", "?")
@@ -331,6 +334,53 @@ def report_dom_success(records: list[dict], filter_hotspot: str | None,
     print("hotspot gates on action agreement only (a valid promotion basis).")
 
 
+def report_act(records: list[dict], filter_hotspot: str | None,
+               verbose: bool) -> None:
+    """Score the ACT-mode population (source=="act" — Vision DRIVING the page
+    under DG_VISION_TIER=act). These are mission OUTCOMES, not agreement
+    samples: each mission ends in one `final` record with outcome
+    success | escalate | failure. This is the section to read after the
+    user's acting validation runs — success% is 'Vision finished the mission
+    without the CUA safety net'."""
+    acts = [r for r in records if r.get("source") == "act"]
+    finals: dict[str, list[dict]] = defaultdict(list)
+    for r in acts:
+        h = r.get("hotspot_id", "?")
+        if filter_hotspot and h != filter_hotspot:
+            continue
+        if r.get("final"):
+            finals[h].append(r)
+    if not finals:
+        return
+
+    print()
+    print("== Vision-act outcomes (source=act, DG_VISION_TIER=act) ==")
+    print(f"{'Hotspot':<20}{'Missions':<10}{'Success':<16}{'Escalated':<11}"
+          f"{'Failed':<8}{'Avg steps':<10}")
+    print("-" * 75)
+    for hotspot in sorted(finals.keys()):
+        evts = finals[hotspot]
+        n = len(evts)
+        succ = sum(1 for r in evts if r.get("outcome") == "success")
+        esc = sum(1 for r in evts if r.get("outcome") == "escalate")
+        fail = sum(1 for r in evts if r.get("outcome") == "failure")
+        steps = [r.get("steps_used") for r in evts if isinstance(r.get("steps_used"), int)]
+        avg_steps = (sum(steps) / len(steps)) if steps else 0.0
+        pct = (succ / n * 100.0) if n else 0.0
+        print(f"{hotspot:<20}{n:<10}{pct:>6.1f}% ({succ}/{n})  "
+              f"{esc:<11}{fail:<8}{avg_steps:>6.1f}")
+        if verbose:
+            for r in [e for e in evts if e.get("outcome") != "success"][-5:]:
+                v = r.get("vision", {}) or {}
+                print(f"    [{r.get('outcome')}] {str(v.get('reason') or v.get('terminal') or '')[:110]}")
+
+    print()
+    print("Act scoring: one line per mission (the `final` record). 'Escalated' missions")
+    print("fell through to the CUA safety net (pipeline unharmed — same as before the")
+    print("acting tier). 'Failed' = the model itself declared the mission impossible;")
+    print("CUA still ran afterward. Non-final act records are the per-step trace (-v).")
+
+
 def main() -> int:
     # Windows consoles default to cp1252, which can't encode the ≥ / ✓ / — glyphs
     # this report prints (it crashed mid-output before). Force UTF-8 stdout.
@@ -358,6 +408,7 @@ def main() -> int:
 
     rc = report(records, args.hotspot, args.verbose)
     report_dom_success(records, args.hotspot, args.verbose)
+    report_act(records, args.hotspot, args.verbose)
     return rc
 
 
