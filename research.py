@@ -8178,6 +8178,12 @@ class PipelineControls:
         # cookie fast path skips these, so a post-sign-in Retry runs the full
         # verify instead of re-trusting the stale jar.
         self.cookie_trust_broken: set[str] = set()
+        # #899: platforms whose work-tab login pause hit the 10-min TIMEOUT
+        # (nobody acted — distinct from an explicit user Skip, though both
+        # land in skipped_agents). P1's caller keys on this to offer the
+        # Retry-able "No brief" card instead of hardcoding the manual-brief
+        # skip nobody asked for. Cleared when a later pause resolves 'ok'.
+        self.login_pause_timeout_agents: set[str] = set()
         # #896: agents whose page is confirmed behind a human-verification
         # wall (key → short reason like "Cloudflare"). Set when the HV
         # cascade exhausts or a setup/paste fail-path probe finds a wall;
@@ -8415,6 +8421,7 @@ class PipelineControls:
         self.skip_init_verify = False
         self.retry_init_verify = False
         self.cookie_trust_broken.clear()
+        self.login_pause_timeout_agents.clear()
         self.hv_blocked.clear()
         self.skipped_agents.clear()
         self.skipped_phases.clear()
@@ -12661,6 +12668,7 @@ async def _work_tab_login_pause(page, agent_key: str, phase: int, label: str,
     def _restore_trust():
         # Trust restored by direct observation — the only mid-run remover.
         _controls.cookie_trust_broken.discard(agent_key)
+        _controls.login_pause_timeout_agents.discard(agent_key)
         _clear_pending_decision()
         emit_event("agent_progress", phase=phase, agent=agent_key,
                    status="verified",
@@ -12740,6 +12748,9 @@ async def _work_tab_login_pause(page, agent_key: str, phase: int, label: str,
 
     log(f"[{label}] login_required timed out ({_WORK_TAB_LOGIN_MAX_LOOPS * 5}s) — skipping {label}", "WARN")
     _controls.skipped_agents.add(agent_key)
+    # Timeout ≠ user decision — mark it so callers can offer a Retry-able
+    # card instead of treating it like an explicit Skip (#899 review).
+    _controls.login_pause_timeout_agents.add(agent_key)
     _clear_pending_decision()
     emit_event("agent_skipped", phase=phase, agent=agent_key,
                reason="login_required_timeout")
@@ -24472,6 +24483,25 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     await browser.navigate("https://chatgpt.com")
     await asyncio.sleep(3)
 
+    # #899 work-tab preflight: confirmed signed-out probe on the tab P1 is
+    # about to drive (the isolated verify tab is being retired; the gate's
+    # cookie fast path can't catch a session that died SERVER-side). Runs regardless
+    # of verifyLogins — cheap insurance for sessions dying after a P0 walk.
+    # P1 has a single agent, so unlike P2 this PAUSES (nothing else could
+    # keep running anyway); signing in inside the open tab auto-resumes.
+    if await _work_tab_signed_out(browser.page, "chatgpt", "ChatGPT"):
+        _p1_preflight = await _work_tab_login_pause(
+            browser.page, "chatgpt", 1, "ChatGPT",
+            work_url="https://chatgpt.com")
+        if _p1_preflight == "stop":
+            return None
+        if _p1_preflight == "skipped":
+            # chatgpt stays in skipped_agents — the caller keys the
+            # manual-brief flow off exactly that membership.
+            log("Phase 1: ChatGPT skipped at the work-tab login pause — caller collects a manual brief", "INFO")
+            return None
+        # 'ok' → signed in, confirmed on the work page; proceed.
+
     # Inject MutationObserver early — right after navigate, before HV check.
     # The scrape selector (`[data-message-author-role="assistant"]`) doesn't
     # exist on HV/login pages, so early-inject produces no false positives
@@ -24564,31 +24594,21 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
             # has a composer) — a signed-out session reads as "no Pro". Probe
             # the already-open page (zero navigations) and surface the honest
             # login_required card instead of misattributing it to the tier.
-            _p1_wall = await _page_shows_login_wall(browser.page)
+            # #899: routed through the work-tab login pause helper — same
+            # card, plus the auto-resume poll and a working Skip branch (the
+            # old inline pause had no Skip: skip_agent left it spinning).
+            _p1_wall = await _work_tab_signed_out(browser.page, "chatgpt", "ChatGPT")
             if _p1_wall:
-                _controls.cookie_trust_broken.add("chatgpt")
                 log(f"Phase 1: ChatGPT shows {_p1_wall} — the no-Pro verdict is a signed-out session; surfacing login_required", "WARN")
-                _p1_login_msg = ("ChatGPT is showing its sign-in page — the saved session expired. "
-                                 "Sign in using the open browser (or run the login command on the device), then Retry.")
-                _p1_login_alert_id = "phase1_login_required_chatgpt"
-                emit_event("login_required", phase=1, platforms=["chatgpt"],
-                           platformLabels=["ChatGPT"], machineName=socket.gethostname(),
-                           attempt=1, message=_p1_login_msg, alert_id=_p1_login_alert_id)
-                _controls.request_pause("login_required")
-                emit_event("pipeline_paused", phase=1, reason="login_required")
-                _persist_pending_decision({
-                    "kind": "login_required", "phase": 1, "platforms": ["chatgpt"],
-                    "platformLabels": ["ChatGPT"], "machineName": socket.gethostname(),
-                    "attempt": 1, "message": _p1_login_msg, "alert_id": _p1_login_alert_id,
-                })
-                await _controls.wait_if_paused()
-                _clear_pending_decision()
-                if _controls.is_stop():
-                    emit_event("pipeline_stopped", phase=1, reason="stopped during login_required")
+                _p1_wall_pause = await _work_tab_login_pause(
+                    browser.page, "chatgpt", 1, "ChatGPT",
+                    work_url="https://chatgpt.com")
+                if _p1_wall_pause == "stop":
                     return None
-                _controls.consume_retry_phase(1)
-                emit_event("pipeline_resumed", phase=1, reason="retry")
-                continue  # re-run the Pro selector on the now-signed-in page
+                if _p1_wall_pause == "skipped":
+                    log("Phase 1: ChatGPT skipped at the mid-P1 login pause — caller collects a manual brief", "INFO")
+                    return None
+                continue  # 'ok' — re-run the Pro selector on the now-signed-in page
             # A genuine downgrade (or a persistent detection failure). Log the
             # exact CUA verdict so a post-E2E review can confirm it wasn't a
             # transient miss, then escalate to the Tier-2 pro_required card.
@@ -29170,6 +29190,13 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
     p3_max_retries = 2
     p3_attempt = 0
     while md_files and p3_attempt <= p3_max_retries:
+        # Respect a prior Skip: the #899 login pause leaves notebooklm in
+        # skipped_agents so re-entries never re-prompt (gate parity) — and
+        # driving CUA uploads at a signed-out page the user already gave up
+        # on would only burn quota.
+        if "notebooklm" in _controls.skipped_agents:
+            log("Phase 3: NotebookLM was skipped earlier this run — not re-attempting the upload", "INFO")
+            break
         log(f"\n--- Uploading {len(md_files)} MDs to NotebookLM (attempt {p3_attempt + 1}/{p3_max_retries + 1}) ---")
         try:
             page = await browser.new_tab("https://notebooklm.google.com")
@@ -29185,6 +29212,20 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     log("Phase 3: HV gate on NotebookLM could not be cleared — retrying or aborting", "ERROR")
                     p3_attempt += 1
                     continue
+
+            # #899 work-tab preflight: confirmed signed-out probe on the
+            # NotebookLM tab itself (the isolated verify tab is being retired).
+            # Single-agent phase → pause like P1; signing in inside the open
+            # tab auto-resumes. Skip/timeout → proceed without NotebookLM
+            # (empty notebook_url; the caller cascades P4 off).
+            if await _work_tab_signed_out(page, "notebooklm", "NotebookLM"):
+                _p3_preflight = await _work_tab_login_pause(
+                    page, "notebooklm", 3, "NotebookLM",
+                    work_url="https://notebooklm.google.com")
+                if _p3_preflight in ("stop", "skipped"):
+                    log(f"Phase 3: NotebookLM login pause ended '{_p3_preflight}' — proceeding without the notebook", "WARN")
+                    break
+                # 'ok' → signed in, confirmed on the work page; proceed.
 
             for i, md_path in enumerate(md_files):
                 log(f"Uploading {md_path.name} ({i+1}/{len(md_files)})...")
@@ -29344,6 +29385,14 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         log("No NotebookLM notebook — skipping Phase 3 (audio)", "WARN")
         return {"audio_path": None}
 
+    # Respect a prior Skip (the #899 login pause leaves notebooklm in
+    # skipped_agents) — the no-audio auto-retry loop re-enters this function,
+    # and re-prompting a decision the user already made would be a re-card
+    # loop with 5-min waits between rounds.
+    if "notebooklm" in _controls.skipped_agents:
+        log("Phase 3 (audio): NotebookLM was skipped earlier this run — not re-attempting", "INFO")
+        return {"audio_path": None}
+
     # Navigate to notebook if not already there
     current = await browser.current_url()
     if "notebooklm" not in current:
@@ -29360,6 +29409,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         if not cleared:
             log("Phase 3: HV gate on NotebookLM could not be cleared — aborting audio step", "ERROR")
             return {"audio_path": None}
+
+    # #899 work-tab preflight: the Google session can die between the upload
+    # step and this audio step (long gap on big source sets). Confirm the
+    # sign-in on the notebook tab itself before spending CUA on Generate.
+    if await _work_tab_signed_out(browser.page, "notebooklm", "NotebookLM"):
+        _p3b_preflight = await _work_tab_login_pause(
+            browser.page, "notebooklm", 3, "NotebookLM",
+            work_url=notebook_url)
+        if _p3b_preflight in ("stop", "skipped"):
+            log(f"Phase 3 (audio): NotebookLM login pause ended '{_p3b_preflight}' — no audio", "WARN")
+            return {"audio_path": None}
+        # 'ok' → signed in, confirmed on the notebook; proceed.
 
     # 2026-05-06 (Stream 2 D1): single-attempt audio generation. The outer
     # _await_phase_with_active_deadline(3, PHASE_3_AUDIO_MAX_MIN,
@@ -29645,26 +29706,22 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
 
         # Mid-poll auth check — NotebookLM session can expire during the
         # audio window. Without this, CUA keeps clicking on a logged-out
-        # page. URL-only check (no tabs, no CUA) per the P0 sequential pattern.
+        # page. #899: upgraded from a bare per-cycle login_required emit
+        # (no pause request → wait_if_paused returned instantly, so it
+        # re-carded EVERY cycle with no alert_id and no durable mirror) to
+        # the work-tab login pause helper: one real pause, auto-resume when
+        # the user signs back in, Skip/timeout ends the audio step cleanly.
         try:
-            current_url = (browser.page.url or "").lower()
-            if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
-                log(f"[Phase3] NotebookLM session expired mid-audio-poll: {current_url}")
-                emit_event("login_required", phase=3,
-                           platforms=["notebooklm"],
-                           platformLabels=["NotebookLM"],
-                           message="Your NotebookLM session signed out. Sign back in using the open browser to keep going.",
-                           attempt=1)
-                emit_event("pipeline_paused", phase=3, reason="notebooklm_login_expired")
-                await _controls.wait_if_paused()
-                if _controls.is_stop():
+            if await _work_tab_signed_out(browser.page, "notebooklm", "NotebookLM"):
+                log("[Phase3] NotebookLM session expired mid-audio-poll — pausing on the notebook tab")
+                _p3_poll_login = await _work_tab_login_pause(
+                    browser.page, "notebooklm", 3, "NotebookLM",
+                    work_url=notebook_url or "https://notebooklm.google.com")
+                if _p3_poll_login in ("stop", "skipped"):
+                    log(f"[Phase3] audio poll ending on login pause result: {_p3_poll_login}", "WARN")
                     break
-                # User logged back in: reload + continue polling.
-                try:
-                    await browser.page.reload(wait_until="domcontentloaded", timeout=15000)
-                    await asyncio.sleep(3)
-                except Exception:
-                    pass
+                # 'ok' → signed back in on the notebook — keep polling (the
+                # helper already reloaded the notebook to confirm).
         except Exception:
             pass
 
@@ -32796,21 +32853,49 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     log("Phase 1: stop_event set — exiting cleanly (no fail_phase cascade)", "INFO")
                     return
                 if not p1 or not p1["text"]:
-                    log("Phase 1 failed — no brief generated; awaiting user decision", "ERROR")
-                    fail_phase(
-                        phase=1,
-                        error="No brief was generated",
-                        reason="ChatGPT didn't produce a brief. Make sure ChatGPT is signed in, then Retry — or Skip and write your own.",
-                        agent="chatgpt",
-                    )
-                    decision = await _controls.await_phase_decision(1)
+                    _p1_login_timeout = "chatgpt" in _controls.login_pause_timeout_agents
+                    _p1_login_skipped = ("chatgpt" in _controls.skipped_agents
+                                         and not _p1_login_timeout)
+                    if _p1_login_skipped:
+                        # #899: the user EXPLICITLY chose Skip on the work-tab
+                        # login pause inside Phase 1 ("I'll write the brief
+                        # myself") — don't re-ask via the generic "No brief
+                        # was generated" card; go straight to the manual-brief
+                        # flow, exactly like the verify gate's skip did. The
+                        # UNATTENDED 10-min timeout deliberately does NOT land
+                        # here: it gets the Retry-able card below, so a user
+                        # returning at minute 11 can sign in + Retry instead
+                        # of finding the run stranded in a 3h typed-brief wait
+                        # nobody asked for.
+                        log("Phase 1: ChatGPT skipped at the login pause → manual brief flow", "INFO")
+                        decision = "skip"
+                    else:
+                        log("Phase 1 failed — no brief generated; awaiting user decision", "ERROR")
+                        fail_phase(
+                            phase=1,
+                            error="No brief was generated",
+                            reason="ChatGPT didn't produce a brief. Make sure ChatGPT is signed in, then Retry — or Skip and write your own.",
+                            agent="chatgpt",
+                        )
+                        decision = await _controls.await_phase_decision(1)
                     if decision == "retry":
                         log("Phase 1: user requested retry — re-running from the top", "INFO")
+                        # #899: a Retry supersedes any stale login-pause skip —
+                        # without this discard the preflight pause would see
+                        # skipped_agents and return 'skipped' on its first
+                        # tick, making Retry structurally unable to work.
+                        _controls.skipped_agents.discard("chatgpt")
+                        _controls.login_pause_timeout_agents.discard("chatgpt")
                         emit_event("phase_restart", phase=1, reason="user_retry_after_error", attempt=0)
                         continue
                     if decision == "skip":
                         log("Phase 1: user skipped after error — switching to manual brief entry mode", "INFO")
-                        emit_event("phase_skipped", phase=1, reason="user_skip_after_error")
+                        # ONE terminal skip event, with the honest reason for
+                        # how we got here (#899 review: the login-pause route
+                        # used to double-emit with a phantom 'after_error').
+                        emit_event("phase_skipped", phase=1,
+                                   reason=("user_skip_at_login_pause" if _p1_login_skipped
+                                           else "user_skip_after_error"))
                         # ── P1 skip → manual brief flow ──
                         # Instead of proceeding with an empty brief, ask the
                         # user to paste their own. Emit a Template-shape info
@@ -33180,6 +33265,31 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     enabled_agents = [a for a in enabled_agents if a not in _p2_dropped_at_gate]
                 if not enabled_agents:
                     log("Phase 2: all agents skipped at verify gate — aborting", "WARN")
+                    fail_phase(2,
+                               "No agents left to run",
+                               "Every research agent was skipped, so there's nothing "
+                               "to run. Retry to re-check logins, or Skip.")
+                    emit_event("pipeline_stopped", phase=2,
+                               reason="all_agents_skipped_at_verify_gate")
+                    return
+            # #899: the work-tab login pauses leave an explicitly-skipped
+            # platform in skipped_agents REGARDLESS of verifyLogins — the
+            # gate loop above only consumes it on skip-init runs. Trim
+            # unconditionally so a decision the user made at a P1 login
+            # pause isn't re-asked at P2 (or worse: a fresh DR launched and
+            # then killed by the round-robin's skip consumer on its first
+            # tick) on init-verified runs.
+            _p2_preskipped = [a for a in enabled_agents if a in _controls.skipped_agents]
+            if _p2_preskipped and not _controls.is_stop():
+                for _ag in _p2_preskipped:
+                    log(f"Phase 2: {_ag} was skipped at an earlier login pause — not launching", "INFO")
+                    emit_event("agent_skipped", phase=2, agent=_ag,
+                               reason=("login_required_timeout"
+                                       if _ag in _controls.login_pause_timeout_agents
+                                       else "user_skip"))
+                enabled_agents = [a for a in enabled_agents if a not in _p2_preskipped]
+                if not enabled_agents:
+                    log("Phase 2: all agents skipped before launch — aborting", "WARN")
                     fail_phase(2,
                                "No agents left to run",
                                "Every research agent was skipped, so there's nothing "
@@ -33889,8 +33999,23 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # decision, notebook_url is empty by design — skip the entire
             # link-extract block instead of falling through into a retry loop
             # that would re-prompt for a notebook that doesn't exist.
-            if _p3a_user_skipped:
-                pass  # user skipped upload — nothing to extract
+            _p3_login_skipped = "notebooklm" in _controls.skipped_agents
+            if _p3a_user_skipped or _p3_login_skipped or _controls.is_stop():
+                # user skipped upload (timeout decision, or the #899 work-tab
+                # login pause) / stop — nothing to extract. A login-pause skip
+                # cascades P4 off, same as the verify gate's skip did (no
+                # YouTube without a podcast), and emits the phase's TERMINAL
+                # skip event — without it this path fell through to a false
+                # phase_complete:3 claiming "NotebookLM notebook created"
+                # (review MAJOR). phase_skipped:3 also live-triggers FE-P4's
+                # no-audio fast path → FE-P5, so delivery still completes.
+                if _p3_login_skipped:
+                    log("Phase 3: NotebookLM skipped at the login pause — no notebook; cascading P4 off", "INFO")
+                    _controls.skipped_phases.add(4)
+                    emit_event("phase_skipped", phase=3,
+                               reason=("login_required_timeout"
+                                       if "notebooklm" in _controls.login_pause_timeout_agents
+                                       else "user_skip_at_login_pause"))
             elif not (notebook_url and validate_link("notebooklm", notebook_url)):
                 log("[NotebookLM] Notebook URL missing/invalid — retrying via extractor (3×)", "WARN")
                 while True:
@@ -34114,6 +34239,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     _p3_audio_user_skipped = True
                     _controls.skipped_phases.add(4)
                     break
+                # #899: a Skip on the work-tab login pause (or its timeout)
+                # leaves notebooklm in skipped_agents — run_phase3_audio
+                # early-returns on it, so auto-retrying is 3× 5-min waits for
+                # nothing. Same clean skip as above, with the HONEST reason
+                # (telemetry must distinguish a login-pause skip/timeout from
+                # a genuine #778 skip-during-auto-retry).
+                if "notebooklm" in _controls.skipped_agents:
+                    log("Phase 3: NotebookLM skipped at the login pause — continuing with notebook link only", "INFO")
+                    emit_event("phase_skipped", phase=3,
+                               reason=("login_required_timeout"
+                                       if "notebooklm" in _controls.login_pause_timeout_agents
+                                       else "user_skip_at_login_pause"))
+                    _p3_audio_user_skipped = True
+                    _controls.skipped_phases.add(4)
+                    break
                 if _audio_auto_retries >= _AUDIO_MAX_AUTO_RETRIES:
                     # Exhausted auto-retries → graceful, non-blocking fallback:
                     # continue with notebook-link-only. P5 still delivers the
@@ -34212,7 +34352,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     log(f"Phase 3 audio auto-retry failed: {_ar}", "WARN")
                     audio_path = None
                 continue
-            if not _p3_audio_user_skipped:
+            # #899: a login-pause skip (or a stop) must not read as a green
+            # "NotebookLM notebook created" — those paths already emitted
+            # their own terminal event (phase_skipped:3 / pipeline_stopped).
+            if (not _p3_audio_user_skipped and not _p3_login_skipped
+                    and not _controls.is_stop()):
                 emit_event("phase_complete", phase=3, durationSec=int(time.time() - _p3_start), links=_p3_links,
                     summary=f"NotebookLM notebook created{', audio generated' if audio_path else ''}{', audio link extracted' if audio_overview_url else ''}")
         else:

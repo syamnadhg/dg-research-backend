@@ -35,6 +35,7 @@ import research
 class _FakeControls:
     def __init__(self):
         self.cookie_trust_broken = set()
+        self.login_pause_timeout_agents = set()
         self.skipped_agents = set()
         self.pause_target_agent = ""
         self.retry_init_verify = False
@@ -270,6 +271,126 @@ def test_chatgpt_tier_retry_actually_re_verifies():
     assert "_clear_pro_required_alerts(triggered_at_phase=2)" in _retry_blk
 
 
+# ── phase C: P1 + P3 wiring ───────────────────────────────────────────────────
+
+def test_p1_preflight_pauses_on_the_work_tab():
+    # P1 probes the tab it is about to drive, BEFORE the HV gate / Pro
+    # selection burn CUA on a signed-out page. Single-agent phase → the
+    # helper PAUSES (auto-resume on in-tab sign-in), unlike P2's fail cards.
+    src = inspect.getsource(research.run_phase1)
+    assert '_work_tab_signed_out(browser.page, "chatgpt", "ChatGPT")' in src
+    probe_at = src.index("_work_tab_signed_out")
+    assert probe_at < src.index("check_hv_gate")
+    # BOTH P1 pause sites (preflight + the Pro-backstop's late wall branch)
+    # route through the helper — the old inline pause with no Skip branch is
+    # gone, and the helper owns the pendingDecision mirror now.
+    assert src.count("_work_tab_login_pause") == 2
+    assert "_persist_pending_decision" not in src
+    # RESULT handling is load-bearing (review: deleting it left the suite
+    # green — the preflight became decorative). Preflight branch: stop AND
+    # skipped both bail out of the phase.
+    pre_blk = src[probe_at:probe_at + 900]
+    assert pre_blk.count("return None") >= 2
+    assert '== "stop"' in pre_blk and '== "skipped"' in pre_blk
+    # Late wall branch: same bails + 'ok' re-loops the Pro selector.
+    late_at = src.index("_work_tab_signed_out", probe_at + 1)
+    late_blk = src[late_at:late_at + 1100]
+    assert late_blk.count("return None") >= 2
+    assert "continue" in late_blk
+
+
+def test_p1_login_skip_routes_to_manual_brief():
+    # EXPLICIT Skip at the P1 login pause = "I'll write the brief myself":
+    # the caller goes STRAIGHT to the manual-brief flow. The unattended
+    # 10-min TIMEOUT does NOT — it gets the Retry-able "No brief" card (a
+    # returning user signs in + Retries; review: hardcoding skip stranded
+    # the run in a 3h typed-brief wait nobody asked for). Exactly ONE
+    # phase_skipped:1 with the honest reason.
+    src = inspect.getsource(research)
+    assert '"chatgpt" in _controls.login_pause_timeout_agents' in src
+    i = src.index('_p1_login_timeout = ')
+    blk = src[i:i + 3000]
+    assert '"chatgpt" in _controls.skipped_agents' in blk
+    assert 'decision = "skip"' in blk
+    # Retry must clear the stale skip or the preflight pause returns
+    # 'skipped' on its first tick and Retry can never work.
+    assert 'skipped_agents.discard("chatgpt")' in blk
+    assert 'login_pause_timeout_agents.discard("chatgpt")' in blk
+    # single conditional-reason emit — no double phase_skipped
+    assert ('reason=("user_skip_at_login_pause" if _p1_login_skipped'
+            in src)
+
+
+def test_p2_trims_preskipped_agents_before_launch():
+    # A P1 login-pause skip leaves chatgpt in skipped_agents REGARDLESS of
+    # verifyLogins, but the P2 verify-gate loop only consumes it on
+    # skip-init runs (review MAJOR: on init-verified runs 2A re-launched
+    # ChatGPT — re-asking the decision, or letting the round-robin's skip
+    # consumer kill a fresh DR on its first tick). The caller must trim
+    # enabled_agents by skipped_agents unconditionally.
+    src = inspect.getsource(research)
+    i = src.index("_p2_preskipped = ")
+    blk = src[i - 200:i + 1400]
+    assert "[a for a in enabled_agents if a in _controls.skipped_agents]" in blk
+    assert "enabled_agents = [a for a in enabled_agents if a not in _p2_preskipped]" in blk
+    assert 'emit_event("agent_skipped", phase=2' in blk
+    # the honest reason split: timeout ≠ user decision
+    assert "login_required_timeout" in blk
+
+
+def test_p3_upload_preflights_and_respects_prior_skip():
+    src = inspect.getsource(research.run_phase3_upload)
+    # entry guard: a prior Skip (login pause leaves notebooklm in
+    # skipped_agents) must not re-prompt or burn CUA on re-entry
+    assert '"notebooklm" in _controls.skipped_agents' in src
+    # preflight probes the fresh tab BEFORE the first upload agent_loop
+    assert '_work_tab_signed_out(page, "notebooklm", "NotebookLM")' in src
+    probe_at = src.index("_work_tab_signed_out")
+    assert probe_at < src.index("PROMPT_NOTEBOOKLM_UPLOAD")
+    # RESULT handling: stop/skipped must BREAK out (empty notebook_url),
+    # never fall through into the upload agent_loops on a signed-out tab.
+    blk = src[probe_at:probe_at + 900]
+    assert 'in ("stop", "skipped")' in blk and "break" in blk
+
+
+def test_p3_audio_preflights_and_midpoll_pause_upgraded():
+    src = inspect.getsource(research.run_phase3_audio)
+    # entry skip guard — the no-audio auto-retry loop re-enters this function
+    assert '"notebooklm" in _controls.skipped_agents' in src
+    # two pause sites: the post-navigate preflight + the mid-poll expiry
+    # check (upgraded from the bare pause-less login_required emit that
+    # re-carded every cycle with no alert_id and no durable mirror)
+    assert src.count("_work_tab_login_pause") == 2
+    assert 'reason="notebooklm_login_expired"' not in src
+    # RESULT handling at both sites: preflight returns the no-audio shape;
+    # the mid-poll pause breaks the poll loop.
+    pre_at = src.index("_work_tab_login_pause")
+    pre_blk = src[pre_at:pre_at + 700]
+    assert 'in ("stop", "skipped")' in pre_blk
+    assert 'return {"audio_path": None}' in pre_blk
+    poll_at = src.index("_work_tab_login_pause", pre_at + 1)
+    poll_blk = src[poll_at:poll_at + 700]
+    assert 'in ("stop", "skipped")' in poll_blk and "break" in poll_blk
+
+
+def test_p3_login_skip_cascades_p4_and_never_fakes_complete():
+    # A login-pause Skip means no notebook → the OUTER extract-retry gate
+    # must take the skip branch (review: dropping '_p3_login_skipped or'
+    # from the condition stayed green while resurrecting the re-prompt),
+    # P4 cascades off, a TERMINAL phase_skipped:3 is emitted (it also
+    # live-triggers FE-P4's no-audio fast path → FE-P5), and the green
+    # "NotebookLM notebook created" phase_complete is suppressed.
+    src = inspect.getsource(research)
+    assert "if _p3a_user_skipped or _p3_login_skipped or _controls.is_stop():" in src
+    i = src.index("_p3_login_skipped = ")
+    blk = src[i:i + 1400]
+    assert "skipped_phases.add(4)" in blk
+    assert 'emit_event("phase_skipped", phase=3' in blk
+    # the complete emit is gated on BOTH skip flags + stop
+    assert ("if (not _p3_audio_user_skipped and not _p3_login_skipped"
+            in src)
+
+
 # ── _work_tab_login_pause: the FE contract on entry ───────────────────────────
 
 async def _run_pause(harness, page=None, agent="chatgpt", phase=1,
@@ -316,11 +437,13 @@ async def test_auto_resume_restores_cookie_trust(harness):
     # 'ok' is the ONLY mid-run remover of cookie_trust_broken — trust comes
     # back by direct observation of the signed-in work page, nothing else.
     harness.ctl.cookie_trust_broken.add("notebooklm")
+    harness.ctl.login_pause_timeout_agents.add("notebooklm")  # stale marker from an earlier timeout
     _probe_script(harness, ["wall", "wall", None])
     out = await _run_pause(harness, agent="notebooklm", phase=3, label="NotebookLM",
                            work_url="https://notebooklm.google.com")
     assert out == "ok"
     assert "notebooklm" not in harness.ctl.cookie_trust_broken
+    assert "notebooklm" not in harness.ctl.login_pause_timeout_agents
 
 
 @pytest.mark.asyncio
@@ -483,6 +606,9 @@ async def test_timeout_degrades_to_skip_not_a_hang(harness):
                            work_url="https://notebooklm.google.com")
     assert out == "skipped"
     assert "notebooklm" in harness.ctl.skipped_agents
+    # timeout ≠ user decision — the marker lets P1's caller offer the
+    # Retry-able card instead of hardcoding the manual-brief skip
+    assert "notebooklm" in harness.ctl.login_pause_timeout_agents
     # mirror retracted + pause released — a cold chat-open must not paint a
     # ghost login card, and the pipeline must not stay paused (HV parity).
     assert harness.cleared
