@@ -135,6 +135,25 @@ def test_click_then_success_executes_and_breadcrumbs(monkeypatch, tmp_path):
     assert "last_action" not in vc.contexts[0]
 
 
+def test_chord_copy_sequence_executes(monkeypatch, tmp_path):
+    # A copy hotspot: Vision selects-all then copies via two chord key steps,
+    # then declares success. Both chords must reach the page (they feed the
+    # clipboard-hijack copy event) — the repeat guard must NOT trip (distinct
+    # keys), and declare_success passes through.
+    _set_log(monkeypatch, tmp_path)
+    monkeypatch.setattr(vision, "ACT_STEP_SETTLE_S", 0.0)
+    page = _FakePage()
+    vc = _FakeVC([
+        _res("key", key="Control+a", reason="select all"),
+        _res("key", key="Control+c", reason="copy"),
+        _res("declare_success", reason="copied"),
+    ])
+    out = _run(vc, page)
+    assert out.action == "declare_success"
+    assert ("press", "Control+a") in page.interactions
+    assert ("press", "Control+c") in page.interactions
+
+
 def test_mission_prompt_is_adapted_and_threaded(monkeypatch, tmp_path):
     _set_log(monkeypatch, tmp_path)
     vc = _FakeVC([_res("declare_success")])
