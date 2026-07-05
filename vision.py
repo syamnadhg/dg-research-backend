@@ -561,17 +561,25 @@ class VisionClient:
                     output_tokens=out_tok,
                 )
         # No tool_use block — schema-invalid response. Failure.
-        return self._failure(
+        # NON-recording builder: this path is reached from inside ask()'s success
+        # branch, which records the returned result exactly once at its own call
+        # site. Using self._failure (which records) here double-counted the call
+        # (call_count +2, p95 skewed, budget slot double-burned) — the parse path
+        # must be side-effect-free so ask() stays the single record point.
+        return self._failure_result(
             "model did not return propose_action tool call",
             model, latency_ms,
             in_tok=in_tok, out_tok=out_tok,
         )
 
-    def _failure(
+    def _failure_result(
         self, reason: str, model: str, latency_ms: float,
         in_tok: int = 0, out_tok: int = 0,
     ) -> ActionResult:
-        result = ActionResult(
+        """Build a declare_failure ActionResult WITHOUT recording metrics.
+        The caller decides whether to record (ask()'s except paths record via
+        _failure; the parse path lets ask()'s success-branch record())."""
+        return ActionResult(
             action="declare_failure",
             reason=reason,
             confidence=0.0,
@@ -581,6 +589,14 @@ class VisionClient:
             input_tokens=in_tok,
             output_tokens=out_tok,
         )
+
+    def _failure(
+        self, reason: str, model: str, latency_ms: float,
+        in_tok: int = 0, out_tok: int = 0,
+    ) -> ActionResult:
+        """Recording failure — used by ask()'s except paths, which return
+        directly and so are NOT re-recorded by the success-branch record()."""
+        result = self._failure_result(reason, model, latency_ms, in_tok, out_tok)
         self.metrics.record(result)
         return result
 
@@ -824,15 +840,27 @@ async def shadow_observe_then_cua(
     cua_result: Any
     cua_latency_ms: float
     if isinstance(results[1], Exception):
-        # CUA broke — propagate, but log it anyway.
-        _append_shadow_record({
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "run_id": run_id, "hotspot_id": hotspot_id,
-            "phase": flow_context.get("phase"),
-            "agent": flow_context.get("platform"),
-            "vision": vision_record,
-            "cua": {"error": f"{type(results[1]).__name__}: {str(results[1])[:200]}"},
-        })
+        # CUA broke — propagate, but log it anyway. Tag the exception as
+        # CUA-origin so the research.py dispatcher's shadow catch-all re-raises
+        # it (to the call site's own handler, matching off-mode) instead of
+        # mislabelling it "shadow path failed" and re-running the CUA a SECOND
+        # time (doubled page side effects + a different verdict path than off).
+        # The logging is best-effort — a log failure must NOT mask the raise.
+        try:
+            _append_shadow_record({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "run_id": run_id, "hotspot_id": hotspot_id,
+                "phase": flow_context.get("phase"),
+                "agent": flow_context.get("platform"),
+                "vision": vision_record,
+                "cua": {"error": f"{type(results[1]).__name__}: {str(results[1])[:200]}"},
+            })
+        except Exception:
+            pass
+        try:
+            results[1]._dg_cua_origin = True
+        except Exception:
+            pass
         raise results[1]
     cua_result, cua_latency_ms = results[1]
 
@@ -845,15 +873,22 @@ async def shadow_observe_then_cua(
     except Exception:
         pass
 
-    _append_shadow_record({
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "run_id": run_id, "hotspot_id": hotspot_id,
-        "phase": flow_context.get("phase"),
-        "agent": flow_context.get("platform"),
-        "vision": vision_record,
-        "cua": {"latency_ms": int(cua_latency_ms),
-                "text_head": cua_text[:200]},
-    })
+    # Best-effort: a shadow-logging error AFTER a successful CUA run must not
+    # bubble out (the dispatcher's shadow catch-all would re-run the CUA a
+    # second time — doubled side effects). _append_shadow_record already
+    # swallows its own IO errors; the guard here covers the dict build too.
+    try:
+        _append_shadow_record({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_id": run_id, "hotspot_id": hotspot_id,
+            "phase": flow_context.get("phase"),
+            "agent": flow_context.get("platform"),
+            "vision": vision_record,
+            "cua": {"latency_ms": int(cua_latency_ms),
+                    "text_head": cua_text[:200]},
+        })
+    except Exception:
+        pass
 
     return cua_result
 

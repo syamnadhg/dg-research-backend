@@ -60,6 +60,26 @@ def test_parse_response_normalizes_pixel_coords():
     assert res.low_confidence is False         # 0.8 >= 0.6
 
 
+def test_parse_response_no_tooluse_does_not_record():
+    # Review [6]: the no-tool_use parse path must be side-effect-free (ask()'s
+    # success branch records once). Previously it called self._failure which
+    # ALSO recorded → the schema-invalid response double-burned the budget.
+    vc = vision.VisionClient(api_key="test-key")
+    empty = types.SimpleNamespace(content=[], usage=types.SimpleNamespace(
+        input_tokens=5, output_tokens=0))
+    res = vc._parse_response(empty, vision.MODEL_SONNET, 50.0, None)
+    assert res.action == "declare_failure"
+    assert "did not return" in res.reason
+    assert vc.metrics.call_count == 0  # parse path recorded nothing
+
+
+def test_failure_records_once():
+    # The recording wrapper still records (used by ask()'s except paths).
+    vc = vision.VisionClient(api_key="test-key")
+    vc._failure("boom", vision.MODEL_SONNET, 10.0)
+    assert vc.metrics.call_count == 1
+
+
 def test_default_timeout_raised_off_8s():
     # 8s was too tight (CUA fallback takes 20–30s); the raise prevents the
     # timeout-dominated shadow telemetry.

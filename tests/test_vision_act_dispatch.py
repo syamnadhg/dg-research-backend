@@ -200,6 +200,125 @@ def test_act_flow_context_carries_hints(monkeypatch):
     assert ctx["workflow_name"] == "7c"
 
 
+def test_pre_cua_net_probe_veto_skips_cua(monkeypatch):
+    # Review [4]: a partial act attempt at a non-idempotent hotspot → the probe
+    # vetoes the CUA net (state already advanced) so CUA never re-acts.
+    fv = _FakeVisionModule("tier2", act_result=_final("escalate_to_cua", "timed out"))
+
+    async def _probe():
+        return {"status": "vision_partial", "text": "generating"}
+
+    out, calls, _ = _dispatch(monkeypatch, fv, pre_cua_net_probe=_probe)
+    assert calls["cua"] == 0
+    assert out["status"] == "vision_partial"
+
+
+def test_pre_cua_net_probe_none_runs_cua(monkeypatch):
+    # Probe returns None (Vision did nothing) → CUA net runs normally.
+    fv = _FakeVisionModule("tier2", act_result=_final("escalate_to_cua", "nope"))
+
+    async def _probe():
+        return None
+
+    out, calls, _ = _dispatch(monkeypatch, fv, pre_cua_net_probe=_probe)
+    assert calls["cua"] == 1
+
+
+def test_pre_cua_net_probe_error_runs_cua(monkeypatch):
+    # A throwing probe must not break the fall-through — CUA still runs.
+    fv = _FakeVisionModule("tier2", act_result=_final("escalate_to_cua"))
+
+    async def _probe():
+        raise RuntimeError("probe boom")
+
+    out, calls, _ = _dispatch(monkeypatch, fv, pre_cua_net_probe=_probe)
+    assert calls["cua"] == 1
+
+
+def test_probe_not_invoked_on_vision_success(monkeypatch):
+    # Vision succeeded → no CUA, and the probe is irrelevant (not called).
+    fv = _FakeVisionModule("tier2", act_result=_final("declare_success", "done"))
+    probed = {"n": 0}
+
+    async def _probe():
+        probed["n"] += 1
+        return {"status": "x"}
+
+    out, calls, _ = _dispatch(monkeypatch, fv, pre_cua_net_probe=_probe)
+    assert calls["cua"] == 0 and probed["n"] == 0
+    assert out["status"] == "vision_success"
+
+
+def test_shadow_reraises_cua_origin_exception(monkeypatch):
+    # Review [5]: a CUA-origin exception (tagged) must propagate, NOT trigger a
+    # second CUA run.
+    class _ShadowReraises(_FakeVisionModule):
+        async def shadow_observe_then_cua(self, page, cua_fn, **kw):
+            self.shadow_calls += 1
+            try:
+                return await cua_fn()  # this raises
+            except Exception as e:
+                e._dg_cua_origin = True
+                raise
+
+    fv = _ShadowReraises("shadow")
+    monkeypatch.setattr(research, "_vision", fv)
+    monkeypatch.setattr(research, "_controls", _FakeControls())
+    calls = {"cua": 0}
+
+    async def _cua():
+        calls["cua"] += 1
+        raise RuntimeError("cua died")
+
+    import pytest
+    with pytest.raises(RuntimeError, match="cua died"):
+        asyncio.run(research._shadow_observed_cua(
+            object(), hotspot_id="7c", phase=2, platform="chatgpt",
+            current_step="s", context_hint="h", cua_coro_factory=_cua))
+    assert calls["cua"] == 1  # ran once, not twice
+
+
+def test_shadow_infra_failure_still_falls_back(monkeypatch):
+    # A genuine shadow-infra error (NOT cua-origin) still falls back to a
+    # direct CUA run — unchanged behavior.
+    class _ShadowBroken(_FakeVisionModule):
+        async def shadow_observe_then_cua(self, page, cua_fn, **kw):
+            raise RuntimeError("shadow infra broke")  # no _dg_cua_origin tag
+
+    fv = _ShadowBroken("shadow")
+    monkeypatch.setattr(research, "_vision", fv)
+    monkeypatch.setattr(research, "_controls", _FakeControls())
+    calls = {"cua": 0}
+
+    async def _cua():
+        calls["cua"] += 1
+        return {"status": "success", "text": "t"}
+
+    out = asyncio.run(research._shadow_observed_cua(
+        object(), hotspot_id="7c", phase=2, platform="chatgpt",
+        current_step="s", context_hint="h", cua_coro_factory=_cua))
+    assert calls["cua"] == 1 and out["text"] == "t"
+
+
+def test_act_pad_ms_zero_off_and_shadow(monkeypatch):
+    # Review [1][2][3]: _act_pad_ms is 0 unless the act tier is armed, so every
+    # padded outer timeout stays byte-identical in off/shadow.
+    monkeypatch.setattr(research, "_vision", _FakeVisionModule("off"))
+    assert research._act_pad_ms(150) == 0
+    assert research._act_pad_ms(120, 150) == 0
+    monkeypatch.setattr(research, "_vision", _FakeVisionModule("shadow"))
+    assert research._act_pad_ms(40, 40) == 0
+    monkeypatch.setattr(research, "_vision", None)
+    assert research._act_pad_ms(150) == 0
+
+
+def test_act_pad_ms_additive_when_armed(monkeypatch):
+    monkeypatch.setattr(research, "_vision", _FakeVisionModule("tier2"))
+    assert research._act_pad_ms(150) == 150000
+    assert research._act_pad_ms(120, 150) == 270000
+    assert research._act_pad_ms(40, 40) == 80000
+
+
 def test_vision_none_runs_cua(monkeypatch):
     monkeypatch.setattr(research, "_vision", None)
     calls = {"cua": 0}

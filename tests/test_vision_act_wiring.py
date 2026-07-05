@@ -286,9 +286,14 @@ def test_setup_fallback_wrapped_with_placeholder_hint():
     assert "placeholder" in blk.lower()
 
 
-def test_validate_setup_wrapped_confirmed_contract():
+def test_validate_setup_wrapped_no_success_text():
+    # Review [markers]: validate-setup must NOT pass success_text — 'verified' is
+    # a confirmation marker gating #744/#709, so stamping it onto any Vision
+    # declare_success could flip a hedged claim into a false confirmation. A
+    # Vision success flows through unstamped: reason containing 'verified'/'fixed'
+    # → confirmed; otherwise the safe ambiguous (True, False).
     (blk,) = _block_for(_src(research.validate_setup_with_cua), "validate-setup")
-    assert 'success_text="verified"' in blk  # Vision success → (True, True) confirmed
+    assert "success_text=" not in blk
     assert "mission_prompt=" in blk
 
 

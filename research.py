@@ -11035,7 +11035,7 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
                     expected_outcome="a public claude.site/claude.ai URL is produced",
                     cua_coro_factory=_publish_share_cua,
                     mission_prompt=PROMPT_PUBLISH_CLAUDE,
-                    act_timeout_s=75.0)
+                    act_timeout_s=40.0)  # bounded; the outer 90s wait_for is act-padded to fit CUA
                 text = ((result or {}).get("text") or "")
                 m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
                 if m:
@@ -12233,7 +12233,10 @@ _HOTSPOT_VISION_HINTS = {
             "READ ONLY — do not click anything. Look at the bottom of the chat / the research "
             "card: a Stop button, spinner, or 'Researching…' means STILL GENERATING (say so, it "
             "overrides everything). Only 'response complete' when there is NO stop button and a "
-            "finished response is visible. Never click the Stop button."
+            "finished response is visible. Never click the Stop button. IMPORTANT: state your "
+            "verdict using the LITERAL phrase 'still generating' or 'response complete' in your "
+            "answer (not only a CONCLUSION: line) — the caller parses that exact wording; when in "
+            "doubt say 'still generating'."
         ),
         "success_signals": ["a Stop button (→ generating)", "no stop button + a finished final paragraph (→ complete)"],
     },
@@ -12281,11 +12284,35 @@ def _attempts_for_hotspot(hotspot_id: str, platform: str) -> int:
     return max(1, esc.attempts.get("cua", 0))
 
 
+def _act_tier_armed() -> bool:
+    """True only when the Vision ACT tier is armed (DG_VISION_TIER=act/tier2).
+    Off/shadow → False, so every act-mode budget adjustment below evaluates to
+    a no-op and those paths stay byte-identical to the pre-Vision pipeline."""
+    if _vision is None:
+        return False
+    try:
+        return _vision.is_vision_enabled() == "tier2"
+    except Exception:
+        return False
+
+
+def _act_pad_ms(*budgets_s) -> int:
+    """Extra milliseconds to add to a FIXED outer timeout (a clipboard-hijack
+    cap, a caller's asyncio.wait_for) that now ALSO contains one or more Vision
+    act legs in front of the CUA leg. The act legs are ADDITIVE time — the CUA
+    safety net must keep its full original budget — so we grow the outer cap by
+    the act budget when the act tier is armed, and by 0 otherwise (off/shadow
+    byte-identical). Pass the act_timeout_s value(s) of the act leg(s) nested
+    inside that outer cap."""
+    return int(sum(budgets_s) * 1000) if _act_tier_armed() else 0
+
+
 async def _shadow_observed_cua(
     page, *, hotspot_id, phase, platform, current_step,
     context_hint, cua_coro_factory, expected_outcome="",
     mission_prompt="", success_text="", high_stakes=False,
     read_only=False, act_timeout_s=90.0, act_max_steps=0,
+    pre_cua_net_probe=None,
 ):
     """The Vision↔CUA dispatch point for every hotspot (name kept for
     grep-stability across logs/memory even though it now covers more than
@@ -12320,6 +12347,12 @@ async def _shadow_observed_cua(
       to CUA unexecuted.
     - act_timeout_s / act_max_steps: wall-clock + step bounds; on timeout the
       act attempt is abandoned and CUA runs.
+    - pre_cua_net_probe: an async no-arg callable run BEFORE the CUA safety net
+      fires (act mode only, after a non-success Vision attempt). If it returns
+      a non-None result, that result is returned and the CUA leg is SKIPPED.
+      For non-idempotent hotspots (audio-generate, #778) where a partial Vision
+      attempt may have already mutated state (started generating) so re-running
+      the full CUA mission would double-act. Off/shadow never invoke it.
 
     Act success returns {"status": "vision_success", "text": ..., "vision_acted":
     True} — the agent_loop dict shape every caller already parses.
@@ -12386,6 +12419,20 @@ async def _shadow_observed_cua(
         if _final is not None:
             log(f"[act:{hotspot_id}] Vision → {getattr(_final, 'action', '?')} "
                 f"({(getattr(_final, 'reason', '') or '')[:120]}) — CUA safety net takes over")
+        # Before the CUA net: a site-specific probe may veto it (a partial Vision
+        # attempt at a non-idempotent hotspot may have already mutated state, so
+        # re-running the full CUA mission would double-act — audio-generate #778).
+        if _final is not None and pre_cua_net_probe is not None:
+            try:
+                _veto = await pre_cua_net_probe()
+            except Exception as _pe:
+                log(f"[act:{hotspot_id}] pre-CUA-net probe errored ({_pe}) — "
+                    f"proceeding to CUA net", "WARN")
+                _veto = None
+            if _veto is not None:
+                log(f"[act:{hotspot_id}] pre-CUA-net probe vetoed the safety net "
+                    f"(state already advanced) — skipping CUA")
+                return _veto
         return await cua_coro_factory()
 
     # ── SHADOW: observe-only, CUA acts ──
@@ -12397,6 +12444,12 @@ async def _shadow_observed_cua(
             run_id=os.environ.get("DG_RUN_ID"),
         )
     except Exception as _se:
+        # A CUA-origin exception (tagged by shadow_observe_then_cua) must
+        # propagate to the call site's own handler EXACTLY as in off mode —
+        # NOT be swallowed and re-run (which double-ran the CUA, #5). Only a
+        # genuine shadow-infrastructure failure falls through to a direct CUA.
+        if getattr(_se, "_dg_cua_origin", False):
+            raise
         log(f"[shadow:{hotspot_id}] shadow path failed, falling back to direct CUA: {_se}",
             "WARN")
         return await cua_coro_factory()
@@ -19979,7 +20032,14 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                 link_res = await asyncio.wait_for(
                     share_extractor(browser, cua_client=cua_client,
                                     label=f"{name} public share", verbose=verbose),
-                    timeout=90.0,
+                    # #839: the Claude/Gemini extractor now runs Vision act legs
+                    # (publish_open ≤40 + the in-function fallback ≤40) IN FRONT
+                    # of its CUA share/publish legs, inside this fixed window. Pad
+                    # the cap by the additive act budget so the CUA safety net
+                    # keeps its full off-mode 90s share (else a slow Vision leg
+                    # ate the whole budget → no CUA publish AND inner_cua_attempted
+                    # wrongly suppressed Step 4b). Off/shadow: pad 0 → 90.0 exact.
+                    timeout=90.0 + _act_pad_ms(40, 40) / 1000.0,
                 )
                 _elapsed_share = time.time() - _share_t0
                 # Validate against the same rules extract_with_retry uses, so
@@ -23758,7 +23818,12 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     # the copy event handler, so raw Ctrl+C captures selected text even
     # when no page-side setData fires. Iframe-aware install covers the
     # DR canvas sandbox iframe. Helper timeout_ms = 200000 sits ABOVE
-    # the inner asyncio.wait_for(180.0) so the inner cap fires first.
+    # the inner asyncio.wait_for(180.0) so the inner CUA cap fires first.
+    # When the #839 act tier is armed, the trigger ALSO runs a Vision act leg
+    # (act_timeout_s=150) BEFORE the CUA leg inside this same cap, so the cap is
+    # padded by _act_pad_ms(150) — else the outer wait_for could cancel the
+    # trigger mid-CUA-copy and starve the safety net to 0 chars. Off/shadow: pad
+    # 0 → byte-identical 200000ms.
     # Gated on browser+cua (P2 only). P1 never reaches here — it calls with
     # browser=None/cua_client=None, so Tier 3 is off for the brief.
     if browser and cua_client:
@@ -23792,7 +23857,7 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
         try:
             md = await _run_with_clipboard_hijack(
                 page, label, _cgpt_t3_trigger,
-                timeout_ms=200000, min_chars=500)
+                timeout_ms=200000 + _act_pad_ms(150), min_chars=500)
         except Exception as _e:
             log(f"[{label}] T3 clipboard hijack raised: {_e}", "WARN")
             md = ""
@@ -24467,9 +24532,13 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         # No OS clipboard read → Wayland-safe. Trigger chains the
         # existing two CUA prompts: navigate to LAST artifact (if
         # multiple), then Ctrl+A/C inside the open panel. No retry
-        # loop, no shadow-wrap, no _IS_WAYLAND gate — helper owns
-        # retry policy. Helper timeout_ms set ABOVE the inner CUA
-        # wait_for budget so the inner caps fire first.
+        # loop, no _IS_WAYLAND gate — helper owns retry policy. Helper
+        # timeout_ms sits ABOVE the inner CUA wait_for budgets so the inner
+        # caps fire first. When the #839 act tier is armed, the trigger ALSO
+        # runs a Vision act leg BEFORE each CUA leg (nav act 120 + copy act
+        # 150) inside this same cap, so it is padded by _act_pad_ms(120, 150)
+        # — else the outer wait_for could cancel the trigger before/during the
+        # copy CUA and starve the safety net to 0 chars. Off/shadow: pad 0.
         if browser and cua_client and not chat_mode:
             async def _claude_t3_trigger():
                 await browser.switch_to_page(page)
@@ -24542,7 +24611,7 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             try:
                 md_hj = await _run_with_clipboard_hijack(
                     page, label, _claude_t3_trigger,
-                    timeout_ms=400000, min_chars=500,
+                    timeout_ms=400000 + _act_pad_ms(120, 150), min_chars=500,
                 )
             except Exception as _te:
                 log(f"[{label}] T3 clipboard-hijack raised: {_te}", "WARN")
@@ -24710,7 +24779,11 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
                          "OPEN artifact via its Publish/Share control and read the public URL",
             expected_outcome="a public claude.site/artifacts/... URL is produced",
             cua_coro_factory=_publish_cua,
-            mission_prompt=PROMPT_PUBLISH_CLAUDE_ARTIFACT)
+            mission_prompt=PROMPT_PUBLISH_CLAUDE_ARTIFACT,
+            # bounded so the act leg stays additive under callers' fixed windows
+            # (extract_share_link_claude's 90s wait_for is act-padded to match);
+            # this publish CUA is itself uncapped, so a small act cap protects it.
+            act_timeout_s=40.0)
         text = (result or {}).get("text", "")
         m = re.search(r'https://claude\.site/artifacts/[a-f0-9-]+', text)
         if not m:
@@ -26699,12 +26772,16 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
                 model=CUA_MODEL, max_iterations=6, verbose=verbose)
 
         # #839 act tier: the validator can FIX (not read-only), so Vision may
-        # act. success_text='verified' maps a Vision success onto the same
-        # (True, True) confirmed contract parsed below; escalate/failure/low-
-        # confidence fall to CUA, which owns the authoritative verdict. #709:
-        # the Gemini user_prompt already demands the composer-placeholder signal
-        # ('What do you want to research?' vs 'Ask Gemini'), passed verbatim as
-        # the mission — a merely-visible chip must never read as confirmed.
+        # act. NO success_text here (review [markers]): "verified" is a
+        # CONFIRMATION marker that gates the #744/#709 chat-mode decision, so
+        # mechanically stamping it onto ANY Vision declare_success would flip a
+        # hedged/soft Vision claim into a hard "DR confirmed on". Instead the
+        # Vision reason flows through UNSTAMPED: the mission tells Vision to SAY
+        # 'verified'/'fixed' on a real success (→ confirmed below), and a
+        # success whose reason lacks those words degrades to the SAFE ambiguous
+        # (True, False) — never a false confirmation. #709: the Gemini
+        # user_prompt's composer-placeholder demand ('What do you want to
+        # research?' vs 'Ask Gemini') rides in verbatim as the mission.
         result = await _shadow_observed_cua(
             page, hotspot_id="validate-setup", phase=2, platform=platform.lower(),
             current_step="validate_deep_research_active",
@@ -26712,8 +26789,7 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
                          f"{label}, fix if not, do NOT type. {user_prompt}",
             expected_outcome="Deep Research is confirmed active (say 'verified' or 'fixed')",
             cua_coro_factory=_validate_setup_cua,
-            mission_prompt=f"{sys_prompt}\n\nTASK: {user_prompt}",
-            success_text="verified") or {}
+            mission_prompt=f"{sys_prompt}\n\nTASK: {user_prompt}") or {}
         text = (result.get("text") or "").lower()
         if "verified" in text or "fixed" in text:
             log(f"[{label}] CUA validation: {text[:120]}")
@@ -30089,6 +30165,32 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             # Generate") is passed verbatim, and its 'abort:' contract is parsed
             # from the returned text below in EVERY mode. A Vision success returns
             # the same {text} shape; CUA is the safety net on anything else.
+            #
+            # #839 review [4] DOUBLE-GENERATE GUARD: this is the one non-idempotent
+            # P3 act site. If a Vision act attempt clicked Generate but ended
+            # without declare_success (timeout/step-cap/escalate), re-running the
+            # FULL CUA mission would click Generate a SECOND time — the exact
+            # undeletable-duplicate #778 forbids (and CUA can't undo). So before
+            # the CUA net fires, re-probe: if generation is already in flight OR a
+            # card appeared since the pre-flight count, SKIP CUA and return a
+            # synthetic "generating" result (no 'abort:') so the caller falls
+            # straight into the authoritative verify + poll loop. Off/shadow never
+            # invoke the probe.
+            async def _audio_gen_net_probe():
+                try:
+                    if await _check_audio_generating(browser.page):
+                        log("[Phase3] act-net guard: audio already generating after the "
+                            "Vision attempt — skipping the CUA re-generate to avoid a "
+                            "duplicate (#778); handing to the poll loop")
+                        return {"status": "vision_partial", "text": "generating"}
+                    if await _count_nlm_audio_cards(browser.page) > existing_cards:
+                        log("[Phase3] act-net guard: a new audio card appeared after the "
+                            "Vision attempt — skipping the CUA re-generate (#778)")
+                        return {"status": "vision_partial", "text": "generating"}
+                except Exception as _pge:
+                    log(f"[Phase3] act-net guard probe errored ({_pge}) — allowing CUA net", "WARN")
+                return None
+
             _ag_result = await _shadow_observed_cua(
                 browser.page, hotspot_id="audio-generate", phase=3, platform="notebooklm",
                 current_step=("configure_generate_audio_panel_open" if _panel_opened
@@ -30099,7 +30201,8 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 expected_outcome="one audio overview starts generating with the requested format/length",
                 cua_coro_factory=_audio_generate_cua,
                 mission_prompt=f"{_prompt}\n\nTASK: {_task_str}",
-                act_timeout_s=180.0) or {}
+                act_timeout_s=180.0,
+                pre_cua_net_probe=_audio_gen_net_probe) or {}
         finally:
             await stop_narration_ticker(_stop, _task)
 
