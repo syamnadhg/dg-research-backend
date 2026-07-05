@@ -1,0 +1,127 @@
+"""Track-B acting path: source guards for the per-hotspot dispatcher wiring.
+
+Each wrapped CUA site must route through _shadow_observed_cua with its
+canonical hotspot id + the SAME mission prompt the CUA call uses, without
+disturbing the load-bearing invariants around it (clipboard hijack, #735
+publish flag, marker parsing). Source-inspection style follows
+tests/test_vision_engine.py."""
+from __future__ import annotations
+
+import inspect
+
+import research
+
+
+def _src(fn):
+    return inspect.getsource(fn)
+
+
+def _dispatch_blocks(src):
+    """The text of each _shadow_observed_cua(...) call in source order.
+    (Functions can also contain _observe_dom_success calls with the same
+    hotspot ids — anchoring on the dispatcher call keeps the guards honest.)"""
+    blocks, start = [], 0
+    while True:
+        i = src.find("_shadow_observed_cua(", start)
+        if i < 0:
+            return blocks
+        blocks.append(src[i:i + 1200])
+        start = i + 1
+
+
+def _block_for(src, hotspot_id):
+    hits = [b for b in _dispatch_blocks(src) if f'hotspot_id="{hotspot_id}"' in b]
+    assert hits, f"no _shadow_observed_cua block with hotspot_id={hotspot_id}"
+    return hits
+
+
+# ── extraction ladder (the #777-dropped trio, re-wrapped) ────────────────────
+
+def test_2c_t3_routed_through_dispatcher():
+    src = _src(research.extract_chatgpt_response)
+    i = src.index('hotspot_id="2c"')
+    assert "_shadow_observed_cua(" in src[:i]
+    assert "mission_prompt=PROMPT_COPY_ARTIFACT_CHATGPT" in src
+    # The hijack still owns the trigger — capture stays the success truth.
+    assert "_run_with_clipboard_hijack(" in src
+    assert "_cgpt_t3_trigger" in src
+    assert "_is_sources_not_document" in src
+
+
+def test_2d_nav_all_three_sites_wrapped():
+    src = _src(research.extract_claude_response)
+    assert src.count('hotspot_id="2d-nav"') == 3
+    assert src.count("mission_prompt=PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT") == 3
+
+
+def test_2d_copy_wrapped_inside_hijack_trigger():
+    src = _src(research.extract_claude_response)
+    assert src.count('hotspot_id="2d-copy"') == 1
+    assert "mission_prompt=PROMPT_COPY_ARTIFACT_CLAUDE" in src
+    # Trigger ordering: nav site C then the copy, both inside _claude_t3_trigger,
+    # and the hijack helper still drives the trigger.
+    t3 = src.index("_claude_t3_trigger")
+    assert src.index('hotspot_id="2d-nav"', t3) < src.index('hotspot_id="2d-copy"', t3)
+    assert "_run_with_clipboard_hijack(" in src
+    # The post-copy selection clear (2026-05-24 highlight-bleed fix) survives.
+    assert "removeAllRanges" in src
+
+
+def test_publish_claude_both_sites_wrapped():
+    src_a = _src(research.publish_open_claude_artifact)
+    assert 'hotspot_id="publish-claude"' in src_a
+    assert "mission_prompt=PROMPT_PUBLISH_CLAUDE_ARTIFACT" in src_a
+    # #735 flag is still set BEFORE the CUA/act pass.
+    assert src_a.index("_claude_publish_cua_used = True") < src_a.index(
+        'hotspot_id="publish-claude"')
+
+    src_b = _src(research.extract_share_link_claude)
+    assert 'hotspot_id="publish-claude"' in src_b
+    assert "mission_prompt=PROMPT_PUBLISH_CLAUDE" in src_b
+
+
+# ── the original five sites gain mission parity ──────────────────────────────
+
+def test_panel_open_sites_carry_mission_and_marker():
+    (blk_p1,) = _block_for(_src(research.poll_until_done), "7c-p1")
+    assert "mission_prompt=PROMPT_OPEN_CHATGPT_SOURCE_PANEL" in blk_p1
+    assert 'success_text="panel: open"' in blk_p1
+
+    src_rr = _src(research.poll_all_agents_round_robin)
+    (blk_7c,) = _block_for(src_rr, "7c")
+    assert "mission_prompt=PROMPT_OPEN_CHATGPT_SOURCE_PANEL" in blk_7c
+    assert 'success_text="panel: open"' in blk_7c
+    (blk_7d,) = _block_for(src_rr, "7d")
+    assert "mission_prompt=PROMPT_OPEN_CLAUDE_SOURCE_ARTIFACT" in blk_7d
+    assert 'success_text="panel: open"' in blk_7d
+
+
+def test_p2_share_sites_carry_missions():
+    (blk_c,) = _block_for(_src(research.extract_share_link_chatgpt), "p2-share")
+    assert "mission_prompt=" in blk_c
+    assert "read it from the clipboard" in blk_c
+
+    (blk_e,) = _block_for(_src(research.extract_and_record_agent), "p2-share")
+    assert "cua_share_prompt" in blk_e
+
+
+# ── hints for the new hotspots ───────────────────────────────────────────────
+
+def test_new_extraction_hotspots_have_hints():
+    for hs in ("2c", "2d-nav", "2d-copy", "publish-claude"):
+        hint = research._HOTSPOT_VISION_HINTS.get(hs)
+        assert hint, f"missing _HOTSPOT_VISION_HINTS entry for {hs}"
+        assert hint.get("context_hint") and hint.get("expected_outcome")
+        assert hint.get("success_signals")
+
+
+def test_2d_nav_hint_targets_last_artifact_only():
+    hint = research._HOTSPOT_VISION_HINTS["2d-nav"]["context_hint"]
+    assert "LAST" in hint
+    assert "NEVER the first" in hint  # the #777 wrong-artifact lesson
+
+
+def test_2c_hint_bans_source_panel_and_preamble():
+    hint = research._HOTSPOT_VISION_HINTS["2c"]["context_hint"]
+    assert "not the chat" in hint.lower() or "report body only" in hint.lower()
+    assert "side panel" in hint.lower()

@@ -10498,7 +10498,14 @@ async def extract_share_link_chatgpt(browser, cua_client, label="Research Brief"
                     current_step="open_share_menu_and_create_link",
                     context_hint="P2 ChatGPT share-link extraction (DR iframe path)",
                     expected_outcome="public-share URL on clipboard",
-                    cua_coro_factory=_chatgpt_share_cua)
+                    cua_coro_factory=_chatgpt_share_cua,
+                    mission_prompt=(
+                        "Share this ChatGPT conversation by clicking the Share button. "
+                        "Click the Share button at the top of this conversation. If a modal "
+                        "appears, click 'Create link' or 'Copy link'. After clicking Copy "
+                        "link, just STOP — don't try to extract the URL yourself, the code "
+                        "will read it from the clipboard."),
+                    act_timeout_s=60.0)
             except asyncio.TimeoutError:
                 log(f"[{label}] CUA share-link extraction timed out (120s) — using current URL as fallback", "WARN")
                 result = {"text": ""}
@@ -11004,18 +11011,32 @@ async def extract_share_link_claude(browser, cua_client, label="Claude Deep Rese
             last_stage = "cua_fallback"
             cua_attempted = True
             try:
-                result = await asyncio.wait_for(
-                    agent_loop(cua_client, browser,
-                        PROMPT_PUBLISH_CLAUDE,
-                        "Publish the research ARTIFACT in the right panel (not the conversation). "
-                        "If two artifacts exist, open the SECOND/bottom one first. "
-                        "Click the Publish/Share icon on the artifact. "
-                        "Get the published URL (claude.site/artifacts/... or claude.ai/...). "
-                        "Tell me the URL.",
-                        model=CUA_MODEL, max_iterations=12, verbose=verbose),
-                    timeout=90.0,
-                )
-                text = (result.get("text") or "")
+                async def _publish_share_cua():
+                    return await asyncio.wait_for(
+                        agent_loop(cua_client, browser,
+                            PROMPT_PUBLISH_CLAUDE,
+                            "Publish the research ARTIFACT in the right panel (not the conversation). "
+                            "If two artifacts exist, open the SECOND/bottom one first. "
+                            "Click the Publish/Share icon on the artifact. "
+                            "Get the published URL (claude.site/artifacts/... or claude.ai/...). "
+                            "Tell me the URL.",
+                            model=CUA_MODEL, max_iterations=12, verbose=verbose),
+                        timeout=90.0,
+                    )
+
+                # #839 act tier: the URL must land in the returned text (the
+                # mission's "Tell me the URL" → declare_success reason) or on
+                # the clipboard — both read below, same as the CUA contract.
+                result = await _shadow_observed_cua(
+                    page, hotspot_id="publish-claude", phase=2, platform="claude",
+                    current_step="publish_share_fallback",
+                    context_hint="DOM publish didn't yield a claude.* URL — publish the "
+                                 "artifact (SECOND/bottom if two) and read the public URL",
+                    expected_outcome="a public claude.site/claude.ai URL is produced",
+                    cua_coro_factory=_publish_share_cua,
+                    mission_prompt=PROMPT_PUBLISH_CLAUDE,
+                    act_timeout_s=75.0)
+                text = ((result or {}).get("text") or "")
                 m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
                 if m:
                     url = m.group(0)
@@ -12103,6 +12124,50 @@ _HOTSPOT_VISION_HINTS = {
         ),
         "success_signals": ["a Share dialog with a 'Notebook access' dropdown",
                             "an 'Anyone with the link' option", "a Copy link button + a notebooklm.google.com URL"],
+    },
+    # P2 extraction-ladder hotspots (#839 act-tier re-wrap of the #777-dropped
+    # trio + the publish fallback). Hints agree with PROMPT_COPY_ARTIFACT_CHATGPT /
+    # PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT / PROMPT_COPY_ARTIFACT_CLAUDE /
+    # PROMPT_PUBLISH_CLAUDE_ARTIFACT — the act loop also receives those full
+    # missions verbatim via mission_prompt.
+    "2c": {
+        "expected_outcome": "the FULL research report text is selected and copied to the clipboard",
+        "context_hint": (
+            "Copy ChatGPT's final research REPORT DOCUMENT (the long report canvas/document, "
+            "not the chat). Open the report document if not already open, click inside its "
+            "body, select ALL of it (Ctrl+A) and copy (Ctrl+C). Do NOT copy the sources/"
+            "activity side panel and do NOT copy the short chat preamble — the report body only."
+        ),
+        "success_signals": ["the report text visibly selected/highlighted", "a copy action inside the open report document"],
+    },
+    "2d-nav": {
+        "expected_outcome": "the LAST (bottom) artifact — the final report — opens in Claude's right panel",
+        "context_hint": (
+            "Open Claude's FINAL report artifact: the LAST (bottom-most) artifact card in the "
+            "conversation. NEVER the first/earlier cards (those are research-tracking "
+            "checklists) and NEVER a filename attachment card. If an earlier artifact panel "
+            "is already open on the right, it must end up showing the FINAL report instead."
+        ),
+        "success_signals": ["the right panel shows the long final report (prose/markdown)",
+                            "not a checklist/tracking artifact"],
+    },
+    "2d-copy": {
+        "expected_outcome": "the full text of the OPEN artifact panel is copied to the clipboard",
+        "context_hint": (
+            "Copy the artifact currently OPEN in Claude's right panel: click inside the panel "
+            "body, select all (Ctrl+A) and copy (Ctrl+C). Only the right artifact panel — "
+            "never the chat column on the left."
+        ),
+        "success_signals": ["the artifact text visibly selected inside the right panel", "a copy performed there"],
+    },
+    "publish-claude": {
+        "expected_outcome": "the open artifact is published and a public claude.site URL is produced",
+        "context_hint": (
+            "Publish the artifact OPEN in Claude's right panel: its Publish/Share control "
+            "(top of the panel), confirm publishing in the dialog, then read/copy the public "
+            "URL (claude.site/artifacts/...). Report the EXACT URL."
+        ),
+        "success_signals": ["a Publish/Share dialog on the artifact", "a claude.site/artifacts/... URL visible or copied"],
     },
 }
 
@@ -18764,7 +18829,9 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                 current_step="open_activity_panel_p1",
                                 context_hint=f"P1 brief poll DOM 2-miss at elapsed={elapsed_sec}s",
                                 expected_outcome="side panel mounts on right with step list",
-                                cua_coro_factory=_cgpt_p1_cua)
+                                cua_coro_factory=_cgpt_p1_cua,
+                                mission_prompt=PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
+                                success_text="panel: open")
                             out = ((cua_res or {}).get("text") or "").lower()
                             if "panel: open" in out or "panel: already_open" in out:
                                 _panel_open_done = True
@@ -19826,7 +19893,10 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                         current_step="open_share_menu_and_create_link",
                         context_hint=f"P2 inline share fallback for {name}",
                         expected_outcome="public-share URL on clipboard or visible in modal",
-                        cua_coro_factory=_p2_share_cua)
+                        cua_coro_factory=_p2_share_cua,
+                        mission_prompt=(f"{cua_share_prompt}\n\nTASK: Make this {name} "
+                                        "conversation shareable and get the link."),
+                        act_timeout_s=60.0)
                     # After CUA acted, recover the URL from clipboard / current URL.
                     cand = ""
                     try:
@@ -21160,7 +21230,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             current_step="open_artifact_1",
                             context_hint=f"DOM 2-miss at cycle={p.get('poll_cycles')}",
                             expected_outcome="right panel mounts artifact-1 checklist",
-                            cua_coro_factory=_claude_p2_cua)
+                            cua_coro_factory=_claude_p2_cua,
+                            mission_prompt=PROMPT_OPEN_CLAUDE_SOURCE_ARTIFACT,
+                            success_text="panel: open")
                         out = ((cua_res or {}).get("text") or "").lower()
                         if "panel: open" in out or "panel: already_open" in out:
                             p["artifact_panel_open"] = True
@@ -21295,7 +21367,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             current_step="open_activity_panel",
                             context_hint=f"DOM 2-miss at cycle={p.get('poll_cycles')}",
                             expected_outcome="side panel mounts on right with step list",
-                            cua_coro_factory=_cgpt_p2_cua)
+                            cua_coro_factory=_cgpt_p2_cua,
+                            mission_prompt=PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
+                            success_text="panel: open")
                         out = ((cua_res or {}).get("text") or "").lower()
                         if "panel: open" in out or "panel: already_open" in out:
                             p["chatgpt_activity_panel_open"] = True
@@ -23483,13 +23557,29 @@ async def extract_chatgpt_response(page, browser=None, cua_client=None, label="C
     if browser and cua_client:
         async def _cgpt_t3_trigger():
             await browser.switch_to_page(page)
-            await asyncio.wait_for(
-                agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CHATGPT,
-                    "Open the research report document and copy its full "
-                    "content to clipboard.",
-                    model=CUA_MODEL, max_iterations=12,
-                    verbose=verbose, target_page=page),
-                timeout=180.0)
+
+            async def _cgpt_t3_cua():
+                return await asyncio.wait_for(
+                    agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CHATGPT,
+                        "Open the research report document and copy its full "
+                        "content to clipboard.",
+                        model=CUA_MODEL, max_iterations=12,
+                        verbose=verbose, target_page=page),
+                    timeout=180.0)
+
+            # #839 act tier: Vision drives the same copy mission under the SAME
+            # clipboard hijack (hooks are already installed around this trigger);
+            # its Ctrl+A/Ctrl+C or Copy-button click feeds the identical capture.
+            # Success truth stays the hijack text (>=500 chars + wrong-artifact
+            # guard below) — the returned text is ignored either way.
+            await _shadow_observed_cua(
+                page, hotspot_id="2c", phase=2, platform="chatgpt",
+                current_step="copy_final_report_t3",
+                context_hint="T3 final-report copy — T1 .md download and T2 HTML->MD both missed",
+                expected_outcome="the full research report text lands on the clipboard",
+                cua_coro_factory=_cgpt_t3_cua,
+                mission_prompt=PROMPT_COPY_ARTIFACT_CHATGPT,
+                act_timeout_s=150.0)
 
         log(f"[{label}] CUA: Tier 3 copy with clipboard hijack")
         try:
@@ -23978,15 +24068,26 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
         if not clicked and browser and cua_client and not chat_mode:
             log(f"[{label}] DOM pre-click missed — CUA fallback to open last artifact", "WARN")
             try:
-                await asyncio.wait_for(
-                    agent_loop(cua_client, browser,
-                        PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
-                        f"There are {artifact_count} artifact(s) in this "
-                        f"conversation. Open the LAST (bottom) artifact card "
-                        f"— that's the final research report.",
-                        model=CUA_MODEL, max_iterations=8,
-                        verbose=verbose, target_page=page),
-                    timeout=120.0)
+                async def _nav_a_cua():
+                    return await asyncio.wait_for(
+                        agent_loop(cua_client, browser,
+                            PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                            f"There are {artifact_count} artifact(s) in this "
+                            f"conversation. Open the LAST (bottom) artifact card "
+                            f"— that's the final research report.",
+                            model=CUA_MODEL, max_iterations=8,
+                            verbose=verbose, target_page=page),
+                        timeout=120.0)
+
+                await _shadow_observed_cua(
+                    page, hotspot_id="2d-nav", phase=2, platform="claude",
+                    current_step="open_final_artifact_preclick_missed",
+                    context_hint=f"DOM pre-click missed; {artifact_count} artifact(s) present — "
+                                 "open the LAST (bottom) card, never the first/tracking one",
+                    expected_outcome="the final report artifact panel opens on the right",
+                    cua_coro_factory=_nav_a_cua,
+                    mission_prompt=PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                    act_timeout_s=90.0)
                 clicked = True
                 await asyncio.sleep(1.5)
             except asyncio.TimeoutError:
@@ -24025,15 +24126,27 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
             log(f"[{label}] Artifact panel content not mounted after click — CUA "
                 f"fallback to open the final report before running extraction tiers", "WARN")
             try:
-                await asyncio.wait_for(
-                    agent_loop(cua_client, browser,
-                        PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
-                        f"There are {artifact_count} artifact(s) in this conversation. "
-                        f"Open the LAST (bottom) artifact card — that's the final "
-                        f"research report — so its panel is visible on the right.",
-                        model=CUA_MODEL, max_iterations=8,
-                        verbose=verbose, target_page=page),
-                    timeout=120.0)
+                async def _nav_b_cua():
+                    return await asyncio.wait_for(
+                        agent_loop(cua_client, browser,
+                            PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                            f"There are {artifact_count} artifact(s) in this conversation. "
+                            f"Open the LAST (bottom) artifact card — that's the final "
+                            f"research report — so its panel is visible on the right.",
+                            model=CUA_MODEL, max_iterations=8,
+                            verbose=verbose, target_page=page),
+                        timeout=120.0)
+
+                await _shadow_observed_cua(
+                    page, hotspot_id="2d-nav", phase=2, platform="claude",
+                    current_step="open_final_artifact_panel_not_mounted",
+                    context_hint=f"panel content never mounted (a pre-click may have false-succeeded); "
+                                 f"{artifact_count} artifact(s) — open the LAST (bottom) card so its "
+                                 "panel is visible on the right",
+                    expected_outcome="the final report artifact panel is visibly mounted on the right",
+                    cua_coro_factory=_nav_b_cua,
+                    mission_prompt=PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                    act_timeout_s=90.0)
                 await asyncio.sleep(1.5)
                 # Re-confirm the panel content mounted (best-effort; tiers still try regardless).
                 try:
@@ -24155,27 +24268,53 @@ async def extract_claude_response(page, browser=None, cua_client=None, label="Cl
                 await browser.switch_to_page(page)
                 if artifact_count >= 2:
                     try:
-                        await asyncio.wait_for(
-                            agent_loop(cua_client, browser,
-                                PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
-                                f"There are {artifact_count} artifacts in this "
-                                f"conversation. Open the LAST (bottom) artifact — "
-                                f"that's the final research report.",
-                                model=CUA_MODEL, max_iterations=8,
-                                verbose=verbose, target_page=page),
-                            timeout=180.0)
+                        async def _nav_c_cua():
+                            return await asyncio.wait_for(
+                                agent_loop(cua_client, browser,
+                                    PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                                    f"There are {artifact_count} artifacts in this "
+                                    f"conversation. Open the LAST (bottom) artifact — "
+                                    f"that's the final research report.",
+                                    model=CUA_MODEL, max_iterations=8,
+                                    verbose=verbose, target_page=page),
+                                timeout=180.0)
+
+                        await _shadow_observed_cua(
+                            page, hotspot_id="2d-nav", phase=2, platform="claude",
+                            current_step="open_final_artifact_pre_t3_copy",
+                            context_hint=f"pre-copy navigate inside the T3 hijack trigger; "
+                                         f"{artifact_count} artifacts — open the LAST (bottom) one",
+                            expected_outcome="the final report artifact panel opens on the right",
+                            cua_coro_factory=_nav_c_cua,
+                            mission_prompt=PROMPT_NAVIGATE_CLAUDE_FINAL_ARTIFACT,
+                            act_timeout_s=120.0)
                         await asyncio.sleep(1)
                     except asyncio.TimeoutError:
                         log(f"[{label}] T3 CUA nav timed out after 180s", "WARN")
                     except Exception as _ne:
                         log(f"[{label}] T3 CUA nav raised: {_ne}", "WARN")
-                await asyncio.wait_for(
-                    agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
-                        "Copy the full content of the artifact currently open "
-                        "in the right panel to clipboard.",
-                        model=CUA_MODEL, max_iterations=12,
-                        verbose=verbose, target_page=page),
-                    timeout=180.0)
+
+                async def _claude_t3_copy_cua():
+                    return await asyncio.wait_for(
+                        agent_loop(cua_client, browser, PROMPT_COPY_ARTIFACT_CLAUDE,
+                            "Copy the full content of the artifact currently open "
+                            "in the right panel to clipboard.",
+                            model=CUA_MODEL, max_iterations=12,
+                            verbose=verbose, target_page=page),
+                        timeout=180.0)
+
+                # #839 act tier: same copy mission under the SAME clipboard hijack
+                # (hooks already installed around this trigger). The hijack capture
+                # (>=500 chars + wrong-artifact guard) stays the only success truth.
+                await _shadow_observed_cua(
+                    page, hotspot_id="2d-copy", phase=2, platform="claude",
+                    current_step="copy_final_artifact_t3",
+                    context_hint="T3 final-artifact copy — select all inside the OPEN right "
+                                 "panel and copy; never the chat column",
+                    expected_outcome="the full artifact text lands on the clipboard",
+                    cua_coro_factory=_claude_t3_copy_cua,
+                    mission_prompt=PROMPT_COPY_ARTIFACT_CLAUDE,
+                    act_timeout_s=150.0)
                 await asyncio.sleep(1)
                 # 2026-05-24: clear the selection the CUA's Ctrl+A
                 # left behind. Without this, the artifact text stays
@@ -24345,13 +24484,27 @@ async def publish_open_claude_artifact(page, browser, cua_client, verbose=False)
             browser._claude_publish_cua_used = True
         except Exception:
             pass
-        result = await agent_loop(cua_client, browser,
-            PROMPT_PUBLISH_CLAUDE_ARTIFACT,
-            "Publish the artifact that's currently open in the right panel. "
-            "Click the Publish/Share button, then confirm publishing. "
-            "Get the public URL (claude.site/artifacts/...). Tell me the EXACT URL.",
-            model=CUA_MODEL, max_iterations=10, verbose=verbose)
-        text = result.get("text", "")
+
+        async def _publish_cua():
+            return await agent_loop(cua_client, browser,
+                PROMPT_PUBLISH_CLAUDE_ARTIFACT,
+                "Publish the artifact that's currently open in the right panel. "
+                "Click the Publish/Share button, then confirm publishing. "
+                "Get the public URL (claude.site/artifacts/...). Tell me the EXACT URL.",
+                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+        # #839 act tier: on a Vision success the claude.site URL must land in
+        # the returned text (the mission says "Tell me the EXACT URL" → it goes
+        # into declare_success's reason) or on the clipboard — both read below.
+        result = await _shadow_observed_cua(
+            page, hotspot_id="publish-claude", phase=2, platform="claude",
+            current_step="publish_open_artifact",
+            context_hint="DOM publish attempt didn't yield a claude.* URL — publish the "
+                         "OPEN artifact via its Publish/Share control and read the public URL",
+            expected_outcome="a public claude.site/artifacts/... URL is produced",
+            cua_coro_factory=_publish_cua,
+            mission_prompt=PROMPT_PUBLISH_CLAUDE_ARTIFACT)
+        text = (result or {}).get("text", "")
         m = re.search(r'https://claude\.site/artifacts/[a-f0-9-]+', text)
         if not m:
             m = re.search(r'https://claude\.(?:site|ai)/[^\s]+', text)
