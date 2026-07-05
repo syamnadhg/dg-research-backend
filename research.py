@@ -12169,6 +12169,80 @@ _HOTSPOT_VISION_HINTS = {
         ),
         "success_signals": ["a Publish/Share dialog on the artifact", "a claude.site/artifacts/... URL visible or copied"],
     },
+    # P1 + P2-polling hotspots (#839 act-tier). The full canonical CUA mission
+    # is also passed to the act loop via mission_prompt at each site; these
+    # hints are the short target descriptor merged into flow_context.
+    "1a-select-pro": {
+        "expected_outcome": "ChatGPT Pro + Extended Thinking is the selected model",
+        "context_hint": (
+            "Open ChatGPT's model picker (top-left model name) and select the Pro model "
+            "WITH Extended Thinking. If the correct model is already active, do NOT re-click "
+            "it. Close the picker popover after. If there is no Pro option, say so — never guess."
+        ),
+        "success_signals": ["the model name shows Pro", "an Extended Thinking / thinking indicator"],
+    },
+    "1a-attach-pdf": {
+        "expected_outcome": "the brief PDF is attached to the ChatGPT composer",
+        "context_hint": (
+            "Click ChatGPT's attach control (the + / paperclip near the composer) to open the "
+            "file picker — the OS dialog auto-selects the file, so do NOT try to type a path or "
+            "drive the native dialog. Just click the attach affordance."
+        ),
+        "success_signals": ["a file chip/thumbnail in the composer", "the attach menu open"],
+    },
+    "1a-submit": {
+        "expected_outcome": "the prompt in the composer is submitted and ChatGPT starts generating",
+        "context_hint": (
+            "The prompt text is already in the composer. Click the Send button to submit it. "
+            "Do NOT retype the prompt — only send what is there."
+        ),
+        "success_signals": ["a Stop button replaces Send", "a response begins streaming"],
+    },
+    "scrape-artifact": {
+        "expected_outcome": "the first tracking artifact's content (URLs/steps/sections) is read out",
+        "context_hint": (
+            "Open Claude's FIRST artifact card (research/sources tracking, NOT the final "
+            "report) and READ its content — list the URLs, steps, sections and sources you "
+            "see — then close the artifact panel."
+        ),
+        "success_signals": ["a checklist/tracking artifact open in the right panel", "readable URL/step rows"],
+    },
+    "poll-diagnose": {
+        "expected_outcome": "an honest verdict on whether the response is still generating",
+        "context_hint": (
+            "READ ONLY — do not click anything. Look at the bottom of the chat / the research "
+            "card: a Stop button, spinner, or 'Researching…' means STILL GENERATING (say so, it "
+            "overrides everything). Only 'response complete' when there is NO stop button and a "
+            "finished response is visible. Never click the Stop button."
+        ),
+        "success_signals": ["a Stop button (→ generating)", "no stop button + a finished final paragraph (→ complete)"],
+    },
+    "poll-fix": {
+        "expected_outcome": "the button blocking generation is clicked so research starts",
+        "context_hint": (
+            "Something is blocking the research from starting — click the button that unblocks "
+            "it (Start research / a confirm dialog / Send). CRITICAL: NEVER type or paste any "
+            "text; click only."
+        ),
+        "success_signals": ["a Start/confirm/Send button clicked", "generation begins"],
+    },
+    "gemini-start": {
+        "expected_outcome": "Gemini's deep-research plan starts or is re-drafted",
+        "context_hint": (
+            "If a blue 'Start research' button is visible, click it. Otherwise the plan failed "
+            "(an error like 'something went wrong') — click the icon-only Retry / Regenerate "
+            "control to re-draft the plan. Do NOT type anything."
+        ),
+        "success_signals": ["a 'Start research' button clicked", "the plan re-drafting after a Retry"],
+    },
+    "click-send": {
+        "expected_outcome": "the typed message is sent",
+        "context_hint": (
+            "The message is already typed in the composer — find and click the Send button/icon "
+            "(Playwright couldn't locate it). Do NOT retype the message."
+        ),
+        "success_signals": ["a Stop button replaces Send", "the message posts and a response starts"],
+    },
 }
 
 
@@ -16715,12 +16789,28 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
     # Layer 2: CUA fallback if DOM yielded nothing
     if not content and not walker.get("source_urls") and browser and cua_client:
         try:
-            result = await agent_loop(cua_client, browser,
-                PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING,
-                "Open the first artifact in the conversation and read its content. "
-                "Report URLs, steps, sections, and sources found. Then close the artifact panel.",
-                model=CUA_MODEL, max_iterations=6, verbose=verbose)
-            content = result.get("text", "")
+            async def _scrape_cua():
+                return await agent_loop(cua_client, browser,
+                    PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING,
+                    "Open the first artifact in the conversation and read its content. "
+                    "Report URLs, steps, sections, and sources found. Then close the artifact panel.",
+                    model=CUA_MODEL, max_iterations=6, verbose=verbose)
+
+            # #839 act tier: the report itself is the value here — a Vision
+            # success puts the read-out (URLs/steps/sections) in the returned
+            # text, which the same regexes below parse. Vision's report is
+            # shorter than CUA narration (single tool call) but the >=5-char /
+            # walker-URL gate below is unchanged either way.
+            result = await _shadow_observed_cua(
+                page, hotspot_id="scrape-artifact", phase=2, platform="claude",
+                current_step="scrape_artifact_1_tracking",
+                context_hint="DOM walker yielded nothing — open the FIRST artifact "
+                             "(research/sources tracking), read URLs/steps/sections, "
+                             "then close the panel",
+                expected_outcome="a text report of the tracking artifact's URLs, steps and sections",
+                cua_coro_factory=_scrape_cua,
+                mission_prompt=PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING)
+            content = (result or {}).get("text", "")
         except Exception as e:
             log(f"[Claude] Artifact CUA tracking failed: {e}", "WARN")
 
@@ -18110,12 +18200,28 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
                 await asyncio.sleep(0.4)
             except Exception:
                 pass
-            diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
-                "Look at the BOTTOM of the chat. Is there a Stop button visible? "
-                "Is there a loading animation or spinner? Is the AI actively generating?",
-                model=CUA_MODEL, max_iterations=3, verbose=verbose)
-            diag_text = (diag.get("text") or "").lower()
-            log(f"[{label}] CUA diagnosis: {diag.get('text', '')[:200]}")
+            async def _diag_cua():
+                return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
+                    "Look at the BOTTOM of the chat. Is there a Stop button visible? "
+                    "Is there a loading animation or spinner? Is the AI actively generating?",
+                    model=CUA_MODEL, max_iterations=3, verbose=verbose)
+
+            # #839 act tier (read_only): a Vision verdict must land in the
+            # returned text with the same plain-English signals the parser
+            # below greps ("stop"+"yes" / "loading" / "still generating") —
+            # the mission text instructs exactly that phrasing.
+            diag = await _shadow_observed_cua(
+                page, hotspot_id="poll-diagnose", phase=2,
+                platform=normalize_agent_key(label),
+                current_step="diagnose_generating_state",
+                context_hint="DOM verify missed 5x — READ the bottom of the chat and "
+                             "report: Stop button? spinner/loading? still generating?",
+                expected_outcome="an honest text verdict on whether generation is running",
+                cua_coro_factory=_diag_cua,
+                mission_prompt=PROMPT_DIAGNOSE,
+                read_only=True)
+            diag_text = ((diag or {}).get("text") or "").lower()
+            log(f"[{label}] CUA diagnosis: {(diag or {}).get('text', '')[:200]}")
 
             # Parse carefully — avoid false positives from "not still generating"
             has_stop = ("stop" in diag_text and "yes" in diag_text)
@@ -18144,10 +18250,24 @@ async def wait_until_verified(verify_fn, page, label, browser=None, cua_client=N
         if i == 6 and browser and cua_client:
             log(f"[{label}] CUA attempting to fix the issue...")
             await browser.switch_to_page(page)
-            fix = await agent_loop(cua_client, browser, PROMPT_FIX_ISSUE,
-                "Fix whatever is blocking the research from starting. Click any needed buttons.",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
-            log(f"[{label}] CUA fix attempt: {fix.get('text', '')[:200]}")
+
+            async def _fix_cua():
+                return await agent_loop(cua_client, browser, PROMPT_FIX_ISSUE,
+                    "Fix whatever is blocking the research from starting. Click any needed buttons.",
+                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+            # #839 act tier: click-only recovery (the mission forbids typing);
+            # success is judged by the Phase-4 DOM re-checks either way.
+            fix = await _shadow_observed_cua(
+                page, hotspot_id="poll-fix", phase=2,
+                platform=normalize_agent_key(label),
+                current_step="fix_blocked_generation",
+                context_hint="generation hasn't started — click whatever blocks it "
+                             "(Start/confirm/Send). NEVER type or paste text",
+                expected_outcome="the blocking button is clicked and generation starts",
+                cua_coro_factory=_fix_cua,
+                mission_prompt=PROMPT_FIX_ISSUE)
+            log(f"[{label}] CUA fix attempt: {(fix or {}).get('text', '')[:200]}")
             await asyncio.sleep(5)
             continue
 
@@ -19125,12 +19245,29 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     await asyncio.sleep(0.4)
                 except Exception:
                     pass
-                diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
-                    "Look at the BOTTOM of the chat (composer / end of response). "
-                    "Is there a Stop button visible? Is there a loading animation or 'Researching...' indicator? "
-                    "If a Stop button is visible anywhere, say 'still generating'. "
-                    "Only say 'response complete' if there is NO stop button AND the final paragraph of the response is visible.",
-                    model=CUA_MODEL, max_iterations=3, verbose=verbose)
+                async def _p1_diag_cua():
+                    return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
+                        "Look at the BOTTOM of the chat (composer / end of response). "
+                        "Is there a Stop button visible? Is there a loading animation or 'Researching...' indicator? "
+                        "If a Stop button is visible anywhere, say 'still generating'. "
+                        "Only say 'response complete' if there is NO stop button AND the final paragraph of the response is visible.",
+                        model=CUA_MODEL, max_iterations=3, verbose=verbose)
+
+                # #839 act tier (read_only): the verdict phrases ('still
+                # generating' / 'response complete') land in the returned text
+                # for the same parser below; a wrong "complete" stays blocked
+                # by the verify_fn DOM re-check (#753 twin note).
+                diag = await _shadow_observed_cua(
+                    page, hotspot_id="poll-diagnose", phase=phase,
+                    platform=agent_key,
+                    current_step="confirm_not_generating",
+                    context_hint="DOM said not-generating 2x — READ the bottom of the "
+                                 "chat: Stop button anywhere → say 'still generating'; "
+                                 "no Stop AND final paragraph visible → 'response complete'",
+                    expected_outcome="an honest 'still generating' or 'response complete' verdict",
+                    cua_coro_factory=_p1_diag_cua,
+                    mission_prompt=PROMPT_DIAGNOSE,
+                    read_only=True) or {"status": "error", "text": ""}
                 # CRITICAL: A structural CUA failure (workspace cap, 401, 529,
                 # etc.) returns {"status": "error", "text": str(exception)}.
                 # Previously that error text fell through the heuristic parse
@@ -19184,8 +19321,19 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     consecutive_not_generating = 0
                     cua_checked = False
                     if "needs click" in diag_text:
-                        await agent_loop(cua_client, browser, PROMPT_FIX_ISSUE,
-                            "Click whatever button needs clicking.", model=CUA_MODEL, max_iterations=5, verbose=verbose)
+                        async def _p1_fix_cua():
+                            return await agent_loop(cua_client, browser, PROMPT_FIX_ISSUE,
+                                "Click whatever button needs clicking.", model=CUA_MODEL, max_iterations=5, verbose=verbose)
+
+                        await _shadow_observed_cua(
+                            page, hotspot_id="poll-fix", phase=phase,
+                            platform=agent_key,
+                            current_step="click_blocking_button",
+                            context_hint="diagnosis said a button needs clicking — click it. "
+                                         "NEVER type or paste text",
+                            expected_outcome="the blocking button is clicked and generation resumes",
+                            cua_coro_factory=_p1_fix_cua,
+                            mission_prompt=PROMPT_FIX_ISSUE)
                         await asyncio.sleep(5)
                     else:
                         await asyncio.sleep(poll_interval)
@@ -19257,7 +19405,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # so a half-rendered finalizing screen can't read as done. The
                 # no-click guard is critical: this inspector must never touch
                 # the Stop button (that would kill an in-flight brief).
-                _sn_diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
+                _sn_mission = (
                     "You are checking whether a ChatGPT Deep Research BRIEF has finished generating. "
                     "Scroll through the latest assistant response from top to bottom and observe — do NOT click anything. "
                     "FIRST look for signs it is STILL GENERATING: a Stop button (filled square) in the composer; "
@@ -19272,8 +19420,28 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     "Say exactly 'response complete' only if there is NO stop button, NO finalizing/loading indicator, "
                     "AND a finished response is visible (ideally with the 'Thought for …' header). "
                     "If you are unsure, say 'still generating'. "
-                    "Remember: observe only — never click the Stop button or any control.",
-                    model=CUA_MODEL, max_iterations=5, verbose=verbose)
+                    "Remember: observe only — never click the Stop button or any control.")
+
+                async def _sn_diag_cua():
+                    return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
+                        _sn_mission, model=CUA_MODEL, max_iterations=5, verbose=verbose)
+
+                # #839 act tier (read_only): scroll-to-inspect is allowed for a
+                # single Vision step ONLY as a verdict — read_only blocks any
+                # click, so the Stop button can never be touched (#753's no-click
+                # guard). Verdict phrases land in text for the parser below.
+                _sn_diag = await _shadow_observed_cua(
+                    page, hotspot_id="poll-diagnose", phase=phase,
+                    platform=normalize_agent_key(label),
+                    current_step="safety_net_completion_check",
+                    context_hint="content flat 5+ min while detector says generating — "
+                                 "READ the latest response: Stop/finalizing/loading → "
+                                 "'still generating'; finished brief with 'Thought for …' "
+                                 "header → 'response complete'; unsure → 'still generating'",
+                    expected_outcome="an honest 'still generating' or 'response complete' verdict",
+                    cua_coro_factory=_sn_diag_cua,
+                    mission_prompt=f"{PROMPT_DIAGNOSE}\n\nTASK: {_sn_mission}",
+                    read_only=True) or {"status": "error", "text": ""}
                 # #753 (review r2): treat 'max_iterations' like 'error'. When
                 # agent_loop exhausts its turns it returns only the LAST text
                 # block — possibly mid-reasoning, not the CONCLUSION — which
@@ -22008,14 +22176,33 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             "two document artifact buttons/cards may appear. Check composer for stop button; absence "
                             "means done."),
             }.get(name, "")
-            diag = await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
+            _rr_diag_mission = (
                 f"{platform_hint}\n\n"
                 "Is the AI still generating (stop button visible, loading animation, spinner, 'Researching...' indicator)? "
                 "Or is the response FULLY complete (no stop button anywhere, no loading, the final paragraph visible)? "
                 "Answer 'still generating' or 'response complete'. "
-                "If you see a Stop button ANYWHERE on the page (composer OR research card), answer 'still generating'.",
-                model=CUA_MODEL, max_iterations=3, verbose=verbose,
-                phase=2, agent_name=normalize_agent_key(name), target_page=p["page"])
+                "If you see a Stop button ANYWHERE on the page (composer OR research card), answer 'still generating'.")
+
+            async def _rr_diag_cua():
+                return await agent_loop(cua_client, browser, PROMPT_DIAGNOSE,
+                    _rr_diag_mission,
+                    model=CUA_MODEL, max_iterations=3, verbose=verbose,
+                    phase=2, agent_name=normalize_agent_key(name), target_page=p["page"])
+
+            # #839 act tier (read_only): the round-robin diagnose has its own
+            # CONCLUSION:-marker parser below; read_only keeps Vision a pure
+            # verdict (never a click), and mission_prompt carries the platform
+            # hint + the exact answer protocol so Vision emits a parseable line.
+            diag = await _shadow_observed_cua(
+                p["page"], hotspot_id="poll-diagnose", phase=2,
+                platform=normalize_agent_key(name),
+                current_step="round_robin_completion_check",
+                context_hint=f"P2 round-robin completion check for {name} at "
+                             f"{int(elapsed/60)}m — {platform_hint[:200]}",
+                expected_outcome="an honest 'still generating' or 'response complete' verdict",
+                cua_coro_factory=_rr_diag_cua,
+                mission_prompt=f"{PROMPT_DIAGNOSE}\n\nTASK: {_rr_diag_mission}",
+                read_only=True) or {"status": "error", "text": ""}
             diag_text_raw = (diag.get("text") or "")
             diag_text = diag_text_raw.lower()
             p["last_cua_check"] = time.time()
@@ -24607,12 +24794,30 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                        status="selecting_model",
                        progress="Selecting ChatGPT Pro with Extended Thinking…")
             try:
-                result = await asyncio.wait_for(
-                    agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
-                        "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
-                        model=CUA_MODEL, max_iterations=15, verbose=verbose),
-                    timeout=180.0,
-                )
+                async def _select_pro_cua():
+                    return await asyncio.wait_for(
+                        agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
+                            "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
+                            model=CUA_MODEL, max_iterations=15, verbose=verbose),
+                        timeout=180.0,
+                    )
+
+                # #839 act tier: Vision drives the model picker with the SAME
+                # PROMPT_SELECT_PRO (which carries the #744 never-re-click-correct
+                # + #745 set-Thinking-before-Max invariants). No success_text —
+                # the caller's contract is the ABSENCE of "no pro"/"not available",
+                # so a Vision success (reason lacks those) reads as claimed, while
+                # a can't-find escalates to CUA which owns the authoritative
+                # no-Pro verdict. Highest-risk act hotspot; default-off + CUA net.
+                result = await _shadow_observed_cua(
+                    browser.page, hotspot_id="1a-select-pro", phase=1, platform="chatgpt",
+                    current_step="select_pro_extended_thinking",
+                    context_hint="select the ChatGPT Pro model with Extended Thinking via the "
+                                 "model picker; if there is no Pro option say so (don't guess)",
+                    expected_outcome="ChatGPT Pro + Extended Thinking is the active model",
+                    cua_coro_factory=_select_pro_cua,
+                    mission_prompt=PROMPT_SELECT_PRO,
+                    act_timeout_s=150.0) or {"text": ""}
             except asyncio.TimeoutError:
                 log("Phase 1: Pro+Extended Thinking selection timed out (180s) — proceeding without explicit Pro upgrade", "WARN")
                 result = {"text": "no pro available (cua_timeout)"}
@@ -24708,12 +24913,26 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                 "mode (Instant/Auto) with no Extended-Pro marker — silently "
                 "re-running the Pro+Extended selector ONCE", "WARN")
             try:
-                await asyncio.wait_for(
-                    agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
-                        "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
-                        model=CUA_MODEL, max_iterations=15, verbose=verbose),
-                    timeout=180.0,
-                )
+                async def _select_pro_rerun_cua():
+                    return await asyncio.wait_for(
+                        agent_loop(cua_client, browser, PROMPT_SELECT_PRO,
+                            "Select ChatGPT Pro model with Extended Thinking. Say 'no pro available' if not found.",
+                            model=CUA_MODEL, max_iterations=15, verbose=verbose),
+                        timeout=180.0,
+                    )
+
+                # #839 act tier: fail-open re-select (result ignored — the log
+                # trail re-confirm below is all that reads state). Same picker
+                # invariants via PROMPT_SELECT_PRO.
+                await _shadow_observed_cua(
+                    browser.page, hotspot_id="1a-select-pro", phase=1, platform="chatgpt",
+                    current_step="reselect_pro_after_downgrade",
+                    context_hint="post-select DOM confirm saw a non-Pro mode — re-select "
+                                 "ChatGPT Pro + Extended Thinking via the model picker",
+                    expected_outcome="ChatGPT Pro + Extended Thinking is the active model",
+                    cua_coro_factory=_select_pro_rerun_cua,
+                    mission_prompt=PROMPT_SELECT_PRO,
+                    act_timeout_s=150.0)
             except Exception as _epc_e:
                 log(f"[Phase1] Extended-Pro re-run did not complete "
                     f"({type(_epc_e).__name__}) — proceeding (fail-open)", "INFO")
@@ -24740,10 +24959,28 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         if not attached and cua_client:
             log("Trying CUA for PDF attachment...")
             browser.set_upload_file(str(pdf))
-            await agent_loop(cua_client, browser, PROMPT_ATTACH_PDF,
-                "Attach the file. The file dialog will auto-select it — just click the attachment button.",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
-            browser.clear_upload_file()
+
+            async def _attach_pdf_cua():
+                return await agent_loop(cua_client, browser, PROMPT_ATTACH_PDF,
+                    "Attach the file. The file dialog will auto-select it — just click the attachment button.",
+                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+            # #839 act tier: the OS file chooser is auto-answered by
+            # BrowserSession's filechooser handler consuming the upload queue —
+            # Vision only needs to click the attach/+ control, NOT drive the
+            # native dialog. set/clear_upload_file bracket stays in place.
+            try:
+                await _shadow_observed_cua(
+                    browser.page, hotspot_id="1a-attach-pdf", phase=1, platform="chatgpt",
+                    current_step="attach_brief_pdf",
+                    context_hint="click ChatGPT's attach / + / paperclip control to open the "
+                                 "file picker (the OS dialog auto-selects the file) — do NOT "
+                                 "try to drive the native file dialog yourself",
+                    expected_outcome="the brief PDF is attached to the composer",
+                    cua_coro_factory=_attach_pdf_cua,
+                    mission_prompt=PROMPT_ATTACH_PDF)
+            finally:
+                browser.clear_upload_file()
 
     # Build and submit the brief prompt
     prompt = (
@@ -24761,9 +24998,22 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
     submitted = await submit_chatgpt_direct(browser, prompt)
     if not submitted and cua_client:
         log("Falling back to CUA for submit...")
-        await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
-            f"Submit this prompt to ChatGPT:\n\n{prompt}",
-            model=CUA_MODEL, max_iterations=15, verbose=verbose)
+
+        async def _submit_cua():
+            return await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
+                f"Submit this prompt to ChatGPT:\n\n{prompt}",
+                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+
+        # #839 act tier: side-effect-only (result ignored); success is judged
+        # by the wait_until_verified(verify_chatgpt_generating) gate right below.
+        await _shadow_observed_cua(
+            browser.page, hotspot_id="1a-submit", phase=1, platform="chatgpt",
+            current_step="submit_brief_prompt",
+            context_hint="the brief prompt is in the composer — click Send to submit it "
+                         "(the DOM submit already failed once)",
+            expected_outcome="the research-brief prompt is submitted and ChatGPT starts generating",
+            cua_coro_factory=_submit_cua,
+            mission_prompt=PROMPT_SUBMIT_FALLBACK)
 
     # VERIFY: confirm ChatGPT is generating
     emit_event("agent_progress", phase=1, agent="chatgpt",
@@ -24841,9 +25091,20 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
         )
         submitted_fu = await submit_chatgpt_direct(browser, followup)
         if not submitted_fu and cua_client:
-            await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
-                f"Submit this follow-up prompt to ChatGPT:\n\n{followup[:500]}",
-                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+            async def _submit_fu_cua():
+                return await agent_loop(cua_client, browser, PROMPT_SUBMIT_FALLBACK,
+                    f"Submit this follow-up prompt to ChatGPT:\n\n{followup[:500]}",
+                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+            # #839 act tier: side-effect-only; the follow-up verify gate below
+            # is the ground truth.
+            await _shadow_observed_cua(
+                browser.page, hotspot_id="1a-submit", phase=1, platform="chatgpt",
+                current_step="submit_followup_prompt",
+                context_hint="a follow-up prompt is in the composer — click Send to submit it",
+                expected_outcome="the follow-up prompt is submitted and ChatGPT regenerates",
+                cua_coro_factory=_submit_fu_cua,
+                mission_prompt=PROMPT_SUBMIT_FALLBACK)
         # Wait for the updated response
         await asyncio.sleep(5)
         verified_fu = await wait_until_verified(verify_chatgpt_generating, browser.page, "Phase1-followup",
@@ -28144,9 +28405,22 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     if not sent:
         log(f"[{label}] Playwright can't find Send — CUA clicking...")
         await browser.switch_to_page(page)
-        await agent_loop(cua_client, browser, PROMPT_CLICK_SEND,
-            "Click the Send button to submit the message.",
-            model=CUA_MODEL, max_iterations=5, verbose=verbose)
+
+        async def _click_send_cua():
+            return await agent_loop(cua_client, browser, PROMPT_CLICK_SEND,
+                "Click the Send button to submit the message.",
+                model=CUA_MODEL, max_iterations=5, verbose=verbose)
+
+        # #839 act tier: side-effect-only last-resort send; success is judged
+        # downstream by verify_*_generating in run_phase2's 2A/2B/2C gates.
+        await _shadow_observed_cua(
+            page, hotspot_id="click-send", phase=2, platform=(platform or "").lower(),
+            current_step="click_send_button",
+            context_hint="the message is typed — click the composer's Send button "
+                         "(Playwright couldn't find it via any selector)",
+            expected_outcome="the message is sent and the agent starts responding",
+            cua_coro_factory=_click_send_cua,
+            mission_prompt=PROMPT_CLICK_SEND)
         log(f"[{label}] CUA send attempted")
         # CUA send is a last resort — Playwright couldn't find a send button
         # via any selector. The click may or may not have landed depending
@@ -28167,9 +28441,21 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 if decision == "retry":
                     try:
                         await browser.switch_to_page(page)
-                        await agent_loop(cua_client, browser, PROMPT_CLICK_SEND,
-                            "Click the Send button to submit the message. The previous attempt may have missed — look carefully for the Send icon.",
-                            model=CUA_MODEL, max_iterations=5, verbose=verbose)
+
+                        async def _click_send_retry_cua():
+                            return await agent_loop(cua_client, browser, PROMPT_CLICK_SEND,
+                                "Click the Send button to submit the message. The previous attempt may have missed — look carefully for the Send icon.",
+                                model=CUA_MODEL, max_iterations=5, verbose=verbose)
+
+                        await _shadow_observed_cua(
+                            page, hotspot_id="click-send", phase=2,
+                            platform=(platform or "").lower(),
+                            current_step="click_send_button_retry",
+                            context_hint="user asked to retry the send — the previous click may "
+                                         "have missed; look carefully for the Send icon and click it",
+                            expected_outcome="the message is sent and the agent starts responding",
+                            cua_coro_factory=_click_send_retry_cua,
+                            mission_prompt=PROMPT_CLICK_SEND)
                         log(f"[{label}] CUA send retry attempted")
                     except Exception as e:
                         log(f"[{label}] CUA send retry failed: {e}", "WARN")
@@ -28968,13 +29254,32 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log(f"[2D] CUA recovery: plan not ready — CUA retrying the plan "
                     f"(attempt {_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})")
                 await browser.switch_to_page(gemini_page)
-                await agent_loop(cua_client, browser,
-                    PROMPT_GEMINI_START_RESEARCH,
-                    "If a 'Start research' button is visible, click it. Otherwise the "
-                    "research plan failed to generate (you may see an error such as "
-                    "'something went wrong') — click the Retry / Regenerate button to "
-                    "re-draft the plan. Do NOT type anything.",
-                    model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+                async def _gemini_start_cua():
+                    return await agent_loop(cua_client, browser,
+                        PROMPT_GEMINI_START_RESEARCH,
+                        "If a 'Start research' button is visible, click it. Otherwise the "
+                        "research plan failed to generate (you may see an error such as "
+                        "'something went wrong') — click the Retry / Regenerate button to "
+                        "re-draft the plan. Do NOT type anything.",
+                        model=CUA_MODEL, max_iterations=10, verbose=verbose)
+
+                # #839 act tier: DUAL-target mission — click 'Start research' OR
+                # the icon-only Regenerate/Retry the JS selector can't match.
+                # Return text is unused in EVERY mode (#776 confirms via the
+                # deterministic JS poll below), so an act success vs a CUA run
+                # is indistinguishable downstream — start_clicked is set only by
+                # _click_start_js. Non-blocking recovery, never the pipeline pause.
+                await _shadow_observed_cua(
+                    gemini_page, hotspot_id="gemini-start", phase=2, platform="gemini",
+                    current_step="start_or_regenerate_plan",
+                    context_hint="Gemini plan not ready — click the blue 'Start research' "
+                                 "button if present, else the Retry/Regenerate control on "
+                                 "the 'something went wrong' error. NEVER type",
+                    expected_outcome="the research plan starts or is re-drafted",
+                    cua_coro_factory=_gemini_start_cua,
+                    mission_prompt=PROMPT_GEMINI_START_RESEARCH,
+                    act_timeout_s=120.0)
                 try:
                     emit_event("agent_progress", phase=2, agent="gemini", status="generating",
                                progress=(f"Gemini's plan didn't start — retrying "

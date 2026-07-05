@@ -125,3 +125,83 @@ def test_2c_hint_bans_source_panel_and_preamble():
     hint = research._HOTSPOT_VISION_HINTS["2c"]["context_hint"]
     assert "not the chat" in hint.lower() or "report body only" in hint.lower()
     assert "side panel" in hint.lower()
+
+
+# ── P1 + polling + misc wiring ───────────────────────────────────────────────
+
+def test_scrape_artifact_wrapped():
+    (blk,) = _block_for(_src(research.scrape_claude_artifact_tracking), "scrape-artifact")
+    assert "mission_prompt=PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING" in blk
+
+
+def test_poll_diagnose_and_fix_are_read_only_where_required():
+    # wait_until_verified: diagnose read_only, fix acting.
+    src_wuv = _src(research.wait_until_verified)
+    for blk in _block_for(src_wuv, "poll-diagnose"):
+        assert "read_only=True" in blk, "diagnose must be read_only"
+    for blk in _block_for(src_wuv, "poll-fix"):
+        assert "mission_prompt=PROMPT_FIX_ISSUE" in blk
+        assert "read_only" not in blk  # fix acts (click-only, not read-only)
+
+
+def test_poll_until_done_diagnose_read_only():
+    src = _src(research.poll_until_done)
+    for blk in _block_for(src, "poll-diagnose"):
+        assert "read_only=True" in blk
+
+
+def test_round_robin_diagnose_read_only():
+    src = _src(research.poll_all_agents_round_robin)
+    for blk in _block_for(src, "poll-diagnose"):
+        assert "read_only=True" in blk
+
+
+def test_gemini_start_wrapped_dual_target():
+    (blk,) = _block_for(_src(research.run_phase2), "gemini-start")
+    assert "mission_prompt=PROMPT_GEMINI_START_RESEARCH" in blk
+    # dual-target intent preserved in the hint (Start OR Regenerate)
+    assert "Retry" in blk or "Regenerate" in blk
+
+
+def test_select_pro_both_sites_wrapped_no_success_text():
+    src = _src(research.run_phase1)
+    blks = _block_for(src, "1a-select-pro")
+    assert len(blks) == 2
+    for blk in blks:
+        assert "mission_prompt=PROMPT_SELECT_PRO" in blk
+        # No positive success marker — success = absence of "no pro".
+        assert "success_text=" not in blk
+
+
+def test_submit_and_attach_wrapped():
+    src = _src(research.run_phase1)
+    assert len(_block_for(src, "1a-submit")) == 2
+    for blk in _block_for(src, "1a-submit"):
+        assert "mission_prompt=PROMPT_SUBMIT_FALLBACK" in blk
+    (attach,) = _block_for(src, "1a-attach-pdf")
+    assert "mission_prompt=PROMPT_ATTACH_PDF" in attach
+    # set/clear_upload_file bracket preserved around the attach act.
+    assert "clear_upload_file()" in src
+
+
+def test_click_send_both_sites_wrapped():
+    src = _src(research.start_agent_no_gemini_wait)
+    assert len(_block_for(src, "click-send")) == 2
+    for blk in _block_for(src, "click-send"):
+        assert "mission_prompt=PROMPT_CLICK_SEND" in blk
+
+
+def test_new_p1_polling_hotspots_have_hints():
+    for hs in ("1a-select-pro", "1a-attach-pdf", "1a-submit", "scrape-artifact",
+               "poll-diagnose", "poll-fix", "gemini-start", "click-send"):
+        hint = research._HOTSPOT_VISION_HINTS.get(hs)
+        assert hint and hint.get("context_hint"), f"missing hint for {hs}"
+
+
+def test_read_only_hints_ban_clicks():
+    # poll-diagnose is the read-only verdict hotspot — its hint must forbid clicks.
+    hint = research._HOTSPOT_VISION_HINTS["poll-diagnose"]["context_hint"].lower()
+    assert "read only" in hint or "do not click" in hint or "never click" in hint
+    # poll-fix acts but must never type.
+    fix = research._HOTSPOT_VISION_HINTS["poll-fix"]["context_hint"].lower()
+    assert "never type" in fix or "click only" in fix
