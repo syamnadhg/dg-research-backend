@@ -12422,7 +12422,13 @@ async def _shadow_observed_cua(
         # Before the CUA net: a site-specific probe may veto it (a partial Vision
         # attempt at a non-idempotent hotspot may have already mutated state, so
         # re-running the full CUA mission would double-act — audio-generate #778).
-        if _final is not None and pre_cua_net_probe is not None:
+        # NOT gated on `_final is not None`: the WORST double-act case is the
+        # OUTER act_timeout_s firing (act_loop cancelled mid-flight → _final stays
+        # None) AFTER Vision already clicked Generate — exactly when the veto is
+        # most needed (round-2 review). By here the stop + declare_success early
+        # returns have fired, so we are unconditionally about to run CUA; the probe
+        # is read-only and only vetoes when state actually advanced.
+        if pre_cua_net_probe is not None:
             try:
                 _veto = await pre_cua_net_probe()
             except Exception as _pe:

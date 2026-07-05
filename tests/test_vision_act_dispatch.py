@@ -213,6 +213,37 @@ def test_pre_cua_net_probe_veto_skips_cua(monkeypatch):
     assert out["status"] == "vision_partial"
 
 
+def test_pre_cua_net_probe_veto_on_outer_timeout(monkeypatch):
+    # Round-2 review: the WORST double-generate case is the OUTER act_timeout_s
+    # firing while act_loop is mid-flight (Vision already clicked Generate) —
+    # act_loop is CANCELLED so _final stays None. The probe MUST still run and
+    # veto, else CUA re-generates (#778 undeletable duplicate). Simulate by
+    # making act_loop hang past a tiny act_timeout_s.
+    fv = _FakeVisionModule("tier2", act_result=_final("declare_success"),
+                           act_delay=0.5)
+
+    async def _probe():
+        return {"status": "vision_partial", "text": "generating"}
+
+    out, calls, _ = _dispatch(monkeypatch, fv, pre_cua_net_probe=_probe,
+                              act_timeout_s=0.05)
+    assert calls["cua"] == 0  # CUA net vetoed even though _final is None
+    assert out["status"] == "vision_partial"
+
+
+def test_pre_cua_net_probe_on_act_crash(monkeypatch):
+    # act_loop raising (not just timing out) also leaves _final None → the probe
+    # must still get its veto chance before CUA.
+    fv = _FakeVisionModule("tier2", act_raises=RuntimeError("engine down"))
+
+    async def _probe():
+        return {"status": "vision_partial", "text": "generating"}
+
+    out, calls, _ = _dispatch(monkeypatch, fv, pre_cua_net_probe=_probe)
+    assert calls["cua"] == 0
+    assert out["status"] == "vision_partial"
+
+
 def test_pre_cua_net_probe_none_runs_cua(monkeypatch):
     # Probe returns None (Vision did nothing) → CUA net runs normally.
     fv = _FakeVisionModule("tier2", act_result=_final("escalate_to_cua", "nope"))
