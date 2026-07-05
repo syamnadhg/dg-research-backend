@@ -275,3 +275,39 @@ def test_p3_read_only_sites_never_execute():
     in test_vision_act_loop; here we pin the CALL SITES pass read_only=True)."""
     audio = _block_for(_src(research.run_phase3_audio), "audio-check")
     assert all("read_only=True" in b for b in audio)
+
+
+# ── P2 DR-setup path (#709 composer-placeholder requirement) ─────────────────
+
+def test_setup_fallback_wrapped_with_placeholder_hint():
+    (blk,) = _block_for(_src(research.start_agent_no_gemini_wait), "setup-dr")
+    assert "mission_prompt=" in blk
+    # #709: DR-active is judged by the composer placeholder, never a pill state.
+    assert "placeholder" in blk.lower()
+
+
+def test_validate_setup_wrapped_confirmed_contract():
+    (blk,) = _block_for(_src(research.validate_setup_with_cua), "validate-setup")
+    assert 'success_text="verified"' in blk  # Vision success → (True, True) confirmed
+    assert "mission_prompt=" in blk
+
+
+def test_gemini_validate_mission_keeps_709_placeholder_signal():
+    # The Gemini validator user_msg (fed verbatim as the act mission) MUST still
+    # demand the composer-placeholder signal, not a pill-pressed heuristic.
+    src = _src(research.validate_setup_with_cua)
+    assert "What do you want to research?" in src
+    assert "merely-visible chip is NOT enough" in src
+
+
+def test_inline_type_wrapped_no_send():
+    (blk,) = _block_for(_src(research.start_agent_no_gemini_wait), "inline-type")
+    assert "do not click Send" in blk.lower() or "not sent" in blk.lower() or "no send" in blk.lower()
+
+
+def test_human_verify_left_cua_only():
+    # Cloudflare/CAPTCHA clearance is deliberately NOT act-wired — Vision escalates
+    # on captchas by design, and driving bot-detection is out of scope.
+    src = _src(research.wait_for_verification_clearance)
+    assert "_shadow_observed_cua(" not in src
+    assert "agent_loop(" in src  # still CUA-driven

@@ -26693,8 +26693,27 @@ async def validate_setup_with_cua(browser, cua_client, page, platform, label, ve
         return True, False  # Unknown platform — skip (not a positive confirmation)
     try:
         await browser.switch_to_page(page)
-        result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
-            model=CUA_MODEL, max_iterations=6, verbose=verbose)
+
+        async def _validate_setup_cua():
+            return await agent_loop(cua_client, browser, sys_prompt, user_prompt,
+                model=CUA_MODEL, max_iterations=6, verbose=verbose)
+
+        # #839 act tier: the validator can FIX (not read-only), so Vision may
+        # act. success_text='verified' maps a Vision success onto the same
+        # (True, True) confirmed contract parsed below; escalate/failure/low-
+        # confidence fall to CUA, which owns the authoritative verdict. #709:
+        # the Gemini user_prompt already demands the composer-placeholder signal
+        # ('What do you want to research?' vs 'Ask Gemini'), passed verbatim as
+        # the mission — a merely-visible chip must never read as confirmed.
+        result = await _shadow_observed_cua(
+            page, hotspot_id="validate-setup", phase=2, platform=platform.lower(),
+            current_step="validate_deep_research_active",
+            context_hint=f"confirm Deep Research / the right model+tools are ACTIVE for "
+                         f"{label}, fix if not, do NOT type. {user_prompt}",
+            expected_outcome="Deep Research is confirmed active (say 'verified' or 'fixed')",
+            cua_coro_factory=_validate_setup_cua,
+            mission_prompt=f"{sys_prompt}\n\nTASK: {user_prompt}",
+            success_text="verified") or {}
         text = (result.get("text") or "").lower()
         if "verified" in text or "fixed" in text:
             log(f"[{label}] CUA validation: {text[:120]}")
@@ -28068,8 +28087,32 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     else:
         # Playwright failed — try original CUA setup as a first fallback (tight iterations)
         log(f"[{label}] Playwright setup failed — CUA fallback setup (tight)...")
-        await agent_loop(cua_client, browser, prompt_system, prompt_user,
-            model=CUA_MODEL, max_iterations=8, verbose=verbose)
+
+        async def _setup_fallback_cua():
+            return await agent_loop(cua_client, browser, prompt_system, prompt_user,
+                model=CUA_MODEL, max_iterations=8, verbose=verbose)
+
+        # #839 act tier: side-effect-only setup (result ignored — Layer-2
+        # validate_setup_with_cua below is the confirmation). #709: DR-active is
+        # judged by the composer PLACEHOLDER, never a pill-pressed heuristic —
+        # the context_hint encodes it so a Vision actor doesn't toggle a working
+        # DR off by misreading a merely-visible chip.
+        _setup_placeholder_hint = {
+            "gemini": "DR is ON only when the composer placeholder reads 'What do you "
+                      "want to research?' (chat mode = 'Ask Gemini'); a visible DR chip "
+                      "alone is NOT proof — don't toggle a pill that's already active.",
+            "chatgpt": "enable Deep Research mode; do NOT type — set up and focus the input.",
+            "claude": "enable Research + the right model/effort; do NOT type.",
+        }.get(platform_l, "enable Deep Research mode; do NOT type.")
+        await _shadow_observed_cua(
+            page, hotspot_id="setup-dr", phase=2, platform=platform_l,
+            current_step="setup_deep_research_mode",
+            context_hint=f"Playwright DR setup failed — enable Deep Research for {platform}. "
+                         + _setup_placeholder_hint,
+            expected_outcome="Deep Research mode is active and the input is focused (not typed)",
+            cua_coro_factory=_setup_fallback_cua,
+            mission_prompt=f"{prompt_system}\n\nTASK: {prompt_user}",
+            act_timeout_s=120.0)
 
     # LAYER 2: CUA visual validation — confirms options are ACTUALLY active.
     # cua_confirmed is True ONLY on a positive "verified"/"fixed" verdict (NOT
@@ -28109,10 +28152,29 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             if not typed:
                 log(f"[{label}] Inline prompt type failed — trying CUA fallback", "WARN")
                 await browser.switch_to_page(page)
-                await agent_loop(cua_client, browser,
-                    "Type a short research prompt referring to the attached brief — then stop (do NOT send).",
-                    "Click the message input, type: 'Please perform deep research on the topic described in the attached brief. Use Deep Research mode and produce a comprehensive report with citations.' Then STOP — do not click Send.",
-                    model=CUA_MODEL, max_iterations=6, verbose=verbose)
+
+                _inline_type_sys = "Type a short research prompt referring to the attached brief — then stop (do NOT send)."
+                _inline_type_user = ("Click the message input, type: 'Please perform deep research on the topic "
+                                     "described in the attached brief. Use Deep Research mode and produce a "
+                                     "comprehensive report with citations.' Then STOP — do not click Send.")
+
+                async def _inline_type_cua():
+                    return await agent_loop(cua_client, browser,
+                        _inline_type_sys, _inline_type_user,
+                        model=CUA_MODEL, max_iterations=6, verbose=verbose)
+
+                # #839 act tier: types the reference prompt but must NOT send
+                # (the send is a separate deterministic step); result ignored,
+                # verify_*_generating downstream is the ground truth.
+                await _shadow_observed_cua(
+                    page, hotspot_id="inline-type", phase=2, platform=platform.lower(),
+                    current_step="type_reference_prompt_no_send",
+                    context_hint="click the composer and TYPE a short prompt referring to the "
+                                 "attached brief (deep research + citations) — then STOP. Do "
+                                 "NOT click Send; the send is a separate step.",
+                    expected_outcome="the reference prompt is typed into the composer (not sent)",
+                    cua_coro_factory=_inline_type_cua,
+                    mission_prompt=f"{_inline_type_sys}\n\nTASK: {_inline_type_user}")
         else:
             log(f"[{label}] Brief attachment failed — falling back to inline paste", "WARN")
             # Attach failed → inline the source docs' text so the agent still
