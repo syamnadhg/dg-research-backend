@@ -31,7 +31,7 @@ import math
 import os
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Literal
 
 import anthropic
@@ -83,6 +83,22 @@ LOW_CONFIDENCE_THRESHOLD = 0.6
 # Pessimistic per-pipeline-run circuit breaker. Stops a flaky hotspot from
 # burning the budget. Caller surfaces as pipeline_warning when raised.
 DEFAULT_CALL_BUDGET = 50
+
+# ── act_loop tuning ──────────────────────────────────────────────────────
+# Steps per mission: CUA's agent_loop runs up to 30 iterations, but Vision
+# steps are single deliberate actions with a fresh screenshot each time —
+# a mission that hasn't landed in 8 is one Vision doesn't understand, and
+# the CUA safety net (which keeps message history) is the better tool.
+ACT_MAX_STEPS_DEFAULT = 8
+# Settle time after a page-mutating step so the next screenshot sees the
+# result (panel slide-ins, modals) instead of the mid-transition frame.
+ACT_STEP_SETTLE_S = 1.0
+# Cap on a model-proposed `wait` — an unbounded duration_ms would stall the
+# whole mission inside one step.
+ACT_MAX_WAIT_MS = 10_000
+# Identical consecutive proposals before we conclude the click isn't taking
+# effect and hand over to CUA. 2 repeats = 3 identical actions total.
+ACT_REPEAT_LIMIT = 3
 
 # Cost coefficients for rough $/run estimates ($/Mtok). Used by
 # VisionMetrics.estimated_cost_usd for surfacing in run analytics, not
@@ -644,12 +660,16 @@ def is_vision_enabled() -> Literal["off", "shadow", "tier2", "tier3"]:
     - "shadow" — Vision runs in PARALLEL with CUA at tier-2 escalation
                  sites; logs Vision's proposed action but CUA's output is
                  what acts. Used for promotion-criterion telemetry.
-    - "tier2"  — Vision runs BEFORE CUA at escalation sites (with_vision_
-                 fallback semantics). For per-hotspot promotion after
-                 shadow proves agreement.
+    - "tier2"  — Vision ACTS before CUA at escalation sites (act_loop /
+                 with_vision_fallback drive the page; CUA stays the tier-3
+                 safety net). ``DG_VISION_TIER=act`` is an alias — it is
+                 the ONE switch that arms the Track-B acting path for the
+                 user's validation runs.
     - "tier3"  — Vision runs only AFTER CUA also fails. Reserved.
     """
     val = (os.environ.get("DG_VISION_TIER") or "off").strip().lower()
+    if val == "act":
+        return "tier2"
     if val in ("off", "shadow", "tier2", "tier3"):
         return val  # type: ignore[return-value]
     return "off"
@@ -934,6 +954,227 @@ def _observe_action_record(result: ActionResult) -> dict:
         "output_tokens": result.output_tokens,
         "low_confidence": result.low_confidence,
     }
+
+
+def _act_mission_text(mission_prompt: str | None) -> str | None:
+    """Adapt a CUA mission prompt for the Vision act loop. CUA prompts are
+    written for a computer-use agent that reports by SAYING things ("say
+    'panel: open'", "answer pro/free/unsure") — Vision reports through the
+    propose_action tool instead, so the adapter redirects any say/type-the-
+    status instruction into declare_success's `reason`. Passing the SAME
+    mission text CUA gets is the point: Vision aims at exactly the element
+    and protocol every hard-won prompt invariant already encodes."""
+    if not mission_prompt:
+        return None
+    return (
+        "MULTI-STEP MISSION — you are driving this mission ONE action per "
+        "response; after each action you receive a fresh screenshot to "
+        "continue from (your recent actions appear in last_action). The "
+        "mission brief below was written for a computer-use agent; wherever "
+        "it says to say/answer/respond with a status phrase, verdict, or "
+        "extracted value, that means: finish with declare_success and put "
+        "that exact output in `reason` verbatim. Never type status phrases "
+        "into the page.\n"
+        "--- MISSION BRIEF ---\n"
+        f"{mission_prompt}\n"
+        "--- END BRIEF ---\n"
+        "If the mission cannot proceed from what you can see (wrong page, "
+        "target absent, captcha/human-verification), respond escalate_to_cua."
+    )
+
+
+def _act_synth(reason: str) -> ActionResult:
+    """A loop-synthesized terminal (step cap / repeat / abort / error) — not
+    a model response, so it is never fed to metrics.record()."""
+    return ActionResult(
+        action="escalate_to_cua", reason=reason, confidence=0.0,
+        next_expected_state="", model_used="act_loop",
+    )
+
+
+async def act_loop(
+    page: Any,
+    *,
+    flow_context: dict,
+    hotspot_id: str,
+    mission_prompt: str | None = None,
+    vision: VisionClient | None = None,
+    run_id: str | None = None,
+    high_stakes: bool = False,
+    max_steps: int = ACT_MAX_STEPS_DEFAULT,
+    should_abort: Callable[[], bool] | None = None,
+    read_only: bool = False,
+) -> ActionResult:
+    """ACT MODE (DG_VISION_TIER=act / tier2): Vision DRIVES the page toward a
+    mission goal, one bounded step at a time — the tier-2 acting sibling of
+    ``shadow_observe_then_cua``. Loop: screenshot → propose_action → execute →
+    settle → repeat, until the model returns a terminal action or a rail fires.
+
+    ``read_only=True`` turns the loop into a pure probe for hotspots whose
+    contract forbids page interaction (NotebookLM audio-check / verify-sources,
+    the mid-poll diagnose): terminal verdicts pass through, but ANY proposed
+    page action escalates to CUA without being executed.
+
+    Returns the terminal ActionResult; the caller (research.py dispatcher)
+    maps ``declare_success`` into the CUA result shape and falls back to the
+    real CUA on anything else. NEVER raises — every failure mode collapses to
+    an ``escalate_to_cua``/``declare_failure`` result so the CUA safety net
+    always gets its turn.
+
+    Rails (all logged to the shadow JSONL with ``source: "act"``):
+    - step cap (``max_steps``) — a mission that hasn't landed in 8 deliberate
+      steps is one Vision doesn't understand; CUA keeps message history and
+      is the better tool.
+    - repeat guard — ACT_REPEAT_LIMIT identical consecutive proposals means
+      the click isn't taking effect; stop re-clicking (the #732/#734 CUA
+      re-click lesson) and hand over.
+    - low confidence — an acting verb OR a success claim below the 0.6
+      threshold is a guess; escalate instead of acting on it.
+    - `wait` capped at ACT_MAX_WAIT_MS; Playwright errors in execute_action
+      and BudgetExceeded both collapse to escalate.
+    - ``should_abort`` (caller's stop/abort probe) is checked before every
+      step; on trip the loop stops WITHOUT falling through to more actions —
+      the caller re-checks its own flag to distinguish stop from escalate.
+    """
+    vc = vision or default_client()
+    ctx = dict(flow_context)
+    task_text = _act_mission_text(mission_prompt)
+    breadcrumbs: list[str] = []
+    last_sig: tuple | None = None
+    repeat_count = 0
+    final: ActionResult | None = None
+    outcome = "escalate"
+    steps_used = 0
+
+    def _log_step(step: int, rec_vision: dict, *, is_final: bool = False,
+                  outc: str | None = None) -> None:
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_id": run_id, "hotspot_id": hotspot_id,
+            "phase": ctx.get("phase"), "agent": ctx.get("platform"),
+            "source": "act", "step": step, "max_steps": max_steps,
+            "vision": rec_vision,
+        }
+        if is_final:
+            rec["final"] = True
+            rec["outcome"] = outc
+            rec["steps_used"] = steps_used
+        _append_shadow_record(rec)
+
+    for step in range(1, max_steps + 1):
+        steps_used = step
+        if should_abort is not None:
+            try:
+                if should_abort():
+                    final = _act_synth(f"aborted by caller before step {step}")
+                    break
+            except Exception:
+                pass
+
+        try:
+            async def _shot_and_ask() -> tuple[ActionResult, ImgMeta]:
+                img, meta = await vc.screenshot(page)
+                await _harvest_fixture(img, hotspot_id, run_id)
+                res = await vc.ask(
+                    img, meta, ctx,
+                    prompt=task_text, high_stakes=high_stakes,
+                )
+                return res, meta
+            # Outer net sized for 1 try + 1 transport retry + screenshot,
+            # comfortably above ask()'s own per-attempt wait_for.
+            result, meta = await asyncio.wait_for(
+                _shot_and_ask(), timeout=DEFAULT_TIMEOUT_S * 2 + 12,
+            )
+        except BudgetExceeded as exc:
+            final = _act_synth(f"vision budget exhausted: {exc}")
+            break
+        except asyncio.TimeoutError:
+            final = _act_synth(f"act step {step} timed out (screenshot hung?)")
+            break
+        except Exception as exc:
+            final = _act_synth(f"act step {step} error: {type(exc).__name__}: {str(exc)[:200]}")
+            break
+
+        _log_step(step, _observe_action_record(result))
+
+        # Terminal actions from the model pass through (their reason carries
+        # the mission output / the escalation cause) — except a LOW-CONFIDENCE
+        # success claim, which is a guess we refuse to trust.
+        if result.action in ("declare_failure", "escalate_to_cua"):
+            final = result
+            outcome = "failure" if result.action == "declare_failure" else "escalate"
+            break
+        if result.action == "declare_success":
+            if result.low_confidence:
+                final = _act_synth(
+                    f"low-confidence success claim ({result.confidence:.2f}) — not trusted: "
+                    f"{result.reason[:160]}"
+                )
+                break
+            final = result
+            outcome = "success"
+            break
+        if result.low_confidence:
+            final = _act_synth(
+                f"low-confidence {result.action} proposal ({result.confidence:.2f}) — "
+                f"not acted on: {result.reason[:160]}"
+            )
+            break
+        if read_only:
+            final = _act_synth(
+                f"read-only hotspot — vision proposed {result.action}; deferring to CUA"
+            )
+            break
+
+        # Repeat guard: the same proposal ACT_REPEAT_LIMIT times in a row
+        # means the action isn't taking effect — stop re-clicking.
+        sig = (
+            result.action,
+            None if result.x_ratio is None else round(result.x_ratio, 2),
+            None if result.y_ratio is None else round(result.y_ratio, 2),
+            result.text, result.key,
+        )
+        repeat_count = repeat_count + 1 if sig == last_sig else 1
+        last_sig = sig
+        if repeat_count >= ACT_REPEAT_LIMIT:
+            final = _act_synth(
+                f"repeated identical {result.action} {repeat_count}x with no progress"
+            )
+            break
+
+        if result.action == "wait" and (result.duration_ms or 0) > ACT_MAX_WAIT_MS:
+            result = replace(result, duration_ms=ACT_MAX_WAIT_MS)
+
+        try:
+            await execute_action(page, result, meta)
+        except Exception as exc:
+            final = _act_synth(
+                f"execute_action({result.action}) failed at step {step}: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            )
+            break
+
+        if result.action in ("click", "type", "key"):
+            await asyncio.sleep(ACT_STEP_SETTLE_S)
+        elif result.action == "scroll":
+            await asyncio.sleep(ACT_STEP_SETTLE_S / 2)
+
+        loc = ""
+        if result.x_ratio is not None and result.y_ratio is not None:
+            loc = f"({result.x_ratio:.2f},{result.y_ratio:.2f})"
+        breadcrumbs.append(
+            f"step {step}/{max_steps}: {result.action}{loc} — {result.reason[:120]}"
+        )
+        ctx["last_action"] = " | ".join(breadcrumbs[-3:])
+
+    if final is None:
+        final = _act_synth(f"step cap ({max_steps}) reached without a terminal action")
+
+    if final.model_used == "act_loop":  # loop-synthesized → not yet logged
+        _log_step(steps_used, _observe_action_record(final), is_final=True, outc="escalate")
+    else:
+        _log_step(steps_used, {"terminal": final.action}, is_final=True, outc=outcome)
+    return final
 
 
 async def with_vision_fallback(
