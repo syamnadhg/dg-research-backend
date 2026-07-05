@@ -37,6 +37,7 @@ class _FakeControls:
         self.cookie_trust_broken = set()
         self.login_pause_timeout_agents = set()
         self.skipped_agents = set()
+        self.skip_init_verify = True
         self.pause_target_agent = ""
         self.retry_init_verify = False
         self._stop = False
@@ -389,6 +390,74 @@ def test_p3_login_skip_cascades_p4_and_never_fakes_complete():
     # the complete emit is gated on BOTH skip flags + stop
     assert ("if (not _p3_audio_user_skipped and not _p3_login_skipped"
             in src)
+
+
+# ── phase D: the slimmed gate is a pure trust check (functional) ─────────────
+
+def _gate_cookie(harness, present):
+    calls = []
+
+    async def _probe(_browser, _key):
+        calls.append(_key)
+        return present
+
+    harness.monkeypatch.setattr(research, "_platform_auth_cookie_present", _probe)
+    return calls
+
+
+async def _run_gate(harness, agent="chatgpt", phase=1):
+    return await research._phase_verify_gate(phase, agent, object(), None)
+
+
+@pytest.mark.asyncio
+async def test_gate_trusts_a_present_cookie(harness):
+    _gate_cookie(harness, True)
+    assert await _run_gate(harness) == "ok"
+    ev = dict(harness.events)
+    assert ev["agent_progress"]["status"] == "verified"
+    assert harness.ctl.pause_reasons == [] and not harness.persisted
+
+
+@pytest.mark.asyncio
+async def test_gate_cookie_miss_is_unverified_not_a_pause(harness):
+    # #899: cookie missing → honest 'unverified' tile line, return 'ok',
+    # and NOTHING else — no tab, no pause, no mirror. The work-tab
+    # preflight owns the real outcome.
+    _gate_cookie(harness, False)
+    assert await _run_gate(harness) == "ok"
+    ev = dict(harness.events)
+    assert ev["agent_progress"]["status"] == "unverified"
+    assert "will confirm on the work page" in ev["agent_progress"]["progress"]
+    assert harness.ctl.pause_reasons == [] and not harness.persisted
+
+
+@pytest.mark.asyncio
+async def test_gate_never_re_trusts_a_broken_jar(harness):
+    # trust-broken + cookie PRESENT must read unverified (review: a source
+    # guard alone couldn't catch the condition being inverted) — and the
+    # cookie probe isn't even consulted for a broken platform.
+    harness.ctl.cookie_trust_broken.add("chatgpt")
+    calls = _gate_cookie(harness, True)
+    assert await _run_gate(harness) == "ok"
+    assert dict(harness.events)["agent_progress"]["status"] == "unverified"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_gate_early_outs(harness):
+    calls = _gate_cookie(harness, True)
+    # verifyLogins ON (skip_init_verify False) → no-op 'ok', zero emits
+    harness.ctl.skip_init_verify = False
+    assert await _run_gate(harness) == "ok"
+    assert harness.events == [] and calls == []
+    # prior-skip echo
+    harness.ctl.skip_init_verify = True
+    harness.ctl.skipped_agents.add("chatgpt")
+    assert await _run_gate(harness) == "skipped"
+    # stop
+    harness.ctl.skipped_agents.clear()
+    harness.ctl._stop = True
+    assert await _run_gate(harness) == "stop"
 
 
 # ── _work_tab_login_pause: the FE contract on entry ───────────────────────────

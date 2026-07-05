@@ -45,10 +45,13 @@ def test_pending_decision_helpers_exist():
 
 def test_login_gates_persist_then_clear():
     mod_src = inspect.getsource(research)
-    # Both login gates (Phase 0 + phase-time) must mirror a login_required
-    # decision durably onto the doc.
+    # Every login pause must mirror a login_required decision durably onto
+    # the doc. Post-#899 the persist sites are: the P0 walk, the env-check,
+    # and the work-tab login pause (_work_tab_login_pause — the only
+    # PHASE-TIME mirror left; its payload is functionally pinned in
+    # test_worktab_preflight_899.py). The slimmed gate persists nothing.
     assert mod_src.count('"kind": "login_required"') >= 2, (
-        "both the Phase 0 and phase-time login gates must persist a "
+        "the P0 walk and the work-tab login pause must persist a "
         "login_required pendingDecision (#710)."
     )
     # Every persist must be paired with a clear so the card retracts on resolve.

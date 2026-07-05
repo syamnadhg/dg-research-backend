@@ -7793,8 +7793,10 @@ def _start_command_listener(uid, research_id, loop):
                 # page and drops it from `pending`. notebooklm/youtube were
                 # added to the allowed list when the phase-time verify gate
                 # (BE-2) started routing per-platform Skip clicks here for
-                # P3/P4 alerts — the gate consumes skipped_agents in its own
-                # pause-wait loop and returns "skipped" to the caller.
+                # P3/P4 alerts. #899: the pause-wait consumers of
+                # skipped_agents are now _work_tab_login_pause's poll loop
+                # + the P2 round-robin; the slimmed gate only echoes a
+                # prior skip back to its caller.
                 _ag = (data.get("agent", "") or "").strip().lower()
                 if _ag in ("chatgpt", "gemini", "claude", "notebooklm", "youtube"):
                     loop.call_soon_threadsafe(_controls.request_skip_agent, _ag)
@@ -8175,8 +8177,10 @@ class PipelineControls:
         self.retry_init_verify: bool = False
         # #893: platforms whose trusted session cookie was FALSIFIED mid-run
         # (a login wall appeared on their work page). The phase-time gate's
-        # cookie fast path skips these, so a post-sign-in Retry runs the full
-        # verify instead of re-trusting the stale jar.
+        # cookie fast path skips these — the tile line downgrades to
+        # "unverified" and the work-tab preflight (#899) owns the real
+        # confirmation on the phase's own page; its 'ok' is the only
+        # mid-run remover (trust restored by direct observation).
         self.cookie_trust_broken: set[str] = set()
         # #899: platforms whose work-tab login pause hit the 10-min TIMEOUT
         # (nobody acted — distinct from an explicit user Skip, though both
@@ -8262,14 +8266,14 @@ class PipelineControls:
         # next platform login_required) display the stale Continue-with-Free
         # button — user clicks it again, BE consumes continue_anyway again.
         self.pro_alert_emitted: set[tuple[int, str]] = set()
-        # Per-platform Free-tier consent for the phase-time verify gate. When
-        # init verification is skipped (skip_init_verify=True) and a phase
-        # later prompts the user for a per-platform pro_required, "Continue
-        # with Free" sets free_tier_consent[platform]=True so subsequent
-        # phases for the SAME platform skip the pro check (the user already
-        # decided). Distinct from pro_warning_acknowledged (global, set by
-        # P0): _phase_verify_gate sets BOTH so the P1 ChatGPT Pro selector
-        # backstop at line ~15218 also picks up the consent.
+        # Per-platform Free-tier consent for phase-time pro_required cards.
+        # "Continue with Free" sets free_tier_consent[platform]=True so
+        # subsequent checks for the SAME platform skip the pro read (the
+        # user already decided). Distinct from pro_warning_acknowledged
+        # (global). #899: the gate's pro loop is gone — the remaining
+        # per-platform writer is the P2 post-2C ChatGPT tier backstop's
+        # Retry path; the 2C Gemini backstop consents via the GLOBAL flag
+        # (its guard checks both, so behavior is unchanged).
         self.free_tier_consent: dict[str, bool] = {}
 
     def request_stop(self):
@@ -9351,10 +9355,12 @@ async def _probe_cua_available(cua_client) -> None:
     Before this, the ONLY place a dead key surfaced was the P0 per-platform
     login walk (verify_login_cua) — which `skipInitVerify` blanks entirely
     (`preflight_platforms = []`). So with "Skip login verification" on, a dead
-    key flowed straight into the run and FAILED OPEN at every phase-time gate
-    (_phase_verify_gate:11194), never alerting. "Skip login verification" is a
-    statement about platform sign-ins; it must NOT also disable the vision
-    infra every phase depends on.
+    key flowed straight into the run and FAILED OPEN at every phase-time gate,
+    never alerting. (History: that gate has since been slimmed to a CUA-free
+    trust check — #899 — so the fail-open concern now lives in the phases'
+    own vision/CUA tiers; this probe is still their availability gate.)
+    "Skip login verification" is a statement about platform sign-ins; it
+    must NOT also disable the vision infra every phase depends on.
 
     So this probe decouples availability from login: the P0 caller runs it
     REGARDLESS of skipInitVerify, it makes ONE minimal Anthropic call, and it
@@ -12361,10 +12367,10 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
     in with a Pro account.
 
     Skip is destination-aware: at P0 it routes to skip_init_verify (fully
-    bypassing init verification, with phases then re-verifying through
-    _phase_verify_gate); at phase ≥ 1 it routes to skip_agent (drops THIS
-    platform from the run while leaving the rest going). Same button label,
-    different downstream wiring keyed by phase.
+    bypassing init verification — the phases' work-tab preflights + DOM
+    tier backstops are the safety net, #899); at phase ≥ 1 it routes to
+    skip_agent (drops THIS platform from the run while leaving the rest
+    going). Same button label, different downstream wiring keyed by phase.
 
     `agent` is the platform key ('chatgpt' / 'claude' / 'gemini'). The alert_id
     embeds it so concurrent multi-platform Pro alerts don't collide.
@@ -12390,8 +12396,8 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
          "command": {"action": "continue_anyway"}},
         {"id": "retry", "label": "Retry", "style": "primary",
          "command": {"action": "retry_phase", "phase": phase}},
-        # Skip: at P0 → skip_init_verify (handed off to per-phase
-        # _phase_verify_gate). At phase ≥ 1 → skip_agent for this
+        # Skip: at P0 → skip_init_verify (the phases' work-tab preflights
+        # take over — #899). At phase ≥ 1 → skip_agent for this
         # platform only, leaving siblings to run normally. The agent-key
         # in the command lets phase-time skip target one platform without
         # touching the others (P2 has 3 concurrent agents).
@@ -12760,51 +12766,37 @@ async def _work_tab_login_pause(page, agent_key: str, phase: int, label: str,
 
 
 async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) -> str:
-    """Phase-time login + pro-tier re-verification gate. Triggered ONLY when
-    init verification was skipped (`_controls.skip_init_verify=True`). Each
-    phase invokes this for the platform it's about to use; if the platform
-    is logged-out or non-pro, the gate emits the same alerts as Phase 0
-    (`login_required` / `pro_required`) and blocks the phase until the user
-    decides. Returns:
+    """Phase-time login TRUST CHECK — slimmed by #899 (work-tab preflight).
+    Runs ONLY when init verification was skipped (skip_init_verify=True;
+    verifyLogins ON ⇒ the P0 walk is the gate and this is a no-op — the
+    truth table is unchanged). The gate never opens a tab, never calls CUA,
+    and never pauses anymore: the phases confirm sign-in on the tab they
+    actually WORK in (_work_tab_signed_out + _work_tab_login_pause / the P2
+    per-agent fail cards), which is both bot-safer (zero extra navigations)
+    and truthful (the isolated tab could pass while the work page failed).
+    Returns:
 
-      'ok'      — verification passed (or fail-open on CUA outage)
-      'skipped' — user picked Skip on the alert (caller drops the platform)
+      'ok'      — cookie trusted, or unconfirmed (the work-tab preflight
+                  owns the real outcome — an `unverified` progress line is
+                  emitted so the tile says so)
+      'skipped' — platform was skip-clicked earlier this run (skipped_agents)
       'stop'    — pipeline stop received
 
-    No-op when skip_init_verify is False — preserves the 2026-04-24 design
-    where Phase 0 is the single login gate for the happy path. The gate
-    opens a fresh tab for verification and closes it on exit, so the
-    phase's own tab handling is unaffected.
-
-    Per-run consent flags:
-      - free_tier_consent[platform]=True suppresses the gate's pro check
-        for that platform on subsequent phases (set when user clicks
-        Continue with Free at phase-time).
-      - skipped_agents.add(platform) makes the gate return 'skipped' on
-        re-entry without re-prompting (set by Skip click at phase-time).
-
-    Notes:
-      - login_required at phase ≥ 1 reuses the same FE alert renderer as
-        P0; only the `phase` field changes. alert_id is scoped per-phase
-        per-platform so concurrent multi-platform alerts don't collide.
-      - pro_required reuses _emit_pro_required_alert which already routes
-        Skip → skip_agent at phase ≥ 1 (BE-1 commit).
-      - The ChatGPT-specific case: at P1, gate-skip routes the caller into
-        the manual_brief flow (caller responsibility). At P2, gate-skip
-        drops ChatGPT from enabled_agents but Gemini/Claude continue.
+    Tier checks moved with the tabs: ChatGPT = P1 Pro-selector backstop +
+    the post-2C DOM read; Gemini = the 2C DOM read; Claude = the chat-mode
+    card. `cua_client` is kept in the signature for caller compatibility.
     """
+    del cua_client  # #899: no CUA at phase time — kept for signature compat
     if not _controls.skip_init_verify:
         return "ok"
     if _controls.is_stop():
         return "stop"
-    # Platform already gate-skipped or skip-clicked in a prior phase →
-    # don't re-prompt. The user already decided; respect that.
+    # Platform already skip-clicked in a prior phase → don't re-prompt.
+    # The user already decided; respect that.
     if agent_key in _controls.skipped_agents:
         return "skipped"
 
     label = _PLATFORM_LABEL_BY_KEY.get(agent_key, agent_key.title())
-    info = LOGIN_PLATFORMS.get(agent_key)
-    root = info["root"] if info else "about:blank"
 
     # Trust-first fast path (2026-07-02): session cookie present → trust the
     # sign-in with ZERO navigations (no verify tab, no CUA call, no gate
@@ -12815,7 +12807,8 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
     # (Free Claude lacks the Research tool, which that card surfaces). A
     # platform whose trusted cookie later turned out STALE (a mid-phase
     # login wall was seen — _page_shows_login_wall) is in cookie_trust_broken
-    # and skips this path, so the post-sign-in Retry re-verifies for real.
+    # and skips this path — it gets the honest "unverified" line below and
+    # the work-tab preflight confirms (and restores trust) on the work page.
     if agent_key not in getattr(_controls, "cookie_trust_broken", set()) \
             and await _platform_auth_cookie_present(browser, agent_key):
         log(f"Phase {phase}: {label} session cookie present — trusting sign-in (no verify tab)", "INFO")
@@ -12823,172 +12816,15 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
                    status="verified", progress=f"{label}: sign-in trusted ✓")
         return "ok"
 
-    log(f"Phase {phase}: re-verifying {label} (no session cookie — phase-time gate)", "INFO")
-
-    while True:
-        if _controls.is_stop():
-            return "stop"
-        if agent_key in _controls.skipped_agents:
-            return "skipped"
-
-        tab = None
-        try:
-            # open_isolated_tab (NOT new_tab) — verify is a throwaway: we
-            # open the tab, check login/tier, close it in finally. Using
-            # new_tab here clobbers self.page; tab.close() then leaves
-            # self.page pointing at a dead page and run_phase1's first
-            # navigate dies with TargetClosedError. open_isolated_tab
-            # preserves self.page across the verify call.
-            tab = await browser.open_isolated_tab(root)
-            # Settle for SPA hydration — same delay Phase 0 uses (line ~19894)
-            # to dodge the "loading shell" false-positive on Claude/Gemini.
-            await asyncio.sleep(4.0)
-
-            try:
-                current_url = (tab.url or "").lower()
-            except Exception:
-                current_url = ""
-
-            login_ok = True
-            if any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
-                log(f"Phase {phase}: {label} on login URL ({current_url[:60]}) — not logged in", "INFO")
-                login_ok = False
-            else:
-                try:
-                    login_ok = await verify_login_cua(tab, agent_key, cua_client)
-                except CuaUnavailableError as cua_err:
-                    # CUA outage at phase-time is fail-open — the phase will
-                    # surface real failures via its own scraping/auth detection.
-                    # Different from P0 which fails-closed because P0 IS the
-                    # gate; here we already accept that init was skipped, so
-                    # adding another hard fail on CUA outage adds zero safety.
-                    log(f"Phase {phase}: CUA unavailable for {label} login check, fail-open: {cua_err}", "WARN")
-                    login_ok = True
-
-            if not login_ok:
-                emit_event("agent_progress", phase=phase, agent=agent_key,
-                           status="needs_login",
-                           progress=f"{label}: login required ✗ (phase-time check)")
-                _pt_login_msg = f"{label} needs a login. Sign in using the open browser, then Retry."
-                _pt_login_alert_id = f"phase{phase}_login_required_{agent_key}"
-                emit_event("login_required",
-                           phase=phase,
-                           platforms=[agent_key],
-                           platformLabels=[label],
-                           machineName=socket.gethostname(),
-                           attempt=1,
-                           message=_pt_login_msg,
-                           alert_id=_pt_login_alert_id)
-                _controls.request_pause("login_required")
-                emit_event("pipeline_paused", phase=phase, reason="login_required")
-                # Durable mirror — see _persist_pending_decision. Lets a cold
-                # chat-open at a phase-time login gate re-surface the Retry card.
-                _persist_pending_decision({
-                    "kind": "login_required",
-                    "phase": phase,
-                    "platforms": [agent_key],
-                    "platformLabels": [label],
-                    "machineName": socket.gethostname(),
-                    "attempt": 1,
-                    "message": _pt_login_msg,
-                    "alert_id": _pt_login_alert_id,
-                })
-                await _controls.wait_if_paused()
-                _clear_pending_decision()
-                if _controls.is_stop():
-                    emit_event("pipeline_stopped", phase=phase, reason="stopped during login_required")
-                    return "stop"
-                if agent_key in _controls.skipped_agents:
-                    emit_event("pipeline_resumed", phase=phase, reason="agent_skipped")
-                    return "skipped"
-                # Anything else (retry_phase, retry_init_verify, generic
-                # resume) → re-loop and re-verify with a fresh tab.
-                _controls.consume_retry_phase(phase)
-                _controls.retry_init_verify = False
-                emit_event("pipeline_resumed", phase=phase, reason="retry")
-                continue  # re-verify
-
-            # Login passed — pro-tier check. Two short-circuits before we
-            # touch CUA (both also save the `[resolve_api_key]` log line +
-            # _cua_pro_tier_call round-trip):
-            #   1. Global ack: user clicked "Continue with Free" at Phase 0 or
-            #      Phase 1 setup-Pro backstop, setting `pro_warning_acknowledged`.
-            #      That ack semantically means "suppress further Pro alerts this
-            #      run" (matching Phase 0 platform-check gate at :21201 + Phase 1
-            #      backstop at :16939). F3 (DGOPS-7449, 2026-05-13) — pre-fix,
-            #      this gate ran the CUA tier check and re-emitted pro_required
-            #      after a P0 ack, costing the user a second Continue click.
-            #   2. Per-platform consent: a prior phase's verify_gate already
-            #      collected ack for THIS specific platform (see :7257 below).
-            if (agent_key in _PRO_TIER_PLATFORMS
-                    and cua_client is not None
-                    and not _controls.pro_warning_acknowledged
-                    and not _controls.free_tier_consent.get(agent_key, False)):
-                emit_event("agent_progress", phase=phase, agent=agent_key,
-                           status="checking_tier",
-                           progress=f"{label}: checking subscription tier… (phase-time check)")
-                try:
-                    tier = await _cua_pro_tier_call(tab, agent_key, cua_client)
-                except CuaUnavailableError as cua_err:
-                    log(f"Phase {phase}: CUA unavailable for {label} tier check — assuming Pro: {cua_err}", "WARN")
-                    tier = "unsure"
-
-                if tier == "free":
-                    log(f"Phase {phase}: {label} on Free tier — emitting pro_required alert", "INFO")
-                    emit_event("agent_progress", phase=phase, agent=agent_key,
-                               status="not_pro",
-                               progress=f"{label}: Pro NOT detected — Phase output will be degraded")
-                    _emit_pro_required_alert(phase=phase, agent=agent_key,
-                                             source=f"phase{phase}/verify_gate")
-                    _controls.request_pause("pro_required")
-                    emit_event("pipeline_paused", phase=phase, reason="pro_required")
-                    await _controls.wait_if_paused()
-                    if _controls.is_stop():
-                        emit_event("pipeline_stopped", phase=phase, reason="user_stop_pro_required")
-                        return "stop"
-                    if agent_key in _controls.skipped_agents:
-                        emit_event("pipeline_resumed", phase=phase, reason="agent_skipped")
-                        return "skipped"
-                    if _controls.consume_retry_phase(phase):
-                        # User clicked Retry on pro_required — they're (presumably)
-                        # signing in with a Pro account. Re-verify from scratch.
-                        log(f"Phase {phase}: user clicked Retry on {label} pro_required — re-verifying", "INFO")
-                        emit_event("pipeline_resumed", phase=phase, reason="pro_retry")
-                        continue  # re-loop, re-verify
-                    if _controls.consume_continue_anyway():
-                        _controls.free_tier_consent[agent_key] = True
-                        # Also set the global flag so the P1 ChatGPT Pro selector
-                        # backstop at line ~15218 picks it up — keeps the existing
-                        # P0-driven behavior intact for the skip-init-verify path.
-                        _controls.pro_warning_acknowledged = True
-                        log(f"Phase {phase}: user opted into Free for {label}", "INFO")
-                        _clear_pro_required_alerts(triggered_at_phase=phase)
-                        emit_event("pipeline_resumed", phase=phase, reason="continue_with_free")
-                        emit_event("agent_progress", phase=phase, agent=agent_key,
-                                   status="free_acknowledged",
-                                   progress=f"{label}: continuing on Free (user-acknowledged)")
-                    else:
-                        # Generic resume without explicit choice — treat as
-                        # Free-acknowledged for THIS platform (matches the P0
-                        # generic-resume semantics at line ~20028).
-                        _controls.free_tier_consent[agent_key] = True
-                        _controls.pro_warning_acknowledged = True
-                        log(f"Phase {phase}: pro_required pause resumed without explicit choice — treating as Free-acknowledged", "INFO")
-                        _clear_pro_required_alerts(triggered_at_phase=phase)
-                        emit_event("pipeline_resumed", phase=phase, reason="resume")
-                elif tier == "pro":
-                    log(f"Phase {phase}: {label} Pro detected ✓ (phase-time)", "INFO")
-                else:  # unsure → fail open
-                    log(f"Phase {phase}: {label} tier UNSURE — assuming Pro (fail-open)", "INFO")
-
-            # Verification cleared — return to caller.
-            emit_event("agent_progress", phase=phase, agent=agent_key,
-                       status="verified", progress=f"{label}: phase-time verify ✓")
-            return "ok"
-        finally:
-            if tab is not None:
-                try: await tab.close()
-                except Exception: pass
+    # #899: cookie missing (or trust broken) → NO verify tab, NO CUA, NO
+    # pause. The work-tab preflight inside the phase confirms sign-in on the
+    # page it is about to drive and owns the login_required pause. Emit the
+    # honest "unconfirmed" tile line and let the phase proceed.
+    log(f"Phase {phase}: {label} sign-in unconfirmed (no session cookie) — the work-tab preflight will confirm", "INFO")
+    emit_event("agent_progress", phase=phase, agent=agent_key,
+               status="unverified",
+               progress=f"{label}: sign-in unconfirmed — will confirm on the work page")
+    return "ok"
 
 
 def _emit_chat_mode_alert(platform_l: str):
@@ -28556,7 +28392,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     # navigations, no CUA) is ChatGPT's Free-tier tell on runs where the P1
     # Pro-selector backstop never runs (skip-P1 / attached-sources runs).
     # Fail-open ("unsure" → no card), one-shot, respects prior consent.
-    if (agents.get("ChatGPT", {}).get("verified")
+    # Liveness accepts the 2A alive-handoff too (verify read False but the
+    # page is at /c/<id> — the cross-origin-DR-iframe false negative): that
+    # run IS generating, so it deserves the same tier tell.
+    _cg_entry = agents.get("ChatGPT", {})
+    _cg_alive = bool(_cg_entry.get("verified")) or \
+        "chatgpt.com/c/" in (_cg_entry.get("url") or "").lower()
+    if (_cg_alive
             and not _controls.pro_warning_acknowledged
             and not _controls.free_tier_consent.get("chatgpt", False)
             and "chatgpt" not in _controls.skipped_agents):
@@ -32616,12 +32458,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                    durationSec=int(time.time() - _p0_start),
                    summary=_p0_summary)
 
-        # Pre-emit phase_start(1) BEFORE the verify gate runs so the FE
-        # renders the P1 chip immediately instead of a blank gap during
-        # the gate's 4s SPA hydration + verify_login_cua + Pro tier check
-        # (skip_init_verify=true path). If the gate / dispatch below skips
-        # P1, phase_skipped follows and the FE flips the chip running →
-        # skipped — same lifecycle as a mid-phase skip click.
+        # Pre-emit phase_start(1) BEFORE the trust gate runs. Still load-
+        # bearing post-#899 even though the gate is now milliseconds: the
+        # gate's own tile emits ("sign-in trusted ✓" / "unverified") are
+        # dropped by the FE unless a P1 phase message already exists
+        # (usePipeline bails when getPhaseMessageId returns nothing). If
+        # the dispatch below skips P1, phase_skipped follows and the FE
+        # flips the chip running → skipped — same as a mid-phase skip.
         _p1_start_emitted = False
         if (start_phase <= 1 and 1 not in skip_phases
                 and 1 not in _controls.skipped_phases
@@ -32632,13 +32475,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _update_firestore_research({"phase": 1, "currentPhase": 1, "status": "ongoing"})
             _p1_start_emitted = True
 
-        # ══════════════════════ PHASE 1 verify gate (BE-2) ══════════════════════
-        # When init was skipped (skip_init_verify=True), re-verify ChatGPT
-        # login + Pro before P1 touches it. Skip routes into manual_brief
-        # flow inline — caller pre-populates brief_text + brief_artifact and
-        # marks _gate_skipped_p1=True so the dispatch chain steers into the
-        # SKIP branch (which then emits phase_skipped + creates BriefArtifact).
-        # No-op when init verified normally.
+        # ══════════════════════ PHASE 1 trust gate (BE-2, slimmed by #899) ══════════════════════
+        # When init was skipped (skip_init_verify=True), the gate is a
+        # zero-navigation cookie TRUST CHECK (no tab, no CUA, no pause —
+        # run_phase1's work-tab preflight owns real verification on the
+        # page it drives). 'skipped' is only the prior-skip echo: chatgpt
+        # already in skipped_agents from an earlier pause/skip. That routes
+        # into the manual_brief flow inline — caller pre-populates
+        # brief_text + brief_artifact and marks _gate_skipped_p1=True so
+        # the dispatch chain steers into the SKIP branch (which then emits
+        # phase_skipped + creates BriefArtifact). No-op when init verified.
         _gate_skipped_p1 = False
         # Did Phase 1 run a LIVE brief generation (ChatGPT) this session? Init
         # above the P1 block so it's always defined — including resume-into-P2
@@ -32656,7 +32502,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 emit_event("pipeline_stopped", phase=1, reason="user_stop_at_verify_gate")
                 return
             if _p1_gate == "skipped":
-                # User picked Skip on the P1 ChatGPT verify alert. Per the
+                # ChatGPT was skip-clicked at an earlier pause (the gate
+                # itself no longer prompts — #899). Per the
                 # ChatGPT-runs-twice design (P1 brief + P2 task), skip-at-P1
                 # cannot silently produce an empty brief — Phase 2 hard-fails
                 # with "No brief text available". Mirror the existing post-fail
@@ -32754,13 +32601,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # a real failure through fail_phase, which the alert panel
             # handles.
             #
-            # 2026-05-08 follow-up: when init verification is skipped
-            # (skip_init_verify=True), _phase_verify_gate runs above this
-            # block to re-verify login + Pro on a per-platform basis,
-            # mirroring P0's flow. The "Phase 0 is the single gate"
-            # invariant holds for the verified-init path; the gate
-            # re-introduces phase-time verification ONLY for the explicit
-            # skip-init path, where the alternative is silent degradation.
+            # 2026-05-08 follow-up, rewritten by #899: on skip-init runs
+            # _phase_verify_gate above is now a zero-navigation cookie
+            # TRUST CHECK only. Real phase-time verification lives in
+            # run_phase1 itself — the work-tab preflight
+            # (_work_tab_signed_out + _work_tab_login_pause) probes the
+            # page P1 actually drives, and runs REGARDLESS of verifyLogins
+            # (cheap insurance for sessions dying after a P0 walk).
             # ARCHITECTURE 2026-04-18: Never-die retry loop. Any fail_phase
             # inside this block awaits the user's Retry/Skip/Stop decision
             # via _controls.await_phase_decision(1). Retry loops back; Skip
@@ -33227,10 +33074,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             enabled_agents = [a for a, on in agents_cfg.items() if on]
             disabled_agents = [a for a, on in agents_cfg.items() if not on]
             log(f"[phase2] enabled_agents={enabled_agents} disabled_agents={disabled_agents}")
-            # Pre-emit phase_start(2) BEFORE the verify gate. Mirrors the
-            # P0→P1 eager-start pattern: without this, P1 ticked complete
-            # and the FE sat on a blank gap while the per-agent verify gate
-            # ran 4-15s of CUA verify_login calls (skip_init_verify path).
+            # Pre-emit phase_start(2) BEFORE the trust gate. Mirrors the
+            # P0→P1 eager-start pattern — and still load-bearing post-#899:
+            # the gate's per-agent tile emits ("trusted ✓"/"unverified")
+            # need an existing P2 phase message to land on.
             # _p2_initial_enabled remembers the pre-gate roster so the
             # canonical re-emit below can detect whether the gate trimmed
             # the list and re-fire with the corrected agents= field. Also
@@ -33244,11 +33091,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _update_firestore_research({"phase": 2, "currentPhase": 2, "status": "ongoing"})
                 _p2_start_emitted = True
 
-            # ── P2 verify gate (BE-2) ──
-            # When init was skipped, re-verify each enabled agent's login +
-            # Pro before P2 runs. Skip drops just that agent from
-            # enabled_agents (P2 continues with the rest). All-skipped →
-            # fail_phase since P2 can't run with zero agents.
+            # ── P2 trust gate (BE-2, slimmed by #899) ──
+            # When init was skipped: zero-navigation cookie trust check per
+            # agent (no tab/CUA/pause — Layer 0.5 in
+            # start_agent_no_gemini_wait owns real verification on each
+            # agent's own work tab). 'skipped' = prior-skip echo; it drops
+            # just that agent from enabled_agents (P2 continues with the
+            # rest). All-skipped → fail_phase since P2 can't run with zero.
             if _controls.skip_init_verify and not _controls.is_stop():
                 _p2_dropped_at_gate: list[str] = []
                 for _ag in list(enabled_agents):
@@ -33842,11 +33691,12 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 and not _controls.is_stop()):
             emit_event("phase_start", phase=3, description="Preparing NotebookLM…", agents=["notebooklm"])
             _update_firestore_research({"phase": 3, "currentPhase": 3, "status": "ongoing"})
-        # ══════════════════════ PHASE 3 verify gate (BE-2) ══════════════════════
-        # When init was skipped, re-verify NotebookLM login before P3 runs.
-        # Skip cascades to P4 (no YouTube without podcast — same rule as the
-        # skip_phase command handler at ~line 2833). NLM has no Pro/Free
-        # split (not in _PRO_TIER_PLATFORMS), so only login is checked.
+        # ══════════════════════ PHASE 3 trust gate (BE-2, slimmed by #899) ══════════════════════
+        # When init was skipped: zero-navigation cookie trust check for
+        # NotebookLM (no tab/CUA/pause — run_phase3_upload/audio own real
+        # verification via their work-tab preflights). 'skipped' =
+        # prior-skip echo; it cascades to P4 (no YouTube without podcast —
+        # same rule as the skip_phase command handler at ~line 2833).
         if (start_phase <= 3 and 3 not in skip_phases
                 and 3 not in _controls.skipped_phases
                 and _controls.skip_init_verify

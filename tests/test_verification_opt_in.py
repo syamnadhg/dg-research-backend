@@ -7,8 +7,10 @@ bot-score exposure. The batch:
   * --login runs Phase 1 only (real-Chrome sign-in; no automated verify);
   * pair Step 4 asks "Skip the verification step? [Y/n]" (default SKIP);
   * skipInitVerify defaults TRUE (BE config reads + bridge verifyLogins);
-  * the phase-time gate trusts a present session cookie (zero navigations)
-    and only opens a verify tab when the cookie is genuinely missing;
+  * the phase-time gate trusts a present session cookie (zero navigations);
+    #899 slimmed it further — a cookie miss now just emits an `unverified`
+    tile line (no verify tab, no CUA, no pause; the phase's own work-tab
+    preflight confirms sign-in on the page it actually drives);
   * the P2 inter-agent stagger is env-tunable (DG_P2_STAGGER_SEC).
 """
 import re
@@ -159,11 +161,25 @@ def test_gemini_gets_a_zero_navigation_tier_backstop():
 def test_gate_has_trust_first_fast_path():
     src = inspect.getsource(research._phase_verify_gate)
     assert "_platform_auth_cookie_present" in src, (
-        "the phase-time gate must consult the cookie probe BEFORE opening a "
-        "verify tab — the proactive navigation is the bot-score signal #893 kills"
+        "the phase-time gate must consult the cookie probe — a present "
+        "session cookie is trusted with ZERO navigations (#893)"
     )
-    # the fast path must come before the tab-opening loop
-    assert src.index("_platform_auth_cookie_present") < src.index("open_isolated_tab")
+    # #899: the gate is a trust CHECK only — no isolated verify tab, no CUA,
+    # no pause. A cookie miss emits the honest `unverified` tile line and
+    # returns 'ok'; the phase's own work-tab preflight owns the real outcome
+    # (probing the page the phase drives, which the throwaway tab never was).
+    assert "open_isolated_tab" not in src
+    assert "verify_login_cua" not in src
+    assert "_cua_pro_tier_call" not in src
+    assert "request_pause" not in src
+    # ...including the REALISTIC re-add vectors (review): calling the
+    # sibling pause helper (which pauses internally), blocking on an
+    # already-armed pause, or re-emitting the login card in-gate.
+    assert "_work_tab_login_pause(" not in src
+    assert "wait_if_paused" not in src
+    assert 'emit_event("login_required"' not in src
+    assert 'status="unverified"' in src
+    assert "will confirm on the work page" in src
 
 
 # ── skipInitVerify defaults TRUE (config reads) ──────────────────────────────
