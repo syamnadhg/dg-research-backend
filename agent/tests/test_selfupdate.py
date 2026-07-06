@@ -89,20 +89,9 @@ def test_agent_update_available(cache, monkeypatch):
     assert selfupdate.agent_update_available() is None  # already latest
 
 
-def test_backend_update_available():
-    import facade.selfupdate as su
-
-    def with_latest(v):
-        su.latest_on_pypi = lambda pkg: v  # type: ignore[assignment]
-
-    orig = su.latest_on_pypi
-    try:
-        with_latest("0.1.2")
-        assert su.backend_update_available("0.1.1") == "0.1.2"
-        assert su.backend_update_available("0.1.2") is None
-        assert su.backend_update_available(None) is None  # backend not installed
-    finally:
-        su.latest_on_pypi = orig  # type: ignore[assignment]
+def test_no_backend_update_available_symbol():
+    # The agent no longer surfaces backend updates anywhere — the helper is gone.
+    assert not hasattr(selfupdate, "backend_update_available")
 
 
 def test_spawn_detached_reconnect_builds_pipx_connect(tmp_path, monkeypatch):

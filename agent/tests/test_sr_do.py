@@ -119,7 +119,10 @@ def test_session_and_maintenance():
     assert "sign out" in _note("log out of super research").lower()
     assert _argv("what version?") == ["version"]
     assert "agent" in _note("update the agent").lower()
-    assert "backend" in _note("update super research").lower()
+    # "update super research" (no agent) → the runtime doesn't update the backend
+    # anymore; it redirects to `superresearch update` on the Research computer.
+    n = _note("update super research").lower()
+    assert "superresearch update" in n and "research computer" in n
 
 
 def test_unmatched_is_a_safe_ask_never_a_guess():
@@ -164,18 +167,29 @@ def test_plain_skip_still_works():
     assert _argv("skip the video and the report") == ["skip", "video", "report"]
 
 
-def test_progress_flavored_update_is_status_not_backend_update():
-    # Pre-fix ALL of these returned the backend-update confirm — a reflexive
-    # "yes" restarted the backend mid-run from a progress question.
+def test_progress_flavored_update_is_status_not_maintenance():
+    # Pre-fix ALL of these returned an update confirm — a reflexive "yes" acted on
+    # a progress question. They must resolve to a run STATUS ask.
     assert _argv("update me") == ["status"]
     assert _argv("give me an update") == ["status"]
     assert _argv("any updates?") == ["status"]
     assert _argv("any update on the Tesla research?") == ["status", "Tesla"]
     assert _argv("update me on the Tesla run") == ["status", "Tesla"]
-    # Maintenance phrasings still confirm-gate.
-    assert "backend" in _note("update the backend").lower()
-    assert "backend" in _note("update super research").lower()
-    assert "agent" in _note("update the agent").lower()
+
+
+def test_update_routing_agent_vs_backend():
+    # "update" / "update the agent" / "upgrade" → confirm the AGENT self-update
+    # (the only thing the runtime updates now — no misroute to a backend that
+    # isn't on this host).
+    for phrase in ("update", "upgrade", "update the agent", "update yourself",
+                   "update the super research agent"):
+        assert "agent" in _note(phrase).lower(), phrase
+    # Backend-named asks (no 'agent') → redirect to `superresearch update` on the
+    # Research computer; the runtime never updates the backend itself now.
+    for phrase in ("update the backend", "update super research",
+                   "update the research computer"):
+        n = _note(phrase).lower()
+        assert "superresearch update" in n and "research computer" in n, phrase
 
 
 def test_code_regex_rejects_hyphenated_words_and_embedded_tokens():

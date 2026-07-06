@@ -178,7 +178,6 @@ def test_status_surfaces_inflight_remote_login(live, mock_fe, monkeypatch):
     )
     monkeypatch.setattr(config, "FE_BASE", fe)
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
-    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda _v: None)
     monkeypatch.setattr(bridge, "_backend_version", lambda: None)
 
     s0 = requests.get(base + "/status").json()

@@ -1409,9 +1409,10 @@ def _local_superresearch() -> "str | None":
 
 
 def cmd_version(_args: argparse.Namespace) -> int:
-    """Show the agent version AND the Super Research backend version (the backend
-    is the thing that runs research; the agent just drives it), each with a
-    pip-style "newer on PyPI" nudge when one is available."""
+    """Show the agent version (+ a pip-style "newer on PyPI" nudge for the AGENT)
+    alongside the Super Research backend version. The agent no longer prompts to
+    update the backend — that's the app's job (the user runs `superresearch
+    update` on the Research computer) — so the backend line is display-only."""
     from . import selfupdate
     b.header("versio", "versions", tagline_color=branding._BOLD + branding._ACCENT)
     print(f"\n  {b.c(branding._BOLD, 'Agent')} (superresearch-agent)   {b.c(branding._BOLD, 'v' + __version__)}")
@@ -1431,36 +1432,10 @@ def cmd_version(_args: argparse.Namespace) -> int:
         m = _re.search(r"(\d+\.\d+\.\d+\S*)", out)
         backend_ver = m.group(1) if m else None
         print(f"  {b.c(branding._BOLD, 'Super Research')} (backend)   {b.c(branding._BOLD, ('v' + backend_ver) if backend_ver else '(version unknown)')}")
-        b_new = selfupdate.backend_update_available(backend_ver)
-        if b_new:
-            print(f"     {b.c(branding._ACCENT, '⬆ v' + b_new + ' available')} — update with  "
-                  f"{b.c(branding._BOLD, 'superresearch --update')}")
     else:
         print(f"  {b.c(branding._BOLD, 'Super Research')} (backend)   {b.c(branding._DIM, 'not installed on this machine')}")
     print()
     return 0
-
-
-def cmd_update(_args: argparse.Namespace) -> int:
-    """Update the Super Research backend (delegates to `superresearch --update`).
-    The backend is the package that does the research; update the chat agent
-    itself separately with `pipx upgrade superresearch-agent`."""
-    b.header("renovatio", "update Super Research", tagline_color=branding._BOLD + branding._ACCENT)
-    sr = _local_superresearch()
-    if not sr:
-        print(f"\n  {_NO} Super Research isn't installed on this machine.")
-        print(f"     {b.c(branding._DIM, 'The backend runs on the paired device — update it there.')}")
-        print()
-        return 1
-    import subprocess as _sp
-    print("\n  Updating Super Research (the backend) …")
-    try:
-        rc = _sp.call([sr, "--update"])
-    except KeyboardInterrupt:
-        return 130
-    print(f"  {b.c(branding._DIM, 'Update the chat agent itself with:')}  {b.c(branding._BOLD, 'pipx upgrade superresearch-agent')}")
-    print()
-    return rc
 
 
 def cmd_home(args: argparse.Namespace) -> int:
@@ -1612,9 +1587,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", parents=[common],
                    help="show the agent + Super Research backend versions"
                    ).set_defaults(func=cmd_version)
-    sub.add_parser("update", parents=[common],
-                   help="update the Super Research backend to the latest published version"
-                   ).set_defaults(func=cmd_update)
+    # No `update` subcommand: the agent doesn't update the backend anymore. To
+    # update the backend, run `superresearch update` on the Research computer (the
+    # app notifies when one's available); update the agent with `connect`.
 
     v = sub.add_parser("verify", parents=[common],
                        help="P0 gate proof: read researches + list devices (+ optional enqueue)")

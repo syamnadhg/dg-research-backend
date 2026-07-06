@@ -1,10 +1,12 @@
-"""Self-update for the AGENT (the chat bridge + skill), distinct from the backend
-update (`superresearch --update`, driven via bridge `/update`).
+"""Self-update for the AGENT (the chat bridge + skill). The agent no longer
+updates the Super Research BACKEND — the app surfaces backend updates (the BE
+self-reports its version + update signal on its device-doc heartbeat) and the user
+runs `superresearch update` on the Research computer.
 
 Two pieces:
-  • version notices — a pip-style "a newer version is on PyPI" nudge for both the
-    agent and the co-located backend, cached 24h so it costs at most one short
-    network call per package per day and can never block or break a command.
+  • version notice — a pip-style "a newer AGENT is on PyPI" nudge, cached 24h so
+    it costs at most one short network call per day and can never block or break a
+    command. (`latest_on_pypi` is generic and still used for backend INSTALL.)
   • a detached reconnect — "update the agent" is a
     `pipx run --no-cache superresearch-agent connect` that runs ONCE the current
     bridge process exits (so the new bridge can bind the freed port). The
@@ -112,14 +114,13 @@ def agent_update_available() -> "str | None":
     return latest if (latest and version_gt(latest, __version__)) else None
 
 
-def backend_update_available(backend_version: "str | None") -> "str | None":
-    """The newer backend version on PyPI if newer than `backend_version` (the
-    installed backend, from `superresearch --version`), else None. None when the
-    backend isn't installed (nothing to compare)."""
-    if not backend_version:
-        return None
-    latest = latest_on_pypi(BACKEND_PKG)
-    return latest if (latest and version_gt(latest, backend_version)) else None
+# NOTE: no `backend_update_available` — the agent no longer surfaces backend
+# updates anywhere (chat, bridge /status + /version, or the CLI). The app owns the
+# backend-update prompt (the BE self-reports its update signal on its device-doc
+# heartbeat; the user runs `superresearch update` on the Research computer).
+# `latest_on_pypi` + `BACKEND_PKG` stay — BACKEND_PKG is still used by
+# spawn_detached_backend_install (installing a backend on a fresh host is a
+# separate, supported action).
 
 
 # Detached helper: wait for the bridge process (passed pid) to exit, then run the

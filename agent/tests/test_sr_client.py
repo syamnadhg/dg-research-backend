@@ -111,7 +111,6 @@ def bridge_port(monkeypatch):
     # Never hit PyPI from tests: neutralize the update notices by default (the
     # /status + /version routes call these). Tests that assert notices override them.
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
-    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: None)
     # The update routes do a FRESH latest_on_pypi(force=True) check; default it to
     # None (= "couldn't determine → proceed"). "already up to date" tests override it.
     monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: None)
@@ -176,7 +175,6 @@ def test_status_account_inflight_signin_hint(monkeypatch, capsys):
     # approve it in the browser (the auto-poller then connects them), instead of a
     # bare "Not signed in — run login".
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
-    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: None)
     monkeypatch.setattr(bridge, "_backend_version", lambda: None)
     state = bridge.BridgeState()
     state.set_session(None)  # force not-signed-in regardless of any on-disk session
@@ -200,7 +198,6 @@ def _no_session_bridge(monkeypatch, *, remote_state: str | None = None):
     """A running bridge with NO account session (optionally a remote flow in
     `remote_state`). Returns (httpd) — caller closes it."""
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
-    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: None)
     monkeypatch.setattr(bridge, "_backend_version", lambda: None)
     state = bridge.BridgeState()
     state.set_session(None)  # force not-signed-in regardless of any on-disk session
@@ -378,59 +375,40 @@ def test_version_when_backend_absent(bridge_port, monkeypatch, capsys):
     assert "not installed" in capsys.readouterr().out
 
 
-def test_update_starts_backend(bridge_port, monkeypatch, capsys):
-    # `update` from chat kicks `superresearch --update` on the connected device
-    # (the bridge shells out; the backend's updater detaches and returns fast).
-    monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
-    monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: "0.2.0")  # newer
-    calls = {}
-    def _fake_update():
-        calls["ran"] = True
-        return {"rc": 0, "output": "started"}
-    monkeypatch.setattr(bridge, "_start_backend_update", _fake_update)
+def test_update_command_routes_to_agent_update(bridge_port, monkeypatch, capsys):
+    # The runtime no longer updates the BACKEND — `update`/`upgrade` are now
+    # aliases for the AGENT self-update (so a bare "update" from chat updates the
+    # thing you're talking to, never a backend that isn't on this host).
+    monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: True)
+    monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: True)
     assert sr.main(["update"]) == 0
-    assert calls.get("ran") is True
-    assert "Updating Super Research" in capsys.readouterr().out
+    assert "Updating the Super Research agent" in capsys.readouterr().out
 
 
-def test_update_already_latest(bridge_port, monkeypatch, capsys):
-    # On the newest published backend → say so, don't pointlessly reinstall/restart.
-    monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
-    monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: "0.1.1")
-    ran = {"v": False}
-    monkeypatch.setattr(bridge, "_start_backend_update", lambda: ran.__setitem__("v", True))
-    assert sr.main(["update"]) == 0
-    out = capsys.readouterr().out
-    assert "already up to date" in out and "0.1.1" in out
-    assert ran["v"] is False  # never shelled the updater
+def test_no_backend_update_surface_left(bridge_port, monkeypatch):
+    # The backend-update path is fully gone from the runtime: no /update route, no
+    # _start_backend_update helper, no cmd_update in the chat client.
+    assert not hasattr(bridge, "_start_backend_update")
+    assert not hasattr(bridge, "_update_backend")
+    assert not hasattr(sr, "cmd_update")
+    assert not hasattr(bridge.selfupdate, "backend_update_available")
 
 
-def test_update_when_backend_absent(bridge_port, monkeypatch, capsys):
-    # No backend on the connected device → a clear chat error (route 404s), not a
-    # crash or a silent no-op.
-    def _absent():
-        raise FileNotFoundError("backend_not_installed")
-    monkeypatch.setattr(bridge, "_start_backend_update", _absent)
-    assert sr.main(["update"]) == 1
-    assert "isn't installed" in capsys.readouterr().out
-
-
-def test_version_shows_update_notices(bridge_port, monkeypatch, capsys):
-    # `version` surfaces a pip-style "newer available" nudge for BOTH the agent and
-    # the backend (the bridge checks PyPI; cached 24h).
+def test_version_shows_agent_nudge_only(bridge_port, monkeypatch, capsys):
+    # `version` surfaces a pip-style "newer available" nudge for the AGENT only.
+    # The backend version is display-only (no update nudge — the app owns that).
     monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: "0.1.9")
-    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: "0.2.0")
     assert sr.main(["version"]) == 0
     out = capsys.readouterr().out
     assert "v0.1.9 available" in out and "update the agent" in out
-    assert "v0.2.0 available" in out
+    assert "backend  v0.1.1" in out          # backend shown…
+    assert "0.1.1 available" not in out       # …but never nudged to update
 
 
 def test_version_no_notices_when_current(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
-    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: None)
     assert sr.main(["version"]) == 0
     assert "available" not in capsys.readouterr().out
 
@@ -503,14 +481,14 @@ def test_install_backend_helper_fails(bridge_port, monkeypatch, capsys):
     assert "pipx" in capsys.readouterr().out.lower()
 
 
-def test_status_account_prompts_available_updates(bridge_port, monkeypatch, capsys):
-    # The welcome / bare-/sr proactively nudges when an update is available.
+def test_status_account_prompts_available_agent_update(bridge_port, monkeypatch, capsys):
+    # The welcome / bare-/sr proactively nudges when an AGENT update is available.
+    # Backend updates are NOT nudged here anymore (the app owns that prompt).
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: "0.1.9")
-    monkeypatch.setattr(bridge.selfupdate, "backend_update_available", lambda b: "0.2.0")
     assert sr.main(["status-account"]) == 0
     out = capsys.readouterr().out
-    assert "Super Research v0.2.0 is available" in out and "update" in out
     assert "Agent v0.1.9 is available" in out
+    assert "backend" not in out.lower()  # no backend-update nag from the runtime
 
 
 def test_research_then_status(bridge_port, capsys):

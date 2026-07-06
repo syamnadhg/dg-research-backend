@@ -1190,22 +1190,16 @@ def _backend_version() -> "str | None":
         return None
     m = re.search(r"(\d+\.\d+\.\d+\S*)", out)
     # On a regex miss return None (version unknown) rather than raw CLI text — a
-    # non-version string would make backend_update_available() compare garbage and
-    # falsely report an upgrade.
+    # non-version string would be a misleading version display.
     return m.group(1) if m else None
 
 
-def _start_backend_update() -> "dict[str, object]":
-    """Kick `superresearch --update` on this host. The backend's updater detaches
-    (waits for its own short-lived process to exit, then runs the upgrade) and
-    returns promptly, so this does not block on the actual install. Raises
-    FileNotFoundError when the backend CLI is absent so the route can 404."""
-    exe = _backend_cli()
-    if not exe:
-        raise FileNotFoundError("backend_not_installed")
-    import subprocess
-    r = subprocess.run([exe, "--update"], capture_output=True, text=True, timeout=180)
-    return {"rc": r.returncode, "output": (r.stdout or r.stderr or "").strip()[-1500:]}
+# NOTE: no backend-update helper here. The runtime no longer updates the Super
+# Research BACKEND — the app surfaces backend updates (the BE self-reports its
+# version + update signal on its device-doc heartbeat) and the user runs
+# `superresearch update` on the Research computer. The agent only self-updates
+# (see /agent-install → selfupdate.spawn_detached_reconnect). Backend INSTALL
+# (turning a fresh PC into a research host) is a separate, still-supported action.
 
 
 def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
@@ -1385,8 +1379,6 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._research_skip(path[len("/research/"):-len("/skip")])
             elif path == "/shutdown":
                 self._shutdown()
-            elif path == "/update":
-                self._update_backend()
             elif path == "/agent-install":
                 self._agent_install()
             elif path == "/install-backend":
@@ -1525,11 +1517,13 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
                 self._json(200, {"ok": True})
 
         def _status(self) -> None:
-            # Carry the pip-style update notices so the welcome / a bare /sr can
-            # PROACTIVELY prompt "a newer version is available" (cached 24h — cheap).
+            # Carry the pip-style AGENT update notice so the welcome / a bare /sr
+            # can PROACTIVELY prompt "a newer agent is available" (cached 24h —
+            # cheap). Backend updates are NOT surfaced here anymore: the app owns
+            # that (the BE self-reports its update signal on its device-doc
+            # heartbeat; the user runs `superresearch update` on the Research PC).
             updates = {
                 "agentUpdate": selfupdate.agent_update_available(),
-                "backendUpdate": selfupdate.backend_update_available(_backend_version()),
             }
             sess = state.session
             if sess is None:
@@ -2425,53 +2419,27 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             threading.Thread(target=self.server.shutdown, daemon=True).start()
 
         def _version(self) -> None:
-            """The agent version + the co-located Super Research backend version,
-            each with a pip-style "newer on PyPI" notice (read-only; no account
-            needed — loopback + Host gated like every route). Lets `version` work
-            from chat the same as the agent CLI."""
-            backend = _backend_version()
+            """The agent version (+ a pip-style "newer agent on PyPI" notice) and
+            the co-located Super Research backend version for DISPLAY (read-only;
+            no account needed — loopback + Host gated like every route). No backend
+            update notice: the runtime doesn't update the backend anymore (the app
+            surfaces that; the user runs `superresearch update` on the Research
+            computer). Lets `version` work from chat the same as the agent CLI."""
             self._json(200, {
                 "agent": __version__,
-                "backend": backend,
+                "backend": _backend_version(),
                 "agentLatest": selfupdate.agent_update_available(),
-                "backendLatest": selfupdate.backend_update_available(backend),
             })
-
-        def _update_backend(self) -> None:
-            """Update the co-located Super Research backend (delegates to
-            `superresearch --update`, which detaches its own updater). Host/Origin
-            gated like every write; the backend that runs here is the host user's
-            own, so this is a local maintenance action (no account needed)."""
-            backend = _backend_version()
-            if backend is None:
-                self._json(404, {"error": "backend_not_installed"})
-                return
-            # Already on (or ahead of) the latest published version → say so instead
-            # of a pointless reinstall (fresh check; an explicit "update now" must not
-            # be decided off the 24h cache).
-            latest = selfupdate.latest_on_pypi(selfupdate.BACKEND_PKG, force=True)
-            if latest and not selfupdate.version_gt(latest, backend):
-                self._json(200, {"ok": True, "already": True, "current": backend})
-                return
-            try:
-                res = _start_backend_update()
-            except FileNotFoundError:
-                self._json(404, {"error": "backend_not_installed"})
-                return
-            except Exception as e:  # subprocess/timeout — report, don't crash the worker
-                log.warning("backend update failed to start: %s", e)
-                self._json(502, {"error": f"update_failed: {type(e).__name__}"})
-                return
-            self._json(200, {"ok": True, "started": True, **res})
 
         def _agent_install(self) -> None:
             """Update the AGENT itself (package + skill + bridge) to the latest
-            published version. `pipx run superresearch-agent` is always-latest, so we
-            spawn a DETACHED reconnect (redeploy skill + re-pin launcher + start the
-            new bridge) that fires once THIS process exits, then shut down — freeing
-            the loopback port so the new bridge can bind it. Host/Origin gated like
-            every write; this is a local maintenance action on the host user's own
-            agent (no account needed). Mirrors the backend's detached self-update."""
+            published version. The detached reconnect uses `pipx run --no-cache`
+            (see selfupdate.spawn_detached_reconnect — without --no-cache pipx
+            re-runs its stale cached build), redeploys the skill + re-pins the
+            launcher + starts the new bridge once THIS process exits, then shut
+            down — freeing the loopback port so the new bridge can bind it.
+            Host/Origin gated like every write; this is a local maintenance action
+            on the host user's own agent (no account needed)."""
             # Already on (or ahead of) the latest published agent → say so instead of
             # a pointless reconnect + bridge restart (fresh check, not the 24h cache).
             latest = selfupdate.latest_on_pypi(selfupdate.AGENT_PKG, force=True)
