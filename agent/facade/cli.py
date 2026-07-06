@@ -1588,7 +1588,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="show the agent + Super Research backend versions"
                    ).set_defaults(func=cmd_version)
     # No `update` subcommand: the agent doesn't update the backend anymore. To
-    # update the backend, run `superresearch update` on the Research computer (the
+    # update the backend, run `superresearch --update` on the Research computer (the
     # app notifies when one's available); update the agent with `connect`.
 
     v = sub.add_parser("verify", parents=[common],

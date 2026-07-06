@@ -473,7 +473,7 @@ def _update_notices(body: dict) -> list[str]:
     """Proactive "a newer AGENT version is available" prompt from a /status (or
     /version) body — so the user is nudged on the welcome without having to ask.
     Backend updates are NOT nudged here anymore: the app surfaces those and the
-    user runs `superresearch update` on the Research computer (the runtime no
+    user runs `superresearch --update` on the Research computer (the runtime no
     longer updates the backend)."""
     out = []
     if body.get("agentUpdate"):
@@ -985,7 +985,7 @@ def cmd_version(args) -> int:
     """Show the chat agent's version (+ a "newer available" nudge for the AGENT
     when one is published) alongside the Super Research backend's version. The
     agent no longer prompts to update the backend — the app surfaces that and the
-    user runs `superresearch update` on the Research computer — so the backend
+    user runs `superresearch --update` on the Research computer — so the backend
     line is display-only here."""
     code, body = _get("/version")
     if code != 200:
@@ -1050,7 +1050,7 @@ def cmd_install(args) -> int:
     if body.get("already"):
         return _emit(body, args.json, [
             "Super Research is already installed on this device.",
-            "To update it, run “superresearch update” on that computer; say "
+            "To update it, run “superresearch --update” on that computer; say "
             "“devices” to see/pair it.",
         ])
     return _emit(body, args.json, [
@@ -1214,7 +1214,7 @@ _NL_CONFIRMS = {
 # to where it happens now — the app notifies + the user runs it on the Research PC.
 _NL_BACKEND_UPDATE_MOVED = (
     "I only update the chat agent from here now. To update Super Research itself, "
-    "run “superresearch update” on the Research computer — the app also notifies "
+    "run “superresearch --update” on the Research computer — the app also notifies "
     "you when a backend update is available. (Say “update the agent” to update this chat agent.)"
 )
 
@@ -1406,7 +1406,7 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
         # Checked BEFORE the agent default so "update the super research AGENT"
         # still self-updates the agent.
         if not re.search(r"\b(agent|skill|bridge|chat|yourself)\b", low) and \
-                re.search(r"\b(backend|super ?research|research (pc|computer|machine)|be)\b", low):
+                re.search(r"\b(backend|super ?research|research (pc|computer|machine))\b", low):
             return None, [_NL_BACKEND_UPDATE_MOVED]
         # Everything else — "update", "upgrade", "update the agent/skill/yourself"
         # — updates the CHAT AGENT (the only thing the runtime updates now). No

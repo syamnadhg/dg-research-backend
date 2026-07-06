@@ -120,9 +120,9 @@ def test_session_and_maintenance():
     assert _argv("what version?") == ["version"]
     assert "agent" in _note("update the agent").lower()
     # "update super research" (no agent) → the runtime doesn't update the backend
-    # anymore; it redirects to `superresearch update` on the Research computer.
+    # anymore; it redirects to `superresearch --update` on the Research computer.
     n = _note("update super research").lower()
-    assert "superresearch update" in n and "research computer" in n
+    assert "superresearch --update" in n and "research computer" in n
 
 
 def test_unmatched_is_a_safe_ask_never_a_guess():
@@ -184,12 +184,22 @@ def test_update_routing_agent_vs_backend():
     for phrase in ("update", "upgrade", "update the agent", "update yourself",
                    "update the super research agent"):
         assert "agent" in _note(phrase).lower(), phrase
-    # Backend-named asks (no 'agent') → redirect to `superresearch update` on the
+    # Backend-named asks (no 'agent') → redirect to `superresearch --update` on the
     # Research computer; the runtime never updates the backend itself now.
     for phrase in ("update the backend", "update super research",
                    "update the research computer"):
         n = _note(phrase).lower()
-        assert "superresearch update" in n and "research computer" in n, phrase
+        assert "superresearch --update" in n and "research computer" in n, phrase
+
+
+def test_update_with_english_word_be_routes_to_agent():
+    # Regression: the backend-ask regex must NOT match the ordinary English word
+    # "be" (the |be alternative was dropped). These are AGENT-update asks, not
+    # backend redirects.
+    for phrase in ("update it, should be quick", "go ahead and update, that'd be great"):
+        n = _note(phrase).lower()
+        assert "research computer" not in n, phrase  # NOT the backend redirect
+        assert "agent" in n, phrase                  # the agent-update confirm
 
 
 def test_code_regex_rejects_hyphenated_words_and_embedded_tokens():

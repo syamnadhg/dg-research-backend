@@ -220,6 +220,28 @@ class TestVersionNotice:
         # cache was refreshed → a subsequent non-forced read sees the new value
         assert research._latest_on_pypi() == "0.1.9"
 
+    def test_latest_on_pypi_force_failure_preserves_cache(self, tmp_path, monkeypatch):
+        # A forced fetch that FAILS (offline) must NOT clobber a prior good value
+        # with "" — else the CLI + FE "update available" nudge goes silent for 24h.
+        import json, time
+        import urllib.request as _u
+        monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
+        (tmp_path / ".version_check.json").write_text(
+            json.dumps({"checked_at": time.time(), "latest": "0.1.9"})
+        )
+
+        def _boom(*a, **k):
+            raise OSError("offline")
+
+        monkeypatch.setattr(_u, "urlopen", _boom)
+        # this call couldn't determine a fresh value…
+        assert research._latest_on_pypi(force=True) is None
+        # …but the prior good value survives for the non-forced readers (nudge stays)
+        data = json.loads((tmp_path / ".version_check.json").read_text())
+        assert data["latest"] == "0.1.9"
+        assert research._latest_on_pypi() == "0.1.9"
+
     def test_device_version_fields_installed_with_update(self, monkeypatch):
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.4")
         monkeypatch.setattr(research, "_check_newer_version", lambda: "0.1.5")

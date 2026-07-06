@@ -1,7 +1,7 @@
 """Self-update for the AGENT (the chat bridge + skill). The agent no longer
 updates the Super Research BACKEND — the app surfaces backend updates (the BE
 self-reports its version + update signal on its device-doc heartbeat) and the user
-runs `superresearch update` on the Research computer.
+runs `superresearch --update` on the Research computer.
 
 Two pieces:
   • version notice — a pip-style "a newer AGENT is on PyPI" nudge, cached 24h so
@@ -117,7 +117,7 @@ def agent_update_available() -> "str | None":
 # NOTE: no `backend_update_available` — the agent no longer surfaces backend
 # updates anywhere (chat, bridge /status + /version, or the CLI). The app owns the
 # backend-update prompt (the BE self-reports its update signal on its device-doc
-# heartbeat; the user runs `superresearch update` on the Research computer).
+# heartbeat; the user runs `superresearch --update` on the Research computer).
 # `latest_on_pypi` + `BACKEND_PKG` stay — BACKEND_PKG is still used by
 # spawn_detached_backend_install (installing a backend on a fresh host is a
 # separate, supported action).

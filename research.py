@@ -3860,7 +3860,7 @@ async def _heartbeat_loop():
                     _heartbeat_failures = 0
 
                 # 2026-07-05: self-report version + PyPI update signal so the FE
-                # can prompt "run superresearch update on the Research computer"
+                # can prompt "run superresearch --update on the Research computer"
                 # (the agent no longer handles BE updates). DECOUPLED from the
                 # liveness write above and best-effort by design: these two fields
                 # are a SEPARATE allow-list entry, so if the firestore.rules update
@@ -43771,11 +43771,19 @@ def _latest_on_pypi(*, force: bool = False) -> "str | None":
             latest = ((_j.loads(r.read().decode("utf-8")).get("info") or {}).get("version")) or ""
     except Exception:
         latest = ""
-    try:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(_j.dumps({"checked_at": _t.time(), "latest": latest}))
-    except Exception:
-        pass
+    # Only refresh the cache on a SUCCESSFUL fetch. A failed fetch (offline /
+    # >2.5s timeout) must NOT overwrite a previously-cached good version with ""
+    # — with force=True (the explicit `--update` path, which is exactly when the
+    # network is likely down) that clobber would suppress the "update available"
+    # nudge on BOTH the CLI and the FE (via the heartbeat's updateAvailable) for
+    # up to 24h. On failure leave the cache untouched so the last known-good
+    # value keeps surfacing the update; the next call simply retries.
+    if latest:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(_j.dumps({"checked_at": _t.time(), "latest": latest}))
+        except Exception:
+            pass
     return latest or None
 
 
@@ -43811,7 +43819,7 @@ def _device_version_fields() -> dict:
     """Version fields the heartbeat publishes to the device doc: `version` (the
     BE's running package version) and `updateAvailable` (the newer version on
     PyPI, or None when current). The FE reads these to raise an in-app "run
-    `superresearch update` on the Research computer" notification — the agent no
+    `superresearch --update` on the Research computer" notification — the agent no
     longer touches BE updates. Sync (file read + 24h-cached PyPI); call OFF the
     event loop. A source checkout / offline yields version None + updateAvailable
     None, so the FE shows no update prompt (nothing to update)."""

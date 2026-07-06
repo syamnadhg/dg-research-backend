@@ -161,7 +161,7 @@ cancels. Never send the bare "yes" back into `do`.
 | "host the backend on this PC", "install Super Research here", "no devices — set one up" | **confirm**, then `sr.py install`, then guide pairing |
 | "what version?" | `sr.py version` (shows the agent + backend versions; nudges only when a new **agent** is available) |
 | "update", "update the agent", "update yourself" | **confirm**, then `sr.py agent-update` (updates the chat agent itself — bridge briefly restarts) |
-| "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch update` on the Research computer (the app also notifies when one's available). `sr.py do "<message>"` returns this exact redirect. |
+| "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer (the app also notifies when one's available). `sr.py do "<message>"` returns this exact redirect. |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome (see **A bare `/sr`**) |
 
 **Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
@@ -252,7 +252,7 @@ never `retry`, never a question back to the user.
   nudges only when a newer **agent** is available. `agent-update` (also `update` /
   `upgrade`) updates the chat agent itself (confirm; the bridge briefly restarts).
   The runtime does NOT update the **backend** — if the user asks to update Super
-  Research / the backend, tell them to run `superresearch update` on the Research
+  Research / the backend, tell them to run `superresearch --update` on the Research
   computer (the web app also notifies them when a backend update is available).
 
 ## Devices & Research Computers

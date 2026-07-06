@@ -1197,7 +1197,7 @@ def _backend_version() -> "str | None":
 # NOTE: no backend-update helper here. The runtime no longer updates the Super
 # Research BACKEND — the app surfaces backend updates (the BE self-reports its
 # version + update signal on its device-doc heartbeat) and the user runs
-# `superresearch update` on the Research computer. The agent only self-updates
+# `superresearch --update` on the Research computer. The agent only self-updates
 # (see /agent-install → selfupdate.spawn_detached_reconnect). Backend INSTALL
 # (turning a fresh PC into a research host) is a separate, still-supported action.
 
@@ -1521,7 +1521,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             # can PROACTIVELY prompt "a newer agent is available" (cached 24h —
             # cheap). Backend updates are NOT surfaced here anymore: the app owns
             # that (the BE self-reports its update signal on its device-doc
-            # heartbeat; the user runs `superresearch update` on the Research PC).
+            # heartbeat; the user runs `superresearch --update` on the Research PC).
             updates = {
                 "agentUpdate": selfupdate.agent_update_available(),
             }
@@ -2423,7 +2423,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             the co-located Super Research backend version for DISPLAY (read-only;
             no account needed — loopback + Host gated like every route). No backend
             update notice: the runtime doesn't update the backend anymore (the app
-            surfaces that; the user runs `superresearch update` on the Research
+            surfaces that; the user runs `superresearch --update` on the Research
             computer). Lets `version` work from chat the same as the agent CLI."""
             self._json(200, {
                 "agent": __version__,
@@ -2463,8 +2463,9 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             """Install the Super Research BACKEND on this host (`pipx install
             superresearch`) — turns this PC into a research host, all from chat.
             Detached (the bridge keeps running; this is a separate package). If the
-            backend is already present, say so (use `/update` to upgrade). Host/Origin
-            gated; pairing (API keys + browser logins) is done on the host after."""
+            backend is already present, say so (it updates via `superresearch
+            --update` on the host / the app's update prompt — not the agent).
+            Host/Origin gated; pairing (API keys + browser logins) on the host after."""
             if _backend_cli():
                 self._json(200, {"ok": True, "already": True})
                 return
