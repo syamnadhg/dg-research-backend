@@ -4218,49 +4218,53 @@ def _handle_update_command(data: dict, device_id: str, loop) -> None:
                                          "latest": None, "reason": "not the device owner"})
         return
 
-    # 2. Supervised-only (must check BEFORE _perform_self_update kills the daemon-loop).
-    _supervisor_alive = False
-    try:
-        self_pid = os.getpid()
-        for pid, _cmd, role in _enumerate_research_py_procs():
-            if pid != self_pid and role == "daemon-loop":
-                _supervisor_alive = True
-                break
-    except Exception:
-        pass
-    if not _supervisor_alive:
-        log("[device-cmds] UPDATE: no daemon-loop supervisor — refusing remote update", "WARN")
+    # 2. Supervised-only: the upgrade kills THIS worker + the daemon-loop, so an OS
+    #    supervisor (Scheduled Task / launchd / systemd) must exist to relaunch the
+    #    BE on the rebuilt venv. Check that artifact directly — it's the source of
+    #    truth (a live daemon-loop alone could be a manual run with no auto-restart,
+    #    which would leave the machine stranded offline after the update).
+    if not _detect_supervised():
+        log("[device-cmds] UPDATE: not supervised (no OS auto-start) — refusing remote update", "WARN")
         _write_update_status(device_id, {
             "state": "failed", "current": cur, "latest": None,
             "reason": "not supervised — run `superresearch --update` on the machine"})
         return
 
-    # 3. Mid-run guard: defer unless forced.
+    # 3. Mid-run guard: defer unless forced. `busy` is device-wide (any worker) and
+    #    gates the defer decision; `local_busy` is THIS worker's own run — the only
+    #    one we can stop gracefully (sibling workers are separate processes,
+    #    terminated by the venv rebuild like any update).
     force = bool(data.get("force"))
-    busy = bool(_QUEUE_STATE.get("running")) or bool(_dev.get("busyWorkerIds"))
+    local_busy = bool(_QUEUE_STATE.get("running"))
     try:
         _qr = _QUEUE_STATE.get("queue_ref")
         if _qr is not None and _qr.qsize() > 0:
-            busy = True
+            local_busy = True
     except Exception:
         pass
+    busy = local_busy or bool(_dev.get("busyWorkerIds"))
     if busy and not force:
         log("[device-cmds] UPDATE: deferred — a run is in progress (resend with force to override)")
         _write_update_status(device_id, {"state": "deferred", "current": cur,
                                          "latest": None, "reason": "a research run is in progress"})
         return
-    if busy and force and loop is not None:
-        try:
-            loop.call_soon_threadsafe(_controls.request_stop)
-            log("[device-cmds] UPDATE: force — signalled the active run to stop before the upgrade")
-        except Exception as _rs:
-            log(f"[device-cmds] UPDATE: request_stop dispatch failed: {_rs}", "WARN")
 
     # Decide + spawn the detached upgrade (does NOT print / exit — we own the exit).
     res = _perform_self_update(force_check=True)
     _write_update_status(device_id, {"state": res["state"], "current": res.get("current"),
                                      "latest": res.get("latest"), "reason": res.get("reason", "")})
     if res["state"] == "started":
+        # Only NOW that an upgrade is actually launched do we stop this worker's own
+        # run (gracefully, keeping partial results). Never stop a run for a no-op
+        # update (already/failed/unsupported) — that would abort an in-flight run
+        # for nothing. Sibling workers were just terminated by
+        # _spawn_detached_lifecycle so pipx can rebuild the shared venv.
+        if local_busy and loop is not None:
+            try:
+                loop.call_soon_threadsafe(_controls.request_stop)
+                log("[device-cmds] UPDATE: signalled this worker's run to stop before the upgrade")
+            except Exception as _rs:
+                log(f"[device-cmds] UPDATE: request_stop dispatch failed: {_rs}", "WARN")
         log(f"[device-cmds] UPDATE: upgrade launched ({res.get('current')} → "
             f"{res.get('latest') or 'latest'}); exiting so pipx can rebuild the venv")
         _schedule_server_exit("device-update", delay_sec=1.5)
@@ -4357,6 +4361,14 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     doc.reference.update({"processed": True})
                 except Exception as _de:
                     log(f"[device-cmds] processed-marker write failed for {doc.id}: {_de}", "DEBUG")
+            elif action == "update" and WORKER_ID != 1:
+                # Only worker 1 ACTS on `update`. A sibling worker must NOT delete
+                # the doc here — deleting it before worker 1's Firestore stream
+                # delivers the ADDED could drop the command with no replay (a
+                # create+delete inside a stream-resync window is coalesced away).
+                # Leaving it means the doc persists until worker 1 processes it (or
+                # the 30s stale gate reaps it). Worker 1 deletes it in the `else`.
+                continue
             else:
                 try:
                     doc.reference.delete()

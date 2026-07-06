@@ -116,8 +116,8 @@ def _handle(monkeypatch, *, dev_doc, cmd, supervised=True, running=False,
     store = {f"devices/{DEV}": dict(dev_doc)}
     monkeypatch.setattr(research, "_firebase_db", _FakeDB(store))
     monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
-    procs = [(999, "py research.py --daemon-loop", "daemon-loop")] if supervised else []
-    monkeypatch.setattr(research, "_enumerate_research_py_procs", lambda: procs)
+    # Supervised gate now checks the OS auto-start artifact (source of truth).
+    monkeypatch.setattr(research, "_detect_supervised", lambda: supervised)
 
     class _FakeQ:
         def qsize(self):
@@ -194,6 +194,23 @@ def test_force_during_run_stops_then_updates(monkeypatch):
     assert perform == [True], "forced update must run the upgrade"
     assert _status(store)["state"] == "started"
     assert exits and exits[0][0] == "device-update"
+
+
+def test_force_no_op_upgrade_does_not_stop_the_run(monkeypatch):
+    # Regression (review MAJOR): if a forced update turns out to be a no-op
+    # (already current / launch failed), the in-flight run must NOT be stopped —
+    # request_stop only fires once an upgrade is actually started.
+    store, exits, perform, loop = _handle(
+        monkeypatch,
+        dev_doc={"ownerUid": OWNER, "busyWorkerIds": [1]},
+        cmd={"action": "update", "submittedBy": OWNER, "force": True},
+        running=True,
+        perform_state="already",
+    )
+    assert perform == [True]
+    assert loop.calls == [], "must NOT stop the active run when nothing was upgraded"
+    assert exits == []
+    assert _status(store)["state"] == "already"
 
 
 def test_idle_owner_supervised_updates_and_exits(monkeypatch):
