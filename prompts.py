@@ -320,6 +320,10 @@ CRITICAL RULES:
 - DO NOT paste any text.
 - DO NOT modify existing content in the input.
 - ONLY locate and click the Send / Submit / Go button.
+- The Send button lives in the message COMPOSER (bottom of the chat column).
+  NEVER click in the LEFT navigation sidebar (New chat / Chats / Recents rows
+  or their "⋮" menus — clicking those opens a Star/Rename/Delete context
+  menu). If such a context menu is open, press Escape first to dismiss it.
 - If you cannot find a Send button, describe what you see instead."""
 
 

@@ -16405,7 +16405,7 @@ async def _count_claude_artifacts(page):
                 // broad pass-2 scan could land there when no artifact card
                 // has rendered yet, opening the Star/Rename/Delete menu
                 // instead of the sources panel (user-observed).
-                if (c.closest('nav, [role="menu"], [aria-haspopup="menu"], [class*="sidebar" i]')) return false;
+                if (c.closest('nav, aside, [role="menu"], [aria-haspopup="menu"], [class*="sidebar" i]')) return false;
                 return true;
             });
             return cards.length;
@@ -16508,7 +16508,7 @@ async def _click_claude_artifact(page, index=0):
                 // broad pass-2 scan could land there when no artifact card
                 // has rendered yet, opening the Star/Rename/Delete menu
                 // instead of the sources panel (user-observed).
-                if (c.closest('nav, [role="menu"], [aria-haspopup="menu"], [class*="sidebar" i]')) return false;
+                if (c.closest('nav, aside, [role="menu"], [aria-haspopup="menu"], [class*="sidebar" i]')) return false;
                 return true;
             });
             const targetIdx = idx < 0 ? cards.length + idx : idx;
