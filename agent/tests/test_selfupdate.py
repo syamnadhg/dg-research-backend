@@ -121,8 +121,10 @@ def test_spawn_detached_reconnect_builds_pipx_connect(tmp_path, monkeypatch):
     cmd = seen["cmd"]
     assert cmd[0] == "python3" and "-c" in cmd                # waiter runs under a stable python
     assert str(__import__("os").getpid()) in cmd              # waits for THIS bridge pid
-    # …then reconnects from the latest published agent
-    assert cmd[-6:] == ["pipx", "run", "superresearch-agent", "connect", "--yes", "--no-login"]
+    # …then reconnects from the latest published agent. --no-cache is REQUIRED:
+    # without it pipx re-runs its cached (stale) run-venv → the stuck-at-vX bug.
+    assert cmd[-7:] == ["pipx", "run", "--no-cache", "superresearch-agent",
+                        "connect", "--yes", "--no-login"]
 
 
 def test_spawn_detached_reconnect_targets_recorded_runtime(tmp_path, monkeypatch):
@@ -161,9 +163,17 @@ def test_spawn_detached_backend_install_no_pipx(monkeypatch):
 
 def test_agent_resolvable(monkeypatch):
     monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
-    monkeypatch.setattr(selfupdate.subprocess, "run",
-                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="agent 0.1.7"))
+    seen = {}
+
+    def _run_ok(*a, **k):
+        seen["argv"] = list(a[0])
+        return types.SimpleNamespace(returncode=0, stdout="agent 0.1.7")
+
+    monkeypatch.setattr(selfupdate.subprocess, "run", _run_ok)
     assert selfupdate.agent_resolvable() is True
+    # The preflight must validate the FRESH build (the one the reconnect will run),
+    # not a cached stale venv that would false-pass.
+    assert "--no-cache" in seen["argv"]
     monkeypatch.setattr(selfupdate.subprocess, "run",
                         lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=""))
     assert selfupdate.agent_resolvable() is False  # pipx couldn't resolve (offline / not on PyPI)

@@ -5,11 +5,15 @@ Two pieces:
   • version notices — a pip-style "a newer version is on PyPI" nudge for both the
     agent and the co-located backend, cached 24h so it costs at most one short
     network call per package per day and can never block or break a command.
-  • a detached reconnect — since `pipx run superresearch-agent` is ALWAYS-LATEST,
-    "update the agent" is just a `pipx run superresearch-agent connect` that runs
-    ONCE the current bridge process exits (so the new bridge can bind the freed
-    port). This mirrors the backend's proven `_spawn_detached_lifecycle` /
-    `_LIFECYCLE_WAITER` pattern (research.py).
+  • a detached reconnect — "update the agent" is a
+    `pipx run --no-cache superresearch-agent connect` that runs ONCE the current
+    bridge process exits (so the new bridge can bind the freed port). The
+    `--no-cache` is LOAD-BEARING: `pipx run` reuses its cached run-venv for ~14
+    days and would otherwise silently re-run the STALE build instead of the
+    newly-published one (the "said updated but stayed vX" bug) — the same reason
+    connect.py:run_agent_in_wsl forces it for connect/serve/resurrect. This
+    mirrors the backend's proven `_spawn_detached_lifecycle` / `_LIFECYCLE_WAITER`
+    pattern (research.py).
 """
 from __future__ import annotations
 
@@ -169,13 +173,16 @@ def agent_resolvable() -> bool:
     """Pre-flight for a self-update: can pipx actually resolve + run the latest
     agent right now? Lets /agent-install REFUSE (and keep the current bridge alive)
     when the update can't proceed — offline, the package isn't published yet, or
-    pipx is broken — instead of shutting the bridge down into a dead end."""
+    pipx is broken — instead of shutting the bridge down into a dead end. Uses
+    `--no-cache` so it validates the SAME fresh build the reconnect will run (a
+    cached run-venv would false-pass on the stale version, hiding a broken/absent
+    new release right up until the bridge is already shutting down)."""
     pipx = _pipx_cmd()
     if pipx is None:
         return False
     try:
-        r = subprocess.run([*pipx, "run", AGENT_PKG, "--version"],
-                           capture_output=True, text=True, timeout=90)
+        r = subprocess.run([*pipx, "run", "--no-cache", AGENT_PKG, "--version"],
+                           capture_output=True, text=True, timeout=180)
         return r.returncode == 0
     except Exception:
         return False
@@ -223,7 +230,11 @@ def spawn_detached_reconnect() -> bool:
     py = _waiter_python()
     if pipx is None or py is None:
         return False
-    reconnect = [*pipx, "run", AGENT_PKG, "connect", "--yes", "--no-login"]
+    # --no-cache is REQUIRED: without it `pipx run` re-uses its cached (~14-day)
+    # run-venv and re-runs the STALE build, so "update the agent" would redeploy
+    # the old version forever (the reported stuck-at-vX bug). Mirrors
+    # connect.py:run_agent_in_wsl, which forces it for connect/serve/resurrect.
+    reconnect = [*pipx, "run", "--no-cache", AGENT_PKG, "connect", "--yes", "--no-login"]
     # Target the SAME runtime that was originally connected — otherwise a host with
     # both runtimes installed would hit connect's "multiple runtimes — pass
     # --runtime" abort, finish without starting a bridge, and (since we shut the old
