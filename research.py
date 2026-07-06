@@ -16400,6 +16400,12 @@ async def _count_claude_artifacts(page):
                 const r = c.getBoundingClientRect();
                 if (r.width < 20 || r.height < 20) return false;
                 if (c.closest('[role="dialog"], [aria-modal="true"]')) return false;
+                // 2026-07-06: NEVER match the left nav/sidebar (Recents rows,
+                // their "More options" kebabs) or any menu trigger — the
+                // broad pass-2 scan could land there when no artifact card
+                // has rendered yet, opening the Star/Rename/Delete menu
+                // instead of the sources panel (user-observed).
+                if (c.closest('nav, [role="menu"], [aria-haspopup="menu"], [class*="sidebar" i]')) return false;
                 return true;
             });
             return cards.length;
@@ -16497,6 +16503,12 @@ async def _click_claude_artifact(page, index=0):
                 const r = c.getBoundingClientRect();
                 if (r.width < 20 || r.height < 20) return false;
                 if (c.closest('[role="dialog"], [aria-modal="true"]')) return false;
+                // 2026-07-06: NEVER match the left nav/sidebar (Recents rows,
+                // their "More options" kebabs) or any menu trigger — the
+                // broad pass-2 scan could land there when no artifact card
+                // has rendered yet, opening the Star/Rename/Delete menu
+                // instead of the sources panel (user-observed).
+                if (c.closest('nav, [role="menu"], [aria-haspopup="menu"], [class*="sidebar" i]')) return false;
                 return true;
             });
             const targetIdx = idx < 0 ? cards.length + idx : idx;
@@ -21603,10 +21615,19 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # CUA tier-3 escalation — fires after 2 consecutive DOM misses,
                 # capped at 1/agent/phase. Tries to find + click the FIRST
                 # artifact card visually.
+                # 2026-07-06 guard: ONLY escalate when the DOM actually SEES an
+                # artifact card (count > 0) that it failed to open. If no card
+                # exists yet (early in the run — polling now starts ~30s after
+                # Gemini's Start click, so Claude may not have spawned its
+                # tracking artifact), vision has nothing legitimate to click and
+                # historically mis-clicked the sidebar chat's ⋮ menu
+                # (Star/Rename/Delete popup). No card → just wait for the next
+                # tick; the DOM path opens it the moment it renders.
                 if (not p.get("artifact_panel_open")
                         and p.get("claude_artifact_dom_misses", 0) >= 2
                         and p.get("claude_artifact_cua_attempts", 0) == 0
-                        and cua_client):
+                        and cua_client
+                        and await _count_claude_artifacts(p["page"]) > 0):
                     log(f"[Claude] DOM missed artifact 2x — escalating to CUA tier-3 "
                         f"(cycle={p.get('poll_cycles')})")
                     emit_tier_transition(phase=2, agent="claude",
@@ -29848,8 +29869,31 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 "as researching (avoids a false 'running' on a stale/failed plan)", "WARN")
             verified_b = False
         else:
-            verified_b = await wait_until_verified(verify_gemini_generating, gemini_page, "2D",
-                browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
+            # 2026-07-06 (user directive): polling must start ≤30s after a
+            # CONFIRMED "Start research" click. The old wait_until_verified
+            # (15×3s + up to two CUA passes) could hold the round-robin
+            # hostage on the Gemini page for 2-3 minutes AFTER the click —
+            # the observed "run sat at Gemini forever before narration".
+            # The click was already confirmed-taken (start_clicked requires
+            # the 2× re-click confirm), so this verify is belt-and-suspenders:
+            # do a DOM-only poll for ≤30s, then hand off to the round-robin
+            # either way — it keeps not-verified agents ("detectors will
+            # decide") and MIN_WAIT stops premature completion checks.
+            verified_b = False
+            _v0 = time.time()
+            while time.time() - _v0 < 30:
+                if _controls.is_stop():
+                    break
+                try:
+                    if await verify_gemini_generating(gemini_page):
+                        verified_b = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+            if not verified_b:
+                log("[2D] DOM verify didn't confirm within 30s — handing to the "
+                    "round-robin anyway (click was confirmed; detectors decide)", "WARN")
         # Record when research actually started (after "Start research" click)
         # so the round-robin doesn't check for completion prematurely
         agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url,

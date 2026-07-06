@@ -1175,6 +1175,11 @@ SKIP these — they are NOT Claude artifacts:
 - Any card whose title is a filename (ends in .md, .pdf, .docx, .txt,
   .csv, .json, .html) — these are user-attached files, NOT artifacts.
 - Any card inside the user's message bubble or attachment-chip area.
+- The LEFT NAVIGATION SIDEBAR — New chat / Chats / Projects / Recents
+  rows and their "⋮" (More options) buttons. NEVER click anything in the
+  left sidebar: a Recents row's ⋮ opens a Star/Rename/Delete context menu,
+  not the artifact. If such a context menu is ALREADY open (Star / Rename /
+  Add to project / Delete), press Escape FIRST to dismiss it, then proceed.
 
 Claude artifact cards have topic-related titles (e.g. "Research Report
 on …", "Sources tracking", "Comprehensive research …", or "Boom! Your
