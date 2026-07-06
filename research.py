@@ -3758,6 +3758,137 @@ def _worker_is_resting(*, ttl_sec: float = 3.0) -> bool:
     return WORKER_ID in _RESTING_CACHE["ids"]
 
 
+# #904 (2026-07-06): throttle for the resting keep-alive pass — the idle
+# rescan ticks every ~15-25s per worker; the keep-alive only needs to act
+# on the order of minutes, so cap the Firestore reads it costs.
+_REST_KEEPALIVE_STATE = {"last_ms": 0}
+
+
+def _rest_keepalive_pass():
+    """#904: while THIS worker is resting, keep the parked queue durable.
+
+    Called from the idle rescan's resting branch (via asyncio.to_thread).
+    Two jobs, both scoped to UNCLAIMED action="start" docs (a resting
+    worker still never claims — Gate 2 stays intact):
+
+    (a) Keep-alive: refresh `restDeferredAt` when the stamp is >30min
+        old. Gate 1 stamps it once per listener ADDED, but no defer
+        passes happen during a steady-state rest — so a doc parked over
+        a weekend woke up with a days-old stamp and the 12h ABANDONED
+        stale-skip purged it on the wake replay (the sweep's rest
+        exemption measures age from this stamp once the worker is no
+        longer resting). Re-stamping here makes "park for days" safe.
+
+    (b) Status self-heal: if the linked research doc drifted to
+        status="ongoing" with no claim (FE mispredicted "run" at submit,
+        or Gate 1's corrective status="queued" write lost the #720
+        user-tree race), re-assert the queued state + enrichment. Live
+        repro 2026-07-06 ("Yo", all workers rested): the FE rendered
+        "Got it. Submitting..." + a Phase-0 Init tile that never
+        advanced because nothing re-corrected the doc. With this pass
+        the doc reads queued within ~a minute and the app's listener
+        paints the banner no matter what the submit-time prediction did.
+        Never touches terminal/claimed states: docs with assignedWorker
+        are skipped, research docs with a backendRunId (claimed at some
+        point) are skipped, and only status=="ongoing" is healed.
+
+    Sync (blocking Firestore I/O). All failures are non-fatal DEBUG: the
+    next tick retries.
+    """
+    now_ms = int(time.time() * 1000)
+    if now_ms - _REST_KEEPALIVE_STATE["last_ms"] < 60_000:
+        return
+    _REST_KEEPALIVE_STATE["last_ms"] = now_ms
+    _STAMP_REFRESH_MS = 30 * 60 * 1000
+    try:
+        did = load_device_id()
+        if not did or _firebase_db is None:
+            return
+        col = _firebase_db.collection("devices").document(did).collection("queue")
+        snaps = list(col.limit(20).stream())
+    except Exception as e:
+        log(f"[rest-keepalive] worker {WORKER_ID}: scan failed (non-fatal): {e}", "DEBUG")
+        return
+    for s in snaps:
+        d = s.to_dict() or {}
+        if d.get("processed") or d.get("assignedWorker"):
+            continue
+        if (d.get("action") or "start") != "start":
+            continue
+        rid = d.get("researchId") or ""
+        uid = d.get("submittedBy") or d.get("uid") or ""
+        if not rid or not uid:
+            continue
+        # Research-doc read FIRST — both the stamp and the heal gate on it.
+        try:
+            _rsnap = (_firebase_db.collection("users").document(uid)
+                      .collection("researches").document(rid).get())
+        except Exception as _e:
+            log(f"[rest-keepalive] status read failed for {rid[:8]}… (non-fatal): {_e}", "DEBUG")
+            continue
+        _rd = (_rsnap.to_dict() or {}) if _rsnap.exists else {}
+        _rstatus = _rd.get("status") or ""
+        # (a) keep-alive stamp — same field Gate 1 writes on defer. Review
+        # fold: gate on a HEALTHY research doc (queued, or the drifted
+        # "ongoing" healed below). A cancel-orphaned queue doc (research
+        # stopped/deleted but the queue-doc delete failed) must NOT be kept
+        # alive — the 12h ABANDONED sweep is what bounds the pre-existing
+        # wake-claims-a-cancelled-run hole, and an indefinite stamp would
+        # extend that hole forever.
+        if _rsnap.exists and _rstatus in ("queued", "ongoing"):
+            _stamp = d.get("restDeferredAt")
+            if (not isinstance(_stamp, (int, float))
+                    or now_ms - int(_stamp) > _STAMP_REFRESH_MS):
+                try:
+                    s.reference.update({"restDeferredAt": now_ms})
+                except Exception as _e:
+                    log(f"[rest-keepalive] stamp failed for {rid[:8]}… (non-fatal): {_e}", "DEBUG")
+        # (b) status self-heal — drifted "ongoing" with no claim anywhere.
+        if not _rsnap.exists or _rstatus != "ongoing" or _rd.get("backendRunId"):
+            continue
+        try:
+            _enrich = _compute_queue_enrichment(col, s.id, uid)
+            _eta_ms, _eta_at = _read_eta_inputs_and_compute(_enrich["position"])
+            # Review fold (TOCTOU): the enrichment compute above costs reads
+            # (~0.5-2s) — a user cancelling the paused run (the likeliest
+            # action on a paused queue) or an awake sibling claiming in that
+            # window must not be overwritten: a stopped→queued clobber would
+            # RESURRECT the cancelled run as a zombie banner with no queue
+            # doc behind it. Track D denies synth-user transactional reads
+            # on the user tree (#720), so a transaction isn't available —
+            # re-read both docs just before the write to shrink the race to
+            # one write RTT. The heal re-runs every ~60s, so a doc that
+            # slips through as still-"ongoing" is caught next tick.
+            _qs2 = s.reference.get()
+            if not _qs2.exists or (_qs2.to_dict() or {}).get("assignedWorker"):
+                continue
+            _rs2 = (_firebase_db.collection("users").document(uid)
+                    .collection("researches").document(rid).get())
+            if not _rs2.exists:
+                continue
+            _rd2 = _rs2.to_dict() or {}
+            if (_rd2.get("status") or "") != "ongoing" or _rd2.get("backendRunId"):
+                continue
+            if _update_research_doc(uid, rid, {
+                "status": "queued",
+                "queuePosition": _enrich["position"],
+                "queuedBehindRunId": _enrich["behind_rid"],
+                "queuedBehindTitle": _enrich["behind_title"],
+                "queueTotalAhead": _enrich["total_ahead"],
+                "queueAheadFromSelf": _enrich["ahead_from_self"],
+                "queueAheadFromOthers": _enrich["ahead_from_others"],
+                "queueEtaMs": _eta_ms,
+                "queueEtaComputedAt": _eta_at,
+            }):
+                log(
+                    f"[rest-keepalive] worker {WORKER_ID}: re-asserted status=queued "
+                    f"for {rid[:8]}… (doc had drifted to 'ongoing' with no claim)",
+                    "INFO",
+                )
+        except Exception as _e:
+            log(f"[rest-keepalive] re-assert failed for {rid[:8]}… (non-fatal): {_e}", "DEBUG")
+
+
 def save_worker_count(n: int) -> None:
     """Merge-write workerCount into research_config.json. Clamped to >=1
     so a bad caller can't disable the only worker. Atomic write via
@@ -36804,7 +36935,12 @@ async def run_server(port=8000):
         # AFTER the busy/exit early-outs (review: a busy worker must keep
         # returning traffic-free) and OFF the event loop (the TTL-expired
         # read is a blocking Firestore get).
+        # #904: before returning, run the keep-alive/self-heal pass so a
+        # parked queue stays durable (restDeferredAt refresh) and a doc
+        # that drifted to status="ongoing" is re-asserted queued. Throttled
+        # internally to ~1/min; still never claims anything.
         if await asyncio.to_thread(_worker_is_resting):
+            await asyncio.to_thread(_rest_keepalive_pass)
             return
         did = load_device_id()
         if not did:
