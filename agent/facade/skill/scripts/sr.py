@@ -28,7 +28,7 @@ or two from the topic) or run-id; omit it to mean the most recent / active run:
                        (--run <run> to target one; else the latest active run)
   arm-stream         prepare this chat's streaming watchdog → prints the cron
                        script + job name to arm via the runtime's cronjob tool
-  version            show the skill + Super Research backend versions
+  version            show the Super Research skill version
   update             update the Super Research skill (this chat — scripts + bridge)
   logout             clear the account session
   help               this list
@@ -1585,7 +1585,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("logout", help="clear the account session").set_defaults(func=cmd_logout)
 
     sub.add_parser("version", aliases=["versions"],
-                   help="show the agent + Super Research backend versions (+ update notices)").set_defaults(func=cmd_version)
+                   help="show the Super Research skill version (+ update notice)").set_defaults(func=cmd_version)
     sub.add_parser("install", aliases=["install-backend", "setup-backend"],
                    help="install the Super Research backend on the connected device (host a BE)"
                    ).set_defaults(func=cmd_install)
