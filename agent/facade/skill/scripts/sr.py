@@ -59,7 +59,7 @@ from pathlib import Path
 # silently (live 2026-07-02: a stale copy predating the podcast MEDIA: fix
 # kept sending bare audio paths). Bumped together with pyproject.toml —
 # guarded by tests/test_sr_skip_agents.py::test_skill_build_matches_package_version.
-_SKILL_BUILD = "0.1.22"
+_SKILL_BUILD = "0.1.23"
 
 _TIMEOUT = 30
 # By-title run resolution scans the newest N runs (status / podcast / list / the
@@ -782,9 +782,23 @@ def cmd_podcast(args) -> int:
     # File" attachment, not playable — the 2026-07-02 live failure). Do NOT
     # add [[audio_as_voice]]: it suppresses the text body (voice-reply dedup)
     # and only matters for .ogg/.opus voice bubbles.
+    # The MEDIA contract keeps breaking on AI paraphrase (live 2026-07-06: the
+    # assistant rewrote the MEDIA: line to "🔊 Audio: <path>", which routes to
+    # document delivery instead of the native player, and the user had to ask
+    # "make it playable" a second time). Ship the instruction WITH the output
+    # under the do-not-relay marker so it's in front of the model at the exact
+    # moment it relays — not buried in SKILL.md's per-command notes.
     return _emit(b2, args.json, [
         f"🎧 {title}",
         f"MEDIA:{b2.get('localPath')}",
+        *_agent_directive_block([
+            "Reply with the TWO lines above EXACTLY as printed — the MEDIA: line",
+            "verbatim on its own line. Do NOT decorate, relabel, or rewrite it",
+            "(no emoji prefix, no speaker/label word before the path, no code",
+            "block, no bare path): the gateway converts the exact MEDIA: line",
+            "into a native playable audio message in this chat; any rewrite",
+            "turns it into a non-playable file path.",
+        ]),
     ])
 
 
@@ -999,22 +1013,19 @@ def cmd_logout(args) -> int:
 
 def cmd_version(args) -> int:
     """Show the Super Research skill's version (+ a "newer available" nudge for
-    the SKILL when one is published) alongside the backend's version. The skill no
-    longer prompts to update the backend — the app surfaces that — so the backend
-    line is display-only here."""
+    the SKILL when one is published). SKILL-ONLY (2026-07-06, user): the backend
+    line ("Backend: not installed on the connected device" — the runtime host,
+    not the Research computer) only confused; the backend's version lives in the
+    app's Settings → About and `superresearch --version` on the Research
+    computer."""
     code, body = _get("/version")
     if code != 200:
         return _emit(body, args.json, [f"✗ couldn't read versions: {body.get('error', code)}"],
                      _fail_code(code))
     agent = body.get("agent") or "?"
-    backend = body.get("backend")
     a_new = body.get("agentLatest")
-    lines = [f"Super Research skill    v{agent}"
+    lines = [f"Super Research skill  v{agent}"
              + (f"   ⬆️ v{a_new} available — say “update”" if a_new else "")]
-    if backend:
-        lines.append(f"Super Research backend  v{backend}")
-    else:
-        lines.append("Super Research backend  (not installed on the connected device)")
     # Stale chat-side copy tell: the runtime executes its own installed COPY of
     # these scripts, which only `connect` / “update” redeploys — a host pip
     # upgrade alone leaves the chat side on old behavior (live 2026-07-02: a

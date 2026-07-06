@@ -362,21 +362,23 @@ def test_device_remove_sharer_leaves(bridge_port, monkeypatch, capsys):
     assert "Left the shared device" in capsys.readouterr().out
 
 
-def test_version_reports_agent_and_backend(bridge_port, monkeypatch, capsys):
-    # `version` from chat reads the bridge's /version: the agent's own version +
-    # the co-located backend's version (parsed from `superresearch --version`).
+def test_version_reports_skill_only(bridge_port, monkeypatch, capsys):
+    # 2026-07-06 (user): `version` shows ONLY the skill version. The backend
+    # line ("Backend: not installed on the connected device" — the runtime
+    # host, not the Research computer) only confused; the app's Settings →
+    # About owns the backend version now.
     monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
     assert sr.main(["version"]) == 0
     out = capsys.readouterr().out
-    assert f"v{bridge.__version__}" in out      # agent version
-    assert "backend  v0.1.1" in out             # backend version
+    assert f"v{bridge.__version__}" in out      # skill version
+    assert "backend" not in out.lower()          # backend never mentioned
 
 
-def test_version_when_backend_absent(bridge_port, monkeypatch, capsys):
-    # Backend not co-located (CLI off PATH) → say so, don't fabricate a version.
+def test_version_no_backend_line_when_backend_absent(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge, "_backend_version", lambda: None)
     assert sr.main(["version"]) == 0
-    assert "not installed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "not installed" not in out and "backend" not in out.lower()
 
 
 def test_update_updates_the_skill(bridge_port, monkeypatch, capsys):
@@ -414,8 +416,8 @@ def test_version_shows_skill_nudge_only(bridge_port, monkeypatch, capsys):
     assert sr.main(["version"]) == 0
     out = capsys.readouterr().out
     assert "v0.1.9 available" in out and "update" in out.lower()
-    assert "backend  v0.1.1" in out          # backend shown…
-    assert "0.1.1 available" not in out       # …but never nudged to update
+    assert "backend" not in out.lower()       # skill-only output
+    assert "0.1.1 available" not in out       # backend never nudged
 
 
 def test_version_no_notices_when_current(bridge_port, monkeypatch, capsys):
@@ -522,6 +524,13 @@ def test_podcast(bridge_port, monkeypatch, capsys):
     assert re.search(r"^MEDIA:.*agent-p\.m4a$", out, re.M)
     assert "[[audio" not in out  # audio_as_voice would suppress the title text
     assert "token=" not in out  # no tokenized URL leaks into chat
+    # 2026-07-06: the verbatim-relay instruction ships WITH the output under
+    # the do-not-relay marker (live failure: the assistant rewrote MEDIA: to
+    # "🔊 Audio: <path>" → non-playable file). MEDIA line sits ABOVE the
+    # marker (user-visible); the instruction sits below it.
+    assert sr._AGENT_ONLY_MARKER in out
+    assert out.index("MEDIA:") < out.index(sr._AGENT_ONLY_MARKER)
+    assert "EXACTLY as printed" in out
 
 
 def test_podcast_not_ready(bridge_port, capsys):
