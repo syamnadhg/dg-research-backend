@@ -5837,6 +5837,44 @@ def start_firestore_start_listener(job_queue, loop):
                 # Processing a stale cancel is a cheap idempotent no-op
                 # (the target run is long terminal), so let it through.
                 # (resume docs keep their prior behavior — out of scope.)
+                #
+                # #904 review catch (wake-before-boot hole): the keepalive
+                # re-stamps restDeferredAt only while the BE is ALIVE. Park
+                # Friday → shut the PC down → wake the workers from the phone
+                # Sunday (device-doc write needs no BE) → boot Monday: on the
+                # replay this branch saw age>12h, worker no longer resting,
+                # stamp days-stale → deleted the run the user was waiting on.
+                # Before purging an UNCLAIMED start doc, read its research
+                # doc: a healthy status="queued" means the run is still
+                # WANTED and this queue doc is its only claim ticket — skip
+                # the purge (the rescan claims it within a tick). Read error
+                # → skip too (never destroy work on a transient); missing doc
+                # or terminal status → purge as before.
+                if (data.get("action", "start") == "start"
+                        and data.get("researchId") and data.get("submittedBy")):
+                    try:
+                        _ab_snap = (_firebase_db.collection("users")
+                                    .document(data["submittedBy"])
+                                    .collection("researches")
+                                    .document(data["researchId"]).get())
+                        _ab_status = ((_ab_snap.to_dict() or {}).get("status") or "") \
+                            if _ab_snap.exists else ""
+                    except Exception as _ab_err:
+                        log(
+                            f"Queue: stale-skip ABANDONED health read failed for "
+                            f"{(data.get('researchId') or '')[:8]}… — keeping doc "
+                            f"(transient): {_ab_err}",
+                            "DEBUG",
+                        )
+                        continue
+                    if _ab_status == "queued":
+                        log(
+                            f"Queue: stale-skip ABANDONED exempt {(data.get('researchId') or '')[:8]}… "
+                            f"— research doc still status=queued (parked run awaiting "
+                            f"pickup; age={_age_ms // 1000}s)",
+                            "INFO",
+                        )
+                        continue
                 log(
                     f"Queue: stale-skip ABANDONED {(data.get('researchId') or '')[:8]}… "
                     f"topic={(data.get('topic') or '')[:40]!r} "

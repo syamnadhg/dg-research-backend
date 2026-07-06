@@ -141,19 +141,35 @@ def test_abandoned_sweep_exempts_rest_deferred_docs():
 # so a weekend park woke up to the 12h stale-skip. The keep-alive pass runs
 # from the rescan's resting branch and fixes both.
 
+class _QSnap:
+    """Standalone queue-doc snapshot for sequencing mid-window mutations."""
+
+    def __init__(self, data, *, exists=True):
+        self.exists = exists
+        self._data = data or {}
+
+    def to_dict(self):
+        return dict(self._data)
+
+
 class _KeepaliveQueueDoc:
     exists = True  # doubles as its own pre-write re-read snapshot
 
-    def __init__(self, doc_id, data):
+    def __init__(self, doc_id, data, get_seq=None):
         self.id = doc_id
         self._data = data
         self.reference = self
         self.updates = []
+        # Optional snapshot sequence for get() — lets a test mutate the
+        # queue doc between the stream() read and the TOCTOU re-read.
+        self._get_seq = list(get_seq) if get_seq else None
 
     def to_dict(self):
         return dict(self._data)
 
     def get(self):
+        if self._get_seq is not None:
+            return self._get_seq.pop(0)
         return self  # TOCTOU re-read (review fold) sees live state
 
     def update(self, patch):
@@ -315,6 +331,49 @@ def test_keepalive_heal_aborts_when_cancelled_mid_window(monkeypatch):
     )
     research._rest_keepalive_pass()
     assert healed == []
+
+
+def test_keepalive_heal_aborts_when_sibling_claims_mid_window(monkeypatch):
+    # TOCTOU re-read, queue-doc side: an awake sibling claims between the
+    # stream() read and the pre-write re-read → heal must abort (a queued
+    # write over a live claim would mislabel a starting run).
+    qdoc = _KeepaliveQueueDoc(
+        "q1",
+        {"action": "start", "researchId": "chat_yo", "submittedBy": "u1",
+         "restDeferredAt": int(time.time() * 1000)},
+        get_seq=[_QSnap({"assignedWorker": 2})],
+    )
+    healed = _keepalive_env(monkeypatch, [qdoc], {"status": "ongoing"})
+    research._rest_keepalive_pass()
+    assert healed == []
+
+
+def test_keepalive_heal_aborts_when_queue_doc_deleted_mid_window(monkeypatch):
+    # TOCTOU re-read, queue-doc side: cancel deletes the queue doc between
+    # the stream() read and the pre-write re-read → heal must abort (no
+    # claim ticket exists anymore; re-asserting queued would strand the run).
+    qdoc = _KeepaliveQueueDoc(
+        "q1",
+        {"action": "start", "researchId": "chat_yo", "submittedBy": "u1",
+         "restDeferredAt": int(time.time() * 1000)},
+        get_seq=[_QSnap({}, exists=False)],
+    )
+    healed = _keepalive_env(monkeypatch, [qdoc], {"status": "ongoing"})
+    research._rest_keepalive_pass()
+    assert healed == []
+
+
+def test_abandoned_sweep_spares_healthy_queued_research():
+    # #904 review catch (wake-before-boot): BE down >12h while parked, owner
+    # wakes workers from the phone, THEN the PC boots — the replay's
+    # ABANDONED branch must read the research doc and spare a still-queued
+    # run instead of deleting its only claim ticket.
+    src = open(research.__file__, encoding="utf-8").read()
+    assert "research doc still status=queued" in src, (
+        "the ABANDONED purge must exempt an unclaimed start doc whose "
+        "research doc is still status=queued — wake-before-boot after >12h "
+        "downtime otherwise silently drops the parked run."
+    )
 
 
 def test_keepalive_throttles_to_once_per_minute(monkeypatch):
