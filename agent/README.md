@@ -19,7 +19,7 @@ One command, run in your chat runtime's environment — or grab it from the page
 **https://superresearch.io/skills** (the old `/agent-install` 308-redirects there):
 
 ```sh
-pipx run superresearch-agent connect      # the published package
+pipx run --no-cache superresearch-agent connect      # the published package
 ```
 
 `connect` is a branded, interactive flow — **Detect → Choose → Install → Go
@@ -35,7 +35,7 @@ signs you in. Then, in chat:
 
 **Install straight from chat.** Hermes / OpenClaw can run the command themselves —
 just ask ("install Super Research"), and the agent runs `pipx run
-superresearch-agent connect` and relays the sign-in link. (The runtime's
+--no-cache superresearch-agent connect` and relays the sign-in link. (The runtime's
 `/skills` marketplace command is terminal-only and doesn't work over a chat
 platform — *running the command* does.) The machine-readable companion is at
 **https://superresearch.io/skills.json** (command + flags + steps; the legacy
@@ -74,15 +74,17 @@ signed in before it can list devices, start research, or pair.
 ### Versions + updates (from chat)
 
 ```
-/sr version        agent + Super Research backend versions, with a "⬆ newer available" nudge
-                   (also surfaced on the welcome)
-/sr update         update the Super Research BACKEND on the connected device
-/sr agent-update   update the chat AGENT itself (package + skill + bridge)
+/sr version        skill + Super Research backend versions, with a "⬆ newer available"
+                   nudge when a newer SKILL is published (also surfaced on the welcome)
+/sr update         update the SKILL (this chat's scripts + bridge; alias: /sr update-skill)
 /sr install        install the backend on this host (turn this PC into a research host)
 ```
 
-`update` / `agent-update` reply "already up to date" when nothing newer is
-published, instead of a pointless reinstall.
+`update` (alias `update-skill`) updates **only the skill** and replies "already up
+to date" when nothing newer is published. Natural language ("upgrade") routes here
+too. The agent no longer updates the **backend** — a "update Super Research / the
+backend" request is redirected: run `superresearch --update` on the Research
+computer (idempotent), or update from the app (Settings → About → Check → Update).
 
 ---
 
@@ -197,14 +199,15 @@ facade/
   session.py         AccountSession — refresh-token / custom-token → ID-token
   firestore_rest.py  minimal Firestore REST (researches/devices, upsert, enqueue, cancel)
   devicelogin.py     remote-login device-flow client (→ the SR web app broker)
-  selfupdate.py      PyPI version notices + self-update (agent reconnect-from-latest;
-                     backend install/update) — detached, mirrors the backend pattern
+  selfupdate.py      PyPI version notices + skill self-update (agent reconnect-from-latest,
+                     --no-cache) + disconnect cache-wipe — detached; backend updates are
+                     NOT the agent's job (that's `superresearch --update` / the app)
   logsetup.py        rotating-file + console logging (--verbose)
   runview.py         flatten links.{kind} → ordered events; terminal-status set
   connect.py         install the skill into a chat runtime (+ WSL hand-off)
   autostart.py       windowless logon autostart (schtasks / systemd --user / launchd)
   bridge.py          loopback HTTP server (/login, /login/remote/*, /devices, /device,
-                     /research, /updates, /version, /update, /agent-install, /install-backend, …)
+                     /research, /updates, /version, /agent-install, /install-backend, …)
   web/login.html     Firebase Web SDK Google sign-in (TOTP MFA aware)
   skill/             the chat-runtime bundle (SKILL.md + scripts/sr.py + the streaming watchdog)
   cli.py             the `agent` command
