@@ -143,9 +143,14 @@ def test_tier5_cloudflare_copy_warns_against_the_click_loop():
 def test_settled_clear_fails_closed_on_unknown_reason():
     # Review catch (major): the top probe can land in a detection gap and
     # freeze reason="" — which must be treated as UNKNOWN (double-probe),
-    # never as "not Cloudflare" (single-probe fast path).
+    # never as "not Cloudflare" (single-probe fast path). 2026-07-06: the
+    # fast-path check goes through the STICKY _is_cloudflare (a gap-landing
+    # probe can't downgrade a confirmed Cloudflare verdict and re-open the
+    # single-probe path); empty reason still lands on the double probe.
+    # Functional polarity pin: test_p2_botscore_fixes.py::
+    # test_functional_cloudflare_verdict_is_sticky.
     src = inspect.getsource(research.wait_for_verification_clearance)
-    assert 'if reason and "cloudflare" not in reason.lower():' in src
+    assert "if reason and not _is_cloudflare():" in src
     assert "nonlocal reason" in src, "later probes must refresh the frozen top-probe reason"
     assert "initial_reason" in src, "callers must be able to seed their confirmed reason"
 

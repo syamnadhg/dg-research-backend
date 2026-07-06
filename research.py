@@ -3933,8 +3933,8 @@ async def _firebase_reconnect_loop():
 
     Backoff is deliberately TIGHT (5→10→30s, never minutes — the FE flips a
     device Offline at ~15s, so a short blip clears before the tile changes).
-    Don't borrow `_DNS_BACKOFF_SECS` (30s/2m/8m) — that's tuned for the 90-min
-    Phase-2 agent path, far too slow for a device-liveness signal. init_firebase
+    Don't borrow a slow minutes-scale backoff — far too slow for a
+    device-liveness signal. init_firebase
     runs in a thread because its live creds.refresh() has a 10s timeout that
     would otherwise stall the loop past its own cadence.
 
@@ -13392,126 +13392,13 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None):
                    **base)
 
 
-# DGOPS-7367 (2026-05-13) — transient Chromium network error categories
-# the unstick-prophylaxis page-reload may encounter when claude.ai DNS
-# briefly fails. Pre-fix, ANY page.reload exception treated Claude as
-# unrecoverable on the very next CUA tick; the third reproduction in
-# 6 weeks (2026-05-11) finally surfaced the missing distinction. These
-# are the categories that justify retrying instead of dropping — every
-# one of them is the kind of error that self-heals in <10min in the
-# wild (residential DNS hiccup, brief WiFi disconnect, captive-portal
-# re-auth, etc.). Errors NOT in this list (ERR_INVALID_RESPONSE,
-# ERR_SSL_PROTOCOL_ERROR, ERR_BLOCKED_BY_*) indicate something durable
-# wrong with the page itself and stay on the immediate-drop path.
-_TRANSIENT_NET_ERRORS = (
-    "ERR_NAME_NOT_RESOLVED",
-    "ERR_CONNECTION_REFUSED",
-    "ERR_TIMED_OUT",
-    "ERR_NETWORK_CHANGED",
-    "ERR_INTERNET_DISCONNECTED",
-    "ERR_ADDRESS_UNREACHABLE",
-    "ERR_NAME_NOT_RESOLVED.",  # trailing-period variant seen in some Chromium builds
-    "ERR_CONNECTION_TIMED_OUT",
-    "ERR_CONNECTION_RESET",
-)
-# Backoff schedule for transient network errors. 30s → 2m → 8m =
-# ~10.5min total recovery window before declaring permanent. Comfortably
-# under Phase 2's typical 90min budget and tracks the rhythm most
-# residential / coffee-shop DNS hiccups self-heal at.
-_DNS_BACKOFF_SECS = (30, 120, 480)
-
-
-def _is_transient_net_error(exc_or_text) -> bool:
-    """Return True if the given exception (or its repr) matches one of
-    the transient Chromium network error categories that warrant retry
-    instead of immediate agent drop. Used by the unstick-prophylaxis
-    path in poll_all_agents_round_robin to distinguish network blips
-    from genuine page failures (DGOPS-7367)."""
-    s = str(exc_or_text or "")
-    return any(code in s for code in _TRANSIENT_NET_ERRORS)
-
-
-async def _advance_dns_backoff(p, name, now, elapsed):
-    """Advance the DNS retry state machine for one agent. Returns True
-    if a retry was attempted (caller should skip the rest of this tick
-    via `continue`), False if no retry was due.
-
-    DGOPS-7367 — refactored from inline (poll_all_agents_round_robin) on
-    2026-05-18 for unit testability (DGOPS-7335 PR review ask).
-
-    State machine:
-      Entry guard: `p["dns_retry_at"]` set AND `now >= dns_retry_at`.
-      Reload succeeds → clear retry state, rejoin rotation, emit progress.
-      Reload raises transient + attempts left → schedule next backoff,
-        emit progress (keeps FE silence + BE no-growth watchdogs quiet
-        during long 480s waits).
-      Reload raises non-transient OR attempts exhausted → flip
-        `error_source` to "network_exhausted" so the is_error gate on
-        the next tick falls through to the normal drop path.
-
-    Mutates `p` in place. Takes `now` (caller's `time.time()`) so tests
-    can pass deterministic timestamps. `elapsed` is the agent's wall-
-    clock elapsed seconds, used only for the emit_event payload.
-    Calls module-level `log` / `emit_event` / `_is_transient_net_error`
-    / `normalize_agent_key`. Tests can mock these via `unittest.mock.patch`.
-
-    Behavior note vs original inline block: `now` is captured at the
-    call site and used for BOTH the `last_cua_check` write and the
-    `dns_retry_at` computation on transient-fail. The original inline
-    block called `time.time()` again AFTER the awaited `page.reload`
-    (~20s) + `asyncio.sleep(3.0)` — so the refactor schedules the
-    next CUA check / next retry up to ~23s earlier than the original.
-    Not safety-relevant (CUA-check throttle is ~5min; next retry
-    earlier-not-later is the safer drift direction)."""
-    import asyncio as _asyncio
-    if not (p.get("dns_retry_at") and now >= p["dns_retry_at"]):
-        return False
-    _attempt = p.get("dns_retry_attempts", 1)
-    log(f"[{name}] DNS retry attempt {_attempt}/{len(_DNS_BACKOFF_SECS)} — "
-        f"re-attempting page.reload (was: {p.get('dns_last_error', '')[:80]})")
-    try:
-        await p["page"].reload(wait_until="domcontentloaded", timeout=20000)
-        await _asyncio.sleep(3.0)
-        log(f"[{name}] DNS retry {_attempt} SUCCEEDED — agent rejoining rotation")
-        p["dns_retry_at"] = 0
-        p["dns_retry_attempts"] = 0
-        p["error_source"] = None
-        p["dns_last_error"] = ""
-        p["claude_refreshed_once"] = True
-        p["last_cua_check"] = now
-        try:
-            emit_event("agent_progress", phase=2,
-                       agent=normalize_agent_key(name),
-                       status="generating",
-                       progress=f"Recovered from network blip after {_attempt} retry",
-                       elapsedSec=int(elapsed))
-        except Exception:
-            pass
-    except Exception as _re2:
-        if _is_transient_net_error(_re2) and _attempt < len(_DNS_BACKOFF_SECS):
-            _next_delay = _DNS_BACKOFF_SECS[_attempt]
-            p["dns_retry_at"] = now + _next_delay
-            p["dns_retry_attempts"] = _attempt + 1
-            p["dns_last_error"] = str(_re2)[:200]
-            log(f"[{name}] DNS retry {_attempt} failed ({str(_re2)[:80]}); "
-                f"next attempt in {_next_delay}s "
-                f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})", "WARN")
-            try:
-                emit_event("agent_progress", phase=2,
-                           agent=normalize_agent_key(name),
-                           status="generating",
-                           progress=f"Network blip — retrying in {_next_delay}s "
-                                    f"({_attempt + 1}/{len(_DNS_BACKOFF_SECS)})",
-                           elapsedSec=int(elapsed))
-            except Exception:
-                pass
-        else:
-            log(f"[{name}] DNS retries exhausted — falling through to "
-                f"normal drop path (last error: {str(_re2)[:80]})", "WARN")
-            p["dns_retry_at"] = 0
-            p["error_source"] = "network_exhausted"
-            p["claude_refreshed_once"] = True
-    return True
+# DGOPS-7367 DNS-backoff retry machinery (transient-net-error taxonomy +
+# `_advance_dns_backoff` state machine): REMOVED 2026-07-06. It existed ONLY
+# to retry the Claude cycle-2 "unstick prophylaxis" reload, which was itself
+# removed (a mid-run reload no longer restores the claude.ai conversation —
+# it blanked the artifact card and cascaded into a CUA sidebar mis-click; see
+# the tombstone in poll_all_agents_round_robin). No reload → nothing schedules
+# a DNS retry → the whole subsystem was dead code.
 
 
 def fail_agent(agent_key: str, title: str, details: str = ""):
@@ -21086,10 +20973,27 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 if _bp.exists():
                     _brief_path_hr = str(_bp)
             # Close old tab — non-fatal if it's already gone.
+            # 2026-07-06 (warm-tab reuse review): NEVER close the browser's
+            # main tab or the persistent context's LAST page. With 2A reusing
+            # the P1 tab, ChatGPT's p["page"] can BE browser.page — closing it
+            # would drop the main handle, and on a ChatGPT-only run it's the
+            # context's only page, so closing it exits headful Chrome entirely
+            # (the restart's new_tab then dies on a closed context). Leaving
+            # the old tab open is harmless — the restart opens a fresh one.
             try:
                 old_page = p.get("page")
                 if old_page is not None:
-                    await old_page.close()
+                    _keep_open = old_page is getattr(browser, "page", None)
+                    if not _keep_open:
+                        try:
+                            _keep_open = len(old_page.context.pages) <= 1
+                        except Exception:
+                            _keep_open = False
+                    if _keep_open:
+                        log(f"[{_agent_name}] Hard retry: keeping the old tab open "
+                            "(main/last tab) — the restart opens a fresh one", "INFO")
+                    else:
+                        await old_page.close()
             except Exception:
                 pass
             # Re-run agent setup. On crash, drop the agent from pending so
@@ -21181,14 +21085,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # gate before opening Claude/ChatGPT panels — see iter-#3 logic
             # below). Increment ONCE per round-robin tick per agent.
             p["poll_cycles"] = p.get("poll_cycles", 0) + 1
-
-            # DGOPS-7367 (2026-05-13) — deferred DNS retry tick. State-
-            # machine lives in `_advance_dns_backoff` (research.py:~7494),
-            # extracted from this inline block on 2026-05-18 for unit-test
-            # coverage. Runs BEFORE the spotlight + scrape body so a
-            # successful retry's fresh DOM is what this tick reads from.
-            if await _advance_dns_backoff(p, name, time.time(), elapsed):
-                continue
 
             # ── C6: cursor foreground + partial-content refresh ──
             # Bring this agent's tab to the front before any scrape/check so
@@ -21516,55 +21412,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # ongoing and the artifact card has spawned. Same gate applied to
             # ChatGPT below for symmetry. After 2 consecutive DOM "no artifact"
             # readings (after the gate clears), escalate to CUA tier-3 once.
-            # One-shot Claude page refresh at cycle 2 — unstick prophylaxis.
-            # Claude.ai sometimes hangs DOM mid-research even though server-side
-            # generation continues. A single reload mid-research re-mounts the
-            # conversation + artifact card from server state without losing any
-            # research progress (research is server-side; refresh is DOM-only).
-            # Runs BEFORE the artifact-open gate clears at cycle 3, so iter 3's
-            # first DOM probe meets a fresh DOM.
-            if (name == "Claude"
-                    and p.get("poll_cycles", 0) == 2
-                    and not p.get("claude_refreshed_once")
-                    and not p.get("dns_retry_at")):
-                try:
-                    log("[Claude] one-shot page refresh at cycle=2 (unstick prophylaxis)")
-                    await p["page"].reload(wait_until="domcontentloaded", timeout=20000)
-                    await asyncio.sleep(3.0)
-                    p["claude_refreshed_once"] = True
-                except Exception as _re:
-                    # DGOPS-7367 (2026-05-13): if the reload tripped a
-                    # transient network error (DNS / connection hiccup),
-                    # don't write claude_refreshed_once and don't fall
-                    # through to the CUA-error-drop path. Schedule an
-                    # exponential-backoff retry instead — most residential
-                    # DNS blips self-heal in < 10min, well inside Phase 2's
-                    # budget. Non-transient errors (SSL, blocked, etc.)
-                    # keep today's behavior: mark refreshed-once, let CUA
-                    # diagnose, drop on `is_error` verdict.
-                    if _is_transient_net_error(_re):
-                        p["error_source"] = "network"
-                        p["dns_last_error"] = str(_re)[:200]
-                        p["dns_retry_attempts"] = 1
-                        p["dns_retry_at"] = time.time() + _DNS_BACKOFF_SECS[0]
-                        log(f"[Claude] transient network error during refresh "
-                            f"({str(_re)[:80]}) — scheduling retry in "
-                            f"{_DNS_BACKOFF_SECS[0]}s (attempt 1/{len(_DNS_BACKOFF_SECS)})", "WARN")
-                        # DGOPS-7367 hardening (2026-05-13): keep the
-                        # silence watchdogs satisfied during the initial
-                        # 30s wait + any future retry waits.
-                        try:
-                            emit_event("agent_progress", phase=2, agent="claude",
-                                       status="generating",
-                                       progress=f"Network blip during prophylaxis refresh — "
-                                                f"retrying in {_DNS_BACKOFF_SECS[0]}s "
-                                                f"(1/{len(_DNS_BACKOFF_SECS)})",
-                                       elapsedSec=int(elapsed))
-                        except Exception:
-                            pass
-                    else:
-                        log(f"[Claude] refresh failed (non-transient): {_re}", "WARN")
-                        p["claude_refreshed_once"] = True
+            #
+            # ── Claude cycle-2 "unstick prophylaxis" refresh: REMOVED (2026-07-06) ──
+            # The 2026-04-26 one-shot reload existed for a rare "DOM hangs while
+            # server-side generation continues" failure. On the 2026-07 claude.ai
+            # SPA a mid-run reload no longer restores the conversation cleanly
+            # (same behavior #897a image-verified for Gemini) — the artifact card
+            # vanished from the DOM, _count_claude_artifacts read 0 twice, and the
+            # CUA tier-3 fallback then vision-misclicked the SIDEBAR chat's ⋮ menu
+            # (Star/Rename popup, user-screenshot 2026-07-06). The reload was the
+            # root of that whole cascade and pure hazard on the happy path. Do NOT
+            # reload Claude mid-run for any reason; the artifact/sources panel
+            # opens in-place from the live DOM below, and a genuinely stalled run
+            # is covered by the silence watchdogs + completion detector. The
+            # DGOPS-7367 DNS-backoff retry machinery existed ONLY to retry this
+            # reload and was removed with it.
 
             # 2026-05-03: lowered cycle gate 3→2 and elapsed 180s→90s for
             # parity with ChatGPT's panel-open gate at line ~11689.
@@ -22389,17 +22251,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # Check completion — CUA-primary fallback (only if Playwright was
             # not confident within the MIN_WAIT + budget window). CUA checks
             # every 5 min per agent (cost-effective, actually works).
-            # DGOPS-7367 hardening (2026-05-13): skip CUA while a DNS retry
-            # is pending. Without this guard, CUA's 5-min check could fire
-            # at T+300 or T+600 during attempt-3's 480s backoff window and
-            # vote `is_done=True` against a chrome-error DOM (no stop button
-            # + no loading marker satisfies the "done" verdict). The
-            # is_error drop gate at L14730 only covers the `is_error`
-            # branch — a false-positive `is_done` would slip past and
-            # trigger the artifact-count nudge gate or hard-fail user-
-            # decision modal mid-recovery.
-            if p.get("dns_retry_at"):
-                continue
             if (time.time() - p.get("last_cua_check", 0)) < CUA_CHECK_INTERVAL:
                 # Not time for CUA check yet — skip this agent this cycle
                 continue
@@ -22532,21 +22383,6 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # pending. Salvage whatever's on the page, fire fail_agent
             # once, drop the agent from rotation.
             if is_error:
-                # DGOPS-7367 (2026-05-13): defer drop while a transient
-                # network retry is pending. The retry path above will
-                # either rejoin the agent (success), or exhaust the
-                # backoff schedule and flip error_source to
-                # "network_exhausted" — at which point we DO want to fall
-                # through to the drop. is_error firing here against a
-                # chrome-error DOM mid-retry is the exact pre-fix failure
-                # mode: dropping immediately even though a 30s wait would
-                # have recovered.
-                if p.get("dns_retry_at") and p.get("error_source") == "network":
-                    _in = max(0, int(p["dns_retry_at"] - time.time()))
-                    log(f"[{name}] CUA reports error but DNS retry pending "
-                        f"(attempt {p.get('dns_retry_attempts')}/"
-                        f"{len(_DNS_BACKOFF_SECS)}, in {_in}s) — deferring drop", "INFO")
-                    continue
                 agent_key_err = normalize_agent_key(name)
                 log(f"[{name}] CUA reported CONCLUSION: ERROR — agent UI shows a failure state. "
                     f"Salvaging partial output and dropping from rotation.", "WARN")
@@ -27725,7 +27561,8 @@ async def _playwright_hv_click(page, label: str) -> bool:
 
 async def wait_for_verification_clearance(browser, cua_client, page, platform: str, label: str,
                                           verbose=False, max_wait_loops: int = 120,
-                                          phase: int = 2, initial_reason: str = "") -> bool:
+                                          phase: int = 2, initial_reason: str = "",
+                                          preserve_tab: bool = False) -> bool:
     """Handle a human-verification gate on an agent page.
 
     Flow (NEVER-DIE-MIGRATION-2026-04-18, full HV chain):
@@ -27744,6 +27581,23 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
          Resume / Skip agent. Polls every 5s so a manual solve auto-
          resumes even if the user never taps Resume.
 
+    2026-07-06 HV-trim (continuous-HV fix): for a POSITIVELY-identified
+    CLOUDFLARE wall the score-raising tiers are skipped — tiers 1 and 3
+    (checkbox re-clicks are failed attestations that re-issue the challenge
+    and raise the score; #896) and tier 4 (another cold navigation against a
+    profile+IP-scoped attestation a fresh tab can't reset). Cloudflare runs
+    tier 0 (the ONE allowed cheap click) → a no-interaction settled probe
+    (JS interstitials auto-resolve) → tier 2 (decay-based cooldown + reload,
+    the code-endorsed move) → tier 5 (user pause / auto-resume on decay).
+    Non-Cloudflare and unknown challenges keep the full chain — their
+    buttons genuinely work. The Cloudflare verdict is STICKY (see _cf_seen).
+
+    preserve_tab (2026-07-06, warm-tab reuse): True = `page` is a tab the
+    caller must keep alive (the reused P1/main ChatGPT tab) — tier-4's
+    close+new_tab is skipped for ANY challenge type, because the replacement
+    page never reaches the caller (tier-4 rebinds only the local `page`) and
+    closing the caller's handle would strand it on a dead tab.
+
     `phase` parameter routes all emit_event calls to the correct phase tile
     in the frontend — default 2 for Phase 2 agents, pass 1/3/4/5 when
     calling from other phase handlers.
@@ -27759,6 +27613,35 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     _, _top_reason = await detect_human_verification(page, platform, label)
     reason = _top_reason or initial_reason
     platform_key = platform.lower()
+    # 2026-07-06 review catch: the Cloudflare verdict is STICKY for this
+    # cascade's lifetime. detect_human_verification's generic "verify you are
+    # human" marker can label a REAL Cloudflare wall as a platform check
+    # whenever the Turnstile iframe is mid-teardown/re-issue (the #896 gap the
+    # tier-0 click itself opens) — an unguarded `reason = _fresh` would then
+    # DOWNGRADE a confirmed Cloudflare verdict and re-arm every skipped tier.
+    # Once any probe positively says Cloudflare, it stays Cloudflare.
+    _cf_seen = False
+
+    def _is_cloudflare() -> bool:
+        """2026-07-06 HV-trim: Cloudflare's checkbox is a browser attestation
+        the automation window can't pass — it re-issues after every click
+        (#896, live 2026-07-02) — and every extra click/navigation RAISES the
+        bot-score that caused the challenge, snowballing into the next run
+        ("continuous HV after one run"). So for a POSITIVELY-identified
+        Cloudflare wall we allow exactly ONE cheap click (Tier 0), keep the
+        decay-based cooldown+reload (the code-endorsed move), and skip the
+        score-raising tiers: the CUA click passes (they'd hammer the checkbox)
+        and the kill-tab (another cold nav; attestation is profile+IP-scoped,
+        a fresh tab doesn't reset it). Unknown/non-Cloudflare challenges keep
+        the full cascade — their buttons genuinely work. Reads the enclosing
+        `reason` (probe-refreshed) and LATCHES: a Cloudflare verdict is never
+        downgraded by a later gap-landing probe (see _cf_seen above)."""
+        nonlocal _cf_seen
+        if "cloudflare" in (reason or "").lower():
+            _cf_seen = True
+        return _cf_seen
+
+    _is_cloudflare()  # latch a Cloudflare verdict seeded by the caller/top probe
 
     async def _settled_clear() -> bool:
         """#896: Cloudflare re-issues its checkbox seconds after a click that
@@ -27767,10 +27650,12 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         burns its setup/paste budget against a walled page (live
         2026-07-02). Only a POSITIVELY-known non-Cloudflare challenge gets
         the single-probe fast path; Cloudflare AND unknown get a second
-        probe ~5s later. A closed page can never certify a clear (its
-        probes fail open to "no challenge"). Reads the enclosing `page` and
-        refreshes the enclosing `reason`, so it follows the kill-tab tier's
-        fresh tab and the gate's phase transitions automatically."""
+        probe ~5s later (the fast-path check goes through the STICKY
+        _is_cloudflare, so a gap-downgraded reason can't re-open it). A
+        closed page can never certify a clear (its probes fail open to "no
+        challenge"). Reads the enclosing `page` and refreshes the enclosing
+        `reason`, so it follows the kill-tab tier's fresh tab and the gate's
+        phase transitions automatically."""
         nonlocal reason
         try:
             if page.is_closed():
@@ -27782,7 +27667,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             reason = _fresh
         if blocked_now:
             return False
-        if reason and "cloudflare" not in reason.lower():
+        if reason and not _is_cloudflare():
             return True
         await asyncio.sleep(5)
         blocked_now, _fresh = await detect_human_verification(page, platform, label)
@@ -27814,6 +27699,9 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     # Most Turnstile gates are a single "I am human" checkbox that CUA can
     # click. This keeps us silent in the common case. Only if it can't do we
     # cool down + reload and try once more, or (last) ask the user.
+    # 2026-07-06 HV-trim: SKIPPED for a confirmed Cloudflare wall — Tier 0
+    # already spent the one allowed click; a CUA pass would re-click the
+    # attestation checkbox up to 3 more times, each a score-raising no-op.
     sys_prompt = (
         "You are looking at a human-verification challenge (Cloudflare, CAPTCHA, or similar) "
         "that is blocking access to an AI agent. If you can see a simple checkbox or button labeled "
@@ -27822,23 +27710,40 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         "If there's nothing simple to click, STOP immediately and respond with the word 'blocked'."
     )
     user_prompt = "Click the single human-verification checkbox if one is visible. Otherwise stop and say 'blocked'."
-    try:
-        log(f"[{label}] Verification detected ({reason or 'unknown'}) — CUA fallback (3 iter, in place)…")
-        await browser.switch_to_page(page)
-        result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
-            model=CUA_MODEL, max_iterations=3, verbose=verbose)
-        # Give the page a moment to re-render after a successful click
-        await asyncio.sleep(3)
+    if _is_cloudflare():
+        log(f"[{label}] Cloudflare wall — skipping the CUA click pass (re-clicks re-issue + raise the score; #896)")
+        # Review 2026-07-06: Cloudflare's JS-only "checking your browser"
+        # interstitial (no checkbox — tier-0 had nothing to click) often
+        # AUTO-RESOLVES in seconds with zero interaction. Pre-trim, tier-1's
+        # ~35s CUA pass + settled probe caught that silently; without a probe
+        # here the flow would jump straight to tier-2's about:blank nav —
+        # killing the in-flight attestation mid-solve and paying a cold
+        # reload for a wall that was clearing itself. So: wait briefly and
+        # settled-probe BEFORE any navigation. Zero clicks, zero navs.
+        await asyncio.sleep(15)
         if await _settled_clear():
-            log(f"[{label}] CUA cleared verification ✓ — proceeding silently")
-            # Clear the dropdown badge immediately so the user sees recovery.
+            log(f"[{label}] Cloudflare check auto-resolved ✓ — no interaction needed")
             emit_event("agent_verified", phase=phase, agent=platform_key)
             _mark_cleared()
             return True
-        _cua_text = (result.get("text") or "")[:120]
-        log(f"[{label}] CUA first pass didn't clear ({_cua_text}) — cooldown + reload + retry", "WARN")
-    except Exception as e:
-        log(f"[{label}] CUA first pass errored: {e} — cooldown + reload + retry", "WARN")
+    else:
+        try:
+            log(f"[{label}] Verification detected ({reason or 'unknown'}) — CUA fallback (3 iter, in place)…")
+            await browser.switch_to_page(page)
+            result = await agent_loop(cua_client, browser, sys_prompt, user_prompt,
+                model=CUA_MODEL, max_iterations=3, verbose=verbose)
+            # Give the page a moment to re-render after a successful click
+            await asyncio.sleep(3)
+            if await _settled_clear():
+                log(f"[{label}] CUA cleared verification ✓ — proceeding silently")
+                # Clear the dropdown badge immediately so the user sees recovery.
+                emit_event("agent_verified", phase=phase, agent=platform_key)
+                _mark_cleared()
+                return True
+            _cua_text = (result.get("text") or "")[:120]
+            log(f"[{label}] CUA first pass didn't clear ({_cua_text}) — cooldown + reload + retry", "WARN")
+        except Exception as e:
+            log(f"[{label}] CUA first pass errored: {e} — cooldown + reload + retry", "WARN")
 
     # ── CUA fallback — second pass (cooldown + reload, 5 iterations) ──
     # Cloudflare's bot-score heuristic partially decays with time, and a clean
@@ -27864,11 +27769,16 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         if _fresh_r:
             reason = _fresh_r  # keep the verdict/copy tracking the latest observed wall
         if blocked:
-            log(f"[{label}] Turnstile still present after cooldown — CUA 5-iter retry")
-            await browser.switch_to_page(page)
-            await agent_loop(cua_client, browser, sys_prompt, user_prompt,
-                model=CUA_MODEL, max_iterations=5, verbose=verbose)
-            await asyncio.sleep(3)
+            # 2026-07-06 HV-trim: for Cloudflare, rely on the decay+reload alone
+            # — a 5-iteration CUA pass is up to 5 more failed attestations.
+            if _is_cloudflare():
+                log(f"[{label}] Cloudflare still present after cooldown — no re-click; settled probe decides")
+            else:
+                log(f"[{label}] Turnstile still present after cooldown — CUA 5-iter retry")
+                await browser.switch_to_page(page)
+                await agent_loop(cua_client, browser, sys_prompt, user_prompt,
+                    model=CUA_MODEL, max_iterations=5, verbose=verbose)
+                await asyncio.sleep(3)
 
         if await _settled_clear():
             # Page just reloaded — re-run platform-specific setup so the
@@ -27899,33 +27809,46 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     # context and clean document layout occasionally clears a stubborn
     # bot flag that the cooldown + reload couldn't. Cheap insurance
     # before we interrupt the user.
-    try:
-        original_url = page.url
-        log(f"[{label}] CUA exhausted — killing the tab and re-opening for a clean slate")
+    # 2026-07-06 HV-trim: SKIPPED for Cloudflare — the attestation is
+    # profile+IP-scoped, so a fresh tab can't reset it; the kill-tab's
+    # new_tab is just one more cold navigation raising the very score
+    # that fired the challenge. Cloudflare goes straight to the user
+    # pause (whose 5s poll still auto-resumes on natural decay).
+    # ALSO skipped when the caller marked the tab preserve_tab (warm-tab
+    # reuse): the replacement page only rebinds the LOCAL `page`, so the
+    # caller would be stranded driving a closed handle.
+    if _is_cloudflare():
+        log(f"[{label}] Cloudflare wall — skipping kill-tab (a fresh tab can't reset a profile-scoped attestation)")
+    elif preserve_tab:
+        log(f"[{label}] Caller's tab must stay alive (warm-tab reuse) — skipping kill-tab")
+    else:
         try:
-            await page.close()
-        except Exception:
-            pass
-        page = await browser.new_tab(original_url)
-        await asyncio.sleep(4)
-        if await _settled_clear():
-            log(f"[{label}] Fresh tab cleared verification ✓ — re-running setup")
-            emit_event("agent_verified", phase=phase, agent=platform_key)
-            _mark_cleared()
-            pl = platform.lower()
+            original_url = page.url
+            log(f"[{label}] CUA exhausted — killing the tab and re-opening for a clean slate")
             try:
-                if pl == "claude":
-                    await setup_claude_dr(page)
-                elif pl == "gemini":
-                    await setup_gemini_dr(page)
-                elif pl == "chatgpt":
-                    await setup_chatgpt_dr(page)
-            except Exception as e:
-                log(f"[{label}] Post-kill-tab setup re-run warning: {e}", "WARN")
-            return True
-        log(f"[{label}] Fresh tab still blocked — escalating to user", "WARN")
-    except Exception as e:
-        log(f"[{label}] Kill-tab tier errored: {e} — escalating to user", "WARN")
+                await page.close()
+            except Exception:
+                pass
+            page = await browser.new_tab(original_url)
+            await asyncio.sleep(4)
+            if await _settled_clear():
+                log(f"[{label}] Fresh tab cleared verification ✓ — re-running setup")
+                emit_event("agent_verified", phase=phase, agent=platform_key)
+                _mark_cleared()
+                pl = platform.lower()
+                try:
+                    if pl == "claude":
+                        await setup_claude_dr(page)
+                    elif pl == "gemini":
+                        await setup_gemini_dr(page)
+                    elif pl == "chatgpt":
+                        await setup_chatgpt_dr(page)
+                except Exception as e:
+                    log(f"[{label}] Post-kill-tab setup re-run warning: {e}", "WARN")
+                return True
+            log(f"[{label}] Fresh tab still blocked — escalating to user", "WARN")
+        except Exception as e:
+            log(f"[{label}] Kill-tab tier errored: {e} — escalating to user", "WARN")
 
     # ── User manual fallback — pause pipeline, banner with Resume/Skip ──
     log(f"[{label}] HUMAN VERIFICATION REQUIRED — {reason or 'unknown challenge'} — pausing pipeline", "WARN")
@@ -28070,6 +27993,13 @@ async def check_hv_gate(browser, cua_client, platform: str, label: str,
     # fault. Capped at one extra attempt, so worst case is two passes through
     # the chain's 180s cooldown (~6 min) — acceptable for a rare exception
     # recovery, and far better than hard-aborting the phase on transient noise.
+    #
+    # 2026-07-06 HV-trim: the silent retry is for NON-Cloudflare walls only.
+    # For a confirmed Cloudflare wall a second cascade pass is more cold
+    # navigations against a profile+IP-scoped attestation — it raises the very
+    # bot-score that fired the challenge and snowballs into the next run
+    # ("continuous HV after one run"). One pass already ends at the user pause
+    # (whose 5s poll auto-resumes on natural score decay), so nothing is lost.
     for _hv_attempt in range(2):
         try:
             return await wait_for_verification_clearance(
@@ -28084,13 +28014,23 @@ async def check_hv_gate(browser, cua_client, platform: str, label: str,
         except Exception as e:
             log(f"[{label}] wait_for_verification_clearance errored "
                 f"(attempt {_hv_attempt + 1}/2): {e}", "WARN")
+            _fresh_reason = ""
             try:
-                still_blocked, _ = await detect_human_verification(browser.page, platform, label)
+                still_blocked, _fresh_reason = await detect_human_verification(browser.page, platform, label)
             except Exception:
                 still_blocked = True
             if not still_blocked:
                 log(f"[{label}] HV gate clear after a transient clearance error — proceeding silently", "INFO")
                 return True
+            # Review 2026-07-06: honor the FRESH re-probe verdict, not just the
+            # entry one — the entry probe can land in the #896 detection gap and
+            # read a Cloudflare wall as unknown; the re-probe often positively
+            # identifies it. Losing that verdict would re-run the full cascade
+            # against the attestation (the exact snowball this branch prevents).
+            if "cloudflare" in ((_fresh_reason or reason) or "").lower():
+                log(f"[{label}] Cloudflare wall — not re-running the clearance chain "
+                    "(more navigations raise the score); aborting phase", "WARN")
+                return False
             if _hv_attempt == 0:
                 await asyncio.sleep(3)  # brief backoff before the single silent retry
     log(f"[{label}] HV clearance failed after silent retry — aborting phase", "WARN")
@@ -28210,28 +28150,129 @@ async def _try_inpage_retry_on_research_fail(page, platform, label, max_wait_s=2
     return False
 
 
+async def _chatgpt_force_new_chat(page, label) -> bool:
+    """Client-side "New chat" on an already-open chatgpt.com tab (2A warm-tab
+    reuse, 2026-07-06 bot-score work). Returns True when the tab lands on a
+    fresh composer WITHOUT a top-level navigation — that's the whole point:
+    the cold chatgpt.com page-load is the Cloudflare-scored event, while the
+    SPA's New-chat click is history-API routing the edge never sees. Mirrors
+    the Gemini Layer-0.6 fresh-chat guard.
+    False = caller should fall back to a same-tab goto (still cheaper than a
+    second tab: one nav instead of one nav + a lingering duplicate surface).
+
+    Review 2026-07-06: URL heuristics alone aren't proof of a composer — a
+    signed-in tab parked on /gpts, /codex, or a read-only /share/<id> page has
+    a chatgpt.com URL but no composer, and "success" there would send
+    setup_chatgpt_dr into its full CUA fallback. So every True is gated on a
+    COMPOSER-PRESENT DOM probe; anything less falls back to the goto."""
+    async def _composer_present() -> bool:
+        try:
+            return bool(await page.evaluate(
+                "() => !!document.querySelector("
+                "'#prompt-textarea, form [contenteditable=\"true\"], "
+                "[data-testid*=\"composer\"] textarea, form textarea')"))
+        except Exception:
+            return False
+
+    try:
+        cur = (page.url or "").lower()
+        if "chatgpt.com" not in cur and "chat.openai.com" not in cur:
+            return False
+        if "/c/" not in cur:
+            # No conversation mounted — but only a real composer counts
+            # (rules out /gpts, /codex, /share/<id>, auth interstitials).
+            return await _composer_present()
+        clicked = await page.evaluate("""() => {
+            const sels = [
+                '[data-testid="create-new-chat-button"]',
+                'a[data-testid="create-new-chat-button"]',
+                'button[aria-label*="New chat" i]',
+                'a[aria-label*="New chat" i]',
+            ];
+            for (const s of sels) {
+                const el = document.querySelector(s);
+                if (el && el.offsetParent !== null) { el.click(); return true; }
+            }
+            for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t === 'new chat' && el.offsetParent !== null) { el.click(); return true; }
+            }
+            return false;
+        }""")
+        if not clicked:
+            return False
+        await asyncio.sleep(2)
+        cur2 = (page.url or "").lower()
+        if "/c/" in cur2:
+            return False  # SPA never left the conversation
+        return await _composer_present()
+    except Exception as e:
+        log(f"[{label}] New-chat click errored: {e}", "WARN")
+        return False
+
+
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
                                      brief, label, platform, verbose=False,
-                                     brief_path=None, source_paths=None):
+                                     brief_path=None, source_paths=None,
+                                     reuse_page=None):
     """Start agent: open tab → Playwright-direct setup → CUA validation → paste brief → submit.
 
     source_paths: user-attached source docs (skip-P1 flow). ChatGPT/Claude
     attach them natively alongside the brief; Gemini gets their text pasted
     (it silently drops file uploads). Empty/None = legacy behavior.
 
+    reuse_page (2026-07-06 bot-score work, ChatGPT/2A only): an already-open,
+    still-warm tab on this platform (the Phase-1 ChatGPT tab). When given, we
+    REUSE it — client-side "New chat" instead of `new_tab(url)` — because every
+    cold top-level load of chatgpt.com is a Cloudflare bot-score event, and P2
+    was paying a second one per run (plus holding two ChatGPT surfaces) right
+    after P1 already established a warm, challenge-passed tab. The reuse path
+    falls back to a same-tab goto, and any failure falls all the way back to
+    the fresh-tab path — behavior-identical worst case. Retries/hard-retries
+    pass None (fresh tab), so recovery still gets a clean slate.
+
     Two-layer setup for reliability:
     1. Playwright clicks known selectors (fast, deterministic when UI is stable)
     2. CUA visually validates the intended state and fixes discrepancies
     """
-    log(f"[{label}] Opening {url}...")
-    page = await browser.new_tab(url)
-    await asyncio.sleep(4)
+    page = None
+    if reuse_page is not None:
+        try:
+            if not reuse_page.is_closed():
+                log(f"[{label}] Reusing the warm {platform} tab (client-side New chat — no cold navigation)")
+                page = reuse_page
+                # Review 2026-07-06: _agent_streams is keyed by id(page) and
+                # inject_agent_observer only setdefault-inits it — a reused
+                # page would keep P1's final text length as P2's starting
+                # observer state (wrong partialTextLen from tick 1, poisoned
+                # text-growth stall baseline). Hard-reset the entry; the P2
+                # observer injection re-creates it from zero.
+                _agent_streams.pop(id(page), None)
+                await browser.switch_to_page(page)
+                if await _chatgpt_force_new_chat(page, label):
+                    await asyncio.sleep(2)
+                else:
+                    # SPA New-chat didn't land — same-tab navigation fallback
+                    # (one nav; still no second ChatGPT surface).
+                    log(f"[{label}] New-chat click didn't land — same-tab nav to {url}", "WARN")
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(4)
+        except Exception as _ru_err:
+            log(f"[{label}] Warm-tab reuse failed ({_ru_err}) — falling back to a fresh tab", "WARN")
+            page = None
+    if page is None:
+        log(f"[{label}] Opening {url}...")
+        page = await browser.new_tab(url)
+        await asyncio.sleep(4)
 
     # LAYER 0: Detect human-verification gates BEFORE Playwright setup tries to
     # click selectors that don't exist under a Cloudflare / CAPTCHA overlay.
     # If a challenge is present, pause the pipeline and let the user solve it
     # in the browser, then auto-resume when cleared.
     platform_l = platform.lower()
+    # Warm-tab reuse: this page is the caller's live P1/main tab — the HV
+    # cascade must never kill it (its tier-4 replacement page can't reach us).
+    _preserve_tab = reuse_page is not None and page is reuse_page
     blocked, reason = await detect_human_verification(page, platform, label)
     if not blocked:
         # #896: fresh nav landed clean — drop any stale wall verdict from a
@@ -28241,7 +28282,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         _controls.hv_blocked.pop(platform_l, None)
     if blocked:
         cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label,
-                                                        verbose=verbose, initial_reason=reason)
+                                                        verbose=verbose, initial_reason=reason,
+                                                        preserve_tab=_preserve_tab)
         if not cleared:
             # #896: reason-aware card — Cloudflare gets the real-Chrome
             # trust-building guidance, not "try again in the open browser".
@@ -28325,7 +28367,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         blocked, _hv_reason = await detect_human_verification(page, platform, label)
         if blocked:
             cleared = await wait_for_verification_clearance(browser, cua_client, page, platform, label,
-                                                            verbose=verbose, initial_reason=_hv_reason)
+                                                            verbose=verbose, initial_reason=_hv_reason,
+                                                            preserve_tab=_preserve_tab)
             if not cleared:
                 # #896: reason-aware card (Cloudflare → real-Chrome guidance);
                 # prefer the cascade's refreshed verdict over our pre-probe.
@@ -28972,17 +29015,36 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     if enabled_agents is None or "chatgpt" in enabled_agents:
         log("\n--- 2A: ChatGPT Deep Research (already in ChatGPT) ---")
         emit_event("agent_progress", phase=2, agent="chatgpt", status="starting", progress="Opening ChatGPT Deep Research mode...")
+        # 2026-07-06 bot-score work: REUSE the warm Phase-1 ChatGPT tab instead
+        # of opening a second one. Every cold top-level chatgpt.com load is a
+        # Cloudflare-scored event; P1 already paid it and left a warm,
+        # challenge-passed tab at /c/<brief-id> — 2A now just clicks "New chat"
+        # there (client-side routing, invisible to the edge). Detected at
+        # runtime by URL so a skip-P1 run (main tab never visited ChatGPT)
+        # falls back to today's fresh-tab path automatically.
+        _warm_chatgpt_tab = None
+        try:
+            if (browser.page is not None and not browser.page.is_closed()
+                    and "chatgpt.com" in (browser.page.url or "").lower()):
+                _warm_chatgpt_tab = browser.page
+        except Exception:
+            _warm_chatgpt_tab = None
         for attempt in range(2):
             if attempt > 0:
                 log("[2A] Retrying ChatGPT (fresh tab)...", "WARN")
-                try: await chatgpt_page.close()
-                except Exception: pass
+                # Never close the reused P1/main tab — the retry gets a clean
+                # fresh tab below (reuse_page=None on attempt 1) and closing
+                # the main tab would leave browser.page dangling.
+                if chatgpt_page is not None and chatgpt_page is not _warm_chatgpt_tab:
+                    try: await chatgpt_page.close()
+                    except Exception: pass
             chatgpt_page, _chatgpt_setup_ok = await start_agent_no_gemini_wait(
                 browser, cua_client, "https://chatgpt.com",
                 PROMPT_CHATGPT_DEEP_RESEARCH,
                 "Enable Deep Research mode in ChatGPT. Do NOT type — just set up and focus input. Say 'ready for paste'.",
                 brief_text, "2A", "ChatGPT", verbose, brief_path=brief_path,
-                source_paths=source_paths)
+                source_paths=source_paths,
+                reuse_page=_warm_chatgpt_tab if attempt == 0 else None)
             if not _chatgpt_setup_ok:
                 # Setup/paste failed — start_agent_no_gemini_wait already
                 # emitted pipeline_error with Retry/Skip actions. Don't try
