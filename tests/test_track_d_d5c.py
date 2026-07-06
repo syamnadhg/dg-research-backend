@@ -179,6 +179,7 @@ class TestVersionNotice:
     def test_check_newer_version_force_passthrough(self, monkeypatch):
         # `force=True` (the app's "Check for updates") must reach _latest_on_pypi.
         seen = {}
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
 
         def _latest(*, force=False):
@@ -256,21 +257,29 @@ class TestVersionNotice:
         assert research._latest_on_pypi() == "0.1.9"
 
     def test_device_version_fields_installed_with_update(self, monkeypatch):
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.4")
         monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: "0.1.5")
         assert research._device_version_fields() == {
             "version": "0.1.4", "updateAvailable": "0.1.5"}
 
     def test_device_version_fields_current(self, monkeypatch):
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
         monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
         assert research._device_version_fields() == {
             "version": "0.1.5", "updateAvailable": None}
 
     def test_device_version_fields_source_checkout_no_prompt(self, monkeypatch):
-        # Source checkout → no installed version → FE shows no update prompt.
-        monkeypatch.setattr(research, "_sr_version", lambda: "(source checkout)")
-        monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
+        # A SOURCE CHECKOUT shows "Backend version unknown" + no update — even when
+        # it's an editable / `pip install -e .` install whose discoverable metadata
+        # makes _sr_version() report a REAL version (the VivobookPro leak: the old
+        # `startswith("(")` test let "0.1.4" through). Gate is the path check, so a
+        # real version string must STILL yield None/None.
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: True)
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.4")  # metadata present
+        # _check_newer_version is short-circuited by the same gate; assert it too.
+        assert research._check_newer_version() is None
         assert research._device_version_fields() == {
             "version": None, "updateAvailable": None}
 

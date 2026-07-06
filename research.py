@@ -43936,7 +43936,16 @@ def _check_newer_version(*, force: bool = False) -> "str | None":
     than the installed one, else None — a pip-style "new version available" nudge.
     Thin wrapper over `_latest_on_pypi()` (24h-cached); returns None on a source
     checkout, offline, or when already current. `force=True` bypasses the 24h
-    cache for a fresh check (the app's on-demand "Check for updates")."""
+    cache for a fresh check (the app's on-demand "Check for updates").
+
+    A source checkout is never PyPI-updatable (it updates via `git pull`, and
+    `--update` refuses it), so it must never advertise an update. Gate on the
+    authoritative PATH check `_is_source_checkout()` — NOT the `_sr_version()`
+    string below: an editable / `pip install -e .` checkout has discoverable
+    package metadata, so `_sr_version()` returns a real "0.1.4" that slips past
+    the `startswith("(")` test (the VivobookPro leak)."""
+    if _is_source_checkout():
+        return None
     cur = _sr_version()
     if not cur or cur.startswith("("):
         return None
@@ -43965,9 +43974,19 @@ def _device_version_fields(*, force: bool = False) -> dict:
     BE's running package version) and `updateAvailable` (the newer version on
     PyPI, or None when current). The FE reads these to show the backend version +
     an update prompt. Sync (file read + 24h-cached PyPI); call OFF the event loop.
-    A source checkout / offline yields version None + updateAvailable None, so the
-    FE shows no update prompt (nothing to update). `force=True` does a FRESH PyPI
-    check (the app's on-demand "Check for updates" device command)."""
+    `force=True` does a FRESH PyPI check (the app's on-demand "Check for updates"
+    device command).
+
+    A SOURCE CHECKOUT yields version None + updateAvailable None: the app then
+    shows "Backend version unknown" and offers no update, because a dev tree isn't
+    a pipx-managed build and can't be updated from the app (it updates via
+    `git pull`). Gate on the authoritative PATH check `_is_source_checkout()`, NOT
+    on the `_sr_version()` string — an editable / `pip install -e .` checkout has
+    discoverable metadata, so `_sr_version()` returns a real "0.1.4" and the old
+    `startswith("(")` test leaked a version for a source-paired device (the
+    VivobookPro bug). Offline / not-installed also yields None."""
+    if _is_source_checkout():
+        return {"version": None, "updateAvailable": None}
     try:
         _v = _sr_version()
         version = _v if (_v and not _v.startswith("(")) else None
