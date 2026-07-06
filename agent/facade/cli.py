@@ -1418,8 +1418,11 @@ def cmd_version(_args: argparse.Namespace) -> int:
     print(f"\n  {b.c(branding._BOLD, 'Agent')} (superresearch-agent)   {b.c(branding._BOLD, 'v' + __version__)}")
     a_new = selfupdate.agent_update_available()
     if a_new:
+        # --no-cache is required: `pipx run` reuses its cached run-venv and would
+        # otherwise re-run the STALE build (the same trap the self-update path
+        # fixes). Matches connect.py:run_agent_in_wsl.
         print(f"     {b.c(branding._ACCENT, '⬆ v' + a_new + ' available')} — update with  "
-              f"{b.c(branding._BOLD, 'pipx run superresearch-agent connect')}")
+              f"{b.c(branding._BOLD, 'pipx run --no-cache superresearch-agent connect')}")
     sr = _local_superresearch()
     backend_ver = None
     if sr:
