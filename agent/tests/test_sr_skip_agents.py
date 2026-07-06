@@ -150,7 +150,11 @@ def test_stream_health_rearm_when_state_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(sr, "_prepare_stream_arm",
                         lambda: (["ARM ME", "  cronjob: create …"], {}, 0))
     runs = [{"runId": "r1", "status": "ongoing", "viaAgent": True}]
-    assert sr._stream_health_lines(runs) == ["ARM ME", "  cronjob: create …"]
+    # The re-arm directive is wrapped under the do-not-relay marker (assistant
+    # acts on it silently; it never reaches the user).
+    assert sr._stream_health_lines(runs) == sr._agent_directive_block(
+        ["ARM ME", "  cronjob: create …"])
+    assert sr._AGENT_ONLY_MARKER in sr._stream_health_lines(runs)
 
 
 def test_stream_health_quiet_when_ticking(monkeypatch, tmp_path):
@@ -179,7 +183,7 @@ def test_stream_health_rearm_on_needs_attention(monkeypatch, tmp_path):
     monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: (["ARM"], {}, 0))
     runs = [{"runId": "r1", "status": "errored", "viaAgent": True,
              "needsAttention": True, "attention": "ChatGPT stopped responding"}]
-    assert sr._stream_health_lines(runs) == ["ARM"]
+    assert sr._stream_health_lines(runs) == sr._agent_directive_block(["ARM"])
 
 
 def test_stream_health_scoped_chat_ignores_other_chats_runs(monkeypatch, tmp_path):
@@ -201,7 +205,7 @@ def test_stream_health_scoped_chat_rearms_for_its_own_run(monkeypatch, tmp_path)
     monkeypatch.setattr(sr, "_prepare_stream_arm", lambda: (["ARM"], {}, 0))
     runs = [{"runId": "r1", "status": "ongoing", "viaAgent": True,
              "chatOrigin": {"platform": "WhatsApp", "chat_id": "A"}}]
-    assert sr._stream_health_lines(runs) == ["ARM"]
+    assert sr._stream_health_lines(runs) == sr._agent_directive_block(["ARM"])
 
 
 # ── stale chat-side copy tell ────────────────────────────────────────────────

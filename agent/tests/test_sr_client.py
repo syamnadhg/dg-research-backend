@@ -286,6 +286,10 @@ def test_research_401_stashes_topic_and_arms_watchdog(monkeypatch, capsys):
     assert start and start[0].get("pending_topic") == "the EV battery market"
     out = capsys.readouterr().out.lower()
     assert "log in here" in out and "pick this up" in out
+    # The arm directive is under the do-not-relay marker, AFTER the sign-in link —
+    # so the AI arms silently in one turn (no duplicate "signing you in" message).
+    assert "do not relay" in out
+    assert out.index("log in here") < out.index("do not relay") < out.index("cronjob")
 
 
 def test_devices(bridge_port, capsys):
@@ -487,6 +491,13 @@ def test_research_then_status(bridge_port, capsys):
     assert "Started" in out and "Tesla 2025" in out
     assert "My PC" in out          # the device is shown by NAME, not its id
     assert "agent-" not in out      # no raw run-id leaks into chat (I4)
+    # The streaming cronjob directive is hidden under the do-not-relay marker:
+    # the human "Started" line is ABOVE it, the cronjob syntax BELOW it (so the
+    # AI arms silently and the user sees a clean message — no clutter).
+    assert sr._AGENT_ONLY_MARKER in out
+    assert out.index("Started") < out.index(sr._AGENT_ONLY_MARKER)
+    assert "cronjob: create" in out
+    assert out.index(sr._AGENT_ONLY_MARKER) < out.index("cronjob: create")
     assert FakeFS.last_enqueue["device_id"] == "dev-a"  # auto-picked the sole device
 
     # status with no id resolves to the most recent run

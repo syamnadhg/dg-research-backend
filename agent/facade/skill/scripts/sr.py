@@ -149,6 +149,22 @@ def _fail_code(http_code: int) -> int:
     return 2 if http_code == 0 else 1
 
 
+# A do-not-relay marker for handing the chat AI a TOOL directive (e.g. the
+# streaming cronjob) without it leaking into the chat. SKILL.md defines the
+# contract: relay everything ABOVE this line verbatim; act on everything BELOW it
+# SILENTLY (call the tool, never quote it, never announce it) — which is what
+# fixes both the cluttered "Started" message and the duplicate "signing you in"
+# message (the AI narrated the arming twice because the directive was mixed into
+# the user text). Nothing runtime-specific is baked in — a runtime with no such
+# tool just ignores the block, so it works AGAINST no runtime.
+_AGENT_ONLY_MARKER = "── for the assistant · do NOT relay to the user ──"
+
+
+def _agent_directive_block(directive_lines: list[str]) -> list[str]:
+    """Wrap assistant-only instruction lines under the do-not-relay marker."""
+    return ["", _AGENT_ONLY_MARKER, *directive_lines]
+
+
 _SR_LINK_LABELS = {
     "brief": "Brief", "chatgpt": "ChatGPT report", "gemini": "Gemini report",
     "claude": "Claude report", "podcast": "Podcast",
@@ -438,7 +454,7 @@ def cmd_login(args) -> int:
     # bridge's "✓ signed in" lands here on its own — no need to poll for completion.
     arm_lines, _payload, arm_rc = _prepare_stream_arm()
     if arm_rc == 0:
-        lines += arm_lines
+        lines += _agent_directive_block(arm_lines)
     return _emit(body, args.json, lines)
 
 
@@ -652,7 +668,7 @@ def cmd_research(args) -> int:
                 _post("/login/remote/pending", stash)
                 lines = ["You're almost signed in — finish in your browser and I'll pick this up."]
                 if arm_rc == 0:
-                    lines += arm_lines
+                    lines += _agent_directive_block(arm_lines)
                 return _emit(body, args.json, lines, _fail_code(code))
             # No flow yet: start one carrying the topic, hand back the click-to-approve
             # link, and the bridge captures it automatically on approval (#848).
@@ -664,7 +680,7 @@ def cmd_research(args) -> int:
                     f"  {link}",
                 ]
                 if arm_rc == 0:
-                    lines += arm_lines
+                    lines += _agent_directive_block(arm_lines)
                 return _emit({**body, "verifyUrl": link}, args.json, lines, _fail_code(code))
             return _emit(body, args.json, [
                 "You're not signed in yet — tell me to log you in and I'll send a link.",
@@ -690,7 +706,7 @@ def cmd_research(args) -> int:
     # error, skip silently: the run is fine and `status` still works.
     arm_lines, _payload, arm_rc = _prepare_stream_arm()
     if arm_rc == 0:
-        lines += arm_lines
+        lines += _agent_directive_block(arm_lines)
     return _emit(body, args.json, lines)
 
 
@@ -1066,19 +1082,24 @@ def cmd_install(args) -> int:
 
 def _prepare_stream_arm() -> tuple[list[str], dict, int]:
     """Prepare THIS chat's run-scoped streaming watchdog and return
-    ``(lines, payload, rc)`` — ``lines`` carry the gateway ``cronjob: create …``
-    directive that arms it. Writes a shim that bakes in this chat's origin (the
-    cron can't take args or read the session env). The watchdog SELF-REMOVES once
-    the chat's runs finish, so it's safe to (re-)emit on every research start — the
-    gateway dedups by the fixed job name. No chat origin (older gateway) → the
-    shared account-wide watchdog. A shim-write error → a single ✗ line + rc=1."""
+    ``(lines, payload, rc)`` — ``lines`` are ASSISTANT-ONLY directive lines (the
+    caller wraps them via ``_agent_directive_block`` so the ``cronjob: create …``
+    syntax never reaches the user) that arm it. Writes a shim that bakes in this
+    chat's origin (the cron can't take args or read the session env). The watchdog
+    SELF-REMOVES once the chat's runs finish, so it's safe to (re-)emit on every
+    research start — the gateway dedups by the fixed job name. No chat origin
+    (older gateway) → the shared account-wide watchdog. A shim-write error → a
+    single ✗ line + rc=1 (the caller drops it on the auto-arm paths)."""
     origin = _origin_from_env()
     if origin is None:
         payload = {"script": "sr_attention_poll.py", "name": "sr-stream",
                    "schedule": "every 1m", "scoped": False}
+        # ASSISTANT-ONLY directive lines — the caller wraps them under the
+        # do-not-relay marker, so the user never sees this cronjob syntax.
         return ([
-            "To stream progress here, arm the watchdog with the cronjob tool "
-            "(it auto-removes when the run finishes):",
+            "Arm this chat's live-progress watchdog with your cronjob tool — skip "
+            "if it's already armed, or if your runtime has no cronjob tool (it "
+            "auto-removes when the run finishes):",
             '  cronjob: create no_agent=true schedule="every 1m" '
             'script="sr_attention_poll.py" name="sr-stream"',
         ], payload, 0)
@@ -1091,7 +1112,7 @@ def _prepare_stream_arm() -> tuple[list[str], dict, int]:
     payload = {"script": script_name, "name": job_name, "schedule": "every 1m",
                "scoped": True, "origin": origin}
     return ([
-        "To stream progress here, arm the watchdog with the cronjob tool — first "
+        "Arm this chat's live-progress watchdog with your cronjob tool — first "
         "check it isn't already armed; it streams only THIS chat's runs and "
         "auto-removes when they finish:",
         f'  cronjob: create no_agent=true schedule="every 1m" '
@@ -1103,6 +1124,8 @@ def cmd_arm_stream(args) -> int:
     """Prepare THIS chat's streaming watchdog and tell the agent how to arm it.
     (Research auto-emits the same directive; this is the explicit/standalone form.)"""
     lines, payload, rc = _prepare_stream_arm()
+    if rc == 0:
+        lines = _agent_directive_block(lines)
     return _emit(payload, args.json, lines, rc)
 
 
@@ -1156,7 +1179,7 @@ def _stream_health_lines(runs: list) -> list[str]:
         if state.exists() and (time.time() - state.stat().st_mtime) < _STREAM_STALE_SEC:
             return []  # ticking — healthy, say nothing
         arm_lines, _payload, rc = _prepare_stream_arm()
-        return arm_lines if rc == 0 else []
+        return _agent_directive_block(arm_lines) if rc == 0 else []
     except Exception:
         return []
 
