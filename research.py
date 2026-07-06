@@ -4185,6 +4185,26 @@ def _write_update_status(device_id: str, status: dict) -> None:
         log(f"[device-cmds] update-status write skipped: {e}", "DEBUG")
 
 
+def _handle_check_update_command(device_id: str) -> None:
+    """App-driven 'check for a backend update' (About-page 'Check' button). Forces
+    a FRESH PyPI check and republishes version + updateAvailable to the device doc,
+    plus a `versionCheckedAt` timestamp so the app knows the check completed (vs
+    still pending). No restart — this only refreshes the update signal. Best-effort;
+    runs off the listener thread's happy path (a failed PyPI fetch just leaves the
+    prior signal + still stamps versionCheckedAt so the spinner clears)."""
+    try:
+        fields = _device_version_fields(force=True)
+    except Exception:
+        fields = {}
+    try:
+        _firebase_db.collection("devices").document(device_id).update({
+            **fields,
+            "versionCheckedAt": int(time.time() * 1000),
+        })
+    except Exception as e:
+        log(f"[device-cmds] check-update publish skipped: {e}", "DEBUG")
+
+
 def _handle_update_command(data: dict, device_id: str, loop) -> None:
     """App-driven remote backend update (owner-only `update` device command).
     Runs on WORKER_ID==1 only. Reuses `_perform_self_update`; forces THIS worker
@@ -4361,13 +4381,13 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     doc.reference.update({"processed": True})
                 except Exception as _de:
                     log(f"[device-cmds] processed-marker write failed for {doc.id}: {_de}", "DEBUG")
-            elif action == "update" and WORKER_ID != 1:
-                # Only worker 1 ACTS on `update`. A sibling worker must NOT delete
-                # the doc here — deleting it before worker 1's Firestore stream
-                # delivers the ADDED could drop the command with no replay (a
-                # create+delete inside a stream-resync window is coalesced away).
-                # Leaving it means the doc persists until worker 1 processes it (or
-                # the 30s stale gate reaps it). Worker 1 deletes it in the `else`.
+            elif action in ("update", "check-update") and WORKER_ID != 1:
+                # Only worker 1 ACTS on `update` / `check-update`. A sibling worker
+                # must NOT delete the doc here — deleting it before worker 1's
+                # Firestore stream delivers the ADDED could drop the command with no
+                # replay (a create+delete inside a stream-resync window is coalesced
+                # away). Leaving it means the doc persists until worker 1 processes
+                # it (or the 30s stale gate reaps it). Worker 1 deletes it (`else`).
                 continue
             else:
                 try:
@@ -4932,6 +4952,14 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                 # All the authz / supervised / mid-run guards live in the handler.
                 if WORKER_ID == 1:
                     _handle_update_command(data, device_id, loop)
+                continue
+
+            if action == "check-update":
+                # App-driven "check for a backend update" (About-page Check button).
+                # Worker 1 forces a fresh PyPI check + republishes the version signal
+                # + versionCheckedAt. Benign (no restart); single-actor like update.
+                if WORKER_ID == 1:
+                    _handle_check_update_command(device_id)
                 continue
 
             # Unknown action — already logged above and the doc is
@@ -43903,15 +43931,16 @@ def _latest_on_pypi(*, force: bool = False) -> "str | None":
     return latest or None
 
 
-def _check_newer_version() -> "str | None":
+def _check_newer_version(*, force: bool = False) -> "str | None":
     """Return the latest superresearch version published on PyPI IF it is newer
     than the installed one, else None — a pip-style "new version available" nudge.
     Thin wrapper over `_latest_on_pypi()` (24h-cached); returns None on a source
-    checkout, offline, or when already current."""
+    checkout, offline, or when already current. `force=True` bypasses the 24h
+    cache for a fresh check (the app's on-demand "Check for updates")."""
     cur = _sr_version()
     if not cur or cur.startswith("("):
         return None
-    latest = _latest_on_pypi()
+    latest = _latest_on_pypi(force=force)
     return latest if (latest and _version_gt(latest, cur)) else None
 
 
@@ -43931,21 +43960,21 @@ def _newer_version_notice() -> "str | None":
     return _VERSION_NOTICE_MEMO  # type: ignore[return-value]
 
 
-def _device_version_fields() -> dict:
+def _device_version_fields(*, force: bool = False) -> dict:
     """Version fields the heartbeat publishes to the device doc: `version` (the
     BE's running package version) and `updateAvailable` (the newer version on
-    PyPI, or None when current). The FE reads these to raise an in-app "run
-    `superresearch --update` on the Research computer" notification — the agent no
-    longer touches BE updates. Sync (file read + 24h-cached PyPI); call OFF the
-    event loop. A source checkout / offline yields version None + updateAvailable
-    None, so the FE shows no update prompt (nothing to update)."""
+    PyPI, or None when current). The FE reads these to show the backend version +
+    an update prompt. Sync (file read + 24h-cached PyPI); call OFF the event loop.
+    A source checkout / offline yields version None + updateAvailable None, so the
+    FE shows no update prompt (nothing to update). `force=True` does a FRESH PyPI
+    check (the app's on-demand "Check for updates" device command)."""
     try:
         _v = _sr_version()
         version = _v if (_v and not _v.startswith("(")) else None
     except Exception:
         version = None
     try:
-        update_available = _check_newer_version()  # newer-than-installed or None (24h-cached)
+        update_available = _check_newer_version(force=force)  # newer-than-installed or None
     except Exception:
         update_available = None
     return {"version": version, "updateAvailable": update_available}

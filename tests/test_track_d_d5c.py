@@ -176,6 +176,19 @@ class TestVersionNotice:
         monkeypatch.setattr(research, "_is_source_checkout", lambda: True)
         assert research._check_newer_version() is None
 
+    def test_check_newer_version_force_passthrough(self, monkeypatch):
+        # `force=True` (the app's "Check for updates") must reach _latest_on_pypi.
+        seen = {}
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
+
+        def _latest(*, force=False):
+            seen["force"] = force
+            return "0.1.6"
+
+        monkeypatch.setattr(research, "_latest_on_pypi", _latest)
+        assert research._check_newer_version(force=True) == "0.1.6"
+        assert seen["force"] is True
+
     def test_version_gt_zero_pads(self):
         # 1.0 and 1.0.0 are the SAME version — neither is 'newer' (regression:
         # unpadded compare treated 1.0.0 > 1.0, which would false-trigger --update).
@@ -244,20 +257,20 @@ class TestVersionNotice:
 
     def test_device_version_fields_installed_with_update(self, monkeypatch):
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.4")
-        monkeypatch.setattr(research, "_check_newer_version", lambda: "0.1.5")
+        monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: "0.1.5")
         assert research._device_version_fields() == {
             "version": "0.1.4", "updateAvailable": "0.1.5"}
 
     def test_device_version_fields_current(self, monkeypatch):
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
-        monkeypatch.setattr(research, "_check_newer_version", lambda: None)
+        monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
         assert research._device_version_fields() == {
             "version": "0.1.5", "updateAvailable": None}
 
     def test_device_version_fields_source_checkout_no_prompt(self, monkeypatch):
         # Source checkout → no installed version → FE shows no update prompt.
         monkeypatch.setattr(research, "_sr_version", lambda: "(source checkout)")
-        monkeypatch.setattr(research, "_check_newer_version", lambda: None)
+        monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
         assert research._device_version_fields() == {
             "version": None, "updateAvailable": None}
 

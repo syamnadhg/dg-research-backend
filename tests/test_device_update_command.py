@@ -225,6 +225,25 @@ def test_idle_owner_supervised_updates_and_exits(monkeypatch):
     assert exits and exits[0][0] == "device-update"
 
 
+def test_check_update_publishes_version_and_checkedat(monkeypatch):
+    # The About-page "Check" command forces a fresh check and republishes the
+    # version signal + a versionCheckedAt stamp (so the FE spinner clears). No exit.
+    store = {f"devices/{DEV}": {"ownerUid": OWNER}}
+    monkeypatch.setattr(research, "_firebase_db", _FakeDB(store))
+    seen = {}
+
+    def _fields(*, force=False):
+        seen["force"] = force
+        return {"version": "0.1.5", "updateAvailable": "0.1.6"}
+
+    monkeypatch.setattr(research, "_device_version_fields", _fields)
+    research._handle_check_update_command(DEV)
+    doc = store[f"devices/{DEV}"]
+    assert seen["force"] is True, "check must force a fresh PyPI read"
+    assert doc["version"] == "0.1.5" and doc["updateAvailable"] == "0.1.6"
+    assert isinstance(doc.get("versionCheckedAt"), int)
+
+
 def test_already_up_to_date_no_exit(monkeypatch):
     store, exits, perform, _ = _handle(
         monkeypatch,
