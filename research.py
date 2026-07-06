@@ -3743,8 +3743,14 @@ def _worker_is_resting(*, ttl_sec: float = 3.0) -> bool:
                 _dev = (_firebase_db.collection("devices").document(did)
                         .get().to_dict() or {})
                 _raw = _dev.get("restingWorkerIds") or []
+                # Type-guard (review): a garbage owner write ("12", a map,
+                # [true]) must count NOBODY as resting — never char-iterate a
+                # scalar, never let bool coerce to worker 1.
+                if not isinstance(_raw, (list, tuple)):
+                    _raw = []
                 ids = tuple(int(x) for x in _raw
-                            if isinstance(x, (int, float)) or (isinstance(x, str) and x.isdigit()))
+                            if (isinstance(x, (int, float)) and not isinstance(x, bool))
+                            or (isinstance(x, str) and x.isdigit()))
         except Exception as e:
             log(f"[rest-gate] restingWorkerIds read failed (treating as awake): {e}", "DEBUG")
             ids = ()
@@ -5681,7 +5687,17 @@ def start_firestore_start_listener(job_queue, loop):
                 # listener fire but don't delete. Doc gets re-evaluated
                 # on next process bounce (replay → ZOMBIE → delete).
                 continue
-            elif _age_ms > ABANDONED_MAX_MS and data.get("action", "start") != "cancel":
+            elif (_age_ms > ABANDONED_MAX_MS and data.get("action", "start") != "cancel"
+                    and not _worker_is_resting()
+                    and not (isinstance(data.get("restDeferredAt"), (int, float))
+                             and int(time.time() * 1000) - int(data["restDeferredAt"])
+                             <= ABANDONED_MAX_MS)):
+                # #903 rest exemptions (review MAJOR): a rest-deferred doc is
+                # EXPECTED to sit unclaimed past 12h (park over a weekend is
+                # the feature's headline use). While resting, never sweep;
+                # after a wake+restart, measure age from the last rest-defer
+                # stamp (restDeferredAt, re-stamped by the defer path) so a
+                # doc parked >12h isn't silently dropped before pickup.
                 # 2026-05-28: exempt action="cancel" docs from the 12h
                 # ABANDONED sweep. A cancel doc is a terminal SIGNAL, not
                 # queued work — silently deleting one before the
@@ -6348,7 +6364,15 @@ def start_firestore_start_listener(job_queue, loop):
             _resting = _worker_is_resting()
             if _resting:
                 _REST_DEFER_SEEN["v"] = True
-            if _resting or _multi_worker_mode:
+            # Review MAJOR (2026-07-06): while _REST_DEFER_SEEN is set, the
+            # single-worker idle-rescan is armed as the wake-side pickup — so
+            # the listener MUST claim too (mutual exclusion via the claim's
+            # conditional update), else the rescan can race this listener
+            # mid-processing and double-run the same research. The flag is
+            # level-triggered: the rescan clears it once the worker is awake
+            # and the queue has no unclaimed start docs, restoring pristine
+            # single-worker behavior (no claim RTT per start event).
+            if _resting or _multi_worker_mode or _REST_DEFER_SEEN["v"]:
                 # Multi-worker: gate-on-busy + Firestore claim. Single-worker
                 # installs skip both (no contender to race; no free Firestore
                 # RTT per start event) — UNLESS resting, which defers.
@@ -6472,6 +6496,16 @@ def start_firestore_start_listener(job_queue, loop):
                             f"{research_id[:8]}… (non-fatal): {_pwerr}",
                             "DEBUG",
                         )
+                    if _resting:
+                        # #903: keep-alive stamp — the 12h ABANDONED sweep
+                        # measures a rest-deferred doc's age from this field
+                        # (re-stamped on every defer pass), so parking a
+                        # worker for >12h + a BE restart can't silently drop
+                        # the queued run. Best-effort (rules allow-listed).
+                        try:
+                            doc.reference.update({"restDeferredAt": int(time.time() * 1000)})
+                        except Exception as _rda_err:
+                            log(f"[start-listener] restDeferredAt stamp failed (non-fatal): {_rda_err}", "DEBUG")
                     # 2026-05-28: refresh the device-doc queueOwners array so
                     # the owner's "Shared with" popup shows this run's amber
                     # queue badge immediately. Without this, queueOwners only
@@ -36672,13 +36706,11 @@ async def run_server(port=8000):
             # Single-worker mode — the listener never gates on busy, so no
             # orphan can exist… EXCEPT a doc deferred by the #903 rest gate
             # (Firestore won't re-fire ADDED when the owner wakes the worker;
-            # this rescan is the wake-side pickup). A restart self-heals
-            # without the flag: listener start re-delivers surviving queue
-            # docs as ADDED.
-            return
-        # #903: a resting worker never claims — neither fresh docs nor
-        # orphans. The wake transition is caught by the next rescan tick.
-        if _worker_is_resting():
+            # this rescan is the wake-side pickup). While the flag is set the
+            # LISTENER claims too (mutual exclusion — see the start-listener
+            # gate), and the flag clears below once the queue is drained. A
+            # restart self-heals without the flag: listener start re-delivers
+            # surviving queue docs as ADDED.
             return
         # Shutdown gate (2026-05-22): STOP scheduled exit makes the
         # worker's `finally` block trigger an idle-rescan even though
@@ -36704,6 +36736,13 @@ async def run_server(port=8000):
             # would treat a gated worker as idle and claim a SECOND doc, serializing
             # it behind the still-gated job.
             return
+        # #903: a resting worker never claims — neither fresh docs nor
+        # orphans. The wake transition is caught by the next rescan tick.
+        # AFTER the busy/exit early-outs (review: a busy worker must keep
+        # returning traffic-free) and OFF the event loop (the TTL-expired
+        # read is a blocking Firestore get).
+        if await asyncio.to_thread(_worker_is_resting):
+            return
         did = load_device_id()
         if not did:
             return
@@ -36713,6 +36752,20 @@ async def run_server(port=8000):
         except Exception as e:
             log(f"[idle-rescan] worker {WORKER_ID}: scan failed: {e}", "WARN")
             return
+
+        # #903 level-trigger: awake + no unclaimed start docs → the rest
+        # episode is fully drained; clear the flag so single-worker installs
+        # return to pristine (no-claim, no-rescan) behavior.
+        if _REST_DEFER_SEEN["v"]:
+            _has_unclaimed_start = any(
+                not (s.to_dict() or {}).get("processed")
+                and not (s.to_dict() or {}).get("assignedWorker")
+                and ((s.to_dict() or {}).get("action") or "start") == "start"
+                for s in candidates
+            )
+            if not _has_unclaimed_start:
+                _REST_DEFER_SEEN["v"] = False
+                log(f"[idle-rescan] worker {WORKER_ID}: rest episode drained — flag cleared", "DEBUG")
 
         # FIFO sort (PR 3, 2026-05-21): pick oldest unclaimed first so an
         # orphan that's been sitting longer gets picked up before a newer
@@ -36738,13 +36791,14 @@ async def run_server(port=8000):
                 continue  # cancel/resume handled by their own paths
             # Re-check busy + shutdown + rest before each claim attempt
             # (could have flipped mid-scan: a sibling claimed a different
-            # doc, a STOP landed, or the owner parked this worker).
+            # doc, a STOP landed, or the owner parked this worker). The rest
+            # re-read runs off-loop (TTL-expired = blocking Firestore get).
             if (
                 _exit_scheduled
                 or _QUEUE_STATE.get("running")
                 or _job_queue.qsize() > 0
                 or _QUEUE_STATE.get("gate_pending_job")
-                or _worker_is_resting()
+                or await asyncio.to_thread(_worker_is_resting)
             ):
                 return
 
