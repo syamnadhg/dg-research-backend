@@ -261,27 +261,28 @@ class TestVersionNotice:
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.4")
         monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: "0.1.5")
         assert research._device_version_fields() == {
-            "version": "0.1.4", "updateAvailable": "0.1.5"}
+            "version": "0.1.4", "updateAvailable": "0.1.5", "sourceCheckout": False}
 
     def test_device_version_fields_current(self, monkeypatch):
         monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
         monkeypatch.setattr(research, "_check_newer_version", lambda *, force=False: None)
         assert research._device_version_fields() == {
-            "version": "0.1.5", "updateAvailable": None}
+            "version": "0.1.5", "updateAvailable": None, "sourceCheckout": False}
 
     def test_device_version_fields_source_checkout_no_prompt(self, monkeypatch):
-        # A SOURCE CHECKOUT shows "Backend version unknown" + no update — even when
+        # A SOURCE CHECKOUT reports sourceCheckout=True + version None — even when
         # it's an editable / `pip install -e .` install whose discoverable metadata
         # makes _sr_version() report a REAL version (the VivobookPro leak: the old
         # `startswith("(")` test let "0.1.4" through). Gate is the path check, so a
-        # real version string must STILL yield None/None.
+        # real version string must STILL yield None + the sourceCheckout flag (the
+        # app then shows "Source checkout · update with git pull", no Check/Update).
         monkeypatch.setattr(research, "_is_source_checkout", lambda: True)
         monkeypatch.setattr(research, "_sr_version", lambda: "0.1.4")  # metadata present
         # _check_newer_version is short-circuited by the same gate; assert it too.
         assert research._check_newer_version() is None
         assert research._device_version_fields() == {
-            "version": None, "updateAvailable": None}
+            "version": None, "updateAvailable": None, "sourceCheckout": True}
 
 
 class TestSelfUpdateIdempotent:

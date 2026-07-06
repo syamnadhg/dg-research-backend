@@ -43986,7 +43986,11 @@ def _device_version_fields(*, force: bool = False) -> dict:
     `startswith("(")` test leaked a version for a source-paired device (the
     VivobookPro bug). Offline / not-installed also yields None."""
     if _is_source_checkout():
-        return {"version": None, "updateAvailable": None}
+        # `sourceCheckout` lets the app show "Source checkout · update with git
+        # pull" and hide the Check/Update control — distinct from a pipx build
+        # that just hasn't reported its version yet (offline/just-started), which
+        # is also version None but SHOULD keep Check.
+        return {"version": None, "updateAvailable": None, "sourceCheckout": True}
     try:
         _v = _sr_version()
         version = _v if (_v and not _v.startswith("(")) else None
@@ -43996,7 +44000,7 @@ def _device_version_fields(*, force: bool = False) -> dict:
         update_available = _check_newer_version(force=force)  # newer-than-installed or None
     except Exception:
         update_available = None
-    return {"version": version, "updateAvailable": update_available}
+    return {"version": version, "updateAvailable": update_available, "sourceCheckout": False}
 
 
 def _pipx_cmd() -> "list[str] | None":
