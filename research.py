@@ -21529,14 +21529,17 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # DGOPS-7367 DNS-backoff retry machinery existed ONLY to retry this
             # reload and was removed with it.
 
-            # 2026-05-03: lowered cycle gate 3→2 and elapsed 180s→90s for
-            # parity with ChatGPT's panel-open gate at line ~11689.
-            # Claude's artifact panel is the only path that ships
-            # source_urls into progress["source_urls"]; the prior 180s gate
-            # left the dropdown showing 0 source chips for the first 3
-            # minutes of every Claude P2 run. ChatGPT proved the 90s gate
-            # is safe (artifact strip is rendered by ~30s on a healthy run).
-            _claude_gate_ok = (p.get("poll_cycles", 0) >= 2 or elapsed >= 90)
+            # 2026-05-03: lowered cycle gate 3→2 and elapsed 180s→90s.
+            # 2026-07-06: lowered again to cycle 1 (open on the FIRST poll
+            # tick). By the time the round-robin starts, the agents have
+            # ALREADY been researching for minutes (through P2 setup + the
+            # Gemini plan-wait that gates round-robin entry), so the artifact
+            # panel exists immediately — waiting for cycle 2 (~120s at the
+            # 120s tick cadence, since a Claude/ChatGPT `start_time` is
+            # stamped at round-robin start so cycle-1 elapsed≈0) just delayed
+            # first narration + source chips by a full tick for no benefit.
+            # Open + narrate on cycle 1.
+            _claude_gate_ok = (p.get("poll_cycles", 0) >= 1)
             if (name == "Claude" and _claude_gate_ok and
                     (time.time() - p.get("last_artifact_scrape", 0)) > ARTIFACT_SCRAPE_INTERVAL):
                 try:
@@ -21673,11 +21676,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #    (`_verify_chatgpt_panel_open`) confirms side panel actually
             #    rendered before flipping the flag.
             #  - After 2 DOM misses → CUA tier-3 fallback (capped at 1/phase).
-            # 2026-04-29: lowered gate from iter-#3/180s to iter-#2/90s. The
-            # activity strip exists from t≈10s on a DR job; waiting 3 polls
-            # left the FE narration card stuck on "0 sources, 0 chars" stub
-            # copy for up to 3 minutes. Earlier gate = sub-2-min rich data.
-            _cgpt_gate_ok = (p.get("poll_cycles", 0) >= 2 or elapsed >= 90)
+            # 2026-04-29: lowered gate from iter-#3/180s to iter-#2/90s.
+            # 2026-07-06: lowered to cycle 1 (open on the FIRST poll tick) —
+            # same rationale as Claude's gate above: the round-robin only
+            # starts after the agents have researched for minutes (P2 setup +
+            # Gemini plan-wait), so the activity strip is already present on
+            # cycle 1; the cycle-2 gate cost a full ~120s tick of dead
+            # narration for nothing. Open + narrate immediately.
+            _cgpt_gate_ok = (p.get("poll_cycles", 0) >= 1)
             # Re-verify each cycle — ChatGPT auto-collapses the panel when
             # the user navigates sub-views or after long idle. The verifier
             # is a cheap JS call; if the panel stays open across cycles
