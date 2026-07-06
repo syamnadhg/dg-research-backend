@@ -4173,6 +4173,101 @@ async def _revoked_recovery_loop():
 _device_cmd_watch = None  # Firestore Watch handle; kept for lifetime cleanup
 
 
+def _write_update_status(device_id: str, status: dict) -> None:
+    """Best-effort write of a remote-update outcome to the device doc so the app
+    can render it (the same channel as the version signal). `at` is stamped here.
+    Never raises — a rules gap / offline write must not break the listener."""
+    try:
+        _firebase_db.collection("devices").document(device_id).update({
+            "updateStatus": {**status, "at": int(time.time() * 1000)},
+        })
+    except Exception as e:
+        log(f"[device-cmds] update-status write skipped: {e}", "DEBUG")
+
+
+def _handle_update_command(data: dict, device_id: str, loop) -> None:
+    """App-driven remote backend update (owner-only `update` device command).
+    Runs on WORKER_ID==1 only. Reuses `_perform_self_update`; forces THIS worker
+    to exit so the detached `pipx upgrade` waiter can rebuild the venv (the OS
+    scheduled task / daemon-loop respawns the BE on the new version).
+
+    Guards (in order):
+      1. OWNER-ONLY defense-in-depth — refuse if submittedBy != device.ownerUid
+         (the Firestore rule also enforces this, but rules can lag deploy and this
+         is a code-execution primitive).
+      2. SUPERVISED-only — the upgrade kills the daemon-loop + workers; something
+         must relaunch the BE. A live daemon-loop (from --resurrect / the OS task)
+         is that supervisor; a foreground --serve has nothing to bring it back, so
+         refuse remotely and point to `superresearch --update` on the machine.
+      3. MID-RUN — defer while a research run is active (local queue OR any
+         busyWorkerId) unless the command sets force=True; on force, stop the
+         active run first (keeps partial results), mirroring hard_reset.
+    Outcomes are written to `updateStatus` for the app; success is also observable
+    via the heartbeat `version` bumping once the BE respawns on the new build."""
+    cur = _sr_version()
+    # 1. Owner-only + read busy-state in one device-doc fetch.
+    try:
+        _dev = _firebase_db.collection("devices").document(device_id).get().to_dict() or {}
+    except Exception as _oe:
+        log(f"[device-cmds] UPDATE: device read failed ({_oe}) — refusing", "WARN")
+        return
+    _owner = _dev.get("ownerUid")
+    if _owner and data.get("submittedBy") and data["submittedBy"] != _owner:
+        log("[device-cmds] UPDATE: refusing — submittedBy is not the device owner", "WARN")
+        _write_update_status(device_id, {"state": "failed", "current": cur,
+                                         "latest": None, "reason": "not the device owner"})
+        return
+
+    # 2. Supervised-only (must check BEFORE _perform_self_update kills the daemon-loop).
+    _supervisor_alive = False
+    try:
+        self_pid = os.getpid()
+        for pid, _cmd, role in _enumerate_research_py_procs():
+            if pid != self_pid and role == "daemon-loop":
+                _supervisor_alive = True
+                break
+    except Exception:
+        pass
+    if not _supervisor_alive:
+        log("[device-cmds] UPDATE: no daemon-loop supervisor — refusing remote update", "WARN")
+        _write_update_status(device_id, {
+            "state": "failed", "current": cur, "latest": None,
+            "reason": "not supervised — run `superresearch --update` on the machine"})
+        return
+
+    # 3. Mid-run guard: defer unless forced.
+    force = bool(data.get("force"))
+    busy = bool(_QUEUE_STATE.get("running")) or bool(_dev.get("busyWorkerIds"))
+    try:
+        _qr = _QUEUE_STATE.get("queue_ref")
+        if _qr is not None and _qr.qsize() > 0:
+            busy = True
+    except Exception:
+        pass
+    if busy and not force:
+        log("[device-cmds] UPDATE: deferred — a run is in progress (resend with force to override)")
+        _write_update_status(device_id, {"state": "deferred", "current": cur,
+                                         "latest": None, "reason": "a research run is in progress"})
+        return
+    if busy and force and loop is not None:
+        try:
+            loop.call_soon_threadsafe(_controls.request_stop)
+            log("[device-cmds] UPDATE: force — signalled the active run to stop before the upgrade")
+        except Exception as _rs:
+            log(f"[device-cmds] UPDATE: request_stop dispatch failed: {_rs}", "WARN")
+
+    # Decide + spawn the detached upgrade (does NOT print / exit — we own the exit).
+    res = _perform_self_update(force_check=True)
+    _write_update_status(device_id, {"state": res["state"], "current": res.get("current"),
+                                     "latest": res.get("latest"), "reason": res.get("reason", "")})
+    if res["state"] == "started":
+        log(f"[device-cmds] UPDATE: upgrade launched ({res.get('current')} → "
+            f"{res.get('latest') or 'latest'}); exiting so pipx can rebuild the venv")
+        _schedule_server_exit("device-update", delay_sec=1.5)
+    else:
+        log(f"[device-cmds] UPDATE: no upgrade ({res['state']}: {res.get('reason')})")
+
+
 def _start_device_command_listener(uid: str, device_id: str, loop=None):
     """Subscribe to devices/{deviceId}/commands so the FE can issue
     device-level commands that aren't scoped to a particular research
@@ -4816,6 +4911,15 @@ def _start_device_command_listener(uid: str, device_id: str, loop=None):
                     log(f"[device-cmds] CLEAR_LOCAL_STORAGE: wiped {wiped} dir(s); preserved active run {active_name}")
                 else:
                     log(f"[device-cmds] CLEAR_LOCAL_STORAGE: wiped {wiped} dir(s)")
+                continue
+
+            if action == "update":
+                # App-driven remote backend update (owner-only command). Single
+                # actor: only worker 1 executes it (it owns the heartbeat/version
+                # publish); other workers no-op (the doc is already deleted above).
+                # All the authz / supervised / mid-run guards live in the handler.
+                if WORKER_ID == 1:
+                    _handle_update_command(data, device_id, loop)
                 continue
 
             # Unknown action — already logged above and the doc is
@@ -43959,26 +44063,56 @@ def _spawn_detached_lifecycle(action: str) -> bool:
                 pass
 
 
+def _perform_self_update(*, force_check: bool = True) -> dict:
+    """Headless core of the self-update — shared by the `superresearch --update`
+    CLI (_self_update) AND the app-driven remote "update" device command. Decides
+    whether to upgrade and, if so, SPAWNS the detached pipx-upgrade waiter — but
+    does NOT print and does NOT exit the process (the caller owns both: the CLI
+    exits via main()'s SystemExit; the serve command handler must call
+    `_schedule_server_exit` so the waiter's `pipx upgrade` can rebuild the venv).
+
+    Returns a status dict the caller can render / write back:
+      {state, current, latest, reason}
+      state ∈ {"already", "started", "failed", "unsupported"}
+        already     — installed build is current (or ahead of) the latest on PyPI
+        started     — a detached upgrade was launched (caller must now exit)
+        unsupported — source checkout (update via `git pull`)
+        failed      — pipx missing, or the detached launch failed
+    `force_check` bypasses the 24h cache for a fresh PyPI read (an explicit
+    "update now" must not decide off a stale cache); `latest` is None only when
+    PyPI is unreachable, in which case we PROCEED rather than strand the update."""
+    cur = _sr_version()
+    if _is_source_checkout():
+        return {"state": "unsupported", "current": cur, "latest": None,
+                "reason": "source checkout — update with `git pull`"}
+    if _pipx_cmd() is None:
+        return {"state": "failed", "current": cur, "latest": None,
+                "reason": "pipx not found"}
+    latest = _latest_on_pypi(force=force_check)
+    if latest and not _version_gt(latest, cur):
+        return {"state": "already", "current": cur, "latest": latest, "reason": ""}
+    if _spawn_detached_lifecycle("upgrade"):
+        return {"state": "started", "current": cur, "latest": latest, "reason": ""}
+    return {"state": "failed", "current": cur, "latest": latest,
+            "reason": "couldn't launch the background upgrade"}
+
+
 def _self_update() -> int:
     """`superresearch --update` — upgrade the installed package via pipx (detached,
     so pipx can rebuild the venv this process runs from). Branded + crisp, matching
-    the other subcommands."""
+    the other subcommands. Thin printer over `_perform_self_update`."""
     _branded_header("renovatio", _BOLD + _ACCENT, "renew · update Super Research")
-    if _is_source_checkout():
+    res = _perform_self_update(force_check=True)
+    state, cur, latest = res["state"], res["current"], res.get("latest")
+    if state == "unsupported":
         print(f"  Source checkout — update with  {_c(_BOLD, 'git pull')}.")
         print()
         return 0
-    if _pipx_cmd() is None:
+    if state == "failed" and res.get("reason") == "pipx not found":
         print(f"  {_c(_WARN, '⚠')}  pipx not found — update manually:  {_c(_BOLD, 'pipx upgrade superresearch')}")
         print()
         return 1
-    # Idempotent: only actually upgrade when PyPI has a newer version. Use a FRESH
-    # check (force) — an explicit `--update` must not be decided off the stale 24h
-    # cache. `latest` is None only when PyPI is unreachable; in that case we proceed
-    # rather than strand an intentional update (mirrors bridge.py `_update_backend`).
-    cur = _sr_version()
-    latest = _latest_on_pypi(force=True)
-    if latest and not _version_gt(latest, cur):
+    if state == "already":
         print(f"  {_c(_OK, '✓')}  Already up to date  {_c(_DIM, '(v' + cur + ')')}")
         print()
         return 0
@@ -43986,7 +44120,7 @@ def _self_update() -> int:
         print(f"  Updating  {_c(_DIM, 'v' + cur)}  →  {_c(_BOLD + _OK, 'v' + latest)}")
     else:
         print(f"  Updating Super Research  {_c(_DIM, '(current: v' + cur + ')')}")
-    if _spawn_detached_lifecycle("upgrade"):
+    if state == "started":
         print(f"  {_c(_OK, '✓')}  Update running — completes a moment after this exits.")
         print(f"  {_c(_DIM, 'Confirm with')}  {_c(_BOLD, _PROG + ' --version')}  {_c(_DIM, 'in ~20s. If On Startup was on, then')}  {_c(_BOLD, _PROG + ' --resurrect')}{_c(_DIM, '.')}")
         print()
