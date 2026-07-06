@@ -712,6 +712,18 @@ def cmd_disconnect(args: argparse.Namespace) -> int:
     if rec_rt and (not explicit or explicit == rec_rt):
         prefs.clear_runtime()
 
+    # Clear pipx's cached run-venv for the agent so a later reinstall pulls FRESH
+    # from PyPI. `pipx run` reuses its cache for ~14 days, so without this a
+    # post-disconnect `pipx run superresearch-agent connect` would replay the
+    # stale build — a full teardown must leave nothing stale behind. Detached:
+    # runs once THIS `pipx run … disconnect` exits and frees the venv. Best-effort.
+    try:
+        from . import selfupdate
+        if selfupdate.spawn_detached_cache_clear():
+            b.dim("Clearing the cached package so a reinstall pulls the latest.")
+    except Exception:
+        pass
+
     # Offer to also tear down the background bridge (the `retire` axis) so a single
     # `disconnect` is a complete "I'm done" cleanup. Consent-gated + default Yes:
     # stopping a process + removing an OS autostart entry is heavier than deleting a
@@ -1415,7 +1427,7 @@ def cmd_version(_args: argparse.Namespace) -> int:
     update` on the Research computer) — so the backend line is display-only."""
     from . import selfupdate
     b.header("versio", "versions", tagline_color=branding._BOLD + branding._ACCENT)
-    print(f"\n  {b.c(branding._BOLD, 'Agent')} (superresearch-agent)   {b.c(branding._BOLD, 'v' + __version__)}")
+    print(f"\n  {b.c(branding._BOLD, 'Skill')} (superresearch-agent)   {b.c(branding._BOLD, 'v' + __version__)}")
     a_new = selfupdate.agent_update_available()
     if a_new:
         # --no-cache is required: `pipx run` reuses its cached run-venv and would

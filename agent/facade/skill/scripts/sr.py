@@ -28,8 +28,8 @@ or two from the topic) or run-id; omit it to mean the most recent / active run:
                        (--run <run> to target one; else the latest active run)
   arm-stream         prepare this chat's streaming watchdog → prints the cron
                        script + job name to arm via the runtime's cronjob tool
-  version            show the agent + Super Research backend versions
-  update-agent       update the chat agent itself (skill + bridge) to the latest
+  version            show the skill + Super Research backend versions
+  update             update the Super Research skill (this chat — scripts + bridge)
   logout             clear the account session
   help               this list
 
@@ -53,9 +53,9 @@ from pathlib import Path
 
 # The version of the agent package THIS script copy shipped with. The runtime
 # executes its own installed COPY of this file (HERMES_HOME/scripts), which a
-# `pip install -U` on the host does NOT refresh — only `agent connect` /
-# “update the agent” redeploys it. cmd_version compares this against the live
-# bridge's version so a stale chat-side copy names itself instead of misbehaving
+# `pip install -U` on the host does NOT refresh — only `connect` / “update”
+# redeploys it. cmd_version compares this against the live bridge's version so a
+# stale chat-side copy names itself instead of misbehaving
 # silently (live 2026-07-02: a stale copy predating the podcast MEDIA: fix
 # kept sending bare audio paths). Bumped together with pyproject.toml —
 # guarded by tests/test_sr_skip_agents.py::test_skill_build_matches_package_version.
@@ -470,14 +470,14 @@ def cmd_login_wait(args) -> int:
 
 
 def _update_notices(body: dict) -> list[str]:
-    """Proactive "a newer AGENT version is available" prompt from a /status (or
+    """Proactive "a newer SKILL version is available" prompt from a /status (or
     /version) body — so the user is nudged on the welcome without having to ask.
     Backend updates are NOT nudged here anymore: the app surfaces those and the
-    user runs `superresearch --update` on the Research computer (the runtime no
+    user updates from the app / `superresearch --update` on the host (the skill no
     longer updates the backend)."""
     out = []
     if body.get("agentUpdate"):
-        out.append(f"⬆️ Agent v{body['agentUpdate']} is available — say “update the agent”.")
+        out.append(f"⬆️ Super Research skill v{body['agentUpdate']} is available — say “update”.")
     return out
 
 
@@ -982,10 +982,9 @@ def cmd_logout(args) -> int:
 
 
 def cmd_version(args) -> int:
-    """Show the chat agent's version (+ a "newer available" nudge for the AGENT
-    when one is published) alongside the Super Research backend's version. The
-    agent no longer prompts to update the backend — the app surfaces that and the
-    user runs `superresearch --update` on the Research computer — so the backend
+    """Show the Super Research skill's version (+ a "newer available" nudge for
+    the SKILL when one is published) alongside the backend's version. The skill no
+    longer prompts to update the backend — the app surfaces that — so the backend
     line is display-only here."""
     code, body = _get("/version")
     if code != 200:
@@ -994,44 +993,45 @@ def cmd_version(args) -> int:
     agent = body.get("agent") or "?"
     backend = body.get("backend")
     a_new = body.get("agentLatest")
-    lines = [f"Super Research agent    v{agent}"
-             + (f"   ⬆️ v{a_new} available — say “update the agent”" if a_new else "")]
+    lines = [f"Super Research skill    v{agent}"
+             + (f"   ⬆️ v{a_new} available — say “update”" if a_new else "")]
     if backend:
         lines.append(f"Super Research backend  v{backend}")
     else:
         lines.append("Super Research backend  (not installed on the connected device)")
     # Stale chat-side copy tell: the runtime executes its own installed COPY of
-    # these scripts, which only `agent connect` / “update the agent” redeploys —
-    # a host pip upgrade alone leaves the chat side on old behavior (live
-    # 2026-07-02: a stale copy predated the podcast MEDIA: fix). Name it.
+    # these scripts, which only `connect` / “update” redeploys — a host pip
+    # upgrade alone leaves the chat side on old behavior (live 2026-07-02: a
+    # stale copy predated the podcast MEDIA: fix). Name it.
     if agent not in ("?", _SKILL_BUILD):
-        lines.append(f"⚠ This chat's scripts are v{_SKILL_BUILD} but the agent is v{agent} — "
-                     "say “update the agent” to redeploy them.")
+        lines.append(f"⚠ This chat's scripts are v{_SKILL_BUILD} but the skill is v{agent} — "
+                     "say “update” to redeploy them.")
     return _emit(body, args.json, lines)
 
 
-def cmd_agent_update(args) -> int:
-    """Update the chat AGENT itself — its package + skill + bridge — to the latest
-    published version (the bridge reconnects from the latest in the background).
-    Distinct from `update`, which updates the Super Research backend."""
+def cmd_update(args) -> int:
+    """Update the Super Research SKILL — this chat runtime (its /sr scripts +
+    bridge) — to the latest published version (the bridge reconnects from the
+    latest in the background). The skill is the ONLY thing this updates; backend
+    updates are done in the app / with `superresearch --update` on the host."""
     code, body = _post("/agent-install")
     if code != 200:
         err = body.get("error", "")
         if err == "agent_unavailable":
-            msg = ("can't reach the latest agent right now — the device may be offline, "
-                   "or this version isn't published yet. (Nothing changed; the agent is still running.)")
+            msg = ("can't reach the latest skill right now — the device may be offline, "
+                   "or this version isn't published yet. (Nothing changed; the skill is still running.)")
         elif err == "update_helper_failed":
-            msg = "couldn't start the agent update (is pipx available on the connected device?)"
+            msg = "couldn't start the update (is pipx available on the connected device?)"
         else:
-            msg = f"couldn't start the agent update: {err or code}"
+            msg = f"couldn't start the update: {err or code}"
         return _emit(body, args.json, [f"✗ {msg}"], _fail_code(code))
     if body.get("already"):
         cur = body.get("current") or ""
         return _emit(body, args.json,
-                     [f"✓ The agent is already up to date{(' (v' + cur + ')') if cur else ''}."])
+                     [f"✓ The skill is already up to date{(' (v' + cur + ')') if cur else ''}."])
     return _emit(body, args.json, [
-        "⬆️ Updating the Super Research agent (skill + bridge) to the latest version.",
-        "The bridge briefly restarts on the new version — say “agent version” in a bit to confirm.",
+        "⬆️ Updating the Super Research skill (scripts + bridge) to the latest version.",
+        "The bridge briefly restarts on the new version — say “version” in a bit to confirm.",
     ])
 
 
@@ -1050,8 +1050,8 @@ def cmd_install(args) -> int:
     if body.get("already"):
         return _emit(body, args.json, [
             "Super Research is already installed on this device.",
-            "To update it, run “superresearch --update” on that computer; say "
-            "“devices” to see/pair it.",
+            "To update it, run “superresearch --update” on that computer or update "
+            "it from the app (Settings → About); say “devices” to see/pair it.",
         ])
     return _emit(body, args.json, [
         "⬇️ Installing Super Research on this device in the background.",
@@ -1205,17 +1205,18 @@ _NL_CONFIRMS = {
     "stop": "Stop {name}? It ends the run — everything finished so far is kept. Say yes and I’ll stop it.",
     "logout": "Sign out of Super Research? (The skill stays installed — you can sign back in anytime.) Say yes and I’ll sign you out.",
     "device-remove": "Unlink {name}? Nothing gets deleted — an owner’s device can re-pair with its code. Say yes and I’ll remove it.",
-    "agent-update": "Update the chat agent itself? The bridge restarts briefly. Say yes and I’ll update it.",
+    "update": "Update the Super Research skill (this chat runtime)? The bridge restarts briefly. Say yes and I’ll update it.",
     "install": "Install the Super Research backend on the connected device? Say yes and I’ll set it up.",
 }
 
-# Info-only reply (NOT a confirm — there's no action for me to take): the runtime
-# no longer updates the Super Research backend. A backend-update ask is redirected
-# to where it happens now — the app notifies + the user runs it on the Research PC.
+# Info-only reply (NOT a confirm — there's no action for me to take): the skill
+# only updates itself. A backend-update ask is redirected to where it happens —
+# `superresearch --update` on the Research computer OR the app's update surface.
 _NL_BACKEND_UPDATE_MOVED = (
-    "I only update the chat agent from here now. To update Super Research itself, "
-    "run “superresearch --update” on the Research computer — the app also notifies "
-    "you when a backend update is available. (Say “update the agent” to update this chat agent.)"
+    "I only update the Super Research skill (this chat) from here. To update Super "
+    "Research on your Research computer, run “superresearch --update” there, or update "
+    "it from the app (Settings → About, or the update notification). "
+    "(Say “update” to update this skill.)"
 )
 
 
@@ -1400,20 +1401,21 @@ def _nl_resolve(text: str) -> "tuple[list[str] | None, list[str] | None]":
                      r"|\b(give|got|have|send)\b.*\bupdates?\b|\blatest updates?\b", low):
             name = _nl_run_name(t)
             return ["status"] + ([name] if name else []), None
-        # A backend-named ask that is NOT also an agent ask (e.g. "update super
+        # A backend-named ask that is NOT also a skill ask (e.g. "update super
         # research", "update the backend", "update the research computer") →
-        # redirect: the runtime doesn't update the backend anymore (the app does).
-        # Checked BEFORE the agent default so "update the super research AGENT"
-        # still self-updates the agent.
-        if not re.search(r"\b(agent|skill|bridge|chat|yourself)\b", low) and \
+        # redirect: the skill doesn't update the backend (the app / the host CLI
+        # does). Checked BEFORE the skill default so "update the super research
+        # SKILL/agent" still self-updates the skill (the 'agent' token is still
+        # accepted colloquially even though the skill no longer calls itself that).
+        if not re.search(r"\b(skill|agent|bridge|chat|yourself)\b", low) and \
                 re.search(r"\b(backend|super ?research|research (pc|computer|machine))\b", low):
             return None, [_NL_BACKEND_UPDATE_MOVED]
-        # Everything else — "update", "upgrade", "update the agent/skill/yourself"
-        # — updates the CHAT AGENT (the only thing the runtime updates now). No
-        # agent-vs-backend split → no misroute to a backend that isn't on this host
-        # (the old default hit "Super Research isn't installed on the connected
-        # device" for a plain "update").
-        return None, [_NL_CONFIRMS["agent-update"]]
+        # Everything else — "update", "upgrade", "update the skill/yourself", and
+        # colloquial "update the agent" — updates the Super Research SKILL (the
+        # only thing this updates now). No agent-vs-backend split → no misroute to
+        # a backend that isn't on this host (the old default hit "Super Research
+        # isn't installed on the connected device" for a plain "update").
+        return None, [_NL_CONFIRMS["update"]]
     if re.search(r"\bversions?\b", low):
         return ["version"], None
     if re.search(r"\b(install|host|set ?up)\b.*\b(backend|super research|here|this (pc|machine|computer))\b", low):
@@ -1553,15 +1555,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("install", aliases=["install-backend", "setup-backend"],
                    help="install the Super Research backend on the connected device (host a BE)"
                    ).set_defaults(func=cmd_install)
-    # NOTE: no `update`/`upgrade` subcommand — the runtime no longer updates the
-    # Super Research BACKEND (the app surfaces that; the user runs `superresearch
-    # update` on the Research computer). `update-agent`/`upgrade-agent` below
-    # update the chat AGENT itself. `install` (host a backend) is unaffected.
-    sub.add_parser("agent-update",
-                   aliases=["agent-install", "update-agent", "update-skill",
-                            "upgrade-agent", "update", "upgrade"],
-                   help="update the chat agent itself (package + skill + bridge) to the latest"
-                   ).set_defaults(func=cmd_agent_update)
+    # `update` updates the Super Research SKILL (this chat runtime — /sr scripts +
+    # bridge), the ONLY thing the runtime updates. Backend updates are done in the
+    # app / with `superresearch --update` on the host — there is no backend-update
+    # subcommand here. `install` (host a backend) is unaffected. NL ("upgrade",
+    # "update the skill", etc.) resolves through `do`, so `update-skill` is the
+    # only alias kept.
+    sub.add_parser("update", aliases=["update-skill"],
+                   help="update the Super Research skill (this chat — scripts + bridge) to the latest"
+                   ).set_defaults(func=cmd_update)
 
     sub.add_parser(
         "arm-stream",

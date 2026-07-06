@@ -133,7 +133,7 @@ missing thing, or asks for the confirmation first. Pass the message exactly as
 the user wrote it, never your paraphrase (escape any double quotes inside it).
 If `do` asked a confirm question ("Say yes and I'll …") and the user confirms,
 run the REAL command it described — stop/logout/device-remove/
-agent-update/install/research, with the run or device it named — a "no" just
+update/install/research, with the run or device it named — a "no" just
 cancels. Never send the bare "yes" back into `do`.
 
 | The user says (examples) | You run |
@@ -159,13 +159,13 @@ cancels. Never send the bare "yes" back into `do`.
 | "logout", "log out", "sign out of Super Research" | `sr.py logout` (signs the agent OUT — keeps the skill + bridge) |
 | "remove / uninstall / disconnect Super Research entirely" | **confirm** ("just sign out, or fully remove skill + bridge?"), then `pipx run superresearch-agent disconnect --yes` (FULL teardown), then tell them to run **/reload-skills** so `/sr` unregisters. Do NOT use the runtime's own skill-removal (leaves the bridge running) or `sr.py logout` (sign-out only). |
 | "host the backend on this PC", "install Super Research here", "no devices — set one up" | **confirm**, then `sr.py install`, then guide pairing |
-| "what version?" | `sr.py version` (shows the agent + backend versions; nudges only when a new **agent** is available) |
-| "update", "update the agent", "update yourself" | **confirm**, then `sr.py agent-update` (updates the chat agent itself — bridge briefly restarts) |
-| "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer (the app also notifies when one's available). `sr.py do "<message>"` returns this exact redirect. |
+| "what version?" | `sr.py version` (shows the skill + backend versions; nudges only when a new **skill** version is available) |
+| "update", "update the skill", "update yourself" (colloquial "update the agent" too) | **confirm**, then `sr.py update` (updates the Super Research **skill** — this chat's scripts + bridge; briefly restarts). This is the ONLY thing the runtime updates. |
+| "update Super Research", "update the backend", "update the research computer" | the runtime does NOT update the backend — tell them to run `superresearch --update` on the Research computer **or** update it from the app (Settings → About / the update notification). `sr.py do "<message>"` returns this exact redirect. |
 | just `/sr`, "what can you do?", "help" | `sr.py status-account` → welcome (see **A bare `/sr`**) |
 
 **Safe defaults:** unnamed run → the **most-recent active** run. **Confirm before
-`stop`, `logout`, `device-remove`, and `agent-update`** (a quick "Stop the EV
+`stop`, `logout`, `device-remove`, and `update`** (a quick "Stop the EV
 run?" is enough); everything else runs on a clear request. **Always answer "what phase / is
 X skipped / how's it going" from a FRESH `sr.py status`** (or `updates`) — never
 from memory or an earlier watchdog message (a run keeps advancing and the user can
@@ -248,12 +248,15 @@ never `retry`, never a question back to the user.
   that PC into a Research Computer) — then guide pairing (`superresearch --pair` on that
   PC → 8-char code → you run `device-add`; they finish API-key + browser-login on
   the PC). Use when `research` reports "no devices yet".
-- **version / agent-update** → `version` relays the agent + backend versions and
-  nudges only when a newer **agent** is available. `agent-update` (also `update` /
-  `upgrade`) updates the chat agent itself (confirm; the bridge briefly restarts).
-  The runtime does NOT update the **backend** — if the user asks to update Super
+- **version / update** → `version` relays the skill + backend versions and nudges
+  only when a newer **skill** version is available. `update` (alias `update-skill`;
+  NL also handles "upgrade"/"update the skill"/colloquial "update the agent")
+  updates the Super Research **skill** — this chat's scripts + bridge — confirm;
+  the bridge briefly restarts. It's the ONLY thing the runtime updates. The
+  runtime does NOT update the **backend** — if the user asks to update Super
   Research / the backend, tell them to run `superresearch --update` on the Research
-  computer (the web app also notifies them when a backend update is available).
+  computer **or** update it from the app (Settings → About / the update
+  notification; the app also notifies when a backend update is available).
 
 ## Devices & Research Computers
 
@@ -324,8 +327,8 @@ it down too: `cronjob(action="list")` → the `sr-stream…` job →
 ## Safety
 
 - **Confirm before** `stop` (ends a real run — keeps partial results + the chat),
-  `logout` (signs the agent out), `device-remove` (unlinks a device — nothing is
-  deleted; an owner's device re-pairs with its code), and `agent-update` (briefly
+  `logout` (signs the account out), `device-remove` (unlinks a device — nothing is
+  deleted; an owner's device re-pairs with its code), and `update` (briefly
   restarts the chat bridge). There is no destructive "delete the chat" action here.
 - Never ask for or handle passwords / tokens — sign-in happens on the user's own
   device via the `/sr login` link; any in-AI sign-in or human check is done by the

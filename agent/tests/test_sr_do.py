@@ -118,9 +118,10 @@ def test_session_and_maintenance():
     assert _argv("log me in") == ["login"]
     assert "sign out" in _note("log out of super research").lower()
     assert _argv("what version?") == ["version"]
-    assert "agent" in _note("update the agent").lower()
-    # "update super research" (no agent) → the runtime doesn't update the backend
-    # anymore; it redirects to `superresearch --update` on the Research computer.
+    # colloquial "update the agent" still routes to the SKILL self-update confirm.
+    assert "skill" in _note("update the agent").lower()
+    # "update super research" (no skill/agent word) → the skill doesn't update the
+    # backend; redirect to `superresearch --update` on the Research computer + app.
     n = _note("update super research").lower()
     assert "superresearch --update" in n and "research computer" in n
 
@@ -177,29 +178,29 @@ def test_progress_flavored_update_is_status_not_maintenance():
     assert _argv("update me on the Tesla run") == ["status", "Tesla"]
 
 
-def test_update_routing_agent_vs_backend():
-    # "update" / "update the agent" / "upgrade" → confirm the AGENT self-update
-    # (the only thing the runtime updates now — no misroute to a backend that
-    # isn't on this host).
-    for phrase in ("update", "upgrade", "update the agent", "update yourself",
-                   "update the super research agent"):
-        assert "agent" in _note(phrase).lower(), phrase
-    # Backend-named asks (no 'agent') → redirect to `superresearch --update` on the
-    # Research computer; the runtime never updates the backend itself now.
+def test_update_routing_skill_vs_backend():
+    # "update" / "upgrade" / "update the skill" / colloquial "update the agent" →
+    # confirm the SKILL self-update (the only thing the runtime updates now — no
+    # misroute to a backend that isn't on this host).
+    for phrase in ("update", "upgrade", "update the skill", "update yourself",
+                   "update the agent", "update the super research skill"):
+        assert "skill" in _note(phrase).lower(), phrase
+    # Backend-named asks (no skill/agent word) → redirect to `superresearch
+    # --update` on the Research computer (and the app); never a skill self-update.
     for phrase in ("update the backend", "update super research",
                    "update the research computer"):
         n = _note(phrase).lower()
         assert "superresearch --update" in n and "research computer" in n, phrase
 
 
-def test_update_with_english_word_be_routes_to_agent():
+def test_update_with_english_word_be_routes_to_skill():
     # Regression: the backend-ask regex must NOT match the ordinary English word
-    # "be" (the |be alternative was dropped). These are AGENT-update asks, not
+    # "be" (the |be alternative was dropped). These are SKILL-update asks, not
     # backend redirects.
     for phrase in ("update it, should be quick", "go ahead and update, that'd be great"):
         n = _note(phrase).lower()
         assert "research computer" not in n, phrase  # NOT the backend redirect
-        assert "agent" in n, phrase                  # the agent-update confirm
+        assert "skill" in n, phrase                  # the skill-update confirm
 
 
 def test_code_regex_rejects_hyphenated_words_and_embedded_tokens():

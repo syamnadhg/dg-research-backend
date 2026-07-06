@@ -150,6 +150,48 @@ def test_spawn_detached_backend_install_no_pipx(monkeypatch):
     assert selfupdate.spawn_detached_backend_install() is False
 
 
+def test_cache_clear_waiter_compiles():
+    # The waiter is an embedded `-c` string; a typo would only surface at runtime
+    # during a real disconnect. Compile it here so it's regression-guarded.
+    compile(selfupdate._CACHE_CLEAR_WAITER, "<cache-clear-waiter>", "exec")
+
+
+def test_pipx_cache_dir_reads_environment(monkeypatch):
+    monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
+    monkeypatch.setattr(selfupdate.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="/home/u/.local/pipx/.cache\n"))
+    assert selfupdate._pipx_cache_dir() == "/home/u/.local/pipx/.cache"
+    monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: None)
+    assert selfupdate._pipx_cache_dir() is None
+
+
+def test_spawn_detached_cache_clear_builds_waiter(tmp_path, monkeypatch):
+    monkeypatch.setattr(selfupdate.config, "store_dir", lambda: tmp_path)
+    monkeypatch.setattr(selfupdate, "_pipx_cache_dir", lambda: "/cache/dir")
+    monkeypatch.setattr(selfupdate, "_waiter_python", lambda: "python3")
+    seen = {}
+    monkeypatch.setattr(selfupdate.subprocess, "Popen",
+                        lambda cmd, **kw: seen.update(cmd=cmd) or types.SimpleNamespace())
+    assert selfupdate.spawn_detached_cache_clear() is True
+    cmd = seen["cmd"]
+    assert cmd[0] == "python3" and "-c" in cmd
+    assert str(__import__("os").getpid()) in cmd  # waits for THIS disconnect pid
+    assert "/cache/dir" in cmd                     # targets the pipx run-cache dir
+
+
+def test_spawn_detached_cache_clear_no_cache_dir(monkeypatch):
+    monkeypatch.setattr(selfupdate, "_pipx_cache_dir", lambda: None)
+    assert selfupdate.spawn_detached_cache_clear() is False
+
+
+def test_disconnect_clears_pipx_cache():
+    # Wiring guard: a full disconnect must clear the agent's pipx run-cache so a
+    # reinstall pulls fresh (no stale build replayed).
+    import inspect
+    from facade import cli
+    assert "spawn_detached_cache_clear" in inspect.getsource(cli.cmd_disconnect)
+
+
 def test_agent_resolvable(monkeypatch):
     monkeypatch.setattr(selfupdate, "_pipx_cmd", lambda: ["pipx"])
     seen = {}

@@ -375,33 +375,41 @@ def test_version_when_backend_absent(bridge_port, monkeypatch, capsys):
     assert "not installed" in capsys.readouterr().out
 
 
-def test_update_command_routes_to_agent_update(bridge_port, monkeypatch, capsys):
-    # The runtime no longer updates the BACKEND — `update`/`upgrade` are now
-    # aliases for the AGENT self-update (so a bare "update" from chat updates the
-    # thing you're talking to, never a backend that isn't on this host).
+def test_update_updates_the_skill(bridge_port, monkeypatch, capsys):
+    # `update` (the ONLY update the runtime does) pre-flights resolvability, spawns
+    # the detached reconnect, returns 200, then the bridge restarts itself. Never
+    # touches the backend (no misroute to a backend that isn't on this host).
     monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: True)
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: True)
     assert sr.main(["update"]) == 0
-    assert "Updating the Super Research agent" in capsys.readouterr().out
+    assert "Updating the Super Research skill" in capsys.readouterr().out
+
+
+def test_update_skill_alias(bridge_port, monkeypatch, capsys):
+    # `update-skill` is the one kept alias (NL handles "upgrade"/"update the skill").
+    monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: True)
+    monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: True)
+    assert sr.main(["update-skill"]) == 0
+    assert "Updating the Super Research skill" in capsys.readouterr().out
 
 
 def test_no_backend_update_surface_left(bridge_port, monkeypatch):
     # The backend-update path is fully gone from the runtime: no /update route, no
-    # _start_backend_update helper, no cmd_update in the chat client.
+    # _start_backend_update helper, no backend_update_available. (sr.cmd_update now
+    # exists but is the SKILL updater — not the removed backend one.)
     assert not hasattr(bridge, "_start_backend_update")
     assert not hasattr(bridge, "_update_backend")
-    assert not hasattr(sr, "cmd_update")
     assert not hasattr(bridge.selfupdate, "backend_update_available")
 
 
-def test_version_shows_agent_nudge_only(bridge_port, monkeypatch, capsys):
-    # `version` surfaces a pip-style "newer available" nudge for the AGENT only.
+def test_version_shows_skill_nudge_only(bridge_port, monkeypatch, capsys):
+    # `version` surfaces a pip-style "newer available" nudge for the SKILL only.
     # The backend version is display-only (no update nudge — the app owns that).
     monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: "0.1.9")
     assert sr.main(["version"]) == 0
     out = capsys.readouterr().out
-    assert "v0.1.9 available" in out and "update the agent" in out
+    assert "v0.1.9 available" in out and "update" in out.lower()
     assert "backend  v0.1.1" in out          # backend shown…
     assert "0.1.1 available" not in out       # …but never nudged to update
 
@@ -413,48 +421,30 @@ def test_version_no_notices_when_current(bridge_port, monkeypatch, capsys):
     assert "available" not in capsys.readouterr().out
 
 
-def test_agent_update_starts(bridge_port, monkeypatch, capsys):
-    # `agent-update` (the agent's own self-update) pre-flights resolvability, spawns
-    # the detached reconnect, returns 200, then the bridge restarts itself. The 200 is
-    # sent before the shutdown fires, so the client sees success.
-    monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: True)
-    monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: True)
-    assert sr.main(["agent-update"]) == 0
-    assert "Updating the Super Research agent" in capsys.readouterr().out
-
-
-def test_agent_install_alias_still_works(bridge_port, monkeypatch, capsys):
-    # `agent-install` stays a back-compat alias for `agent-update`.
-    monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: True)
-    monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: True)
-    assert sr.main(["agent-install"]) == 0
-    assert "Updating the Super Research agent" in capsys.readouterr().out
-
-
-def test_agent_update_already_latest(bridge_port, monkeypatch, capsys):
-    # Agent already on the newest published version → say so, no reconnect/restart.
+def test_update_already_latest(bridge_port, monkeypatch, capsys):
+    # Skill already on the newest published version → say so, no reconnect/restart.
     monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: bridge.__version__)
     spawned = {"v": False}
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect",
                         lambda: spawned.__setitem__("v", True) or True)
-    assert sr.main(["agent-update"]) == 0
+    assert sr.main(["update"]) == 0
     out = capsys.readouterr().out
     assert "already up to date" in out and bridge.__version__ in out
     assert spawned["v"] is False  # never tore the bridge down
 
 
-def test_agent_update_refuses_when_unavailable(bridge_port, monkeypatch, capsys):
+def test_update_refuses_when_unavailable(bridge_port, monkeypatch, capsys):
     # Pre-flight fails (offline / not yet on PyPI) → REFUSE without shutting the
     # bridge down, so the user is never stranded with no chat (B2).
     monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: False)
-    assert sr.main(["agent-update"]) == 1
+    assert sr.main(["update"]) == 1
     assert "still running" in capsys.readouterr().out.lower()
 
 
-def test_agent_update_helper_fails(bridge_port, monkeypatch, capsys):
+def test_update_helper_fails(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge.selfupdate, "agent_resolvable", lambda: True)
     monkeypatch.setattr(bridge.selfupdate, "spawn_detached_reconnect", lambda: False)
-    assert sr.main(["agent-update"]) == 1
+    assert sr.main(["update"]) == 1
     assert "pipx" in capsys.readouterr().out.lower()
 
 
@@ -481,13 +471,13 @@ def test_install_backend_helper_fails(bridge_port, monkeypatch, capsys):
     assert "pipx" in capsys.readouterr().out.lower()
 
 
-def test_status_account_prompts_available_agent_update(bridge_port, monkeypatch, capsys):
-    # The welcome / bare-/sr proactively nudges when an AGENT update is available.
+def test_status_account_prompts_available_skill_update(bridge_port, monkeypatch, capsys):
+    # The welcome / bare-/sr proactively nudges when a SKILL update is available.
     # Backend updates are NOT nudged here anymore (the app owns that prompt).
     monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: "0.1.9")
     assert sr.main(["status-account"]) == 0
     out = capsys.readouterr().out
-    assert "Agent v0.1.9 is available" in out
+    assert "skill v0.1.9 is available" in out.lower()
     assert "backend" not in out.lower()  # no backend-update nag from the runtime
 
 

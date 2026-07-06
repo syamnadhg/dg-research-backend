@@ -257,3 +257,76 @@ def spawn_detached_backend_install() -> bool:
     if pipx is None:
         return False
     return _spawn_detached([*pipx, "install", BACKEND_PKG], "backend-install.log")
+
+
+# Detached helper: wait for THIS (disconnect) process to exit, then delete pipx's
+# cached `run` venv(s) for the agent. `pipx run` reuses a cached venv for ~14
+# days, so without this a post-disconnect `pipx run superresearch-agent connect`
+# would replay the STALE build (the same cache trap the self-update path fixes) —
+# "removed" wouldn't mean removed. Runs AFTER exit because the venv is in use
+# while disconnect (itself a `pipx run …`) is running. Surgical: only removes
+# cache entries whose name contains "superresearch"; never touches other tools'
+# caches, never raises.
+_CACHE_CLEAR_WAITER = r'''
+import os, sys, time, shutil
+from pathlib import Path
+pid = int(sys.argv[1]); cachedir = sys.argv[2]
+def alive(p):
+    if sys.platform == "win32":
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x00100000, 0, p)  # SYNCHRONIZE
+        if not h:
+            return False
+        r = ctypes.windll.kernel32.WaitForSingleObject(h, 0)
+        ctypes.windll.kernel32.CloseHandle(h)
+        return r == 0x00000102  # WAIT_TIMEOUT -> still running
+    try:
+        os.kill(p, 0); return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+for _ in range(120):  # wait up to ~60s for disconnect to exit
+    if not alive(pid):
+        break
+    time.sleep(0.5)
+time.sleep(2)  # grace for the OS to release the venv's files
+try:
+    root = Path(cachedir)
+    if root.is_dir():
+        for entry in root.iterdir():
+            if "superresearch" in entry.name.lower():
+                shutil.rmtree(entry, ignore_errors=True)
+except Exception:
+    pass
+'''
+
+
+def _pipx_cache_dir() -> "str | None":
+    """pipx's `run` venv-cache dir (PIPX_VENV_CACHEDIR) — where
+    ``pipx run superresearch-agent …`` caches its throwaway venv. None if pipx
+    can't report it (old pipx / not installed)."""
+    pipx = _pipx_cmd()
+    if pipx is None:
+        return None
+    try:
+        r = subprocess.run([*pipx, "environment", "--value", "PIPX_VENV_CACHEDIR"],
+                           capture_output=True, text=True, timeout=30)
+        out = (r.stdout or "").strip()
+        return out if (r.returncode == 0 and out) else None
+    except Exception:
+        return None
+
+
+def spawn_detached_cache_clear() -> bool:
+    """After THIS process exits, delete pipx's cached run-venv(s) for the agent so
+    a later ``pipx run superresearch-agent connect`` rebuilds fresh from PyPI
+    instead of replaying the stale cached build. Used by `disconnect` so a full
+    teardown leaves NO stale cache behind. Best-effort — returns True if the
+    detached cleaner launched, False if pipx can't report its cache dir."""
+    cachedir = _pipx_cache_dir()
+    py = _waiter_python()
+    if not cachedir or py is None:
+        return False
+    cmd = [py, "-c", _CACHE_CLEAR_WAITER, str(os.getpid()), cachedir]
+    return _spawn_detached(cmd, "cache-clear.log")
