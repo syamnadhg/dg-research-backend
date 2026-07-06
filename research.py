@@ -3467,6 +3467,11 @@ _start_listener = None  # Global start-command listener
 # to a stale Firestore client). Reinit threshold below.
 _last_heartbeat_at_ms = 0
 _heartbeat_failures = 0
+# 2026-07-05 — BE-update signal for the app. worker-1 heartbeat publishes the
+# running version + PyPI update state to the device doc, throttled + written only
+# on change (see _heartbeat_loop / _device_version_fields).
+_last_published_version_fields: "dict | None" = None
+_version_publish_next_ms = 0
 # #717 — per-worker liveness pulse, bumped every iteration of
 # _firebase_reconnect_loop (which runs on ALL workers). /api/health surfaces it
 # as `lastTickAt` so the supervisor watchdog can spot a wedged event loop on ANY
@@ -3817,6 +3822,7 @@ async def _heartbeat_loop():
     # All globals must be declared at the top of the function — Python
     # rejects `global X` if X has already been read in this scope.
     global _last_heartbeat_at_ms, _heartbeat_failures, _firebase_db, _firebase_down_reason
+    global _last_published_version_fields, _version_publish_next_ms
     while True:
         try:
             # Update top-level `devices/{deviceId}` — BE is signed in as
@@ -3852,6 +3858,34 @@ async def _heartbeat_loop():
                 if _heartbeat_failures > 0:
                     log(f"[heartbeat] recovered after {_heartbeat_failures} consecutive failures", "INFO")
                     _heartbeat_failures = 0
+
+                # 2026-07-05: self-report version + PyPI update signal so the FE
+                # can prompt "run superresearch update on the Research computer"
+                # (the agent no longer handles BE updates). DECOUPLED from the
+                # liveness write above and best-effort by design: these two fields
+                # are a SEPARATE allow-list entry, so if the firestore.rules update
+                # hasn't been deployed yet a 403 here must NOT flip the device
+                # offline. Throttled to ~5 min + written only when the value
+                # changes (version/updateAvailable move ~once per release), so it
+                # adds no meaningful write volume to the 5s heartbeat.
+                _now_ms = int(time.time() * 1000)
+                if _now_ms >= _version_publish_next_ms:
+                    try:
+                        _vf = await asyncio.to_thread(_device_version_fields)
+                        if _vf != _last_published_version_fields:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    lambda: _firebase_db.collection("devices")
+                                        .document(device_id).update(_vf)),
+                                timeout=10.0,
+                            )
+                            _last_published_version_fields = _vf
+                        _version_publish_next_ms = _now_ms + 300_000
+                    except Exception as _vf_err:
+                        # Back off on failure too (e.g. rules not yet deployed) so a
+                        # persistent 403 retries every ~5 min, not every tick.
+                        _version_publish_next_ms = _now_ms + 300_000
+                        log(f"[heartbeat] version-signal publish skipped ({_vf_err})", "DEBUG")
         except Exception as e:
             _heartbeat_failures += 1
             # #738: the dominant failure is asyncio.TimeoutError, whose str()
@@ -43771,6 +43805,26 @@ def _newer_version_notice() -> "str | None":
         except Exception:
             _VERSION_NOTICE_MEMO = None
     return _VERSION_NOTICE_MEMO  # type: ignore[return-value]
+
+
+def _device_version_fields() -> dict:
+    """Version fields the heartbeat publishes to the device doc: `version` (the
+    BE's running package version) and `updateAvailable` (the newer version on
+    PyPI, or None when current). The FE reads these to raise an in-app "run
+    `superresearch update` on the Research computer" notification — the agent no
+    longer touches BE updates. Sync (file read + 24h-cached PyPI); call OFF the
+    event loop. A source checkout / offline yields version None + updateAvailable
+    None, so the FE shows no update prompt (nothing to update)."""
+    try:
+        _v = _sr_version()
+        version = _v if (_v and not _v.startswith("(")) else None
+    except Exception:
+        version = None
+    try:
+        update_available = _check_newer_version()  # newer-than-installed or None (24h-cached)
+    except Exception:
+        update_available = None
+    return {"version": version, "updateAvailable": update_available}
 
 
 def _pipx_cmd() -> "list[str] | None":

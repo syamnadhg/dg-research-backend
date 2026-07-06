@@ -119,6 +119,37 @@ def test_heartbeat_hands_off_instead_of_unreachable_reinit():
     )
 
 
+def test_heartbeat_publishes_backend_version_and_update_signal():
+    # 2026-07-05: the heartbeat self-reports version + updateAvailable so the FE
+    # can prompt "run superresearch update on the Research computer" (the agent no
+    # longer handles BE updates). Computed off the loop via _device_version_fields.
+    src = inspect.getsource(research._heartbeat_loop)
+    assert "_device_version_fields" in src, (
+        "the heartbeat must publish _device_version_fields (version + "
+        "updateAvailable) so the FE can raise the BE-update notification."
+    )
+    fields = inspect.getsource(research._device_version_fields)
+    assert '"version"' in fields and '"updateAvailable"' in fields
+
+
+def test_version_signal_is_decoupled_from_liveness():
+    # CRITICAL: the version/updateAvailable write is a SEPARATE allow-list entry
+    # in firestore.rules. If those rules aren't deployed yet, a 403 on it must NOT
+    # flip the device offline — so it lives in its own try/except AFTER the
+    # liveness write + failure-counter reset, and never touches _heartbeat_failures.
+    src = inspect.getsource(research._heartbeat_loop)
+    live_idx = src.index("_heartbeat_failures = 0")  # end of the liveness path
+    vsig_idx = src.index("_device_version_fields")
+    assert vsig_idx > live_idx, (
+        "the version signal must be published AFTER the liveness write + recovery, "
+        "so a failure there can't affect online status."
+    )
+    # the version-signal block must be throttled (only writes on change / ~5 min)
+    assert "_version_publish_next_ms" in src and "_last_published_version_fields" in src, (
+        "the version signal must be throttled + change-gated (no per-tick writes)."
+    )
+
+
 def test_relink_loop_gated_on_revoked():
     src = inspect.getsource(research._revoked_recovery_loop)
     assert '_firebase_down_reason != "revoked"' in src, (

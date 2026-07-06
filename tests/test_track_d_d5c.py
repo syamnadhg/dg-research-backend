@@ -220,6 +220,25 @@ class TestVersionNotice:
         # cache was refreshed → a subsequent non-forced read sees the new value
         assert research._latest_on_pypi() == "0.1.9"
 
+    def test_device_version_fields_installed_with_update(self, monkeypatch):
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.4")
+        monkeypatch.setattr(research, "_check_newer_version", lambda: "0.1.5")
+        assert research._device_version_fields() == {
+            "version": "0.1.4", "updateAvailable": "0.1.5"}
+
+    def test_device_version_fields_current(self, monkeypatch):
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
+        monkeypatch.setattr(research, "_check_newer_version", lambda: None)
+        assert research._device_version_fields() == {
+            "version": "0.1.5", "updateAvailable": None}
+
+    def test_device_version_fields_source_checkout_no_prompt(self, monkeypatch):
+        # Source checkout → no installed version → FE shows no update prompt.
+        monkeypatch.setattr(research, "_sr_version", lambda: "(source checkout)")
+        monkeypatch.setattr(research, "_check_newer_version", lambda: None)
+        assert research._device_version_fields() == {
+            "version": None, "updateAvailable": None}
+
 
 class TestSelfUpdateIdempotent:
     """`superresearch --update` must reinstall ONLY when actually outdated — else
