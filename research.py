@@ -3712,6 +3712,46 @@ def load_worker_count() -> int:
     return 1
 
 
+# ── #903 worker rest (2026-07-06) ────────────────────────────────────────────
+# The owner can park a worker from the app (Shared-With popup → tap an idle
+# pill): the device doc's `restingWorkerIds` (owner-writable, firestore.rules)
+# lists parked worker ids. A resting worker takes NO new runs — in-flight runs
+# finish (resumes bypass the start listener entirely), and if every worker
+# rests, submitted runs queue with a position until one is woken. Read fresh
+# with a short TTL cache (the start listener can fire for a batch of docs);
+# FAILS OPEN (awake) so a Firestore blip can never pause the device.
+_RESTING_CACHE: dict = {"at": 0.0, "ids": ()}
+# Latched True the first time THIS process defers a doc for rest — lets the
+# single-worker idle-rescan pick the deferred doc back up after a wake (the
+# queue doc won't re-fire ADDED). Not persisted: a restart re-delivers every
+# surviving queue doc as ADDED on listener start, so recovery self-heals.
+_REST_DEFER_SEEN = {"v": False}
+
+
+def _worker_is_resting(*, ttl_sec: float = 3.0) -> bool:
+    """True when the owner parked THIS worker (WORKER_ID ∈ device doc's
+    restingWorkerIds). Mirrors the fresh device-doc `.get()` pattern of
+    `_handle_update_command`; ~3s TTL so a batched listener callback costs
+    one read, not one per doc."""
+    global _RESTING_CACHE
+    now = time.time()
+    if now - _RESTING_CACHE["at"] > ttl_sec:
+        ids: tuple = ()
+        try:
+            did = load_device_id()
+            if _firebase_db is not None and did:
+                _dev = (_firebase_db.collection("devices").document(did)
+                        .get().to_dict() or {})
+                _raw = _dev.get("restingWorkerIds") or []
+                ids = tuple(int(x) for x in _raw
+                            if isinstance(x, (int, float)) or (isinstance(x, str) and x.isdigit()))
+        except Exception as e:
+            log(f"[rest-gate] restingWorkerIds read failed (treating as awake): {e}", "DEBUG")
+            ids = ()
+        _RESTING_CACHE = {"at": now, "ids": ids}
+    return WORKER_ID in _RESTING_CACHE["ids"]
+
+
 def save_worker_count(n: int) -> None:
     """Merge-write workerCount into research_config.json. Clamped to >=1
     so a bad caller can't disable the only worker. Atomic write via
@@ -6296,12 +6336,24 @@ def start_firestore_start_listener(job_queue, loop):
             #   - Else → try claim. On win, fall through to existing
             #     status-decision + side-effect path. On loss, skip.
             _multi_worker_mode = load_worker_count() > 1
-            if _multi_worker_mode:
-                # Multi-worker only: gate-on-busy + Firestore claim.
-                # Single-worker installs skip both — no contender to
-                # race, and adding a Firestore RTT to every start event
-                # would be a free regression with no upside.
-                if (_QUEUE_STATE.get("running")
+            # #903 worker rest (2026-07-06): the owner parked THIS worker from
+            # the app → it must not take NEW runs. Applies in BOTH worker-count
+            # modes (a resting single worker defers exactly like a busy multi-
+            # worker one, so the run still queues with a position and the app
+            # can show "Workers paused"). Resumes never pass through this
+            # listener, so in-flight runs are untouched. The defer body below
+            # is shared with busy-defer on purpose: the sibling-claimed
+            # re-check still applies (an AWAKE sibling should claim, and then
+            # we must not write status=queued over its ongoing).
+            _resting = _worker_is_resting()
+            if _resting:
+                _REST_DEFER_SEEN["v"] = True
+            if _resting or _multi_worker_mode:
+                # Multi-worker: gate-on-busy + Firestore claim. Single-worker
+                # installs skip both (no contender to race; no free Firestore
+                # RTT per start event) — UNLESS resting, which defers.
+                if (_resting
+                        or _QUEUE_STATE.get("running")
                         or job_queue.qsize() > 0
                         or _pending_enq_read() > 0):
                     # Silent defer was the load-bearing observability gap
@@ -6322,7 +6374,9 @@ def start_firestore_start_listener(job_queue, loop):
                     # claim. Without this clause, both docs claim and
                     # the second job goes stale (the 2026-05-22 St
                     # Bernard symptom).
-                    if _QUEUE_STATE.get("running"):
+                    if _resting:
+                        _defer_reason = "worker-resting"
+                    elif _QUEUE_STATE.get("running"):
                         _defer_reason = "busy-running"
                     elif job_queue.qsize() > 0:
                         _defer_reason = "queue-nonempty"
@@ -36614,8 +36668,18 @@ async def run_server(port=8000):
         """
         if not _firebase_db:
             return
-        if load_worker_count() <= 1:
-            return  # single-worker mode — listener never gates on busy
+        if load_worker_count() <= 1 and not _REST_DEFER_SEEN["v"]:
+            # Single-worker mode — the listener never gates on busy, so no
+            # orphan can exist… EXCEPT a doc deferred by the #903 rest gate
+            # (Firestore won't re-fire ADDED when the owner wakes the worker;
+            # this rescan is the wake-side pickup). A restart self-heals
+            # without the flag: listener start re-delivers surviving queue
+            # docs as ADDED.
+            return
+        # #903: a resting worker never claims — neither fresh docs nor
+        # orphans. The wake transition is caught by the next rescan tick.
+        if _worker_is_resting():
+            return
         # Shutdown gate (2026-05-22): STOP scheduled exit makes the
         # worker's `finally` block trigger an idle-rescan even though
         # the process is about to die. Without this gate, the rescan
@@ -36672,14 +36736,15 @@ async def run_server(port=8000):
                 continue
             if (d.get("action") or "start") != "start":
                 continue  # cancel/resume handled by their own paths
-            # Re-check busy + shutdown before each claim attempt (could
-            # have flipped mid-scan: a sibling claimed a different doc
-            # OR a STOP landed between candidates).
+            # Re-check busy + shutdown + rest before each claim attempt
+            # (could have flipped mid-scan: a sibling claimed a different
+            # doc, a STOP landed, or the owner parked this worker).
             if (
                 _exit_scheduled
                 or _QUEUE_STATE.get("running")
                 or _job_queue.qsize() > 0
                 or _QUEUE_STATE.get("gate_pending_job")
+                or _worker_is_resting()
             ):
                 return
 
