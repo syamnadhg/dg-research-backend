@@ -110,7 +110,7 @@ def bridge_port(monkeypatch):
     monkeypatch.setattr(bridge.prefs, "clear_selected_device", lambda: sel.__setitem__("v", None))
     # Never hit PyPI from tests: neutralize the update notices by default (the
     # /status + /version routes call these). Tests that assert notices override them.
-    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda **kw: None)
     # The update routes do a FRESH latest_on_pypi(force=True) check; default it to
     # None (= "couldn't determine → proceed"). "already up to date" tests override it.
     monkeypatch.setattr(bridge.selfupdate, "latest_on_pypi", lambda pkg, force=False: None)
@@ -174,7 +174,7 @@ def test_status_account_inflight_signin_hint(monkeypatch, capsys):
     # #848 P3: a not-signed-in bridge with a sign-in mid-flight tells the user to
     # approve it in the browser (the auto-poller then connects them), instead of a
     # bare "Not signed in — run login".
-    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda **kw: None)
     monkeypatch.setattr(bridge, "_backend_version", lambda: None)
     state = bridge.BridgeState()
     state.set_session(None)  # force not-signed-in regardless of any on-disk session
@@ -197,7 +197,7 @@ def test_status_account_inflight_signin_hint(monkeypatch, capsys):
 def _no_session_bridge(monkeypatch, *, remote_state: str | None = None):
     """A running bridge with NO account session (optionally a remote flow in
     `remote_state`). Returns (httpd) — caller closes it."""
-    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda **kw: None)
     monkeypatch.setattr(bridge, "_backend_version", lambda: None)
     state = bridge.BridgeState()
     state.set_session(None)  # force not-signed-in regardless of any on-disk session
@@ -412,7 +412,7 @@ def test_version_shows_skill_nudge_only(bridge_port, monkeypatch, capsys):
     # `version` surfaces a pip-style "newer available" nudge for the SKILL only.
     # The backend version is display-only (no update nudge — the app owns that).
     monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
-    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: "0.1.9")
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda **kw: "0.1.9")
     assert sr.main(["version"]) == 0
     out = capsys.readouterr().out
     assert "v0.1.9 available" in out and "update" in out.lower()
@@ -422,7 +422,7 @@ def test_version_shows_skill_nudge_only(bridge_port, monkeypatch, capsys):
 
 def test_version_no_notices_when_current(bridge_port, monkeypatch, capsys):
     monkeypatch.setattr(bridge, "_backend_version", lambda: "0.1.1")
-    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: None)
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda **kw: None)
     assert sr.main(["version"]) == 0
     assert "available" not in capsys.readouterr().out
 
@@ -480,7 +480,7 @@ def test_install_backend_helper_fails(bridge_port, monkeypatch, capsys):
 def test_status_account_prompts_available_skill_update(bridge_port, monkeypatch, capsys):
     # The welcome / bare-/sr proactively nudges when a SKILL update is available.
     # Backend updates are NOT nudged here anymore (the app owns that prompt).
-    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda: "0.1.9")
+    monkeypatch.setattr(bridge.selfupdate, "agent_update_available", lambda **kw: "0.1.9")
     assert sr.main(["status-account"]) == 0
     out = capsys.readouterr().out
     assert "skill v0.1.9 is available" in out.lower()

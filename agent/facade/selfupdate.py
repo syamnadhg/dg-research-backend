@@ -108,9 +108,12 @@ def latest_on_pypi(pkg: str, *, force: bool = False) -> "str | None":
     return latest or None
 
 
-def agent_update_available() -> "str | None":
-    """The newer agent version published on PyPI if one exists, else None."""
-    latest = latest_on_pypi(AGENT_PKG)
+def agent_update_available(*, force: bool = False) -> "str | None":
+    """The newer agent version published on PyPI if one exists, else None.
+    `force=True` bypasses the 24h cache for a FRESH read — used when the user
+    EXPLICITLY asks ("version" / "any update?"); passive nudges (welcome,
+    status) stay on the cached daily read."""
+    latest = latest_on_pypi(AGENT_PKG, force=force)
     return latest if (latest and version_gt(latest, __version__)) else None
 
 

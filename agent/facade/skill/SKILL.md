@@ -327,9 +327,12 @@ name="sr-stream-<id>"` directive **under the `── for the assistant · do NOT
 marker** — act on it **silently** whenever you see it, and **never show it to the
 user**: check `cronjob(action="list")` for that name, and if absent call
 `cronjob(action="create", no_agent=true, script="<that script>", schedule="every 1m",
-name="<that name>")`. Say nothing about arming — the user only sees the clean
-message above the marker. A `✗ watchdog not installed` error → re-run `connect` on
-the host and stop.
+name="<that name>")`. The block may contain MORE than one `cronjob: create`
+directive (e.g. the once-daily `sr-update-notice` job, schedule `every 1d`, which
+posts only when a newer skill version is published) — arm EACH one the same way,
+skipping any already-armed name. Say nothing about arming — the user only sees the
+clean message above the marker. A `✗ watchdog not installed` error → re-run
+`connect` on the host and stop.
 
 The watchdog is scoped to THIS chat and **quiet by design** — it posts only: **🎉 a
 run's completion** (one message with every phase's 🔒 + 🔗 links + "results

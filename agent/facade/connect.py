@@ -492,6 +492,10 @@ def _prune_legacy_installs(parent: Path) -> None:
 # runs in the gateway process — NOT as an agent exec call (issue #66142) — so the
 # /sr skill can't arm it from chat the Hermes way, hence no per-chat watchdog there.
 _STREAM_SCRIPT = "sr_attention_poll.py"
+# The once-daily skill-update notice rides the same deployment (armed by the
+# skill as cron job "sr-update-notice", schedule "every 1d"; posts only when a
+# newer skill version is published; self-removes after a disconnect).
+_CRON_SCRIPTS = (_STREAM_SCRIPT, "sr_update_notice.py")
 
 
 def hermes_scripts_dir(home: Path | None = None) -> Path:
@@ -500,23 +504,25 @@ def hermes_scripts_dir(home: Path | None = None) -> Path:
 
 
 def _install_stream_script(home: Path | None) -> None:
-    """Copy the streaming watchdog into HERMES_HOME/scripts/ so the /sr skill's
-    cron job can run it by filename. Best-effort — never breaks the skill install
-    (a WSL 9p / UNC mount can reject the write)."""
-    src = skill_src_dir() / "scripts" / _STREAM_SCRIPT
-    if not src.is_file():
-        return
-    try:
-        dst_dir = hermes_scripts_dir(home)
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        dst = dst_dir / _STREAM_SCRIPT
-        shutil.copy2(src, dst)
+    """Copy the skill's cron scripts (streaming watchdog + daily update notice)
+    into HERMES_HOME/scripts/ so the /sr skill's cron jobs can run them by
+    filename. Best-effort — never breaks the skill install (a WSL 9p / UNC
+    mount can reject the write)."""
+    for name in _CRON_SCRIPTS:
+        src = skill_src_dir() / "scripts" / name
+        if not src.is_file():
+            continue
         try:
-            dst.chmod(0o644)
+            dst_dir = hermes_scripts_dir(home)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst = dst_dir / name
+            shutil.copy2(src, dst)
+            try:
+                dst.chmod(0o644)
+            except OSError:
+                pass
         except OSError:
             pass
-    except OSError:
-        pass
 
 
 def _uninstall_stream_script(home: Path | None) -> None:
@@ -526,7 +532,9 @@ def _uninstall_stream_script(home: Path | None) -> None:
     the state means a later re-connect + re-arm starts from a clean silent
     baseline instead of replaying old phases."""
     scripts = hermes_scripts_dir(home)
-    targets = [scripts / _STREAM_SCRIPT, scripts / ".sr_stream_state.json"]
+    targets = [scripts / name for name in _CRON_SCRIPTS]
+    targets += [scripts / ".sr_stream_state.json",
+                scripts / ".sr_update_notice.state.json"]
     try:
         targets += list(scripts.glob("sr_poll_*.py"))
         targets += list(scripts.glob(".sr_poll_*.state.json"))
@@ -547,7 +555,9 @@ def _is_stream_job(job: object) -> bool:
     name = job.get("name") or ""
     script = job.get("script") or ""
     return (name == "sr-stream" or name.startswith("sr-stream-")
-            or script == _STREAM_SCRIPT or script.startswith("sr_poll_"))
+            or name == "sr-update-notice"
+            or script == _STREAM_SCRIPT or script == "sr_update_notice.py"
+            or script.startswith("sr_poll_"))
 
 
 def _stream_jobs_present(jobs_file: Path) -> bool | None:

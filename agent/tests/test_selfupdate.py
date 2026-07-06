@@ -83,9 +83,9 @@ def test_per_package_cache_is_independent(cache, monkeypatch):
 
 def test_agent_update_available(cache, monkeypatch):
     monkeypatch.setattr(selfupdate, "__version__", "0.1.6")
-    monkeypatch.setattr(selfupdate, "latest_on_pypi", lambda pkg: "0.1.8")
+    monkeypatch.setattr(selfupdate, "latest_on_pypi", lambda pkg, force=False: "0.1.8")
     assert selfupdate.agent_update_available() == "0.1.8"
-    monkeypatch.setattr(selfupdate, "latest_on_pypi", lambda pkg: "0.1.6")
+    monkeypatch.setattr(selfupdate, "latest_on_pypi", lambda pkg, force=False: "0.1.6")
     assert selfupdate.agent_update_available() is None  # already latest
 
 

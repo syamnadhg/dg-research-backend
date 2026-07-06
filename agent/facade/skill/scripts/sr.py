@@ -59,7 +59,7 @@ from pathlib import Path
 # silently (live 2026-07-02: a stale copy predating the podcast MEDIA: fix
 # kept sending bare audio paths). Bumped together with pyproject.toml —
 # guarded by tests/test_sr_skip_agents.py::test_skill_build_matches_package_version.
-_SKILL_BUILD = "0.1.23"
+_SKILL_BUILD = "0.1.24"
 
 _TIMEOUT = 30
 # By-title run resolution scans the newest N runs (status / podcast / list / the
@@ -1018,7 +1018,9 @@ def cmd_version(args) -> int:
     not the Research computer) only confused; the backend's version lives in the
     app's Settings → About and `superresearch --version` on the Research
     computer."""
-    code, body = _get("/version")
+    # Explicit ask ⇒ FRESH PyPI read (2026-07-06, user: "any update found?"
+    # right after a publish must see it — a stale 24h-cached "no" is a lie).
+    code, body = _get("/version?fresh=1")
     if code != 200:
         return _emit(body, args.json, [f"✗ couldn't read versions: {body.get('error', code)}"],
                      _fail_code(code))
@@ -1113,6 +1115,11 @@ def _prepare_stream_arm() -> tuple[list[str], dict, int]:
             "auto-removes when the run finishes):",
             '  cronjob: create no_agent=true schedule="every 1m" '
             'script="sr_attention_poll.py" name="sr-stream"',
+            "Also arm the once-daily skill-update notice (skip if already armed; "
+            "it posts only when a newer skill version is published and removes "
+            "itself after a disconnect):",
+            '  cronjob: create no_agent=true schedule="every 1d" '
+            'script="sr_update_notice.py" name="sr-update-notice"',
         ], payload, 0)
     slug = _origin_slug(origin)
     script_name = f"sr_poll_{slug}.py"
@@ -1128,6 +1135,11 @@ def _prepare_stream_arm() -> tuple[list[str], dict, int]:
         "auto-removes when they finish:",
         f'  cronjob: create no_agent=true schedule="every 1m" '
         f'script="{script_name}" name="{job_name}"',
+        "Also arm the once-daily skill-update notice (skip if already armed; "
+        "it posts only when a newer skill version is published and removes "
+        "itself after a disconnect):",
+        '  cronjob: create no_agent=true schedule="every 1d" '
+        'script="sr_update_notice.py" name="sr-update-notice"',
     ], payload, 0)
 
 

@@ -1307,7 +1307,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             elif path == "/updates":
                 self._updates()
             elif path == "/version":
-                self._version()
+                self._version(fresh="fresh=1" in (self.path.split("?", 1) + [""])[1])
             elif path.startswith("/research/") and path.endswith("/podcast"):
                 self._research_podcast(path[len("/research/"):-len("/podcast")])
             elif path.startswith("/research/"):
@@ -2418,7 +2418,7 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             self._json(200, {"ok": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
 
-        def _version(self) -> None:
+        def _version(self, fresh: bool = False) -> None:
             """The agent version (+ a pip-style "newer agent on PyPI" notice) and
             the co-located Super Research backend version for DISPLAY (read-only;
             no account needed — loopback + Host gated like every route). No backend
@@ -2428,7 +2428,10 @@ def _make_handler(state: BridgeState) -> type[BaseHTTPRequestHandler]:
             self._json(200, {
                 "agent": __version__,
                 "backend": _backend_version(),
-                "agentLatest": selfupdate.agent_update_available(),
+                # fresh=1 (explicit user ask / the daily notice job) bypasses
+                # the 24h cache — an "any update?" right after a publish must
+                # see it, not a stale cached "no".
+                "agentLatest": selfupdate.agent_update_available(force=fresh),
             })
 
         def _agent_install(self) -> None:
