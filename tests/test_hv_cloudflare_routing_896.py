@@ -132,8 +132,11 @@ def test_cleared_paths_drop_the_hv_blocked_verdict():
 
 
 def test_tier5_cloudflare_copy_warns_against_the_click_loop():
+    # 2026-07-06 hands-off directive: the copy now states the automation
+    # leaves the wall untouched (it no longer attempts anything) and points
+    # at the later real-Chrome login as the fix.
     src = inspect.getsource(research.wait_for_verification_clearance)
-    assert "don't keep clicking" in src
+    assert "leaves it completely untouched" in src
     assert "login command" in src
     assert "builds Cloudflare's trust" in src
 

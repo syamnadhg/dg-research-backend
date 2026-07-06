@@ -27878,14 +27878,17 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
          Resume / Skip agent. Polls every 5s so a manual solve auto-
          resumes even if the user never taps Resume.
 
-    2026-07-06 HV-trim (continuous-HV fix): for a POSITIVELY-identified
-    CLOUDFLARE wall the score-raising tiers are skipped — tiers 1 and 3
-    (checkbox re-clicks are failed attestations that re-issue the challenge
-    and raise the score; #896) and tier 4 (another cold navigation against a
-    profile+IP-scoped attestation a fresh tab can't reset). Cloudflare runs
-    tier 0 (the ONE allowed cheap click) → a no-interaction settled probe
-    (JS interstitials auto-resolve) → tier 2 (decay-based cooldown + reload,
-    the code-endorsed move) → tier 5 (user pause / auto-resume on decay).
+    2026-07-06 HANDS-OFF CLOUDFLARE (user directive, supersedes the earlier
+    same-day HV-trim): for a POSITIVELY-identified CLOUDFLARE wall the
+    automation touches NOTHING — no DOM click (tier 0), no CUA (tiers 1/3),
+    no Vision, no cooldown+reload (tier 2: two cold navigations), no
+    kill-tab (tier 4). Every interaction is a failed attestation that
+    re-issues the challenge and raises the bot score (#896). Cloudflare's
+    entire path is: passive 15s settled probe (pure DOM reads — the JS-only
+    interstitial often auto-resolves) → tier 5 user alert with SKIP as the
+    only action. The wall is left untouched for the user to solve later via
+    a real-Chrome sign-in (the login command); the tier-5 poll is passive,
+    so a naturally-decayed or hand-solved check still auto-resumes the run.
     Non-Cloudflare and unknown challenges keep the full chain — their
     buttons genuinely work. The Cloudflare verdict is STICKY (see _cf_seen).
 
@@ -27976,21 +27979,29 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         _controls.hv_blocked.pop(platform_key, None)
 
     # ── Tier 0: Playwright cheap-click ──
-    # Most Cloudflare gates are a single checkbox. A direct Playwright
-    # click clears them for zero CUA cost. Keep the banner subtle here —
-    # only escalate to "retrying" alert if this attempt fails.
-    try:
-        clicked = await _playwright_hv_click(page, label)
-        if clicked:
-            await asyncio.sleep(3)
-            if await _settled_clear():
-                log(f"[{label}] Playwright cleared verification ✓ — CUA not needed")
-                emit_event("agent_verified", phase=phase, agent=platform_key)
-                _mark_cleared()
-                return True
-            log(f"[{label}] Playwright click didn't clear — escalating to CUA", "WARN")
-    except Exception as e:
-        log(f"[{label}] Playwright HV tier errored: {e} — escalating to CUA", "WARN")
+    # A direct Playwright click clears simple platform-native checks for
+    # zero CUA cost. Keep the banner subtle here — only escalate to
+    # "retrying" alert if this attempt fails.
+    # 2026-07-06 (user directive, hands-off Cloudflare): SKIPPED for a
+    # confirmed Cloudflare wall — even the "one cheap click" is a failed
+    # attestation that re-issues the challenge and raises the bot score.
+    # NOTHING (DOM, CUA, Vision) touches a Cloudflare wall anymore; it is
+    # left untouched for the user to solve later via a real-Chrome login.
+    if _is_cloudflare():
+        log(f"[{label}] Cloudflare wall — hands-off policy: no DOM click (every touch raises the score)")
+    else:
+        try:
+            clicked = await _playwright_hv_click(page, label)
+            if clicked:
+                await asyncio.sleep(3)
+                if await _settled_clear():
+                    log(f"[{label}] Playwright cleared verification ✓ — CUA not needed")
+                    emit_event("agent_verified", phase=phase, agent=platform_key)
+                    _mark_cleared()
+                    return True
+                log(f"[{label}] Playwright click didn't clear — escalating to CUA", "WARN")
+        except Exception as e:
+            log(f"[{label}] Playwright HV tier errored: {e} — escalating to CUA", "WARN")
 
     # ── CUA fallback — first pass (in place, 3 iterations) ──
     # Most Turnstile gates are a single "I am human" checkbox that CUA can
@@ -28009,14 +28020,13 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     user_prompt = "Click the single human-verification checkbox if one is visible. Otherwise stop and say 'blocked'."
     if _is_cloudflare():
         log(f"[{label}] Cloudflare wall — skipping the CUA click pass (re-clicks re-issue + raise the score; #896)")
-        # Review 2026-07-06: Cloudflare's JS-only "checking your browser"
-        # interstitial (no checkbox — tier-0 had nothing to click) often
-        # AUTO-RESOLVES in seconds with zero interaction. Pre-trim, tier-1's
-        # ~35s CUA pass + settled probe caught that silently; without a probe
-        # here the flow would jump straight to tier-2's about:blank nav —
-        # killing the in-flight attestation mid-solve and paying a cold
-        # reload for a wall that was clearing itself. So: wait briefly and
-        # settled-probe BEFORE any navigation. Zero clicks, zero navs.
+        # Cloudflare's JS-only "checking your browser" interstitial (no
+        # checkbox) often AUTO-RESOLVES in seconds with zero interaction —
+        # wait briefly and settled-probe (pure DOM reads, sends nothing to
+        # the page) before bothering the user. This is the ONLY pre-alert
+        # step Cloudflare gets: 2026-07-06 user directive makes the wall
+        # fully hands-off — no click, no CUA, no Vision, no cooldown
+        # reload, no fresh tab. Straight to the user alert below.
         await asyncio.sleep(15)
         if await _settled_clear():
             log(f"[{label}] Cloudflare check auto-resolved ✓ — no interaction needed")
@@ -28043,62 +28053,71 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             log(f"[{label}] CUA first pass errored: {e} — cooldown + reload + retry", "WARN")
 
     # ── CUA fallback — second pass (cooldown + reload, 5 iterations) ──
-    # Cloudflare's bot-score heuristic partially decays with time, and a clean
+    # The bot-score heuristic partially decays with time, and a clean
     # page navigation (blank → original URL) re-runs the stealth init script
     # against a fresh document, which often defuses a recently-flagged session.
-    # If Turnstile still fires, CUA gets more iterations this time around
+    # If the check still fires, CUA gets more iterations this time around
     # since it's our last auto-resort before bothering the user.
-    try:
-        original_url = page.url
-        log(f"[{label}] CUA fallback retry: blank → 3 min cooldown → reload → CUA (5 iter)…")
+    # 2026-07-06 (user directive, hands-off Cloudflare): the ENTIRE tier is
+    # skipped for Cloudflare — the about:blank + reload pair is two cold
+    # navigations against a profile+IP-scoped attestation, feeding the very
+    # score that fired the challenge. Cloudflare goes straight to the user
+    # alert (Skip-only) below.
+    if _is_cloudflare():
+        log(f"[{label}] Cloudflare wall — hands-off policy: no cooldown/reload; straight to the user alert")
+    else:
         try:
-            await page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
-        except Exception:
-            pass
-        await asyncio.sleep(180)
-        try:
-            await page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(4)
-        except Exception as e:
-            log(f"[{label}] Reload failed: {e} — escalating to user", "WARN")
-
-        blocked, _fresh_r = await detect_human_verification(page, platform, label)
-        if _fresh_r:
-            reason = _fresh_r  # keep the verdict/copy tracking the latest observed wall
-        if blocked:
-            # 2026-07-06 HV-trim: for Cloudflare, rely on the decay+reload alone
-            # — a 5-iteration CUA pass is up to 5 more failed attestations.
-            if _is_cloudflare():
-                log(f"[{label}] Cloudflare still present after cooldown — no re-click; settled probe decides")
-            else:
-                log(f"[{label}] Turnstile still present after cooldown — CUA 5-iter retry")
-                await browser.switch_to_page(page)
-                await agent_loop(cua_client, browser, sys_prompt, user_prompt,
-                    model=CUA_MODEL, max_iterations=5, verbose=verbose)
-                await asyncio.sleep(3)
-
-        if await _settled_clear():
-            # Page just reloaded — re-run platform-specific setup so the
-            # caller's subsequent paste/send logic still finds Deep Research
-            # pill / Opus Adaptive + Research tool / Pro Extended Thinking
-            # active on the fresh page.
-            log(f"[{label}] CUA retry cleared verification ✓ — re-running setup")
-            emit_event("agent_verified", phase=phase, agent=platform_key)
-            _mark_cleared()
-            pl = platform.lower()
+            original_url = page.url
+            log(f"[{label}] CUA fallback retry: blank → 3 min cooldown → reload → CUA (5 iter)…")
             try:
-                if pl == "claude":
-                    await setup_claude_dr(page)
-                elif pl == "gemini":
-                    await setup_gemini_dr(page)
-                elif pl == "chatgpt":
-                    await setup_chatgpt_dr(page)
+                await page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            await asyncio.sleep(180)
+            try:
+                await page.goto(original_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(4)
             except Exception as e:
-                log(f"[{label}] Post-clear setup re-run warning: {e}", "WARN")
-            return True
-        log(f"[{label}] CUA retry still blocked — escalating to tab-kill", "WARN")
-    except Exception as e:
-        log(f"[{label}] CUA retry errored: {e} — escalating to tab-kill", "WARN")
+                log(f"[{label}] Reload failed: {e} — escalating to user", "WARN")
+
+            blocked, _fresh_r = await detect_human_verification(page, platform, label)
+            if _fresh_r:
+                reason = _fresh_r  # keep the verdict/copy tracking the latest observed wall
+            if blocked:
+                # A confirmed-Cloudflare verdict can first LATCH here (the top
+                # probe landed in a detection gap and the cascade ran as
+                # "unknown"): stop re-clicking the moment it's known.
+                if _is_cloudflare():
+                    log(f"[{label}] Cloudflare still present after cooldown — no re-click; settled probe decides")
+                else:
+                    log(f"[{label}] Turnstile still present after cooldown — CUA 5-iter retry")
+                    await browser.switch_to_page(page)
+                    await agent_loop(cua_client, browser, sys_prompt, user_prompt,
+                        model=CUA_MODEL, max_iterations=5, verbose=verbose)
+                    await asyncio.sleep(3)
+
+            if await _settled_clear():
+                # Page just reloaded — re-run platform-specific setup so the
+                # caller's subsequent paste/send logic still finds Deep Research
+                # pill / Opus Adaptive + Research tool / Pro Extended Thinking
+                # active on the fresh page.
+                log(f"[{label}] CUA retry cleared verification ✓ — re-running setup")
+                emit_event("agent_verified", phase=phase, agent=platform_key)
+                _mark_cleared()
+                pl = platform.lower()
+                try:
+                    if pl == "claude":
+                        await setup_claude_dr(page)
+                    elif pl == "gemini":
+                        await setup_gemini_dr(page)
+                    elif pl == "chatgpt":
+                        await setup_chatgpt_dr(page)
+                except Exception as e:
+                    log(f"[{label}] Post-clear setup re-run warning: {e}", "WARN")
+                return True
+            log(f"[{label}] CUA retry still blocked — escalating to tab-kill", "WARN")
+        except Exception as e:
+            log(f"[{label}] CUA retry errored: {e} — escalating to tab-kill", "WARN")
 
     # ── Tier 4: Kill the tab, open a fresh one ──
     # NEVER-DIE-MIGRATION-2026-04-18: Last automated tier before
@@ -28160,11 +28179,12 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             platform_key, platform.capitalize())
         _hv_msg = (
             f"{_hv_plat} hit Cloudflare's 'Verify you are human' check. "
-            f"Clicking it in the automation window makes it re-issue — don't keep clicking there. "
-            f"Skip {_hv_plat} for this run; to make these checks go away, run the "
-            f"login command on this computer and sign in to {_hv_plat} in the real "
-            f"Chrome window it opens — each clean sign-in builds Cloudflare's trust until it "
-            f"stops asking. If the check clears here on its own, the run resumes automatically."
+            f"The automation leaves it completely untouched — any click there re-issues "
+            f"the check and raises the bot score. Skip {_hv_plat} for this run; to make "
+            f"these checks go away, run the login command on this computer later and sign "
+            f"in to {_hv_plat} in the real Chrome window it opens — each clean sign-in "
+            f"builds Cloudflare's trust until it stops asking. If the check clears here "
+            f"on its own, the run resumes automatically."
         )
     else:
         _hv_msg = f"Solve the check ({platform.capitalize()}'s 'are you human' prompt) in the open browser, then Resume — or Skip {platform.capitalize()}."

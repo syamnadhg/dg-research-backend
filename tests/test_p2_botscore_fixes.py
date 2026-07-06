@@ -142,10 +142,17 @@ def test_chatgpt_force_new_chat_functional():
 # ── 3. HV-trim: Cloudflare-aware clearance cascade ──────────────────────────
 
 def test_hv_cascade_skips_score_raising_tiers_for_cloudflare():
+    # 2026-07-06 hands-off directive: Cloudflare gets NO interaction at all —
+    # DOM, CUA, Vision, navigation, fresh tab. Detection reads only; then the
+    # user alert (Skip-only) with the passive auto-resume poll.
     src = inspect.getsource(research.wait_for_verification_clearance)
     assert "_is_cloudflare" in src
+    # Tier 0 (the former "one allowed" Playwright click) skipped for Cloudflare.
+    assert "hands-off policy: no DOM click" in src
     # Tier 1 (CUA 3-iter click pass) skipped for Cloudflare.
     assert "skipping the CUA click pass" in src
+    # Tier 2 (cooldown + about:blank/reload = two cold navigations) skipped.
+    assert "no cooldown/reload; straight to the user alert" in src
     # Tier 3 (post-cooldown CUA 5-iter re-click) skipped for Cloudflare.
     assert "no re-click; settled probe decides" in src
     # Tier 4 (kill-tab = one more cold nav) skipped for Cloudflare.
@@ -160,8 +167,9 @@ def test_hv_cascade_keeps_full_chain_for_non_cloudflare():
     assert "max_iterations=5" in src
     # …and the kill-tab fresh-tab tier.
     assert "browser.new_tab(original_url)" in src
-    # The decay-based cooldown+reload runs for EVERYONE (incl. Cloudflare) —
-    # it's the code-endorsed move, never trimmed.
+    # The decay-based cooldown+reload stays for non-Cloudflare challenges
+    # (2026-07-06 hands-off directive removed it for Cloudflare — a reload
+    # is a cold navigation feeding the score).
     assert "asyncio.sleep(180)" in src
 
 
@@ -197,7 +205,7 @@ class _FakeHvPage:
         return False
 
     async def goto(self, *a, **k):
-        pass
+        self._c["goto"] += 1
 
     async def close(self):
         self._c["closed"] += 1
@@ -244,7 +252,7 @@ def _run_cascade(monkeypatch, *, reasons, preserve_tab=False):
     repeat the tail — always blocked, so the cascade walks every tier it is
     WILLING to run and ends at tier-5 (which exits immediately via is_stop).
     Returns the action counters."""
-    counters = {"agent_loop": 0, "closed": 0, "new_tab": 0}
+    counters = {"agent_loop": 0, "closed": 0, "new_tab": 0, "goto": 0, "hv_click": 0}
     seq = list(reasons)
 
     async def fake_detect(page, platform, label):
@@ -255,11 +263,16 @@ def _run_cascade(monkeypatch, *, reasons, preserve_tab=False):
         counters["agent_loop"] += 1
         return {"text": "blocked"}
 
+    async def fake_hv_click(page, label):
+        counters["hv_click"] += 1
+        return False  # never clears — the cascade keeps walking
+
     async def _nosleep(_s):
         return None
 
     monkeypatch.setattr(research, "detect_human_verification", fake_detect)
     monkeypatch.setattr(research, "agent_loop", fake_agent_loop)
+    monkeypatch.setattr(research, "_playwright_hv_click", fake_hv_click)
     monkeypatch.setattr(research, "emit_event", lambda *a, **k: None)
     monkeypatch.setattr(research, "_persist_pending_decision", lambda *a, **k: None)
     monkeypatch.setattr(research, "_controls", _FakeControls())
@@ -274,32 +287,41 @@ def _run_cascade(monkeypatch, *, reasons, preserve_tab=False):
     return counters
 
 
-def test_functional_cloudflare_runs_zero_score_raising_actions(monkeypatch):
-    # A Cloudflare wall must produce ZERO CUA click passes, ZERO tab closes,
-    # ZERO fresh tabs — the whole point of the HV trim. This is the polarity
-    # pin: inverting any `if _is_cloudflare()` flips these counters.
+def test_functional_cloudflare_runs_zero_interactions(monkeypatch):
+    # 2026-07-06 hands-off directive: a Cloudflare wall must produce ZERO
+    # touches of ANY kind — no DOM click, no CUA pass, no navigation
+    # (cooldown/reload), no tab close, no fresh tab. Detection reads only,
+    # then the Skip-only user alert. This is the polarity pin: inverting
+    # any `if _is_cloudflare()` flips these counters.
     c = _run_cascade(monkeypatch, reasons=["Cloudflare"])
-    assert c["agent_loop"] == 0
+    assert c["hv_click"] == 0     # tier-0 DOM click never fires
+    assert c["agent_loop"] == 0   # no CUA pass, ever
+    assert c["goto"] == 0         # no about:blank / reload navigation
     assert c["closed"] == 0
     assert c["new_tab"] == 0
 
 
 def test_functional_non_cloudflare_keeps_full_cascade(monkeypatch):
-    # A reCAPTCHA wall keeps its working tiers: both CUA passes + the kill-tab.
+    # A reCAPTCHA wall keeps its working tiers: the DOM click, both CUA
+    # passes, the cooldown/reload navigations, and the kill-tab.
     c = _run_cascade(monkeypatch, reasons=["reCAPTCHA"])
+    assert c["hv_click"] == 1     # tier-0 Playwright click
     assert c["agent_loop"] == 2   # 3-iter pass + post-cooldown 5-iter pass
+    assert c["goto"] == 2         # about:blank + original-URL reload
     assert c["closed"] == 1       # kill-tab closed the page…
     assert c["new_tab"] == 1      # …and opened a replacement
 
 
 def test_functional_cloudflare_verdict_is_sticky(monkeypatch):
-    # Review MAJOR: the tier-0 click opens the #896 re-issue gap, where the
-    # detector can relabel a REAL Cloudflare wall "Claude human verification".
-    # The verdict must LATCH — a later gap-landing probe can't re-arm the
-    # skipped tiers. Feed: top probe says Cloudflare, every later probe says
-    # the generic platform label.
+    # Review MAJOR (#896 re-issue gap): the detector can relabel a REAL
+    # Cloudflare wall "Claude human verification" mid-cascade. The verdict
+    # must LATCH — a later gap-landing probe can't re-arm the skipped tiers.
+    # Feed: top probe says Cloudflare, every later probe says the generic
+    # platform label.
     c = _run_cascade(monkeypatch, reasons=["Cloudflare", "Claude human verification"])
+    assert c["hv_click"] == 0
     assert c["agent_loop"] == 0
+    assert c["goto"] == 0
     assert c["closed"] == 0
     assert c["new_tab"] == 0
 
