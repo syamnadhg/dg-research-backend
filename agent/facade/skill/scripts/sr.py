@@ -120,7 +120,7 @@ def _request(method: str, path: str, body: dict | None = None,
     except urllib.error.URLError as e:
         return 0, {"error": f"bridge unreachable ({e.reason}) — the Super Research bridge "
                             "isn't running on this machine yet. Set it up with `pipx run "
-                            "superresearch-agent connect` (it starts the bridge + keeps it "
+                            "--no-cache superresearch-agent connect` (it starts the bridge + keeps it "
                             "on login), then sign in."}
 
 

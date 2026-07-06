@@ -221,7 +221,7 @@ def _spawn_detached(cmd: list, log_name: str) -> bool:
 
 def spawn_detached_reconnect() -> bool:
     """Spawn a DETACHED process that, once THIS (bridge) process exits, runs
-    ``pipx run superresearch-agent connect --yes --no-login`` — fetching the latest
+    ``pipx run --no-cache superresearch-agent connect --yes --no-login`` — fetching the latest
     agent from PyPI, redeploying the skill, re-pinning the launcher to the new code,
     and starting the new bridge. Returns True if the helper launched.
 

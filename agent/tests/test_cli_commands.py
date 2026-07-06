@@ -374,7 +374,7 @@ def test_connect_wsl_nonzero_rc_shows_fallback(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 3
     assert "didn't finish" in out
-    assert "pipx run superresearch-agent connect" in out     # fallback printed
+    assert "pipx run --no-cache superresearch-agent connect" in out     # fallback printed
 
 
 def test_connect_wsl_noninteractive_without_yes_prints_manual(monkeypatch, capsys):
@@ -385,7 +385,7 @@ def test_connect_wsl_noninteractive_without_yes_prints_manual(monkeypatch, capsy
     rc = cli._connect_wsl_runtime(_wsl_target(), assume_yes=False, noninteractive=True,
                                   startup=None, login=None)
     assert rc == 0 and ran == []
-    assert "pipx run superresearch-agent connect" in capsys.readouterr().out
+    assert "pipx run --no-cache superresearch-agent connect" in capsys.readouterr().out
 
 
 # ── lifecycle/query delegation to WSL (Option A — symmetric with connect) ─────

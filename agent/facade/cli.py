@@ -496,7 +496,7 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
 
     # No TTY and no --yes → can't drive the interactive in-distro setup; print it.
     if noninteractive and not assume_yes:
-        _print_wsl_manual(distro, "pipx run superresearch-agent connect")
+        _print_wsl_manual(distro, "pipx run --no-cache superresearch-agent connect")
         return 0
     # pipx missing in the distro → install it autonomously (the WSL-side bootstrap),
     # then proceed. Only fall back to the manual command if that install can't finish.
@@ -506,13 +506,13 @@ def _connect_wsl_runtime(target: connect.Target, *, assume_yes: bool, noninterac
         b.dim(f"pipx isn't in WSL · {distro} yet — installing it there…")
         if not connect.ensure_wsl_pipx(distro):
             b.warn(f"Couldn't install pipx in WSL · {distro} automatically.")
-            _print_wsl_manual(distro, "pipx run superresearch-agent connect")
+            _print_wsl_manual(distro, "pipx run --no-cache superresearch-agent connect")
             return 0
     b.dim(f"Setting it up inside {distro}…")
     rc = connect.run_agent_in_wsl(distro, "connect", forwarded)
     if rc != 0:
         b.warn(f"The in-WSL setup didn't finish (exit {rc}).")
-        _print_wsl_manual(distro, "pipx run superresearch-agent connect")
+        _print_wsl_manual(distro, "pipx run --no-cache superresearch-agent connect")
     return rc
 
 

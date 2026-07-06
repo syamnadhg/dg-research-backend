@@ -96,7 +96,7 @@ machine — the same place you run `sr.py` — so **run it yourself** (don't ask
 user, don't ask for confirmation), then tell them you're doing the one-time setup:
 
 ```
-pipx run superresearch-agent connect
+pipx run --no-cache superresearch-agent connect
 ```
 
 (or `python research.py agent connect` from a backend checkout). It installs the
