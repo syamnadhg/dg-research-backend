@@ -15341,12 +15341,25 @@ async def _verify_chatgpt_panel_open(page):
     the ChatGPT DR viewport. Used post-click to detect silent click failures.
 
     Heuristic: an <aside> / [role="complementary"] / [aria-label*="source"i]
-    / [class*="panel"] element with width >= 280px and at least one URL or
-    numbered step row inside."""
+    / [class*="panel"] element ≥280×200 on the right side of the viewport with
+    substantial text — the SAME acceptance `scrape_chatgpt_activity_panel_tracking`
+    uses to read the panel.
+
+    2026-07-06 (P1/P2 ChatGPT sources didn't open): dropped the old
+    `hasUrl || hasList` requirement (a raw `<a href="http…">` or `<ol>/<ul> > li`).
+    That made this verifier STRICTER than the scraper it guards — a modern DR
+    panel whose source rows are `<div>`/`<button>` chips (no raw anchor, no `<li>`)
+    passed the open-click but FAILED verify, so `chatgpt_activity_panel_open` never
+    flipped, the flag-gated scraper never ran, and ChatGPT surfaced no sources /
+    narration in the FE phase dropdown (both P1 `7c-p1` and P2 `7c`). The
+    panel-specific selectors + right-side + size + ≥50-char text are exactly what
+    the scraper trusts; a composer/chat guard prevents ever matching the chat
+    column (which is never an <aside>/complementary anyway)."""
     JS = """() => {
         const sels = [
             'aside', '[role="complementary"]', '[role="region"]',
-            '[aria-label*="source" i]', '[aria-label*="research" i]',
+            '[aria-label*="source" i]', '[aria-label*="activity" i]',
+            '[aria-label*="research" i]',
             '[class*="panel" i][class*="side" i]',
             '[class*="research" i][class*="panel" i]'
         ];
@@ -15358,9 +15371,9 @@ async def _verify_chatgpt_panel_open(page):
                     if (r.right < window.innerWidth * 0.55) continue;  // must be on right side
                     const inner = (el.innerText || '').trim();
                     if (inner.length < 50) continue;
-                    const hasUrl = !!el.querySelector('a[href*="http"]');
-                    const hasList = !!el.querySelector('ol > li, ul > li');
-                    if (hasUrl || hasList) return true;
+                    // Never mistake the composer/chat column for the panel.
+                    if (el.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')) continue;
+                    return true;
                 }
             } catch (e) {}
         }
