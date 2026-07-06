@@ -39028,8 +39028,41 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
         emit_row(name, status != "missing", label)
 
 
+async def _probe_profile_logins(profile_dir, *, security_check, results) -> str:
+    """Open the profile READ-ONLY (patchright, ZERO page navigations) and record
+    TRUTHFUL per-platform session presence into `results` via cookie reads — the
+    profile's sessions are left completely untouched (no Chrome kill/relaunch, no
+    sign-in tabs, no clear). Runs the optional `security_check` on the same context
+    (a cookie read, zero page loads — DGOPS-7451 must not be skippable). Returns
+    'ok' | 'refused' | 'probe_failed' ('probe_failed' = the context/probe itself
+    couldn't run, e.g. the profile is locked by a live Chrome — NOT 'signed out').
+    Shared by the `--login` pre-probe and the verify_mode='skip' branch."""
+    browser = Browser(profile_dir, headless=False)
+    try:
+        async with _async_spinner_ctx("Checking the profile"):
+            await browser.start()
+        if security_check is not None:
+            try:
+                if await security_check(browser):
+                    return "refused"
+            except Exception as _sec_err:
+                log(f"login: security check errored (continuing): {_sec_err}", "WARN")
+        for _n2, _u2, _k2 in _LOGIN_SERVICES:
+            results[_k2] = await _platform_auth_cookie_present(browser, _k2)
+        return "ok"
+    except Exception as _pr_err:
+        log(f"login: cookie probe unavailable ({_pr_err}) — trusting the sign-in", "WARN")
+        return "probe_failed"
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
 async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_row,
-                             security_check=None, verify_mode="verify") -> str:
+                             security_check=None, verify_mode="verify",
+                             ask_reopen_if_signed_in=False) -> str:
     """Sign in ONE profile — the shared engine for `--login` and pair Step 4.
     Phase 1 = the user's plain Chrome (human signs in on the un-detected surface,
     and can clear any Cloudflare check by hand — a REAL human interaction that
@@ -39050,11 +39083,60 @@ async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_ro
                  Enter/y ⇒ 'skip' (default: verification is the bot-score
                  risk), n ⇒ 'verify'.
 
+    ask_reopen_if_signed_in ('--login' walk): BEFORE seeding, probe the profile's
+    existing sessions read-only (never kills/relaunches Chrome, never clears it).
+    This is the fix for `--login` dragging an already-signed-in profile back
+    through sign-in (the old flow always opened the sign-in tabs and hard-killed
+    live Chrome, which could drop an unflushed session). Behaviour when the probe
+    succeeds — a truthful per-profile Y/N gate (vs silently auto-advancing):
+      • fully signed in → "re-open anyway (usually to check / do Human
+        Verifications, if any)? [y/N]" — DEFAULT SKIP; declining returns 'ok'
+        with the probed state, session 100% untouched.
+      • some/all signed out → "Open Chrome to sign in? [Y/n]" — DEFAULT open.
+    Declining either just leaves the profile as-is (never cleaned, worker count
+    unchanged). On a probe failure (e.g. the profile is locked) it falls through
+    to seed, i.e. today's behaviour. Off (pair Step 4) the flow is unchanged.
+
     Mutates `results`. Returns 'ok' | 'no_chrome' | 'refused'. Raises
     KeyboardInterrupt on Ctrl+C (universal cancel) — the caller handles it."""
     service_urls = [u for _n, u, _k in _LOGIN_SERVICES]
     reopen = False
     resolved_mode: "str | None" = None  # 'ask' answers once, then sticks
+
+    # --login pre-probe: don't force a re-login on an already-signed-in profile.
+    # Read the profile's sessions WITHOUT touching them, then let the user decide
+    # per profile (state-aware Y/N) whether to open Chrome at all.
+    if ask_reopen_if_signed_in:
+        _pre = await _probe_profile_logins(
+            profile_dir, security_check=security_check, results=results)
+        if _pre == "refused":
+            return "refused"
+        if _pre == "ok":
+            _held = [nm for nm, _u, k in _LOGIN_SERVICES if results.get(k)]
+            _absent = [nm for nm, _u, k in _LOGIN_SERVICES if not results.get(k)]
+            print()
+            if _held:
+                print(f"  {_c(_OK, '✓')}  {_c(_DIM, 'Signed in: ' + ', '.join(_held))}")
+            if _absent:
+                print(f"  {_c(_WARN, 'No session:')} {_c(_DIM, ', '.join(_absent))}")
+            if _held and not _absent:
+                # Fully signed in — DEFAULT skip the re-open (keep session intact).
+                prompt = (f"  {_c(_ACCENT, '>')}  Looks signed in — re-open anyway "
+                          f"{_c(_DIM, '(usually to check / do Human Verifications, if any)')}? "
+                          f"{_c(_DIM, '[y/N]')}: ")
+                default_open = False
+            else:
+                # Some/all signed out — DEFAULT open Chrome so the user can sign in.
+                prompt = f"  {_c(_ACCENT, '>')}  Open Chrome to sign in? {_c(_DIM, '[Y/n]')}: "
+                default_open = True
+            ans = (await asyncio.to_thread(input, prompt)).strip().lower()  # Ctrl+C = cancel
+            want_open = (ans in ("", "y", "yes")) if default_open else (ans in ("y", "yes"))
+            if not want_open:
+                print(f"  {_c(_DIM, 'Left as-is — your sign-in is untouched.')}")
+                return "ok"
+        # _pre == 'probe_failed' → couldn't read the profile (likely locked by a
+        # live Chrome); fall through to seed (today's behaviour — no false skip).
+
     while True:
         # Phase 1 — plain Chrome sign-in (all tabs). On a reopen the user just
         # fixes the flagged platforms.
@@ -39081,28 +39163,11 @@ async def _login_one_profile(profile_dir, cua_client, *, label, results, emit_ro
             # (zero page loads): a user who closed Chrome without signing in
             # must not mint green login badges or a worker slot. The security
             # check (pair F4, DGOPS-7451) rides the same context open.
-            _probe_ok = False
-            browser = Browser(profile_dir, headless=False)
-            try:
-                async with _async_spinner_ctx("Checking the profile"):
-                    await browser.start()
-                if security_check is not None:
-                    try:
-                        if await security_check(browser):
-                            return "refused"
-                    except Exception as _sec_err:
-                        log(f"login: security check errored (continuing): {_sec_err}", "WARN")
-                for _n2, _u2, _k2 in _LOGIN_SERVICES:
-                    results[_k2] = await _platform_auth_cookie_present(browser, _k2)
-                _probe_ok = True
-            except Exception as _pr_err:
-                log(f"login: cookie probe unavailable ({_pr_err}) — trusting the sign-in", "WARN")
-            finally:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-            if not _probe_ok:
+            _probe = await _probe_profile_logins(
+                profile_dir, security_check=security_check, results=results)
+            if _probe == "refused":
+                return "refused"
+            if _probe == "probe_failed":
                 # Probe itself failed (not "cookies absent") — fail open: the
                 # human just signed in, and phase time rechecks anyway.
                 for _n2, _u2, _k2 in _LOGIN_SERVICES:
@@ -39190,7 +39255,7 @@ async def run_login_flow(
         sfx = f"  {_c(_DIM, lbl)}" if lbl else ""
         print(f"        {mark}  {nm.ljust(pad)}{sfx}")
 
-    async def _do_profile(n: int, total: int) -> "tuple[dict, str]":
+    async def _do_profile(n: int, total: int, *, ask_reopen: bool = False) -> "tuple[dict, str]":
         nonlocal seeded_any
         profile_dir = str(_profile_dir(n))
         label = "profile" if total <= 1 else f"profile {n}"
@@ -39203,7 +39268,7 @@ async def run_login_flow(
         try:
             status = await _login_one_profile(
                 profile_dir, cua_client, label=label, results=results, emit_row=_row,
-                verify_mode=verify_mode)
+                verify_mode=verify_mode, ask_reopen_if_signed_in=ask_reopen)
         except (EOFError, KeyboardInterrupt):
             raise  # propagate the cancel (caller/main handles it)
         except Exception as e:
@@ -39232,7 +39297,10 @@ async def run_login_flow(
         print(f"  {_c(_BOLD, str(_n_prof))} browser profile{'s' if _n_prof != 1 else ''} detected — "
               f"walking through each so you can check its sign-ins and solve any human-check.")
     for n in profile_list:
-        await _do_profile(n, total)
+        # ask_reopen: existing profiles get the read-only pre-probe + per-profile
+        # Y/N so a signed-in profile isn't dragged back through sign-in (and never
+        # auto-advances silently). Added profiles below use the add-loop's own gate.
+        await _do_profile(n, total, ask_reopen=True)
 
     # `--login` add-loop: offer to set up ADDITIONAL worker profiles, pair-style,
     # so a single-worker install can grow to multi-worker from --login (matching

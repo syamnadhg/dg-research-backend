@@ -204,8 +204,16 @@ def test_login_one_profile_supports_verify_modes():
     assert src.index('if mode == "skip"') < src.index("_verify_platform_logins")
     # skip mode records TRUTHFUL per-platform cookie presence — never a
     # blanket all-True (a closed-without-signing-in Chrome must not mint
-    # green badges or a workerCount slot)
-    assert "_platform_auth_cookie_present(browser, _k2)" in src
+    # green badges or a workerCount slot). The cookie read now lives in the
+    # shared _probe_profile_logins helper the skip branch delegates to.
+    assert "_probe_profile_logins(" in src, (
+        "skip mode must delegate the truthful cookie read to _probe_profile_logins"
+    )
+    probe_src = inspect.getsource(research._probe_profile_logins)
+    assert "_platform_auth_cookie_present(browser, _k2)" in probe_src, (
+        "_probe_profile_logins must record per-platform cookie presence "
+        "(never a blanket all-True)"
+    )
     # the ask answer is PINNED across the [r] reopen-fix loop — re-asking let
     # a habitual Enter (default skip) defeat the re-verify the user chose
     assert "resolved_mode = mode" in src
