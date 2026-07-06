@@ -43616,7 +43616,7 @@ def _version_gt(a: str, b: str) -> bool:
     """True if version string `a` is strictly newer than `b`. Tolerant numeric
     component compare (1.0.10 > 1.0.9); non-numeric suffixes are ignored. Returns
     False on any parse error so a weird version never spams an upgrade nudge."""
-    def _parse(v: str) -> tuple:
+    def _parse(v: str) -> list:
         out = []
         for chunk in str(v).split("."):
             digits = ""
@@ -43626,38 +43626,42 @@ def _version_gt(a: str, b: str) -> bool:
                 else:
                     break
             out.append(int(digits) if digits else 0)
-        return tuple(out)
+        return out
     try:
-        return _parse(a) > _parse(b)
+        pa, pb = _parse(a), _parse(b)
+        n = max(len(pa), len(pb))  # zero-pad so 1.0 == 1.0.0 (no false 'newer')
+        pa += [0] * (n - len(pa))
+        pb += [0] * (n - len(pb))
+        return pa > pb
     except Exception:
         return False
 
 
-def _check_newer_version() -> "str | None":
-    """Return the latest superresearch version published on PyPI IF it is newer
-    than the installed one, else None — a pip-style "new version available" nudge.
+def _latest_on_pypi(*, force: bool = False) -> "str | None":
+    """Latest superresearch version published on PyPI (RAW — regardless of the
+    installed version), or None if it can't be determined (source checkout /
+    offline / timeout / parse error).
 
     Cheap + safe by construction: skips entirely on a source checkout; caches the
     PyPI answer to ~/.super-research/.version_check.json for 24h (so it costs at
     most ONE short network call per day, shared across all commands/workers);
-    fail-silent on offline / timeout / parse error so it can NEVER block or break
-    a command. The 2.5s timeout only ever applies once per day on a cache miss."""
+    fail-silent so it can NEVER block or break a command. The 2.5s timeout only
+    ever applies once per day on a cache miss. `force=True` bypasses the cache
+    READ for a FRESH answer (used by an explicit `--update` — an 'update now' must
+    not be decided off a stale 24h cache); it still refreshes the cache."""
     if _is_source_checkout():
-        return None
-    cur = _sr_version()
-    if not cur or cur.startswith("("):
         return None
     import json as _j
     import time as _t
     cache = _STATE_DIR / ".version_check.json"
-    try:
-        if cache.exists():
-            data = _j.loads(cache.read_text())
-            if _t.time() - float(data.get("checked_at", 0)) < 86400:
-                latest = data.get("latest") or ""
-                return latest if (latest and _version_gt(latest, cur)) else None
-    except Exception:
-        pass
+    if not force:
+        try:
+            if cache.exists():
+                data = _j.loads(cache.read_text())
+                if _t.time() - float(data.get("checked_at", 0)) < 86400:
+                    return (data.get("latest") or None)
+        except Exception:
+            pass
     latest = ""
     try:
         import urllib.request as _u
@@ -43670,6 +43674,18 @@ def _check_newer_version() -> "str | None":
         cache.write_text(_j.dumps({"checked_at": _t.time(), "latest": latest}))
     except Exception:
         pass
+    return latest or None
+
+
+def _check_newer_version() -> "str | None":
+    """Return the latest superresearch version published on PyPI IF it is newer
+    than the installed one, else None — a pip-style "new version available" nudge.
+    Thin wrapper over `_latest_on_pypi()` (24h-cached); returns None on a source
+    checkout, offline, or when already current."""
+    cur = _sr_version()
+    if not cur or cur.startswith("("):
+        return None
+    latest = _latest_on_pypi()
     return latest if (latest and _version_gt(latest, cur)) else None
 
 
@@ -43826,11 +43842,20 @@ def _self_update() -> int:
         print(f"  {_c(_WARN, '⚠')}  pipx not found — update manually:  {_c(_BOLD, 'pipx upgrade superresearch')}")
         print()
         return 1
-    _newer = _newer_version_notice()
-    if _newer:
-        print(f"  Updating  {_c(_DIM, 'v' + _sr_version())}  →  {_c(_BOLD + _OK, 'v' + _newer)}")
+    # Idempotent: only actually upgrade when PyPI has a newer version. Use a FRESH
+    # check (force) — an explicit `--update` must not be decided off the stale 24h
+    # cache. `latest` is None only when PyPI is unreachable; in that case we proceed
+    # rather than strand an intentional update (mirrors bridge.py `_update_backend`).
+    cur = _sr_version()
+    latest = _latest_on_pypi(force=True)
+    if latest and not _version_gt(latest, cur):
+        print(f"  {_c(_OK, '✓')}  Already up to date  {_c(_DIM, '(v' + cur + ')')}")
+        print()
+        return 0
+    if latest:
+        print(f"  Updating  {_c(_DIM, 'v' + cur)}  →  {_c(_BOLD + _OK, 'v' + latest)}")
     else:
-        print(f"  Updating Super Research  {_c(_DIM, '(current: v' + _sr_version() + ')')}")
+        print(f"  Updating Super Research  {_c(_DIM, '(current: v' + cur + ')')}")
     if _spawn_detached_lifecycle("upgrade"):
         print(f"  {_c(_OK, '✓')}  Update running — completes a moment after this exits.")
         print(f"  {_c(_DIM, 'Confirm with')}  {_c(_BOLD, _PROG + ' --version')}  {_c(_DIM, 'in ~20s. If On Startup was on, then')}  {_c(_BOLD, _PROG + ' --resurrect')}{_c(_DIM, '.')}")

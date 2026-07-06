@@ -175,3 +175,108 @@ class TestVersionNotice:
     def test_source_checkout_skips(self, monkeypatch):
         monkeypatch.setattr(research, "_is_source_checkout", lambda: True)
         assert research._check_newer_version() is None
+
+    def test_version_gt_zero_pads(self):
+        # 1.0 and 1.0.0 are the SAME version — neither is 'newer' (regression:
+        # unpadded compare treated 1.0.0 > 1.0, which would false-trigger --update).
+        assert research._version_gt("1.0", "1.0.0") is False
+        assert research._version_gt("1.0.0", "1.0") is False
+        assert research._version_gt("1.0.1", "1.0") is True
+        assert research._version_gt("0.1.5", "0.1.5") is False
+
+    def test_latest_on_pypi_cache_hit_returns_raw(self, tmp_path, monkeypatch):
+        # Returns the RAW latest regardless of the installed version (vs
+        # _check_newer_version which only returns it when strictly newer).
+        import json, time
+        monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
+        (tmp_path / ".version_check.json").write_text(
+            json.dumps({"checked_at": time.time(), "latest": "0.1.2"})
+        )
+        assert research._latest_on_pypi() == "0.1.2"
+
+    def test_latest_on_pypi_force_bypasses_cache(self, tmp_path, monkeypatch):
+        # A forced lookup ignores a fresh 24h cache and re-hits the network.
+        import json, time
+        import urllib.request as _u
+        monkeypatch.setattr(research, "_STATE_DIR", tmp_path)
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
+        (tmp_path / ".version_check.json").write_text(
+            json.dumps({"checked_at": time.time(), "latest": "0.1.2"})  # stale
+        )
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"info": {"version": "0.1.9"}}).encode()
+
+        monkeypatch.setattr(_u, "urlopen", lambda *a, **k: _Resp())
+        assert research._latest_on_pypi(force=True) == "0.1.9"
+        # cache was refreshed → a subsequent non-forced read sees the new value
+        assert research._latest_on_pypi() == "0.1.9"
+
+
+class TestSelfUpdateIdempotent:
+    """`superresearch --update` must reinstall ONLY when actually outdated — else
+    say 'already up to date' and NOT bounce running workers (the idempotency gate
+    that already existed on the bridge `/update` path, ported to the CLI)."""
+
+    def _wire(self, monkeypatch, *, cur, latest, spawned):
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
+        monkeypatch.setattr(research, "_pipx_cmd", lambda: ["pipx"])
+        monkeypatch.setattr(research, "_sr_version", lambda: cur)
+        monkeypatch.setattr(research, "_latest_on_pypi", lambda *, force=False: latest)
+
+        def _spawn(action):
+            spawned.append(action)
+            return True
+
+        monkeypatch.setattr(research, "_spawn_detached_lifecycle", _spawn)
+
+    def test_already_current_does_not_reinstall(self, monkeypatch, capsys):
+        spawned = []
+        self._wire(monkeypatch, cur="0.1.5", latest="0.1.5", spawned=spawned)
+        assert research._self_update() == 0
+        assert spawned == [], "must NOT spawn an upgrade when already current"
+        assert "up to date" in capsys.readouterr().out.lower()
+
+    def test_current_ahead_of_pypi_does_not_reinstall(self, monkeypatch):
+        # Local pre-release ahead of PyPI — treat as current, no reinstall.
+        spawned = []
+        self._wire(monkeypatch, cur="0.1.6", latest="0.1.5", spawned=spawned)
+        assert research._self_update() == 0
+        assert spawned == []
+
+    def test_outdated_reinstalls(self, monkeypatch):
+        spawned = []
+        self._wire(monkeypatch, cur="0.1.4", latest="0.1.5", spawned=spawned)
+        assert research._self_update() == 0
+        assert spawned == ["upgrade"], "must spawn the upgrade when outdated"
+
+    def test_offline_proceeds(self, monkeypatch):
+        # PyPI unreachable (latest None) — don't strand an intentional update.
+        spawned = []
+        self._wire(monkeypatch, cur="0.1.5", latest=None, spawned=spawned)
+        assert research._self_update() == 0
+        assert spawned == ["upgrade"]
+
+    def test_freshness_check_is_forced(self, monkeypatch):
+        # The gate MUST use a forced lookup (not the stale 24h cache).
+        seen = {}
+        monkeypatch.setattr(research, "_is_source_checkout", lambda: False)
+        monkeypatch.setattr(research, "_pipx_cmd", lambda: ["pipx"])
+        monkeypatch.setattr(research, "_sr_version", lambda: "0.1.5")
+        monkeypatch.setattr(research, "_spawn_detached_lifecycle", lambda a: True)
+
+        def _latest(*, force=False):
+            seen["force"] = force
+            return "0.1.5"
+
+        monkeypatch.setattr(research, "_latest_on_pypi", _latest)
+        research._self_update()
+        assert seen.get("force") is True
