@@ -6,7 +6,7 @@ Summarises what the PX-0 shadow layer observed, per (platform, intent):
   * how many WOULD-HEAL opportunities were seen (predicate failed → PX-2 would
     attempt a heal here),
   * probe coverage (how many DOM elements probe_region returned).
-Then checks the PX-0 Definition of Done (PhoenixRecipe §8): all 6 P2 intents
+Then checks the PX-0 Definition of Done: all 6 P2 intents
 observed, probe deployed on all 3 platforms, ≥1 heal shadowed per platform.
 
 It parses the structured JSONL the pipeline already emits

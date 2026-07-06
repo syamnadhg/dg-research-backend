@@ -4,7 +4,7 @@
 All pure functions, so this is hermetic. The corpus eval is the real bar: for
 each seed, semantic_match must re-find the intended control from durable signals
 and selector_inference must reproduce the seed's known_good_selector — the
-scaffolding for PhoenixRecipe §9's eval_resolver pass-bar.
+scaffolding for the resolver-eval (eval_resolver) pass-bar.
 """
 
 from __future__ import annotations

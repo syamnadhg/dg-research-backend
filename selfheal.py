@@ -1,8 +1,8 @@
 """Phoenix self-healing SELECTOR engine — PX-0 foundation (shadow-only).
 
-This is the selector / UI-churn half of `PhoenixRecipe.md`. The model-churn half
-(the recipe's PX-1 "generalise verOf into a policy resolver") already shipped via
-the model-freshness work in ``models.py`` (``P2_MODEL_POLICY`` etc.); this module
+This is the selector / UI-churn half of the Phoenix self-heal design. The
+model-churn half (PX-1, "generalise verOf into a policy resolver") already shipped
+via the model-freshness work in ``models.py`` (``P2_MODEL_POLICY`` etc.); this module
 owns the *selector* side — keeping each tier's knowledge of the page current and
 turning a recovery into a durable, persisted fix.
 
@@ -52,8 +52,8 @@ logger = logging.getLogger(__name__)
 # ── Vocabulary (the contract's closed sets) ──────────────────────────────────
 PLATFORMS = ("chatgpt", "gemini", "claude")
 INTENT_TYPES = ("toggle", "select")
-# Tier ordering per PhoenixRecipe §4 (DOM → Vision → CUA, plus the registry
-# fast-path and the heuristic heal). The literal order is the resolve sequence.
+# Tier ordering (DOM → Vision → CUA, plus the registry fast-path and the
+# heuristic heal). The literal order is the resolve sequence.
 KNOWN_TIERS = ("registry", "builtin", "heal", "vision", "cua")
 
 _PROBE_CAP = 40  # max elements returned per probe (bounds the page→py payload)
@@ -151,7 +151,7 @@ def _capture_log_path() -> str:
 
 
 # ── 1. Intent / outcome contracts ────────────────────────────────────────────
-# The manifest. Schema (PhoenixRecipe §4.0):
+# The manifest. Schema:
 #   { "<platform>.<intent_id>": {
 #       platform, intent_id, type ('toggle'|'select'), irreversible (bool),
 #       region (REGIONS key | spec dict), outcome_predicate (str id),
@@ -967,7 +967,7 @@ async def heal_once(
     confirmed_off: bool,
     do_act: bool,
 ) -> dict[str, Any]:
-    """One bounded Tier-1.5 heal attempt for ``intent`` (PhoenixRecipe §5). Never
+    """One bounded Tier-1.5 heal attempt for ``intent``. Never
     raises — returns a result dict.
 
     Sequence: probe → fingerprint → Tier-0 registry hit (validity-gated: the
@@ -1054,7 +1054,7 @@ async def heal_once(
 def shadow_log(rec: dict[str, Any]) -> None:
     """Append one shadow-eval record to ``logs/selfheal_shadow.jsonl``.
 
-    Schema (PhoenixRecipe §10): ``{ts, platform, intent, tier, outcome_pass,
+    Schema: ``{ts, platform, intent, tier, outcome_pass,
     selector_or_box, confidence, resolved_by}`` — the caller supplies the fields,
     ``ts`` is stamped here. NO-OP unless ``DG_SELFHEAL_ENABLED``. Lockless and
     crash-safe (one JSON object per line). Never raises — telemetry must never

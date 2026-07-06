@@ -1,7 +1,7 @@
 # Phoenix self-heal — golden DOM corpus (PX-0 scaffolding)
 
-This directory is the **seed** of the resolver-eval corpus described in
-`PhoenixRecipe.md` §9. Each file is one captured (platform, ui_fingerprint,
+This directory is the **seed** of the resolver-eval corpus (PX-0 scaffolding).
+Each file is one captured (platform, ui_fingerprint,
 intent) example that the PX-2 `semantic_match` resolver is evaluated against
 (`tests/test_selfheal_resolver.py`, added at PX-2) — for each seed,
 `semantic_match` must re-find the intended control and `selector_inference`

@@ -77,7 +77,7 @@ GEMINI_NARRATE_FALLBACK = os.environ.get("GEMINI_NARRATE_FALLBACK_MODEL", "gemin
 
 
 # ── Phoenix (model_refresh) — P2 deep-research model POLICY ──────────────
-# NB: "Phoenix" here is the model-FRESHNESS slice of PhoenixRecipe.md §6 — a
+# NB: "Phoenix" here is the model-FRESHNESS concept — a
 # DISTINCT concept from research.py's unrelated daemon restart/resume/
 # checkpoint "Phoenix". All symbols are namespaced `model_refresh` / `p2_*`
 # to avoid grep-confusion with that subsystem.
