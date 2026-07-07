@@ -307,7 +307,9 @@ def test_round_robin_sweep_raises_on_login_interrupt():
 
 def test_run_pipeline_emits_login_interrupt_card():
     # inspect.getsource on run_pipeline is huge — pin via the module source.
-    assert "Interrupted by the Research computer's login command" in _SRC
+    # #911 rewrote the card copy short ("Paused by the login command") with a
+    # Stop-button note + durable force_mirror — see test_login_batch_909_912.
+    assert "Paused by the login command" in _SRC
     assert "resume_from_checkpoint" in _SRC
 
 

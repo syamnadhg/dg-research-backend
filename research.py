@@ -12308,10 +12308,17 @@ def emit_event(event_type, phase=None, agent=None, **data):
     # Retracted by the SAME central clear above on pipeline_resumed/stopped +
     # the run-startup wipe. `suppress_generic_mirror` lets a richer kind-specific
     # persist (pro_required) own the mirror without this generic one clobbering it.
+    # `force_mirror` (#911) is the inverse override: a QUIET card (no red tile)
+    # that must still persist durably + reach the agent-chat watchdog — the
+    # login-interrupt card is quiet by design (nothing errored) yet is exactly
+    # the kind of "run is waiting on you" state the durable mirror exists for
+    # (pre-fix it vanished on cold open and the agent chat posted nothing).
     try:
         _suppress_generic_mirror = bool(data.pop("suppress_generic_mirror", False))
+        _force_mirror = bool(data.pop("force_mirror", False))
         if (event_type == "pipeline_error" and data.get("actions")
-                and not data.get("quiet") and not _suppress_generic_mirror):
+                and (not data.get("quiet") or _force_mirror)
+                and not _suppress_generic_mirror):
             _persist_pending_decision({
                 "kind": "pipeline_error",
                 "phase": phase if isinstance(phase, int) else 0,
@@ -21279,6 +21286,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # #906: Skip means skip — close the platform's tab (guards
                 # inside: main/last tab is left open, just unregistered).
                 await _close_skipped_agent_tab(browser, p.get("page"), _ag_key, _agent_name)
+            elif _agent_name:
+                # #912: the agent already left `pending` (an earlier fail/
+                # empty/timeout path dropped it with its tab still open,
+                # awaiting this very decision) — Skip must still clean up the
+                # browser side, not just the marker. Prefer the dispatcher
+                # registry (hard retry re-registers its fresh tab there); fall
+                # back to the original setup handle. _close_skipped_agent_tab's
+                # guards (None / already closed / main / last tab) make a stale
+                # handle safe.
+                _left_page = (_runtime.active_pages.get(_ag_key)
+                              or (agents.get(_agent_name) or {}).get("page"))
+                if _left_page is not None:
+                    log(f"[{_agent_name}] Skipped by user after leaving the poll "
+                        "set — closing its leftover tab", "INFO")
+                    await _close_skipped_agent_tab(browser, _left_page, _ag_key, _agent_name)
             # Whether or not the agent was actually in pending, clear it from
             # the skip set so we don't keep firing agent_skipped every tick.
             _controls.skipped_agents.discard(_ag_key)
@@ -31231,6 +31253,34 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             if _controls.is_stop():
                 break
 
+        # ── #910: dead-browser check per cycle ──
+        # Every per-step failure below is deliberately swallowed (reload,
+        # screenshot retry, DOM read, CUA) — so a dead browser previously
+        # looped "Audio still generating…" FOREVER (live 2026-07-06:
+        # --login killed Chrome mid-audio at 22:19; 8 stale cycles of
+        # "Screenshot failed → still generating" until a manual Stop at
+        # 22:30, and the run never got the login-interrupt card). Detect
+        # the dead browser explicitly and unwind so run_pipeline's failure
+        # path classifies it: login interrupt → pause-at-checkpoint +
+        # honest card; real crash → silent auto-retry from checkpoint.
+        _poll_pg = getattr(browser, "page", None)
+        try:
+            _browser_dead = _poll_pg is None or _poll_pg.is_closed()
+        except Exception:
+            _browser_dead = True
+        if _browser_dead:
+            if _login_interrupt_active():
+                _runtime.last_failure_kind = "login_interrupt"
+                log("[Phase3] Browser closed by the login command mid-audio-poll "
+                    "— pausing the run at its checkpoint", "WARN")
+                raise RuntimeError(
+                    "research browser closed by the login command (login interrupt)")
+            _runtime.last_failure_kind = "browser_crash"
+            log("[Phase3] Browser closed mid-audio-poll — unwinding for "
+                "checkpoint recovery", "WARN")
+            raise RuntimeError(
+                "research browser closed mid-audio-poll (browser crash)")
+
         # Refresh page every cycle (NotebookLM doesn't always auto-update)
         try:
             await browser.page.reload(wait_until="domcontentloaded", timeout=15000)
@@ -33397,6 +33447,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         }
         d.update(new_fields)
         d_path.write_text(json.dumps(d, indent=2), encoding="utf-8")
+
+    # #910: a resumed run is ongoing again. Clear a stale local "paused"
+    # (login-interrupt / in-process pause) so _plan_pipeline_auto_retry's
+    # Gate 2 doesn't read the OLD pause and refuse silent self-heal for the
+    # whole resumed run, and so --login's run enumeration stays honest.
+    # Narrow on purpose: only paused→ongoing — never touches completed/stopped.
+    if resume_dir:
+        try:
+            _d_path = queue_dir / "delivery.json"
+            if (_d_path.exists()
+                    and json.loads(_d_path.read_text(encoding="utf-8")).get("status") == "paused"):
+                update_delivery(status="ongoing")
+                log("Resume: delivery.json status paused → ongoing (stale pause cleared)")
+        except Exception:
+            pass
 
     # Stop/pause are driven through `_controls` (asyncio events) now. The
     # .stop and .pause sentinel files are still written by the HTTP endpoints
@@ -36108,15 +36173,29 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Browser closed by the login command at phase {last_phase} — "
                 "pausing at checkpoint (no auto-retry)", "WARN")
             emit_event("pipeline_paused", phase=last_phase, reason="login_interrupt")
+            # #910: durable local pause marker. --login's run enumeration skips
+            # paused runs (a re-run right after the first must not re-list a
+            # run that's already parked), and _plan_pipeline_auto_retry's
+            # Gate 2 keeps standing down even past the marker's 30-min
+            # staleness cap. The resume path re-asserts "ongoing" on entry.
+            try:
+                update_delivery(status="paused")
+            except Exception:
+                pass
+            # #911: short card. force_mirror overrides the quiet no-mirror rule
+            # so the card survives a cold chat-open AND the agent-chat watchdog
+            # posts it (both silently missing pre-fix). Distinct alert_id keeps
+            # it clear of the generic phase{N}_error dedup ledger.
             fail_phase(
                 phase=last_phase,
-                error="Interrupted by the Research computer's login command",
-                reason="The login command closed the research browser mid-run. "
-                       "When the login finishes, tap Retry to resume from the "
-                       "last checkpoint — or stop the run with the chat's Stop "
-                       "button.",
+                error="Paused by the login command",
+                reason="Login closed the research browser. Tap Retry after "
+                       "login — the run resumes from its checkpoint.\n"
+                       "Note: the Stop button ends the run instead.",
                 agent=None,
                 mark_phase_errored=False,
+                force_mirror=True,
+                alert_id=f"phase{last_phase}_login_interrupt",
                 actions=[
                     {"id": "retry", "label": "Retry", "style": "primary",
                      "command": {"action": "resume_from_checkpoint"}},
@@ -39800,20 +39879,98 @@ def _count_chrome_for_profile(profile_dir: str) -> int:
     return n
 
 
-async def _close_profile_browser_neatly(profile_dir: str) -> None:
-    """#907: graceful close of a profile's Chrome with a bounded wait so the
-    caller can honestly report 'Browser closed' — WM_CLOSE/SIGTERM first
-    (Chrome flushes cookies + session), up to ~8s for a clean exit, then a
-    hard sweep of any remnant. Silent (no per-PID chatter) by design."""
-    signaled = _kill_chrome_for_profile(profile_dir, graceful=True)
-    if signaled <= 0:
-        return
-    for _ in range(16):  # ≤8s for a clean flush + exit
-        await asyncio.sleep(0.5)
-        if _count_chrome_for_profile(profile_dir) == 0:
-            return
-    _kill_chrome_for_profile(profile_dir)  # hard-kill remnants
-    await asyncio.sleep(1.0)
+def _chrome_procs_for_profile(profile_dir: str) -> list:
+    """#909: ONE process-table scan returning the live psutil.Process objects
+    whose cmdline references this profile dir. The old close path re-ran a
+    full cmdline scan per signal AND per 0.5s wait tick (up to ~18 scans per
+    run close — tens of seconds on a busy machine); callers now scan once and
+    wait on the returned handles via psutil.wait_procs."""
+    try:
+        import psutil
+    except Exception:
+        return []
+    raw = str(profile_dir).lower().replace("\\", "/")
+    try:
+        resolved = str(Path(profile_dir).resolve()).lower().replace("\\", "/")
+    except Exception:
+        resolved = raw
+    targets = {t for t in (raw, resolved) if t}
+    procs = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if not (proc.info["name"] and "chrom" in proc.info["name"].lower()):
+                continue
+            cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
+            if any(_profile_matches_cmdline(t, cmdline) for t in targets):
+                procs.append(proc)
+        except Exception:
+            pass
+    return procs
+
+
+async def _close_profile_browser_neatly(profile_dir: str) -> dict:
+    """#907/#909: graceful close of a profile's Chrome with a bounded wait so
+    the caller can honestly report 'Browser closed' — WM_CLOSE/SIGTERM first
+    (Chrome flushes cookies + session to the profile; run RESULTS are not
+    saved here on purpose — they already ride the run's checkpoints), up to
+    ~8s for a clean exit, then a hard sweep of any remnant. Silent (no
+    per-PID chatter) by design; returns {procs, elapsed_sec, hard_killed} so
+    the --login ✓ line can carry the honest numbers.
+
+    #909 rewrite: ONE scan (_chrome_procs_for_profile) + ONE batched taskkill
+    (multi-/PID is a single spawn; the old shape spawned taskkill once per
+    Chrome child, 10-30 sequential ~100-300ms spawns) + psutil.wait_procs on
+    the collected handles instead of a full process-table rescan every 0.5s.
+    All blocking psutil/subprocess work runs via to_thread so the caller's
+    terminal spinner keeps animating."""
+    _t0 = time.time()
+    stats = {"procs": 0, "elapsed_sec": 0.0, "hard_killed": 0}
+    try:
+        import psutil
+    except Exception:
+        return stats
+    procs = await asyncio.to_thread(_chrome_procs_for_profile, profile_dir)
+    stats["procs"] = len(procs)
+    if not procs:
+        return stats
+
+    def _graceful_signal_all():
+        if sys.platform == "win32":
+            # One spawn for the whole set: taskkill accepts repeated /PID.
+            # No /F — WM_CLOSE lets Chrome flush; per-PID "could not be
+            # terminated" noise for mid-tree children is expected and the
+            # wait+hard sweep below covers whatever graceful missed.
+            args = ["taskkill"]
+            for p in procs:
+                args += ["/PID", str(p.pid)]
+            args.append("/T")
+            try:
+                subprocess.run(args, capture_output=True, timeout=15,
+                               creationflags=_PS_NO_WINDOW)
+            except Exception:
+                pass
+        else:
+            for p in procs:
+                try:
+                    p.terminate()  # SIGTERM — Chrome flushes, then exits
+                except Exception:
+                    pass
+
+    await asyncio.to_thread(_graceful_signal_all)
+    try:
+        _gone, _alive = await asyncio.to_thread(psutil.wait_procs, procs, 8)
+    except Exception:
+        _alive = [p for p in procs if p.is_running()]
+    if _alive:
+        stats["hard_killed"] = len(_alive)
+        for p in _alive:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)  # let the profile lock release
+    stats["elapsed_sec"] = round(time.time() - _t0, 1)
+    return stats
 
 
 # ── #907: --login ↔ serve coordination marker ────────────────────────────────
@@ -39894,6 +40051,19 @@ def _enumerate_ongoing_runs() -> "list[dict]":
                 qdir = lock_dir / run_id
                 if (qdir / ".stop").exists():
                     continue  # already terminally stopped — nothing to close
+                # #910: skip runs that are already parked or over. A prior
+                # --login (or an in-process pause) leaves delivery.json at
+                # "paused" — the run's browser is gone and its card is up,
+                # so a --login re-run must not re-list it as "ongoing"
+                # (live 2026-07-06: a re-run showed 1 phantom ongoing run).
+                try:
+                    _dstat = json.loads(
+                        (qdir / "delivery.json").read_text(encoding="utf-8")
+                    ).get("status", "")
+                except Exception:
+                    _dstat = ""
+                if _dstat in ("completed", "stopped", "paused"):
+                    continue
                 title = run_id
                 try:
                     meta = json.loads((qdir / "meta.json").read_text(encoding="utf-8"))
@@ -40480,7 +40650,11 @@ async def run_login() -> None:
 
     # Guard: --login frees + reopens each profile, which closes the browser a
     # running backend is using. Warn before disrupting an active research.
-    if _backend_is_running():
+    # #909: the full-system process scan takes seconds on a busy machine —
+    # run it off-thread under a spinner instead of a silent hang.
+    async with _async_spinner_ctx("Checking for a running backend"):
+        _backend_up = await asyncio.to_thread(_backend_is_running)
+    if _backend_up:
         print()
         print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'A Super Research backend is running.')}")
         print(f"  {_c(_DIM, '     --login pauses any ongoing research at a checkpoint and closes its browser.')}")
@@ -40506,16 +40680,24 @@ async def run_login() -> None:
         import atexit as _atexit
         _atexit.register(_clear_login_marker)
         # Neatly close ongoing runs first — one line per run instead of the
-        # old per-PID orphan-sweep flood from Browser.start().
+        # old per-PID orphan-sweep flood from Browser.start(). #909: live
+        # spinner while each close runs (the old shape was silent for its
+        # whole 10-30s), and the ✓ line carries the honest numbers.
         _ongoing_runs = _enumerate_ongoing_runs()
         if _ongoing_runs:
             print()
             print(f"  {_c(_BOLD, f'Found {len(_ongoing_runs)} ongoing run(s)')}"
                   f"{_c(_DIM, ' — closing each at a checkpoint (resume from the app after login).')}")
             for _ri, _run in enumerate(_ongoing_runs, 1):
-                await _close_profile_browser_neatly(str(_profile_dir(_run["worker"])))
-                print(f"  {_c(_OK, '✓')}  Closing Run {_ri} — {_run['title']} → Browser closed")
-            await asyncio.sleep(2)
+                _title = str(_run["title"])
+                if len(_title) > 48:
+                    _title = _title[:47] + "…"
+                async with _async_spinner_ctx(f"Closing Run {_ri} — {_title}"):
+                    _cs = await _close_profile_browser_neatly(str(_profile_dir(_run["worker"])))
+                _closed_note = (f"Browser closed ({_cs['elapsed_sec']}s)"
+                                if _cs.get("procs") else "Browser already closed")
+                print(f"  {_c(_OK, '✓')}  Closing Run {_ri} — {_title} → {_closed_note}")
+            await asyncio.sleep(1)
 
     # CUA vision verifier (optional — verify degrades to a URL-only check without it).
     cua_client = None
