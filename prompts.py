@@ -1058,15 +1058,19 @@ mode (P2) OR Pro + Extended Thinking mode (P1). The target looks slightly
 different in each, but the click behavior and goal are identical.
 
 GOAL: Click the collapsed activity affordance attached to the most recent
-ChatGPT response so the side panel opens, revealing the full step list and
-source URLs.
+ChatGPT response so its research activity opens. Depending on mode, the
+click opens EITHER a side panel sliding out on the right (Deep Research)
+OR an inline thoughts/activity section that expands directly below the
+clicked line (Pro/Extended Thinking). BOTH outcomes are success.
 
 WHERE IT IS:
-- Attached to the TRAILING EDGE of the latest ChatGPT assistant message —
-  i.e., immediately AFTER the last paragraph the model has streamed so far,
-  flush-left with that message's content.
-- It is INLINE with the conversation flow, not a separate bottom bar. As
-  the response keeps streaming, this affordance moves down with it.
+- Early in a response (thinking phase, 2026-07 UI): DIRECTLY BELOW the
+  last SENT (user) message — the first row of the assistant turn, before
+  any response text exists (e.g. a bare shimmering "Pro thinking").
+- Once text streams: attached to the TRAILING EDGE of the latest ChatGPT
+  assistant message — immediately AFTER the last paragraph streamed so
+  far, flush-left with that message's content, moving down as it streams.
+- It is INLINE with the conversation flow, not a separate bottom bar.
 - It is NOT pinned to the bottom of the screen. It is NOT inside the
   composer. It is NOT the model selector at the top.
 
@@ -1119,20 +1123,29 @@ STRUCTURAL HINT (use this when verb wording is unfamiliar):
 
 VERIFY STATE FIRST (do this BEFORE any click):
 - If a wide side panel is ALREADY visible on the RIGHT showing a numbered
-  step list with URL bullets — the panel is already open. Output exactly:
+  step list with URL bullets — it is already open. Output exactly:
   "panel: already_open". DO NOT CLICK.
+- If an inline thoughts/activity section is ALREADY expanded below the
+  status line (rows of activity text / site names / reasoning visible
+  between the status line and the response) — it is already open. Output
+  exactly: "panel: already_open". DO NOT CLICK.
 - If you cannot find ANY shimmering inline label OR count-badge strip
   attached to the latest response — output exactly: "panel: not_found".
   DO NOT CLICK.
 
-ACTION (only if target is found AND panel is closed):
+ACTION (only if target is found AND nothing is open yet):
 - Click the shimmering label / strip ONCE, on its visible text. Single
-  click only.
-- Wait ~1.5 seconds for the side panel to slide out from the right.
-- Verify: a panel now occupies the right ~30–40% of the screen showing
-  numbered/bulleted steps and URL rows.
-- If panel opened: output "panel: open".
-- If you clicked but no panel appeared: output "panel: click_failed".
+  click only. IT IS A TOGGLE — a second click would close what the first
+  opened, so never click twice.
+- Wait ~1.5 seconds, then check for EITHER outcome:
+  a) a side panel now occupies the right ~30–40% of the screen showing
+     numbered/bulleted steps and URL rows, OR
+  b) an inline section expanded directly below the clicked line — even a
+     small expansion with sparse text counts (early in a run the drawer
+     can be nearly empty; a chevron rotating or new rows appearing under
+     the line IS the open state).
+- If either appeared: output "panel: open".
+- If you clicked and truly nothing changed: output "panel: click_failed".
 
 HARD CONSTRAINTS:
 - DO NOT click the composer / "Follow up" text input.

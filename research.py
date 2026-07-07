@@ -15024,6 +15024,43 @@ async def scrape_progress_chatgpt(page):
         except Exception as _hpe:
             log(f"ChatGPT host-panel scrape skipped: {_hpe}", "DEBUG")
 
+        # ---- #913: inline thoughts/activity sweep (2026-07 UI) ----
+        # P1 Pro/ET renders the live status line ("Pro thinking" →
+        # "Searching the web…") + the expandable thoughts drawer INLINE in
+        # the last assistant turn — no side panel at all. Sweep it EVERY
+        # cycle: the status line + hostname chips + "N searches/citations"
+        # counts are scrapeable even while the drawer is collapsed, so P1
+        # narration stays rich from the first poll tick instead of showing
+        # "0 sources, 0 chars" until a panel-open succeeds.
+        try:
+            il = await page.evaluate(_CHATGPT_INLINE_ACTIVITY_JS)
+            if il:
+                if il.get("status_line") and not result.get("progress"):
+                    result["progress"] = il["status_line"]
+                if il.get("steps") and len(il["steps"]) > len(result.get("steps") or []):
+                    result["steps"] = il["steps"]
+                if il.get("source_urls"):
+                    seen_il = set(result.get("source_urls") or [])
+                    unioned_il = list(result.get("source_urls") or [])
+                    for u in il["source_urls"]:
+                        if u not in seen_il:
+                            seen_il.add(u)
+                            unioned_il.append(u)
+                    if len(unioned_il) > result.get("sources", 0):
+                        result["source_urls"] = unioned_il[:50]
+                        result["sources"] = len(result["source_urls"])
+                if int(il.get("searches", 0) or 0) > int(result.get("searches", 0) or 0):
+                    result["searches"] = int(il.get("searches", 0) or 0)
+                if int(il.get("partial_text_len", 0) or 0) > int(result.get("partial_text_len", 0) or 0):
+                    result["partial_text_len"] = int(il.get("partial_text_len", 0) or 0)
+                if il.get("expanded"):
+                    result["panel_open"] = True
+                if (il.get("sections")
+                        and len(il["sections"]) > len(result.get("sections") or [])):
+                    result["sections"] = il["sections"]
+        except Exception as _ile:
+            log(f"ChatGPT inline activity sweep skipped: {_ile}", "DEBUG")
+
         # ---- Iframe scrape (Deep Research content lives here as of 2026)
         try:
             for frame in page.frames:
@@ -15351,10 +15388,254 @@ async def scrape_progress_chatgpt(page):
         return {"status": "scrape_error", "progress": "Selector mismatch — ChatGPT UI may have changed", "sources": 0, "partial_text_len": 0}
 
 
-async def _open_chatgpt_activity_panel(page):
-    """Click the collapsed activity strip (e.g. 'Looking into Hermes... 196 searches')
-    in ChatGPT Deep Research so the side panel with full step list + source URLs
-    slides out.
+# ── #913 (2026-07-07): ChatGPT 2026-07 UI redesign — shape-agnostic activity ──
+# The activity/thinking affordance is the SHIMMERING STATUS LINE rendered
+# directly below the last sent (user) message. What a click opens depends on
+# mode: P2 Deep Research still slides a right-hand side panel ("Deep research
+# execution plan" — CUA confirmed live 2026-07-06 21:59), but P1 Pro/Extended
+# Thinking expands an INLINE thoughts/activity drawer under the line. Four
+# live runs (2026-07-06) had DOM + CUA clicks judged "failed" because every
+# verifier only accepted a ≥280×200 right-side panel — so the poll re-clicked
+# the line every ~30s, TOGGLING the drawer open/closed. Additionally the DR
+# card now renders in an iframe whose URL no longer matches the old
+# "deep_research|oaiusercontent" filter (walked_hits=0 across ALL P2 cycles
+# while CUA could see the strip) — frame loops must enumerate every frame.
+_CHATGPT_INLINE_ACTIVITY_JS = """() => {
+    // Scope: the LAST assistant turn. The status row + drawer render inside
+    // the <article> turn wrapper but OUTSIDE [data-message-author-role], so
+    // prefer the article; fall back to the role node's parent.
+    const main = document.querySelector('main') || document.body;
+    const arts = main.querySelectorAll('article');
+    let turn = arts.length ? arts[arts.length - 1] : null;
+    if (!turn) {
+        const asst = main.querySelectorAll('[data-message-author-role="assistant"]');
+        turn = asst.length ? (asst[asst.length - 1].parentElement
+                              || asst[asst.length - 1]) : null;
+    }
+    if (!turn) return null;
+    const out = { steps: [], source_urls: [], sections: [], searches: 0,
+                  partial_text_len: 0, progress: '', status_line: '',
+                  expanded: false };
+    const turnText = (turn.innerText || '').trim();
+    out.partial_text_len = turnText.length;
+    // Drawer/expansion state: any aria-expanded=true inside the turn, or a
+    // mounted thoughts/activity region with real height.
+    if (turn.querySelector('[aria-expanded="true"]')) out.expanded = true;
+    if (!out.expanded) {
+        for (const el of turn.querySelectorAll(
+                '[class*="thought" i], [class*="activity" i], [data-testid*="thought" i]')) {
+            const r = el.getBoundingClientRect();
+            if (r.height >= 60 && r.width >= 120) { out.expanded = true; break; }
+        }
+    }
+    // Live status line — anchored on structure/wording, closest below the
+    // last user message. Same anchor family as the opener walker.
+    const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?|citations?)\\b/i;
+    const STATUS_LINE = /^(?:[\\w.+-]{1,12}\\s+)?(?:thinking|reasoning|researching)\\b/i;
+    const VERB = /^(?:checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing|confirming|synthesi[zs]ing|thought)\\b/i;
+    const ELLIPSIS = /(?:\\.{3}|\\u2026)\\s*$/;
+    const HOSTCHIP = /^[a-z0-9][a-z0-9.-]{2,60}\\.[a-z]{2,10}$/i;
+    let statusTop = Infinity;
+    const seenStep = new Set();
+    let nodes;
+    try { nodes = turn.querySelectorAll('*'); } catch (e) { nodes = []; }
+    if (nodes.length > 8000) nodes = [];
+    for (const el of nodes) {
+        if (el.children.length > 3) continue;
+        const t = (el.innerText || '').trim();
+        if (!t || t.length < 4 || t.length > 300) continue;
+        if ((t.match(/\\n/g) || []).length > 3) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const isStatus = (STATUS_LINE.test(t) && t.length <= 60)
+                      || (ELLIPSIS.test(t) && t.length >= 8 && t.length <= 240)
+                      || (COUNT.test(t) && t.length <= 160);
+        if (isStatus && r.top < statusTop) {
+            statusTop = r.top;
+            out.status_line = t.slice(0, 200);
+        }
+        // Activity rows: verb-prefixed leaves + hostname chips. Exclude the
+        // response prose (.markdown) unless verb-gated — the drawer rows
+        // render OUTSIDE the markdown body.
+        const inProse = !!(el.closest && el.closest('.markdown'));
+        const isChip = HOSTCHIP.test(t);
+        if ((VERB.test(t) && t.length >= 8) || (isChip && !inProse)) {
+            if (inProse && !VERB.test(t)) continue;
+            const k = t.slice(0, 80);
+            if (!seenStep.has(k)) {
+                seenStep.add(k);
+                out.steps.push(t.slice(0, 220));
+            }
+        }
+    }
+    out.steps = out.steps.slice(-15);
+    // Source links inside the turn — unwrap the chatgpt.com redirector.
+    const seenUrl = new Set();
+    turn.querySelectorAll('a[href^="http"]').forEach(a => {
+        let h = a.href || '';
+        if (!h || h.length >= 500) return;
+        try {
+            if (h.includes('chatgpt.com/') && h.includes('url=')) {
+                const u = new URL(h);
+                const real = u.searchParams.get('url');
+                if (real && real.startsWith('http')) h = decodeURIComponent(real);
+            }
+        } catch (e) {}
+        if (h.includes('chatgpt.com') || h.includes('openai.com') ||
+            h.includes('oaiusercontent') || h.includes('chat.openai')) return;
+        if (seenUrl.has(h)) return;
+        seenUrl.add(h);
+        out.source_urls.push(h);
+    });
+    out.source_urls = out.source_urls.slice(0, 50);
+    // Aggregate counts — max wins so transient lower reads don't shrink.
+    try {
+        const re = /(\\d+)\\s+(?:websites?|sources?|searches?|sites?|results?|citations?)\\b/gi;
+        let mm; let best = 0;
+        while ((mm = re.exec(turnText)) !== null) {
+            const n = parseInt(mm[1], 10) || 0;
+            if (n > best) best = n;
+        }
+        out.searches = best;
+    } catch (e) {}
+    turn.querySelectorAll('h1, h2, h3').forEach(h => {
+        const t = (h.innerText || '').trim();
+        if (t && t.length > 1 && t.length < 120) out.sections.push(t);
+    });
+    out.sections = out.sections.slice(0, 20);
+    const lastVerb = out.steps.length ? out.steps[out.steps.length - 1] : '';
+    out.progress = out.status_line || lastVerb;
+    return out;
+}"""
+
+# Right-hand side panel presence (bool) — the pre-#913 verify heuristic,
+# kept as the "side" shape detector and now ALSO evaluated in every frame
+# (the DR iframe's URL no longer matches any fixed substring).
+_CHATGPT_SIDE_PANEL_JS = """() => {
+    const sels = [
+        'aside', '[role="complementary"]', '[role="region"]',
+        '[aria-label*="source" i]', '[aria-label*="activity" i]',
+        '[aria-label*="research" i]',
+        '[class*="panel" i][class*="side" i]',
+        '[class*="research" i][class*="panel" i]'
+    ];
+    for (const sel of sels) {
+        try {
+            for (const el of document.querySelectorAll(sel)) {
+                const r = el.getBoundingClientRect();
+                if (r.width < 280 || r.height < 200) continue;
+                if (r.right < window.innerWidth * 0.55) continue;
+                const inner = (el.innerText || '').trim();
+                if (inner.length < 50) continue;
+                if (el.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')) continue;
+                return true;
+            }
+        } catch (e) {}
+    }
+    return false;
+}"""
+
+
+async def _chatgpt_activity_state(page):
+    """#913: shape-agnostic ChatGPT activity state — what is open RIGHT NOW.
+
+    Returns {side_panel, inline_expanded, thread_len}. `side_panel` is the
+    P2 DR right-hand panel (checked on the host page AND in every frame —
+    the DR iframe's URL is no longer matchable). `inline_expanded` is the
+    P1 Pro/ET thoughts drawer inside the last assistant turn. Callers use
+    this BEFORE clicking (never click when a shape is already open — the
+    status line is a TOGGLE, and blind re-clicks close it) and AFTER
+    clicking (either shape counts as verified open)."""
+    out = {"side_panel": False, "inline_expanded": False, "thread_len": 0}
+    try:
+        if await page.evaluate(_CHATGPT_SIDE_PANEL_JS):
+            out["side_panel"] = True
+    except Exception:
+        pass
+    try:
+        il = await page.evaluate(_CHATGPT_INLINE_ACTIVITY_JS)
+        if isinstance(il, dict):
+            out["inline_expanded"] = bool(il.get("expanded"))
+            out["thread_len"] = int(il.get("partial_text_len", 0) or 0)
+    except Exception:
+        pass
+    if not out["side_panel"]:
+        try:
+            for frame in [f for f in page.frames if f != page.main_frame][:20]:
+                try:
+                    if await frame.evaluate(_CHATGPT_SIDE_PANEL_JS):
+                        out["side_panel"] = True
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return out
+
+
+async def _log_chatgpt_thread_snapshot(page, tag=""):
+    """#913 (instrument-with-logs directive): one compact structural line of
+    the thread region below the last user message + the frame inventory, so
+    a persistent panel-open miss can be root-caused from backend.log alone —
+    no live DOM session needed (probing the worker profile out-of-band risks
+    the bot score)."""
+    JS = """() => {
+        let lub = -1;
+        document.querySelectorAll('[data-message-author-role="user"]').forEach(u => {
+            const r = u.getBoundingClientRect();
+            if (r.bottom > lub) lub = r.bottom;
+        });
+        const rows = [];
+        for (const el of document.querySelectorAll('main *')) {
+            if (rows.length >= 18) break;
+            if (el.children.length > 2) continue;
+            const t = (el.innerText || '').trim();
+            if (!t || t.length < 3 || t.length > 120) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            if (lub > 0 && (r.top < lub - 8 || r.top > lub + 700)) continue;
+            let anim = false;
+            try {
+                const cs = getComputedStyle(el);
+                anim = (cs.animationName && cs.animationName !== 'none')
+                    || cs.webkitBackgroundClip === 'text' || cs.backgroundClip === 'text';
+            } catch (e) {}
+            const btn = el.closest ? !!el.closest('button, [role="button"], [tabindex]') : false;
+            rows.push({ t: t.slice(0, 60), tag: el.tagName,
+                        ti: (el.getAttribute && el.getAttribute('data-testid')) || '',
+                        ax: (el.getAttribute && el.getAttribute('aria-expanded')) || '',
+                        y: Math.round(r.top), btn, anim });
+        }
+        return { lub: Math.round(lub), rows };
+    }"""
+    try:
+        snap = await page.evaluate(JS)
+    except Exception as _se:
+        log(f"[ChatGPT] thread snapshot failed ({tag}): {_se}", "DEBUG")
+        return
+    try:
+        frames = [(f.url or "")[:80] for f in page.frames][:10]
+    except Exception:
+        frames = []
+    try:
+        line = json.dumps({"snap": snap, "frames": frames}, ensure_ascii=True)
+    except Exception:
+        line = str(snap)[:1800]
+    log(f"[ChatGPT] panel-miss snapshot ({tag}): {line[:1800]}", "DEBUG")
+
+
+async def _open_chatgpt_activity_panel(page, skip_structural=False):
+    """Click the activity affordance for the latest ChatGPT response.
+
+    #913: what the click opens is MODE-DEPENDENT — P2 Deep Research slides
+    out the right-hand side panel; P1 Pro/Extended-Thinking expands an
+    INLINE thoughts drawer below the status line. This function only finds
+    + clicks; callers verify with `_chatgpt_activity_state` (either shape
+    counts) and must NEVER call this while a shape is already open — the
+    line is a toggle. PASS 0 anchors structurally on the shimmering status
+    line directly below the last sent (user) message; the wording anchors
+    (PASS 1/2) remain for the DR count-badge strip (e.g. 'Looking into
+    Hermes... 196 searches'), which lives inside the DR card's iframe.
 
     Robust selector (2026-04-26 v2): walks ALL elements (not just buttons —
     ChatGPT renders the strip as a styled <div> with imperatively-bound click
@@ -15366,9 +15647,14 @@ async def _open_chatgpt_activity_panel(page):
 
     Returns dict with `found`, `candidates` (count of text-matched nodes),
     `clicked`, `alreadyExpanded`, `label`, `clickedTag`. Caller uses
-    `_verify_chatgpt_panel_open(page)` 2s post-click to confirm side panel
-    actually rendered (mitigates silent click failures)."""
-    JS = """() => {
+    `_chatgpt_activity_state(page)` 2s post-click to confirm a shape
+    actually mounted (mitigates silent click failures).
+
+    `skip_structural=True` (#913): callers pass this after 2 failed
+    attempts — if PASS 0 keeps picking a host-page element whose click
+    never verifies, it would otherwise starve the legacy passes AND the
+    frame walk (host found:true short-circuits both) forever."""
+    JS = """(skipStructural) => {
         // searches | sources | results | citations — covers all observed
         // badge wordings ("citations" added 2026-07-06 #905: the completed
         // strip reads "Research completed in 8m · 17 citations · 96 searches").
@@ -15504,6 +15790,83 @@ async def _open_chatgpt_activity_panel(page):
                      bbox: clickedBox };
         }
 
+        // #913 PASS 0 — STRUCTURAL anchor (user directive 2026-07-07): the
+        // shimmering status line sits DIRECTLY BELOW the last sent (user)
+        // message as the first short row of the assistant turn. Its wording
+        // mutates with the platform's progress ("Pro thinking" →
+        // "Searching the web" → "Research completed in 9m · …"), so rank by
+        // position + interactivity + shimmer animation instead of text.
+        // Never clicks bare prose: a candidate must have button/tabindex
+        // ancestry OR an animated/gradient-clipped style. Composer, header
+        // and toolbar subtrees are excluded. The wording anchors below stay
+        // as PASS 1/2 fallbacks (they also serve the DR count-badge strip,
+        // which sits at the BOTTOM of the DR card inside its iframe).
+        let lub = -1;
+        try {
+            document.querySelectorAll('[data-message-author-role="user"]').forEach(u => {
+                const r = u.getBoundingClientRect();
+                if (r.bottom > lub) lub = r.bottom;
+            });
+        } catch (e) {}
+        if (!skipStructural && lub > 0) {
+            const structural = [];
+            const mainEl = document.querySelector('main') || document.body;
+            let mnodes;
+            try { mnodes = mainEl.querySelectorAll('*'); } catch (e) { mnodes = []; }
+            if (mnodes.length > 8000) mnodes = [];
+            for (const el of mnodes) {
+                if (el.children.length > 2) continue;
+                const t = (el.innerText || el.textContent || '').trim();
+                if (!t || t.length < 3 || t.length > 200) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                if (r.top < lub - 8 || r.top > lub + 600) continue;
+                if (el.closest && el.closest(
+                        'form, [data-testid*="composer" i], #prompt-textarea, ' +
+                        'header, [role="toolbar"], nav')) continue;
+                let inter = false, node = el;
+                for (let i = 0; i < 6 && node; i++) {
+                    const role = node.getAttribute && node.getAttribute('role');
+                    // tabindex >= 0 only — tabindex="-1" rides on scroll
+                    // containers and would bless half the page.
+                    const ti = node.getAttribute && node.getAttribute('tabindex');
+                    if (node.tagName === 'BUTTON' || role === 'button' ||
+                        (ti !== null && ti !== undefined && parseInt(ti, 10) >= 0)) {
+                        inter = true; break;
+                    }
+                    node = node.parentElement;
+                }
+                let anim = false;
+                try {
+                    const cs = getComputedStyle(el);
+                    anim = (cs.animationName && cs.animationName !== 'none')
+                        || cs.webkitBackgroundClip === 'text'
+                        || cs.backgroundClip === 'text';
+                    if (!anim && el.parentElement) {
+                        const cp = getComputedStyle(el.parentElement);
+                        anim = (cp.animationName && cp.animationName !== 'none')
+                            || cp.webkitBackgroundClip === 'text'
+                            || cp.backgroundClip === 'text';
+                    }
+                } catch (e) {}
+                if (!inter && !anim) continue;
+                const wordy = COUNT.test(t) || VERB_ONLY.test(t)
+                    || STATUS_LINE.test(t) || ELLIPSIS.test(t) || COMPLETED.test(t);
+                const score = (inter ? 3 : 0) + (anim ? 3 : 0) + (wordy ? 2 : 0)
+                    - (r.top - lub) / 1000;
+                structural.push({ el, score, len: t.length });
+            }
+            if (structural.length) {
+                structural.sort((a, b) => (b.score - a.score) || (a.len - b.len));
+                if (structural[0].score >= 3) {
+                    const picked = clickAndReturn(structural[0].el,
+                                                  structural.length, 'structural');
+                    picked.anchor = 'structural';
+                    return picked;
+                }
+            }
+        }
+
         // 2026-04-28: PASS 1 — dialog-scoped search FIRST. The DR plan
         // dialog (role="dialog" / aria-modal / report-plan class) renders
         // the activity-strip pill ("Summarizing X · 133 searches") pinned
@@ -15552,97 +15915,46 @@ async def _open_chatgpt_activity_panel(page):
         return clickAndReturn(hits[0].el, hits.length, 'global');
     }"""
     try:
-        res = await page.evaluate(JS)
+        res = await page.evaluate(JS, bool(skip_structural))
         if res and res.get("found"):
             return res
     except Exception:
         pass
+    # #913: enumerate ALL frames — the DR card's iframe URL no longer matches
+    # any fixed substring (live 2026-07-06: walked_hits=0 every P2 cycle while
+    # CUA could SEE the strip; the old "deep_research|oaiusercontent" filter
+    # simply never visited the frame that renders it).
     try:
-        for frame in page.frames:
+        for frame in [f for f in page.frames if f != page.main_frame][:20]:
             try:
-                src = (frame.url or "").lower()
+                res = await frame.evaluate(JS, bool(skip_structural))
             except Exception:
                 continue
-            if not src:
-                continue
-            if ("deep_research" in src or "oaiusercontent" in src or
-                    "web-sandbox.oaiusercontent" in src):
+            if res and res.get("found"):
                 try:
-                    res = await frame.evaluate(JS)
-                    if res and res.get("found"):
-                        return res
+                    res["frameUrl"] = (frame.url or "")[:120]
                 except Exception:
-                    continue
+                    pass
+                return res
     except Exception:
         pass
     return {"found": False, "candidates": 0}
 
 
 async def _verify_chatgpt_panel_open(page):
-    """Returns True if a wide side panel is now visible on the right side of
-    the ChatGPT DR viewport. Used post-click to detect silent click failures.
+    """#913: shape-agnostic — True when EITHER the P2 DR right-hand side
+    panel OR the P1 Pro/ET inline thoughts drawer is open.
 
-    Heuristic: an <aside> / [role="complementary"] / [aria-label*="source"i]
-    / [class*="panel"] element ≥280×200 on the right side of the viewport with
-    substantial text — the SAME acceptance `scrape_chatgpt_activity_panel_tracking`
-    uses to read the panel.
-
-    2026-07-06 (P1/P2 ChatGPT sources didn't open): dropped the old
-    `hasUrl || hasList` requirement (a raw `<a href="http…">` or `<ol>/<ul> > li`).
-    That made this verifier STRICTER than the scraper it guards — a modern DR
-    panel whose source rows are `<div>`/`<button>` chips (no raw anchor, no `<li>`)
-    passed the open-click but FAILED verify, so `chatgpt_activity_panel_open` never
-    flipped, the flag-gated scraper never ran, and ChatGPT surfaced no sources /
-    narration in the FE phase dropdown (both P1 `7c-p1` and P2 `7c`). The
-    panel-specific selectors + right-side + size + ≥50-char text are exactly what
-    the scraper trusts; a composer/chat guard prevents ever matching the chat
-    column (which is never an <aside>/complementary anyway)."""
-    JS = """() => {
-        const sels = [
-            'aside', '[role="complementary"]', '[role="region"]',
-            '[aria-label*="source" i]', '[aria-label*="activity" i]',
-            '[aria-label*="research" i]',
-            '[class*="panel" i][class*="side" i]',
-            '[class*="research" i][class*="panel" i]'
-        ];
-        for (const sel of sels) {
-            try {
-                for (const el of document.querySelectorAll(sel)) {
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 280 || r.height < 200) continue;
-                    if (r.right < window.innerWidth * 0.55) continue;  // must be on right side
-                    const inner = (el.innerText || '').trim();
-                    if (inner.length < 50) continue;
-                    // Never mistake the composer/chat column for the panel.
-                    if (el.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')) continue;
-                    return true;
-                }
-            } catch (e) {}
-        }
-        return false;
-    }"""
-    try:
-        ok = await page.evaluate(JS)
-        if ok:
-            return True
-    except Exception:
-        pass
-    try:
-        for frame in page.frames:
-            try:
-                src = (frame.url or "").lower()
-            except Exception:
-                continue
-            if "oaiusercontent" in src or "deep_research" in src:
-                try:
-                    ok = await frame.evaluate(JS)
-                    if ok:
-                        return True
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return False
+    History: the pre-#913 version accepted ONLY a ≥280×200 right-side panel
+    (side-panel JS now lives in `_CHATGPT_SIDE_PANEL_JS`, evaluated across
+    ALL frames by `_chatgpt_activity_state`). In the 2026-07 ChatGPT UI the
+    P1 click expands an INLINE drawer, so the side-only verifier judged
+    every successful click "failed" and the poll re-clicked the status line
+    each cycle — toggling the drawer (live 2026-07-06, 4 runs). #906's rule
+    still holds: this verifier must never be STRICTER than the scraper it
+    guards — `scrape_chatgpt_activity_panel_tracking` reads both shapes."""
+    st = await _chatgpt_activity_state(page)
+    return bool(st.get("side_panel") or st.get("inline_expanded"))
 
 
 async def scrape_progress_gemini(page):
@@ -17474,29 +17786,47 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         res = await page.evaluate(JS)
     except Exception as _e:
         log(f"[ChatGPT] activity panel walker failed: {_e}", "DEBUG")
-        return None
-    # Also try the Deep Research sandbox iframe — the panel often mounts
-    # there when the conversation runs in DR mode (cross-origin iframe
-    # at oaiusercontent / web-sandbox.oaiusercontent).
+        res = None
+    if res:
+        res["panel_shape"] = "side"
+    # #913: the DR sandbox iframe URL no longer matches any fixed substring
+    # (live 2026-07-06: the strip + panel were visible to CUA while every
+    # URL-filtered frame walk returned nothing) — enumerate ALL frames.
     if not res or (not res.get("steps") and not res.get("source_urls")):
         try:
-            for frame in page.frames:
+            for frame in [f for f in page.frames if f != page.main_frame][:20]:
                 try:
-                    src = (frame.url or "").lower()
+                    f_res = await frame.evaluate(JS)
                 except Exception:
                     continue
-                if not src:
-                    continue
-                if ("deep_research" in src or "oaiusercontent" in src):
-                    try:
-                        f_res = await frame.evaluate(JS)
-                        if f_res and (f_res.get("steps") or f_res.get("source_urls")):
-                            res = f_res
-                            break
-                    except Exception:
-                        continue
+                if f_res and (f_res.get("steps") or f_res.get("source_urls")):
+                    res = f_res
+                    res["panel_shape"] = "side"
+                    break
         except Exception:
             pass
+    # #913: inline fallback — P1 Pro/ET (and any non-DR mode) renders the
+    # thoughts/activity drawer INLINE in the last assistant turn instead of
+    # a side panel. Scrape that shape when no side panel yielded data, so
+    # the FE raw-activity dropdown + cycling readings stay rich in P1 too.
+    if not res or (not res.get("steps") and not res.get("source_urls")
+                   and not int(res.get("searches", 0) or 0)):
+        try:
+            il = await page.evaluate(_CHATGPT_INLINE_ACTIVITY_JS)
+        except Exception as _ie:
+            log(f"[ChatGPT] inline activity walker failed: {_ie}", "DEBUG")
+            il = None
+        if il and (il.get("steps") or il.get("source_urls")
+                   or il.get("progress") or int(il.get("searches", 0) or 0)):
+            res = {
+                "steps": il.get("steps") or [],
+                "sections": il.get("sections") or [],
+                "source_urls": il.get("source_urls") or [],
+                "searches": int(il.get("searches", 0) or 0),
+                "partial_text_len": int(il.get("partial_text_len", 0) or 0),
+                "progress": il.get("progress") or "",
+                "panel_shape": "inline",
+            }
     if not res:
         return None
     has_data = (
@@ -17504,6 +17834,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         or bool(res.get("source_urls"))
         or bool(res.get("sections"))
         or int(res.get("searches", 0) or 0) > 0
+        or bool((res.get("progress") or "").strip())
     )
     if not has_data:
         return None
@@ -19250,6 +19581,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     _panel_dom_misses = 0
     _panel_cua_attempts = 0
     _panel_poll_cycles = 0  # ticks once per ChatGPT P1 poll while panel still closed
+    _panel_reopens = 0      # #913: bounded drawer re-opens after auto-collapse (max 3)
     # Stall detector — multi-signal (2026-04-25 strictness rewrite):
     # tracks text + sources + steps. ChatGPT DR's "researching" phase
     # legitimately produces zero text growth for 5-15 min while sources
@@ -19386,17 +19718,50 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # entry points; Gemini/Claude have own paths.
                 if label in ("Phase1", "Phase1-followup") and not _panel_open_done:
                     _panel_poll_cycles += 1
+                # #913: once open, cheap per-cycle state check — the inline
+                # drawer auto-collapses on some UI transitions. Bounded
+                # re-open (3 max) instead of the old fire-and-forget.
+                if (label in ("Phase1", "Phase1-followup") and _panel_open_done):
+                    try:
+                        _st_now = await _chatgpt_activity_state(page)
+                        if not (_st_now.get("side_panel") or _st_now.get("inline_expanded")):
+                            _panel_reopens += 1
+                            if _panel_reopens <= 3:
+                                _panel_open_done = False
+                                _panel_dom_misses = 0
+                                log(f"[{label}] activity drawer collapsed — will re-open "
+                                    f"(reopen #{_panel_reopens}/3)", "DEBUG")
+                    except Exception:
+                        pass
                 if (label in ("Phase1", "Phase1-followup")
                         and (_panel_poll_cycles >= 2 or elapsed_sec >= 60)
                         and not _panel_open_done):
                     try:
-                        res = await _open_chatgpt_activity_panel(page)
+                        # #913 anti-toggle: the status line is a TOGGLE — the
+                        # pre-#913 loop re-clicked it every cycle because the
+                        # side-panel-only verifier couldn't see the inline
+                        # drawer it had already opened. NEVER click while a
+                        # shape is open.
+                        _st_pre = await _chatgpt_activity_state(page)
+                        if _st_pre.get("side_panel") or _st_pre.get("inline_expanded"):
+                            _panel_open_done = True
+                            _shape = "side" if _st_pre.get("side_panel") else "inline"
+                            log(f"[{label}] activity already open (shape={_shape}) at "
+                                f"elapsed={elapsed_sec}s — no click needed")
+                            res = None
+                        else:
+                            res = await _open_chatgpt_activity_panel(
+                                page, skip_structural=(_panel_dom_misses >= 2))
                         cands = (res or {}).get("candidates", 0)
-                        if not res or not res.get("found"):
+                        if _panel_open_done:
+                            pass
+                        elif not res or not res.get("found"):
                             _panel_dom_misses += 1
                             log(f"[{label}] panel DOM miss #{_panel_dom_misses} "
                                 f"(elapsed={elapsed_sec}s, walked_hits={cands}) — "
                                 f"strip not yet rendered or wording changed", "DEBUG")
+                            if _panel_dom_misses in (2, 5):
+                                await _log_chatgpt_thread_snapshot(page, tag=f"p1-miss{_panel_dom_misses}")
                         elif res.get("alreadyExpanded"):
                             _panel_open_done = True
                             log(f"[{label}] activity panel already expanded at "
@@ -19407,19 +19772,30 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                                  dom_ground_truth=_dom_gt_from_res(res))
                         elif res.get("clicked"):
                             await asyncio.sleep(2.0)
-                            verified = await _verify_chatgpt_panel_open(page)
+                            _st_post = await _chatgpt_activity_state(page)
+                            verified = bool(_st_post.get("side_panel")
+                                            or _st_post.get("inline_expanded"))
                             if verified:
                                 _panel_open_done = True
-                                log(f"[{label}] activity panel opened via DOM at "
-                                    f"elapsed={elapsed_sec}s — clickedTag={res.get('clickedTag','?')}")
+                                _shape = "side" if _st_post.get("side_panel") else "inline"
+                                log(f"[{label}] activity opened via DOM at "
+                                    f"elapsed={elapsed_sec}s — shape={_shape} "
+                                    f"anchor={res.get('anchor', res.get('scope', '?'))} "
+                                    f"clickedTag={res.get('clickedTag','?')} "
+                                    f"frame={res.get('frameUrl','host')} "
+                                    f"label=\"{res.get('label','')[:60]}\"")
                                 _observe_dom_success(page, hotspot_id="7c-p1", phase=phase,
                                                      platform="chatgpt",
                                                      current_step="open_activity_panel_p1",
                                                      dom_ground_truth=_dom_gt_from_res(res))
                             else:
                                 _panel_dom_misses += 1
-                                log(f"[{label}] DOM clicked but panel didn't render — "
-                                    f"miss #{_panel_dom_misses}", "WARN")
+                                log(f"[{label}] DOM clicked but neither panel nor inline "
+                                    f"drawer verified — miss #{_panel_dom_misses} "
+                                    f"(anchor={res.get('anchor', res.get('scope', '?'))} "
+                                    f"label=\"{res.get('label','')[:60]}\")", "WARN")
+                                if _panel_dom_misses in (2, 5):
+                                    await _log_chatgpt_thread_snapshot(page, tag=f"p1-miss{_panel_dom_misses}")
                         else:
                             _panel_dom_misses += 1
                             log(f"[{label}] panel found but click failed — "
@@ -19443,9 +19819,13 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             return await asyncio.wait_for(
                                 agent_loop(cua_client, browser,
                                     PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
-                                    "Open the activity strip at the bottom of this ChatGPT "
-                                    "Pro/Thinking conversation. ONE click only. Verify the "
-                                    "side panel slides out before reporting.",
+                                    "Open the research activity for the latest response in "
+                                    "this ChatGPT Pro/Thinking conversation: click the "
+                                    "shimmering status line directly below the last sent "
+                                    "message. ONE click only. The result may be a side "
+                                    "panel sliding out on the right OR an inline thoughts/"
+                                    "activity section expanding below the line — EITHER "
+                                    "counts as open.",
                                     model=CUA_MODEL, max_iterations=5,
                                     verbose=verbose, target_page=page),
                                 timeout=120.0)
@@ -19454,7 +19834,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                 page, hotspot_id="7c-p1", phase=phase, platform="chatgpt",
                                 current_step="open_activity_panel_p1",
                                 context_hint=f"P1 brief poll DOM 2-miss at elapsed={elapsed_sec}s",
-                                expected_outcome="side panel mounts on right with step list",
+                                expected_outcome="side panel mounts OR inline thoughts drawer expands",
                                 cua_coro_factory=_cgpt_p1_cua,
                                 mission_prompt=PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
                                 success_text="panel: open")
@@ -19667,6 +20047,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                         # cooldown ticks.
                         if _vision_narration:
                             progress["progress"] = _vision_narration
+                        elif (progress.get("progress") or "").strip():
+                            # #913: the inline-activity sweep now scrapes the
+                            # LIVE status line ("Pro thinking" → "Searching
+                            # the web — <topic>…") every cycle — that beats
+                            # any generic fallback. Keep it.
+                            pass
                         else:
                             # Elapsed time deliberately omitted — the parent
                             # phase card already shows "N.N min elapsed" at the
@@ -22081,13 +22467,34 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if (name == "ChatGPT" and _cgpt_gate_ok and
                     not p.get("chatgpt_activity_panel_open")):
                 try:
-                    res = await _open_chatgpt_activity_panel(p["page"])
+                    # #913 anti-toggle: the strip/status line is a TOGGLE.
+                    # Never click while a shape (side panel OR inline drawer)
+                    # is already open — the pre-#913 side-only verifier
+                    # couldn't see the inline drawer and re-clicked it every
+                    # cycle, closing what it had just opened.
+                    _st_pre = await _chatgpt_activity_state(p["page"])
+                    if _st_pre.get("side_panel") or _st_pre.get("inline_expanded"):
+                        p["chatgpt_activity_panel_open"] = True
+                        p["chatgpt_panel_dom_misses"] = 0
+                        _shape = "side" if _st_pre.get("side_panel") else "inline"
+                        log(f"[ChatGPT] activity already open (shape={_shape}) at "
+                            f"elapsed={int(elapsed)}s — no click needed")
+                        res = None
+                    else:
+                        res = await _open_chatgpt_activity_panel(
+                            p["page"],
+                            skip_structural=(p.get("chatgpt_panel_dom_misses", 0) >= 2))
                     cands = (res or {}).get("candidates", 0)
-                    if not res or not res.get("found"):
+                    if p.get("chatgpt_activity_panel_open"):
+                        pass
+                    elif not res or not res.get("found"):
                         p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
                         log(f"[ChatGPT] panel DOM miss #{p['chatgpt_panel_dom_misses']} "
                             f"(cycle={p.get('poll_cycles')}, walked_hits={cands}) — "
                             f"strip not yet rendered or wording changed", "DEBUG")
+                        if p["chatgpt_panel_dom_misses"] in (2, 6):
+                            await _log_chatgpt_thread_snapshot(
+                                p["page"], tag=f"p2-miss{p['chatgpt_panel_dom_misses']}")
                     elif res.get("alreadyExpanded"):
                         p["chatgpt_activity_panel_open"] = True
                         p["chatgpt_panel_dom_misses"] = 0
@@ -22097,22 +22504,35 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                              platform="chatgpt", current_step="open_activity_panel",
                                              dom_ground_truth=_dom_gt_from_res(res))
                     elif res.get("clicked"):
-                        # Verify panel actually rendered (mitigates silent click failure).
+                        # Verify a shape actually mounted (side panel OR
+                        # inline drawer — silent click failures still count
+                        # as misses).
                         await asyncio.sleep(2.0)
-                        verified = await _verify_chatgpt_panel_open(p["page"])
+                        _st_post = await _chatgpt_activity_state(p["page"])
+                        verified = bool(_st_post.get("side_panel")
+                                        or _st_post.get("inline_expanded"))
                         if verified:
                             p["chatgpt_activity_panel_open"] = True
                             p["chatgpt_panel_dom_misses"] = 0
-                            log(f"[ChatGPT] activity panel opened via DOM at "
-                                f"elapsed={int(elapsed)}s — label: \"{res.get('label','')[:80]}\" "
-                                f"clickedTag={res.get('clickedTag','?')}")
+                            _shape = "side" if _st_post.get("side_panel") else "inline"
+                            log(f"[ChatGPT] activity opened via DOM at "
+                                f"elapsed={int(elapsed)}s — shape={_shape} "
+                                f"anchor={res.get('anchor', res.get('scope', '?'))} "
+                                f"clickedTag={res.get('clickedTag','?')} "
+                                f"frame={res.get('frameUrl','host')} "
+                                f"label=\"{res.get('label','')[:60]}\"")
                             _observe_dom_success(p["page"], hotspot_id="7c", phase=2,
                                                  platform="chatgpt", current_step="open_activity_panel",
                                                  dom_ground_truth=_dom_gt_from_res(res))
                         else:
                             p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
-                            log(f"[ChatGPT] DOM clicked but panel didn't render — "
-                                f"miss #{p['chatgpt_panel_dom_misses']}", "WARN")
+                            log(f"[ChatGPT] DOM clicked but neither panel nor inline "
+                                f"drawer verified — miss #{p['chatgpt_panel_dom_misses']} "
+                                f"(anchor={res.get('anchor', res.get('scope', '?'))} "
+                                f"label=\"{res.get('label','')[:60]}\")", "WARN")
+                            if p["chatgpt_panel_dom_misses"] in (2, 6):
+                                await _log_chatgpt_thread_snapshot(
+                                    p["page"], tag=f"p2-miss{p['chatgpt_panel_dom_misses']}")
                     else:
                         p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
                         log(f"[ChatGPT] panel found but click failed — "
@@ -22137,9 +22557,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         return await asyncio.wait_for(
                             agent_loop(cua_client, browser,
                                 PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
-                                "Open the activity strip at the bottom of this ChatGPT "
-                                "Deep Research conversation. ONE click only. Verify the "
-                                "side panel slides out before reporting.",
+                                "Open the research activity for the latest response in "
+                                "this ChatGPT Deep Research conversation: click the live "
+                                "activity strip / shimmering status line attached to it. "
+                                "ONE click only. The result may be a side panel sliding "
+                                "out on the right OR an inline thoughts/activity section "
+                                "expanding below the line — EITHER counts as open.",
                                 model=CUA_MODEL, max_iterations=5,
                                 verbose=verbose, target_page=p["page"]),
                             timeout=120.0)
@@ -22148,7 +22571,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             p["page"], hotspot_id="7c", phase=2, platform="chatgpt",
                             current_step="open_activity_panel",
                             context_hint=f"DOM 2-miss at cycle={p.get('poll_cycles')}",
-                            expected_outcome="side panel mounts on right with step list",
+                            expected_outcome="side panel mounts OR inline thoughts drawer expands",
                             cua_coro_factory=_cgpt_p2_cua,
                             mission_prompt=PROMPT_OPEN_CHATGPT_SOURCE_PANEL,
                             success_text="panel: open")
@@ -22207,7 +22630,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         if int(panel_data.get("partial_text_len", 0) or 0) > int(progress.get("partial_text_len", 0) or 0):
                             progress["partial_text_len"] = panel_data["partial_text_len"]
                         scrape_ok = True
-                        log(f"[ChatGPT] panel tracking: "
+                        log(f"[ChatGPT] panel tracking "
+                            f"(shape={panel_data.get('panel_shape', 'side')}): "
                             f"{len(panel_data.get('source_urls', []))} URLs, "
                             f"{len(panel_data.get('steps', []))} steps, "
                             f"{len(panel_data.get('sections', []))} sections, "
