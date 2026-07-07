@@ -21553,7 +21553,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     if await verify_gemini_generating(p["page"]):
                         p["needs_start_verify"] = False
                         emit_event("agent_progress", phase=2, agent="gemini",
-                                   status="generating",
+                                   status="generating", stage="researching",
                                    progress="Gemini Deep Research plan created and started")
                         log("[2D] Gemini is researching ✓ (confirmed on round-robin re-check)")
                         try:
@@ -29638,7 +29638,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                              "url": chatgpt_page.url if chatgpt_page else "",
                              "research_started_at": time.time()}
         if verified_a:
-            emit_event("agent_progress", phase=2, agent="chatgpt", status="generating", progress="ChatGPT Deep Research started and verified")
+            emit_event("agent_progress", phase=2, agent="chatgpt", status="generating",
+                       stage="researching",
+                       progress="ChatGPT Deep Research started and verified")
             log("[2A] ChatGPT Deep Research is running ✓")
             await inject_agent_observer(chatgpt_page, "chatgpt")
         else:
@@ -29748,7 +29750,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                             "url": claude_page.url if claude_page else "",
                             "research_started_at": time.time()}
         if verified_c:
-            emit_event("agent_progress", phase=2, agent="claude", status="generating", progress="Claude Adaptive Thinking started and verified")
+            emit_event("agent_progress", phase=2, agent="claude", status="generating",
+                       stage="researching",
+                       progress="Claude Adaptive Thinking started and verified")
             log("[2B] Claude is running ✓")
             await inject_agent_observer(claude_page, "claude")
         else:
@@ -30155,7 +30159,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         f"will re-check for 'Start research'", "INFO")
                     try:
                         emit_event("agent_progress", phase=2, agent="gemini",
-                                   status="generating",
+                                   status="generating", stage="planning",
                                    progress=(f"Gemini plan hit an error — retrying "
                                              f"({_regen_count}/{_GEMINI_MAX_PLAN_REGEN})…"))
                     except Exception:
@@ -30202,7 +30206,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     f"— still no 'Start research'; will keep polling then escalate", "WARN")
                 try:
                     emit_event("agent_progress", phase=2, agent="gemini",
-                               status="generating",
+                               status="generating", stage="planning",
                                progress=(f"Gemini's plan keeps failing — retried "
                                          f"{_regen_count}× and still waiting…"))
                 except Exception:
@@ -30219,8 +30223,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     _gm_status = (_gm.get("status") or "generating")
                     if _gm_status in ("complete", "done"):
                         _gm_status = "generating"
+                    # stage="planning" (2026-07-06 milestone stepper): the FE
+                    # can't tell Gemini's plan-draft from research via counters
+                    # — this explicit stage drives the Planning milestone.
                     emit_event("agent_progress", phase=2, agent="gemini",
-                               status=_gm_status,
+                               status=_gm_status, stage="planning",
                                progress=_gm.get("progress") or "Gemini drafting research plan...",
                                sources=int(_gm.get("sources", 0) or 0),
                                source_urls=(_gm.get("source_urls", []) or [])[:50],
@@ -30304,6 +30311,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     act_timeout_s=120.0)
                 try:
                     emit_event("agent_progress", phase=2, agent="gemini", status="generating",
+                               stage="planning",
                                progress=(f"Gemini's plan didn't start — retrying "
                                          f"({_regen_attempt + 1}/{_FALLBACK_MAX_REGEN})…"))
                 except Exception:
@@ -30381,7 +30389,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                             "research_started_at": time.time(),
                             "needs_start_verify": bool(start_clicked and not verified_b)}
         if verified_b:
-            emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini Deep Research plan created and started")
+            emit_event("agent_progress", phase=2, agent="gemini", status="generating",
+                       stage="researching",
+                       progress="Gemini Deep Research plan created and started")
             log("[2D] Gemini is researching ✓")
             await inject_agent_observer(gemini_page, "gemini")
         else:
@@ -30543,6 +30553,7 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
         log(f"[NotebookLM] source verify (round {_round}): {len(failed)} failed → re-uploading {failed}", "WARN")
         try:
             emit_event("agent_progress", phase=3, agent="notebooklm", status="repairing",
+                       stage="uploading",
                        progress=f"Re-uploading {len(failed)} source(s) that failed to import…")
         except Exception:
             pass
@@ -30660,8 +30671,11 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
 
             for i, md_path in enumerate(md_files):
                 log(f"Uploading {md_path.name} ({i+1}/{len(md_files)})...")
+                # stage= (2026-07-06 milestone stepper): P3's three milestones
+                # — uploading → notebook → podcast — tick off these explicit
+                # stages (keyword fallback covers older events).
                 emit_event("agent_progress", phase=3, agent="notebooklm",
-                           status="uploading",
+                           status="uploading", stage="uploading",
                            progress=f"Uploading source {i+1}/{len(md_files)}: {md_path.name}")
                 browser.set_upload_file(str(md_path))
 
@@ -30729,7 +30743,7 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             title = smart_title(topic)
             log(f"Renaming notebook to '{title}'...")
             emit_event("agent_progress", phase=3, agent="notebooklm",
-                       status="renaming",
+                       status="renaming", stage="notebook",
                        progress=f"Renaming notebook to '{title}'…")
             async def _nlm_rename_cua():
                 return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
@@ -30752,7 +30766,7 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # C1: make notebook public (Share → "Anyone with the link" → Save)
             # BEFORE emitting the URL, so the frontend's link is always viewable.
             emit_event("agent_progress", phase=3, agent="notebooklm",
-                       status="sharing",
+                       status="sharing", stage="notebook",
                        progress="Setting notebook to 'Anyone with the link can view'…")
             notebook_url = await browser.current_url()
             try:
@@ -31330,7 +31344,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
             _typ_low, _typ_high = _AUDIO_TYPICAL_RANGE_MIN.get(
                 _len_key, _AUDIO_TYPICAL_RANGE_MIN["default"])
             emit_event("agent_progress", phase=3, agent="notebooklm",
-                       status="generating",
+                       status="generating", stage="podcast",
                        progress=f"NotebookLM still generating audio overview… "
                                 f"({elapsed_min}m total / {_typ_low}–{_typ_high}m typical)",
                        elapsedSec=elapsed_min * 60,
@@ -31416,7 +31430,7 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
         browser.page.on("download", _on_download)
 
         emit_event("agent_progress", phase=3, agent="notebooklm",
-                   status="downloading",
+                   status="downloading", stage="podcast",
                    progress="Downloading audio file from NotebookLM…")
         _stop_d, _task_d = start_narration_ticker(
             3, "notebooklm",
@@ -35870,6 +35884,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 _wait_min = _AUDIO_RETRY_INTERVAL_SEC // 60
                 log(f"Phase 3: audio file missing — auto-retry {_audio_auto_retries}/{_AUDIO_MAX_AUTO_RETRIES} in {_wait_min} min", "WARN")
                 emit_event("agent_progress", phase=3, agent="notebooklm", status="downloading",
+                           stage="podcast",
                            progress=f"Audio not captured yet — retrying ({_audio_auto_retries}/{_AUDIO_MAX_AUTO_RETRIES}) in {_wait_min} min…")
 
                 # 5-min interval wait — interruptible so Stop/Pause/Skip are
