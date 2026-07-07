@@ -1,24 +1,34 @@
 """#913 (2026-07-07): ChatGPT 2026-07 UI — shape-agnostic activity open +
 rich source-panel relay.
 
-Live evidence (backend.log 2026-07-06, 4 runs): P1's "Pro thinking" shimmer
-was found and clicked (DOM + CUA real click) but every verifier only accepted
-a ≥280×200 RIGHT-SIDE panel, so each cycle judged the click failed and
-re-clicked the line — TOGGLING the inline thoughts drawer open/closed every
-~30s. In P2, the DR card now renders inside an iframe whose URL no longer
-matches "deep_research|oaiusercontent" (walked_hits=0 on every cycle while
-CUA could SEE the strip; CUA's one success opened the "Deep research
-execution plan" side panel). Fix:
+GROUND TRUTH (user screenshot 2026-07-07 + backend.log 2026-07-06, 4 runs):
+clicking the shimmering status line below the sent message OPENS a right-
+side panel headed "Activity · <N>s" in P1 — but it is NARROW (~21% of the
+viewport ≈ 267px at our 1280px viewport) and shows only skeleton rows early
+(~33 chars), so the old verifier's ≥280px width + ≥50-char text gates
+rejected the OPEN panel, judged the click failed, and re-clicked the toggle
+every ~30s — closing it. In P2, the DR card renders inside an iframe whose
+URL no longer matches "deep_research|oaiusercontent" (walked_hits=0 on every
+cycle while CUA could SEE the strip; CUA's one success opened the "Deep
+research execution plan" side panel). Completed strips are not clickable.
 
+Fix:
+  - `_CHATGPT_SIDE_PANEL_JS` Signature A: "Activity"-headed right-side
+    container, no text floor (skeleton-only = open); legacy sweep width
+    gate 280→240;
   - structural PASS 0 in the opener: the shimmering status line directly
     below the last SENT (user) message — position + interactivity + shimmer
     animation, never wording (user directive: the text mutates with the
     platform's progress);
   - every ChatGPT frame walk enumerates ALL frames (no URL filter);
-  - `_chatgpt_activity_state` = shape-agnostic open detector (side panel OR
-    inline drawer), used BEFORE clicking (anti-toggle) and as the verify;
-  - `scrape_chatgpt_activity_panel_tracking` + `scrape_progress_chatgpt`
-    read the inline drawer/status line too (rich narration for P1 and P2);
+  - `_chatgpt_activity_state` = shape-agnostic open detector, used BEFORE
+    clicking (anti-toggle — the line is a toggle) and as the verify;
+  - `scrape_chatgpt_activity_panel_tracking` (Activity-root preferred,
+    width gate 200, inline-turn fallback) + `scrape_progress_chatgpt`
+    (per-cycle turn sweep) keep narration rich for P1 and P2;
+  - VERB_GATE backspace fix: a lone \\b in a NON-raw Python string parsed
+    to a literal backspace, so the panel walker's step gate NEVER matched
+    since it shipped;
   - persistent misses log a compact DOM snapshot (instrument-with-logs
     directive) so the next miss is root-causable from backend.log alone.
 """
@@ -207,14 +217,65 @@ def test_open_success_logs_shape_anchor_frame():
             f"open-success log must carry {marker} in both P1 and P2 sites")
 
 
-# ── CUA prompt: both shapes are success ──────────────────────────────────────
+# ── ground truth: the P1 "Activity" panel (user screenshot 2026-07-07) ──────
 
-def test_cua_prompt_accepts_inline_expansion():
+def test_side_panel_js_has_activity_signature():
+    js = research._CHATGPT_SIDE_PANEL_JS
+    assert "activity" in js and "Signature A" in js, (
+        "the P1 panel is headed 'Activity · Ns' — the header anchor is the "
+        "strongest signature and carries no text-length floor")
+    assert "r.width < 240" in js and "r.width < 280" not in js, (
+        "the Activity panel is ~267px at a 1280px viewport — a 280px gate "
+        "rejects the OPEN panel and restarts the toggle storm")
+
+
+def test_side_panel_js_no_raw_backspace():
+    # lone \b in a NON-raw Python string parses to a literal backspace and
+    # silently kills the JS regex (the VERB_GATE bug lived for months).
+    for name in ("_CHATGPT_SIDE_PANEL_JS", "_CHATGPT_INLINE_ACTIVITY_JS"):
+        assert "\x08" not in getattr(research, name), f"{name} has a raw backspace"
+
+
+def test_no_raw_backspace_in_chatgpt_scraper_literals():
+    import ast
+    import textwrap
+    for fn in (research.scrape_chatgpt_activity_panel_tracking,
+               research.scrape_progress_chatgpt,
+               research._open_chatgpt_activity_panel,
+               research._log_chatgpt_thread_snapshot,
+               research._chatgpt_activity_state):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert "\x08" not in node.value, (
+                    f"{fn.__name__} embeds a string with a literal backspace "
+                    "— a lone \\b in a non-raw Python string; the JS regex "
+                    "it belongs to can never match")
+
+
+def test_tracking_scraper_prefers_activity_root():
+    src = inspect.getsource(research.scrape_chatgpt_activity_panel_tracking)
+    assert "activityRoot" in src
+    assert "activityRoot || panels[0]" in src, (
+        "the Activity-headed root must beat the height-ranked legacy match")
+    assert "r.width >= 200" in src, (
+        "panel filter must admit the ~267px Activity panel")
+
+
+# ── CUA prompt: real shapes are success ──────────────────────────────────────
+
+def test_cua_prompt_matches_ground_truth():
     p = prompts.PROMPT_OPEN_CHATGPT_SOURCE_PANEL
+    assert "Activity" in p and "skeleton" in p.lower(), (
+        "CUA must accept the narrow skeleton-only Activity panel as OPEN — "
+        "live 2026-07-06 it kept reporting 'no side panel slid out'")
     assert "inline thoughts/activity" in p
     assert "IT IS A TOGGLE" in p
     assert "DIRECTLY BELOW" in p, (
         "2026-07 UI: early in a response the status line sits directly "
         "below the last sent message")
-    # already-open detection must include the inline shape
+    assert "Answer now" in p, (
+        "'Answer now' inside the Activity panel truncates the run — CUA "
+        "must never click it")
+    # already-open detection must include the skeleton/inline shapes
     assert p.count("panel: already_open") >= 2

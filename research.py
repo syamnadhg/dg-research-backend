@@ -15024,14 +15024,14 @@ async def scrape_progress_chatgpt(page):
         except Exception as _hpe:
             log(f"ChatGPT host-panel scrape skipped: {_hpe}", "DEBUG")
 
-        # ---- #913: inline thoughts/activity sweep (2026-07 UI) ----
-        # P1 Pro/ET renders the live status line ("Pro thinking" →
-        # "Searching the web…") + the expandable thoughts drawer INLINE in
-        # the last assistant turn — no side panel at all. Sweep it EVERY
-        # cycle: the status line + hostname chips + "N searches/citations"
-        # counts are scrapeable even while the drawer is collapsed, so P1
-        # narration stays rich from the first poll tick instead of showing
-        # "0 sources, 0 chars" until a panel-open succeeds.
+        # ---- #913: inline turn sweep (2026-07 UI) ----
+        # The live status line ("Pro thinking" → "Searching the web…")
+        # renders inside the last assistant turn, and hostname chips +
+        # "N searches/citations" counts appear there too. Sweep it EVERY
+        # cycle: this data is scrapeable regardless of whether the Activity
+        # side panel is open yet, so P1 narration stays rich from the first
+        # poll tick instead of showing "0 sources, 0 chars" until a
+        # panel-open succeeds.
         try:
             il = await page.evaluate(_CHATGPT_INLINE_ACTIVITY_JS)
             if il:
@@ -15390,16 +15390,21 @@ async def scrape_progress_chatgpt(page):
 
 # ── #913 (2026-07-07): ChatGPT 2026-07 UI redesign — shape-agnostic activity ──
 # The activity/thinking affordance is the SHIMMERING STATUS LINE rendered
-# directly below the last sent (user) message. What a click opens depends on
-# mode: P2 Deep Research still slides a right-hand side panel ("Deep research
-# execution plan" — CUA confirmed live 2026-07-06 21:59), but P1 Pro/Extended
-# Thinking expands an INLINE thoughts/activity drawer under the line. Four
-# live runs (2026-07-06) had DOM + CUA clicks judged "failed" because every
-# verifier only accepted a ≥280×200 right-side panel — so the poll re-clicked
-# the line every ~30s, TOGGLING the drawer open/closed. Additionally the DR
-# card now renders in an iframe whose URL no longer matches the old
+# directly below the last sent (user) message. GROUND TRUTH (user screenshot,
+# 2026-07-07): clicking it opens a right-side panel headed "Activity · <N>s"
+# (× close, "Answer now" link) in P1 Pro/ET; P2 Deep Research slides out the
+# "Deep research execution plan" panel (CUA confirmed live 2026-07-06 21:59).
+# Four live runs (2026-07-06) had DOM + CUA clicks judged "failed" because
+# the verifier's gates rejected the OPEN Activity panel — it is NARROW
+# (~21% of viewport ≈ 267px at 1280, gate demanded ≥280) and nearly EMPTY
+# early (skeleton rows ≈ 33 chars, gate demanded ≥50) — so the poll
+# re-clicked the line every ~30s, TOGGLING the panel closed. Additionally
+# the DR card now renders in an iframe whose URL no longer matches the old
 # "deep_research|oaiusercontent" filter (walked_hits=0 across ALL P2 cycles
 # while CUA could see the strip) — frame loops must enumerate every frame.
+# The inline-turn sweep below is (a) the per-cycle narration source (status
+# line + counts are scrapeable in the turn regardless of panel state) and
+# (b) a defensive secondary "open" shape for future UI variants.
 _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     // Scope: the LAST assistant turn. The status row + drawer render inside
     // the <article> turn wrapper but OUTSIDE [data-message-author-role], so
@@ -15418,15 +15423,16 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
                   expanded: false };
     const turnText = (turn.innerText || '').trim();
     out.partial_text_len = turnText.length;
-    // Drawer/expansion state: any aria-expanded=true inside the turn, or a
-    // mounted thoughts/activity region with real height.
-    if (turn.querySelector('[aria-expanded="true"]')) out.expanded = true;
-    if (!out.expanded) {
-        for (const el of turn.querySelectorAll(
-                '[class*="thought" i], [class*="activity" i], [data-testid*="thought" i]')) {
-            const r = el.getBoundingClientRect();
-            if (r.height >= 60 && r.width >= 120) { out.expanded = true; break; }
-        }
+    // Inline-expansion state — SECONDARY shape (ground truth 2026-07-07:
+    // P1's click opens the "Activity" SIDE panel; this only covers modes
+    // that expand in-turn). Deliberately strict: a mounted thoughts/
+    // activity region with real height. No bare aria-expanded=true
+    // shortcut — a stray expanded chip inside the turn would report
+    // "open", block the click, and starve the real panel forever.
+    for (const el of turn.querySelectorAll(
+            '[class*="thought" i], [class*="activity" i], [data-testid*="thought" i]')) {
+        const r = el.getBoundingClientRect();
+        if (r.height >= 60 && r.width >= 120) { out.expanded = true; break; }
     }
     // Live status line — anchored on structure/wording, closest below the
     // last user message. Same anchor family as the opener walker.
@@ -15508,10 +15514,48 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     return out;
 }"""
 
-# Right-hand side panel presence (bool) — the pre-#913 verify heuristic,
-# kept as the "side" shape detector and now ALSO evaluated in every frame
-# (the DR iframe's URL no longer matches any fixed substring).
+# Right-hand side panel presence (bool) — evaluated on the host page AND in
+# every frame (the DR iframe's URL no longer matches any fixed substring).
+#
+# #913 ground truth (user screenshot 2026-07-07, P1 live): clicking the
+# "Pro thinking" shimmer opens a right-side panel headed "Activity · <N>s"
+# with an × close button and an "Answer now" link. Two gates in the old
+# heuristic rejected that OPEN panel and caused the re-click toggle storm:
+#   - width ≥ 280: the Activity panel is ~21% of the viewport ≈ 267px at
+#     our 1280px automation viewport;
+#   - text ≥ 50 chars: early on it shows only skeleton/placeholder rows —
+#     "Activity · 8s / Pro thinking / Answer now" ≈ 33 chars.
+# Signature A below matches the measured panel directly; the legacy
+# selector sweep keeps a relaxed width gate + the text gate (it has no
+# header anchor, so the text floor still guards against random asides).
 _CHATGPT_SIDE_PANEL_JS = """() => {
+    // Signature A — "Activity"-headed right-side panel (P1 Pro/ET, and any
+    // future variant that keeps the header). Header text anchors the match,
+    // so no text-length floor: a skeleton-only panel is still OPEN.
+    try {
+        for (const el of document.querySelectorAll('*')) {
+            const t = (el.innerText || '').trim();
+            if (!t || !/^activity\\b/i.test(t)) continue;
+            if (t.length > 40) continue;              // header leaf, not a container
+            const hr = el.getBoundingClientRect();
+            if (hr.width === 0 || hr.height === 0) continue;
+            if (hr.left < window.innerWidth * 0.5) continue;  // right half only
+            // Climb to a panel-sized ancestor.
+            let node = el;
+            for (let i = 0; i < 8 && node; i++) {
+                const r = node.getBoundingClientRect();
+                if (r.width >= 200 && r.width <= window.innerWidth * 0.6
+                        && r.height >= 150
+                        && r.right > window.innerWidth * 0.55) {
+                    if (!node.querySelector('#prompt-textarea, form textarea, [data-testid*="composer" i]')) {
+                        return true;
+                    }
+                }
+                node = node.parentElement;
+            }
+        }
+    } catch (e) {}
+    // Signature B — legacy selector sweep (P2 DR execution-plan panel etc.).
     const sels = [
         'aside', '[role="complementary"]', '[role="region"]',
         '[aria-label*="source" i]', '[aria-label*="activity" i]',
@@ -15523,7 +15567,7 @@ _CHATGPT_SIDE_PANEL_JS = """() => {
         try {
             for (const el of document.querySelectorAll(sel)) {
                 const r = el.getBoundingClientRect();
-                if (r.width < 280 || r.height < 200) continue;
+                if (r.width < 240 || r.height < 200) continue;
                 if (r.right < window.innerWidth * 0.55) continue;
                 const inner = (el.innerText || '').trim();
                 if (inner.length < 50) continue;
@@ -15539,13 +15583,14 @@ _CHATGPT_SIDE_PANEL_JS = """() => {
 async def _chatgpt_activity_state(page):
     """#913: shape-agnostic ChatGPT activity state — what is open RIGHT NOW.
 
-    Returns {side_panel, inline_expanded, thread_len}. `side_panel` is the
-    P2 DR right-hand panel (checked on the host page AND in every frame —
-    the DR iframe's URL is no longer matchable). `inline_expanded` is the
-    P1 Pro/ET thoughts drawer inside the last assistant turn. Callers use
-    this BEFORE clicking (never click when a shape is already open — the
-    status line is a TOGGLE, and blind re-clicks close it) and AFTER
-    clicking (either shape counts as verified open)."""
+    Returns {side_panel, inline_expanded, thread_len}. `side_panel` covers
+    BOTH real shapes seen live: P1's narrow "Activity · Ns" panel and P2
+    DR's execution-plan panel (checked on the host page AND in every frame —
+    the DR iframe's URL is no longer matchable). `inline_expanded` is a
+    defensive secondary for in-turn expansions. Callers use this BEFORE
+    clicking (never click when a shape is already open — the status line is
+    a TOGGLE, and blind re-clicks close it) and AFTER clicking (either
+    shape counts as verified open)."""
     out = {"side_panel": False, "inline_expanded": False, "thread_len": 0}
     try:
         if await page.evaluate(_CHATGPT_SIDE_PANEL_JS):
@@ -15627,10 +15672,10 @@ async def _log_chatgpt_thread_snapshot(page, tag=""):
 async def _open_chatgpt_activity_panel(page, skip_structural=False):
     """Click the activity affordance for the latest ChatGPT response.
 
-    #913: what the click opens is MODE-DEPENDENT — P2 Deep Research slides
-    out the right-hand side panel; P1 Pro/Extended-Thinking expands an
-    INLINE thoughts drawer below the status line. This function only finds
-    + clicks; callers verify with `_chatgpt_activity_state` (either shape
+    #913: what the click opens is MODE-DEPENDENT — P1 Pro/ET opens the
+    narrow "Activity · Ns" right-side panel (skeleton rows early); P2 Deep
+    Research slides out the execution-plan panel. This function only finds
+    + clicks; callers verify with `_chatgpt_activity_state` (any shape
     counts) and must NEVER call this while a shape is already open — the
     line is a toggle. PASS 0 anchors structurally on the shimmering status
     line directly below the last sent (user) message; the wording anchors
@@ -15945,14 +15990,16 @@ async def _verify_chatgpt_panel_open(page):
     """#913: shape-agnostic — True when EITHER the P2 DR right-hand side
     panel OR the P1 Pro/ET inline thoughts drawer is open.
 
-    History: the pre-#913 version accepted ONLY a ≥280×200 right-side panel
-    (side-panel JS now lives in `_CHATGPT_SIDE_PANEL_JS`, evaluated across
-    ALL frames by `_chatgpt_activity_state`). In the 2026-07 ChatGPT UI the
-    P1 click expands an INLINE drawer, so the side-only verifier judged
-    every successful click "failed" and the poll re-clicked the status line
-    each cycle — toggling the drawer (live 2026-07-06, 4 runs). #906's rule
-    still holds: this verifier must never be STRICTER than the scraper it
-    guards — `scrape_chatgpt_activity_panel_tracking` reads both shapes."""
+    History: the pre-#913 version demanded ≥280px width and ≥50 chars of
+    text (side-panel JS now lives in `_CHATGPT_SIDE_PANEL_JS`, evaluated
+    across ALL frames by `_chatgpt_activity_state`). The 2026-07 P1
+    "Activity" panel is ~267px at our 1280px viewport and shows only
+    skeleton rows early, so the verifier judged every successful click
+    "failed" and the poll re-clicked the status line each cycle — toggling
+    the panel closed (live 2026-07-06, 4 runs; user screenshot 2026-07-07
+    is the ground truth). #906's rule still holds: this verifier must never
+    be STRICTER than the scraper it guards —
+    `scrape_chatgpt_activity_panel_tracking` reads both shapes."""
     st = await _chatgpt_activity_state(page)
     return bool(st.get("side_panel") or st.get("inline_expanded"))
 
@@ -17688,6 +17735,10 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         // [role="complementary"] / [aria-label~=source] in the DR
         // sandbox iframe OR host page (post-2025 redesign). Match either.
         // Width gate prevents matching narrow chrome (sidebar nav, etc.).
+        // #913 ground truth (user screenshot): P1's "Activity · Ns" panel
+        // is ~21% of the viewport (≈267px at 1280) — width gate is 200,
+        // not 280, and an Activity-headed container is accepted directly
+        // even when no legacy selector matches it.
         const PANEL_SELS = [
             'aside', '[role="complementary"]', '[role="region"]',
             '[aria-label*="source" i]', '[aria-label*="activity" i]',
@@ -17697,10 +17748,35 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         const panels = Array.from(document.querySelectorAll(PANEL_SELS))
             .filter(el => {
                 const r = el.getBoundingClientRect();
-                return r.width >= 280 && r.height >= 200 &&
+                return r.width >= 200 && r.height >= 200 &&
                        r.right > window.innerWidth * 0.45;
             });
-        if (panels.length === 0) return out;
+        // Activity-headed panel (Signature A) — climb from the header leaf
+        // to a panel-sized ancestor. Kept OUTSIDE the sorted candidate list:
+        // the header anchor beats any height-ranked legacy match.
+        let activityRoot = null;
+        try {
+            for (const el of document.querySelectorAll('*')) {
+                const t = (el.innerText || '').trim();
+                if (!t || !/^activity\\b/i.test(t) || t.length > 40) continue;
+                const hr = el.getBoundingClientRect();
+                if (hr.width === 0 || hr.height === 0) continue;
+                if (hr.left < window.innerWidth * 0.5) continue;
+                let node = el;
+                for (let i = 0; i < 8 && node; i++) {
+                    const r = node.getBoundingClientRect();
+                    if (r.width >= 200 && r.width <= window.innerWidth * 0.6
+                            && r.height >= 150
+                            && r.right > window.innerWidth * 0.55) {
+                        activityRoot = node;
+                        break;
+                    }
+                    node = node.parentElement;
+                }
+                if (activityRoot) break;
+            }
+        } catch (e) {}
+        if (panels.length === 0 && !activityRoot) return out;
         // Prefer the rightmost-and-tallest — ChatGPT mounts a single
         // dominant side panel; smaller candidates are usually unrelated
         // chrome that happens to match the selector.
@@ -17710,7 +17786,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
             return (rb.height * (rb.right > window.innerWidth * 0.5 ? 1.5 : 1))
                  - (ra.height * (ra.right > window.innerWidth * 0.5 ? 1.5 : 1));
         });
-        const panel = panels[0];
+        const panel = activityRoot || panels[0];
         const panelText = (panel.innerText || '').trim();
         out.partial_text_len = panelText.length;
 
@@ -17728,7 +17804,10 @@ async def scrape_chatgpt_activity_panel_tracking(page):
             '[class*="step" i]', '[class*="checklist" i] > div',
             '[class*="task" i] > div', '[class*="activity" i]'
         ].join(', ');
-        const VERB_GATE = /^(?:checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing|confirming|synthesi[zs]ing)\b/i;
+        // #913: was a lone \\b in a NON-raw Python string — Python parsed it
+        // into a literal backspace char, so this gate NEVER matched and the
+        // side-panel walker returned zero step rows since it shipped.
+        const VERB_GATE = /^(?:checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing|confirming|synthesi[zs]ing)\\b/i;
         const seenStep = new Set();
         panel.querySelectorAll(STEP_SELS).forEach(e => {
             const t = (e.innerText || '').trim();
@@ -17805,10 +17884,10 @@ async def scrape_chatgpt_activity_panel_tracking(page):
                     break
         except Exception:
             pass
-    # #913: inline fallback — P1 Pro/ET (and any non-DR mode) renders the
-    # thoughts/activity drawer INLINE in the last assistant turn instead of
-    # a side panel. Scrape that shape when no side panel yielded data, so
-    # the FE raw-activity dropdown + cycling readings stay rich in P1 too.
+    # #913: inline-turn fallback — when no side panel yielded data (panel
+    # closed, or open but still skeleton-only), scrape the last assistant
+    # turn itself: status line, verb rows, hostname chips, counts. Keeps
+    # the FE raw-activity dropdown + cycling readings rich in P1 too.
     if not res or (not res.get("steps") and not res.get("source_urls")
                    and not int(res.get("searches", 0) or 0)):
         try:
@@ -19739,9 +19818,9 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                     try:
                         # #913 anti-toggle: the status line is a TOGGLE — the
                         # pre-#913 loop re-clicked it every cycle because the
-                        # side-panel-only verifier couldn't see the inline
-                        # drawer it had already opened. NEVER click while a
-                        # shape is open.
+                        # verifier's width/text gates rejected the narrow,
+                        # skeleton-only Activity panel it had already opened.
+                        # NEVER click while a shape is open.
                         _st_pre = await _chatgpt_activity_state(page)
                         if _st_pre.get("side_panel") or _st_pre.get("inline_expanded"):
                             _panel_open_done = True
@@ -19822,10 +19901,10 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                     "Open the research activity for the latest response in "
                                     "this ChatGPT Pro/Thinking conversation: click the "
                                     "shimmering status line directly below the last sent "
-                                    "message. ONE click only. The result may be a side "
-                                    "panel sliding out on the right OR an inline thoughts/"
-                                    "activity section expanding below the line — EITHER "
-                                    "counts as open.",
+                                    "message. ONE click only — it is a toggle. Expected "
+                                    "result: a NARROW 'Activity · <seconds>' panel on the "
+                                    "right — even if it only shows gray skeleton bars, "
+                                    "that IS open. Never click 'Answer now' or the X.",
                                     model=CUA_MODEL, max_iterations=5,
                                     verbose=verbose, target_page=page),
                                 timeout=120.0)
@@ -22468,10 +22547,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     not p.get("chatgpt_activity_panel_open")):
                 try:
                     # #913 anti-toggle: the strip/status line is a TOGGLE.
-                    # Never click while a shape (side panel OR inline drawer)
-                    # is already open — the pre-#913 side-only verifier
-                    # couldn't see the inline drawer and re-clicked it every
-                    # cycle, closing what it had just opened.
+                    # Never click while a shape is already open — the
+                    # pre-#913 verifier's width/text gates rejected the
+                    # narrow, skeleton-only Activity panel and re-clicked
+                    # every cycle, closing what it had just opened.
                     _st_pre = await _chatgpt_activity_state(p["page"])
                     if _st_pre.get("side_panel") or _st_pre.get("inline_expanded"):
                         p["chatgpt_activity_panel_open"] = True
@@ -22560,9 +22639,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 "Open the research activity for the latest response in "
                                 "this ChatGPT Deep Research conversation: click the live "
                                 "activity strip / shimmering status line attached to it. "
-                                "ONE click only. The result may be a side panel sliding "
-                                "out on the right OR an inline thoughts/activity section "
-                                "expanding below the line — EITHER counts as open.",
+                                "ONE click only — it is a toggle. Expected result: a side "
+                                "panel on the right (execution plan / step list, or a "
+                                "narrow 'Activity' panel — skeleton bars still count as "
+                                "open). Never click 'Answer now' or the X.",
                                 model=CUA_MODEL, max_iterations=5,
                                 verbose=verbose, target_page=p["page"]),
                             timeout=120.0)
