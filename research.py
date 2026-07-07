@@ -1277,6 +1277,17 @@ def log(msg, level="INFO"):
     print(f"[{ts}] [{level}] {msg}")
 
 
+# #907: --login's profile pre-probe silences the Browser.start orphan-sweep
+# chatter (the "Closing orphaned Chrome PID …" per-PID flood that buried the
+# login terminal). Serve keeps the full detail — it's real diagnostics there.
+_BROWSER_SWEEP_QUIET = False
+
+
+def _sweep_log(msg, level="INFO"):
+    if not _BROWSER_SWEEP_QUIET:
+        log(msg, level)
+
+
 # ── Terminal colors (used by --pair for the branded UI) ──────────────────
 # Detects tty + enables ANSI on Windows 10+ so colors render in cmd/powershell.
 _USE_COLOR = False
@@ -13003,6 +13014,21 @@ def fail_phase(phase: int, title: str = "", details: str = "",
         title = error
     if details == "" and reason:
         details = reason
+    # #908: never persist "errored" onto a phase the pipeline hasn't reached
+    # — a gate/preflight failure tagged with a FUTURE phase painted that
+    # phase's tile red (observed 2026-07-06: the P3 no-output gate → red
+    # NotebookLM tile while the run was visibly at P2). The card + actions
+    # still fire; only the icon-state write (and, via quiet, the volatile
+    # tile badge) is demoted. Explicit mark_phase_errored=False callers are
+    # unaffected; current-or-past phases keep today's behavior.
+    try:
+        _cur_phase = getattr(_runtime, "phase", None)
+        if mark_phase_errored and isinstance(_cur_phase, int) and phase > _cur_phase:
+            log(f"[fail_phase] phase {phase} hasn't started (current={_cur_phase}) "
+                "— demoting to quiet card (no errored tile)", "INFO")
+            mark_phase_errored = False
+    except Exception:
+        pass
     if actions is None:
         actions = []
         if can_retry:
@@ -13629,6 +13655,14 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None):
     On a retry attempt the auto-retry guard won't fire again, so callers
     must use fail_phase/fail_agent instead — see the `_runtime.is_retry_attempt`
     branch at each browser-crash site."""
+    # #907: a --login in flight killed this Chrome ON PURPOSE. No auto-retry
+    # happens (the planner stands down), so a "tab crashed — auto-retrying"
+    # banner would be both wrong and alarming; run_pipeline's failure path
+    # emits the honest "Interrupted by the login command" card instead.
+    if _login_interrupt_active():
+        log("Browser death coincides with an active --login — suppressing the "
+            "crash banner (login-interrupt card follows)", "INFO")
+        return
     base = {
         "actions": [],
         "alertType": "warn",
@@ -13658,7 +13692,7 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None):
 # a DNS retry → the whole subsystem was dead code.
 
 
-def fail_agent(agent_key: str, title: str, details: str = ""):
+def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False):
     """Template B: Phase 2 per-agent error alert. Emits pipeline_error
     scoped to one agent with [Retry (hard), Skip]. NO Stop.
     Retry uses mode=hard (close tab + re-run setup) — the more recoverable
@@ -13669,17 +13703,24 @@ def fail_agent(agent_key: str, title: str, details: str = ""):
     20-min no-growth silent grace before this fires, so an extra budget-
     extension affordance is redundant.
 
+    #906 `skip_only=True`: Skip is the ONLY action — used by the hands-off
+    Cloudflare paths, where a Retry (hard) would close + re-open/navigate
+    the walled surface (exactly the interaction the 2026-07-06 directive
+    forbids because every touch raises the bot score).
+
     Every alert carries `dismissible: True` + a unique
     `alert_id = agent_<key>_error` so the FE store can dedupe dismiss."""
     # Dismiss button removed 2026-04-28 — the alert's corner ✕ already
     # records the alertId in dismissedAlertIds and clears the visible
     # alert (PhaseDropdown.tsx:2062-2069), so an in-action Dismiss button
     # was a duplicate path that just added noise.
-    actions = [
-        {"id": "retry", "label": "Retry (hard)", "style": "primary",
-         "command": {"action": "retry_agent", "agent": agent_key, "mode": "hard"}},
-    ]
-    actions.append({"id": "skip", "label": "Skip", "style": "default",
+    actions = []
+    if not skip_only:
+        actions.append(
+            {"id": "retry", "label": "Retry (hard)", "style": "primary",
+             "command": {"action": "retry_agent", "agent": agent_key, "mode": "hard"}})
+    actions.append({"id": "skip", "label": "Skip",
+                    "style": "primary" if skip_only else "default",
                     "command": {"action": "skip_agent", "agent": agent_key}})
     emit_event("pipeline_error", phase=2, agent=agent_key,
                error=title, details=details, actions=actions,
@@ -15321,8 +15362,22 @@ async def _open_chatgpt_activity_panel(page):
     `_verify_chatgpt_panel_open(page)` 2s post-click to confirm side panel
     actually rendered (mitigates silent click failures)."""
     JS = """() => {
-        // searches | sources | results — covers all observed badge wordings
-        const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?)\\b/i;
+        // searches | sources | results | citations — covers all observed
+        // badge wordings ("citations" added 2026-07-06 #905: the completed
+        // strip reads "Research completed in 8m · 17 citations · 96 searches").
+        const COUNT = /\\b\\d+\\s+(?:searches?|sources?|results?|citations?)\\b/i;
+        // 2026-07-06 (#905, live-run walked_hits=0 ×3): two NEW strip states
+        // the old anchors missed entirely —
+        //  - COMPLETED: after the run finishes the strip drops the ellipsis
+        //    and reads "Research completed in 8m · …". Clicking it still
+        //    opens the sources side panel (needed for source chips + the
+        //    end-of-phase URL extraction), so it must stay clickable.
+        //  - STATUS_LINE: the 2026-07 UI streams a tier-prefixed shimmer
+        //    line ("Pro thinking") with NO ellipsis, NO count, and the verb
+        //    not line-initial — invisible to VERB_ONLY's ^ anchor. Length-
+        //    capped at 60 chars in findHitsIn so prose can't match.
+        const COMPLETED = /\\bresearch\\s+completed\\b|\\bcompleted\\s+in\\s+\\d+\\s*(?:s|m|min|h)\\b/i;
+        const STATUS_LINE = /^(?:[\\w.+-]{1,12}\\s+)?(?:thinking|reasoning|researching)\\b/i;
         // Verb-only fallback for P1 Pro+ET strips that haven't materialized a
         // count yet. Includes "thinking"/"reasoning" because Pro+ET shows
         // those before swapping to site-fetch verbs ("Reading <site>",
@@ -15345,13 +15400,16 @@ async def _open_chatgpt_activity_panel(page):
         // "parent strip > badge child" guarantee while putting the live
         // ellipsis-bearing leaf above everything (it's the actual click
         // target with the React handler attached, not a presentational
-        // wrapper). Tiers: 5 ellipsis+verb > 4 ellipsis+count > 3.5 bare
-        // ellipsis > 3 verb+count > 2 verb-only > 1 count-only > 0 (none —
+        // wrapper). Tiers: 5 ellipsis+verb > 4.5 ellipsis+count >
+        // 4 completed-strip > 3.5 bare ellipsis > 3.2 status-line >
+        // 3 verb+count > 2 verb-only > 1 count-only > 0 (none —
         // unreachable; findHitsIn filters).
         const hitScore = (h) => {
             if (h.hasEllipsis && h.hasVerb)  return 5;
-            if (h.hasEllipsis && h.hasCount) return 4;
+            if (h.hasEllipsis && h.hasCount) return 4.5;
+            if (h.hasCompleted)              return 4;
             if (h.hasEllipsis)               return 3.5;
+            if (h.hasStatusLine)             return 3.2;
             if (h.hasVerb && h.hasCount)     return 3;
             if (h.hasVerb)                   return 2;
             if (h.hasCount)                  return 1;
@@ -15376,12 +15434,20 @@ async def _open_chatgpt_activity_panel(page):
                 // "..." in streamed prose paragraphs typically run >240
                 // chars (filtered out) or <12 chars (placeholder spans).
                 const matchesEllipsis = ELLIPSIS.test(t) && t.length >= 12 && t.length <= 240;
-                if (!matchesCount && !matchesVerb && !matchesEllipsis) continue;
+                // #905: completed strip ("Research completed in 8m · …") —
+                // leaf cap 120 chars so a prose recap can't match.
+                const matchesCompleted = COMPLETED.test(t) && t.length <= 120;
+                // #905: shimmer status line ("Pro thinking") — short leaves only.
+                const matchesStatus   = STATUS_LINE.test(t) && t.length <= 60;
+                if (!matchesCount && !matchesVerb && !matchesEllipsis
+                        && !matchesCompleted && !matchesStatus) continue;
                 const r = el.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
                 out.push({ el, top: r.top, len: t.length,
                            hasCount: matchesCount, hasVerb: matchesVerb,
-                           hasEllipsis: matchesEllipsis });
+                           hasEllipsis: matchesEllipsis,
+                           hasCompleted: matchesCompleted,
+                           hasStatusLine: matchesStatus });
             }
             return out;
         }
@@ -17498,14 +17564,14 @@ class Browser:
                             except (psutil.NoSuchProcess, psutil.AccessDenied):
                                 chrome_start_ts = 0.0
                             if serve_start_ts > 0 and chrome_start_ts >= serve_start_ts:
-                                log(f"Sparing sibling Chrome PID {proc.info['pid']} (younger than --serve, our profile)")
+                                _sweep_log(f"Sparing sibling Chrome PID {proc.info['pid']} (younger than --serve, our profile)")
                                 continue
                             # #898b: close GRACEFULLY first — a hard kill can
                             # drop a seconds-old sign-in (e.g. the user just
                             # ran --login) before Chrome flushes it to disk.
                             # Windows needs taskkill /T WITHOUT /F for a real
                             # WM_CLOSE (psutil terminate() is hard there).
-                            log(f"Closing orphaned Chrome PID {proc.info['pid']} (our profile) — graceful, hard-kill fallback")
+                            _sweep_log(f"Closing orphaned Chrome PID {proc.info['pid']} (our profile) — graceful, hard-kill fallback")
                             try:
                                 if sys.platform == "win32":
                                     subprocess.run(
@@ -17525,7 +17591,7 @@ class Browser:
                 _gone, _alive = await asyncio.to_thread(psutil.wait_procs, _orphans, 5)
                 for _p in _alive:
                     try:
-                        log(f"Killing orphaned Chrome PID {_p.pid} (didn't exit within the graceful window)")
+                        _sweep_log(f"Killing orphaned Chrome PID {_p.pid} (didn't exit within the graceful window)")
                         _p.kill()
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
@@ -19234,7 +19300,12 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                 # useful here, so emit passive banner and let the outer
                 # auto-retry rebuild the session. last_failure_kind tells
                 # run_pipeline.finally to bypass the not-resume_dir gate.
-                _runtime.last_failure_kind = "browser_crash"
+                # #907: a fresh --login marker means the death was the login
+                # command closing our Chrome — classify accordingly (no
+                # auto-retry; honest card from run_pipeline's failure path).
+                _runtime.last_failure_kind = ("login_interrupt"
+                                              if _login_interrupt_active()
+                                              else "browser_crash")
                 emit_browser_recovery_status(
                     phase, agent=_ag_norm_crash if (phase == 2 and _ag_norm_crash) else None)
                 return False
@@ -19243,7 +19314,9 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
             # garbage; treat that as a crash too.
             log(f"[{label}] Page handle invalid — treating as crash", "WARN")
             _ag_norm_crash = normalize_agent_key(label)
-            _runtime.last_failure_kind = "browser_crash"
+            _runtime.last_failure_kind = ("login_interrupt"
+                                          if _login_interrupt_active()
+                                          else "browser_crash")
             emit_browser_recovery_status(
                 phase, agent=_ag_norm_crash if (phase == 2 and _ag_norm_crash) else None)
             return False
@@ -20966,6 +21039,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             "claude_clarification_replied": False,  # one-shot flag for clarification-defer reply
             "gemini_kickoff_nudge_count": 0,        # multi-shot nudge counter (max 3, 3min apart) for Gemini kickoff-stall
             "gemini_last_kickoff_nudge_at": 0.0,    # timestamp gate enforcing 3min spacing between Gemini kickoff nudges
+            # #905: 2D hands off right after a confirmed "Start research"
+            # click so cycle 1 can open the ChatGPT/Claude panels first; the
+            # cycle-1 Gemini leg then finishes the start-verify.
+            "needs_start_verify": bool(agent.get("needs_start_verify")),
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -21005,6 +21082,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 _crashed = True
             if _crashed:
                 _crash_key = normalize_agent_key(_crash_name)
+                # #906: a tab we closed on a user Skip is not a crash — leave
+                # the agent for the skip consumer just below this sweep.
+                if _crash_key in _controls.skipped_agents:
+                    continue
+                # #907: --login killed this Chrome ON PURPOSE (it takes every
+                # tab at once). Don't fail agents one by one into a phantom
+                # "PHASE 2 COMPLETE: 0/3" → phase-3 gate card — unwind the
+                # whole pipeline so run_pipeline's failure path pauses at the
+                # checkpoint with the honest "Interrupted by the login
+                # command" card (Retry = resume_from_checkpoint).
+                if _login_interrupt_active():
+                    log(f"[{_crash_name}] Browser closed by the login command — "
+                        "pausing the run at its checkpoint", "WARN")
+                    _runtime.last_failure_kind = "login_interrupt"
+                    raise RuntimeError(
+                        "research browser closed by the login command (login interrupt)")
                 log(f"[{_crash_name}] Browser tab crashed — failing agent", "WARN")
                 # Always-auto: passive banner, outer run_pipeline.finally
                 # rebuilds the browser session and resumes from checkpoint.
@@ -21148,20 +21241,34 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             _agent_name = _skip_name_map.get(_ag_key)
             if _agent_name and _agent_name in pending:
                 p = pending[_agent_name]
-                log(f"[{_agent_name}] Skipped by user — extracting partial output", "WARN")
-                try:
-                    await browser.switch_to_page(p["page"])
-                    _partial = await extract_fns[_agent_name](
-                        p["page"], browser=browser, cua_client=cua_client,
-                        label=_agent_name, verbose=verbose)
-                except Exception as _e:
-                    log(f"[{_agent_name}] Skip-extract failed: {_e}", "WARN")
+                # #906 hands-off: never run the extraction ladder against a
+                # verification-walled tab — DOM walks + the CUA fallback ARE
+                # the touches the 2026-07-06 Cloudflare directive forbids
+                # (live repro: skip-extract drove the full ladder against the
+                # challenge_redirect page), and there's nothing to extract
+                # from an agent that never got past the wall anyway.
+                if _ag_key in _controls.hv_blocked:
+                    log(f"[{_agent_name}] Skipped by user — verification-walled tab, "
+                        "skipping partial extraction (hands-off)", "WARN")
                     _partial = ""
+                else:
+                    log(f"[{_agent_name}] Skipped by user — extracting partial output", "WARN")
+                    try:
+                        await browser.switch_to_page(p["page"])
+                        _partial = await extract_fns[_agent_name](
+                            p["page"], browser=browser, cua_client=cua_client,
+                            label=_agent_name, verbose=verbose)
+                    except Exception as _e:
+                        log(f"[{_agent_name}] Skip-extract failed: {_e}", "WARN")
+                        _partial = ""
                 results[_agent_name] = {
                     "status": "skipped_by_user",
                     "text": _partial or "",
                     "url": p.get("url", ""),
-                    "page": p["page"],
+                    # #906: the tab is closed below — never hand a dead page
+                    # handle downstream (nothing consumes it for skipped
+                    # agents; run_phase2's caller only reads .text).
+                    "page": None,
                     "elapsed_sec": int(time.time() - p["start_time"]),
                 }
                 del pending[_agent_name]
@@ -21169,6 +21276,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                            reason="user_skip",
                            partial_chars=len(_partial or ""))
                 # status="skipped" auto-persisted by emit_event hook (runtime reason set).
+                # #906: Skip means skip — close the platform's tab (guards
+                # inside: main/last tab is left open, just unregistered).
+                await _close_skipped_agent_tab(browser, p.get("page"), _ag_key, _agent_name)
             # Whether or not the agent was actually in pending, clear it from
             # the skip set so we don't keep firing agent_skipped every tick.
             _controls.skipped_agents.discard(_ag_key)
@@ -21355,12 +21465,50 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         # Rotate iteration order so no agent is always "first". With 3
         # agents, the order cycles A→B→C, B→C→A, C→A→B, A→B→C, ensuring
         # that over 3 ticks every agent has been processed first.
+        # #905: shift is (_tick_counter - 1) so CYCLE 1 runs in insertion
+        # order — ChatGPT → Claude → Gemini — i.e. "open both source panels
+        # first, then come back to check Gemini" (2026-07-06 user directive).
+        # The old `_tick_counter %` made tick 1 start at Claude.
         _pending_keys = list(pending.keys())
         if _pending_keys:
-            _shift = _tick_counter % len(_pending_keys)
+            _shift = (_tick_counter - 1) % len(_pending_keys)
             _pending_keys = _pending_keys[_shift:] + _pending_keys[:_shift]
 
+        # #905 "60 secs at each platform": each platform KEEPS the foreground
+        # for ~60s after its leg (interruptible on stop/pause/skip/retry),
+        # instead of the old all-legs-back-to-back + one flat 120s sleep
+        # parked on whichever agent happened to be last. Cycle 1 runs with NO
+        # dwell — its whole job is opening the panels + re-checking Gemini
+        # immediately after "Start research".
+        async def _leg_dwell():
+            try:
+                _dwell_target = int(os.environ.get("P2_AGENT_DWELL_SEC", "60"))
+            except ValueError:
+                _dwell_target = 60
+            # Fast cadence once any agent shows a done-marker (mirrors the
+            # old 30s-when-done cycle sleep — the 2-snapshot confirm gate
+            # wants a quick second tick).
+            if any(pp.get("done_marker_first_at", 0.0) > 0.0 for pp in pending.values()):
+                _dwell_target = 10
+            _dw0 = time.time()
+            while time.time() - _dw0 < _dwell_target:
+                if (_controls.is_stop() or _controls.is_pause()
+                        or _controls.skipped_agents or _controls.retry_agents_hard):
+                    return
+                await asyncio.sleep(min(5.0, max(0.1, _dwell_target - (time.time() - _dw0))))
+
+        _first_leg_of_tick = True
         for name in _pending_keys:
+            # Dwell on the PREVIOUS platform before moving here (cycle 1 and
+            # the first leg of every tick run immediately — the tick's own
+            # trailing dwell already paced the rotation).
+            if not _first_leg_of_tick and _tick_counter > 1:
+                await _leg_dwell()
+                if _controls.is_stop() or _controls.is_pause():
+                    break
+            _first_leg_of_tick = False
+            if name not in pending:
+                continue  # dropped by a signal handled mid-tick
             p = pending[name]
             elapsed = time.time() - p["start_time"]
             # Per-agent cycle counter (used for "give research time to settle"
@@ -21391,6 +21539,27 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 p["last_spotlight_at"] = time.time()
                 try:
                     await _spotlight_latest_response(p["page"], name)
+                except Exception:
+                    pass
+
+            # #905: deferred Gemini start-verify — 2D hands off right after a
+            # confirmed "Start research" click so cycle 1 can open the other
+            # panels first; this leg closes the loop ("come back to check
+            # Gemini is all good"). Cheap DOM probe, retried each cycle until
+            # it flips (the detectors + wall-clock cap cover a never-started
+            # plan exactly as for any other not-verified agent).
+            if name == "Gemini" and p.get("needs_start_verify"):
+                try:
+                    if await verify_gemini_generating(p["page"]):
+                        p["needs_start_verify"] = False
+                        emit_event("agent_progress", phase=2, agent="gemini",
+                                   status="generating",
+                                   progress="Gemini Deep Research plan created and started")
+                        log("[2D] Gemini is researching ✓ (confirmed on round-robin re-check)")
+                        try:
+                            await inject_agent_observer(p["page"], "gemini")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -22977,18 +23146,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 m = int((time.time() - p["start_time"]) / 60)
                 parts.append(f"{n}:{m}m")
             log(f"Still polling: {', '.join(parts)}")
-            # 2026-04-28: speed up the poll cycle ONCE any pending agent
-            # has hit its done-marker. Default poll_interval is 120s
-            # (POLL_DEEP_RESEARCH) — fine while agents are mid-run, but
-            # the 2-snapshot tolerance gate above wants a quick second
-            # confirmation tick. Drop to 30s when at least one agent is
-            # in done-marker-confirmed state (they finish at unrelated
-            # times, so the cycle is gated by the slowest pending). Save
-            # ~60-90s on the post-completion gap (advisor 2026-04-28 R2).
-            _any_done_marker = any(
-                p.get("done_marker_first_at", 0.0) > 0.0 for p in pending.values()
-            )
-            await asyncio.sleep(30 if _any_done_marker else poll_interval)
+            # #905: the trailing dwell is the LAST platform's "60 secs at
+            # each platform" leg (the per-leg dwell above only fires between
+            # platforms). Interruptible; drops to 10s once any agent shows a
+            # done-marker (the 2-snapshot confirm gate wants a quick second
+            # tick — successor of the 2026-04-28 30s fast path). Cycle 1 has
+            # no dwell at all: panels first, Gemini check, straight into
+            # cycle 2 which paces normally.
+            if _tick_counter > 1:
+                await _leg_dwell()
 
     return results
 
@@ -27752,14 +27918,17 @@ def _hv_fail_copy(platform: str, reason: str) -> tuple[str, str]:
     _names = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
     plat = _names.get(platform.lower(), platform.capitalize())
     if "cloudflare" in (reason or "").lower():
+        # #906 + hands-off directive: no Retry mention — the card is
+        # Skip-only for Cloudflare (fail_agent skip_only=True) because a
+        # Retry (hard) would re-navigate the walled tab and raise the score.
         return (
             f"{plat} hit Cloudflare's human check",
             f"Cloudflare re-issues its 'Verify you are human' check every time it's "
-            f"clicked in the automation window, so clicking there won't clear it. "
-            f"Skip {plat} for this run. To make these checks go away: run the login "
-            f"command on this computer and sign in to {plat} in the real Chrome window "
-            f"it opens — each clean sign-in builds Cloudflare's trust in this computer "
-            f"until it stops asking. Retry gives it one more shot now.",
+            f"clicked in the automation window, so the run leaves it completely "
+            f"untouched. Skip {plat} for this run. To make these checks go away: "
+            f"run the login command on this computer and sign in to {plat} in the "
+            f"real Chrome window it opens — each clean sign-in builds Cloudflare's "
+            f"trust in this computer until it stops asking.",
         )
     return (
         f"{plat} needs a human check",
@@ -27767,6 +27936,45 @@ def _hv_fail_copy(platform: str, reason: str) -> tuple[str, str]:
         f"{f' ({reason})' if reason else ''}. Solve it in the open browser window, "
         f"then Retry — or Skip {plat} for this run.",
     )
+
+
+async def _close_skipped_agent_tab(browser, page, platform_key: str, label: str,
+                                   preserve_tab: bool = False) -> None:
+    """#906: finalize a user Skip by CLOSING the skipped platform's tab.
+
+    Pre-fix, NO skip path anywhere closed a tab — the skipped platform's
+    window stayed open, and (for a Cloudflare-walled Claude) the round-robin
+    skip consumer even kept touching it. Closing makes Skip mean skip.
+    Guards mirror the hard-retry close (~poll_all_agents_round_robin): never
+    close the browser's main page or the context's LAST page (headful Chrome
+    exits with its last window → dead context for the rest of the run), and
+    never close a caller-preserved warm-reuse tab — those are only
+    unregistered from the mid-run dispatcher."""
+    try:
+        _runtime.unregister_page(platform_key, final_status="skipped")
+    except Exception:
+        pass
+    if page is None:
+        return
+    try:
+        if page.is_closed():
+            return
+    except Exception:
+        return
+    keep_open = bool(preserve_tab) or (page is getattr(browser, "page", None))
+    if not keep_open:
+        try:
+            keep_open = len(page.context.pages) <= 1
+        except Exception:
+            keep_open = False
+    if keep_open:
+        log(f"[{label}] Skip: leaving the {platform_key} tab open (main/last tab)", "INFO")
+        return
+    try:
+        await page.close()
+        log(f"[{label}] Skip: closed the {platform_key} tab", "INFO")
+    except Exception as _ce:
+        log(f"[{label}] Skip: couldn't close the {platform_key} tab: {_ce}", "WARN")
 
 
 async def _hv_setup_fail_card(page, platform: str, label: str) -> bool:
@@ -27807,7 +28015,10 @@ async def _hv_setup_fail_card(page, platform: str, label: str) -> bool:
         details += (" This profile also looks signed out, so the sign-in via the "
                     "login command is required, not optional.")
     log(f"[{label}] setup failed ON a human-verification wall ({reason}) — emitting HV card, not the generic fail", "WARN")
-    fail_agent(platform_key, title, details)
+    # #906 hands-off Cloudflare: Skip-only card (Retry (hard) would re-open /
+    # re-navigate the walled surface — the exact touch the directive forbids).
+    fail_agent(platform_key, title, details,
+               skip_only="cloudflare" in (reason or "").lower())
     return True
 
 
@@ -28223,13 +28434,26 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             return False
         # User tapped "Skip agent" in the banner → drop this agent cleanly
         if platform_key in _controls.skipped_agents:
-            _controls.skipped_agents.discard(platform_key)
+            # #906: KEEP the marker in skipped_agents — this function returns
+            # a bare bool, so False is ambiguous ("unresolved" vs "user
+            # skipped") and the callers previously always followed up with a
+            # fail_agent card (the observed SECOND "hit Cloudflare's human
+            # check" alert right after the user skipped, which also clobbered
+            # the just-persisted "skipped" status with "errored"). Callers
+            # now check membership to suppress that card; the round-robin's
+            # skip consumer discards the marker when it finalizes the agent.
             log(f"[{label}] User chose Skip agent during human verification — dropping {platform_key}", "INFO")
             emit_event("agent_skipped", phase=phase, agent=platform_key,
                        reason="human_verification_skipped")
             # status="skipped" auto-persisted by emit_event hook.
             emit_event("pipeline_resumed", phase=phase, reason="skip_agent_during_verification", agent=platform_key)
             _controls.request_resume()
+            # #906: Skip means skip — close the walled tab NOW (zero further
+            # touches; hands-off for Cloudflare) instead of leaving it open
+            # for the poll loop to keep probing. Guards inside: never closes
+            # the main/last tab or a caller-preserved warm-reuse tab.
+            await _close_skipped_agent_tab(browser, page, platform_key, label,
+                                           preserve_tab=preserve_tab)
             return False
         if not _controls.is_pause():
             # User tapped Resume — verify the challenge is actually cleared
@@ -28602,13 +28826,26 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                                         verbose=verbose, initial_reason=reason,
                                                         preserve_tab=_preserve_tab)
         if not cleared:
+            # #906: a user Skip during the tier-5 wait also returns False —
+            # the HV loop keeps the marker in skipped_agents exactly so we
+            # can tell that apart from "unresolved". The skip already emitted
+            # agent_skipped + closed the tab; a fail card here was the
+            # observed duplicate-alert bug (Skip → second "hit Cloudflare's
+            # human check" card with Retry (hard) right after skipping).
+            if platform_l in _controls.skipped_agents:
+                log(f"[{label}] User skipped {platform} during verification — no failure card")
+                return page, False
             # #896: reason-aware card — Cloudflare gets the real-Chrome
             # trust-building guidance, not "try again in the open browser".
             # Prefer the cascade's refreshed verdict (hv_blocked) over our
             # possibly-stale pre-cascade probe.
-            _hv_title, _hv_details = _hv_fail_copy(
-                platform, _controls.hv_blocked.get(platform_l, reason))
-            fail_agent(platform_l, _hv_title, _hv_details)
+            _hv_reason_final = _controls.hv_blocked.get(platform_l, reason)
+            _hv_title, _hv_details = _hv_fail_copy(platform, _hv_reason_final)
+            # Hands-off Cloudflare (2026-07-06 directive): Skip is the ONLY
+            # action — a Retry (hard) re-navigates the walled tab, which is
+            # exactly the interaction that raises the bot score.
+            fail_agent(platform_l, _hv_title, _hv_details,
+                       skip_only="cloudflare" in (_hv_reason_final or "").lower())
             return page, False
         # Settle after clearance — page often reloads to the real content
         await asyncio.sleep(2)
@@ -28687,11 +28924,17 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                                             verbose=verbose, initial_reason=_hv_reason,
                                                             preserve_tab=_preserve_tab)
             if not cleared:
+                # #906: user Skip during the wait → no second card (see the
+                # Layer-0 twin above for the full rationale).
+                if platform_l in _controls.skipped_agents:
+                    log(f"[{label}] User skipped {platform} during verification — no failure card")
+                    return page, False
                 # #896: reason-aware card (Cloudflare → real-Chrome guidance);
                 # prefer the cascade's refreshed verdict over our pre-probe.
-                _hv_title, _hv_details = _hv_fail_copy(
-                    platform, _controls.hv_blocked.get(platform_l, _hv_reason))
-                fail_agent(platform_l, _hv_title, _hv_details)
+                _hv_reason_final = _controls.hv_blocked.get(platform_l, _hv_reason)
+                _hv_title, _hv_details = _hv_fail_copy(platform, _hv_reason_final)
+                fail_agent(platform_l, _hv_title, _hv_details,
+                           skip_only="cloudflare" in (_hv_reason_final or "").lower())
                 return page, False
             await asyncio.sleep(2)
             # Retry Playwright setup once, now that the challenge is gone
@@ -29299,6 +29542,21 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     log("  Sequence: ChatGPT → Claude → Gemini (submit+plan) → scrape-pass → Gemini (Start) → Poll all")
     log("=" * 60)
 
+    # #906: clear STALE skip markers for the agents this pass launches. The
+    # tier-5 HV skip now keeps its marker (callers check membership to
+    # suppress the duplicate fail card) and the round-robin consumer only
+    # discards markers when it actually runs — so a marker could survive a
+    # phase-2 restart (e.g. the P3 gate's "Retry Phase 2") and instantly
+    # auto-"skip" the relaunched agent at its next HV wait, or silently
+    # suppress a legit failure card. A skip is a this-attempt decision, not
+    # a persistent config: consume leftovers up front (matches the pre-fix
+    # semantics where the consumer discarded every marker each tick).
+    for _stale_ag in (enabled_agents if enabled_agents is not None
+                      else ("chatgpt", "gemini", "claude")):
+        if _stale_ag in _controls.skipped_agents:
+            log(f"Phase 2: clearing stale skip marker for {_stale_ag} (fresh launch)", "INFO")
+            _controls.skipped_agents.discard(_stale_ag)
+
     # Ensure brief.md is on disk for file-attachment delivery (Option A).
     brief_path = None
     if _tracks_dir:
@@ -29372,7 +29630,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
             if verified_a:
                 break
-        agents["ChatGPT"] = {"page": chatgpt_page, "verified": verified_a, "url": chatgpt_page.url if chatgpt_page else ""}
+        # #905: stamp research start at SUBMIT time (like Gemini's post-click
+        # stamp) — the round-robin previously stamped start_time at its own
+        # entry, minutes later, so MIN_WAIT-gated completion checks ignored
+        # a ChatGPT that had already finished during the Gemini plan-wait.
+        agents["ChatGPT"] = {"page": chatgpt_page, "verified": verified_a,
+                             "url": chatgpt_page.url if chatgpt_page else "",
+                             "research_started_at": time.time()}
         if verified_a:
             emit_event("agent_progress", phase=2, agent="chatgpt", status="generating", progress="ChatGPT Deep Research started and verified")
             log("[2A] ChatGPT Deep Research is running ✓")
@@ -29404,6 +29668,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # (page, False). Don't mislabel a clean cancellation as a hard
                 # agent failure — no red fail_agent banner, no 'errored' status.
                 log("[2A] ChatGPT setup ended on user stop — clean cancel, no failure banner", "INFO")
+            elif "chatgpt" in _controls.skipped_agents:
+                # #906: the user already skipped this agent (e.g. during the
+                # HV wait — the tier-5 loop now KEEPS the marker for exactly
+                # this check). agent_skipped/status were emitted there; a
+                # failure card or "setup/paste failed" progress line here
+                # would contradict + duplicate that decision.
+                log("[2A] ChatGPT setup ended after a user Skip — no failure card", "INFO")
             else:
                 log("[2A] ChatGPT setup failed", "ERROR")
                 # Mark as terminally failed so the round-robin doesn't sit on it
@@ -29472,7 +29743,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 browser=browser, cua_client=cua_client, max_retries=15, interval=3, verbose=verbose)
             if verified_c:
                 break
-        agents["Claude"] = {"page": claude_page, "verified": verified_c, "url": claude_page.url if claude_page else ""}
+        # #905: research start = submit time (see the ChatGPT note above).
+        agents["Claude"] = {"page": claude_page, "verified": verified_c,
+                            "url": claude_page.url if claude_page else "",
+                            "research_started_at": time.time()}
         if verified_c:
             emit_event("agent_progress", phase=2, agent="claude", status="generating", progress="Claude Adaptive Thinking started and verified")
             log("[2B] Claude is running ✓")
@@ -29499,6 +29773,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # (page, False). Don't mislabel a clean cancellation as a hard
                 # agent failure — no red fail_agent banner, no 'errored' status.
                 log("[2B] Claude setup ended on user stop — clean cancel, no failure banner", "INFO")
+            elif "claude" in _controls.skipped_agents:
+                # #906: user already skipped during the HV wait (live repro
+                # 2026-07-06: the Skip-only Cloudflare card was answered, and
+                # THIS path then emitted the second "hit Cloudflare's human
+                # check" card with Retry (hard) + Skip, forcing a second
+                # skip). agent_skipped/status were emitted by the HV loop.
+                log("[2B] Claude setup ended after a user Skip — no failure card", "INFO")
             else:
                 log("[2B] Claude setup failed", "ERROR")
                 emit_event("agent_progress", phase=2, agent="claude", status="failed",
@@ -29581,6 +29862,12 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                             # does; an unclosed pipeline_paused leaves the
                             # FE pause chrome stale).
                             emit_event("pipeline_resumed", phase=2, reason="agent_skipped")
+        elif "gemini" in _controls.skipped_agents:
+            # #906: the user already skipped Gemini (e.g. during the HV wait
+            # — the tier-5 loop keeps the marker for this check). The skip
+            # emitted agent_skipped/status there; a "failed" status here
+            # would clobber it. The marker also skips the [2D] plan wait.
+            log("[2C] Gemini setup ended after a user Skip — no failure status", "INFO")
         else:
             # Setup or paste failed — start_agent_no_gemini_wait already emitted
             # pipeline_error with Retry/Skip actions. Mark Gemini terminally
@@ -29759,15 +30046,34 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         _start_wait_max_sec = int(os.environ.get("GEMINI_PLAN_WAIT_SEC", str(5 * 60)))
         # Shared JS: click the "Start research" button, and a sibling probe for
         # whether it's STILL present (used to confirm a click actually took).
+        # 2026-07-06 (#905, live-run forensics): the old `<button>`-only text
+        # match had two failure modes seen in one run — (a) it clicked the
+        # DISABLED skeleton Start button Gemini renders while the plan is
+        # still streaming (3s after submit → "click didn't take after 2
+        # re-clicks"), and (b) it went blind while its own stall diagnostic
+        # dumped a visible {"aria":"Start research"} control, because Gemini
+        # renders the control as [role="button"] in some states. Match BOTH
+        # element shapes + aria-label, and require enabled + actually
+        # rendered (≥8px rect) before clicking/counting.
+        _START_RESEARCH_PREDICATE_JS = (
+            " const CAND = document.querySelectorAll('button, [role=\"button\"]');"
+            " for (const b of CAND) {"
+            "   const t = ((b.textContent) || '').trim().toLowerCase();"
+            "   const a = ((b.getAttribute && b.getAttribute('aria-label')) || '').trim().toLowerCase();"
+            "   if (!t.includes('start research') && !a.includes('start research')) continue;"
+            "   if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;"
+            "   const r = b.getBoundingClientRect();"
+            "   if (r.width < 8 || r.height < 8) continue;"
+        )
         _click_start_js = (
-            "() => { for (const b of document.querySelectorAll('button')) {"
-            " if (((b.textContent)||'').trim().toLowerCase().includes('start research'))"
-            " { b.click(); return true; } } return false; }"
+            "() => {" + _START_RESEARCH_PREDICATE_JS +
+            "   b.click(); return true;"
+            " } return false; }"
         )
         _start_present_js = (
-            "() => { for (const b of document.querySelectorAll('button')) {"
-            " if (((b.textContent)||'').trim().toLowerCase().includes('start research'))"
-            " return true; } return false; }"
+            "() => {" + _START_RESEARCH_PREDICATE_JS +
+            "   return true;"
+            " } return false; }"
         )
         _loop_start = time.time()
         _last_plan_emit = 0.0
@@ -29945,14 +30251,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             _FALLBACK_MAX_REGEN = 3   # CUA-driven re-draft attempts (the in-loop #755 path already tried 3 via JS)
             log(f"[2D] No 'Start research' after {_start_wait_max_sec}s — CUA recovery: "
                 f"retry the plan (≤{_FALLBACK_MAX_REGEN}×) until 'Start research' appears, then click it")
-            _click_start_js = """() => {
-                const btns = document.querySelectorAll('button');
-                for (const b of btns) {
-                    const txt = b.textContent.trim().toLowerCase();
-                    if (txt.includes('start research')) { b.click(); return true; }
-                }
-                return false;
-            }"""
+            # #905: reuse the hardened _click_start_js from the plan-wait loop
+            # above — the recovery path previously redefined a `<button>`-only
+            # variant, so the two finders could disagree about the same DOM.
             for _regen_attempt in range(_FALLBACK_MAX_REGEN):
                 if _controls.is_stop():
                     break
@@ -30058,35 +30359,27 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 "as researching (avoids a false 'running' on a stale/failed plan)", "WARN")
             verified_b = False
         else:
-            # 2026-07-06 (user directive): polling must start ≤30s after a
-            # CONFIRMED "Start research" click. The old wait_until_verified
-            # (15×3s + up to two CUA passes) could hold the round-robin
-            # hostage on the Gemini page for 2-3 minutes AFTER the click —
-            # the observed "run sat at Gemini forever before narration".
-            # The click was already confirmed-taken (start_clicked requires
-            # the 2× re-click confirm), so this verify is belt-and-suspenders:
-            # do a DOM-only poll for ≤30s, then hand off to the round-robin
-            # either way — it keeps not-verified agents ("detectors will
-            # decide") and MIN_WAIT stops premature completion checks.
+            # #905 (2026-07-06 user directive, superseding the same-day ≤30s
+            # verify): after a CONFIRMED "Start research" click, the round-
+            # robin must start IMMEDIATELY — cycle 1 opens the ChatGPT +
+            # Claude source panels FIRST, then comes back to confirm Gemini.
+            # So: one instant DOM probe here (usually already true — the
+            # click was confirmed-taken via the re-click loop), and if it
+            # hasn't flipped yet, the cycle-1 Gemini leg finishes the verify
+            # (needs_start_verify below) seconds later.
             verified_b = False
-            _v0 = time.time()
-            while time.time() - _v0 < 30:
-                if _controls.is_stop():
-                    break
-                try:
-                    if await verify_gemini_generating(gemini_page):
-                        verified_b = True
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(3)
+            try:
+                verified_b = bool(await verify_gemini_generating(gemini_page))
+            except Exception:
+                verified_b = False
             if not verified_b:
-                log("[2D] DOM verify didn't confirm within 30s — handing to the "
-                    "round-robin anyway (click was confirmed; detectors decide)", "WARN")
+                log("[2D] Instant DOM verify didn't confirm — the cycle-1 Gemini "
+                    "leg re-checks (click was confirmed; detectors decide)", "WARN")
         # Record when research actually started (after "Start research" click)
         # so the round-robin doesn't check for completion prematurely
         agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url,
-                            "research_started_at": time.time()}
+                            "research_started_at": time.time(),
+                            "needs_start_verify": bool(start_clicked and not verified_b)}
         if verified_b:
             emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini Deep Research plan created and started")
             log("[2D] Gemini is researching ✓")
@@ -32565,6 +32858,16 @@ def _plan_pipeline_auto_retry(queue_dir, resume_dir, failure_kind, crash_retries
         return (False, 0, is_crash)
     if (queue_dir / ".stop").exists() or (queue_dir / ".pause").exists():
         return (False, 0, is_crash)
+    # Gate 2b (#907) — a --login in flight killed our Chrome ON PURPOSE.
+    # Auto-retrying would relaunch Chrome onto the very profile the user is
+    # signing into (and the login side would kill it again — a fight).
+    # Stand down; run_pipeline's failure path emits the "Interrupted by the
+    # login command" card whose Retry resumes from this same checkpoint
+    # after the login finishes. Marker file = on-disk state, so the
+    # called-twice-consistency contract of this function holds (30-min
+    # freshness window >> the ms between the two calls).
+    if _login_interrupt_active():
+        return (False, 0, is_crash)
     # Gate 3 — phase eligibility. Phase 5 = BE done (FE owns P5); >4 = nothing
     # to retry. A browser crash can surface at phase 0/1 (brief not yet written
     # → detect_resume_phase returns 0), which the legacy `1 < phase` gate
@@ -35029,6 +35332,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # zero usable sources landed on disk. No Retry P2 action —
                 # there's nothing to retry. Offer Skip P3 (run P5 with
                 # whatever the pipeline can salvage) or stop.
+                # #908: mark_phase_errored=False — this gate fires BEFORE
+                # Phase 3 ever starts, and the persistent errored write was
+                # painting the NotebookLM tile red while the actual failure
+                # is the missing research output (user screenshot 2026-07-06).
+                # The decision card + Skip action are unchanged.
                 fail_phase(
                     phase=3,
                     error="No files to research",
@@ -35036,16 +35344,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                             "attach (PDF, Word, text, or Markdown), but none "
                             "came through. Skip this step, or stop and "
                             "re-attach your files."),
+                    mark_phase_errored=False,
                     actions=[
                         {"id": "skip", "label": "Skip Phase 3", "style": "primary",
                          "command": {"action": "skip_phase", "phase": 3}},
                     ],
                 )
             else:
+                # #908: same rationale — the run is still AT Phase 2 when
+                # this fires; NotebookLM hasn't run and must not go red.
                 fail_phase(
                     phase=3,
                     error="No research to turn into a notebook",
                     reason="None of the agents produced a report. Retry the research, or Skip the notebook step.",
+                    mark_phase_errored=False,
                     actions=[
                         {"id": "retry", "label": "Retry Phase 2", "style": "primary",
                          "command": {"action": "retry_phase", "phase": 3}},
@@ -35769,6 +36081,32 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             log(f"Browser crash at phase {last_phase} (attempt {_att}/"
                 f"{BROWSER_CRASH_MAX_RETRIES + 1}) — auto-retrying from "
                 f"checkpoint, no card shown", "WARN")
+        elif (_login_interrupt_active()
+              and _captured_failure_kind in ("browser_crash", "login_interrupt")):
+            # #907: the browser died because --login closed it ON PURPOSE.
+            # Pause semantics + an honest card: Retry resumes from the last
+            # checkpoint once the login run is done (same resume_from_
+            # checkpoint engine as the crash-loop terminal card below); the
+            # chat's Stop button remains the way to end the run instead.
+            # mark_phase_errored=False (#908): nothing errored — the phase
+            # was interrupted, so no phase tile should paint red.
+            log(f"Browser closed by the login command at phase {last_phase} — "
+                "pausing at checkpoint (no auto-retry)", "WARN")
+            emit_event("pipeline_paused", phase=last_phase, reason="login_interrupt")
+            fail_phase(
+                phase=last_phase,
+                error="Interrupted by the Research computer's login command",
+                reason="The login command closed the research browser mid-run. "
+                       "When the login finishes, tap Retry to resume from the "
+                       "last checkpoint — or stop the run with the chat's Stop "
+                       "button.",
+                agent=None,
+                mark_phase_errored=False,
+                actions=[
+                    {"id": "retry", "label": "Retry", "style": "primary",
+                     "command": {"action": "resume_from_checkpoint"}},
+                ],
+            )
         else:
             # Auto-retries exhausted (or a non-recoverable terminal failure):
             # escalate to a user-facing card. Route Retry through the PROVEN
@@ -39420,6 +39758,141 @@ def _kill_chrome_for_profile(profile_dir: str, graceful: bool = False) -> int:
     return signaled
 
 
+def _count_chrome_for_profile(profile_dir: str) -> int:
+    """#907: read-only sibling of _kill_chrome_for_profile — how many Chrome
+    processes currently reference this profile dir. Used to wait for a
+    graceful close to actually finish before printing 'Browser closed'."""
+    try:
+        import psutil
+    except Exception:
+        return 0
+    raw = str(profile_dir).lower().replace("\\", "/")
+    try:
+        resolved = str(Path(profile_dir).resolve()).lower().replace("\\", "/")
+    except Exception:
+        resolved = raw
+    targets = {t for t in (raw, resolved) if t}
+    n = 0
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if not (proc.info["name"] and "chrom" in proc.info["name"].lower()):
+                continue
+            cmdline = " ".join(proc.info["cmdline"] or []).lower().replace("\\", "/")
+            if any(_profile_matches_cmdline(t, cmdline) for t in targets):
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+async def _close_profile_browser_neatly(profile_dir: str) -> None:
+    """#907: graceful close of a profile's Chrome with a bounded wait so the
+    caller can honestly report 'Browser closed' — WM_CLOSE/SIGTERM first
+    (Chrome flushes cookies + session), up to ~8s for a clean exit, then a
+    hard sweep of any remnant. Silent (no per-PID chatter) by design."""
+    signaled = _kill_chrome_for_profile(profile_dir, graceful=True)
+    if signaled <= 0:
+        return
+    for _ in range(16):  # ≤8s for a clean flush + exit
+        await asyncio.sleep(0.5)
+        if _count_chrome_for_profile(profile_dir) == 0:
+            return
+    _kill_chrome_for_profile(profile_dir)  # hard-kill remnants
+    await asyncio.sleep(1.0)
+
+
+# ── #907: --login ↔ serve coordination marker ────────────────────────────────
+# --login stamps this file before closing the backend's Chrome; the serve
+# process checks it when its browser dies so a login interruption is paused
+# at a checkpoint with an honest card instead of being treated as a crash
+# (whose silent auto-retry would relaunch Chrome onto the profile the user
+# is actively signing in on — a kill/relaunch fight).
+_LOGIN_MARKER_NAME = "login_in_progress.json"
+
+
+def _login_marker_path() -> Path:
+    return Path.home() / ".super-research" / _LOGIN_MARKER_NAME
+
+
+def _write_login_marker() -> None:
+    try:
+        p = _login_marker_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"ts": int(time.time() * 1000), "pid": os.getpid()}),
+                     encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _clear_login_marker() -> None:
+    try:
+        _login_marker_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _login_interrupt_active(max_age_sec: int = 30 * 60) -> bool:
+    """True while a --login run is in flight (marker present + fresh). The
+    age cap keeps a hard-killed --login (marker never cleaned up) from
+    classifying every future browser crash as a login interrupt forever."""
+    try:
+        p = _login_marker_path()
+        if not p.exists():
+            return False
+        ts = float(json.loads(p.read_text(encoding="utf-8")).get("ts", 0)) / 1000.0
+        return ts > 0 and (time.time() - ts) < max_age_sec
+    except Exception:
+        return False
+
+
+def _enumerate_ongoing_runs() -> "list[dict]":
+    """#907: best-effort list of runs a live backend is mid-flight on —
+    [{worker, run_id, title}]. Reads the worker claim locks
+    (queues/.worker.N.lock, JSON with pid/run_id — see _write_worker_lock)
+    gated on PID-liveness + the 8h stale-age guard, then meta.json for a
+    human title. Local-disk only, so it works even when the HTTP API is
+    unreachable. Empty list on any failure — callers degrade to the plain
+    profile walk."""
+    out: "list[dict]" = []
+    try:
+        import psutil
+    except Exception:
+        return out
+    try:
+        lock_dir = Path(__file__).parent / "queues"
+        if not lock_dir.exists():
+            return out
+        now_ms = int(time.time() * 1000)
+        for lock_file in sorted(lock_dir.glob(".worker.*.lock")):
+            try:
+                data = json.loads(lock_file.read_text(encoding="utf-8"))
+                wid = int(data.get("worker_id") or 0)
+                pid = int(data.get("pid") or 0)
+                started = int(data.get("started_at") or 0)
+                run_id = str(data.get("run_id") or "").strip()
+                if wid <= 0 or pid <= 0 or not run_id:
+                    continue
+                if not psutil.pid_exists(pid):
+                    continue
+                if started <= 0 or (now_ms - started) > _WORKER_LOCK_PID_REUSE_MAX_AGE_MS:
+                    continue
+                qdir = lock_dir / run_id
+                if (qdir / ".stop").exists():
+                    continue  # already terminally stopped — nothing to close
+                title = run_id
+                try:
+                    meta = json.loads((qdir / "meta.json").read_text(encoding="utf-8"))
+                    title = str(meta.get("title") or meta.get("topic") or run_id)
+                except Exception:
+                    pass
+                out.append({"worker": wid, "run_id": run_id, "title": title})
+            except Exception:
+                continue
+    except Exception:
+        return out
+    return out
+
+
 def _backend_is_running() -> bool:
     """True if a Super Research backend (--serve / --daemon-loop) looks like it's
     running on this machine — so --login can warn before it disrupts an active
@@ -39654,6 +40127,12 @@ async def _probe_profile_logins(profile_dir, *, security_check, results) -> str:
     couldn't run, e.g. the profile is locked by a live Chrome — NOT 'signed out').
     Shared by the `--login` pre-probe and the verify_mode='skip' branch."""
     browser = Browser(profile_dir, headless=False)
+    # #907: silence Browser.start's orphan-sweep chatter for the login
+    # terminal — the per-PID "Closing orphaned Chrome …" flood buried the
+    # branded flow (the sweep itself still runs; with the ongoing runs
+    # already closed neatly by run_login there's little left to sweep).
+    global _BROWSER_SWEEP_QUIET
+    _BROWSER_SWEEP_QUIET = True
     try:
         async with _async_spinner_ctx("Checking the profile"):
             await browser.start()
@@ -39670,6 +40149,7 @@ async def _probe_profile_logins(profile_dir, *, security_check, results) -> str:
         log(f"login: cookie probe unavailable ({_pr_err}) — trusting the sign-in", "WARN")
         return "probe_failed"
     finally:
+        _BROWSER_SWEEP_QUIET = False
         try:
             await browser.close()
         except Exception:
@@ -39988,8 +40468,8 @@ async def run_login() -> None:
     if _backend_is_running():
         print()
         print(f"  {_c(_WARN, '⚠')}  {_c(_BOLD, 'A Super Research backend is running.')}")
-        print(f"  {_c(_DIM, '     --login will close the browser it uses and interrupt any active research.')}")
-        print(f"  {_c(_DIM, '     Best to stop it first; it will pick up the new logins on its next run.')}")
+        print(f"  {_c(_DIM, '     --login pauses any ongoing research at a checkpoint and closes its browser.')}")
+        print(f"  {_c(_DIM, '     Interrupted runs can be resumed from the app (Retry on the alert) after login.')}")
         try:
             _ans = (await asyncio.to_thread(
                 input, f"  {_c(_ACCENT, '>')}  Continue anyway? {_c(_DIM, '[y/N]')}: ")).strip().lower()
@@ -39999,6 +40479,28 @@ async def run_login() -> None:
         if _ans not in ("y", "yes"):
             print(f"  {_c(_DIM, 'Aborted. Stop the backend, then re-run')}  {_c(_BOLD, _PROG + ' --login')}{_c(_DIM, '.')}")
             return
+        # #907: stamp the login marker BEFORE touching any Chrome so the
+        # serve process classifies the coming browser death as a login
+        # interruption (pause-at-checkpoint + honest "Interrupted by the
+        # login command" card with a Retry) instead of a crash it should
+        # silently rebuild from — the rebuild would relaunch Chrome onto
+        # the very profile the user is about to sign in on. Cleared at
+        # process exit (atexit) + a 30-min staleness cap on the serve side
+        # covers a hard-killed --login.
+        _write_login_marker()
+        import atexit as _atexit
+        _atexit.register(_clear_login_marker)
+        # Neatly close ongoing runs first — one line per run instead of the
+        # old per-PID orphan-sweep flood from Browser.start().
+        _ongoing_runs = _enumerate_ongoing_runs()
+        if _ongoing_runs:
+            print()
+            print(f"  {_c(_BOLD, f'Found {len(_ongoing_runs)} ongoing run(s)')}"
+                  f"{_c(_DIM, ' — closing each at a checkpoint (resume from the app after login).')}")
+            for _ri, _run in enumerate(_ongoing_runs, 1):
+                await _close_profile_browser_neatly(str(_profile_dir(_run["worker"])))
+                print(f"  {_c(_OK, '✓')}  Closing Run {_ri} — {_run['title']} → Browser closed")
+            await asyncio.sleep(2)
 
     # CUA vision verifier (optional — verify degrades to a URL-only check without it).
     cua_client = None
