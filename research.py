@@ -15426,13 +15426,18 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
     // Inline-expansion state — SECONDARY shape (ground truth 2026-07-07:
     // P1's click opens the "Activity" SIDE panel; this only covers modes
     // that expand in-turn). Deliberately strict: a mounted thoughts/
-    // activity region with real height. No bare aria-expanded=true
-    // shortcut — a stray expanded chip inside the turn would report
-    // "open", block the click, and starve the real panel forever.
+    // activity region with real height AND readable text. No bare
+    // aria-expanded=true shortcut — a stray expanded chip inside the turn
+    // would report "open", block the click, and starve the real panel
+    // forever. The ≥40-char text floor exists for P2: the DR card is an
+    // iframe embed (its text is invisible to the host), so an "activity"-
+    // classed host container around it must NOT count as expanded.
     for (const el of turn.querySelectorAll(
             '[class*="thought" i], [class*="activity" i], [data-testid*="thought" i]')) {
         const r = el.getBoundingClientRect();
-        if (r.height >= 60 && r.width >= 120) { out.expanded = true; break; }
+        if (r.height < 60 || r.width < 120) continue;
+        if (((el.innerText || '').trim()).length < 40) continue;
+        out.expanded = true; break;
     }
     // Live status line — anchored on structure/wording, closest below the
     // last user message. Same anchor family as the opener walker.
@@ -15529,13 +15534,16 @@ _CHATGPT_INLINE_ACTIVITY_JS = """() => {
 # selector sweep keeps a relaxed width gate + the text gate (it has no
 # header anchor, so the text floor still guards against random asides).
 _CHATGPT_SIDE_PANEL_JS = """() => {
-    // Signature A — "Activity"-headed right-side panel (P1 Pro/ET, and any
-    // future variant that keeps the header). Header text anchors the match,
-    // so no text-length floor: a skeleton-only panel is still OPEN.
+    // Signature A — header-anchored right-side panel: "Activity · Ns"
+    // (P1 Pro/ET, user screenshot 2026-07-07) or "Deep research execution
+    // plan" (P2 DR, CUA transcript 2026-07-06 21:59). Header text anchors
+    // the match, so no text-length floor: a skeleton-only panel is still
+    // OPEN (a freshly-opened DR panel is sparse too, and bouncing it
+    // through the legacy 50-char gate would restart the toggle storm).
     try {
         for (const el of document.querySelectorAll('*')) {
             const t = (el.innerText || '').trim();
-            if (!t || !/^activity\\b/i.test(t)) continue;
+            if (!t || !/^(?:activity|deep research)\\b/i.test(t)) continue;
             if (t.length > 40) continue;              // header leaf, not a container
             const hr = el.getBoundingClientRect();
             if (hr.width === 0 || hr.height === 0) continue;
@@ -15616,6 +15624,70 @@ async def _chatgpt_activity_state(page):
         except Exception:
             pass
     return out
+
+
+async def _close_chatgpt_side_panel(page):
+    """#913: close an open ChatGPT right-side panel (Activity / DR plan).
+
+    Used by 2A warm-tab reuse: P1 and P2 share the SAME ChatGPT tab, and if
+    P1's Activity panel survives the client-side "New chat", P2's cycle-1
+    anti-toggle pre-check would see side_panel=True, flag the panel open
+    WITHOUT ever clicking the DR strip, and spend the whole phase scraping
+    a stale P1 panel. Finds the panel root (same header/legacy signatures
+    as `_chatgpt_activity_state`), clicks its close (×) button; Escape is
+    the fallback. Returns True when a close action was dispatched."""
+    JS = """() => {
+        const roots = [];
+        try {
+            for (const el of document.querySelectorAll('*')) {
+                const t = (el.innerText || '').trim();
+                if (!t || !/^(?:activity|deep research)\\b/i.test(t) || t.length > 40) continue;
+                const hr = el.getBoundingClientRect();
+                if (hr.width === 0 || hr.height === 0) continue;
+                if (hr.left < window.innerWidth * 0.5) continue;
+                let node = el;
+                for (let i = 0; i < 8 && node; i++) {
+                    const r = node.getBoundingClientRect();
+                    if (r.width >= 200 && r.width <= window.innerWidth * 0.6
+                            && r.height >= 150 && r.right > window.innerWidth * 0.55) {
+                        roots.push(node); break;
+                    }
+                    node = node.parentElement;
+                }
+            }
+        } catch (e) {}
+        for (const sel of ['aside', '[role="complementary"]',
+                           '[aria-label*="activity" i]', '[aria-label*="research" i]']) {
+            try {
+                for (const el of document.querySelectorAll(sel)) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 200 && r.height >= 150
+                            && r.right > window.innerWidth * 0.55) roots.push(el);
+                }
+            } catch (e) {}
+        }
+        for (const root of roots) {
+            const btns = root.querySelectorAll(
+                'button[aria-label*="close" i], [role="button"][aria-label*="close" i], button');
+            for (const b of btns) {
+                const bt = (b.innerText || b.getAttribute('aria-label') || '').trim().toLowerCase();
+                if (bt === 'x' || bt === '\\u00d7' || bt === '\\u2715' || bt.includes('close')) {
+                    try { b.click(); return true; } catch (e) {}
+                }
+            }
+        }
+        return false;
+    }"""
+    try:
+        if await page.evaluate(JS):
+            return True
+    except Exception:
+        pass
+    try:
+        await page.keyboard.press("Escape")
+        return True
+    except Exception:
+        return False
 
 
 async def _log_chatgpt_thread_snapshot(page, tag=""):
@@ -17758,7 +17830,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         try {
             for (const el of document.querySelectorAll('*')) {
                 const t = (el.innerText || '').trim();
-                if (!t || !/^activity\\b/i.test(t) || t.length > 40) continue;
+                if (!t || !/^(?:activity|deep research)\\b/i.test(t) || t.length > 40) continue;
                 const hr = el.getBoundingClientRect();
                 if (hr.width === 0 || hr.height === 0) continue;
                 if (hr.left < window.innerWidth * 0.5) continue;
@@ -29318,6 +29390,20 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 await browser.switch_to_page(page)
                 if await _chatgpt_force_new_chat(page, label):
                     await asyncio.sleep(2)
+                    # #913: warm-tab hygiene — P1 and P2 share this tab. If
+                    # P1's "Activity" panel survived the SPA New chat, P2's
+                    # cycle-1 anti-toggle pre-check would flag the panel
+                    # open without ever clicking the DR strip and scrape
+                    # stale P1 data all phase. Detect + close + log.
+                    try:
+                        _st_warm = await _chatgpt_activity_state(page)
+                        if _st_warm.get("side_panel"):
+                            _closed = await _close_chatgpt_side_panel(page)
+                            log(f"[{label}] stale P1 activity panel on the reused "
+                                f"tab — close dispatched={_closed} (warm-tab hygiene)")
+                            await asyncio.sleep(1)
+                    except Exception as _wh_err:
+                        log(f"[{label}] warm-tab panel hygiene check failed: {_wh_err}", "DEBUG")
                 else:
                     # SPA New-chat didn't land — same-tab navigation fallback
                     # (one nav; still no second ChatGPT surface).

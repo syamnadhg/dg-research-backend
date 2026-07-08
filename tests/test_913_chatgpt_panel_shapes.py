@@ -224,9 +224,44 @@ def test_side_panel_js_has_activity_signature():
     assert "activity" in js and "Signature A" in js, (
         "the P1 panel is headed 'Activity · Ns' — the header anchor is the "
         "strongest signature and carries no text-length floor")
+    assert "deep research" in js, (
+        "the P2 panel is headed 'Deep research execution plan' — a freshly "
+        "opened sparse DR panel must not bounce off the legacy 50-char gate")
     assert "r.width < 240" in js and "r.width < 280" not in js, (
         "the Activity panel is ~267px at a 1280px viewport — a 280px gate "
         "rejects the OPEN panel and restarts the toggle storm")
+
+
+def test_inline_region_requires_readable_text():
+    js = research._CHATGPT_INLINE_ACTIVITY_JS
+    assert "length < 40" in js, (
+        "P2's DR card is an iframe embed (text invisible to the host) — an "
+        "'activity'-classed host container around it must not count as "
+        "inline-expanded, or the anti-toggle pre-check would block the DR "
+        "strip click forever")
+
+
+# ── shared P1/P2 tab: warm-tab panel hygiene ─────────────────────────────────
+
+def test_warm_tab_reuse_closes_stale_p1_panel():
+    assert _SRC.count("_close_chatgpt_side_panel") >= 2, (
+        "def + the 2A warm-reuse call — P1 and P2 share the ChatGPT tab; a "
+        "P1 Activity panel surviving New chat would make P2's anti-toggle "
+        "pre-check flag the panel open without ever clicking the DR strip")
+    src = inspect.getsource(research.start_agent_no_gemini_wait)
+    new_chat = src.find("_chatgpt_force_new_chat(")
+    hygiene = src.find("_close_chatgpt_side_panel(")
+    assert new_chat != -1 and hygiene != -1 and new_chat < hygiene, (
+        "hygiene must run AFTER the SPA New chat lands (the goto fallback "
+        "destroys the panel by itself)")
+
+
+def test_close_panel_helper_never_clicks_answer_now():
+    src = inspect.getsource(research._close_chatgpt_side_panel)
+    assert "close" in src and "Escape" in src
+    assert "answer" not in src.lower(), (
+        "the close helper must only target close affordances — 'Answer now' "
+        "truncates the run")
 
 
 def test_side_panel_js_no_raw_backspace():
@@ -243,7 +278,8 @@ def test_no_raw_backspace_in_chatgpt_scraper_literals():
                research.scrape_progress_chatgpt,
                research._open_chatgpt_activity_panel,
                research._log_chatgpt_thread_snapshot,
-               research._chatgpt_activity_state):
+               research._chatgpt_activity_state,
+               research._close_chatgpt_side_panel):
         tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
