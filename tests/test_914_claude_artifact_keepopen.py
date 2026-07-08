@@ -100,7 +100,23 @@ def test_call_site_sets_flag_from_probe():
 
 def test_call_site_bounds_reopen_attempts():
     assert "claude_panel_reopens" in _SRC
-    assert re.search(r"_reopens\s*<\s*3", _SRC), "re-clicks after collapse are bounded at 3"
+    # #914b: the cap is checked at ENTRY (flag-independent) — the old
+    # flag-transition-only cap let a panel whose clicks never stick
+    # (post-probe always closed → flag never True) re-click unbounded.
+    assert re.search(r"_reopens\s*>=\s*3", _SRC), "click budget checked at entry"
+    assert "click didn't stick" in _SRC, (
+        "a click that came back with data but no mounted panel must burn "
+        "the click budget, or probe false-negatives re-click forever")
+    assert "_attempted_open" in _SRC
+
+
+def test_first_time_log_only_once():
+    # #914b: reopen-after-collapse must not log "(first time)" again —
+    # grep-count forensics depend on it.
+    assert "_claude_panel_ever_open" in _SRC
+    assert _SRC.count("artifact panel opened (first time)") == 0 or \
+        "first time" in _SRC  # tag is computed, not inlined
+    assert 're-opened, reopens=' in _SRC
 
 
 def test_already_open_arg_comes_from_probe_not_flag():
@@ -201,11 +217,33 @@ def test_probe_gates_are_flush_right_and_tall():
     src = inspect.getsource(research._claude_artifact_panel_state)
     assert "vw - 40" in src, "right-docked panel is flush right"
     assert "vw * 0.22" in src, "left gate excludes full-width wrappers/body"
-    assert "vh * 0.6" in src, "height gate excludes bubbles/dialogs"
+    assert "vh * 0.5" in src, (
+        "height gate matches the read path's 0.5vh — #906 rule: the "
+        "verifier must never be stricter than the scraper (a 0.6vh probe "
+        "over a 0.5vh reader left a divergence window where data flowed "
+        "with the flag stuck closed → unbounded re-clicks)")
+    assert "vh * 0.6" not in src
     assert "iframe" in src, (
         "artifact content can be iframe-mounted — host innerText reads '' "
         "then (same lesson as ChatGPT's DR-card iframe embed)")
     assert "menu_open" in src
+
+
+def test_geometry_gates_exclude_chat_column_everywhere():
+    # #914b (review, self-verified MAJOR): with the sidebar EXPANDED
+    # (~288px) the nav-right main-content wrapper passes pure geometry at
+    # 1280px (left=288 ≥ 0.22vw, flush right, width 992 ≤ old 0.78vw cap).
+    # Guards: 0.75vw width cap (960 < 992) + skip candidates CONTAINING
+    # chat-thread markers — in the probe, the reader fallback, AND the
+    # walker root (all three sweep 'div, aside, section').
+    for fn in (research._claude_artifact_panel_state,
+               research._read_claude_artifact_panel,
+               research.scrape_claude_artifact_tracking):
+        src = inspect.getsource(fn)
+        assert '[data-testid="user-message"]' in src, fn.__name__
+        assert ".font-claude-message" in src, fn.__name__
+        assert "* 0.75" in src, fn.__name__
+        assert "* 0.78" not in src, fn.__name__
 
 
 # ── no-backspace regression (JS regex inside non-raw Python strings) ─────────

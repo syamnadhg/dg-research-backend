@@ -17354,13 +17354,21 @@ async def _read_claude_artifact_panel(page):
         // fails the left gate. Among survivors pick most-text, tie-break
         // smaller area so we root at the panel, not an ancestor wrapper.
         function _bestGeoPanel(minText) {
+            // #914b: skip candidates containing chat-thread markers — with
+            // the sidebar expanded the nav-right main wrapper passes the
+            // pure-geometry gates (992px ≤ old 0.78vw cap at 1280), and
+            // reading the chat column as "artifact content" is worse than
+            // reading nothing. Width cap 0.75vw excludes it structurally.
+            const CHAT_MARKERS = '[data-message-author-role="user"], ' +
+                '[data-testid="user-message"], .font-claude-message';
             let best = null, bestLen = -1, bestArea = Infinity;
             for (const el of document.querySelectorAll('div, aside, section')) {
                 const r = el.getBoundingClientRect();
-                if (r.width < 380 || r.width > _vw * 0.78) continue;
+                if (r.width < 380 || r.width > _vw * 0.75) continue;
                 if (r.left < _vw * 0.22) continue;
                 if (r.right < _vw - 40) continue;
                 if (r.height < _vh * 0.5) continue;
+                if (el.querySelector(CHAT_MARKERS)) continue;
                 const txt = (el.innerText || '');
                 if (txt.length < minText) continue;
                 const head = txt.slice(0, 500);
@@ -17726,12 +17734,24 @@ async def _claude_artifact_panel_state(page):
     user saw was invisible to the code.
 
     Gates (1280×800 automation viewport): a right-DOCKED panel is flush to
-    the right edge (right ≥ vw−40) and tall (≥60% vh) — a centered chat
-    column (left ≈ 0.2·vw, right ≈ 0.8·vw) and message bubbles fail the
-    flush-right gate, dialogs fail it too, and the left nav fails the left
-    gate. Text floor is 40 chars (skeleton-tolerant) OR an embedded iframe
-    ≥300px wide (artifact content can be iframe-mounted; host innerText
-    reads '' then — same lesson as ChatGPT's DR-card iframe embed).
+    the right edge (right ≥ vw−40) and tall (≥50% vh — matches the read
+    path's gate; #906 rule: the verifier must never be stricter than the
+    scraper) — a centered chat column (left ≈ 0.2·vw, right ≈ 0.8·vw) and
+    message bubbles fail the flush-right gate, dialogs fail it too, and
+    the left nav fails the left gate. Text floor is 40 chars (skeleton-
+    tolerant) OR an embedded iframe ≥300px wide (artifact content can be
+    iframe-mounted; host innerText reads '' then — same lesson as
+    ChatGPT's DR-card iframe embed).
+
+    #914b (review find, self-verified): with the SIDEBAR EXPANDED
+    (~288px) the nav-right main-content wrapper passes every pure-
+    geometry gate at 1280px (left=288 ≥ 0.22vw, flush right, width
+    992 ≤ 0.78vw) — a false "open" that would freeze the click forever
+    while the walker harvested chat-column junk. Two guards: width cap
+    tightened to 0.75·vw (960px < the 992px wrapper; the real panel is
+    ~half the viewport), and any candidate CONTAINING chat-thread
+    markers (user-message bubbles / .font-claude-message) is skipped —
+    the artifact panel never contains the conversation.
 
     Returns {"open": bool, "width": int, "text_len": int, "menu_open": bool}
     (all-falsy dict on evaluate failure — callers treat that as closed).
@@ -17751,13 +17771,16 @@ async def _claude_artifact_panel_state(page):
             }
         } catch (e) {}
         const NAV_MARKERS = /\\b(new chat|recents?|projects|search|topic generator|starred|home|chats?\\b)\\b/i;
+        const CHAT_MARKERS = '[data-message-author-role="user"], ' +
+            '[data-testid="user-message"], .font-claude-message';
         let bestLen = -1, bestArea = Infinity;
         for (const el of document.querySelectorAll('div, aside, section')) {
             const r = el.getBoundingClientRect();
-            if (r.width < 380 || r.width > vw * 0.78) continue;
+            if (r.width < 380 || r.width > vw * 0.75) continue;
             if (r.left < vw * 0.22) continue;
             if (r.right < vw - 40) continue;
-            if (r.height < vh * 0.6) continue;
+            if (r.height < vh * 0.5) continue;
+            if (el.querySelector(CHAT_MARKERS)) continue;
             const txt = (el.innerText || '').trim();
             let hasFrame = false;
             try {
@@ -17932,13 +17955,19 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
                     else out.root = 'class';
                 }
                 if (!root) {
+                    // #914b: same chat-marker + 0.75vw guards as the probe/
+                    // reader — the expanded-sidebar main wrapper must never
+                    // become the walker root (chat-column junk steps).
+                    const CHAT_MARKERS = '[data-message-author-role="user"], ' +
+                        '[data-testid="user-message"], .font-claude-message';
                     let bestLen = -1, bestArea = Infinity;
                     for (const el of document.querySelectorAll('div, aside, section')) {
                         const r = el.getBoundingClientRect();
-                        if (r.width < 380 || r.width > vw * 0.78) continue;
+                        if (r.width < 380 || r.width > vw * 0.75) continue;
                         if (r.left < vw * 0.22) continue;
                         if (r.right < vw - 40) continue;
                         if (r.height < vh * 0.5) continue;
+                        if (el.querySelector(CHAT_MARKERS)) continue;
                         const txt = (el.innerText || '');
                         if (txt.length < 40) continue;
                         const area = r.width * r.height;
@@ -22748,20 +22777,28 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # panel toggling in the 2026-07-08 E2E).
                     _panel_pre = await _claude_artifact_panel_state(p["page"])
                     _probe_open = bool(_panel_pre.get("open"))
-                    if p.get("artifact_panel_open") and not _probe_open:
-                        _reopens = p.get("claude_panel_reopens", 0)
-                        if _reopens < 3:
-                            p["claude_panel_reopens"] = _reopens + 1
-                            log(f"[Claude] artifact panel collapsed (probe width="
-                                f"{_panel_pre.get('width')}, text_len="
-                                f"{_panel_pre.get('text_len')}) — re-click allowed "
-                                f"({p['claude_panel_reopens']}/3)")
-                        else:
-                            # Something keeps closing it — stop fighting; reads
-                            # continue best-effort (CUA leaves it open now).
-                            log("[Claude] artifact panel collapsed again after 3 "
-                                "re-opens — suppressing further re-clicks", "WARN")
-                            _probe_open = True
+                    _reopens = p.get("claude_panel_reopens", 0)
+                    if not _probe_open and _reopens >= 3:
+                        # #914b: cap checked at ENTRY, independent of the
+                        # flag. The old cap only engaged on the flag-open→
+                        # probe-closed transition, so a panel whose clicks
+                        # never stick (post-probe always closed → flag never
+                        # True) re-clicked UNBOUNDED every tick — churn with
+                        # extra steps. After 3 burned attempts nothing
+                        # re-clicks; reads continue best-effort.
+                        if not p.get("_claude_reclick_cap_logged"):
+                            p["_claude_reclick_cap_logged"] = True
+                            log("[Claude] artifact panel click budget exhausted "
+                                "(3) — suppressing further re-clicks for this "
+                                "phase; reads continue best-effort", "WARN")
+                        _probe_open = True
+                    elif p.get("artifact_panel_open") and not _probe_open:
+                        p["claude_panel_reopens"] = _reopens + 1
+                        log(f"[Claude] artifact panel collapsed (probe width="
+                            f"{_panel_pre.get('width')}, text_len="
+                            f"{_panel_pre.get('text_len')}) — re-click allowed "
+                            f"({p['claude_panel_reopens']}/3)")
+                    _attempted_open = not _probe_open
                     artifact_data = await scrape_claude_artifact_tracking(
                         p["page"], browser=browser, cua_client=cua_client,
                         verbose=verbose, keep_open=True,
@@ -22774,10 +22811,25 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _panel_post = await _claude_artifact_panel_state(p["page"])
                     _now_open = bool(_panel_post.get("open"))
                     if _now_open and not p.get("artifact_panel_open"):
-                        log(f"[Claude] artifact panel opened (first time) at "
+                        # #914b: "(first time)" only once — a reopen-after-
+                        # collapse logging as "first time" would corrupt the
+                        # forensic signal (grep counts opens per run).
+                        _tag = ("first time" if not p.get("_claude_panel_ever_open")
+                                else f"re-opened, reopens={p.get('claude_panel_reopens', 0)}/3")
+                        p["_claude_panel_ever_open"] = True
+                        log(f"[Claude] artifact panel opened ({_tag}) at "
                             f"elapsed={int(elapsed)}s, cycle={p.get('poll_cycles')} "
                             f"(width={_panel_post.get('width')}, "
                             f"text_len={_panel_post.get('text_len')})")
+                    elif _attempted_open and artifact_data and not _now_open:
+                        # #914b: we clicked, data even came back (geo read /
+                        # CUA text), but no panel is mounted — the click
+                        # didn't stick. Burn the click budget so this can't
+                        # run unbounded (see the entry cap above).
+                        p["claude_panel_reopens"] = p.get("claude_panel_reopens", 0) + 1
+                        log(f"[Claude] artifact click didn't stick (post-probe "
+                            f"closed, layer={artifact_data.get('layer')}) — "
+                            f"click budget {p['claude_panel_reopens']}/3", "WARN")
                     p["artifact_panel_open"] = _now_open
                     # Mirror onto runtime singleton so extract_and_record_agent
                     # (which has no `p` handle) can close-1 before clicking the
