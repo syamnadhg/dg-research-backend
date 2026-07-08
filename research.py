@@ -17186,9 +17186,29 @@ async def _click_claude_artifact(page, index=0):
             });
             const targetIdx = idx < 0 ? cards.length + idx : idx;
             if (cards.length > 0 && targetIdx >= 0 && targetIdx < cards.length) {
-                const tr = cards[targetIdx].getBoundingClientRect();
-                cards[targetIdx].click();
-                return { cx: tr.left + tr.width / 2, cy: tr.top + tr.height / 2,
+                const target = cards[targetIdx];
+                const tr = target.getBoundingClientRect();
+                // #914: full pointer/mouse event chain instead of bare
+                // .click() — same lesson as ChatGPT's activity strip
+                // (2026-04-26 v2): claude.ai binds card-open handlers via
+                // React synthetic listeners that can swallow a bare
+                // synthetic .click(); E2E logs showed the click "succeed"
+                // while the CUA arriving ~30s later found the panel still
+                // closed and had to click the card itself.
+                const cx = tr.left + tr.width / 2;
+                const cy = tr.top + tr.height / 2;
+                const opts = { bubbles: true, cancelable: true, composed: true,
+                               clientX: cx, clientY: cy, button: 0 };
+                try {
+                    target.dispatchEvent(new PointerEvent('pointerdown', opts));
+                    target.dispatchEvent(new MouseEvent('mousedown', opts));
+                    target.dispatchEvent(new PointerEvent('pointerup', opts));
+                    target.dispatchEvent(new MouseEvent('mouseup', opts));
+                    target.dispatchEvent(new MouseEvent('click', opts));
+                } catch (e) {
+                    target.click();
+                }
+                return { cx: cx, cy: cy,
                          vw: window.innerWidth, vh: window.innerHeight };
             }
             return false;
@@ -17300,6 +17320,7 @@ async def _read_claude_artifact_panel(page):
     _PANEL_GATE_JS = r"""
         const NAV_MARKERS = /\b(new chat|recents?|projects|search|topic generator|starred|home|chats?\b)\b/i;
         const _vw = window.innerWidth || document.documentElement.clientWidth;
+        const _vh = window.innerHeight || document.documentElement.clientHeight;
         const _candidates = Array.from(document.querySelectorAll(
             '[class*="artifact-panel"], ' +
             '[data-testid*="artifact-panel"], ' +
@@ -17321,6 +17342,41 @@ async def _read_claude_artifact_panel(page):
             }
             return true;
         }
+        // #914 geometry fallback — the 2026-07 claude.ai panel stopped
+        // matching every artifact-classed selector above (E2E logs: DOM
+        // read returned '' every cycle while the CUA could plainly SEE and
+        // read the open panel → the CUA fallback fired on every poll).
+        // Mirror ChatGPT #913 Signature-A: trust position/size over class
+        // names. A right-DOCKED panel is flush right (right ≥ vw−40),
+        // starts past the chat column (left ≥ 0.22·vw), is panel-sized
+        // (380px..78% vw wide, ≥50% vh tall). The centered chat column and
+        // its message bubbles fail the flush-right gate; the left nav
+        // fails the left gate. Among survivors pick most-text, tie-break
+        // smaller area so we root at the panel, not an ancestor wrapper.
+        function _bestGeoPanel(minText) {
+            let best = null, bestLen = -1, bestArea = Infinity;
+            for (const el of document.querySelectorAll('div, aside, section')) {
+                const r = el.getBoundingClientRect();
+                if (r.width < 380 || r.width > _vw * 0.78) continue;
+                if (r.left < _vw * 0.22) continue;
+                if (r.right < _vw - 40) continue;
+                if (r.height < _vh * 0.5) continue;
+                const txt = (el.innerText || '');
+                if (txt.length < minText) continue;
+                const head = txt.slice(0, 500);
+                if (NAV_MARKERS.test(head)) {
+                    let _m = 0;
+                    const re = new RegExp(NAV_MARKERS.source, 'gi');
+                    while (re.exec(head) !== null) _m++;
+                    if (_m >= 2) continue;
+                }
+                const area = r.width * r.height;
+                if (txt.length > bestLen || (txt.length === bestLen && area < bestArea)) {
+                    best = el; bestLen = txt.length; bestArea = area;
+                }
+            }
+            return best;
+        }
     """
 
     async def _try_html(target):
@@ -17340,6 +17396,9 @@ async def _read_claude_artifact_panel(page):
                 for (const el of _candidates) {{
                     if (_isLikelyPanel(el) && el.innerText.length > 200) return el.innerHTML;
                 }}
+                // #914: class-free geometry fallback (see _bestGeoPanel).
+                const _geo = _bestGeoPanel(200);
+                if (_geo) return _geo.innerHTML;
                 return '';
             }}""")
         except Exception:
@@ -17358,6 +17417,9 @@ async def _read_claude_artifact_panel(page):
                 for (const el of _candidates) {{
                     if (_isLikelyPanel(el) && el.innerText.length > 200) return el.innerText;
                 }}
+                // #914: class-free geometry fallback (see _bestGeoPanel).
+                const _geo = _bestGeoPanel(200);
+                if (_geo) return _geo.innerText;
                 return '';
             }}""")
         except Exception:
@@ -17652,6 +17714,146 @@ async def _close_claude_artifact_panel(page):
         pass
 
 
+async def _claude_artifact_panel_state(page):
+    """#914 truthful panel probe — is Claude's right-side artifact/tracking
+    panel ACTUALLY open? Geometry-first (mirror of ChatGPT #913's
+    `_chatgpt_activity_state`): the 2026-07 claude.ai panel no longer
+    reliably carries "artifact-panel"-style class names, so class-anchored
+    checks can read "closed" while the panel is plainly open (and vice
+    versa). The old call-site flag inferred "open" from "scrape returned
+    data" — but that data could come from the CUA fallback which used to
+    CLOSE the panel, so the flag lied and the open→read→close churn the
+    user saw was invisible to the code.
+
+    Gates (1280×800 automation viewport): a right-DOCKED panel is flush to
+    the right edge (right ≥ vw−40) and tall (≥60% vh) — a centered chat
+    column (left ≈ 0.2·vw, right ≈ 0.8·vw) and message bubbles fail the
+    flush-right gate, dialogs fail it too, and the left nav fails the left
+    gate. Text floor is 40 chars (skeleton-tolerant) OR an embedded iframe
+    ≥300px wide (artifact content can be iframe-mounted; host innerText
+    reads '' then — same lesson as ChatGPT's DR-card iframe embed).
+
+    Returns {"open": bool, "width": int, "text_len": int, "menu_open": bool}
+    (all-falsy dict on evaluate failure — callers treat that as closed).
+    Also reports `menu_open` (visible [role=menu]/radix popper) so callers
+    can detect a card-click that landed on a menu trigger instead.
+    """
+    JS = """() => {
+        const out = { open: false, width: 0, text_len: 0, menu_open: false };
+        const vw = window.innerWidth || document.documentElement.clientWidth;
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        try {
+            for (const m of document.querySelectorAll(
+                    '[role="menu"], [data-radix-popper-content-wrapper], ' +
+                    '[data-radix-menu-content]')) {
+                const r = m.getBoundingClientRect();
+                if (r.width > 40 && r.height > 40) { out.menu_open = true; break; }
+            }
+        } catch (e) {}
+        const NAV_MARKERS = /\\b(new chat|recents?|projects|search|topic generator|starred|home|chats?\\b)\\b/i;
+        let bestLen = -1, bestArea = Infinity;
+        for (const el of document.querySelectorAll('div, aside, section')) {
+            const r = el.getBoundingClientRect();
+            if (r.width < 380 || r.width > vw * 0.78) continue;
+            if (r.left < vw * 0.22) continue;
+            if (r.right < vw - 40) continue;
+            if (r.height < vh * 0.6) continue;
+            const txt = (el.innerText || '').trim();
+            let hasFrame = false;
+            try {
+                const fr = el.querySelector('iframe');
+                hasFrame = !!(fr && fr.getBoundingClientRect().width >= 300);
+            } catch (e) {}
+            if (txt.length < 40 && !hasFrame) continue;
+            const head = txt.slice(0, 500);
+            if (NAV_MARKERS.test(head)) {
+                let m = 0;
+                const re = new RegExp(NAV_MARKERS.source, 'gi');
+                while (re.exec(head) !== null) m++;
+                if (m >= 2) continue;
+            }
+            const area = r.width * r.height;
+            if (txt.length > bestLen || (txt.length === bestLen && area < bestArea)) {
+                bestLen = txt.length; bestArea = area;
+                out.open = true;
+                out.width = Math.round(r.width);
+                out.text_len = txt.length;
+            }
+        }
+        return out;
+    }"""
+    try:
+        res = await page.evaluate(JS)
+        return res if isinstance(res, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _log_claude_artifact_snapshot(page, tag=""):
+    """#914 (instrument-with-logs directive): one compact structural line of
+    the artifact-card candidates + right-half container inventory + frame
+    URLs, so a persistent Claude panel miss can be root-caused from
+    backend.log alone — no live DOM session needed (probing the worker
+    profile out-of-band risks the bot score). Mirror of ChatGPT #913's
+    `_log_chatgpt_thread_snapshot`."""
+    JS = """() => {
+        const sels = [
+            'button[data-testid*="artifact"]',
+            '[data-testid*="artifact-preview"]',
+            '[class*="artifact"][role="button"]',
+            'button[aria-label*="Open the artifact"]',
+            'button[aria-label*="research"]',
+            'a[href*="/artifacts/"]'
+        ];
+        const counts = {};
+        const cards = [];
+        for (const s of sels) {
+            let hits = [];
+            try { hits = Array.from(document.querySelectorAll(s)); } catch (e) {}
+            counts[s] = hits.length;
+            for (const el of hits) {
+                if (cards.length >= 4) break;
+                const r = el.getBoundingClientRect();
+                cards.push({ s: s.slice(0, 28),
+                             t: (el.textContent || '').trim().slice(0, 50),
+                             a: (el.getAttribute('aria-label') || '').slice(0, 36),
+                             w: Math.round(r.width), h: Math.round(r.height),
+                             y: Math.round(r.top) });
+            }
+        }
+        const vw = window.innerWidth || 0;
+        const vh = window.innerHeight || 0;
+        const panels = [];
+        for (const el of document.querySelectorAll('div, aside, section')) {
+            if (panels.length >= 6) break;
+            const r = el.getBoundingClientRect();
+            if (r.width < 300 || r.height < vh * 0.4) continue;
+            if (r.left < vw * 0.15) continue;
+            if (el.children.length > 12) continue;
+            panels.push({ tag: el.tagName,
+                          c: (el.className && ('' + el.className).slice(0, 40)) || '',
+                          w: Math.round(r.width), l: Math.round(r.left),
+                          r: Math.round(r.right), h: Math.round(r.height),
+                          tl: (el.innerText || '').length });
+        }
+        return { counts, cards, panels };
+    }"""
+    try:
+        snap = await page.evaluate(JS)
+    except Exception as _se:
+        log(f"[Claude] artifact snapshot failed ({tag}): {_se}", "DEBUG")
+        return
+    try:
+        frames = [(f.url or "")[:80] for f in page.frames][:8]
+    except Exception:
+        frames = []
+    try:
+        line = json.dumps({"snap": snap, "frames": frames}, ensure_ascii=True)
+    except Exception:
+        line = str(snap)[:1800]
+    log(f"[Claude] artifact-miss snapshot ({tag}): {line[:1800]}", "DEBUG")
+
+
 async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
                                           verbose=False, keep_open=False,
                                           already_open=False):
@@ -17675,30 +17877,95 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
                 if isinstance(clicked, dict):
                     _click_box = clicked
                 await asyncio.sleep(1.5)  # Wait for panel to render
+                # #914 post-click guard: probe what the click ACTUALLY did.
+                # E2E runs showed the CUA repeatedly finding an open CONTEXT
+                # MENU on arrival ("Good, the context menu is closed…") —
+                # i.e. our card click had landed on a menu trigger. Detect
+                # + Escape it instead of leaving it for the CUA, and log
+                # the observed state either way (instrument-with-logs).
+                _st_click = await _claude_artifact_panel_state(page)
+                if _st_click.get("menu_open"):
+                    log("[Claude] artifact click opened a context menu — "
+                        f"Escape dispatched (panel_open={_st_click.get('open')})",
+                        "WARN")
+                    await _log_claude_artifact_snapshot(page, "click-opened-menu")
+                    try:
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+                elif not _st_click.get("open"):
+                    log("[Claude] artifact click did not mount the side panel "
+                        f"(text_len={_st_click.get('text_len')})", "DEBUG")
+                else:
+                    log("[Claude] artifact panel open after click "
+                        f"(width={_st_click.get('width')}, "
+                        f"text_len={_st_click.get('text_len')})", "DEBUG")
+            else:
+                log("[Claude] artifact card click found no target "
+                    "(count saw cards, click's filtered set was empty)", "DEBUG")
         content = await _read_claude_artifact_panel(page)
         # Structured DOM walker — cheaper + more accurate than regex on plain text.
         # Reads the live artifact's checklist headings + section list + URL anchors
         # so steps[]/sections[]/source_urls[] reflect Claude's running outline.
         try:
             walker = await page.evaluate("""() => {
-                const out = { steps: [], sections: [], source_urls: [] };
-                const root = document.querySelector(
-                    '[data-testid="artifact-content"], aside, [class*="artifact-panel"]'
-                ) || document;
-                root.querySelectorAll(
-                    'li, [role="listitem"], [class*="step"], [class*="checklist"] > div, ' +
-                    '[class*="task"] > div, [class*="activity"]'
-                ).forEach(e => {
-                    const t = (e.innerText || '').trim();
-                    if (t && t.length > 4 && t.length < 240) out.steps.push(t.slice(0, 220));
-                });
-                root.querySelectorAll('h1, h2, h3').forEach(h => {
-                    const t = (h.innerText || '').trim();
-                    if (t && t.length > 1 && t.length < 120) out.sections.push(t);
-                });
+                const out = { steps: [], sections: [], source_urls: [], root: '' };
+                // #914: the old root fell back to bare `aside` (claude.ai's
+                // LEFT NAV is an <aside> — 2026-05-13 lesson in
+                // _CLAUDE_PANEL_SELECTORS_JS) and then to `document`, so with
+                // the panel unmatched the steps/sections sweep harvested nav
+                // rows / chat chrome — the suspiciously constant "15 steps,
+                // 15 sections" in every E2E tracking line. Root at the real
+                // panel only: artifact-classed match OR the #914 geometry
+                // panel (right-docked, flush right, panel-sized). No root →
+                // no steps/sections (junk is worse than empty narration);
+                // source_urls fall back to a nav-excluded document sweep
+                // (external anchors in the thread are legitimate sources).
+                const vw = window.innerWidth || document.documentElement.clientWidth;
+                const vh = window.innerHeight || document.documentElement.clientHeight;
+                let root = document.querySelector(
+                    '[data-testid="artifact-content"], [class*="artifact-panel"]');
+                if (root) {
+                    const rr = root.getBoundingClientRect();
+                    if (rr.width < 200 || rr.height < 150) root = null;
+                    else out.root = 'class';
+                }
+                if (!root) {
+                    let bestLen = -1, bestArea = Infinity;
+                    for (const el of document.querySelectorAll('div, aside, section')) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 380 || r.width > vw * 0.78) continue;
+                        if (r.left < vw * 0.22) continue;
+                        if (r.right < vw - 40) continue;
+                        if (r.height < vh * 0.5) continue;
+                        const txt = (el.innerText || '');
+                        if (txt.length < 40) continue;
+                        const area = r.width * r.height;
+                        if (txt.length > bestLen ||
+                                (txt.length === bestLen && area < bestArea)) {
+                            root = el; bestLen = txt.length; bestArea = area;
+                        }
+                    }
+                    if (root) out.root = 'geo';
+                }
+                if (root) {
+                    root.querySelectorAll(
+                        'li, [role="listitem"], [class*="step"], [class*="checklist"] > div, ' +
+                        '[class*="task"] > div, [class*="activity"]'
+                    ).forEach(e => {
+                        const t = (e.innerText || '').trim();
+                        if (t && t.length > 4 && t.length < 240) out.steps.push(t.slice(0, 220));
+                    });
+                    root.querySelectorAll('h1, h2, h3').forEach(h => {
+                        const t = (h.innerText || '').trim();
+                        if (t && t.length > 1 && t.length < 120) out.sections.push(t);
+                    });
+                }
                 const seen = new Set();
-                root.querySelectorAll('a[href^="http"]').forEach(a => {
+                (root || document).querySelectorAll('a[href^="http"]').forEach(a => {
                     const h = a.href || '';
+                    if (!root && a.closest('nav, aside, [class*="sidebar" i]')) return;
                     if (h && h.length < 500 && !h.includes('claude.ai') &&
                         !h.includes('anthropic.com') && !seen.has(h)) {
                         seen.add(h); out.source_urls.push(h);
@@ -17717,13 +17984,24 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
         log(f"[Claude] Artifact DOM tracking failed: {e}", "WARN")
 
     # Layer 2: CUA fallback if DOM yielded nothing
+    _layer = "dom"
     if not content and not walker.get("source_urls") and browser and cua_client:
         try:
             async def _scrape_cua():
+                # #914: the task text used to end "Then close the artifact
+                # panel." — directly contradicting the system prompt's step
+                # 5 ("DO NOT close the artifact panel"). The CUA obeyed the
+                # task text, so every fallback read CLOSED the panel while
+                # the call site flagged it open → the open→read→close churn
+                # the user watched all E2E (2026-07-08). The panel must
+                # STAY OPEN across polls, exactly like ChatGPT #913.
                 return await agent_loop(cua_client, browser,
                     PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING,
-                    "Open the first artifact in the conversation and read its content. "
-                    "Report URLs, steps, sections, and sources found. Then close the artifact panel.",
+                    "Open the first artifact in the conversation (skip this if "
+                    "the right-side panel is already open) and read its content. "
+                    "Report URLs, steps, sections, and sources found. LEAVE the "
+                    "artifact panel OPEN when you finish — do NOT close it; the "
+                    "polling loop re-reads the open panel each cycle.",
                     model=CUA_MODEL, max_iterations=6, verbose=verbose)
 
             # #839 act tier: the report itself is the value here — a Vision
@@ -17735,12 +18013,15 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
                 page, hotspot_id="scrape-artifact", phase=2, platform="claude",
                 current_step="scrape_artifact_1_tracking",
                 context_hint="DOM walker yielded nothing — open the FIRST artifact "
-                             "(research/sources tracking), read URLs/steps/sections, "
-                             "then close the panel",
+                             "(research/sources tracking) unless the panel is "
+                             "already open, read URLs/steps/sections, and LEAVE "
+                             "the panel OPEN for the next poll",
                 expected_outcome="a text report of the tracking artifact's URLs, steps and sections",
                 cua_coro_factory=_scrape_cua,
                 mission_prompt=PROMPT_SCRAPE_CLAUDE_ARTIFACT_TRACKING)
             content = (result or {}).get("text", "")
+            if content:
+                _layer = "cua"
         except Exception as e:
             log(f"[Claude] Artifact CUA tracking failed: {e}", "WARN")
 
@@ -17776,6 +18057,11 @@ async def scrape_claude_artifact_tracking(page, browser=None, cua_client=None,
         "click_box": _click_box,  # Track-B coord ground-truth (None unless WE clicked this call)
         "artifact_tracking": True,
         "artifact_count": artifact_count,
+        # #914 forensics: which layer produced the data (dom|cua) + which
+        # walker root matched (class|geo|'') — lets backend.log alone answer
+        # "is the DOM path healthy or is the CUA carrying every read?"
+        "layer": _layer,
+        "walker_root": (walker.get("root") or "") if isinstance(walker, dict) else "",
     }
 
 
@@ -22452,23 +22738,56 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if (name == "Claude" and _claude_gate_ok and
                     (time.time() - p.get("last_artifact_scrape", 0)) > ARTIFACT_SCRAPE_INTERVAL):
                 try:
+                    # ── #914 anti-churn pre-check (mirror of ChatGPT #913) ──
+                    # Probe the REAL panel state before deciding whether to
+                    # click. The old flow inferred "open" from "the scrape
+                    # returned data", but that data could come from the CUA
+                    # fallback whose task text used to CLOSE the panel — the
+                    # flag lied open, the re-click was skipped forever, and
+                    # every cycle re-ran CUA open→read→close (the visible
+                    # panel toggling in the 2026-07-08 E2E).
+                    _panel_pre = await _claude_artifact_panel_state(p["page"])
+                    _probe_open = bool(_panel_pre.get("open"))
+                    if p.get("artifact_panel_open") and not _probe_open:
+                        _reopens = p.get("claude_panel_reopens", 0)
+                        if _reopens < 3:
+                            p["claude_panel_reopens"] = _reopens + 1
+                            log(f"[Claude] artifact panel collapsed (probe width="
+                                f"{_panel_pre.get('width')}, text_len="
+                                f"{_panel_pre.get('text_len')}) — re-click allowed "
+                                f"({p['claude_panel_reopens']}/3)")
+                        else:
+                            # Something keeps closing it — stop fighting; reads
+                            # continue best-effort (CUA leaves it open now).
+                            log("[Claude] artifact panel collapsed again after 3 "
+                                "re-opens — suppressing further re-clicks", "WARN")
+                            _probe_open = True
                     artifact_data = await scrape_claude_artifact_tracking(
                         p["page"], browser=browser, cua_client=cua_client,
                         verbose=verbose, keep_open=True,
-                        already_open=p.get("artifact_panel_open", False))
+                        already_open=_probe_open)
+                    # ── #914 truthful flag: probe AGAIN after the scrape ──
+                    # The flag must reflect the DOM, not "data came back"
+                    # (CUA text ≠ open panel). Downstream consumers: the
+                    # already_open skip above, extract's close-1-before-
+                    # final-extract, and the vision URL-extract gate.
+                    _panel_post = await _claude_artifact_panel_state(p["page"])
+                    _now_open = bool(_panel_post.get("open"))
+                    if _now_open and not p.get("artifact_panel_open"):
+                        log(f"[Claude] artifact panel opened (first time) at "
+                            f"elapsed={int(elapsed)}s, cycle={p.get('poll_cycles')} "
+                            f"(width={_panel_post.get('width')}, "
+                            f"text_len={_panel_post.get('text_len')})")
+                    p["artifact_panel_open"] = _now_open
+                    # Mirror onto runtime singleton so extract_and_record_agent
+                    # (which has no `p` handle) can close-1 before clicking the
+                    # final artifact card. See extract_claude_response signature.
+                    try:
+                        _runtime.claude_artifact_panel_open = _now_open
+                    except Exception:
+                        pass
                     if artifact_data:
-                        if not p.get("artifact_panel_open"):
-                            log(f"[Claude] artifact panel opened (first time) at "
-                                f"elapsed={int(elapsed)}s, cycle={p.get('poll_cycles')}")
-                        p["artifact_panel_open"] = True
                         p["claude_artifact_dom_misses"] = 0  # reset on success
-                        # Mirror onto runtime singleton so extract_and_record_agent
-                        # (which has no `p` handle) can close-1 before clicking the
-                        # final artifact card. See extract_claude_response signature.
-                        try:
-                            _runtime.claude_artifact_panel_open = True
-                        except Exception:
-                            pass
                         if artifact_data.get("source_urls"):
                             for key in ("source_urls", "steps", "sections", "tool_uses"):
                                 if artifact_data.get(key):
@@ -22484,9 +22803,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 progress["partial_text_len"] = artifact_data["partial_text_len"]
                             progress["artifact_count"] = artifact_data.get("artifact_count", 0)
                             scrape_ok = True
+                            _first_step = (artifact_data.get("steps") or [""])[0]
                             log(f"[Claude] Artifact tracking: {len(artifact_data.get('source_urls', []))} URLs, "
                                 f"{len(artifact_data.get('steps', []))} steps, "
-                                f"{len(artifact_data.get('sections', []))} sections")
+                                f"{len(artifact_data.get('sections', []))} sections "
+                                f"(layer={artifact_data.get('layer')}, "
+                                f"walker_root={artifact_data.get('walker_root') or 'none'}, "
+                                f"panel_open={_now_open}, "
+                                f"step0={_first_step[:60]!r})")
                             # Track-B success-path observe (once/run — independent samples).
                             # click_box is the true target ONLY when WE clicked this poll
                             # (already_open=False); on later polls it's None (no fresh click).
@@ -22499,11 +22823,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                                          artifact_count=artifact_data.get("artifact_count")))
                     else:
                         # No artifact detected — count as DOM miss for CUA escalation.
-                        if not p.get("artifact_panel_open"):
+                        if not _now_open:
                             p["claude_artifact_dom_misses"] = p.get("claude_artifact_dom_misses", 0) + 1
                             log(f"[Claude] artifact DOM miss "
                                 f"#{p['claude_artifact_dom_misses']} at cycle={p.get('poll_cycles')}",
                                 "DEBUG")
+                            # #914 forensics: snapshot the card candidates +
+                            # right-half containers at misses #2/#5 so the next
+                            # selector drift is diagnosable from backend.log.
+                            if p["claude_artifact_dom_misses"] in (2, 5):
+                                await _log_claude_artifact_snapshot(
+                                    p["page"],
+                                    f"miss-{p['claude_artifact_dom_misses']}")
                     p["last_artifact_scrape"] = time.time()
                 except Exception as e:
                     log(f"[Claude] Artifact tracking scrape failed: {e}", "WARN")
@@ -22551,12 +22882,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             success_text="panel: open")
                         out = ((cua_res or {}).get("text") or "").lower()
                         if "panel: open" in out or "panel: already_open" in out:
-                            p["artifact_panel_open"] = True
+                            # #914: trust the DOM probe over the CUA's claim —
+                            # a hallucinated "panel: open" would freeze the
+                            # already_open skip on a closed panel.
+                            _p3 = await _claude_artifact_panel_state(p["page"])
+                            p["artifact_panel_open"] = bool(_p3.get("open"))
                             try:
-                                _runtime.claude_artifact_panel_open = True
+                                _runtime.claude_artifact_panel_open = p["artifact_panel_open"]
                             except Exception:
                                 pass
-                            log("[Claude] artifact panel opened via CUA tier-3")
+                            log(f"[Claude] artifact panel opened via CUA tier-3 "
+                                f"(probe_open={p['artifact_panel_open']}, "
+                                f"width={_p3.get('width')})")
                         else:
                             log(f"[Claude] CUA tier-3 didn't confirm panel open: {out[:120]}", "WARN")
                     except asyncio.TimeoutError:

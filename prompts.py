@@ -1233,6 +1233,8 @@ HARD CONSTRAINTS:
 - DO NOT click the send / up-arrow / stop button.
 - DO NOT click any source link inside an open artifact.
 - DO NOT click "Publish" or "Share".
+- DO NOT close the panel after opening it (no X / close button, no
+  Escape) — the polling loop needs it to STAY OPEN across cycles.
 - ONE click only — on the FIRST artifact card and nothing else.
 - If you cannot find the first artifact card without clicking the composer,
   output "panel: not_found" rather than clicking anything risky.
