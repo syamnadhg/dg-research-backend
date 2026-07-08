@@ -27200,6 +27200,19 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
         # after the model pick, but if it closed we reopen via the mode button.
         # Best-effort: a miss leaves the default level (Standard) and is logged,
         # not fatal.
+        #
+        # #919 (2026-07-08, user screenshot "Gemini didn't select Extended
+        # flash"): the 'Thinking level' trigger stopped being findable
+        # overnight (last hit 07-07 21:55, misses from 07-08 02:02) while the
+        # Flash row itself was unchanged — a menu-structure rotation, not a
+        # model rename. Hardened: (a) trigger match broadened to any item
+        # STARTING with 'thinking'; (b) a DIRECT 'Extended…' item inside the
+        # open menu counts (covers an Extended-thinking toggle row / an
+        # 'Extended Flash' sibling row — both drifts Google has shipped
+        # elsewhere); (c) the reopen-retry also HOVERs the picked Flash row
+        # first (row-nested submenus only render on hover); (d) every miss
+        # dumps the visible menu rows so the NEXT drift is diagnosable from
+        # backend.log alone (instrument-with-logs).
         _reopen_js = """() => {
             const b = document.querySelector(
                 'button[data-test-id="bard-mode-menu-button"], bard-mode-menu-button button');
@@ -27212,7 +27225,8 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
             for (const el of items) {
                 if (!el.offsetParent) continue;
                 const t = (el.textContent || '').trim().toLowerCase();
-                if (t.startsWith('thinking level') || t.includes('thinking level')) {
+                if (t.includes('thinking level') ||
+                        (t.startsWith('thinking') && t.length < 60)) {
                     try { el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true})); } catch(e){}
                     try { el.dispatchEvent(new MouseEvent('pointerover', {bubbles:true})); } catch(e){}
                     el.click();
@@ -27221,12 +27235,85 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
             }
             return false;
         }"""
+        # Direct 'Extended…' item INSIDE an open overlay menu (never bare page
+        # text — the closest() guard pins it to Angular Material's overlay).
+        _click_direct_ext_js = """() => { // directExtended
+            const items = document.querySelectorAll(
+                '[role="menuitem"], [role="menuitemradio"], ' +
+                '[role="menuitemcheckbox"], [role="option"], button, li');
+            for (const el of items) {
+                if (!el.offsetParent) continue;
+                if (!el.closest('[role="menu"], [class*="menu-panel" i], .cdk-overlay-container')) continue;
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t.startsWith('standard') || t.length >= 60) continue;
+                if (/\\bextended\\b/.test(t)) {
+                    el.click();
+                    return t.slice(0, 40);
+                }
+            }
+            return '';
+        }"""
+        _hover_flash_row_js = """() => { // hoverFlashRow
+            for (const el of document.querySelectorAll(
+                    '[role="menuitem"], [role="menuitemradio"], [role="option"], li')) {
+                if (!el.offsetParent) continue;
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (/\\bflash\\b/.test(t) && !/lite|\\bpro\\b|deep think/.test(t)) {
+                    try { el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true})); } catch(e){}
+                    try { el.dispatchEvent(new MouseEvent('pointerover', {bubbles:true})); } catch(e){}
+                    return t.slice(0, 40);
+                }
+            }
+            return '';
+        }"""
+        _menu_dump_js = """() => { // menuDump
+            const rows = [];
+            for (const el of document.querySelectorAll(
+                    '[role="menuitem"], [role="menuitemradio"], ' +
+                    '[role="menuitemcheckbox"], [role="option"], ' +
+                    '.cdk-overlay-container button, .cdk-overlay-container li')) {
+                if (!el.offsetParent || rows.length >= 20) continue;
+                const t = (el.textContent || '').trim();
+                if (!t) continue;
+                rows.push({ t: t.slice(0, 60),
+                            hp: el.getAttribute('aria-haspopup') || '',
+                            ex: el.getAttribute('aria-expanded') || '',
+                            ck: el.getAttribute('aria-checked') || '' });
+            }
+            return { openMenus: document.querySelectorAll('[role="menu"]').length,
+                     rows };
+        }"""
+
+        async def _dump_thinking_menu(tag):
+            try:
+                snap = await page.evaluate(_menu_dump_js)
+                line = json.dumps(snap, ensure_ascii=True)[:1200]
+            except Exception as _de:
+                line = f"dump-failed: {_de}"
+            log(f"[setup_gemini_dr] thinking-menu snapshot ({tag}): {line}", "DEBUG")
+
         _gem_ext_confirmed = False  # Phoenix: advisory extended-thinking confirmation
         tl_opened = await page.evaluate(_click_tl_js)
         if not tl_opened:
-            await page.evaluate(_reopen_js)
-            await asyncio.sleep(0.6)
-            tl_opened = await page.evaluate(_click_tl_js)
+            _direct = await page.evaluate(_click_direct_ext_js)
+            if _direct:
+                _gem_ext_confirmed = True
+                log(f"[setup_gemini_dr] model-pick: direct Extended item clicked "
+                    f"('{_direct}') — no Thinking-level submenu on this menu variant")
+            else:
+                await _dump_thinking_menu("first-miss")
+                await page.evaluate(_reopen_js)
+                await asyncio.sleep(0.6)
+                _hovered = await page.evaluate(_hover_flash_row_js)
+                if _hovered:
+                    await asyncio.sleep(0.5)
+                tl_opened = await page.evaluate(_click_tl_js)
+                if not tl_opened:
+                    _direct = await page.evaluate(_click_direct_ext_js)
+                    if _direct:
+                        _gem_ext_confirmed = True
+                        log(f"[setup_gemini_dr] model-pick: direct Extended item "
+                            f"clicked after reopen+hover ('{_direct}')")
         if tl_opened:
             await asyncio.sleep(0.6)
             ext_picked = await page.evaluate("""() => {
@@ -27248,8 +27335,10 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
                 _gem_ext_confirmed = True
                 log(f"[setup_gemini_dr] model-pick: Thinking level -> Extended ('{ext_picked}')")
             else:
+                await _dump_thinking_menu("extended-option-miss")
                 log("[setup_gemini_dr] model-pick: 'Extended' option not found — leaving default thinking level", "WARN")
-        else:
+        elif not _gem_ext_confirmed:
+            await _dump_thinking_menu("final-miss")
             log("[setup_gemini_dr] model-pick: 'Thinking level' submenu not found — leaving default thinking level", "WARN")
 
         # Verify the mode button now reflects Extended (best-effort), then close

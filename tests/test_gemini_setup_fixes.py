@@ -332,6 +332,84 @@ class TestGeminiModelPickSourceContract:
         # The fix's rationale comment is a stable marker of the corrected match.
         assert "trailing word boundary" in src
 
+    # ── #919 (2026-07-08): 'Thinking level' vanished from the menu overnight
+    # (last hit 07-07 21:55, misses 07-08 02:02 + 11:17 — user screenshot
+    # showed the run on plain Flash). Hardened walk + self-documenting miss.
+
+    def test_919_trigger_match_broadened_beyond_literal_thinking_level(self):
+        src = self._src()
+        assert "t.startsWith('thinking')" in src, (
+            "a renamed trigger ('Thinking', 'Thinking: Standard') must still "
+            "match — the literal 'thinking level' text is what vanished")
+
+    def test_919_direct_extended_fallback_is_overlay_scoped(self):
+        src = self._src()
+        assert "directExtended" in src
+        assert "cdk-overlay-container" in src, (
+            "the direct 'Extended…' click must be pinned to an OPEN overlay "
+            "menu — never bare page text (the brief itself can contain the "
+            "word 'extended')")
+        assert "t.length >= 60" in src, "container-node guard"
+
+    def test_919_reopen_retry_hovers_flash_row(self):
+        src = self._src()
+        assert "hoverFlashRow" in src, (
+            "row-nested Thinking submenus only render on hover of the "
+            "selected model row — the reopen-retry must hover first")
+
+    def test_919_menu_dump_on_every_miss(self):
+        src = self._src()
+        assert "menuDump" in src
+        assert src.count("_dump_thinking_menu(") >= 4, (
+            "define + first-miss + final-miss + extended-option-miss — every "
+            "miss path must leave a menu snapshot in backend.log "
+            "(instrument-with-logs)")
+        assert "thinking-menu snapshot" in src
+
+    def test_919_no_literal_backspace_in_model_pick_strings(self):
+        # #913 VERB_GATE lesson: a lone \b in a NON-raw Python string parses
+        # to a literal backspace and the JS regex silently never matches.
+        import ast
+        import textwrap
+        import research
+        tree = ast.parse(textwrap.dedent(
+            inspect.getsource(research._gemini_select_flash_model)))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert "\x08" not in node.value, (
+                    "_gemini_select_flash_model embeds a literal backspace — "
+                    "a lone \\b in a non-raw string; escape it as \\\\b")
+
+
+class TestGeminiDirectExtendedFallbackFlow:
+    """#919 functional: when the 'Thinking level' trigger is gone but a
+    direct 'Extended…' item exists in the open menu, the fallback clicks it,
+    confirmation is recorded, and NO 'submenu not found' WARN fires."""
+
+    def test_direct_extended_path_confirms_without_warn(self):
+        import research
+        base = _make_model_pick_eval(
+            opened=True, picked="3.5 flashall-around help",
+            tl_seq=[False], ext_picked="",
+            mode_txt="currently flash extended")
+
+        def fake_eval(js, *a, **k):
+            if "directExtended" in js:
+                return "extended thinking"
+            if "menuDump" in js or "hoverFlashRow" in js:
+                return None
+            return base(js, *a, **k)
+
+        page = _model_page(fake_eval)
+        with mock.patch.object(research.asyncio, "sleep", mock.AsyncMock()), \
+             mock.patch.object(research, "log", mock.MagicMock()) as logm:
+            result = _run(research._gemini_select_flash_model(page))
+        assert result is True
+        logged = " ".join(str(c) for c in logm.call_args_list).lower()
+        assert "direct extended item clicked" in logged
+        assert "submenu not found" not in logged
+        assert research._P2_THINKING_STATE.get("gemini", {}).get("thinking") is True
+
 
 # Mirror of the model-row matcher, asserted against captured DOM row text.
 _MODEL_RE = re.compile(r"3\.5\s*flash", re.I)
