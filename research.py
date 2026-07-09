@@ -18767,12 +18767,51 @@ class Browser:
         # layer; it's additive and patchright tolerates it.
         from patchright.async_api import async_playwright
         self.playwright = await async_playwright().start()
-        self.context = await self.playwright.chromium.launch_persistent_context(
+        # macOS COOKIE-DECRYPTION FIX (2026-07-09). patchright/Playwright inject
+        # `--use-mock-keychain` into the channel="chrome" launch by default. On
+        # macOS, Chrome's cookie-encryption key ("Chrome Safe Storage") lives in
+        # the login Keychain; --use-mock-keychain swaps in a MOCK key, so THIS
+        # automated Chrome cannot decrypt the cookies the plain-Chrome sign-in
+        # (_seed_login_plain_chrome, launched via `open` → real Keychain) wrote —
+        # Chrome silently DROPS the undecryptable rows and rewrites the jar empty.
+        # Net effect on macOS: verify + every research run reopen the SAME profile
+        # dir the user signed into, but read it as SIGNED-OUT, and the saved
+        # session is wiped on the first reopen. That is the reported "the profile
+        # the Mac opens for runs/verify is a different (empty) profile" bug — and
+        # it is macOS-specific because Windows cookies use DPAPI, which
+        # --use-mock-keychain does not touch (so Windows decrypts fine). Dropping
+        # the mock-keychain arg makes automated Chrome use the SAME real Keychain
+        # key as the seed → cookies decrypt → logins persist across
+        # seed → verify → run. Real (non-automated) Chrome never sets this flag, so
+        # this also makes the automated browser look MORE like real Chrome (a net
+        # positive for the patchright stealth layer, not a regression).
+        # Proven on-device (Chrome 150, launchd + Terminal): with the flag the
+        # reopen reads 0 cookies and wipes the jar; without it, the seeded cookies
+        # decrypt and persist. Scoped to Darwin so Windows/Linux launch is byte-for-
+        # byte unchanged.
+        _launch_kwargs = dict(
             user_data_dir=self.profile_dir,
             channel="chrome",
             headless=self.headless,
             viewport={"width": API_WIDTH, "height": API_HEIGHT},
             no_viewport=False,
+        )
+        if sys.platform == "darwin":
+            _launch_kwargs["ignore_default_args"] = ["--use-mock-keychain"]
+        # Instrumentation (mac login-profile bug): make backend.log ALONE able to
+        # root-cause a profile / keychain mismatch — the fully-resolved abspath,
+        # HOME (Path.home() differs if a supervisor launched us with another HOME),
+        # WORKER_ID (which _profile_dir slot), the channel, and whether the macOS
+        # real-Keychain fix is active for this launch.
+        try:
+            _abs_profile = str(Path(self.profile_dir).resolve())
+        except Exception:
+            _abs_profile = str(self.profile_dir)
+        log(f"[browser] launch profile_dir={_abs_profile} home={Path.home()} "
+            f"worker={WORKER_ID} channel=chrome headless={self.headless} "
+            f"real_keychain={sys.platform == 'darwin'}")
+        self.context = await self.playwright.chromium.launch_persistent_context(
+            **_launch_kwargs
         )
         # patchright owns the stealth layer from here. The prior hand-rolled
         # add_init_script (webdriver/plugins/languages/vendor/platform/
@@ -41837,6 +41876,17 @@ async def _seed_login_plain_chrome(profile_dir: str, service_urls: "list[str]", 
         # Windows + Linux: a direct binary launch honors --user-data-dir — a
         # distinct data-dir gets its own instance even if the user's Chrome runs.
         args = [chrome] + chrome_args
+    # Instrumentation (mac login-profile bug): the EXACT seed invocation + the
+    # fully-resolved profile abspath + HOME. Diff this against the `[browser]
+    # launch` line verify/run emit — they MUST name the same dir, and the seed
+    # writes cookies with the REAL macOS Keychain key (plain Chrome via `open`),
+    # which the run now also uses (Browser.start drops --use-mock-keychain on macOS).
+    try:
+        _abs_seed = str(Path(profile_dir).resolve())
+    except Exception:
+        _abs_seed = str(profile_dir)
+    log(f"[login] seed plain-Chrome profile_dir={_abs_seed} home={Path.home()} "
+        f"invocation={' '.join(args)}")
     if reopen:
         print(f"  {_c(_DIM, 'Reopening your real Chrome — fix the flagged platforms (sign in / switch to Pro).')}")
     else:
