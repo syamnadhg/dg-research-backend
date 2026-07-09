@@ -13514,31 +13514,20 @@ _PHASE_GATE_AUTH_COOKIES = {
 }
 
 
-async def _platform_auth_cookie_present(browser, agent_key: str) -> bool:
-    """Trust-first probe for the phase-time gate (2026-07-02, bot-score work):
-    does the profile still HOLD the platform's session cookie? Read-only on
-    the browser context — NO navigation, which is the whole point (the gate's
-    proactive verify tab was the top bot-score signal on fresh profiles; live
-    evidence 2026-07-02: verify PASSED at 00:31:24, the Cloudflare challenge
-    hit the WORK page 16s later — the verify tab was pure extra exposure).
-
-    A present cookie CAN lie (server-side-invalidated session) — that trade is
-    deliberate now that verification is off by default (user direction
-    2026-07-02, inverting the 2026-04-24 "Phase 0 is the only gate and must
-    not lie" premise): the phase's own failure handling + the human-verify
-    cascade catch the rare stale-cookie case, while every healthy run saves
-    up to 5 proactive navigations. A MISSING cookie stays reliable — genuinely
-    signed out → the caller falls through to the full verify gate + its
-    login_required card."""
+def _auth_cookie_present_in(cookies, agent_key: str) -> bool:
+    """Pure predicate: is `agent_key`'s live session cookie present in this
+    already-fetched `cookies` list? Split out of _platform_auth_cookie_present
+    (2026-07-09) so a caller that reads the jar ITSELF can distinguish
+    "read the jar → cookie absent" (this returns False) from "couldn't read the
+    jar at all" (the caller catches its own read error and treats it as unknown) —
+    a distinction _platform_auth_cookie_present deliberately collapses to False.
+    login-verify's no_check cross-check needs that tri-state so a probe failure
+    is NOT misread as a logout. Same match rule as the gate: right host + exact or
+    chunked cookie name + a non-empty, non-expired value."""
     spec = _PHASE_GATE_AUTH_COOKIES.get(agent_key)
     if spec is None:
         return False
     domain_suffix, names = spec
-    try:
-        cookies = await browser.context.cookies()
-    except Exception as e:
-        log(f"[gate] cookie probe failed ({e}) — falling back to full verify", "DEBUG")
-        return False
     now = time.time()
     for c in cookies:
         cd = (c.get("domain") or "").lstrip(".").lower()
@@ -13558,6 +13547,32 @@ async def _platform_auth_cookie_present(browser, agent_key: str) -> bool:
         if c.get("value"):
             return True
     return False
+
+
+async def _platform_auth_cookie_present(browser, agent_key: str) -> bool:
+    """Trust-first probe for the phase-time gate (2026-07-02, bot-score work):
+    does the profile still HOLD the platform's session cookie? Read-only on
+    the browser context — NO navigation, which is the whole point (the gate's
+    proactive verify tab was the top bot-score signal on fresh profiles; live
+    evidence 2026-07-02: verify PASSED at 00:31:24, the Cloudflare challenge
+    hit the WORK page 16s later — the verify tab was pure extra exposure).
+
+    A present cookie CAN lie (server-side-invalidated session) — that trade is
+    deliberate now that verification is off by default (user direction
+    2026-07-02, inverting the 2026-04-24 "Phase 0 is the only gate and must
+    not lie" premise): the phase's own failure handling + the human-verify
+    cascade catch the rare stale-cookie case, while every healthy run saves
+    up to 5 proactive navigations. A MISSING cookie stays reliable — genuinely
+    signed out → the caller falls through to the full verify gate + its
+    login_required card."""
+    if _PHASE_GATE_AUTH_COOKIES.get(agent_key) is None:
+        return False
+    try:
+        cookies = await browser.context.cookies()
+    except Exception as e:
+        log(f"[gate] cookie probe failed ({e}) — falling back to full verify", "DEBUG")
+        return False
+    return _auth_cookie_present_in(cookies, agent_key)
 
 
 async def _page_shows_login_wall(page) -> "str | None":
@@ -41960,12 +41975,44 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
             current_url = (tab.url or "").lower()
         except Exception:
             current_url = ""
+        # GROUND-TRUTH CROSS-CHECK (2026-07-09). The navigation/vision layer below
+        # can be DEFEATED without meaning "logged out": claude.ai (and any
+        # Cloudflare-fronted host) can throw a managed challenge on the canonical
+        # host, and there may be no API key for the vision pass. The old code
+        # fail-OPEN in those cases (status="no_check", which counts as signed in),
+        # which SILENTLY accepts a genuinely logged-out platform — live repro
+        # 2026-07-09: profile 1's claude.ai jar held only `pendingLogin` (NO
+        # `sessionKey`; the login never completed), yet Stage-4 verify passed it
+        # because the Cloudflare interstitial forced no_check, so the user was
+        # never prompted to finish signing in. The auth-cookie read is the reliable
+        # signal (host-only session cookie; it never lies signed-IN for a
+        # logged-out jar — see _PHASE_GATE_AUTH_COOKIES), so use it to disambiguate
+        # the no_check branches: cookie ABSENT ⇒ genuinely "missing"; cookie
+        # PRESENT ⇒ keep the fail-open no_check (a real session the challenge just
+        # hid — don't nag a re-login). Only downgrade on an AFFIRMATIVE absent
+        # (`is False`); on unknown (no cookie spec / probe error) keep prior behavior.
+        # Read the jar OURSELVES (not via _platform_auth_cookie_present) so a
+        # read FAILURE stays distinct from cookie ABSENCE: None = couldn't read
+        # (keep the prior fail-open no_check); True/False = definitive.
+        _has_auth_cookie = None
+        if key in _PHASE_GATE_AUTH_COOKIES:
+            try:
+                _jar = await browser.context.cookies()
+                _has_auth_cookie = _auth_cookie_present_in(_jar, key)
+            except Exception:
+                _has_auth_cookie = None
         if _blocked:
-            status, label = "no_check", f"couldn't verify — {_cf} check in the way (you're likely still signed in)"
+            if _has_auth_cookie is False:
+                status, label = "missing", f"not signed in — no session cookie ({_cf} check blocked the visual verify)"
+            else:
+                status, label = "no_check", f"couldn't verify — {_cf} check in the way (you're likely still signed in)"
         elif any(h in current_url for h in _LOGIN_HOST_NEGATIVES):
             status, label = "missing", "not signed in"
         elif not cua_client:
-            status, label = "no_check", "no vision check (no API key)"
+            if _has_auth_cookie is False:
+                status, label = "missing", "not signed in — no session cookie"
+            else:
+                status, label = "no_check", "no vision check (no API key)"
         else:
             try:
                 async with _async_spinner_ctx(f"Verifying {name}"):
@@ -41973,9 +42020,14 @@ async def _verify_platform_logins(browser, services, cua_client, *, results, emi
             except CuaUnavailableError as _cua_err:
                 # AI service down / key rate-limited / over cap — NOT a logout.
                 # Accept on the URL pass (login-host negatives already cleared)
-                # and flag it, rather than falsely reporting "not signed in".
-                log(f"verify: CUA unavailable for {key} ({_cua_err}) — URL-only accept", "WARN")
-                status, label = "no_check", "signed in (vision check unavailable)"
+                # rather than falsely reporting "not signed in" — UNLESS the
+                # session cookie is affirmatively absent (then it IS missing, and
+                # vision being down must not mask that).
+                log(f"verify: CUA unavailable for {key} ({_cua_err}) — cookie cross-check", "WARN")
+                if _has_auth_cookie is False:
+                    status, label = "missing", "not signed in — no session cookie"
+                else:
+                    status, label = "no_check", "signed in (vision check unavailable)"
             except Exception as e:
                 log(f"verify: CUA error {key}: {e}", "WARN")
                 status, label = "missing", "not signed in"
