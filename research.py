@@ -791,12 +791,61 @@ def _read_firestore_api_keys() -> dict:
             return {}
         data = snap.to_dict() or {}
         keys = data.get("apiKeys") or {}
-        # Strip + filter empty values so callers can treat any present
-        # key as authoritative.
-        return {k: str(v).strip() for k, v in keys.items() if v and str(v).strip()}
+        did = load_device_id()
+        merged = _overlay_device_keys(keys, did)
+        # Observability (#928): name WHICH fields this device overrides —
+        # field names only, values never logged. Change-only, so the 60s
+        # resolve cadence doesn't spam the log.
+        _dev = (keys.get("byDevice") or {}).get(did) if did else None
+        _dev_fields = sorted(
+            k for k, v in _dev.items() if isinstance(v, str) and v.strip()
+        ) if isinstance(_dev, dict) else []
+        _prev = _DEVICE_KEY_OVERRIDE_MEMO.get("fields")
+        if _dev_fields != _prev:
+            _DEVICE_KEY_OVERRIDE_MEMO["fields"] = _dev_fields
+            if _dev_fields:
+                log(f"[_read_firestore_api_keys] device-scoped key override active for {', '.join(_dev_fields)} (device {did})", "INFO")
+            elif _prev:
+                # Was set, now gone — a real clear; revert to flat/local.
+                log(f"[_read_firestore_api_keys] device-scoped key override cleared — account-wide/local fallback (device {did})", "INFO")
+        return merged
     except Exception as e:
         log(f"[_read_firestore_api_keys] read failed (non-fatal): {e}", "WARN")
         return {}
+
+
+# #928: change-only memo for the device-override log line above.
+_DEVICE_KEY_OVERRIDE_MEMO = {"fields": None}
+
+
+def _overlay_device_keys(keys, device_id):
+    """Merge THIS device's per-device key overrides over the flat
+    account-wide keys. Pure — unit-testable without Firestore.
+
+    #928 (2026-07-09): the FE Account page writes device-scoped keys at
+    apiKeys.byDevice.{deviceId}.{anthropic,gemini} (owner-only by the
+    settings/prefs write rule — sharers can't read or write them, unlike
+    the sharer-readable device doc). A device's own entry OUTRANKS the
+    flat account-wide key so each research computer can run its own key;
+    the flat keys stay as the account-wide fallback for devices without
+    an override, so pre-#928 installs keep working unchanged. An empty
+    per-device value never shadows a flat key (empties are filtered), so
+    clear-on-the-FE cleanly reverts this device to flat → local env.
+
+    Strips + filters empty values so callers can treat any present key
+    as authoritative."""
+    flat = {
+        k: str(v).strip() for k, v in (keys or {}).items()
+        if k != "byDevice" and isinstance(v, str) and v.strip()
+    }
+    by_device = (keys or {}).get("byDevice")
+    if device_id and isinstance(by_device, dict):
+        dev = by_device.get(device_id)
+        if isinstance(dev, dict):
+            for k, v in dev.items():
+                if isinstance(v, str) and v.strip():
+                    flat[k] = v.strip()
+    return flat
 
 
 _RESOLVED_KEY_CACHE = {"key": None, "ts": 0.0}
