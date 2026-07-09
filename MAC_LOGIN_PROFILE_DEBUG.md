@@ -8,8 +8,15 @@
 
 ## 0. Getting started (bootstrap)
 
-1. **Pull latest**: `git pull origin master` (personal fork, branch `master`). Recent
-   P1/login fixes live there — don't debug stale code. (User handles git auth.)
+1. **Get the repo (from scratch — nothing is set up on this Mac yet):** authenticate git
+   first (`gh auth login`, or add an SSH key to GitHub — the fork is private), then clone the
+   personal fork and enter it:
+   ```
+   git clone https://github.com/syamnadhg/dg-research-backend.git
+   cd dg-research-backend
+   ```
+   `research.py` is at the repo root. Branch is `master` (recent P1/login fixes live there —
+   don't debug stale code). *Already cloned?* `git pull origin master` instead.
 2. **Python env**: use the repo's `uv`/venv (see `pyproject.toml` / README).
 3. **Credentials — there is NO GCP key file to transfer:**
    - **Firebase/Firestore** access = an OS‑keystore refresh token minted by pairing
@@ -120,9 +127,11 @@ Chrome‑written cookies won't decrypt and it'll look signed‑out despite the r
 
 ## 5. Conventions (match the repo)
 
-- Push to personal `origin` **master** only, and **ask before pushing**. Small, focused
+- **Push to personal `origin` master directly** once the fix is tested + reviewed — you do
+  NOT need to wait for the user (auto-push is fine on the personal fork). Small, focused
   commits; end messages with:
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+  (Never push to the `org` remote.)
 - Tests: add/extend under `tests/`; run `python -m pytest tests/ -q` (scope to `tests/` —
   root pytest chokes on `agent/tests`). Keep `ruff check research.py` delta at 0 (F405 on
   star‑imported `PROMPT_*` / config names is the pre‑existing benign baseline — don't touch).
@@ -136,8 +145,9 @@ Chrome‑written cookies won't decrypt and it'll look signed‑out despite the r
 ## 6. Deliverable
 
 A crisp root‑cause writeup (with the proving log lines), the fix, a regression test, and a
-clean reproduce showing **login‑profile == run‑profile == verify‑profile**. Then stop and
-show the user before pushing.
+clean reproduce showing **login‑profile == run‑profile == verify‑profile**. Once it's tested
++ reviewed, **commit and push to personal `origin master` directly** (no need to wait for the
+user), then post the root‑cause + fix summary.
 
 ---
 
