@@ -47,14 +47,16 @@ def test_parent_shell_marker_is_scoped_to_claude_without_composer():
 
 # ── _hv_fail_copy: honest, reason-aware card copy ─────────────────────────────
 
-def test_cloudflare_copy_points_at_real_chrome_not_the_automation_window():
+def test_cloudflare_copy_is_short_hands_off_and_login_free():
+    # 2026-07-09 (user): the Cloudflare HV copy is short + to the point, says
+    # the wall can't be cleared from here, and does NOT mention the login
+    # command (it isn't the right fix for a Cloudflare wall).
     title, details = research._hv_fail_copy("Claude", "Cloudflare")
     assert "Cloudflare" in title
-    assert "login command" in details, "the winnable move is the real-Chrome login"
-    assert "trust" in details.lower(), "frame it as trust-building"
-    assert "won't clear" in details or "re-issues" in details, (
-        "must warn that clicking in the automation window is a losing loop"
-    )
+    assert "login command" not in details.lower()
+    assert "cleared from here" in details, "state it can't be solved in the automation window"
+    assert "resumes automatically" in details
+    assert len(details) < 200, "keep it to the point"
 
 
 def test_non_cloudflare_copy_stays_solvable_in_place():
@@ -131,14 +133,17 @@ def test_cleared_paths_drop_the_hv_blocked_verdict():
     assert src.count("_mark_cleared()") >= 5
 
 
-def test_tier5_cloudflare_copy_warns_against_the_click_loop():
-    # 2026-07-06 hands-off directive: the copy now states the automation
-    # leaves the wall untouched (it no longer attempts anything) and points
-    # at the later real-Chrome login as the fix.
+def test_tier5_cloudflare_copy_is_short_and_hands_off():
+    # 2026-07-06 hands-off directive + 2026-07-09 (user): the copy is short and
+    # to the point — it says the wall can't be cleared from here (touching it
+    # only makes Cloudflare ask harder) and that Skip is the move, and it must
+    # NOT tell the user to run the login command (not the right fix for a CF wall).
     src = inspect.getsource(research.wait_for_verification_clearance)
-    assert "leaves it completely untouched" in src
-    assert "login command" in src
-    assert "builds Cloudflare's trust" in src
+    assert "trying only makes Cloudflare ask harder" in src
+    assert "resumes automatically" in src
+    # The login-command instruction is gone from the Cloudflare HV message.
+    assert "builds Cloudflare's trust" not in src
+    assert "run the login command on this computer later" not in src
 
 
 # ── review fixes: no false clears via frozen reason / dead pages / brief text ─

@@ -96,7 +96,9 @@ def test_hv_fail_copy_cloudflare_never_mentions_retry():
     _title, details = research._hv_fail_copy("claude", "Cloudflare challenge")
     assert "retry" not in details.lower(), (
         "CF copy invites the click loop the hands-off directive forbids")
-    assert "untouched" in details.lower()
+    # Conveys hands-off without inviting the click loop (2026-07-09 short copy).
+    assert "cleared from here" in details.lower()
+    assert "login command" not in details.lower()
 
 
 def test_hv_setup_fail_card_wires_skip_only_for_cloudflare():

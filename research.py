@@ -20835,8 +20835,27 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                                 _et_parts.append(f"{_merged_partial_len:,} chars drafted")
                             progress["progress"] = " · ".join(_et_parts)
                     agent_key = normalize_agent_key(label)
+                    # P1 milestone stepper (#924): the brief has NO research
+                    # counters (it's Pro + Extended Thinking, not Deep Research)
+                    # and the poll emit carried no `stage`, so the stepper sat on
+                    # "Submitted" for the whole phase even while the brief was
+                    # plainly generating (user-captured: stuck at Submitted 4.2m
+                    # in). We're inside poll_until_done → the agent is verified
+                    # generating → emit an honest stage so the stepper advances
+                    # off Submitted the instant polling starts (the scrape+emit is
+                    # at the top of the loop, before any sleep, so this fires ~1s
+                    # after the send is confirmed). Writing once real brief text
+                    # streams (matches the is_et <500-char boundary) or an outline
+                    # exists. poll_until_done is P1-only, so this never touches P2.
+                    _p1_stage = ""
+                    if phase == 1:
+                        _p1_stage = ("writing"
+                                     if (_merged_partial_len >= 500
+                                         or len(progress.get("sections", []) or []) > 0)
+                                     else "researching")
                     emit_event("agent_progress", phase=phase, agent=agent_key,
                         status=progress.get("status", ""),
+                        stage=_p1_stage,
                         progress=progress.get("progress", ""),
                         sources=progress.get("sources", 0),
                         sourceUrls=progress.get("source_urls", []),
@@ -29494,9 +29513,9 @@ def _hv_fail_copy(platform: str, reason: str) -> tuple[str, str]:
     Cloudflare gets its own copy because its checkbox is an ATTESTATION, not
     a click test: the automation browser fails the browser-integrity check,
     so the challenge re-issues after every click — solving it in the
-    automation window is a losing loop. The winnable move is signing in via
-    the real-Chrome login window, which builds Cloudflare's trust in this
-    profile+IP until the challenge stops being issued at all."""
+    automation window is a losing loop, hence hands-off + Skip-only.
+    2026-07-09 (user): keep the copy short + to the point and do NOT tell the
+    user to run the login command (it isn't the right fix for a Cloudflare wall)."""
     _names = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
     plat = _names.get(platform.lower(), platform.capitalize())
     if "cloudflare" in (reason or "").lower():
@@ -29505,12 +29524,8 @@ def _hv_fail_copy(platform: str, reason: str) -> tuple[str, str]:
         # Retry (hard) would re-navigate the walled tab and raise the score.
         return (
             f"{plat} hit Cloudflare's human check",
-            f"Cloudflare re-issues its 'Verify you are human' check every time it's "
-            f"clicked in the automation window, so the run leaves it completely "
-            f"untouched. Skip {plat} for this run. To make these checks go away: "
-            f"run the login command on this computer and sign in to {plat} in the "
-            f"real Chrome window it opens — each clean sign-in builds Cloudflare's "
-            f"trust in this computer until it stops asking.",
+            f"It can't be cleared from here — trying only makes Cloudflare ask harder. "
+            f"Skip {plat} for this run; if it clears on its own, the run resumes automatically.",
         )
     return (
         f"{plat} needs a human check",
@@ -29965,19 +29980,16 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     _hv_alert_id = f"phase{phase}_human_verify_{platform_key}"
     if "cloudflare" in (reason or "").lower():
         # #896: Cloudflare's checkbox is a browser attestation the automation
-        # window can't pass — it re-issues after every click there. Point the
-        # user at the winnable move (real-Chrome sign-in = trust building)
-        # instead of inviting them into the losing click loop.
+        # window can't pass — it re-issues after every click there, so the run
+        # leaves it hands-off (Skip-only). 2026-07-09 (user): keep the copy
+        # short + to the point; do NOT tell the user to run the login command
+        # (it isn't the right fix for a Cloudflare wall).
         _hv_plat = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}.get(
             platform_key, platform.capitalize())
         _hv_msg = (
             f"{_hv_plat} hit Cloudflare's 'Verify you are human' check. "
-            f"The automation leaves it completely untouched — any click there re-issues "
-            f"the check and raises the bot score. Skip {_hv_plat} for this run; to make "
-            f"these checks go away, run the login command on this computer later and sign "
-            f"in to {_hv_plat} in the real Chrome window it opens — each clean sign-in "
-            f"builds Cloudflare's trust until it stops asking. If the check clears here "
-            f"on its own, the run resumes automatically."
+            f"It can't be cleared from here — trying only makes Cloudflare ask harder. "
+            f"Skip {_hv_plat} for this run; if it clears on its own, the run resumes automatically."
         )
     else:
         _hv_msg = f"Solve the check ({platform.capitalize()}'s 'are you human' prompt) in the open browser, then Resume — or Skip {platform.capitalize()}."
