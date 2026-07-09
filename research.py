@@ -14127,7 +14127,7 @@ def _compact_event_for_narration(e: dict) -> str:
     if ag:
         parts.append(f"agent={ag}")
     for k in ("status", "progress", "error", "message", "reason",
-              "sources", "sections", "partialTextLen", "partialTextPreview",
+              "sources", "sections", "steps", "partialTextLen", "partialTextPreview",
               "elapsedSec", "searches", "sectionsDone", "sectionsTotal",
               "currentFocus", "websitesCount", "panelOpen", "artifactCount"):
         v = d.get(k)
@@ -14139,6 +14139,14 @@ def _compact_event_for_narration(e: dict) -> str:
                 v = [c for c in (_scrub_for_narrator(x) for x in v
                                   if isinstance(x, str)) if c]
                 if not v:
+                    continue
+                if k == "steps":
+                    # The scraped activity-panel step titles = the literal
+                    # "what's happening now". Feed the narrator the freshest
+                    # few as a readable line so it grounds its sentence in the
+                    # real activity instead of inventing from a hardcoded
+                    # timeline (the user-reported "generic narration").
+                    parts.append(f"steps={' · '.join(v[-3:])[:220]}")
                     continue
             s = json.dumps(v)[:120]
         elif k == "partialTextPreview":
@@ -14583,6 +14591,16 @@ async def _narrator_loop(phase: int):
                                 if (e.get("agent") or "").lower() == akey
                                 or ((e.get("data", {}) or {}).get("agent") or "").lower() == akey]
                     if not a_events:
+                        # Never-started agent: P2 opens ChatGPT → Claude →
+                        # Gemini sequentially (~30s apart). If this agent hasn't
+                        # produced a single event yet, it isn't underway — stay
+                        # SILENT rather than fabricating "Claude is…" before the
+                        # backend has even opened Claude (which would contradict
+                        # the FE's "Waiting to start" queued card). Once it has
+                        # emitted at least one event, the quiet-window Tier-3
+                        # fallback below resumes as before.
+                        if akey not in last_known_status_for_agent:
+                            continue
                         # Tier 3 fallback — only after 60s warmup so we don't
                         # produce bogus narration during the brief window where
                         # DOM scrape is settling and vision hasn't run yet.
@@ -14659,6 +14677,10 @@ async def _narrator_loop(phase: int):
                         "WHEN DATA IS RICH: Weave structured fields (searches, "
                         "sectionsDone/Total, currentFocus, partialTextLen) as "
                         "paraphrased facts, not quoted strings. When events "
+                        "contain `steps=<titles>` that is the platform's OWN "
+                        "description of its current activity — GROUND your "
+                        "sentence in the freshest step (the truth of what's "
+                        "happening now), paraphrased not quoted. When events "
                         "contain `host=<domain>` or `hosts=foo.com,bar.com`, "
                         "weave 1-2 hostnames naturally — 'ChatGPT is skimming "
                         "sec.gov filings on Tesla 10-K' beats 'ChatGPT is "
@@ -18133,7 +18155,7 @@ async def scrape_chatgpt_activity_panel_tracking(page):
     """
     JS = """() => {
         const out = {
-            steps: [], sections: [], source_urls: [],
+            steps: [], sections: [], source_urls: [], source_items: [],
             searches: 0, partial_text_len: 0, progress: ""
         };
         // Panel root — ChatGPT renders the side panel as <aside> /
@@ -18212,7 +18234,16 @@ async def scrape_chatgpt_activity_panel_tracking(page):
         // #913: was a lone \\b in a NON-raw Python string — Python parsed it
         // into a literal backspace char, so this gate NEVER matched and the
         // side-panel walker returned zero step rows since it shipped.
-        const VERB_GATE = /^(?:checking|searching|looking|browsing|investigating|analyzing|reading|exploring|visiting|researching|thinking|reasoning|gathering|reviewing|consulting|comparing|evaluating|considering|drafting|writing|finalizing|finalising|summari[zs]ing|confirming|synthesi[zs]ing)\\b/i;
+        // 2026-07-08 (#922): the old fixed verb allowlist rejected real step
+        // titles like "Creating a brief on Golden Retrievers…" (starts with
+        // "Creating", which wasn't listed) — the user's screenshot showed the
+        // activity panel had rich content we were dropping. ChatGPT's activity
+        // titles are consistently GERUND-led ("Creating…", "Reading…",
+        // "Searching…", "Building…", "Analyzing…"), so a leading-gerund gate is
+        // both broader (admits the titles we were losing) AND still rejects
+        // non-verb UI chrome ("Settings", "New chat", "Deep Research Flash
+        // Sources Files") — and it subsumes the whole old list (all gerunds).
+        const VERB_GATE = /^[a-z]+ing\\b/i;
         const seenStep = new Set();
         panel.querySelectorAll(STEP_SELS).forEach(e => {
             const t = (e.innerText || '').trim();
@@ -18246,8 +18277,16 @@ async def scrape_chatgpt_activity_panel_tracking(page):
             if (seenUrl.has(h)) return;
             seenUrl.add(h);
             out.source_urls.push(h);
+            // Capture the visible anchor text as the source TITLE (the real
+            // article/page name shown in the panel) so the raw-activity popup
+            // can show it instead of just a hostname. Bounded + falls back to
+            // empty when the anchor is icon-only.
+            let _title = (a.innerText || a.getAttribute('aria-label') || a.title || '').trim();
+            if (_title.length > 200) _title = _title.slice(0, 200);
+            out.source_items.push({ url: h, title: _title });
         });
         out.source_urls = out.source_urls.slice(0, 50);
+        out.source_items = out.source_items.slice(0, 50);
 
         // Aggregate search count — ChatGPT renders strings like
         // "193 searches" / "33 sources" in the panel header or near the
@@ -23209,6 +23248,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 progress[key] = merged
                         # Invariant: progress["sources"] == len(progress["source_urls"]).
                         progress["sources"] = len(progress.get("source_urls", []) or [])
+                        # Merge source_items ({url,title}) by url — dicts aren't
+                        # hashable so this can't ride the dict.fromkeys() union
+                        # above. Keep the first non-empty title seen per url so
+                        # a later title-less scrape doesn't erase it.
+                        if panel_data.get("source_items"):
+                            _by_url = {}
+                            for _it in (progress.get("source_items") or []):
+                                if isinstance(_it, dict) and _it.get("url"):
+                                    _by_url[_it["url"]] = _it
+                            for _it in panel_data["source_items"]:
+                                if not isinstance(_it, dict) or not _it.get("url"):
+                                    continue
+                                _prev = _by_url.get(_it["url"]) or {}
+                                _title = (_it.get("title") or _prev.get("title") or "").strip()
+                                _by_url[_it["url"]] = {"url": _it["url"], "title": _title}
+                            progress["source_items"] = list(_by_url.values())[:50]
                         # Searches count — take max so transient lower
                         # reads don't shrink the chip.
                         _ps = int(panel_data.get("searches", 0) or 0)
@@ -23611,6 +23666,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     progress=_progress_val,
                     sources=progress.get("sources", 0),
                     sourceUrls=progress.get("source_urls", []),
+                    # {url,title} pairs — the REAL scraped source-panel titles
+                    # (the raw-activity popup renders these instead of bare
+                    # hostnames). Empty/absent → FE falls back to sourceUrls.
+                    sourceItems=progress.get("source_items", []),
                     sections=progress.get("sections", []),
                     partialTextLen=_partial_text_len,
                     partialTextPreview=_obs_preview,
@@ -30942,7 +31001,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             _chatgpt_alive = "chatgpt.com/c/" in _chatgpt_url
             if _chatgpt_alive:
                 log("[2A] verify_chatgpt_generating returned False but page is at /c/<id> — handing off to round-robin polling (no fail_agent banner)", "WARN")
+                # stage="researching": the page reaching /c/<id> IS evidence the
+                # DR run started — same signal the verified path stamps. Without
+                # it, a cross-origin-iframe DR (unreadable → zero counters) would
+                # leave the milestone stepper pinned on "Submitted" for the whole
+                # run (#922 stepper drives off stage/counters, not status alone).
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="generating",
+                           stage="researching",
                            progress="ChatGPT DR submitted — verifying via round-robin polling")
                 await inject_agent_observer(chatgpt_page, "chatgpt")
             elif _controls.is_stop():
@@ -31049,7 +31114,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             _claude_alive = "claude.ai/chat/" in _claude_url
             if _claude_alive:
                 log("[2B] verify_claude_generating returned False but page is at /chat/<id> — handing off to round-robin polling (no fail_agent banner)", "WARN")
+                # stage="researching": reaching /chat/<id> IS evidence the run
+                # started (mirrors the verified path). Prevents the #922 stepper
+                # from stranding a live-but-unreadable Claude on "Submitted".
                 emit_event("agent_progress", phase=2, agent="claude", status="generating",
+                           stage="researching",
                            progress="Claude DR submitted — verifying via round-robin polling")
                 await inject_agent_observer(claude_page, "claude")
             elif _controls.is_stop():
@@ -31110,7 +31179,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             source_paths=source_paths)
         if gemini_setup_ok:
             log("[2C] Gemini brief submitted — letting it generate research plan")
-            emit_event("agent_progress", phase=2, agent="gemini", status="generating", progress="Gemini generating research plan...")
+            emit_event("agent_progress", phase=2, agent="gemini", status="generating", stage="planning", progress="Gemini generating research plan...")
             # #893 tier backstop: with verification off by default, the P0
             # walk + gate tier checks no longer run — this DOM read on the
             # ALREADY-OPEN work page (zero navigations, no CUA) is Gemini's
