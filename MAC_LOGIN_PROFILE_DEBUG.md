@@ -25,7 +25,13 @@
      # then fill in ANTHROPIC_API_KEY=…  (GEMINI_API_KEY=… optional)
      ```
      `.dg-supervisor.env` is **gitignored** — never commit secrets.
-4. **CLI reference**: `python research.py --help`. Flags you'll use:
+4. **Commit signing (optional)**: signing is configured *repo-local* on the Windows clone,
+   so it does NOT travel with a fresh clone/pull — Mac commits are **unsigned by default and
+   that's fine** (personal fork). If the user wants signed/Verified commits they'll set it up
+   themselves (SSH signing via `gpg.format ssh`, or import the GPG key
+   `1CABFF166C1FF8334EC9D83934FA38BECE5387F2` = "Sammy Guli <sammy.guli@distributedglobal.com>").
+   **Never bypass or fake signing, and never commit a private key / `.asc` file.**
+5. **CLI reference**: `python research.py --help`. Flags you'll use:
    - `python research.py --pair` — first‑time setup incl. **Stage 4** (profile creation).
    - `python research.py --login` — re‑seed logins into existing profiles.
    - `python research.py --worker-id N` — run as worker N (profile = `_profile_dir(N)`).
