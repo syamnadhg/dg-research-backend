@@ -10092,6 +10092,244 @@ async def _chatgpt_extended_pro_confirm(page) -> str:
     return "unsure"
 
 
+# Composer detector shared by the clear + verify legs below. DR-active when a
+# short 'deep research' pill/chip is visible in the composer FORM, or the
+# composer placeholder is the Deep-Research one. NB the DR placeholder is
+# "Get a detailed report" (contains 'report', NOT 'research') — user-captured
+# 2026-07-08 — so the old placeholder.includes('research') check would MISS it.
+# Scoped to `form` so a 'Deep research' badge on an already-SENT message (which
+# lives OUTSIDE the composer form) can never false-positive.
+_CHATGPT_DR_ACTIVE_JS = r"""() => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const form = document.querySelector('form') || document.body;
+    let pillText = '';
+    for (const p of form.querySelectorAll('button, [role="button"], span, div')) {
+        if (!p.offsetParent) continue;
+        const t = norm(p.textContent);
+        if (t && t.length <= 30 && t.includes('deep research')) { pillText = t; break; }
+    }
+    let placeholder = '';
+    const ta = document.querySelector('#prompt-textarea, textarea, [contenteditable="true"]');
+    if (ta) placeholder = norm(ta.getAttribute('placeholder') || ta.getAttribute('data-placeholder'));
+    if (!placeholder) {
+        const ph = (form.querySelector('[data-placeholder]') || {});
+        placeholder = norm(ph.getAttribute ? ph.getAttribute('data-placeholder') : '');
+    }
+    const phDR = /detailed report|deep research|research report/.test(placeholder);
+    return { active: !!pillText || phDR, pillText, placeholder: placeholder.slice(0, 80) };
+}"""
+
+
+async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) -> str:
+    """Phase 1 must write the research brief on ChatGPT Pro + Extended Thinking
+    with NO composer tool selected — Deep Research belongs to Phase 2 ONLY.
+
+    ChatGPT persists the last-used composer tool per account, so a PRIOR run's
+    Phase-2 'Deep research' selection carries into the next run's Phase-1 (the
+    tool stays sticky even on a fresh chat). Submitting the brief prompt while
+    Deep Research is active drops P1 into Deep Research mode: instead of a
+    Pro-Extended text brief, ChatGPT returns a research-plan card ('… Deep
+    Research' with an Edit/Cancel/Start gate) — the wrong output type, gated
+    behind a Start click, and it burns a deep-research slot (user-captured
+    2026-07-08 screenshot: 'Get a detailed report' placeholder + '📣 Deep
+    research' on the sent brief + a 'Golden Retriever Deep Research' Start-46 card).
+
+    Read-first + fully fail-safe. Detects an ACTIVE Deep Research composer tool
+    and turns it OFF — DOM primary ('+' tools-menu toggle → composer-pill ✕),
+    then a bounded CUA fallback — re-verifying after each leg. Returns
+    'cleared' | 'absent' | 'unsure'. NEVER enables a tool; swallows every error;
+    must never block Phase 1 (a miss just proceeds → worst case is today's
+    behaviour and the brief still submits)."""
+    page = browser.page
+    try:
+        st = await page.evaluate(_CHATGPT_DR_ACTIVE_JS)
+    except Exception as e:
+        log(f"[p1:clear_dr] composer probe failed ({e}) — proceeding without clearing", "INFO")
+        return "unsure"
+    if not st or not st.get("active"):
+        log(f"[p1:clear_dr] Deep Research not active on the P1 composer "
+            f"(placeholder={((st or {}).get('placeholder')) or ''!r}) — nothing to clear")
+        return "absent"
+    log(f"[p1:clear_dr] Deep Research is ACTIVE on the P1 composer "
+        f"(pill={st.get('pillText')!r}, placeholder={st.get('placeholder')!r}) — "
+        f"clearing it (Deep Research belongs to Phase 2 only)", "WARN")
+
+    async def _still_active() -> bool:
+        try:
+            s = await page.evaluate(_CHATGPT_DR_ACTIVE_JS)
+            return bool(s and s.get("active"))
+        except Exception:
+            return True  # can't confirm cleared → assume still on, keep trying
+
+    # ── Strategy A: '+' / tools menu toggle (symmetric with setup_chatgpt_dr —
+    #    the same control that turns DR ON toggles it OFF). Open the menu, click
+    #    the already-selected "Deep research" item, then Escape to close. ──
+    try:
+        _menu_opened = False
+        for sel in ['button[aria-label*="Use a tool"]',
+                    'button[aria-label*="Attach"]',
+                    'button[data-testid="composer-plus-btn"]',
+                    'button[aria-label*="More"]']:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click()
+                    await asyncio.sleep(0.8)
+                    _menu_opened = True
+                    break
+            except Exception:
+                continue
+        if _menu_opened:
+            toggled = await page.evaluate(r"""() => {
+                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const items = document.querySelectorAll(
+                    '[role="menuitemradio"], [role="menuitem"], [role="option"], button, a, li');
+                for (const el of items) {
+                    if (!el.offsetParent) continue;
+                    const t = norm(el.textContent);
+                    const a = norm(el.getAttribute('aria-label'));
+                    if (t === 'deep research' || a === 'deep research' ||
+                        t.startsWith('deep research') || a.startsWith('deep research')) {
+                        el.click(); return true;
+                    }
+                }
+                return false;
+            }""")
+            # The 'Deep research' menuitemradio lives in a body-level popover and
+            # is only observable WHILE the menu is open — dump it here (before the
+            # Escape below), document-wide + with data-testid, so a future relabel
+            # of the Strategy-A control can be pinned from a real run (mirrors
+            # setup_chatgpt_dr's Step-2 dump; the final form-scoped dump below can
+            # only ever see the Strategy-B composer pill, never this item).
+            if not toggled:
+                try:
+                    _mdump = await page.evaluate(r"""() => {
+                        const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+                        const out = [];
+                        for (const el of document.querySelectorAll(
+                                '[role="menuitemradio"], [role="menuitem"], [role="option"], button, a, li')) {
+                            if (!el.offsetParent) continue;
+                            const t = norm(el.textContent);
+                            const a = el.getAttribute('aria-label') || '';
+                            if (!t && !a) continue;
+                            out.push({ role: el.getAttribute('role') || el.tagName.toLowerCase(),
+                                       text: t.slice(0, 40), aria: a.slice(0, 40),
+                                       testid: el.getAttribute('data-testid') || '',
+                                       checked: el.getAttribute('aria-checked') || el.getAttribute('aria-pressed') || '' });
+                        }
+                        return out.slice(0, 30);
+                    }""")
+                    log("[p1:clear_dr] Strategy-A menu dump (no 'deep research' item toggled — "
+                        "pin the rotated control from this): " + json.dumps(_mdump, ensure_ascii=False), "WARN")
+                except Exception:
+                    pass
+            await asyncio.sleep(1.0)
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+            log(f"[p1:clear_dr] Strategy A ('+' menu toggle): item clicked={toggled}")
+    except Exception as e:
+        log(f"[p1:clear_dr] Strategy A errored ({e}) — trying pill ✕", "INFO")
+
+    # ── Strategy B: composer-pill ✕ (click the remove control on the DR chip) ──
+    if await _still_active():
+        try:
+            removed = await page.evaluate(r"""() => {
+                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const form = document.querySelector('form') || document.body;
+                let pill = null;
+                for (const p of form.querySelectorAll('button, [role="button"], span, div')) {
+                    if (!p.offsetParent) continue;
+                    const t = norm(p.textContent);
+                    if (t && t.length <= 30 && t.includes('deep research')) { pill = p; break; }
+                }
+                if (!pill) return false;
+                // Walk up to the chip container and find a close/remove control.
+                let chip = pill;
+                for (let i = 0; i < 4 && chip; i++) {
+                    const btn = [...chip.querySelectorAll('button, [role="button"]')].find(b => {
+                        if (!b.offsetParent) return false;
+                        const a = norm(b.getAttribute('aria-label'));
+                        const t = norm(b.textContent);
+                        return a.includes('remove') || a.includes('close') ||
+                               a.includes('turn off') || a.includes('clear') ||
+                               t === '×' || t === 'x';
+                    });
+                    if (btn) { btn.click(); return true; }
+                    chip = chip.parentElement;
+                }
+                return false;
+            }""")
+            await asyncio.sleep(0.8)
+            log(f"[p1:clear_dr] Strategy B (pill ✕): remove clicked={removed}")
+        except Exception as e:
+            log(f"[p1:clear_dr] Strategy B errored ({e})", "INFO")
+
+    # ── Strategy C: bounded CUA fallback (selectors rotate; DR-off is
+    #    correctness-critical for P1, so keep the tier-3 net like setup_*_dr). ──
+    if cua_client and await _still_active():
+        log("[p1:clear_dr] DOM legs left Deep Research active — CUA fallback to disable it", "INFO")
+        try:
+            async def _disable_dr_cua():
+                return await asyncio.wait_for(
+                    agent_loop(cua_client, browser, PROMPT_CHATGPT_DISABLE_DR,
+                        "Turn OFF the Deep Research tool in the ChatGPT composer. "
+                        "Do not type, do not send, do not enable any other tool.",
+                        model=CUA_MODEL, max_iterations=10, verbose=verbose),
+                    timeout=120.0,
+                )
+
+            await _shadow_observed_cua(
+                page, hotspot_id="1a-disable-dr", phase=1, platform="chatgpt",
+                current_step="disable_deep_research_for_brief",
+                context_hint="the composer has Deep Research active (placeholder 'Get a detailed "
+                             "report' / a 'Deep research' pill) — turn Deep Research OFF so the "
+                             "Pro brief is NOT run as a deep research; don't enable any other tool",
+                expected_outcome="the ChatGPT composer is in normal chat mode (no Deep Research)",
+                cua_coro_factory=_disable_dr_cua,
+                mission_prompt=PROMPT_CHATGPT_DISABLE_DR,
+                act_timeout_s=110.0)
+        except asyncio.TimeoutError:
+            log("[p1:clear_dr] CUA fallback timed out (120s) — proceeding", "WARN")
+        except Exception as e:
+            log(f"[p1:clear_dr] CUA fallback errored ({e}) — proceeding", "WARN")
+
+    # ── Final verify + one-shot diagnostic dump (pins the real control if a
+    #    future relabel breaks every leg — grep 'clear_dr composer dump'). ──
+    if await _still_active():
+        try:
+            dump = await page.evaluate(r"""() => {
+                const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+                // Document-wide (not form-scoped): a body-level popover node or a
+                // testid-based control that broke every leg must be pinnable here.
+                const out = [];
+                for (const el of document.querySelectorAll(
+                        'button, [role="button"], [role="menuitemradio"], [role="menuitem"], span, div')) {
+                    if (!el.offsetParent) continue;
+                    const t = norm(el.textContent);
+                    if (!/research|report/i.test(t) || t.length > 40) continue;
+                    out.push({ tag: (el.tagName || '').toLowerCase(),
+                               role: el.getAttribute('role') || '',
+                               text: t.slice(0, 40),
+                               aria: (el.getAttribute('aria-label') || '').slice(0, 40),
+                               testid: el.getAttribute('data-testid') || '',
+                               checked: el.getAttribute('aria-checked') || el.getAttribute('aria-pressed') || '' });
+                }
+                return out.slice(0, 20);
+            }""")
+            log("[p1:clear_dr] composer dump (DR still active — fix selector from this): "
+                + json.dumps(dump, ensure_ascii=False), "WARN")
+        except Exception:
+            pass
+        log("[p1:clear_dr] could not confirm Deep Research is OFF — proceeding anyway "
+            "(brief may run in DR mode; not fatal)", "WARN")
+        return "unsure"
+    log("[p1:clear_dr] Deep Research cleared — composer back to normal chat mode ✓")
+    return "cleared"
+
+
 async def _cua_pro_tier_call(page, platform: str, cua_client, heavy: bool = False) -> str:
     """Single-screenshot Pro/Free verdict for ChatGPT/Claude/Gemini.
 
@@ -12670,6 +12908,17 @@ _HOTSPOT_VISION_HINTS = {
             "drive the native dialog. Just click the attach affordance."
         ),
         "success_signals": ["a file chip/thumbnail in the composer", "the attach menu open"],
+    },
+    "1a-disable-dr": {
+        "expected_outcome": "ChatGPT's composer is in normal chat mode with Deep Research OFF",
+        "context_hint": (
+            "Turn OFF the Deep Research tool in ChatGPT's composer (the placeholder reads "
+            "'Get a detailed report', or a 'Deep research' pill is shown near the +). Click the "
+            "pill's ✕, OR open the +/tools menu and click the selected 'Deep research' to deselect. "
+            "Do NOT type, do NOT send, do NOT enable any other tool, and leave the model unchanged."
+        ),
+        "success_signals": ["the composer placeholder is back to a normal 'Ask anything' prompt",
+                             "no 'Deep research' pill in the composer"],
     },
     "1a-submit": {
         "expected_outcome": "the prompt in the composer is submitted and ChatGPT starts generating",
@@ -26790,6 +27039,17 @@ async def run_phase1(browser, cua_client, topic, pdf_paths, verbose=False, feedb
                     mission_prompt=PROMPT_ATTACH_PDF)
             finally:
                 browser.clear_upload_file()
+
+    # Deep Research belongs to Phase 2 ONLY. ChatGPT persists the last-used
+    # composer tool per account, so a prior run's P2 'Deep research' pill can be
+    # sticky-on here and would silently run the brief as a deep research (wrong
+    # output type + a Start-gate card + a burned DR slot — user-captured
+    # 2026-07-08). Clear it just before submit so the composer is guaranteed in
+    # normal Pro+Extended mode. Fully fail-safe: a miss only logs + proceeds.
+    try:
+        await _chatgpt_clear_deep_research(browser, cua_client, verbose=verbose)
+    except Exception as _cdr_e:
+        log(f"Phase 1: clear-Deep-Research step errored ({_cdr_e}) — proceeding", "WARN")
 
     # Build and submit the brief prompt
     prompt = (
