@@ -38,6 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import research  # noqa: E402
 
+_SRC = Path(research.__file__).read_text(encoding="utf-8")
 _POLL = inspect.getsource(research.poll_all_agents_round_robin)
 _GEM = inspect.getsource(research.start_agent_no_gemini_wait)
 _P2 = inspect.getsource(research.run_phase2)
@@ -171,6 +172,16 @@ def test_stuck_arbiter_defaults_working_on_probe_error():
     # A CUA probe failure must NOT fire a card / auto-skip (conservative).
     assert "_confirmed_stuck = False" in _POLL
     assert 'if unsure' in _POLL.lower() or "If unsure" in _POLL
+
+
+def test_auto_skip_is_user_controllable():
+    # Settings → Pipeline "Auto-skip stuck agents" (default ON). The Layer-3
+    # auto-skip is gated on _runtime.auto_skip_stuck; the Layer-1 stuck card is
+    # NOT gated (it always surfaces so the user knows).
+    assert "_runtime.auto_skip_stuck and (_hit_hard_cap or _unacted_too_long)" in _POLL
+    # Default True on the runtime object + primed per-run from config.json.
+    assert "self.auto_skip_stuck: bool = True" in _SRC
+    assert 'pipeline_config.get("autoSkipStuck", True)' in _SRC
 
 
 def test_layer3_auto_skip_is_single_agent_and_notifies():

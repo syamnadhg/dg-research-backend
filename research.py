@@ -9299,6 +9299,14 @@ class PipelineRuntime:
         # always auto-retry — no human in the loop, no per-attempt cap;
         # the worker 5h outer ceiling is the safety net.
         self.last_failure_kind: str = ""
+        # #921: user-controllable auto-skip (Settings → Pipeline → "Auto-skip
+        # stuck agents"). True (default) = a stuck agent whose [Retry][Skip]
+        # card sits unacted, or one past the hard cap, is auto-skipped so the
+        # run finishes unattended. False = the card stays up and WAITS for the
+        # user (manual Skip only) — the Layer-1 stuck card + FE watchdog still
+        # fire; only the Layer-3 auto-skip is suppressed. Primed per-run from
+        # pipeline_config["autoSkipStuck"] in reload_config().
+        self.auto_skip_stuck: bool = True
 
     def reset(self):
         self.__init__()
@@ -23435,7 +23443,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             _hit_hard_cap = elapsed > PER_AGENT_HARD_CAP_SEC
             _unacted_too_long = (_stuck_alerted_at > 0
                                  and (time.time() - _stuck_alerted_at) > AUTO_SKIP_UNACTED_SEC)
-            if _hit_hard_cap or _unacted_too_long:
+            # #921: auto-skip is user-controllable (Settings → Pipeline). When
+            # OFF, the stuck card + FE watchdog still surface, but we never
+            # auto-resolve — the card waits for a manual Retry/Skip.
+            if _runtime.auto_skip_stuck and (_hit_hard_cap or _unacted_too_long):
                 _as_why = (f"ran past the {PER_AGENT_HARD_CAP_SEC // 60}-minute limit"
                            if _hit_hard_cap
                            else f"stalled with no response for "
@@ -34716,6 +34727,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # bot-score signal; the phase-time gate (now on the work page) and the
         # human-verify cascade still cover a genuinely logged-out platform.
         siv = bool(pipeline_config.get("skipInitVerify", True))
+        # #921: prime the user-controllable auto-skip flag from the same run
+        # config (default True). Set on every reload_config so a resume/retry
+        # re-read stays in sync. Gating lives in poll_all_agents_round_robin's
+        # Layer-3 block; Layer-1 stuck cards are unaffected.
+        _runtime.auto_skip_stuck = bool(pipeline_config.get("autoSkipStuck", True))
         return sp, ac, ve, ee, pl, siv
 
     skip_phases, agents_cfg, video_enabled, email_enabled, podcast_length, skip_init_verify_cfg = reload_config()
