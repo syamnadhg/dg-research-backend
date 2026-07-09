@@ -1,0 +1,209 @@
+"""#921 (2026-07-08): P2 alert/retry consistency + three stale-run incidents.
+
+User E2E 2026-07-08 surfaced three ways a real problem became INVISIBLE
+instead of becoming a card, plus inconsistent alert mechanics:
+
+  Incident #1 — Skip left an already-errored agent's tile RED (and took two
+    clicks). The round-robin skip consumer's "agent already left `pending`"
+    branch (an earlier fail_agent dropped it) only closed the tab; it never
+    emitted agent_skipped nor wrote status="skipped", so the FE tile (which
+    binds to the persisted agents[key].status) stayed on the fail_agent
+    "errored" write forever.
+
+  Incident #2 — Claude sat 36 min on an empty "Research plan created"
+    placeholder with a stale complete-marker; detect_completion_claude
+    confirmed done on a {0,0,0} snapshot → a 0-char extraction → churn, and
+    the no-growth watchdog (gated behind `_cua_check_age > 1200`, never true)
+    never raised a card.
+
+  Incident #3 — Gemini answered the brief as plain chat; no research plan /
+    no "Start research" ever rendered. The honest [Retry][Skip] card lived
+    only after the full 300s plan-wait + a 3x CUA recovery ladder (~17 min),
+    so the run sat with no card until a manual Stop.
+
+Fixes verified here:
+  - skip elif emits agent_skipped (+ guards a complete agent);
+  - chat-mode Skip no longer double-fires fail_agent("was skipped");
+  - detect_completion_claude rejects a done-marker on an empty snapshot;
+  - Layer-1 CUA-arbitrated stuck detector (replaces the dead recency gate) +
+    Layer-3 auto-skip (unacted card / 90-min hard cap);
+  - Gemini submit retries standardized to 3; 2D raises an early card.
+"""
+
+import inspect
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import research  # noqa: E402
+
+_POLL = inspect.getsource(research.poll_all_agents_round_robin)
+_GEM = inspect.getsource(research.start_agent_no_gemini_wait)
+_P2 = inspect.getsource(research.run_phase2)
+
+
+class _FakePage:
+    """Minimal page whose evaluate() returns a fixed dict (detectors read it)."""
+    def __init__(self, result):
+        self._result = result
+
+    async def evaluate(self, js):
+        return self._result
+
+
+# ── Incident #1: Skip greys an already-errored agent ────────────────────────
+
+def test_skip_elif_emits_agent_skipped():
+    # The "agent left `pending`" branch must now emit agent_skipped with a
+    # reason (the emit_event hook flips persisted errored→skipped → tile greys)
+    # + retract the durable card — not merely close the tab.
+    assert 'reason="user_skip_after_leaving_poll"' in _POLL
+    assert "user left the poll" not in _POLL.lower() or "agent_skipped" in _POLL
+    # Emitted inside the skip-consumer's elif (near _close_skipped_agent_tab).
+    assert _POLL.count('emit_event("agent_skipped"') >= 2, (
+        "both the in-pending IF and the already-left elif must emit agent_skipped"
+    )
+
+
+def test_skip_elif_guards_completed_agent():
+    # A stale/duplicate skip must never grey a genuinely-COMPLETE agent.
+    assert '_recorded_status != "complete"' in _POLL
+    assert "_agent_status_by_rid" in _POLL
+
+
+# ── Consistency: no chat-mode skip → fail_agent double-fire ──────────────────
+
+def test_chat_mode_skip_no_double_fire():
+    # The chat-mode decision branches emit agent_skipped (greys tile + retracts
+    # the card). The old fail_agent("<name> was skipped", ...) re-wrote
+    # status="errored" + raised a RED retry card on a just-skipped agent.
+    # Target the exact removed call (the f-string form), not comment mentions.
+    assert 'f"{_agent_name} was skipped"' not in _GEM, (
+        "the fail_agent('<name> was skipped') double-fire must be gone"
+    )
+    # The skip path still emits agent_skipped with a research-unavailable reason.
+    assert "research_unavailable_user_skip" in _GEM
+    assert "retry_on_chat_mode_alert_unsupported" in _GEM
+
+
+# ── Incident #2: detect_completion_claude rejects an empty done-marker ───────
+
+def _detect(**kw):
+    data = {"hasStop": False, "liveActive": False, "researchDone": False,
+            "researchCardDone": False, "textLen": 0, "sources": 0, "steps": 0}
+    data.update(kw)
+    return asyncio.run(research.detect_completion_claude(_FakePage(data)))
+
+
+def test_detect_claude_rejects_empty_done_marker():
+    done, reason, snap = _detect(researchCardDone=True, textLen=0, sources=0, steps=0)
+    assert done is False, "a done-marker on a {0,0,0} snapshot is a false-done"
+    assert "empty_snapshot" in reason
+    assert snap == {"text_len": 0, "sources": 0, "steps": 0}
+
+
+def test_detect_claude_confirms_nonempty_done():
+    done, reason, _ = _detect(researchDone=True, textLen=5000, sources=40, steps=8)
+    assert done is True
+    assert "research_complete_marker" in reason
+
+
+def test_detect_claude_confirms_done_with_only_sources():
+    # Not fully empty (has sources) → still a real completion.
+    done, _, _ = _detect(researchCardDone=True, textLen=0, sources=12, steps=0)
+    assert done is True
+
+
+def test_detect_claude_stop_button_still_wins():
+    # Regression: an existing hard gate — a visible Stop button always means
+    # generating, regardless of a stale marker.
+    done, reason, _ = _detect(hasStop=True, researchDone=True, textLen=9000)
+    assert done is False and "stop_btn" in reason
+
+
+# ── Incident #2 + core: Layer-1 stuck arbiter replaces the dead recency gate ─
+
+def test_dead_cua_recency_gate_removed():
+    # The variable is no longer COMPUTED (only referenced in explanatory
+    # comments) — so the never-true gate that silenced genuine stalls is gone.
+    assert "_cua_check_age =" not in _POLL, (
+        "the never-true recency gate that silenced genuine stalls must be gone"
+    )
+
+
+def test_stuck_detector_is_growth_and_cua_arbitrated():
+    # A CUA arbiter decides stuck-vs-slow at the no-growth point, distinguishing
+    # an empty/frozen placeholder (stuck) from a working-but-scrape-blind agent
+    # (the 2026-04-28 1,289-source false-positive class).
+    assert "STUCK_NO_GROWTH_SEC" in _POLL
+    assert "poll-stuck-arbiter" in _POLL
+    assert "CONCLUSION: stuck" in _POLL or r"conclusion\s*:\s*(stuck|working)" in _POLL
+    # Conservative default — never a false card/auto-skip on doubt.
+    assert "conservative" in _POLL.lower()
+
+
+def test_stuck_constants_defaults():
+    assert 'DG_STUCK_NO_GROWTH_SEC", "600"' in _POLL
+    assert 'DG_AUTO_SKIP_UNACTED_SEC", "1200"' in _POLL
+    assert 'DG_PER_AGENT_HARD_CAP_SEC", "5400"' in _POLL
+
+
+# ── Layer-3 auto-skip backstop ───────────────────────────────────────────────
+
+def test_layer3_auto_skip_present():
+    assert "PER_AGENT_HARD_CAP_SEC" in _POLL
+    assert "AUTO_SKIP_UNACTED_SEC" in _POLL
+    assert "auto_skip_hard_cap" in _POLL
+    assert "auto_skip_stuck_no_response" in _POLL
+
+
+def test_stuck_alert_cancelled_on_recovery():
+    # False-positive guard: if a stuck-flagged agent RESUMES producing output,
+    # the auto-skip countdown (stuck_alerted_at) must be cancelled + the card
+    # retracted — never auto-skip a recovered agent on a stale alert.
+    assert 'p["stuck_alerted_at"] = 0.0' in _POLL
+    assert "growth resumed" in _POLL
+    assert "Recovered after a stuck alert" in _POLL
+
+
+def test_stuck_arbiter_defaults_working_on_probe_error():
+    # A CUA probe failure must NOT fire a card / auto-skip (conservative).
+    assert "_confirmed_stuck = False" in _POLL
+    assert 'if unsure' in _POLL.lower() or "If unsure" in _POLL
+
+
+def test_layer3_auto_skip_is_single_agent_and_notifies():
+    # Auto-skip drops ONLY this agent (others keep output), greys its tile
+    # (agent_skipped) and posts an informational notice.
+    assert 'emit_event("agent_skipped", phase=2, agent=agent_key_stuck' in _POLL
+    assert "_autoskip" in _POLL          # the informational pipeline_warning id
+    assert "del pending[name]" in _POLL
+
+
+# ── Incident #3: Gemini submit retries = 3 + early 2D card ───────────────────
+
+def test_gemini_submit_retries_standardized_to_3():
+    assert "_max_attempts = 3" in _GEM
+
+
+def test_gemini_2d_raises_early_card():
+    assert "_plan_alert_emitted" in _P2
+    assert "_PLAN_ALERT_SEC" in _P2
+    assert "Gemini couldn't start its research plan" in _P2
+    # Non-blocking + retracted if the plan recovers.
+    assert "Retracted the early plan-stall card" in _P2
+
+
+def test_gemini_2d_early_card_fires_once():
+    # Guarded by _plan_alert_emitted so the loop can't spam the card each tick.
+    assert "not _plan_alert_emitted" in _P2
+
+
+# ── syntax / import sanity ───────────────────────────────────────────────────
+
+def test_module_imports_and_functions_exist():
+    for nm in ("poll_all_agents_round_robin", "start_agent_no_gemini_wait",
+               "run_phase2", "detect_completion_claude", "fail_agent",
+               "emit_event"):
+        assert callable(getattr(research, nm))
