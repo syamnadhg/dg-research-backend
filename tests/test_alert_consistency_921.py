@@ -201,7 +201,7 @@ def test_gemini_submit_retries_standardized_to_3():
 def test_gemini_2d_raises_early_card():
     assert "_plan_alert_emitted" in _P2
     assert "_PLAN_ALERT_SEC" in _P2
-    assert "Gemini couldn't start its research plan" in _P2
+    assert "Gemini couldn't start Deep Research" in _P2
     # Non-blocking + retracted if the plan recovers.
     assert "Retracted the early plan-stall card" in _P2
 

@@ -153,7 +153,10 @@ def test_start_research_click_is_verified_before_trusting():
 def test_plan_failure_raises_retry_skip_alert_promptly():
     # [2C] submit-exhaustion, [2D] CUA-recovery-exhaustion, AND a failed user-retry
     # (hard retry) each raise the Retry/Skip alert (no silent drop to wall-clock cap).
-    assert MODSRC.count("Gemini couldn't start its research plan") >= 3, (
+    # #921: title tightened to "Gemini couldn't start Deep Research" (unified
+    # across all sites — the [2C] submit exhaustion, the [2D] early + terminal
+    # cards, and the failed-user-retry all share it).
+    assert MODSRC.count("Gemini couldn't start Deep Research") >= 3, (
         "fail_agent for an unstartable Gemini plan must fire at [2C], [2D], and on a "
         "failed user-retry"
     )

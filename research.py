@@ -21042,9 +21042,9 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             # second failure silently dropped to the wall-clock cap). dedup-safe.
             if not _controls.is_stop():
                 fail_agent(
-                    "gemini", "Gemini couldn't start its research plan",
-                    "The retried Gemini run still didn't produce a startable research "
-                    "plan. Retry re-asks in a fresh chat; Skip continues without Gemini.")
+                    "gemini", "Gemini couldn't start Deep Research",
+                    "Gemini didn't begin its research — likely a platform-side glitch. "
+                    "Retry to try again, or Skip to continue without it.")
             return (new_page, False)
         verified = await wait_until_verified(
             verify_gemini_generating, new_page, "2B-retry",
@@ -23447,10 +23447,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # OFF, the stuck card + FE watchdog still surface, but we never
             # auto-resolve — the card waits for a manual Retry/Skip.
             if _runtime.auto_skip_stuck and (_hit_hard_cap or _unacted_too_long):
-                _as_why = (f"ran past the {PER_AGENT_HARD_CAP_SEC // 60}-minute limit"
-                           if _hit_hard_cap
-                           else f"stalled with no response for "
-                                f"{int((time.time() - _stuck_alerted_at) // 60)} minutes")
+                _as_why = (f"ran past the {PER_AGENT_HARD_CAP_SEC // 60}-min limit"
+                           if _hit_hard_cap else "stayed frozen with no response")
                 _as_reason = ("auto_skip_hard_cap" if _hit_hard_cap
                               else "auto_skip_stuck_no_response")
                 log(f"[{name}] Auto-skip — {_as_why} (elapsed {int(elapsed/60)}m). "
@@ -23476,9 +23474,9 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # Informational notice (not an error card — the agent is
                 # resolved, not awaiting a decision) so the user learns WHY.
                 emit_event("pipeline_warning", phase=2, agent=agent_key_stuck,
-                           error=f"{name} was skipped automatically",
-                           details=(f"{name} {_as_why}, so it was skipped to keep your "
-                                    "run moving. The other agents' results are unaffected."),
+                           error=f"{name} skipped automatically",
+                           details=(f"{name} {_as_why} — skipped so your run can finish. "
+                                    "The other agents aren't affected."),
                            actions=[], alert_id=f"agent_{agent_key_stuck}_autoskip",
                            auto_clear_on_resume=True)
                 await _close_skipped_agent_tab(browser, p.get("page"), agent_key_stuck, name)
@@ -23552,10 +23550,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] CUA arbiter: CONFIRMED STUCK — raising [Retry][Skip] card", "WARN")
                     fail_agent(agent_key_stuck,
                                f"{name} seems stuck",
-                               (f"{name} hasn't produced anything new for a while and shows "
-                                "no real research output. Retry to run it fresh, or Skip it. "
-                                "If you don't respond it will be skipped automatically so "
-                                "your run can finish."))
+                               (f"{name} stopped producing output — likely a platform-side "
+                                "glitch. Retry to restart it, or Skip to continue without it."))
                     # Non-blocking: the other agents keep polling; the command
                     # bus applies a user Retry/Skip on the next tick. If none
                     # comes, Layer 3 auto-skips after AUTO_SKIP_UNACTED_SEC.
@@ -30798,10 +30794,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 log(f"[{label}] Gemini brief never started a research plan after "
                     f"{_max_attempts} retries — surfacing a Retry/Skip blocker (no silent skip)", "ERROR")
                 try:
-                    fail_agent("gemini", "Gemini couldn't start its research plan",
-                               "Gemini's Deep Research kept erroring (e.g. \"something went wrong\") "
-                               "and never started a research plan after several automatic retries. "
-                               "Retry to try again, or Skip to continue with the other agents.")
+                    fail_agent("gemini", "Gemini couldn't start Deep Research",
+                               "Gemini didn't begin its research — likely a platform-side glitch. "
+                               "Retry to try again, or Skip to continue without it.")
                 except Exception:
                     pass
                 return page, False
@@ -31541,11 +31536,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     f"(regens={_regen_count}) — surfacing early [Retry][Skip] card "
                     "(non-blocking; recovery continues)", "WARN")
                 try:
-                    fail_agent("gemini", "Gemini couldn't start its research plan",
-                               "Gemini hasn't produced a startable research plan. It may "
-                               "have answered as a normal chat instead of Deep Research, or "
-                               "its plan kept erroring. Retry to re-ask in a fresh Deep "
-                               "Research chat, or Skip to continue with the other agents.")
+                    fail_agent("gemini", "Gemini couldn't start Deep Research",
+                               "Gemini didn't begin its research — likely a platform-side glitch. "
+                               "Retry to try again, or Skip to continue without it.")
                 except Exception:
                     pass
 
@@ -31681,10 +31674,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # dedups by alert_id, so a later wall-clock re-assert is harmless.
                 if not _controls.is_stop():
                     fail_agent(
-                        "gemini", "Gemini couldn't start its research plan",
-                        f"No startable research plan after {_start_wait_max_sec // 60} min "
-                        f"+ {_FALLBACK_MAX_REGEN} plan retries. Retry re-asks in a fresh "
-                        "Gemini chat; Skip continues with the other agents.")
+                        "gemini", "Gemini couldn't start Deep Research",
+                        "Gemini didn't begin its research — likely a platform-side glitch. "
+                        "Retry to try again, or Skip to continue without it.")
 
         # Verify Gemini is actually researching. #755: on Stop, skip the ~45s
         # DOM-verify retry churn — record not-verified and let the stop-aware
