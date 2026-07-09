@@ -82,6 +82,14 @@ superresearch "your topic"
 # 1. Install
 git clone https://github.com/dg-eng/super-research-backend.git
 cd super-research-backend
+
+# macOS / Linux: create + ACTIVATE a Python 3.11+ virtual env FIRST.
+# (macOS ships python3 3.9 — too old — and Homebrew/system Pythons are
+# "externally managed" (PEP 668), so a bare `pip install` is refused. The
+# venv is the supported way; `uv` is fastest, plain venv works too.)
+python3.11 -m venv .venv && source .venv/bin/activate   # or: uv venv --python 3.11 && source .venv/bin/activate
+# Windows: a system Python 3.11+ works directly; a venv is optional.
+
 pip install -r requirements.txt
 python -m patchright install chrome    # downloads patchright's stealth Chrome wrapper
 
@@ -104,6 +112,8 @@ python research.py --retire
 #     Tile disappears across every browser within a second.
 python research.py --unpair
 ```
+
+> **macOS / Linux — the venv is per-terminal.** After the one-time setup above, run `source .venv/bin/activate` in **every new terminal** before `python research.py …` (the prompt shows `(.venv)` when it's active) — then it behaves exactly like Windows. This applies only to a **source checkout**; the installed `superresearch` command (Option A, via pipx) manages its own isolated env, so end users never touch a venv. If you'd rather not activate each time, use `uv run python research.py …` or alias the venv's Python.
 
 That's it. Three commands to a hands-off always-on backend — plus `--retire` to disable On Startup or `--unpair` to fully disconnect this PC.
 
@@ -240,6 +250,12 @@ customToken).
 ### Step 1: Install Dependencies
 
 ```bash
+# macOS / Linux (source checkout): make a 3.11+ venv and ACTIVATE it first —
+# the OS python3 (3.9 on macOS) is too old and system/Homebrew Pythons refuse
+# a bare `pip install` (PEP 668). Re-run `source .venv/bin/activate` in each
+# new terminal. Windows: skip this — a system Python 3.11+ works directly.
+python3.11 -m venv .venv && source .venv/bin/activate   # or: uv venv --python 3.11 && source .venv/bin/activate
+
 pip install -r requirements.txt
 python -m patchright install chrome
 ```
