@@ -23899,8 +23899,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             #       (which a no-growth timer never trips) and the verified=False
             #       handoff that never yields a CUA done/error verdict.
             #   (b) a raised stuck card (below) left unacted for
-            #       AUTO_SKIP_UNACTED_SEC (20 min) — the user was already shown
-            #       the card + pinged, so this is "you're not coming back".
+            #       AUTO_SKIP_UNACTED_SEC (30 min since #929) — the user was
+            #       already shown the card + pinged, so this is "not coming back".
             # Mirrors the existing chat-mode 3h auto-skip precedent. Partial
             # output is salvaged before the tab closes.
             _stuck_alerted_at = p.get("stuck_alerted_at", 0.0)

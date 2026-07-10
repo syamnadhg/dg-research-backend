@@ -114,7 +114,7 @@ All events are JSON objects written to `events.jsonl` (one per line) AND mirrore
 |-----------|-------|--------|------|
 | `phase_start` | 0-5 | `{agents?: string[], description: string}` | Phase begins |
 | `phase_restart` | 1-2 | `{phase, reason, chars, attempt?}` | Phase rerun after pause+input+resume (mid-phase or boundary) |
-| `agent_progress` | 1-2 | `{status, progress, sources, sourceUrls, sections, partialTextLen, model, thinking, steps, plan, toolUses, elapsedSec, expectedMinutes, scrapeOk, scrapeSource, visionNarration}` | During Phase 1/2 polling (~120s interval, `POLL_DEEP_RESEARCH` default). `scrapeSource: "dom" \| "vision"` records which tier produced the data. `visionNarration` is populated by the agent-side-panel walker when DG_VISION_NARRATE=1 OR when the vision-narrator fallback is exercised (see `_vision_narration` / `_vision_narration_p2` emits at the P1 + P2 sites); when neither fires it's empty string. FE renders verbatim when present. |
+| `agent_progress` | 1-2 | `{status, stage, progress, sources, sourceUrls, sections, partialTextLen, model, thinking, steps, plan, toolUses, elapsedSec, expectedMinutes, scrapeOk, scrapeSource, visionNarration}` | During Phase 1/2 polling (~120s interval, `POLL_DEEP_RESEARCH` default). `stage` (`"planning" \| "researching" \| "writing"`) drives the FE milestone stepper — it advances an agent off "Submitted" the moment a real counter is scrape-blind. P1 emits it from `poll_until_done` (#924); P2 emits it continuously from the round-robin poller + launch sites + hard-retry (#930), with `"planning"` gated on the scraper's plan-page signal so a planning Gemini stays on "Submitted" by design. Empty `stage` is omitted so it never clobbers a prior value in the FE merge. `scrapeSource: "dom" \| "vision"` records which tier produced the data. `visionNarration` is populated by the agent-side-panel walker when DG_VISION_NARRATE=1 OR when the vision-narrator fallback is exercised (see `_vision_narration` / `_vision_narration_p2` emits at the P1 + P2 sites); when neither fires it's empty string. FE renders verbatim when present. |
 | `agent_skipped` | 2 | `{agent: string}` | Disabled agent in Phase 2 config |
 | `agent_verified` | 2 | `{agent: string, verified: bool}` | Agent confirmed running |
 | `link_extracting` | 1-5 | `{agent: string}` | Link extraction starting |
@@ -331,7 +331,7 @@ Frontend writes commands to `users/{uid}/research_commands/{researchId}` (or equ
 | `retry_agent` | `{agent}` | Frontend response to a Phase 2 agent warning (timeout, empty-final, send-fallback, session-expiry). Phase 2 polling consumes + submits a follow-up prompt via `paste_followup` |
 | `continue_partial_agent` | `{agent}` | Accept Phase 2 agent's current short/timed-out output as final; agent finalizes with status `done_partial` / `timeout_partial` |
 | `poke_agent` | `{agent}` | Stuck-agent response: send mild "please continue" follow-up without extending budget |
-| `wait_longer_agent` | `{agent}` | Stuck-agent response: reset `last_growth_time`, granting ~20 min before the no-growth watchdog can flag the agent again. (Distinct from the Claude 2-artifact `Wait` button which extends `start_time` by 15 min — different gate, different semantics.) |
+| `wait_longer_agent` | `{agent}` | Stuck-agent response: reset `last_growth_time`, granting ~15 min (`STUCK_NO_GROWTH_SEC`, since #929) before the no-growth watchdog can flag the agent again. (Distinct from the Claude 2-artifact `Wait` button which extends `start_time` by 15 min — different gate, different semantics.) |
 | `skip_init_verify` | — | Phase 0 dropdown response — bail verification, proceed to Phase 1 with whatever cookie-fast-path read says |
 | `retry_init_verify` | — | Phase 0 `login_required` banner response — re-run Phase 0 verification with a fresh tile (frontend tears down the prior tile, BE re-emits `phase_start`) |
 | `skip_agent` | `{agent}` | Skip a stuck Phase 2 agent from `BackendSilentBanner` / `HumanVerifyBanner` / `agent_alert`. Polling loop drops the agent from `pending` on the next tick. ALSO retracts the durable agent-scoped `pendingDecision` Firestore mirror via `_clear_pending_decision` (idempotent `DELETE_FIELD` on `pendingDecision`) so the "Hit a snag" card dismisses on the FE instead of re-surfacing on reload |
@@ -431,7 +431,7 @@ The agent-level action set was consolidated to reduce noise:
 |-----------|----------------|
 | Every agent/phase alert (unless overridden below) | **Retry · Skip** |
 | Phase 2 workspace cap hit | **End research** only (`action=stop`) |
-| Phase 2 poll timeout | **Retry · Skip · Wait** (Wait extends budget 15 min) |
+| Phase 2 poll timeout (90-min hard cap) | **Auto-skip** — partial saved (≥200 chars), no decision gate since 2026-04-30 (`be8f7b3`) |
 | Stuck-agent (renamed vocabulary) | **Retry · Wait · Skip** (was Poke / Wait longer / Skip agent) |
 
 **Removed entirely:** the `[Poke]` button (folded into Retry, which now does the hard tab close+reopen from Apr 19 early `retry_agent`) and `[Proceed without CUA]` (let users walk into broken-state pipelines with no recovery path). Frontend PhaseAlertPanel already renders every alert via the `action.command` passthrough, so the normalization was pure backend: change the `actions` array the event carries and the UI follows.
@@ -458,16 +458,17 @@ Retry counters: hard-capped (P1=2, P3=2, P4=1) so a misbehaving platform can't s
 
 | Gate | Site | Timeout | Options | Retry action |
 |------|------|---------|---------|--------------|
-| Agent 90-min poll timeout | poll_all_agents_round_robin | 5 min | `[Retry]` · `[Skip]` · `[Wait]` (Apr 19 late-late: Wait extends budget 15 min) | `paste_followup` "please output complete report" on Retry; `target_page` re-anchor on next poll tick |
+| Agent 90-min hard cap (`PER_AGENT_HARD_CAP_SEC`) | poll_all_agents_round_robin | auto | **Auto-skip** — no decision gate since 2026-04-30 (`be8f7b3`); toggleable via Settings → Pipeline (#921) | Partial output (≥200 chars) salvaged before the tab closes |
 | Agent empty-final | 3× CUA done + empty extract | 5 min | `[Retry]` · `[Skip]` | Same follow-up, reset done state |
 | Agent send-button fallback | start_agent_no_gemini_wait | 90 s | `[Retry]` · `[Skip]` | Re-run `PROMPT_CLICK_SEND` CUA loop |
 | Claude 2-artifact hard-fail | Inline (elapsed ≥ 80% of wait AND <2 artifacts) | 5 min | `[Retry]` · `[Skip]` | Retry closes + reopens Claude tab via hard-mode `retry_agent` |
 | Workspace cap | Phase 2 platform constraint hit | — | **`[End research]` only** (`stop`) | n/a |
-| Stuck-agent | Inline (when `elapsed > 20m` AND `no_growth > 20m` AND status NOT in `{planning, thinking, researching, searching}`) | async (non-blocking) | `[Retry]` · `[Wait]` · `[Skip]` (Apr 19 late-late — relabeled from Poke / Wait longer / Skip agent) | Retry = hard-mode tab close+reopen; Wait resets the no-growth timer 15 min |
+| Stuck-agent (L1 card) | Inline (`no_growth > 15m` [`STUCK_NO_GROWTH_SEC`] AND `elapsed > 10m` [`STUCK_MIN_ELAPSED_SEC`] AND status NOT in `{planning, thinking, researching, searching}` AND scrape `phase != planning`), then confirmed by a CUA vision arbiter before the card fires | async (non-blocking) | `[Retry]` · `[Skip]` (#921/#929 single-alert design) | Retry = hard-mode tab close+reopen |
+| Stuck-agent (L3 auto-skip) | L1 card left unacted `> 30m` (`AUTO_SKIP_UNACTED_SEC`, since #929) | async | Auto-skip this agent (toggleable via Settings → Pipeline, default ON) | Partial output salvaged; tab closes |
 | Session expiry | Inline (requires 2× consecutive confirms spaced 2 min) | 30 min | `[I've logged in — Retry]` · `[Skip]` | Reload tab + keep polling |
 
 **False-alarm suppression baked into the detectors:**
-- Stuck-agent: 20-min elapsed floor, checks text AND source growth, skips during known active statuses.
+- Stuck-agent: 10-min elapsed floor + 15-min no-growth threshold (#929), checks text AND source growth, skips during known active statuses (incl. the scraper's `phase == "planning"` for Gemini), and a CUA vision arbiter must confirm genuinely-stuck before the card fires.
 - Session-expiry: 2 consecutive confirmations 2 min apart; distinct from HV (CAPTCHA/Cloudflare) which has its own detector.
 - Brief-short: only fires in 100-500 char window (never on truly empty output — that's a different path with its own handling).
 - Every alert is dedup'd on `(phase, type, title, details)` so duplicates from polling loops don't spam the dropdown.
