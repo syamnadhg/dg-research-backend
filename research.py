@@ -22814,8 +22814,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
                 try:
+                    # #930: carry stage — the FE just reset this agent's tile on
+                    # retry, and a fresh DR legitimately shows 0 sources/0 chars
+                    # for minutes. Without stage the milestone stepper re-parks
+                    # on "Submitted" until a counter comes alive (never, for a
+                    # scrape-blind ChatGPT iframe). verified_h == generation was
+                    # re-verified, so "researching" is honest here.
                     emit_event("agent_progress", phase=2, agent=_agent_key,
-                               status="generating",
+                               status="generating", stage="researching",
                                progress=f"{_agent_name} restarted (hard retry #{_hard_count}) — running")
                 except Exception:
                     pass
@@ -24079,11 +24085,34 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 p["stuck_alerted_at"] = 0.0
                 p["stuck_warned_at"] = 0.0
 
+            # #930: continuous stage for the FE milestone stepper. The launch
+            # sites emit stage="researching" exactly once (post-verify); if the
+            # FE misses that one-shot (mid-run reload, hard retry, phase
+            # restart) NOTHING in this poller moved the stepper off
+            # "Submitted" while counters are scrape-blind (ChatGPT's
+            # cross-origin iframe reads 0 sources/0 chars on a healthy run).
+            # Re-affirm stage on every emit: "planning" while the scraper
+            # reports a plan page (the FE keeps planning on Submitted by
+            # design), "researching" otherwise — every agent in this loop was
+            # verified generating (or alive-handed-off) at launch, and
+            # genuinely-stuck agents are the L1/L2/L3 escalation's job, not
+            # the stepper's. Terminal/idle statuses carry no stage, and an
+            # empty stage is OMITTED from the emit so it never clobbers a
+            # previously-set value in the FE's details merge.
+            _p2_stage = ""
+            if _scrape_phase == "planning":
+                _p2_stage = "planning"
+            elif (_status_val or "generating").lower() not in (
+                    "done", "complete", "completed", "waiting", "queued",
+                    "error", "failed"):
+                _p2_stage = "researching"
+
             # Dedup: only emit when something meaningful changed (status / sources /
             # partialTextLen / sections-count). Otherwise we spam Firestore ~180 writes
             # per agent per run with identical payloads. Heartbeat still covers liveness.
             progress_key = json.dumps({
                 "status": _status_val or "",
+                "stage": _p2_stage,
                 "sources": progress.get("sources", 0),
                 "partialTextLen": _partial_text_len,
                 "sections_len": len(progress.get("sections", []) or []),
@@ -24112,6 +24141,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 emit_event("agent_progress", phase=2, agent=agent_key,
                     status=_status_val or "generating",
                     progress=_progress_val,
+                    # #930: omit (don't blank) stage when we have no verdict
+                    **({"stage": _p2_stage} if _p2_stage else {}),
                     sources=progress.get("sources", 0),
                     sourceUrls=progress.get("source_urls", []),
                     # {url,title} pairs — the REAL scraped source-panel titles
@@ -40202,6 +40233,20 @@ async def run_server(port=8000):
     # Banner shows localhost so users can copy-click; uvicorn still binds
     # to 0.0.0.0 below so the FE web app can reach this BE.
     log(f"Starting API server on http://localhost:{port}")
+    # #930: log the loaded build so "worker running stale code" is a one-grep
+    # diagnosis from backend.log (2026-07-09: a worker up since the prior day
+    # ran pre-fix code through a live E2E and the report read as a regression).
+    # Source checkouts only — compiled wheels have no .git; stay silent then.
+    try:
+        _build = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "log", "-1",
+             "--format=%h %cd %s", "--date=format:%Y-%m-%d %H:%M"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=_PS_NO_WINDOW).stdout.strip()
+        if _build:
+            log(f"[build] {_build}")
+    except Exception:
+        pass
     log("  GET  /api/runs                     — List all runs")
     log("  POST /api/runs                     — Start new run {topic, email}")
     log("  GET  /api/runs/{id}                — Run details + meta")
