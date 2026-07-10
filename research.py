@@ -8697,6 +8697,11 @@ class PipelineControls:
         # on its next tick — drops the agent from `pending`, extracts whatever
         # partial output exists, and emits agent_skipped.
         self.skipped_agents: set[str] = set()
+        # Agents dropped by the HV auto-skip (unacted hands-off wall). Marks a
+        # skipped_agents entry as an INTERNAL auto-skip (not a user tap) so the
+        # round-robin skip consumer reports the honest reason + doesn't re-emit /
+        # re-close a tab the finalize already greyed + closed.
+        self.hv_auto_skipped: set[str] = set()
         # Watchdog banner's "Skip phase" button queues phase numbers here.
         # Each phase's coroutine checks is_phase_skip_requested(N) at its
         # natural yield points and exits early with phase_skipped when set.
@@ -8923,6 +8928,7 @@ class PipelineControls:
         self.login_pause_timeout_agents.clear()
         self.hv_blocked.clear()
         self.skipped_agents.clear()
+        self.hv_auto_skipped.clear()
         self.skipped_phases.clear()
         self.continue_anyway = False
         self.pro_warning_acknowledged = False
@@ -22582,6 +22588,23 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         _skip_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
         for _ag_key in list(_controls.skipped_agents):
             _agent_name = _skip_name_map.get(_ag_key)
+            if _ag_key in _controls.hv_auto_skipped:
+                # Already finalized by the HV auto-skip (greyed + tab closed +
+                # decision cleared at skip time). Just drop it from the poll set
+                # so we don't re-emit agent_skipped (with a wrong user_skip
+                # reason), re-extract, or re-close.
+                if _agent_name and _agent_name in pending:
+                    _p = pending[_agent_name]
+                    results[_agent_name] = {
+                        "status": "skipped_auto_hv",
+                        "text": "",
+                        "url": _p.get("url", ""),
+                        "page": None,
+                        "elapsed_sec": int(time.time() - _p["start_time"]),
+                    }
+                    del pending[_agent_name]
+                _controls.skipped_agents.discard(_ag_key)
+                continue
             if _agent_name and _agent_name in pending:
                 p = pending[_agent_name]
                 # #906 hands-off: never run the extraction ladder against a
@@ -29878,7 +29901,41 @@ async def _close_skipped_agent_tab(browser, page, platform_key: str, label: str,
         log(f"[{label}] Skip: couldn't close the {platform_key} tab: {_ce}", "WARN")
 
 
-async def _hv_setup_fail_card(page, platform: str, label: str) -> bool:
+async def _hv_auto_skip_finalize(browser, page, agent_key: str, label: str,
+                                 phase: int = 2, preserve_tab: bool = False) -> None:
+    """Clean auto-skip for an unacted hands-off HV wall (Skip is the only real
+    move for Cloudflare). Mirrors the L3 stuck-agent auto-skip dynamics so the
+    UX is consistent: greys the tile (agent_skipped) with an HONEST reason,
+    posts an informational notice (NOT a red error card), retracts the decision
+    mirror, and closes the walled tab. The agent is marked in hv_auto_skipped so
+    the round-robin skip consumer neither re-emits nor re-extracts (hands-off).
+
+    Caller gates this on `_runtime.auto_skip_stuck` — when auto-skip is OFF the
+    HV card stays up for a manual Skip instead."""
+    _name = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini"}.get(
+        agent_key, agent_key.capitalize())
+    log(f"[{label}] HV auto-skip — verification wall unanswered; greying {agent_key} "
+        "+ closing tab (hands-off)", "WARN")
+    _controls.skipped_agents.add(agent_key)
+    _controls.hv_auto_skipped.add(agent_key)
+    # agent_skipped greys the tile + retracts any live HV card (emit hook flips
+    # the persisted status to "skipped" and clears the pendingDecision mirror).
+    emit_event("agent_skipped", phase=phase, agent=agent_key,
+               reason="auto_skip_hv_unanswered")
+    # Informational (not an error card — the agent is resolved, not awaiting a
+    # decision), so the user learns WHY it greyed. Mirrors the L3 notice.
+    emit_event("pipeline_warning", phase=phase, agent=agent_key,
+               error=f"{_name} skipped automatically",
+               details=(f"{_name} hit a verification wall that wasn't cleared in time — "
+                        "skipped so your run can finish. The other agents aren't affected."),
+               actions=[], alert_id=f"agent_{agent_key}_autoskip",
+               auto_clear_on_resume=True)
+    _clear_pending_decision()
+    await _close_skipped_agent_tab(browser, page, agent_key, label,
+                                   preserve_tab=preserve_tab)
+
+
+async def _hv_setup_fail_card(browser, page, platform: str, label: str) -> bool:
     """#896: when setup/paste fails, check whether the REAL cause is a
     human-verification wall and, if so, emit an honest HV card instead of
     the caller's generic "didn't start" card.
@@ -29915,6 +29972,14 @@ async def _hv_setup_fail_card(page, platform: str, label: str) -> bool:
         log(f"[{label}] HV wall coincides with {_wall} — session also looks signed out; cookie trust broken", "WARN")
         details += (" This profile also looks signed out, so the sign-in via the "
                     "login command is required, not optional.")
+    # Auto-skip an unacted hands-off wall (Skip is the only real action) so the
+    # run finishes on its own with the agent cleanly GREYED — not a lingering
+    # red error card the user must tap. When auto-skip is OFF, keep the Skip-only
+    # card for a manual skip.
+    if _runtime.auto_skip_stuck:
+        log(f"[{label}] setup failed ON a human-verification wall ({reason}) — auto-skipping (grey, hands-off)", "WARN")
+        await _hv_auto_skip_finalize(browser, page, platform_key, label, phase=2)
+        return True
     log(f"[{label}] setup failed ON a human-verification wall ({reason}) — emitting HV card, not the generic fail", "WARN")
     # #906 hands-off Cloudflare: Skip-only card (Retry (hard) would re-open /
     # re-navigate the walled surface — the exact touch the directive forbids).
@@ -30382,6 +30447,16 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             emit_event("pipeline_resumed", phase=phase, reason="human_verification_cleared", agent=platform_key)
             return True
 
+    # Unacted for the whole grace window. With auto-skip ON, finalize a CLEAN
+    # grey-skip here (agent_skipped + close tab + honest reason) instead of
+    # returning False into the caller's red fail_agent card — the caller's
+    # `platform in skipped_agents` branch then suppresses that card. The pause
+    # already gave the grace period for an out-of-band solve (which auto-resumes
+    # anytime it lands). When auto-skip is OFF, fall through to the manual card.
+    if _runtime.auto_skip_stuck:
+        await _hv_auto_skip_finalize(browser, page, platform_key, label, phase,
+                                     preserve_tab=preserve_tab)
+        return False
     log(f"[{label}] Human verification timed out ({max_wait_loops * 5}s) — skipping agent", "WARN")
     # #710: this timeout exit drops the agent WITHOUT emitting
     # pipeline_resumed/stopped, so the universal emit_event clear never fires —
@@ -30966,7 +31041,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # a human-verification wall raised mid-setup (Composer absent,
                 # Clipboard API blocked by the challenge page's permissions
                 # policy). Name the real cause instead of the generic card.
-                if not await _hv_setup_fail_card(page, platform, label):
+                if not await _hv_setup_fail_card(browser, page, platform, label):
                     # #929: `platform` (display name, e.g. "Gemini"), never
                     # `label` — that's the internal step tag ("2C") and it
                     # leaked into user-facing copy ("…hand the brief to 2C").
@@ -31001,7 +31076,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             log(f"[{label}] CRITICAL: Brief paste failed (DOM + CUA) — skipping this agent", "ERROR")
             # #896: paste-blocked can mean a human-verification wall is up —
             # probe before blaming the paste machinery.
-            if not await _hv_setup_fail_card(page, platform, label):
+            if not await _hv_setup_fail_card(browser, page, platform, label):
                 # #929: platform display name, not the internal step label.
                 fail_agent(platform_l, f"Couldn't send the brief to {platform}",
                            f"We couldn't hand the research brief to {platform}. Retry to try again, or Skip it.")
@@ -31624,7 +31699,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # #896: a human-verification wall is the most specific cause —
                 # probe it before the login-wall check (the sticky hv_blocked
                 # verdict also survives a dead page reference).
-                if await _hv_setup_fail_card(chatgpt_page, "chatgpt", "2A"):
+                if await _hv_setup_fail_card(browser, chatgpt_page, "chatgpt", "2A"):
                     pass
                 else:
                     # #893: a stale trusted cookie lands here via a login wall —
@@ -31735,7 +31810,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # #896: human-verification wall first — Claude's in-app
                 # Cloudflare gate is exactly what used to land here as the
                 # misleading generic "didn't start" card (live 2026-07-02).
-                if await _hv_setup_fail_card(claude_page, "claude", "2B"):
+                if await _hv_setup_fail_card(browser, claude_page, "claude", "2B"):
                     pass
                 else:
                     # #893: stale-cookie login wall → honest signed-out card.

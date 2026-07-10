@@ -100,15 +100,15 @@ def test_paste_fail_paths_probe_for_a_wall_first():
 def test_outer_agent_fail_paths_probe_hv_before_login_wall():
     # 2A + 2B: the HV probe is more specific than the #893 login-wall probe
     # and must run first (a Cloudflare page is not a "signed out" page).
-    for probe, wall in ((' _hv_setup_fail_card(chatgpt_page, "chatgpt", "2A")',
+    for probe, wall in ((' _hv_setup_fail_card(browser, chatgpt_page, "chatgpt", "2A")',
                          '_page_shows_login_wall(chatgpt_page)'),
-                        (' _hv_setup_fail_card(claude_page, "claude", "2B")',
+                        (' _hv_setup_fail_card(browser, claude_page, "claude", "2B")',
                          '_page_shows_login_wall(claude_page)')):
         assert probe.strip() in MODSRC.replace("await ", " ").replace("  ", " ") or \
                probe.strip().replace(" _hv", "_hv") in MODSRC, f"missing outer probe: {probe}"
-    assert MODSRC.index('_hv_setup_fail_card(claude_page') < MODSRC.index(
+    assert MODSRC.index('_hv_setup_fail_card(browser, claude_page') < MODSRC.index(
         '_page_shows_login_wall(claude_page)')
-    assert MODSRC.index('_hv_setup_fail_card(chatgpt_page') < MODSRC.index(
+    assert MODSRC.index('_hv_setup_fail_card(browser, chatgpt_page') < MODSRC.index(
         '_page_shows_login_wall(chatgpt_page)')
 
 
