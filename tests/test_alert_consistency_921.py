@@ -145,8 +145,10 @@ def test_stuck_detector_is_growth_and_cua_arbitrated():
 
 
 def test_stuck_constants_defaults():
-    assert 'DG_STUCK_NO_GROWTH_SEC", "600"' in _POLL
-    assert 'DG_AUTO_SKIP_UNACTED_SEC", "1200"' in _POLL
+    # #929 (2026-07-09): 600→900 / 1200→1800 after a live false alarm on a
+    # healthy >10-min Gemini plan (carded at 10 min, auto-skipped at +20).
+    assert 'DG_STUCK_NO_GROWTH_SEC", "900"' in _POLL
+    assert 'DG_AUTO_SKIP_UNACTED_SEC", "1800"' in _POLL
     assert 'DG_PER_AGENT_HARD_CAP_SEC", "5400"' in _POLL
 
 

@@ -14038,6 +14038,21 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
 
     Every alert carries `dismissible: True` + a unique
     `alert_id = agent_<key>_error` so the FE store can dedupe dismiss."""
+    # #929: --login teardown window — the browser is being closed ON
+    # PURPOSE, so any agent failure right now is a side effect of that
+    # close, not a real platform problem (live 2026-07-09: Gemini's paste
+    # died with "Target page … has been closed" and carded
+    # agent_gemini_error ONE second before the login-interrupt card,
+    # leaving two conflicting cards up). The login-interrupt handler
+    # emits the single honest card moments later; suppress this one
+    # entirely (no card, no persisted "errored" tile).
+    try:
+        if _login_interrupt_active():
+            log(f"[{agent_key}] fail_agent suppressed — login command is "
+                f"closing the browser ({title})", "WARN")
+            return
+    except Exception:
+        pass
     # Dismiss button removed 2026-04-28 — the alert's corner ✕ already
     # records the alertId in dismissedAlertIds and clears the visible
     # alert (PhaseDropdown.tsx:2062-2069), so an in-action Dismiss button
@@ -22294,10 +22309,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
     # Stop. Progress here means growth in extracted chars/sources, NEVER
     # heartbeats or narration churn (a stuck agent narrates "still generating"
     # the whole time). All env-overridable for live tuning.
-    STUCK_NO_GROWTH_SEC = int(os.environ.get("DG_STUCK_NO_GROWTH_SEC", "600"))       # L1: 10 min flat → CUA arbiter → [Retry][Skip] card
+    # #929 (2026-07-09): 600→900 / 1200→1800 after a live false alarm — a
+    # healthy Gemini took >10 min on its research plan, got carded at the
+    # old 10-min mark and auto-skipped 20 min later. 15 min before the
+    # arbiter is even consulted + 30 min of card-unacted grace gives the
+    # WORKING re-verdict (throttled to every 10 min) two chances to
+    # retract a false card before Layer 3 can act on it.
+    STUCK_NO_GROWTH_SEC = int(os.environ.get("DG_STUCK_NO_GROWTH_SEC", "900"))       # L1: 15 min flat → CUA arbiter → [Retry][Skip] card
     STUCK_MIN_ELAPSED_SEC = int(os.environ.get("DG_STUCK_MIN_ELAPSED_SEC", "600"))   # never stuck-check in the first 10 min
     STUCK_WARN_THROTTLE_SEC = int(os.environ.get("DG_STUCK_WARN_THROTTLE_SEC", "600"))  # ≥10 min between arbiter probes / re-warns
-    AUTO_SKIP_UNACTED_SEC = int(os.environ.get("DG_AUTO_SKIP_UNACTED_SEC", "1200"))  # L3: 20 min after the card sits unacted → auto-skip THIS agent
+    AUTO_SKIP_UNACTED_SEC = int(os.environ.get("DG_AUTO_SKIP_UNACTED_SEC", "1800"))  # L3: 30 min after the card sits unacted → auto-skip THIS agent
     PER_AGENT_HARD_CAP_SEC = int(os.environ.get("DG_PER_AGENT_HARD_CAP_SEC", "5400"))  # L3: 90 min absolute per-agent ceiling → auto-skip
 
     pending = {}
@@ -23851,7 +23872,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             no_growth_secs = time.time() - p["last_growth_time"]
             since_warn = time.time() - p["stuck_warned_at"]
             _active_statuses = ("planning", "thinking", "researching", "searching")
-            status_is_active = (_status_val or "").lower() in _active_statuses
+            # #929: also honor the scraper's separate `phase` field — but ONLY
+            # for "planning". Gemini's scraper never returns status="planning"
+            # (its plan states read status='generating' with the planning
+            # signal in `phase` — scrape_progress_gemini ~16663), so the
+            # status-only gate never protected a legitimately long plan draft
+            # (2026-07-09 false alarm: healthy 10-min plan → stuck card →
+            # auto-skip). `phase` values OTHER than planning must NOT gate:
+            # the scraper reports phase='researching' off stale panel steps
+            # even on a frozen page, which would silence L1 entirely.
+            _scrape_phase = ((progress.get("phase") or "") if scrape_ok else "").lower()
+            status_is_active = ((_status_val or "").lower() in _active_statuses
+                                or _scrape_phase == "planning")
 
             # ── #921 Layer 3 — auto-skip backstop (checked first) ──────────
             # Guarantees a run can't hang on an AFK operator. Two triggers,
@@ -23880,13 +23912,22 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 log(f"[{name}] Auto-skip — {_as_why} (elapsed {int(elapsed/60)}m). "
                     "Salvaging partial output, closing tab, continuing other agents.", "WARN")
                 _as_partial = ""
-                try:
-                    await browser.switch_to_page(p["page"])
-                    _as_partial = await extract_fns[name](
-                        p["page"], browser=browser, cua_client=cua_client,
-                        label=name, verbose=verbose) or ""
-                except Exception as _ase:
-                    log(f"[{name}] Auto-skip salvage extract failed: {_ase}", "WARN")
+                # #929 hands-off parity with the user-skip consumer (22555):
+                # never run the extraction ladder (DOM walks + CUA fallback)
+                # against a verification-walled tab — those touches are
+                # exactly what the 2026-07-06 Cloudflare directive forbids,
+                # and a walled agent has nothing to salvage anyway.
+                if agent_key_stuck in _controls.hv_blocked:
+                    log(f"[{name}] Auto-skip — verification-walled tab, "
+                        "skipping partial extraction (hands-off)", "WARN")
+                else:
+                    try:
+                        await browser.switch_to_page(p["page"])
+                        _as_partial = await extract_fns[name](
+                            p["page"], browser=browser, cua_client=cua_client,
+                            label=name, verbose=verbose) or ""
+                    except Exception as _ase:
+                        log(f"[{name}] Auto-skip salvage extract failed: {_ase}", "WARN")
                 results[name] = {
                     "status": "auto_skipped",
                     "text": _as_partial,
@@ -23937,14 +23978,20 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     "Look at the page: is there SUBSTANTIAL research output visible — a "
                     "populated report, many sources/citations, long generated text — "
                     "even if a spinner is still running? Or is there only an EMPTY / "
-                    "PLACEHOLDER / loading state (e.g. 'Preparing…', a skeleton, a "
-                    "research plan with no actual findings, zero sources) that looks "
-                    "frozen?\n"
+                    "PLACEHOLDER / loading state (e.g. 'Preparing…', a skeleton) that "
+                    "looks frozen?\n"
+                    "IMPORTANT — planning is NOT stuck: if the page shows a research "
+                    "plan being drafted or already drafted ('Generating research plan', "
+                    "a streaming plan outline, a plan with a 'Start research' button, "
+                    "an active stop/streaming control), answer 'CONCLUSION: working' — "
+                    "plan generation legitimately takes 10+ minutes with zero sources "
+                    "and zero findings.\n"
                     "Answer 'CONCLUSION: stuck' ONLY if there is essentially no real "
-                    "research output (empty / placeholder / frozen). Answer "
-                    "'CONCLUSION: working' if substantial output is visible OR a "
-                    "counter / progress indicator is actively climbing. If unsure, "
-                    "answer 'CONCLUSION: working'.")
+                    "research output AND no plan activity (empty / placeholder / "
+                    "frozen). Answer 'CONCLUSION: working' if substantial output is "
+                    "visible OR a counter / progress indicator is actively climbing "
+                    "OR plan generation is visible. If unsure, answer "
+                    "'CONCLUSION: working'.")
                 _confirmed_stuck = False
                 try:
                     async def _stuck_probe_cua():
@@ -23988,6 +24035,26 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     log(f"[{name}] CUA arbiter: WORKING — output visible despite flat "
                         "scrape; resetting growth clock (no stuck alert)", "INFO")
                     p["last_growth_time"] = time.time()
+                    # #929: a WORKING verdict must also DISARM Layer 3 and
+                    # retract any earlier stuck card. Pre-fix, only renewed
+                    # GROWTH cleared stuck_alerted_at — so an agent the
+                    # arbiter itself just re-judged healthy (e.g. a long
+                    # Gemini plan that shows no text growth) still hit the
+                    # unacted-card auto-skip measured from the stale alert.
+                    if p.get("stuck_alerted_at", 0.0):
+                        p["stuck_alerted_at"] = 0.0
+                        p["stuck_warned_at"] = 0.0
+                        log(f"[{name}] WORKING re-verdict after a stuck alert — "
+                            "retracting card, cancelling auto-skip", "INFO")
+                        try:
+                            emit_event("pipeline_warning", phase=2, agent=agent_key_stuck,
+                                       error=f"{name} is working",
+                                       details=f"{name} was re-checked and is still working — earlier alert withdrawn.",
+                                       actions=[], alert_id=f"agent_{agent_key_stuck}_error",
+                                       auto_clear_on_resume=True)
+                            _clear_pending_decision(agent_key_stuck)
+                        except Exception:
+                            pass
             # Apply any async decision that landed since last tick.
             if _controls.consume_poke_agent(agent_key_stuck):
                 log(f"[{name}] User poked — sending 'please continue' follow-up")
@@ -23998,9 +24065,19 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception as _e:
                     log(f"[{name}] Poke failed: {_e}", "WARN")
                 p["last_growth_time"] = time.time()
+                # #929: a user interaction restarts the whole escalation —
+                # pre-fix only the growth clock reset, so the Layer-3
+                # unacted-card countdown (measured from stuck_alerted_at)
+                # kept running and could auto-skip right after the poke.
+                p["stuck_alerted_at"] = 0.0
+                p["stuck_warned_at"] = 0.0
             if _controls.consume_wait_longer_agent(agent_key_stuck):
                 log(f"[{name}] User granted another 20 min of no-growth budget")
                 p["last_growth_time"] = time.time()
+                # #929: same disarm as poke — "wait longer" is an explicit
+                # user decision that the agent should keep running.
+                p["stuck_alerted_at"] = 0.0
+                p["stuck_warned_at"] = 0.0
 
             # Dedup: only emit when something meaningful changed (status / sources /
             # partialTextLen / sections-count). Otherwise we spam Firestore ~180 writes
@@ -24664,7 +24741,45 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         if p["hf_timeouts"] >= 2:
                             log(f"[Claude] 2-artifact hard-fail timed out {p['hf_timeouts']}× "
                                 f"without a user decision — auto-skipping agent", "WARN")
-                            _controls.skipped_agents.add(agent_key_hf)
+                            # #929: finalize the skip HERE instead of routing a
+                            # bare marker through the user-skip consumer — that
+                            # path stamped reason="user_skip" on a skip nobody
+                            # chose. Mirror the L3 auto-skip: salvage partial,
+                            # emit agent_skipped with an honest reason (the
+                            # emit hook flips the persisted tile status to
+                            # "skipped" + clears the durable card mirror),
+                            # close the tab, drop from pending.
+                            _hf_partial = ""
+                            if agent_key_hf in _controls.hv_blocked:
+                                log("[Claude] Auto-skip — verification-walled tab, "
+                                    "skipping partial extraction (hands-off)", "WARN")
+                            else:
+                                try:
+                                    await browser.switch_to_page(p["page"])
+                                    _hf_partial = await extract_fns[name](
+                                        p["page"], browser=browser, cua_client=cua_client,
+                                        label=name, verbose=verbose) or ""
+                                except Exception as _hfe:
+                                    log(f"[Claude] Auto-skip salvage extract failed: {_hfe}", "WARN")
+                            results[name] = {
+                                "status": "auto_skipped",
+                                "text": _hf_partial,
+                                "url": p.get("url", ""),
+                                "page": None,
+                                "elapsed_sec": int(elapsed),
+                            }
+                            emit_event("agent_skipped", phase=2, agent=agent_key_hf,
+                                       reason="auto_skip_unanswered_timeout",
+                                       partial_chars=len(_hf_partial))
+                            emit_event("pipeline_warning", phase=2, agent=agent_key_hf,
+                                       error="Claude skipped automatically",
+                                       details=("Claude's report never finished and the retry "
+                                                "prompt went unanswered — skipped so your run "
+                                                "can finish. The other agents aren't affected."),
+                                       actions=[], alert_id=f"agent_{agent_key_hf}_autoskip",
+                                       auto_clear_on_resume=True)
+                            await _close_skipped_agent_tab(browser, p.get("page"), agent_key_hf, name)
+                            del pending[name]
                             continue
                         p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
                         p["done_count"] = 0
@@ -30766,8 +30881,11 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # Clipboard API blocked by the challenge page's permissions
                 # policy). Name the real cause instead of the generic card.
                 if not await _hv_setup_fail_card(page, platform, label):
-                    fail_agent(platform_l, f"Couldn't send the brief to {label}",
-                               f"We couldn't hand the research brief to {label}. Retry to try again, or Skip it.")
+                    # #929: `platform` (display name, e.g. "Gemini"), never
+                    # `label` — that's the internal step tag ("2C") and it
+                    # leaked into user-facing copy ("…hand the brief to 2C").
+                    fail_agent(platform_l, f"Couldn't send the brief to {platform}",
+                               f"We couldn't hand the research brief to {platform}. Retry to try again, or Skip it.")
                 return page, False
     else:
         # Inline paste path — engaged in two cases:
@@ -30798,8 +30916,9 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             # #896: paste-blocked can mean a human-verification wall is up —
             # probe before blaming the paste machinery.
             if not await _hv_setup_fail_card(page, platform, label):
-                fail_agent(platform_l, f"Couldn't send the brief to {label}",
-                           f"We couldn't hand the research brief to {label}. Retry to try again, or Skip it.")
+                # #929: platform display name, not the internal step label.
+                fail_agent(platform_l, f"Couldn't send the brief to {platform}",
+                           f"We couldn't hand the research brief to {platform}. Retry to try again, or Skip it.")
             return page, False
 
     # ── Just-before-send: ensure the required mode is STILL active ──
@@ -31270,6 +31389,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         if _stale_ag in _controls.skipped_agents:
             log(f"Phase 2: clearing stale skip marker for {_stale_ag} (fresh launch)", "INFO")
             _controls.skipped_agents.discard(_stale_ag)
+    # #929: the persisted per-agent tile-status reset ("running") lives at
+    # each agent's LAUNCH site (2A/2B/2C "starting" emits below), NOT here —
+    # a phase-entry write would strand a never-launched agent on a persisted
+    # "running" when the user stops the run during the sequential launch
+    # window (review finding, 2026-07-09).
 
     # Ensure brief.md is on disk for file-attachment delivery (Option A).
     brief_path = None
@@ -31304,6 +31428,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     if enabled_agents is None or "chatgpt" in enabled_agents:
         log("\n--- 2A: ChatGPT Deep Research (already in ChatGPT) ---")
         emit_event("agent_progress", phase=2, agent="chatgpt", status="starting", progress="Opening ChatGPT Deep Research mode...")
+        # #929: reset the PERSISTED tile status at actual launch. A checkpoint
+        # resume (or a P3-gate "Retry Phase 2") relaunches previously
+        # skipped/errored agents, but their stale root-doc "skipped"/"errored"
+        # kept the FE icon grey/red through the whole fresh attempt (bug 0 —
+        # Claude skipped pre-login stayed grey after resume). Launch-site, not
+        # phase-entry, so an early Stop can't strand a never-launched agent on
+        # a persisted "running". Same transient value the Retry-intake writes.
+        _write_agent_terminal_status("chatgpt", "running")
         # 2026-07-06 bot-score work: REUSE the warm Phase-1 ChatGPT tab instead
         # of opening a second one. Every cold top-level chatgpt.com load is a
         # Cloudflare-scored event; P1 already paid it and left a warm,
@@ -31447,6 +31579,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     if enabled_agents is None or "claude" in enabled_agents:
         log("\n--- 2B: Claude Deep Research ---")
         emit_event("agent_progress", phase=2, agent="claude", status="starting", progress="Opening Claude with Opus 4.8 (Max effort + Adaptive Thinking) + Research tools...")
+        # #929: launch-site persisted-status reset — see the 2A note.
+        _write_agent_terminal_status("claude", "running")
         for attempt in range(2):
             if attempt > 0:
                 log("[2B] Retrying Claude (fresh tab)...", "WARN")
@@ -31546,6 +31680,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
     if enabled_agents is None or "gemini" in enabled_agents:
         log("\n--- 2C: Gemini Deep Research (submit + let it plan) ---")
         emit_event("agent_progress", phase=2, agent="gemini", status="starting", progress="Opening Gemini and submitting research brief...")
+        # #929: launch-site persisted-status reset — see the 2A note.
+        _write_agent_terminal_status("gemini", "running")
         gemini_page, gemini_setup_ok = await start_agent_no_gemini_wait(
             browser, cua_client, "https://gemini.google.com",
             PROMPT_GEMINI_DEEP_RESEARCH,
@@ -31767,6 +31903,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         await asyncio.sleep(2)
 
         start_clicked = False
+        # #929: set when the user skips Gemini mid-2D (plan wait or CUA
+        # recovery). The skip is finalized in place (agent_skipped + tab
+        # close), so the recovery/verify/round-robin hand-off below must
+        # all stand down for this agent.
+        _gemini_2d_skipped = False
         # Cap the plan-draft wait near the user's "Start research in 3-5 min max"
         # expectation (was a flat 10 min, which felt far too long on a stuck plan).
         # Env-overridable for a genuinely slow-but-healthy plan. After this window
@@ -31826,7 +31967,48 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # recovery keep self-healing. If a plan then appears we retract it.
         _plan_alert_emitted = False
         _PLAN_ALERT_SEC = int(os.environ.get("GEMINI_PLAN_ALERT_SEC", "240"))  # 4 min: a plan normally drafts in 1-3 min
-        while time.time() - _loop_start < _start_wait_max_sec:
+        # #929: plan-STREAMING hold-off. The flat 300s budget + 4-min card
+        # fired on a healthy plan that simply took >5 min to draft
+        # (2026-07-09 live false alarm → card → auto-skip of a working
+        # Gemini). While the heartbeat scrape shows the plan actively
+        # generating (status='generating': stop button / streaming attr /
+        # running animation — scrape_progress_gemini ~16620), we hold the
+        # early card and extend the wait, bounded by a hard cap so a
+        # misread animation can't dwell forever.
+        _stream_max_sec = int(os.environ.get("GEMINI_PLAN_STREAM_MAX_SEC", "900"))
+        _last_stream_seen_at = time.time()  # grace: the submit just happened
+
+        def _retract_plan_alert(where: str):
+            # #921/#929: retract the early plan-stall card once the plan
+            # recovers. The main-loop click path always did this; the two
+            # CUA-recovery success paths didn't — leaving a stale
+            # [Retry][Skip] card sitting on a healthy researching Gemini.
+            nonlocal _plan_alert_emitted
+            if not _plan_alert_emitted:
+                return
+            try:
+                emit_event("pipeline_warning", phase=2, agent="gemini",
+                           error="Gemini's research plan started",
+                           details="Gemini recovered and began its deep research.",
+                           actions=[], alert_id="agent_gemini_error",
+                           auto_clear_on_resume=True)
+                _clear_pending_decision("gemini")
+            except Exception:
+                pass
+            _plan_alert_emitted = False
+            log(f"[2D] Retracted the early plan-stall card — plan recovered ({where})", "INFO")
+
+        while True:
+            # #929: dynamic budget — original 300s window, extended while the
+            # plan is visibly streaming, hard-capped at _stream_max_sec.
+            _elapsed = int(time.time() - _loop_start)
+            _streaming_recent = (time.time() - _last_stream_seen_at) < 45
+            if _elapsed >= _stream_max_sec:
+                log(f"[2D] Plan wait hard cap reached ({_elapsed}s ≥ {_stream_max_sec}s) "
+                    "— handing off to recovery", "WARN")
+                break
+            if _elapsed >= _start_wait_max_sec and not _streaming_recent:
+                break
             # #755: stop/pause-aware — a 10-min plan wait must honor Stop/Pause.
             if _controls.is_stop():
                 log("[2D] Stop requested during plan wait — exiting loop", "INFO")
@@ -31835,7 +32017,18 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 await _controls.wait_if_paused()
                 if _controls.is_stop():
                     break
-            _elapsed = int(time.time() - _loop_start)
+            # #929: consume a user Skip DURING the plan wait — pre-fix this
+            # loop only honored Stop, so a Skip on the early card left it
+            # regenerating/waiting on a dismissed agent with NO agent_skipped
+            # ever emitted (persisted tile stayed red — the grey-fade-on-skip
+            # rule broke) and the tab left open.
+            if "gemini" in _controls.skipped_agents:
+                log("[2D] User skipped Gemini during the plan wait — finalizing skip", "INFO")
+                _controls.skipped_agents.discard("gemini")
+                _gemini_2d_skipped = True
+                emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
+                await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
+                break
             # 1. Check Start-research button on Gemini and click if present
             try:
                 await browser.switch_to_page(gemini_page)
@@ -31865,22 +32058,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         start_clicked = True
                         # #921: the plan recovered after we'd raised the early
                         # [Retry][Skip] card — retract it so a stale error card
-                        # doesn't sit on a now-healthy agent. Clears the durable
-                        # mirror (clean cold-open) + re-emits the alert_id as an
-                        # auto-clearing notice; the card also self-clears when
-                        # Gemini reaches a clean terminal status (FE).
-                        if _plan_alert_emitted:
-                            try:
-                                emit_event("pipeline_warning", phase=2, agent="gemini",
-                                           error="Gemini's research plan started",
-                                           details="Gemini recovered and began its deep research.",
-                                           actions=[], alert_id="agent_gemini_error",
-                                           auto_clear_on_resume=True)
-                                _clear_pending_decision("gemini")
-                            except Exception:
-                                pass
-                            _plan_alert_emitted = False
-                            log("[2D] Retracted the early plan-stall card — plan recovered", "INFO")
+                        # doesn't sit on a now-healthy agent (#929: shared
+                        # helper, also used by the CUA-recovery success paths).
+                        _retract_plan_alert("main loop")
                         await asyncio.sleep(5)
                         break
                     log("[2D] 'Start research' click didn't take after 2 re-clicks "
@@ -31974,7 +32154,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # the terminal fail_agent after the CUA ladder reuses the same id).
             if (not start_clicked and not _plan_alert_emitted
                     and not _controls.is_stop()
+                    and not _streaming_recent
                     and (_regen_cap_emitted or _elapsed > _PLAN_ALERT_SEC)):
+                # #929 `not _streaming_recent`: a plan that is VISIBLY still
+                # generating is healthy-slow, not failed — carding it was the
+                # 2026-07-09 false alarm. The card now waits for the streaming
+                # evidence to go quiet (or the regen cap), so it still fires
+                # fast on the true plain-chat/DR-dropped stall.
                 _plan_alert_emitted = True
                 log(f"[2D] Plan not started after {_elapsed}s "
                     f"(regens={_regen_count}) — surfacing early [Retry][Skip] card "
@@ -31994,6 +32180,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             if time.time() - _last_plan_emit >= 15:
                 try:
                     _gm = await scrape_progress_gemini(gemini_page) or {}
+                    # #929: streaming clock — RAW scrape status only ('generating'
+                    # = stop button / streaming attr / running animation, incl.
+                    # the plan-ready-awaiting-Start state, which the clicker
+                    # resolves within a tick). A failed scrape ('scrape_error')
+                    # or idle/complete page does NOT feed the clock, so a dead
+                    # plan still ages out on the original 300s budget.
+                    if (_gm.get("status") or "") == "generating":
+                        _last_stream_seen_at = time.time()
                     _gm_status = (_gm.get("status") or "generating")
                     if _gm_status in ("complete", "done"):
                         _gm_status = "generating"
@@ -32012,7 +32206,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 except Exception:
                     pass
 
-            log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
+            # #929: name the wait mode — past the base budget the loop only
+            # keeps going while streaming evidence is fresh, and the log must
+            # say so (a "320s / 300s" line read as a bug).
+            if _elapsed >= _start_wait_max_sec:
+                log(f"[2D] Plan still visibly streaming — extended wait ({_elapsed}s / "
+                    f"hard cap {_stream_max_sec}s)")
+            else:
+                log(f"[2D] Still waiting for Gemini research plan... ({_elapsed}s / {_start_wait_max_sec}s)")
             # Tighter tick (was 30s) so a "Start research" button is clicked within
             # ~10s of appearing and the wait feels responsive, not stalled.
             await asyncio.sleep(10)
@@ -32028,7 +32229,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # click it via deterministic JS — then verify + hand back to the
         # round-robin. Bounded so a permanently-failing plan still escalates
         # honestly (verified_b=False below) instead of dwelling forever.
-        if not start_clicked and not _controls.is_stop():
+        if not _gemini_2d_skipped and not start_clicked and not _controls.is_stop():
             _FALLBACK_MAX_REGEN = 3   # CUA-driven re-draft attempts (the in-loop #755 path already tried 3 via JS)
             log(f"[2D] No 'Start research' after {_start_wait_max_sec}s — CUA recovery: "
                 f"retry the plan (≤{_FALLBACK_MAX_REGEN}×) until 'Start research' appears, then click it")
@@ -32037,6 +32238,16 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # variant, so the two finders could disagree about the same DOM.
             for _regen_attempt in range(_FALLBACK_MAX_REGEN):
                 if _controls.is_stop():
+                    break
+                # #929: honor a user Skip between recovery attempts — same
+                # finalize as the plan-wait loop (agent_skipped + tab close),
+                # and never point the CUA at an agent the user dismissed.
+                if "gemini" in _controls.skipped_agents:
+                    log("[2D] User skipped Gemini during CUA recovery — finalizing skip", "INFO")
+                    _controls.skipped_agents.discard("gemini")
+                    _gemini_2d_skipped = True
+                    emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
+                    await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
                     break
                 # 1. The plan may already expose a Start-research button (a prior
                 #    re-draft just succeeded, or it was simply slow) — click it.
@@ -32048,6 +32259,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 if _sr:
                     start_clicked = True
                     log("[2D] CUA recovery: clicked 'Start research' via JS ✓")
+                    # #929 (B4iii gap): this success path never retracted the
+                    # early plan-stall card — a healthy researching Gemini kept
+                    # a stale [Retry][Skip] card for the rest of the run.
+                    _retract_plan_alert("CUA recovery")
                     await asyncio.sleep(5)
                     break
                 # 2. No Start-research → the plan is in a FAIL state. CUA clicks the
@@ -32093,7 +32308,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # 3. Wait ~2 min for the re-draft, polling for "Start research"
                 #    every ~5s and clicking it the instant it renders.
                 for _i in range(24):   # ~120s
-                    if _controls.is_stop():
+                    # #929: a Skip mid-poll exits fast — the next outer-attempt
+                    # check finalizes it (or the loop ends and the guard below
+                    # stands down).
+                    if _controls.is_stop() or "gemini" in _controls.skipped_agents:
                         break
                     try:
                         await browser.switch_to_page(gemini_page)
@@ -32103,12 +32321,25 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     if _sr2:
                         start_clicked = True
                         log("[2D] CUA recovery: 'Start research' appeared after re-draft — clicked ✓")
+                        # #929 (B4iii gap): same retraction as the other
+                        # success paths — was missing here too.
+                        _retract_plan_alert("CUA recovery re-draft")
                         await asyncio.sleep(5)
                         break
                     await asyncio.sleep(5)
                 if start_clicked:
                     break
-            if not start_clicked:
+            # #929: a Skip that landed during the FINAL attempt's poll loop
+            # exits the for-loop without hitting the top-of-attempt finalize —
+            # consume it here so the skip is never silently dropped.
+            if (not _gemini_2d_skipped and not start_clicked
+                    and "gemini" in _controls.skipped_agents):
+                log("[2D] User skipped Gemini at the end of CUA recovery — finalizing skip", "INFO")
+                _controls.skipped_agents.discard("gemini")
+                _gemini_2d_skipped = True
+                emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
+                await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
+            if not start_clicked and not _gemini_2d_skipped:
                 log(f"[2D] CUA recovery exhausted ({_FALLBACK_MAX_REGEN} attempts) — "
                     f"plan never produced a clickable 'Start research'", "WARN")
                 # Surface the Retry/Skip alert NOW — don't make the user wait for
@@ -32132,7 +32363,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # No confirmed click ⇒ not running; the round-robin keeps the tab (it does
         # NOT drop a not-verified agent — see ~19298) and the wall-clock cap
         # surfaces an honest fail_agent if the plan never starts.
-        if _controls.is_stop():
+        if _gemini_2d_skipped:
+            # #929: the skip was finalized in place (agent_skipped emitted,
+            # tab closed) — Gemini must NOT be handed to the round-robin,
+            # whose pollers would touch a dead page handle.
+            log("[2D] Gemini skipped during the plan wait — tab closed, "
+                "not handed to the round-robin", "INFO")
+            verified_b = False
+        elif _controls.is_stop():
             log("[2D] Stop requested — skipping Gemini verify", "INFO")
             verified_b = False
         elif not start_clicked:
@@ -32157,17 +32395,19 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2D] Instant DOM verify didn't confirm — the cycle-1 Gemini "
                     "leg re-checks (click was confirmed; detectors decide)", "WARN")
         # Record when research actually started (after "Start research" click)
-        # so the round-robin doesn't check for completion prematurely
-        agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url,
-                            "research_started_at": time.time(),
-                            "needs_start_verify": bool(start_clicked and not verified_b)}
+        # so the round-robin doesn't check for completion prematurely.
+        # #929: a mid-2D skip never registers — the tab is already closed.
+        if not _gemini_2d_skipped:
+            agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url,
+                                "research_started_at": time.time(),
+                                "needs_start_verify": bool(start_clicked and not verified_b)}
         if verified_b:
             emit_event("agent_progress", phase=2, agent="gemini", status="generating",
                        stage="researching",
                        progress="Gemini Deep Research plan created and started")
             log("[2D] Gemini is researching ✓")
             await inject_agent_observer(gemini_page, "gemini")
-        else:
+        elif not _gemini_2d_skipped:
             log("[2D] Gemini may not be running", "WARN")
 
     # ── Verify all launched agents are running ──
@@ -34806,6 +35046,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         log(f"RESUME: {reason}")
         # Emit resume marker so frontend knows to ignore events before this point
         emit_event("pipeline_resumed", phase=start_phase, resumeReason=reason)
+        # #929: full-restart marker. A checkpoint resume re-runs the phase
+        # from scratch (run_phase2 relaunches ALL enabled agents — a pre-pause
+        # user skip is a per-attempt decision, not persisted), so the FE must
+        # reset that phase's UI state too: per-agent icons/steppers/details
+        # and any stale alert cards from the paused attempt. full=True is
+        # emitted ONLY here — the many soft-retry phase_restart sites must
+        # NOT wipe live phase UI (their agents keep running).
+        if isinstance(start_phase, int) and 0 <= start_phase <= 3:
+            emit_event("phase_restart", phase=start_phase,
+                       reason="resume_from_checkpoint", full=True)
         if start_phase >= 6:
             log("Pipeline already complete — nothing to resume")
             return
@@ -41760,15 +42010,36 @@ def _clear_login_marker() -> None:
 
 
 def _login_interrupt_active(max_age_sec: int = 30 * 60) -> bool:
-    """True while a --login run is in flight (marker present + fresh). The
-    age cap keeps a hard-killed --login (marker never cleaned up) from
-    classifying every future browser crash as a login interrupt forever."""
+    """True while a --login run is in flight (marker present + fresh + its
+    process still ALIVE). The age cap keeps a hard-killed --login (marker
+    never cleaned up) from classifying every future browser crash as a
+    login interrupt forever.
+
+    #929: pid-liveness gate added. The stakes rose when fail_agent gained
+    its login-teardown suppression — with only the age check, a taskkill'd
+    /power-lossed --login (atexit clear never ran) would silently swallow
+    every REAL per-agent [Retry][Skip] card on a healthy run for up to 30
+    minutes. The marker records the --login process pid (_write_login_marker);
+    a recorded-but-dead pid means no login is in flight. Same liveness
+    pattern as _enumerate_ongoing_runs' worker-lock check. Legacy/pid-less
+    markers keep the pure age check."""
     try:
         p = _login_marker_path()
         if not p.exists():
             return False
-        ts = float(json.loads(p.read_text(encoding="utf-8")).get("ts", 0)) / 1000.0
-        return ts > 0 and (time.time() - ts) < max_age_sec
+        data = json.loads(p.read_text(encoding="utf-8"))
+        ts = float(data.get("ts", 0)) / 1000.0
+        if not (ts > 0 and (time.time() - ts) < max_age_sec):
+            return False
+        pid = int(data.get("pid", 0) or 0)
+        if pid > 0:
+            try:
+                import psutil
+                if not psutil.pid_exists(pid):
+                    return False
+            except Exception:
+                pass  # psutil unavailable → degrade to the age-only check
+        return True
     except Exception:
         return False
 
