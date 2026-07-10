@@ -110,7 +110,13 @@ def _request(method: str, path: str, body: dict | None = None,
     try:
         with urllib.request.urlopen(req, timeout=timeout or _TIMEOUT) as resp:
             raw = resp.read()
-            return resp.status, (json.loads(raw) if raw else {})
+            status = resp.status
+            try:
+                return status, (json.loads(raw) if raw else {})
+            except ValueError:
+                # A non-JSON 200 (proxy/HTML error page, truncated body) would
+                # otherwise escape as a raw traceback to the chat runtime.
+                return status, {"error": f"HTTP {status} (unexpected non-JSON reply from the bridge)"}
     except urllib.error.HTTPError as e:
         raw = e.read()
         try:
@@ -119,6 +125,15 @@ def _request(method: str, path: str, body: dict | None = None,
             return e.code, {"error": f"HTTP {e.code}"}
     except urllib.error.URLError as e:
         return 0, {"error": f"bridge unreachable ({e.reason}) — the Super Research bridge "
+                            "isn't running on this machine yet. Set it up with `pipx run "
+                            "--no-cache superresearch-agent connect` (it starts the bridge + keeps it "
+                            "on login), then sign in."}
+    except OSError as e:
+        # HTTPError/URLError are OSError subclasses handled above, so this last
+        # clause absorbs read timeouts (socket.timeout is TimeoutError) and other
+        # low-level socket/OS errors into the same friendly line instead of a
+        # raw traceback.
+        return 0, {"error": f"bridge unreachable ({e}) — the Super Research bridge "
                             "isn't running on this machine yet. Set it up with `pipx run "
                             "--no-cache superresearch-agent connect` (it starts the bridge + keeps it "
                             "on login), then sign in."}
