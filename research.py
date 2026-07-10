@@ -17100,9 +17100,26 @@ async def detect_completion_claude(page):
                     al.includes('stop response') || al.includes('stop research') ||
                     al.includes('stop generating')) { hasStop = true; break; }
             }
-            if (!hasStop && document.querySelector(
-                '[data-is-streaming="true"], .streaming, [class*="animate-pulse"]'
-            )) hasStop = true;
+            if (!hasStop && document.querySelector('[data-is-streaming="true"]')) hasStop = true;
+            // 2026-07-10: count an ANIMATION as "still streaming" ONLY when the
+            // element is VISIBLE (offsetParent) AND its animation is actually
+            // RUNNING. The prior bare `[class*="animate-pulse"], .streaming`
+            // selector false-positived on persisted-but-completed shimmer / hidden
+            // skeleton chrome that Claude leaves in the DOM after a research
+            // completes — pinning hasStop=true forever, so detect returned
+            // "stop_btn_present" on a genuinely-done report and completion fell to
+            // the slow 5-min CUA fallback (stuck-despite-complete, live E2E
+            // 2026-07-10). This is the exact guard verify_claude_generating
+            // adopted 2026-05-14 (research.py:19872) but never back-ported here.
+            if (!hasStop) {
+                for (const el of document.querySelectorAll(
+                    '[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"], .streaming'
+                )) {
+                    if (el.offsetParent === null) continue;                 // not visible
+                    if (typeof el.getAnimations !== 'function') continue;
+                    if (el.getAnimations().some(a => a.playState === 'running')) { hasStop = true; break; }
+                }
+            }
 
             const bodyText = document.body?.innerText || '';
             // 2026-04-26: regex matches BOTH "research completed in 5m"
@@ -24237,6 +24254,31 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # the FE entirely (agent stayed "generating" until MIN_WAIT
             # cleared, ~5 min after the BE could SEE it was done).
             if detect_fn:
+                # 2026-07-10: Claude renders a FINISHED deep-research report — and
+                # its "Research complete · N sources · Xm Ys" done-marker — inside a
+                # VIRTUALIZED artifact/research panel. The bulk of it (the marker +
+                # most source rows) is NOT in document.body.innerText until the
+                # panel is scrolled, so the cheap DOM detector below kept returning
+                # not-done on a genuinely-complete report and the run limped along
+                # on the slow 5-min CUA fallback (live E2E 2026-07-10: ~50m flat at
+                # "5 URLs, 15 steps", only CUA — which scrolls first, :24444 — ever
+                # caught it). Scroll the panel + window to the bottom first so the
+                # marker + full sources render into the DOM before we read them.
+                # Claude-scoped: ChatGPT/Gemini detectors weren't affected and we
+                # don't want to perturb their timing. Best-effort; a scroll failure
+                # just leaves the prior (unscrolled) behavior.
+                if name == "Claude":
+                    try:
+                        await p["page"].evaluate("""() => {
+                            window.scrollTo(0, document.body.scrollHeight);
+                            document.querySelectorAll(
+                                'aside, [class*="artifact"], [class*="overflow-y"], '
+                                + '[class*="overflow-auto"], [class*="scroll"], main'
+                            ).forEach(c => { try { c.scrollTop = c.scrollHeight; } catch(e){} });
+                        }""")
+                        await asyncio.sleep(0.4)  # let the virtualizer render the newly-visible range
+                    except Exception:
+                        pass
                 try:
                     dom_done, dom_reason, snap = await detect_fn(p["page"])
                 except Exception as _de:
@@ -24245,7 +24287,20 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 p.setdefault("flat_history", [])
                 p.setdefault("done_marker_first_at", 0.0)
                 p.setdefault("extraction_attempts", 0)
+                p.setdefault("last_notdone_log_at", 0.0)
                 if not dom_done:
+                    # Diagnostics (2026-07-10): surface WHY the cheap DOM detector
+                    # isn't confirming done, throttled to ~2 min so a long run
+                    # doesn't spam backend.log. Makes "stuck despite complete" a
+                    # one-grep root-cause from the log alone (distinguishes
+                    # stop_btn_present / animate-pulse vs no_done_marker vs the
+                    # empty-snapshot guard) — the old code logged nothing on the
+                    # persistent not-done path, which is why this stall needed a
+                    # code read to diagnose.
+                    _nd_now = time.time()
+                    if _nd_now - p.get("last_notdone_log_at", 0.0) >= 120:
+                        p["last_notdone_log_at"] = _nd_now
+                        log(f"[{name}] DOM not-done: {dom_reason}; snap={snap}")
                     # Definitive done-marker absent — discard any flat history.
                     if p["flat_history"]:
                         log(f"[{name}] Done-marker lost — clearing flat_history ({dom_reason})")
