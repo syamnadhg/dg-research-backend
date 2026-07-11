@@ -808,6 +808,26 @@ def _read_firestore_api_keys() -> dict:
             elif _prev:
                 # Was set, now gone — a real clear; revert to flat/local.
                 log(f"[_read_firestore_api_keys] device-scoped key override cleared — account-wide/local fallback (device {did})", "INFO")
+        # #938: sharer-submitted run — overlay the SUBMITTER's own per-device
+        # keys (their explicit opt-in for THIS computer) over the owner chain.
+        # try/except fail-open: any error here (e.g. mid-run unshare → 403)
+        # must degrade to the owner chain, NOT fall out to the outer except
+        # (which would return {} and nuke the owner keys too).
+        submitter = _RUN_SUBMITTER["uid"]
+        s_fields = []
+        if submitter and submitter != uid:
+            try:
+                s_keys = _read_submitter_prefs_keys(submitter)
+                merged, s_fields = _overlay_submitter_keys(merged, s_keys, did)
+            except Exception:
+                s_fields = []
+        if (s_fields, submitter) != (_SHARER_KEY_OVERRIDE_MEMO["fields"], _SHARER_KEY_OVERRIDE_MEMO["uid"]):
+            _prev_s = _SHARER_KEY_OVERRIDE_MEMO["fields"]
+            _SHARER_KEY_OVERRIDE_MEMO.update(fields=s_fields, uid=submitter)
+            if s_fields:
+                log(f"[_read_firestore_api_keys] sharer key override active for {', '.join(s_fields)} (device {did})", "INFO")
+            elif _prev_s:
+                log(f"[_read_firestore_api_keys] sharer key override cleared — computer owner's keys (device {did})", "INFO")
         return merged
     except Exception as e:
         log(f"[_read_firestore_api_keys] read failed (non-fatal): {e}", "WARN")
@@ -848,6 +868,76 @@ def _overlay_device_keys(keys, device_id):
     return flat
 
 
+# #938: change-only memo for the sharer-override log line + error-card
+# attribution. `fields` = which key fields the current run's submitter
+# overrides (names only, never values); `uid` = that submitter.
+_SHARER_KEY_OVERRIDE_MEMO = {"fields": None, "uid": None}
+
+# #938: only these fields may be overridden by a sharer — a stray byDevice
+# field (e.g. deepgram) must never shadow the owner's value.
+_SHARER_OVERRIDABLE_FIELDS = ("anthropic", "gemini")
+
+
+def _overlay_submitter_keys(merged, submitter_keys, device_id):
+    """#938: overlay the SUBMITTER's explicit per-device keys over the owner
+    chain — a sharer's keys are used ONLY for runs THEY submit, and only on
+    devices they explicitly configured. Pure — unit-testable without
+    Firestore.
+
+    Only apiKeys.byDevice.{device_id}.{anthropic,gemini} applies: the
+    sharer's FLAT account-wide keys are deliberately ignored on someone
+    else's computer (per-device is the explicit opt-in), and the field
+    allowlist keeps any other byDevice field from shadowing the owner's
+    value. Empty/whitespace values are filtered (a cleared FE field reverts
+    to the owner chain); strings are stripped.
+
+    Returns (new_merged, overridden_fields) — overridden_fields sorted, for
+    the change-only names-never-values log + error-card attribution."""
+    out = dict(merged or {})
+    overridden = []
+    by_device = (submitter_keys or {}).get("byDevice")
+    if device_id and isinstance(by_device, dict):
+        dev = by_device.get(device_id)
+        if isinstance(dev, dict):
+            for k in _SHARER_OVERRIDABLE_FIELDS:
+                v = dev.get(k)
+                if isinstance(v, str) and v.strip():
+                    out[k] = v.strip()
+                    overridden.append(k)
+    return out, sorted(overridden)
+
+
+# #938: 30s single-slot memo for the submitter prefs read.
+# resolve_gemini_api_key() has no cache of its own (the narrator re-resolves
+# every ~6s tick), so without this a sharer run would double the per-resolve
+# Firestore reads. 30s still discovers a mid-run unshare (403 → fail-open to
+# the owner chain) quickly; failures are cached as {} for the same window so
+# a revoked sharer doesn't retry the denied read on every tick.
+_SHARER_PREFS_CACHE = {"uid": None, "keys": None, "ts": 0.0}
+_SHARER_PREFS_TTL = 30.0
+
+
+def _read_submitter_prefs_keys(submitter_uid):
+    """Read the SUBMITTER's users/{uid}/settings/prefs → apiKeys via the
+    same synth-device-user client (the settings/prefs read rule already
+    allows deviceMemberOf — the sharer is in this device's sharedWith[]).
+    Fail-open: any error returns {} so key resolution degrades to the owner
+    chain instead of dying (mirrors the sharer-tree rehydration precedent)."""
+    now = time.time()
+    if (_SHARER_PREFS_CACHE["uid"] == submitter_uid
+            and now - _SHARER_PREFS_CACHE["ts"] < _SHARER_PREFS_TTL):
+        return _SHARER_PREFS_CACHE["keys"] or {}
+    keys = {}
+    try:
+        snap = _firebase_db.collection("users").document(submitter_uid) \
+            .collection("settings").document("prefs").get()
+        keys = ((snap.to_dict() or {}).get("apiKeys") or {}) if snap.exists else {}
+    except Exception as se:
+        log(f"[_read_firestore_api_keys] sharer prefs read failed (non-fatal, owner-chain fallback): {se}", "WARN")
+    _SHARER_PREFS_CACHE.update(uid=submitter_uid, keys=keys, ts=now)
+    return keys
+
+
 _RESOLVED_KEY_CACHE = {"key": None, "ts": 0.0}
 _RESOLVED_KEY_TTL = 60.0  # seconds — long enough to absorb hot-path callers (narrator
                           # ticks every 6s in P1/P2), short enough to pick up rotated
@@ -858,6 +948,130 @@ _RESOLVED_KEY_NONE_TTL = 5.0  # seconds — shorter TTL when no key is found, so
                               # within ~5s instead of waiting out the full
                               # 60s. Addresses PR review C1 (Copilot — None
                               # caching blocked fast recovery on retry).
+
+
+# #938: WHO submitted the run this worker is executing (queue-doc uid ==
+# submittedBy — the tree the research doc lives under). None outside runs
+# and in the --login/setup CLI processes, where the owner chain is correct.
+_RUN_SUBMITTER = {"uid": None}
+
+# #938: attribution of the BAKED Anthropic key. cua_client is built ONCE at
+# run entry from resolve_api_key (research.py run_pipeline), but the sharer
+# memo is refreshed by every narrator Gemini resolve (~30s sharer-prefs TTL).
+# Freezing the Anthropic attribution at bake time keeps a mid-run prefs edit
+# from flipping an error card to the wrong party — the card must describe the
+# key the failing client actually holds, not the latest memo snapshot.
+_RUN_ANTHROPIC_ATTR = {"is_sharers": False, "captured": False}
+
+
+def _set_run_submitter(uid):
+    """#938: bind the run's submitter identity. Entry-only + change-
+    triggered: clears the resolved-key cache and the sharer memos ONLY when
+    the submitter actually changes, so
+      (a) a ≤60s cached owner key can never cross into a sharer's run,
+      (b) same-submitter auto-retries (which pass the already-resolved key
+          back as cli_key and skip Firestore) keep their attribution memo,
+      (c) post-run title/summary daemon threads stay attributed to the run
+          that spawned them.
+    Deliberately NOT cleared in run_pipeline's finally — see the entry
+    call-site comment there."""
+    uid = (uid or "").strip() or None
+    if uid == _RUN_SUBMITTER["uid"]:
+        return
+    _RUN_SUBMITTER["uid"] = uid
+    _RESOLVED_KEY_CACHE.update(key=None, ts=0.0)
+    _SHARER_KEY_OVERRIDE_MEMO.update(fields=None, uid=None)
+    _SHARER_PREFS_CACHE.update(uid=None, keys=None, ts=0.0)
+    # A different submitter = a fresh baked key on the next resolve.
+    _RUN_ANTHROPIC_ATTR.update(is_sharers=False, captured=False)
+
+
+def _capture_anthropic_attribution():
+    """#938: snapshot whether the just-resolved+baked Anthropic key came from
+    the submitter's own per-device override. Called right after the entry
+    resolve_api_key + cua_client bake, when the memo reflects exactly that
+    resolve. Idempotent within a run (skips once captured) so a same-submitter
+    auto-retry — which forwards the resolved key as cli_key and never re-reads
+    Firestore — keeps the original attribution instead of picking up a memo
+    that drifted from mid-run narrator Gemini resolves."""
+    if _RUN_ANTHROPIC_ATTR["captured"]:
+        return
+    _RUN_ANTHROPIC_ATTR["is_sharers"] = (
+        bool(_RUN_SUBMITTER["uid"])
+        and "anthropic" in (_SHARER_KEY_OVERRIDE_MEMO["fields"] or [])
+    )
+    _RUN_ANTHROPIC_ATTR["captured"] = True
+
+
+def _is_sharer_run():
+    """#938: True iff the current run was submitted by a SHARER (submitter
+    known and ≠ the device owner)."""
+    try:
+        return bool(_RUN_SUBMITTER["uid"]) and _RUN_SUBMITTER["uid"] != load_paired_uid()
+    except Exception:
+        return False
+
+
+def _anthropic_key_is_sharers():
+    """#938: True iff the BAKED Anthropic key (frozen at run entry by
+    _capture_anthropic_attribution) came from the submitter's own per-device
+    override. Reads the entry snapshot, NOT the live memo — the memo is
+    refreshed by narrator Gemini resolves and would otherwise let a mid-run
+    prefs edit mis-attribute an error card for a key that never changed."""
+    return _RUN_ANTHROPIC_ATTR["is_sharers"]
+
+
+def _anthropic_key_card_copy(kind, label=""):
+    """#938: honest key attribution for the Anthropic error cards.
+
+    Owner-submitted runs and sharer runs using the SHARER's own key keep
+    the pre-#938 copy byte-for-byte ("Your Anthropic API key…" — accurate
+    either way). A sharer run that fell back to the OWNER's key says so,
+    and points the sharer at adding their own key instead of implying they
+    can fix the owner's.
+
+    kinds: rate_limit | cap | invalid | probe | login_walk | missing."""
+    if _is_sharer_run() and not _anthropic_key_is_sharers():
+        return {
+            "rate_limit": ("The computer owner's Anthropic API key hit its rate "
+                           "limit. You can add your own key for this computer in "
+                           "Account → API Config, then Retry."),
+            "cap": ("The computer owner's Anthropic API key hit its usage cap. "
+                    "You can add your own key for this computer in Account → "
+                    "API Config, then Retry."),
+            "invalid": ("The computer owner's Anthropic API key is invalid or "
+                        "expired. You can add your own key for this computer in "
+                        "Account → API Config, then Retry."),
+            "probe": ("The run can't start — the computer owner's Anthropic API "
+                      "key looks rate-limited, invalid, or over its cap. You can "
+                      "add your own key for this computer in Account → API "
+                      "Config, then Retry."),
+            "login_walk": (f"Can't verify your {label} login right now — the "
+                           "computer owner's Anthropic API key looks rate-limited, "
+                           "invalid, or over its limit. You can add your own key "
+                           "for this computer in Account → API Config, then Retry."),
+            "missing": ("This computer has no Anthropic API key. Add your own "
+                        "for this computer in Account → API Config (or ask the "
+                        "owner to add one), then Retry."),
+        }[kind]
+    return {
+        "rate_limit": ("Your Anthropic API key hit its rate limit. Switch to "
+                       "another key in Account → API Config, then Retry."),
+        "cap": ("Your Anthropic API key hit its usage cap. Switch to "
+                "another key in Account → API Config (or raise the cap "
+                "in the Anthropic console), then Retry."),
+        "invalid": ("Your Anthropic API key is invalid or expired. Paste a "
+                    "working key in Account → API Config, then Retry."),
+        "probe": ("The run can't start — your Anthropic API key looks "
+                  "rate-limited, invalid, or over its cap. Update or "
+                  "switch it in Account → API Config, then Retry."),
+        "login_walk": (f"Can't verify your {label} login right now — your "
+                       "Anthropic API key looks rate-limited, invalid, or over "
+                       "its limit. Update or switch it in Account → API Config, "
+                       "then Retry."),
+        "missing": ("The run needs an Anthropic API key to start. Add it in "
+                    "Account → API Config, then Retry."),
+    }[kind]
 
 
 def resolve_api_key(cli_key=None):
@@ -19449,8 +19663,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 # vanish); pause immediately with a Retry-only 'load or switch
                 # your key' card, same as the cap / key-rejected branches below.
                 log(f"Claude API rate limited (429) — pausing for key action: {err[:160]}", "ERROR")
-                _rl_msg = ("Your Anthropic API key hit its rate limit. Switch to "
-                           "another key in Account → API Config, then Retry.")
+                _rl_msg = _anthropic_key_card_copy("rate_limit")
                 if _phase == 2 and _agent:
                     fail_agent(_agent, "API key is rate-limited", _rl_msg)
                 else:
@@ -19461,9 +19674,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 await asyncio.sleep(60); continue
             elif "workspace api usage limits" in low or ("400" in err and "usage limit" in low):
                 log(f"Workspace API cap hit — aborting CUA loop: {err[:200]}", "ERROR")
-                _cap_hint = ("Your Anthropic API key hit its usage cap. Switch to "
-                             "another key in Account → API Config (or raise the cap "
-                             "in the Anthropic console), then Retry.")
+                _cap_hint = _anthropic_key_card_copy("cap")
                 if _phase == 2 and _agent:
                     fail_agent(_agent, "API key is over its limit", _cap_hint)
                 else:
@@ -19471,7 +19682,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
                 return {"status": "error", "text": str(e)}
             elif "401" in err and ("unauthorized" in low or "invalid" in low or "api_key" in low):
                 log(f"Claude API key rejected — aborting CUA loop: {err[:200]}", "ERROR")
-                _bad_key_hint = "Your Anthropic API key is invalid or expired. Paste a working key in Account → API Config, then Retry."
+                _bad_key_hint = _anthropic_key_card_copy("invalid")
                 if _phase == 2 and _agent:
                     fail_agent(_agent, "API key was rejected", _bad_key_hint)
                 else:
@@ -35121,6 +35332,16 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
     + P3 are all skipped — the user pasted source URLs and just wants the
     final Doc + email. BE hydrates notebook_url / youtube_url / audio_url /
     links from these in the P3-skip block so P5 has something to compose."""
+    # #938: bind the submitter identity BEFORE any key resolution — the
+    # Anthropic key is resolved and baked into cua_client a few lines down,
+    # and a sharer's own per-device key must win for runs THEY submitted.
+    # Entry-only by design; NOT cleared in this function's finally: the
+    # auto-retry recursion forwards the resolved key as cli_key (skipping
+    # Firestore, so a clear would mis-attribute retry error cards), the
+    # post-run title/summary daemon threads resolve keys after we return,
+    # and several early returns above the main try would leak past a
+    # finally anyway. The next run re-binds at its own entry.
+    _set_run_submitter(uid)
     user_sources = user_sources or []
     user_links = user_links or []
     pdf_paths = pdf_paths or []
@@ -35139,6 +35360,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
 
     import anthropic
     cua_client = anthropic.Anthropic(api_key=api_key)
+    # #938: freeze WHOSE Anthropic key this client holds, now — the memo it
+    # reads from is refreshed by later narrator Gemini resolves, but this
+    # client's key is fixed for the run, so its error cards must attribute
+    # the key as it was at bake time.
+    _capture_anthropic_attribution()
 
     # ── Initialize pipeline controls + Firestore bridge ──
     _controls.reset()
@@ -36013,9 +36239,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     log(f"Phase 0: CUA availability probe failed — {cua_err}", "ERROR")
                     fail_phase(
                         0, "AI service unavailable",
-                        ("The run can't start — your Anthropic API key looks "
-                         "rate-limited, invalid, or over its cap. Update or "
-                         "switch it in Account → API Config, then Retry."),
+                        _anthropic_key_card_copy("probe"),
                         agent="system",
                         actions=[
                             {"id": "retry", "label": "Retry", "style": "primary",
@@ -36156,10 +36380,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
                     fail_phase(
                         0, "AI service unavailable",
-                        (f"Can't verify your {label} login right now — your "
-                         "Anthropic API key looks rate-limited, invalid, or over "
-                         "its limit. Update or switch it in Account → API Config, "
-                         "then Retry."),
+                        _anthropic_key_card_copy("login_walk", label=label),
                         agent=key,
                         actions=[
                             {"id": "retry", "label": "Retry", "style": "primary",
@@ -36373,7 +36594,8 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
         # Account → API Config" instead of a mid-phase vision crash.
         if not resolve_api_key():
             _env_ok = False
-            _env_errors.append("The run needs an Anthropic API key to start. Add it in Account → API Config, then Retry.")
+            _missing_msg = _anthropic_key_card_copy("missing")
+            _env_errors.append(_missing_msg)
         if not _env_ok:
             emit_event("login_required",
                        phase=0,
@@ -36382,7 +36604,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        machineName=socket.gethostname(),
                        envErrors=_env_errors,
                        attempt=1,
-                       message="The run needs an Anthropic API key to start. Add it in Account → API Config, then Retry.",
+                       message=_missing_msg,
                        alert_id="phase0_env_check")
             # #710 parity: durable mirror so an env-check failure raised while
             # this chat wasn't the viewed tab re-surfaces the card on open.
@@ -36395,7 +36617,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 "machineName": socket.gethostname(),
                 "envErrors": _env_errors,
                 "attempt": 1,
-                "message": "The run needs an Anthropic API key to start. Add it in Account → API Config, then Retry.",
+                "message": _missing_msg,
                 "alert_id": "phase0_env_check",
             })
             _controls.request_pause()
