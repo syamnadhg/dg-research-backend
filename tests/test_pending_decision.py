@@ -209,7 +209,11 @@ def test_pending_decision_cleared_on_universal_resolve_signal():
     # covers gates that wait via their own poll loop (human-verify) as well as
     # those using wait_if_paused.
     src = inspect.getsource(research.emit_event)
-    assert "_clear_pending_decision()" in src, "emit_event must clear pendingDecision (#710)."
+    # 2026-07-11: the seam agent-scopes agent_skipped clears (skipping agent A
+    # must not retract agent B's still-live mirror); agent-less events keep
+    # the unconditional clear via the None arm — same #710 contract.
+    assert ('_clear_pending_decision(agent if event_type == "agent_skipped" '
+            "else None)") in src, "emit_event must clear pendingDecision (#710)."
     # Every resolution signal retracts the mirror: resume/stop AND skip
     # (#715 — a Skip emits agent_skipped/phase_skipped, not pipeline_resumed).
     for ev in ("pipeline_resumed", "pipeline_stopped", "agent_skipped", "phase_skipped"):

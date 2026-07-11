@@ -102,10 +102,12 @@ def test_D_model_popover_double_escape():
 def test_E_emit_event_clears_pending_decision_on_phase_restart():
     src = inspect.getsource(research.emit_event)
     # The _clear_pending_decision whitelist must include phase_restart so a
-    # Retry-after-error retracts the durable snag card.
-    assert "phase_restart" in src and "_clear_pending_decision()" in src
+    # Retry-after-error retracts the durable snag card. (2026-07-11: the seam
+    # call is agent-scoped for agent_skipped; phase_restart rides the
+    # unconditional None arm — same behavior.)
+    assert "phase_restart" in src and "_clear_pending_decision(" in src
     # Be specific: phase_restart appears in the same tuple as the other resolve
     # signals (guard against an unrelated phase_restart mention).
     assert 'phase_skipped", "phase_restart"' in src or '"phase_restart"' in (
-        src.split("_clear_pending_decision()")[0].split("event_type in")[-1]
+        src.split("_clear_pending_decision(")[0].split("event_type in")[-1]
     )

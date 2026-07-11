@@ -37,6 +37,8 @@ class _FakeControls:
         self.cookie_trust_broken = set()
         self.login_pause_timeout_agents = set()
         self.skipped_agents = set()
+        self.user_skip_taps = set()
+        self.auto_skip_reasons = {}
         self.skip_init_verify = True
         self.pause_target_agent = ""
         self.retry_init_verify = False
@@ -314,8 +316,10 @@ def test_p1_login_skip_routes_to_manual_brief():
     assert '"chatgpt" in _controls.skipped_agents' in blk
     assert 'decision = "skip"' in blk
     # Retry must clear the stale skip or the preflight pause returns
-    # 'skipped' on its first tick and Retry can never work.
-    assert 'skipped_agents.discard("chatgpt")' in blk
+    # 'skipped' on its first tick and Retry can never work. (2026-07-11:
+    # retirement is atomic via consume_skip_marker — the tap record and auto
+    # reason retire with the marker.)
+    assert 'consume_skip_marker("chatgpt")' in blk
     assert 'login_pause_timeout_agents.discard("chatgpt")' in blk
     # single conditional-reason emit — no double phase_skipped
     assert ('reason=("user_skip_at_login_pause" if _p1_login_skipped'

@@ -8623,9 +8623,10 @@ def _start_command_listener(uid, research_id, loop):
                     loop.call_soon_threadsafe(_clear_pending_decision, _ag_norm)
                     if _agent_pre_failed:
                         # Drop the pre-fail skip marker so the hard-retry path
-                        # doesn't see Gemini as still-skipped.
+                        # doesn't see Gemini as still-skipped (atomic — taps/
+                        # reasons retire with the marker).
                         try:
-                            _controls.skipped_agents.discard(_ag_norm)
+                            _controls.consume_skip_marker(_ag_norm)
                         except Exception:
                             pass
                         log(f"Command received: RETRY_AGENT agent={_ag} mode=hard (auto-promoted — agent had pre-pending setup failure)")
@@ -8916,6 +8917,19 @@ class PipelineControls:
         # round-robin skip consumer reports the honest reason + doesn't re-emit /
         # re-close a tab the finalize already greyed + closed.
         self.hv_auto_skipped: set[str] = set()
+        # 2026-07-11 Gemini-P2 incident: skipped_agents is OVERLOADED — genuine
+        # user Skip taps (request_skip_agent) share it with INTERNAL markers
+        # (2A/2B/2C setup-fail, login-gate timeout). The poll's skip consumer
+        # used to stamp EVERY member "skipped_by_user"/user_skip*, so an agent
+        # whose brief never sent was reported to the FE as a user decision AND
+        # the agent_skipped emit auto-retracted the honest Retry/Skip card 4s
+        # after fail_agent raised it (emit_event pending-decision clear seam).
+        # user_skip_taps records which skipped_agents entries came from an
+        # actual user tap; anything else is internal and must NOT be labeled
+        # or emitted as a user skip.
+        self.user_skip_taps: set[str] = set()
+        # Internal marker → honest reason string (logged when consumed).
+        self.auto_skip_reasons: dict[str, str] = {}
         # Watchdog banner's "Skip phase" button queues phase numbers here.
         # Each phase's coroutine checks is_phase_skip_requested(N) at its
         # natural yield points and exits early with phase_skipped when set.
@@ -9143,6 +9157,11 @@ class PipelineControls:
         self.hv_blocked.clear()
         self.skipped_agents.clear()
         self.hv_auto_skipped.clear()
+        # Classification companions of skipped_agents — must reset with it,
+        # or a run-N tap/reason bleeds into run N+1 on this worker's shared
+        # controls and misclassifies an internal marker there.
+        self.user_skip_taps.clear()
+        self.auto_skip_reasons.clear()
         self.skipped_phases.clear()
         self.continue_anyway = False
         self.pro_warning_acknowledged = False
@@ -9181,8 +9200,28 @@ class PipelineControls:
         key = (agent or "").strip().lower()
         if key:
             self.skipped_agents.add(key)
+            # Mark this entry as a REAL user tap — the poll's skip consumer
+            # only reports "skipped by user" for entries recorded here
+            # (2026-07-11 incident: internal setup-fail markers were being
+            # stamped user_skip*).
+            self.user_skip_taps.add(key)
             self.pause_event.clear()
             self.resume_event.set()
+
+    def consume_skip_marker(self, agent: str):
+        """Atomically retire a skipped_agents entry WITH its classification
+        (user-tap record + auto reason). Every site that discards a marker
+        must use this — a discard that leaves the tap behind lets a stale tap
+        misclassify a LATER internal marker for the same agent as a user skip
+        (adversarial-review chains: 2D-skip → P2 retry → setup-fail relabeled
+        "skipped by user"; and cross-run via the worker-loop's shared
+        controls when reset() didn't clear the new fields)."""
+        key = (agent or "").strip().lower()
+        if not key:
+            return
+        self.skipped_agents.discard(key)
+        self.user_skip_taps.discard(key)
+        self.auto_skip_reasons.pop(key, None)
 
     def request_skip_phase(self, phase: int):
         """User picked "Skip phase" from the 45-min backend-silent banner.
@@ -12805,7 +12844,13 @@ def emit_event(event_type, phase=None, agent=None, **data):
         # resolve the single pending decision — clearing here is always correct.
         if event_type in ("pipeline_resumed", "pipeline_stopped",
                           "agent_skipped", "phase_skipped", "phase_restart"):
-            _clear_pending_decision()
+            # 2026-07-11 review: scope agent_skipped clears to THAT agent so
+            # skipping agent A can't retract agent B's still-live Retry/Skip
+            # mirror (a setup-failed agent's card is non-blocking and must
+            # survive unrelated resolves). The keep-guard in
+            # _clear_pending_decision arbitrates; agent-less events (stop,
+            # phase-level) keep the unconditional clear exactly as before.
+            _clear_pending_decision(agent if event_type == "agent_skipped" else None)
     except Exception:
         pass
     # #715 universal alert persistence: ANY blocking pipeline_error decision
@@ -14044,7 +14089,11 @@ async def _work_tab_login_pause(page, agent_key: str, phase: int, label: str,
             return "ok"
 
     log(f"[{label}] login_required timed out ({_WORK_TAB_LOGIN_MAX_LOOPS * 5}s) — skipping {label}", "WARN")
+    # INTERNAL marker — the honest agent_skipped(reason=login_required_timeout)
+    # is emitted right below; without the auto tag the poll consumer would
+    # re-emit this skip as user_skip* and overwrite the honest copy.
     _controls.skipped_agents.add(agent_key)
+    _controls.auto_skip_reasons[agent_key] = "login_required_timeout"
     # Timeout ≠ user decision — mark it so callers can offer a Retry-able
     # card instead of treating it like an explicit Skip (#899 review).
     _controls.login_pause_timeout_agents.add(agent_key)
@@ -22814,7 +22863,36 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         "elapsed_sec": int(time.time() - _p["start_time"]),
                     }
                     del pending[_agent_name]
-                _controls.skipped_agents.discard(_ag_key)
+                _controls.consume_skip_marker(_ag_key)
+                continue
+            # 2026-07-11 incident (Gemini 2C brief never sent): NON-user
+            # markers must not ride the user-skip rails below. The 2A/2B/2C
+            # setup-fail paths park the agent here only to keep it out of the
+            # poll/scrape (their fail_agent already reported the truth:
+            # status="failed", "errored" tile, Retry/Skip card), and the
+            # login-gate timeout already emitted its own honest agent_skipped.
+            # Routing them below stamped reason="user_skip*" on a skip nobody
+            # chose AND the emit auto-retracted the live Retry/Skip card via
+            # the emit_event pending-decision clear seam (card raised 02:50:13,
+            # phantom-cleared 02:50:17). #929 precedent: finalize honest skips
+            # at their source; the consumer's user-skip copy is ONLY for taps.
+            if _ag_key not in _controls.user_skip_taps:
+                _auto_reason = _controls.auto_skip_reasons.pop(_ag_key, "internal_marker")
+                if _agent_name and _agent_name in pending:
+                    _p_int = pending[_agent_name]
+                    results[_agent_name] = {
+                        "status": "failed_setup", "text": "",
+                        "url": _p_int.get("url", ""), "page": None,
+                        "elapsed_sec": int(time.time() - _p_int["start_time"]),
+                    }
+                    del pending[_agent_name]
+                    log(f"[{_agent_name}] dropped from the poll set ({_auto_reason}) — "
+                        "NOT a user skip; failed status + Retry/Skip card stay up", "INFO")
+                else:
+                    log(f"[{_agent_name or _ag_key}] internal skip marker consumed "
+                        f"({_auto_reason}) — no user_skip emit (source already "
+                        "reported failed/skipped honestly)", "INFO")
+                _controls.consume_skip_marker(_ag_key)
                 continue
             if _agent_name and _agent_name in pending:
                 p = pending[_agent_name]
@@ -22893,7 +22971,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                reason="user_skip_after_leaving_poll")
             # Whether or not the agent was actually in pending, clear it from
             # the skip set so we don't keep firing agent_skipped every tick.
-            _controls.skipped_agents.discard(_ag_key)
+            _controls.consume_skip_marker(_ag_key)
 
         # ── Hard retry (close tab + re-run setup from scratch) ──
         # Unlike the soft retry (pastes a follow-up into the same tab and
@@ -30936,6 +31014,238 @@ async def _chatgpt_force_new_chat(page, label) -> bool:
         return False
 
 
+def _gemini_owns_candidate(candidate_text: str, pasted_head: str) -> bool:
+    """True iff a sidebar-entry title (or conversation-body snippet) plausibly
+    belongs to the brief we just pasted. Gemini auto-titles a new chat from the
+    prompt, so the candidate's significant tokens (len>=4, first 12) must
+    largely (>=60%) appear — WORD-BOUNDARY matched, not substring — in the
+    head of the pasted text. Fail-closed: empty, too-short, or <3-significant-
+    token candidates never match (adversarial review: a 1-2 generic-token
+    title like 'Market research' must not pass on template words alone) —
+    adopting a WRONG conversation is the "stuck in past run" failure LAYER 0.6
+    exists to prevent, so we only adopt on positive evidence. Pure function
+    (regression-tested)."""
+    cand = re.sub(r"\s+", " ", (candidate_text or "")).strip().lower()
+    head = re.sub(r"\s+", " ", (pasted_head or "")).strip().lower()
+    if len(cand) < 8 or not head:
+        return False
+    toks = re.findall(r"[a-z0-9]{4,}", cand)[:12]
+    if len(toks) < 3:
+        return False
+    hits = sum(1 for t in toks if re.search(rf"\b{re.escape(t)}\b", head))
+    return hits / len(toks) >= 0.6
+
+
+async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
+    """Last-resort recovery when a Gemini send never surfaced on OUR tab (URL
+    pinned at bare /app through every re-submit) — live incident 2026-07-11
+    ~02:50 (worker 2): the brief eventually registered platform-side (the user
+    later found the conversation waiting at 'Start research'), but 2C had
+    already failed the agent because our page kept showing the empty new-chat
+    home. Two probes, cheapest first:
+
+      1. TAB CENSUS — a sibling tab in this context already at /app/<id>.
+         gemini.google.com is popup-allow-listed (spawned tabs are adopted
+         into _known_pages, never closed) but nothing rebinds our handle.
+      2. SIDEBAR — expand the left rail's Recent list (expansion ladder
+         inherited from the retired #897a recovery) and read the MOST RECENT
+         entry.
+
+    Ownership gate for BOTH probes (_gemini_owns_candidate + brief-chunk body
+    check): adopt ONLY what provably is THIS run's brief. Logs a full Gemini
+    tab census either way so backend.log alone can adjudicate tab-orphan vs
+    dropped-send next time. Returns (page, adopted). Never raises."""
+    pasted_head = (pasted_text or "")[:600]
+    # Build the identity chunk from PAST any shared template header (every
+    # brief opens with the same "# Research Brief…" boilerplate — a chunk of
+    # it would match every past run; adversarial-review finding).
+    _chunk_src = pasted_head
+    if _chunk_src.lstrip().lower().startswith("# research brief"):
+        _chunk_src = _chunk_src.split("\n", 1)[1] if "\n" in _chunk_src else ""
+    _chunk = re.sub(r"\s+", " ", _chunk_src).strip().lower()[:60]
+
+    async def _conversation_matches(p) -> bool:
+        # The opened conversation must CONTAIN our brief: read the first
+        # user-query bubble (fallback: body text) and match it.
+        try:
+            body = await p.evaluate(
+                "() => { const q = document.querySelector('user-query');"
+                " return ((q && q.innerText) || document.body.innerText || '')"
+                ".slice(0, 4000); }")
+        except Exception:
+            return False
+        b = re.sub(r"\s+", " ", body or "").strip().lower()
+        if _chunk and _chunk in b:
+            return True
+        return _gemini_owns_candidate(b[:300], pasted_head)
+
+    async def _adoptable_state(p) -> str:
+        """Pre-Start states only. A conversation already holding a COMPLETED
+        research report is a PREVIOUS run of the same/similar brief (identical
+        content passes the ownership gate deterministically on a re-run) —
+        adopting it would deliver stale research and strand [2D] hunting a
+        'Start research' button that will never appear (adversarial-review
+        finding). 'start_waiting' (the incident state) and 'pre_start' (plan
+        still generating) are what [2D] is built to drive."""
+        try:
+            return await p.evaluate(
+                """() => {
+                  const vis = (el) => !!el && el.offsetParent !== null;
+                  for (const b of document.querySelectorAll('button')) {
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    if (t.includes('start research') && vis(b)) return 'start_waiting';
+                  }
+                  if (document.querySelector('immersive-panel, [data-test-id*="report"]'))
+                    return 'report_present';
+                  return 'pre_start';
+                }""")
+        except Exception:
+            return "probe_error"
+
+    # ── Probe 1: sibling-tab census ──
+    try:
+        _tabs = list(page.context.pages)
+    except Exception:
+        _tabs = []
+    _census = []
+    for _t in _tabs:
+        try:
+            _census.append((_t.url or "?").split("?", 1)[0])
+        except Exception:
+            _census.append("<err>")
+    log(f"[{label}] Gemini tab census: {len(_census)} tab(s): "
+        + " | ".join(_census[:8]), "WARN")
+    for _t in _tabs:
+        if _t is page:
+            continue
+        try:
+            _u = (_t.url or "").split("?", 1)[0].rstrip("/")
+        except Exception:
+            continue
+        if "gemini.google.com" not in _u or "/app/" not in _u:
+            continue
+        if await _conversation_matches(_t):
+            _st = await _adoptable_state(_t)
+            if _st == "report_present":
+                log(f"[{label}] sibling Gemini tab {_u} matches our brief but "
+                    "already holds a COMPLETED report (previous run of the same "
+                    "brief) — not adopting", "WARN")
+                continue
+            log(f"[{label}] ADOPTED sibling Gemini tab at {_u} (state={_st}) — "
+                "the send landed in a tab we weren't watching", "WARN")
+            try:
+                await _t.bring_to_front()
+            except Exception:
+                pass
+            return _t, True
+        log(f"[{label}] sibling Gemini tab {_u} does NOT match our brief — "
+            "leaving it alone", "INFO")
+
+    # ── Probe 2: most-recent sidebar conversation on OUR page ──
+    _SIDEBAR_JS = """
+    () => {
+      const pick = () => {
+        const els = Array.from(document.querySelectorAll(
+          '[data-test-id*="conversation"], a[href*="/app/"]'));
+        for (const el of els) {
+          const t = ((el.innerText || el.textContent) || '').trim();
+          // Length cap rejects list CONTAINERS whose innerText concatenates
+          // every title into a blob (adversarial-review finding) — a real
+          // sidebar entry title is short.
+          if (t && t.length <= 120) return t.slice(0, 200);
+        }
+        return null;
+      };
+      let t = pick();
+      if (t) return t;
+      // Recent list is usually collapsed — same expansion ladder the retired
+      // #897a recovery used (aria labels: Open sidebar / Toggle Recent).
+      const sels = ['[data-test-id="side-nav-menu-button"]',
+        'button[aria-label*="open sidebar" i]', 'button[aria-label*="sidebar" i]',
+        'button[aria-label*="recent" i]', 'button[aria-label*="main menu" i]',
+        'button[aria-label*="expand" i]', 'button[aria-label*="menu" i]'];
+      for (const s of sels) { const b = document.querySelector(s); if (b) b.click(); }
+      return null;
+    }
+    """
+    _CLICK_BY_TITLE_JS = """
+    (title) => {
+      const els = Array.from(document.querySelectorAll(
+        '[data-test-id*="conversation"], a[href*="/app/"]'));
+      for (const el of els) {
+        const t = ((el.innerText || el.textContent) || '').trim();
+        if (t && t.slice(0, 200) === title) { el.click(); return true; }
+      }
+      return false;
+    }
+    """
+    try:
+        _title = await page.evaluate(_SIDEBAR_JS)
+        if not _title:
+            await asyncio.sleep(1.5)  # expansion may mount on the next frame
+            _title = await page.evaluate(_SIDEBAR_JS)
+    except Exception as _se:
+        log(f"[{label}] sidebar probe raised (non-fatal): {_se}", "DEBUG")
+        _title = None
+    if not _title:
+        log(f"[{label}] sidebar probe: no recent conversation entry found", "INFO")
+        return page, False
+    if not _gemini_owns_candidate(_title, pasted_head):
+        log(f"[{label}] most-recent sidebar chat '{_title[:60]}' does NOT match "
+            "our brief — not adopting (won't hijack a past run)", "WARN")
+        return page, False
+    log(f"[{label}] most-recent sidebar chat '{_title[:60]}' matches our brief "
+        "— opening it", "WARN")
+    try:
+        if not await page.evaluate(_CLICK_BY_TITLE_JS, _title):
+            return page, False
+    except Exception:
+        return page, False
+    _u = ""
+    for _ in range(10):  # wait for the SPA to land on /app/<id>
+        await asyncio.sleep(1.5)
+        try:
+            _u = (page.url or "").split("?", 1)[0].rstrip("/")
+        except Exception:
+            _u = ""
+        if "/app/" in _u:
+            break
+    if "/app/" not in _u:
+        log(f"[{label}] sidebar open never landed on /app/<id> (url={_u or '?'}) "
+            "— not adopting", "WARN")
+        return page, False
+    # The conversation content mounts lazily after the URL flips — retry the
+    # match a few times before the irreversible back-out (adversarial-review
+    # finding: a single-shot check one render-tick early defeated the whole
+    # recovery).
+    _matched = False
+    for _mi in range(3):
+        if await _conversation_matches(page):
+            _matched = True
+            break
+        await asyncio.sleep(2.0)
+    if _matched:
+        _st = await _adoptable_state(page)
+        if _st == "report_present":
+            log(f"[{label}] sidebar chat {_u} matches our brief but already "
+                "holds a COMPLETED report (previous run of the same brief) — "
+                "not adopting, backing out", "WARN")
+        else:
+            log(f"[{label}] ADOPTED most-recent sidebar conversation {_u} "
+                f"(state={_st}) — the send had registered platform-side after "
+                "our confirm window", "WARN")
+            return page, True
+    else:
+        log(f"[{label}] opened sidebar chat {_u} but its content doesn't contain "
+            "our brief — backing out to a fresh home", "WARN")
+    try:
+        await page.goto("https://gemini.google.com/app",
+                        wait_until="domcontentloaded", timeout=20000)
+    except Exception:
+        pass
+    return page, False
+
+
 async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, prompt_user,
                                      brief, label, platform, verbose=False,
                                      brief_path=None, source_paths=None,
@@ -31692,6 +32002,37 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     log(f"[{label}] Gemini error → clicked in-page Retry "
                         f"(attempt {_att}/{_max_attempts})")
                 elif not _gemini_in_conversation():
+                    # 2026-07-11 incident: the documented drop REVERTS the
+                    # composer to empty, so re-clicking Send / pressing Enter
+                    # against it is a guaranteed no-op (all 3 retries in the
+                    # incident were no-ops). Re-paste the brief first when the
+                    # composer is empty — that's what makes a retry real.
+                    try:
+                        # -1 when the selector finds nothing: selector drift
+                        # must degrade to the old re-click behavior, not a
+                        # blind re-paste ladder (adversarial-review finding).
+                        _composer_len = await page.evaluate(
+                            "() => { const c = document.querySelector("
+                            "'rich-textarea div[contenteditable=\"true\"]')"
+                            " || document.querySelector('rich-textarea');"
+                            " return c ? ((c.innerText || '').trim().length) : -1; }")
+                    except Exception:
+                        _composer_len = -1  # unreadable — don't re-paste blind
+                    if _composer_len == 0:
+                        log(f"[{label}] composer is EMPTY on retry (dropped send "
+                            "reverts it) — re-pasting brief before re-submit", "WARN")
+                        try:
+                            await verified_paste_brief(page, brief_to_paste,
+                                                       platform, label)
+                        except Exception as _pe:
+                            log(f"[{label}] re-paste raised (non-fatal): {_pe}",
+                                "DEBUG")
+                    elif _composer_len > 0:
+                        log(f"[{label}] composer holds {_composer_len} chars on "
+                            "retry — re-submitting as-is", "INFO")
+                    else:
+                        log(f"[{label}] composer unreadable (selector miss) — "
+                            "re-clicking Send as-is, no blind re-paste", "INFO")
                     log(f"[{label}] Gemini URL still bare, no error yet — re-submitting "
                         f"(attempt {_att}/{_max_attempts})", "WARN")
                     try:
@@ -31716,6 +32057,40 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                     _landed = True
                     break
             if not _landed and not _gemini_in_conversation():
+                # 2026-07-11: before failing, check whether the send actually
+                # registered somewhere we weren't looking — a sibling tab or
+                # the sidebar's most-recent chat (ownership-verified adoption;
+                # also logs the tab census for postmortems). Skipped after a
+                # user Stop — no post-Stop DOM driving (#737 spirit).
+                _adopted = False
+                if not _controls.is_stop():
+                    _pre_adopt_page = page
+                    try:
+                        page, _adopted = await _gemini_adopt_lost_conversation(
+                            page, brief_to_paste, label)
+                    except Exception as _ae:
+                        _adopted = False
+                        log(f"[{label}] lost-conversation adoption raised "
+                            f"(non-fatal): {_ae}", "WARN")
+                if _adopted:
+                    try:
+                        _runtime.register_page("gemini", page)
+                    except Exception:
+                        pass
+                    if page is not _pre_adopt_page:
+                        # Sibling-tab adoption — retire the abandoned bare-/app
+                        # tab so it doesn't linger untracked (guard: never the
+                        # browser's main handle or the context's last page).
+                        try:
+                            if (_pre_adopt_page is not getattr(browser, "page", None)
+                                    and not _pre_adopt_page.is_closed()
+                                    and len(_pre_adopt_page.context.pages) > 1):
+                                await _pre_adopt_page.close()
+                                log(f"[{label}] closed the abandoned bare-/app tab", "INFO")
+                        except Exception:
+                            pass
+                    log(f"[{label}] Gemini submission confirmed ✓ (adopted lost conversation)")
+                    return page, True
                 log(f"[{label}] Gemini brief never started a research plan after "
                     f"{_max_attempts} retries — surfacing a Retry/Skip blocker (no silent skip)", "ERROR")
                 try:
@@ -31760,7 +32135,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                       else ("chatgpt", "gemini", "claude")):
         if _stale_ag in _controls.skipped_agents:
             log(f"Phase 2: clearing stale skip marker for {_stale_ag} (fresh launch)", "INFO")
-            _controls.skipped_agents.discard(_stale_ag)
+            _controls.consume_skip_marker(_stale_ag)
     # #929: the persisted per-agent tile-status reset ("running") lives at
     # each agent's LAUNCH site (2A/2B/2C "starting" emits below), NOT here —
     # a phase-entry write would strand a never-launched agent on a persisted
@@ -31927,7 +32302,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         fail_agent("chatgpt", "ChatGPT didn't start",
                                    "ChatGPT failed to launch after two tries. Retry to start it fresh, or Skip it.")
                 try:
+                    # INTERNAL marker (keeps the dead agent out of the poll +
+                    # scrape) — NOT a user tap; the consumer must not stamp
+                    # user_skip on it (2026-07-11 incident).
                     _controls.skipped_agents.add("chatgpt")
+                    _controls.auto_skip_reasons["chatgpt"] = "setup_failed"
                 except Exception:
                     pass
     else:
@@ -32036,7 +32415,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         fail_agent("claude", "Claude didn't start",
                                    "Claude failed to launch after two tries. Retry to start it fresh, or Skip it.")
                 try:
+                    # INTERNAL marker — NOT a user tap (see the 2A note).
                     _controls.skipped_agents.add("claude")
+                    _controls.auto_skip_reasons["claude"] = "setup_failed"
                 except Exception:
                     pass
     else:
@@ -32123,7 +32504,15 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     _controls.cookie_trust_broken.add("gemini")
                     log(f"[2C] Gemini shows {_gm_wall} — session expired (stale cookie)", "WARN")
             try:
+                # INTERNAL marker — NOT a user tap. This exact add is what the
+                # 2026-07-11 incident leaked through the user-skip consumer:
+                # Gemini's failed brief was reported "skipped by user" and the
+                # honest Retry/Skip card was phantom-cleared 4s after raise.
+                # ([2D] is independently gated on gemini_setup_ok; the poll's
+                # internal branch consumes this marker silently on its first
+                # tick — no user_skip emit, card/tile untouched.)
                 _controls.skipped_agents.add("gemini")
+                _controls.auto_skip_reasons["gemini"] = "setup_failed"
             except Exception:
                 pass
     else:
@@ -32396,7 +32785,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # rule broke) and the tab left open.
             if "gemini" in _controls.skipped_agents:
                 log("[2D] User skipped Gemini during the plan wait — finalizing skip", "INFO")
-                _controls.skipped_agents.discard("gemini")
+                _controls.consume_skip_marker("gemini")
                 _gemini_2d_skipped = True
                 emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
                 await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
@@ -32616,7 +33005,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # and never point the CUA at an agent the user dismissed.
                 if "gemini" in _controls.skipped_agents:
                     log("[2D] User skipped Gemini during CUA recovery — finalizing skip", "INFO")
-                    _controls.skipped_agents.discard("gemini")
+                    _controls.consume_skip_marker("gemini")
                     _gemini_2d_skipped = True
                     emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
                     await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
@@ -32707,7 +33096,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             if (not _gemini_2d_skipped and not start_clicked
                     and "gemini" in _controls.skipped_agents):
                 log("[2D] User skipped Gemini at the end of CUA recovery — finalizing skip", "INFO")
-                _controls.skipped_agents.discard("gemini")
+                _controls.consume_skip_marker("gemini")
                 _gemini_2d_skipped = True
                 emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
                 await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
@@ -36928,7 +37317,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # without this discard the preflight pause would see
                         # skipped_agents and return 'skipped' on its first
                         # tick, making Retry structurally unable to work.
-                        _controls.skipped_agents.discard("chatgpt")
+                        _controls.consume_skip_marker("chatgpt")
                         _controls.login_pause_timeout_agents.discard("chatgpt")
                         emit_event("phase_restart", phase=1, reason="user_retry_after_error", attempt=0)
                         continue
