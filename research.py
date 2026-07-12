@@ -17357,7 +17357,29 @@ async def detect_completion_claude(page):
       • "research completed" text present OR research-card status='complete'
     Removed: artifacts>=2 fallback (Claude legitimately produces 2 artifacts
     pre-final), text_len>8000+heading fallback (mid-stream summary headings
-    can match). Caller handles 2-cycle flatness."""
+    can match). Caller handles 2-cycle flatness.
+
+    2026-07-11 (FIFA run, detector blind 15:01→15:26 — 24 min):
+      • liveActive DEMOTED below the done-markers. The poll loop keeps the
+        research-TRACKING artifact panel open (keep_open=True), and its
+        "N sources and counting" ticker text persists in body.innerText
+        after completion — with liveActive as the first unconditional gate
+        the detector returned live_sources_counting every tick while the
+        SAME body text carried "Research complete · N sources" (proven: the
+        CUA-branch marker probe matched at 15:26). A present done-marker
+        now overrides the stale ticker; liveActive only vetoes on its own.
+      • Snapshot re-rooted on the #914 geometry panel scan. The 2026-07
+        claude.ai panel carries no artifact class names and the only
+        <aside> is the LEFT NAV, so every legacy class/aside selector read
+        0/0/0 (snap all zeros) while the geo walker read 16 URLs/15 steps
+        from the same document in the same tick — and the all-zeros snap
+        made the #921 empty-snapshot guard structurally refuse done. Same
+        never-back-ported pattern as the animation guard note below.
+      • NEW artifact-header affordance marker (user-suggested): a finished
+        Document artifact's panel header shows Copy (+ download chevron)
+        AND Publish/Share. Both present inside the geo panel counts as a
+        done-marker — but ONLY when the live ticker is absent, so a
+        mid-research tracking panel can never confirm through it."""
     try:
         data = await page.evaluate("""() => {
             let hasStop = false;
@@ -17391,14 +17413,18 @@ async def detect_completion_claude(page):
             }
 
             const bodyText = document.body?.innerText || '';
-            // 2026-04-26: regex matches BOTH "research completed in 5m"
-            // (legacy) AND "Research complete · 553 sources · 24m 41s" (modern
-            // 2026 layout). 2026-05-04: also "Boom! Research report is ready"
-            // — Claude's 2026-05+ ready callout for long DR runs (the artifact
-            // card title alone, "<Title> · N sources · Xh Ym", is matched by
-            // the scoped fallback below to avoid mid-stream false positives).
-            const researchDone = /research\\s+complete(?:d)?(?:\\s+in)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?(?:[\\s·•—\\-]+\\d+(?:[hms]|\\s*(?:hour|min|sec)))?/i.test(bodyText)
+            // 2026-04-26: matches BOTH "research completed in 5m" (legacy)
+            // AND "Research complete · 553 sources · 24m 41s" (modern 2026
+            // layout). 2026-05-04: also "Boom! Research report is ready".
+            // 2026-07-11 (review r2): split into ANCHORED (requires the
+            // "· N sources" tail or the Boom! callout — cannot match prose)
+            // vs LOOSE. Only the anchored form may override a live ticker
+            // below; the loose form gained a \\b so "the research completes"
+            // (Claude's own launch prose) no longer matches.
+            const anchoredDone = /research\\s+complete(?:d)?\\s*[\\s·•—\\-]+\\d[\\d,]*\\s+sources?/i.test(bodyText)
                               || /\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(bodyText);
+            const researchDone = anchoredDone
+                              || /research\\s+complete(?:d)?\\b/i.test(bodyText);
             const liveActive = /\\d[\\d,]*\\s+sources?\\s+and\\s+counting/i.test(bodyText);
             // Claude's research card flips status when streaming ends.
             // 2026-04-26: also accept TEXT-CONTENT match — Claude's modern
@@ -17436,13 +17462,78 @@ async def detect_completion_claude(page):
             );
             if (researchCard) textLen = Math.max(textLen, (researchCard.innerText || '').length);
 
-            const sources = document.querySelectorAll(
+            let sources = document.querySelectorAll(
                 '.font-claude-message a[href^="http"], aside a[href^="http"]'
             ).length;
-            const steps = document.querySelectorAll(
+            let steps = document.querySelectorAll(
                 '[class*="research"] li, [class*="step"]'
             ).length;
-            return { hasStop, researchDone, researchCardDone, liveActive,
+
+            // 2026-07-11 #914 back-port: geometry panel root — same gates as
+            // _bestGeoPanel / _claude_artifact_panel_state (right-docked,
+            // 380px..0.75vw, left ≥ 0.22vw, flush right, ≥ 0.5vh, no chat
+            // markers). The legacy class/aside selectors above read 0/0/0 on
+            // the 2026-07 layout; the geo root feeds real numbers into the
+            // snap so the #921 empty-snapshot guard judges actual content.
+            // (review r2) legacyEmpty is captured BEFORE the geo merge and
+            // geoIsTracker flags a tracking-shaped panel, so the Python side
+            // can refuse a done verdict whose ONLY content evidence is the
+            // kept-open tracking panel with no anchored marker — otherwise
+            // the geo numbers structurally disarm the #921 guard.
+            const legacyEmpty = (textLen === 0 && sources === 0 && steps === 0);
+            const vw = window.innerWidth || document.documentElement.clientWidth;
+            const vh = window.innerHeight || document.documentElement.clientHeight;
+            const CHAT_MARKERS = '[data-message-author-role="user"], ' +
+                '[data-testid="user-message"], .font-claude-message';
+            let geoPanel = null, geoLen = -1, geoArea = Infinity;
+            for (const el of document.querySelectorAll('div, aside, section')) {
+                const r = el.getBoundingClientRect();
+                if (r.width < 380 || r.width > vw * 0.75) continue;
+                if (r.left < vw * 0.22) continue;
+                if (r.right < vw - 40) continue;
+                if (r.height < vh * 0.5) continue;
+                if (el.querySelector(CHAT_MARKERS)) continue;
+                const t = (el.innerText || '');
+                if (t.length < 40) continue;
+                const area = r.width * r.height;
+                if (t.length > geoLen || (t.length === geoLen && area < geoArea)) {
+                    geoPanel = el; geoLen = t.length; geoArea = area;
+                }
+            }
+            let artifactAffordances = false;
+            let geoIsTracker = false;
+            if (geoPanel) {
+                textLen = Math.max(textLen, geoLen);
+                sources = Math.max(sources,
+                    geoPanel.querySelectorAll('a[href^="http"]').length);
+                steps = Math.max(steps,
+                    geoPanel.querySelectorAll('li, [role="listitem"]').length);
+                geoIsTracker = /\\d[\\d,]*\\s+sources?\\s+and\\s+counting/i.test(
+                    geoPanel.innerText || '');
+                // Completed-header affordances: Copy (+ download chevron) AND
+                // Publish/Share live in the finished Document artifact HEADER
+                // (the same trio the T1 download and publish extractors use).
+                // (review r2) scoped to the panel's top strip + aria-label
+                // (or short text) — a code-block Copy button deep in report
+                // content or a citation chip titled "…market share…" must
+                // not satisfy it. Requiring BOTH keeps a lone Copy out.
+                const pr = geoPanel.getBoundingClientRect();
+                let hasCopy = false, hasPublish = false;
+                for (const b of geoPanel.querySelectorAll('button, [role="button"]')) {
+                    const br = b.getBoundingClientRect();
+                    if (br.top > pr.top + 96) continue;      // header strip only
+                    const al = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const bt = (b.textContent || '').trim().toLowerCase();
+                    const t = al || (bt.length < 30 ? bt : '');
+                    if (!t) continue;
+                    if (/\\bcopy\\b/.test(t)) hasCopy = true;
+                    if (/\\b(publish|share)\\b/.test(t)) hasPublish = true;
+                    if (hasCopy && hasPublish) break;
+                }
+                artifactAffordances = hasCopy && hasPublish;
+            }
+            return { hasStop, researchDone, anchoredDone, researchCardDone,
+                     liveActive, artifactAffordances, geoIsTracker, legacyEmpty,
                      textLen, sources, steps };
         }""")
 
@@ -17451,12 +17542,25 @@ async def detect_completion_claude(page):
         steps = int(data.get("steps") or 0)
         snap = {"text_len": text_len, "sources": sources, "steps": steps}
 
-        if data.get("liveActive"):
-            return (False, "live_sources_counting", snap)
+        live_active = bool(data.get("liveActive"))
         if data.get("hasStop"):
             return (False, f"stop_btn_present (text={text_len})", snap)
-        if not (data.get("researchDone") or data.get("researchCardDone")):
-            return (False, "no_done_marker (no research_complete text/card)", snap)
+        # 2026-07-11 marker-over-ticker ordering: a definitive done-marker
+        # overrides a lingering "N sources and counting" ticker (the kept-open
+        # tracking panel freezes that text post-completion — FIFA incident).
+        # (review r2) ONLY the ANCHORED markers may override: the card-state
+        # marker, "Boom!…", or "research complete · N sources" — forms that
+        # cannot occur mid-run as prose. The loose text marker and the header
+        # affordances stay subordinate to a live ticker (a reviewer executed
+        # the earlier draft's JS against a simulated mid-research DOM and got
+        # a false done through prose + the loose regex).
+        anchored = bool(data.get("anchoredDone") or data.get("researchCardDone"))
+        if live_active and not anchored:
+            return (False, "live_sources_counting", snap)
+        markers = anchored or bool(data.get("researchDone"))
+        affordances = bool(data.get("artifactAffordances")) and not live_active
+        if not (markers or affordances):
+            return (False, "no_done_marker (no research_complete text/card/affordances)", snap)
         # #921 incident-2: a done-marker on a COMPLETELY EMPTY snapshot
         # (0 chars, 0 sources, 0 steps) is the platform-bug false-done — the
         # research-complete card/marker rendered but the actual report artifact
@@ -17467,7 +17571,19 @@ async def detect_completion_claude(page):
         # stuck arbiter raises a [Retry][Skip] card if it never fills in.
         if text_len == 0 and sources == 0 and steps == 0:
             return (False, "done_marker_but_empty_snapshot (text=0, sources=0, steps=0)", snap)
-        return (True, "no_stop + research_complete_marker", snap)
+        # (review r2) tracker-fed snapshot guard: when the ONLY content
+        # evidence is the tracking-shaped geo panel (legacy selectors all
+        # zero) and the marker isn't anchored, the geo numbers must not
+        # stand in for report content — that combination is #921's stale-
+        # marker case with the guard disarmed. Anchored markers pass (the
+        # FIFA body text carried "Research complete · 553 sources" while
+        # the open panel was the tracker — that must keep confirming).
+        if (data.get("legacyEmpty") and data.get("geoIsTracker")
+                and not anchored):
+            return (False, "tracker_fed_snapshot_weak_marker", snap)
+        which = "research_complete_marker" if markers else "artifact_header_affordances"
+        stale = " (stale live-ticker overridden)" if live_active else ""
+        return (True, f"no_stop + {which}{stale}", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
 
@@ -17621,6 +17737,46 @@ DETECT_FNS = {
 
 
 # ── Claude Artifact DOM Helpers ──────────────────────────────────────────────
+
+async def _claude_modern_marker(page, strict=False) -> bool:
+    """Cheap DOM probe for the modern Claude completion marker (2026-05-04
+    parity set): anchored "research complete · N sources" (legacy + modern
+    layouts, body-text safe), "Boom! Research report is ready" (2026-05+
+    callout), and the modern card title "<Title> · N sources · Xh Ym"
+    (scoped to artifact/aside containers — body-text would false-positive
+    mid-stream on separate elapsed-timer + source-count elements).
+
+    strict=True skips that card-title fallback — its safety rests on a
+    layout-scoping assumption the 2026-05-04 docstring itself calls
+    mid-stream-ambiguous, so callers using the marker to REPLACE a second
+    CUA confirmation (done_count==1 corroboration) only accept the two
+    anchored forms; the post-2-confirm artifact gate keeps the full set
+    where the marker is merely a layout bypass.
+
+    2026-07-11: hoisted out of the CUA-says-done branch into a shared helper
+    so the poll loop can also consult it at done_count==1 — the FIFA run
+    carried this marker in the DOM for ~24 min while completion waited on a
+    second CUA vision pass (one contradicting misread reset the counter and
+    cost ~14 min). Returns False on any evaluate error."""
+    try:
+        return bool(await page.evaluate(
+            """(strict) => {
+                const body = document.body?.innerText || '';
+                if (/research\\s+complete(?:d)?\\s*[\\s·•—\\-]+\\d[\\d,]*\\s+sources?/i.test(body)) return true;
+                if (/\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(body)) return true;
+                if (strict) return false;
+                const cards = document.querySelectorAll(
+                    '.font-claude-message [class*="artifact"], aside [class*="artifact"], aside [class*="card"]'
+                );
+                for (const el of cards) {
+                    if (/[\\s·•—\\-]+\\d[\\d,]*\\s+sources?\\s*[\\s·•—\\-]+\\d+\\s*[hms]/i.test(el.innerText || '')) return true;
+                }
+                return false;
+            }""", bool(strict)
+        ))
+    except Exception:
+        return False
+
 
 async def _count_claude_artifacts(page):
     """Count artifact preview cards in Claude conversation. Returns int.
@@ -19675,6 +19831,7 @@ async def agent_loop(client, browser, system_prompt, user_message,
 
     last_text = ""
     recent_actions = []
+    transient_api_retries = 0
 
     for iteration in range(1, max_iterations + 1):
         # ── Check stop/pause before each CUA API call ──
@@ -19692,10 +19849,36 @@ async def agent_loop(client, browser, system_prompt, user_message,
 
         if verbose: log(f"Iteration {iteration}/{max_iterations}")
         try:
-            response = client.beta.messages.create(
-                model=model, max_tokens=4096, system=system_prompt,
-                tools=tools, messages=messages, betas=[BETA_FLAG],
-            )
+            # 2026-07-11 (+review r2): transient server-side 5xx errors retry
+            # INSIDE the create call so they don't burn mission iterations (a
+            # 500 on the final iteration used to exit as max_iterations
+            # without retrying; before that, a single mid-mission 500
+            # TERMINATED the whole CUA task — FIFA run 15:28:50: the P3
+            # create-notebook task died at iteration 4 and gemini.md never
+            # reached the file dialog). 429/529/cap/401 keep their existing
+            # handling in the except branches below. Bounded per mission.
+            while True:
+                try:
+                    response = client.beta.messages.create(
+                        model=model, max_tokens=4096, system=system_prompt,
+                        tools=tools, messages=messages, betas=[BETA_FLAG],
+                    )
+                    break
+                except Exception as _api_e:
+                    _api_s = str(_api_e)
+                    _api_l = _api_s.lower()
+                    _is_5xx = ("internal server error" in _api_l
+                               or "api_error" in _api_l
+                               or re.search(r"error code:\s*5\d\d", _api_l))
+                    _handled_elsewhere = ("overloaded" in _api_l or "529" in _api_s
+                                          or "429" in _api_s or "rate_limit" in _api_l)
+                    if _is_5xx and not _handled_elsewhere and transient_api_retries < 3:
+                        transient_api_retries += 1
+                        log(f"API transient 5xx — retry {transient_api_retries}/3 "
+                            f"in 20s: {_api_s[:160]}", "WARN")
+                        await asyncio.sleep(20)
+                        continue
+                    raise
         except Exception as e:
             err = str(e)
             # Resolve which phase/agent this CUA call is serving so the
@@ -19738,6 +19921,8 @@ async def agent_loop(client, browser, system_prompt, user_message,
                     fail_phase(_phase, "API key was rejected", _bad_key_hint)
                 return {"status": "error", "text": str(e)}
             else:
+                # Transient 5xx already exhausted its bounded in-place retries
+                # in the inner loop above — anything landing here is terminal.
                 log(f"API error: {e}", "ERROR")
                 return {"status": "error", "text": str(e)}
 
@@ -19748,7 +19933,11 @@ async def agent_loop(client, browser, system_prompt, user_message,
         for block in assistant_content:
             if hasattr(block, "text"):
                 last_text = block.text
-                if verbose: log(f"Claude: {last_text[:200]}")
+                # 2026-07-11: 200→400 chars — verdict rationales (completion
+                # checks, source verify, stuck arbiter) were losing their
+                # decisive tail to the truncation, making the log alone
+                # unable to explain WHY a vision check concluded what it did.
+                if verbose: log(f"Claude: {last_text[:400]}")
             if block.type == "tool_use":
                 tool_uses.append(block)
 
@@ -24347,7 +24536,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     _sp_text = (_sp.get("text") or "").lower()
                     _sp_match = re.search(r'conclusion\s*:\s*(stuck|working)', _sp_text)
                     _confirmed_stuck = bool(_sp_match and _sp_match.group(1) == "stuck")
-                    p["last_cua_check"] = time.time()
+                    # 2026-07-11: deliberately NOT stamping last_cua_check
+                    # here — the arbiter probe used to, silently deferring the
+                    # COMPLETION check by up to a full CUA_CHECK_INTERVAL on a
+                    # WORKING verdict (FIFA run: the 15:17 arbiter pushed the
+                    # next completion check from ~15:17 to 15:22, part of the
+                    # anomalous 23m→33m gap on an already-complete report).
+                    # Arbiter re-probe throttling comes from the WORKING
+                    # branch's growth-clock reset below, not from this key.
                 except Exception as _spe:
                     log(f"[{name}] Stuck-arbiter CUA probe failed ({_spe}) — treating as "
                         "WORKING (conservative; no false card / auto-skip)", "WARN")
@@ -24811,8 +25007,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 await p["page"].evaluate("""() => {
                     window.scrollTo(0, document.body.scrollHeight);
                     // Also scroll common chat containers (ChatGPT DR has internal scroll)
+                    // 2026-07-11: + aside/artifact/overflow containers (parity with the
+                    // DOM detector's pre-scroll) — Claude renders the "Research
+                    // complete · N sources" marker inside a VIRTUALIZED panel, and a
+                    // screenshot that never scrolled it can hide the very completion
+                    // evidence the vision check is asked to find.
                     const containers = document.querySelectorAll(
-                        '[class*="react-scroll"], [class*="chat-messages"], main, [role="presentation"], [data-testid*="conversation"]');
+                        '[class*="react-scroll"], [class*="chat-messages"], main, [role="presentation"], [data-testid*="conversation"], ' +
+                        'aside, [class*="artifact"], [class*="overflow-y"], [class*="overflow-auto"], [class*="scroll"]');
                     containers.forEach(c => { try { c.scrollTop = c.scrollHeight; } catch(e){} });
                 }""")
                 await asyncio.sleep(0.5)
@@ -24834,7 +25036,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             "progress indicator; otherwise say 'still generating'."),
                 "Claude": ("Claude shows a stop button in the composer/input area while generating. After completion, "
                             "two document artifact buttons/cards may appear. Check composer for stop button; absence "
-                            "means done."),
+                            "means done. IMPORTANT: a right-side artifact panel is usually OPEN (our tracker keeps it "
+                            "open) and may still display a stale 'N sources and counting' progress label AFTER the "
+                            "research has finished — that label alone is NOT evidence of generation, and the panel "
+                            "covering the chat is NOT a reason to say generating. Treat these as COMPLETE: a card or "
+                            "text reading 'Research complete · N sources · Xm Ys', or an artifact panel header with "
+                            "Copy / Publish buttons — as long as there is no Stop button and no running spinner."),
             }.get(name, "")
             _rr_diag_mission = (
                 f"{platform_hint}\n\n"
@@ -24963,9 +25170,27 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 p["done_count"] += 1
                 # Need 2 consecutive CUA "done" readings to confirm
                 if p["done_count"] < 2:
-                    log(f"[{name}] CUA says done ({p['done_count']}/2 confirmations)")
-                    p["last_cua_check"] = time.time() - 120  # Check again soon
-                    continue
+                    # 2026-07-11 DOM corroboration (Claude): if the modern
+                    # completion marker is ALREADY in the DOM, one CUA verdict
+                    # + the marker is confirmation enough — waiting for a
+                    # second vision pass costs a full rotation (~3-10 min) and
+                    # a single misread resets the counter (FIFA run: the 15:12
+                    # misread turned a ~6-min confirm into a ~24-min one). The
+                    # marker only renders when streaming ends, and the
+                    # downstream artifact-count gate re-checks it anyway.
+                    _marker_corroborates = False
+                    if name == "Claude":
+                        # strict=True: only the anchored marker forms may
+                        # substitute for the second CUA confirmation.
+                        _marker_corroborates = await _claude_modern_marker(
+                            p["page"], strict=True)
+                    if not _marker_corroborates:
+                        log(f"[{name}] CUA says done ({p['done_count']}/2 confirmations)")
+                        p["last_cua_check"] = time.time() - 120  # Check again soon
+                        continue
+                    log(f"[{name}] CUA says done (1/2) + modern completion marker "
+                        f"in DOM — accepting without a second CUA pass")
+                    p["done_count"] = 2
                 log(f"[{name}] CUA confirms complete ✓ ({int(elapsed/60)}m)")
 
                 # Gemini-specific: validate completion via source count + content length
@@ -25014,32 +25239,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     # modern "Research complete · N sources · Xm Ys" marker
                     # is present. This lets the 1-artifact-card layout pass
                     # without nudging or hard-failing.
-                    _claude_completion_marker = False
-                    try:
-                        # 2026-05-04: parity with detect_completion_claude — three
-                        # markers: anchored "research complete · N sources" (legacy
-                        # + modern 2026-04 layouts, body-text safe), anchored
-                        # "Boom! Research report is ready" (2026-05+ ready
-                        # callout, body-text safe), and the modern card title
-                        # "<Title> · N sources · Xh Ym" (no "complete" prefix —
-                        # body-text would false-positive mid-stream, scope to
-                        # artifact/aside containers).
-                        _claude_completion_marker = bool(await p["page"].evaluate(
-                            """() => {
-                                const body = document.body?.innerText || '';
-                                if (/research\\s+complete(?:d)?\\s*[\\s·•—\\-]+\\d[\\d,]*\\s+sources?/i.test(body)) return true;
-                                if (/\\bBoom!\\s+(?:Your\\s+)?[Rr]esearch\\s+report\\s+is\\s+ready\\b/.test(body)) return true;
-                                const cards = document.querySelectorAll(
-                                    '.font-claude-message [class*="artifact"], aside [class*="artifact"], aside [class*="card"]'
-                                );
-                                for (const el of cards) {
-                                    if (/[\\s·•—\\-]+\\d[\\d,]*\\s+sources?\\s*[\\s·•—\\-]+\\d+\\s*[hms]/i.test(el.innerText || '')) return true;
-                                }
-                                return false;
-                            }"""
-                        ))
-                    except Exception:
-                        _claude_completion_marker = False
+                    # 2026-05-04 marker set, 2026-07-11 hoisted into the shared
+                    # _claude_modern_marker helper (also consulted at
+                    # done_count==1 above so a single CUA misread can't cost a
+                    # full extra confirmation round-trip).
+                    _claude_completion_marker = await _claude_modern_marker(p["page"])
                     if _claude_completion_marker:
                         log(f"[Claude] Modern completion marker detected — accepting 1-artifact layout (art_count={_art_count})", "INFO")
                         # A1: telemetry so we can see how often this layout fires
@@ -33260,6 +33464,361 @@ def _build_phase2_to_phase3_handoff(results: dict, queue_dir) -> None:
 
 
 # ── Phase 3: NotebookLM Upload ───────────────────────────────────────────────
+#
+# 2026-07-11 DOM-first upload rework (FIFA run incident): the per-file CUA
+# vision tasks were the ONLY upload path, and the whole chain was fail-open —
+# an Anthropic API 500 killed the gemini.md task before the file dialog ever
+# opened, the call sites discarded the returned error dict, clear_upload_file
+# wiped the still-queued file, and the red-state-only source verify passed a
+# 2/3 notebook as "all sources OK". The primitives below drive NotebookLM's
+# own DOM (create notebook, hidden <input type=file> multi-upload, source-row
+# census, rename) so the happy path needs NO vision at all; the CUA missions
+# remain as the fallback tier, now with per-file DOM verification.
+
+_NLM_CLICK_JS = """(patterns) => {
+    // Click the first button-ish element matching a pattern. PATTERN ORDER IS
+    // AUTHORITATIVE (review r2): the pattern loop is outermost, so a specific
+    // pattern ('add source') is exhausted page-wide before a generic one
+    // ('upload') is tried — pre-fix, DOM order won and a stray generic match
+    // (e.g. a Studio '+ Add note' button whose mat-icon ligature 'add' leads
+    // its textContent) could shadow the real control. Within a pattern,
+    // dialog-scoped candidates win over page-wide ones. aria-label is
+    // matched first; textContent is normalized to strip a leading icon
+    // ligature (doubled token or snake_case icon name).
+    const scopes = [];
+    for (const d of document.querySelectorAll(
+            '[role="dialog"], mat-dialog-container, [class*="dialog"]')) {
+        const r = d.getBoundingClientRect();
+        if (r.width > 200 && r.height > 100) scopes.push(d);
+    }
+    scopes.push(document);
+    const norm = (el) => {
+        const aria = (el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+        let txt = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+        txt = txt.replace(/^([\\w]+)\\s+(?=\\1\\b)/i, '');   // 'add Add note' → 'Add note'
+        txt = txt.replace(/^[a-z]+(?:_[a-z]+)+\\s+/, '');    // 'upload_file Upload' → 'Upload'
+        return { aria, txt };
+    };
+    for (const p of patterns) {
+        const re = new RegExp(p, 'i');
+        for (const scope of scopes) {
+            for (const el of scope.querySelectorAll(
+                    'button, [role="button"], [class*="create-new"], create-new-button')) {
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) continue;   // hidden/collapsed
+                const { aria, txt } = norm(el);
+                if (re.test(aria) || re.test(txt)) {
+                    el.click();
+                    return (aria || txt).slice(0, 80);
+                }
+            }
+        }
+    }
+    return '';
+}"""
+
+
+async def _nlm_click_first(page, patterns):
+    """DOM-click the first NotebookLM control matching any regex pattern.
+    Returns the matched label text ('' = nothing matched). Best-effort."""
+    try:
+        return (await page.evaluate(_NLM_CLICK_JS, list(patterns))) or ""
+    except Exception:
+        return ""
+
+
+async def _nlm_close_dialogs(page, label="NotebookLM"):
+    """Best-effort close of any open NotebookLM modal (the FIFA source verify
+    ran BEHIND a leftover Add-sources dialog). Close-button first, Escape
+    fallback; silent no-op when nothing is open."""
+    try:
+        closed = await page.evaluate("""() => {
+            let n = 0;
+            for (const d of document.querySelectorAll(
+                    '[role="dialog"], mat-dialog-container')) {
+                const r = d.getBoundingClientRect();
+                if (r.width < 200 || r.height < 100) continue;
+                const btn = d.querySelector(
+                    'button[aria-label*="lose" i], button[aria-label*="ancel" i], ' +
+                    '[class*="close"] button, button [class*="close"]');
+                if (btn) { (btn.closest('button') || btn).click(); n++; }
+            }
+            return n;
+        }""")
+        if closed:
+            log(f"[{label}] closed {closed} leftover dialog(s) via DOM")
+            await asyncio.sleep(1)
+        else:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+    except Exception:
+        pass
+
+
+async def _nlm_visible_source_names(page, expected_names):
+    """DOM census of the Sources panel against the expected upload manifest.
+    Returns (present: set[str], row_count: int). row_count = -1 when no
+    structured source rows matched and the fallback body-text scan was used.
+
+    Matching: exact filename anywhere in the harvested text; a stem match
+    (name minus extension — NotebookLM sometimes titles the source without
+    it) is accepted only inside structured rows, never against body text
+    (report prose can legitimately contain a bare agent name like 'gemini')."""
+    try:
+        res = await page.evaluate("""(expected) => {
+            const rowSel = 'source-item, [class*="source-item" i], ' +
+                '[class*="single-source" i], [class*="source-title" i], ' +
+                'mat-list-item, [role="listitem"]';
+            const rows = [];
+            for (const el of document.querySelectorAll(rowSel)) {
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                if (t && t.length < 300) rows.push(t);
+            }
+            const hay = rows.length ? rows.join('\\n') : (document.body?.innerText || '');
+            const present = [];
+            for (const name of expected) {
+                let hit = hay.includes(name);
+                if (!hit && rows.length) {
+                    const stem = name.replace(/\\.[a-z0-9]+$/i, '');
+                    hit = rows.some(t => t.includes(stem));
+                }
+                if (hit) present.push(name);
+            }
+            return { present, rowCount: rows.length ? rows.length : -1 };
+        }""", list(expected_names))
+        return set(res.get("present") or []), int(res.get("rowCount") or -1)
+    except Exception as e:
+        log(f"[NotebookLM] source census failed: {e}", "DEBUG")
+        return set(), -1
+
+
+async def _nlm_census_settled(page, expected_names, attempts=4, interval=3.0):
+    """Census with settle-polling (review r2): NotebookLM ingests sources
+    ASYNC, so a single census taken seconds after a submission can miss a
+    row that renders moments later — which used to trigger duplicate re-adds
+    and, at the final gate, a spurious 'upload failed' Retry/Skip card for
+    an upload that actually succeeded. Polls until every expected name is
+    visible or attempts exhaust. Returns (present, row_count) of the LAST
+    census."""
+    present: set = set()
+    row_count = -1
+    for i in range(max(1, attempts)):
+        present, row_count = await _nlm_visible_source_names(page, expected_names)
+        if len(present) == len(list(expected_names)):
+            break
+        if i < attempts - 1:
+            await asyncio.sleep(interval)
+    return present, row_count
+
+
+async def _nlm_dom_add_files(browser, page, paths, label="NotebookLM"):
+    """Add files to the CURRENT notebook via NotebookLM's own DOM. Opens the
+    Add-sources dialog if needed, then feeds every path in ONE go through the
+    hidden <input type=file> (multi-select). Falls back to the armed-queue
+    file chooser (one click per file) when no input is reachable. Returns
+    True when a submission mechanism fired (ingestion verified by caller)."""
+    paths = [str(p) for p in paths]
+    try:
+        # The Add-sources dialog auto-opens on a fresh notebook; otherwise
+        # open it ("Add source" / "+" in the sources panel).
+        inp = None
+        for attempt in range(3):
+            try:
+                inp = await page.query_selector('input[type="file"]')
+            except Exception:
+                inp = None
+            if inp:
+                break
+            # (review r2) no bare '^add' pattern — mat-icon ligatures make
+            # every '+' button's textContent start with 'add', and a stray
+            # match creates notes / opens the wrong dialog.
+            clicked = await _nlm_click_first(page, (
+                r"^add source", r"\badd sources?\b", r"upload sources?"))
+            if attempt and not clicked:
+                break
+            await asyncio.sleep(2)
+        if inp:
+            try:
+                await inp.set_input_files(paths)
+            except Exception:
+                # Non-multiple input rejects a list — feed one at a time,
+                # re-querying between files (the dialog may re-render).
+                for p in paths:
+                    _inp = await page.query_selector('input[type="file"]')
+                    if _inp is None:
+                        await _nlm_click_first(page, (
+                            r"^add source", r"\badd sources?\b", r"upload sources?"))
+                        await asyncio.sleep(2)
+                        _inp = await page.query_selector('input[type="file"]')
+                    if _inp is None:
+                        return False
+                    await _inp.set_input_files([p])
+                    await asyncio.sleep(2)
+            log(f"[{label}] DOM upload: set {len(paths)} file(s) on hidden "
+                f"input[type=file] — {[Path(p).name for p in paths]}")
+            await asyncio.sleep(2)
+            return True
+        # Chooser fallback: the global filechooser handler answers one dialog
+        # per armed file, so click the Upload control once per path.
+        fired_any = False
+        for p in paths:
+            browser.set_upload_file(p)
+            clicked = await _nlm_click_first(page, (
+                r"upload file", r"choose file", r"select file", r"\bbrowse\b",
+                r"\bupload\b"))
+            if not clicked:
+                browser.clear_upload_file()
+                log(f"[{label}] DOM upload: no Upload control found for "
+                    f"{Path(p).name} — leaving it to the CUA fallback", "WARN")
+                break
+            # Interception empties the one-entry queue; wait briefly for it.
+            for _ in range(10):
+                await asyncio.sleep(1)
+                if not getattr(browser, "_upload_queue", None):
+                    fired_any = True
+                    break
+            else:
+                log(f"[{label}] DOM upload: chooser never opened for "
+                    f"{Path(p).name}", "WARN")
+            browser.clear_upload_file()
+        return fired_any
+    except Exception as e:
+        log(f"[{label}] DOM upload attempt failed: {e}", "WARN")
+        try:
+            browser.clear_upload_file()
+        except Exception:
+            pass
+        return False
+
+
+async def _nlm_dom_upload_sources(browser, page, md_files, label="NotebookLM"):
+    """DOM-first NotebookLM upload: create a notebook if we're on the home
+    page, submit ALL md files, then census the Sources panel until every
+    expected filename is visible (ingestion is async). Returns the set of
+    DOM-confirmed uploaded names — caller hands anything missing to the CUA
+    fallback. Never raises."""
+    expected = [p.name for p in md_files]
+    try:
+        url = ""
+        try:
+            url = page.url or ""
+        except Exception:
+            pass
+        if "/notebook/" not in url:
+            clicked = await _nlm_click_first(page, (
+                r"create new notebook", r"new notebook", r"create new", r"^create\b"))
+            if not clicked:
+                log(f"[{label}] DOM-first: create-notebook control not found — "
+                    f"falling back to CUA", "WARN")
+                return set()
+            log(f"[{label}] DOM-first: clicked create ('{clicked}')")
+            for _ in range(15):
+                await asyncio.sleep(1)
+                try:
+                    if "/notebook/" in (page.url or ""):
+                        break
+                except Exception:
+                    pass
+            # (review r2) post-wait guard: never run the add/chooser dance
+            # against the HOME page — a slow create would waste ~15s of
+            # misclicks and could false-match home-page cards in the census.
+            try:
+                if "/notebook/" not in (page.url or ""):
+                    log(f"[{label}] DOM-first: create never reached a "
+                        f"/notebook/ URL — falling back to CUA", "WARN")
+                    return set()
+            except Exception:
+                return set()
+        if not await _nlm_dom_add_files(browser, page, md_files, label=label):
+            return set()
+        # Census until every name shows up (ingestion is async; rows usually
+        # appear within seconds, processing continues after).
+        present: set = set()
+        for _ in range(30):
+            await asyncio.sleep(3)
+            present, row_count = await _nlm_visible_source_names(page, expected)
+            if len(present) == len(expected):
+                break
+        log(f"[{label}] DOM-first upload census: {sorted(present)} of "
+            f"{expected} visible")
+        # (review r2) close dialogs unconditionally — a leftover Add-sources
+        # modal otherwise greets the CUA fallback (and the FIFA source verify
+        # ran behind exactly such a modal).
+        await _nlm_close_dialogs(page, label=label)
+        return present
+    except Exception as e:
+        log(f"[{label}] DOM-first upload failed ({e}) — falling back to CUA", "WARN")
+        return set()
+
+
+async def _nlm_dom_rename(page, title, label="NotebookLM"):
+    """DOM-first notebook rename. NotebookLM's title field ignores Ctrl+A
+    (FIFA run: typed text APPENDED, leaving 'FIFA World Cup Evolution And
+    EconomicsThe FIFA W' — the CUA burned 8/8 iterations failing to clear
+    it). Set the input value natively + fire Angular-visible events instead.
+    Returns True when the title verifiably matches afterwards."""
+    try:
+        ok = await page.evaluate("""(title) => {
+            const findInput = () => {
+                for (const el of document.querySelectorAll(
+                        'input[aria-label*="title" i], input[class*="title" i], ' +
+                        '[class*="notebook-title" i] input, [class*="project-title" i] input')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 60 && r.top < 120) return el;
+                }
+                return null;
+            };
+            let inp = findInput();
+            if (!inp) {
+                // The field may mount only after clicking the header title.
+                for (const el of document.querySelectorAll(
+                        '[class*="notebook-title" i], [class*="project-title" i], ' +
+                        'h1, header [class*="title" i]')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.top < 120 && r.width > 60) { el.click(); break; }
+                }
+                inp = findInput();
+            }
+            if (!inp) return false;
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            setter.call(inp, title);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            inp.blur();
+            return inp.value === title;
+        }""", title)
+        if not ok:
+            return False
+        # Read-back from a FRESH query after a settle (review r2): the
+        # immediate `inp.value === title` only proves the native setter ran —
+        # if Angular ignores synthetic events and reverts on its next change
+        # detection, returning True here would silently skip the CUA
+        # fallback in exactly the failure mode this helper was built for.
+        await asyncio.sleep(1.5)
+        committed = await page.evaluate("""(title) => {
+            for (const el of document.querySelectorAll(
+                    'input[aria-label*="title" i], input[class*="title" i], ' +
+                    '[class*="notebook-title" i] input, [class*="project-title" i] input, ' +
+                    '[class*="notebook-title" i], [class*="project-title" i], h1')) {
+                const r = el.getBoundingClientRect();
+                if (r.top > 120 || r.width < 60) continue;
+                const v = ('value' in el && el.value) ? el.value
+                          : (el.innerText || '').trim();
+                if (v === title) return true;
+            }
+            return false;
+        }""", title)
+        if committed:
+            log(f"[{label}] DOM rename OK (read-back verified): '{title}'")
+            return True
+        log(f"[{label}] DOM rename did not commit (read-back mismatch) — "
+            f"CUA fallback will handle it", "WARN")
+        return False
+    except Exception as e:
+        log(f"[{label}] DOM rename failed: {e}", "DEBUG")
+        return False
+
 
 async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=False, max_rounds=2):
     """Post-upload health check for NotebookLM sources.
@@ -33275,17 +33834,79 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
     (preferring NotebookLM's in-place retry over delete+re-add). Bounded to
     `max_rounds`. CONSERVATIVE: an "ALL OK" / ambiguous / unmappable verdict
     takes NO action, so the outcome is never worse than skipping this step.
-    The caller wraps this so any exception just proceeds with what processed."""
-    if not cua_client or not md_files:
-        return
+    The caller wraps this so any exception just proceeds with what processed.
+
+    2026-07-11 (FIFA run, gemini.md silently absent): the red-state-only CUA
+    probe passes a MISSING source — no row, no error icon, "all sources OK"
+    on a 2/3 notebook. Each round now starts with a DOM census against the
+    expected manifest (also closing any leftover Add-sources modal — the
+    FIFA verify ran behind one): missing names are re-added DOM-first, CUA
+    re-upload as fallback, and the CUA red-state mission now carries the
+    manifest so vision can flag absences too. Census runs even without a
+    cua_client. Returns the set of names still missing after all rounds."""
+    if not md_files:
+        return set()
     by_name = {p.name: p for p in md_files}
+    expected = list(by_name.keys())
+    missing: set = set()
     for _round in range(1, max_rounds + 1):
         # Let async ingestion settle before judging (spinners → ✓ or red).
         await asyncio.sleep(8)
+        await _nlm_close_dialogs(browser.page)
+        present, _rows = await _nlm_census_settled(browser.page, expected,
+                                                   attempts=4, interval=3.0)
+        missing = {n for n in expected if n not in present}
+        if missing:
+            log(f"[NotebookLM] source census (round {_round}): "
+                f"{len(present)}/{len(expected)} present — missing {sorted(missing)}", "WARN")
+            try:
+                emit_event("agent_progress", phase=3, agent="notebooklm",
+                           status="repairing", stage="uploading",
+                           progress=f"Re-adding {len(missing)} missing source(s)…")
+            except Exception:
+                pass
+            _missing_paths = [by_name[n] for n in sorted(missing)]
+            if await _nlm_dom_add_files(browser, browser.page, _missing_paths):
+                continue  # next round re-censuses
+            if not cua_client:
+                continue
+            for name in sorted(missing):
+                browser.set_upload_file(str(by_name[name]))
+                try:
+                    async def _readd_cua(_name=name):
+                        return await agent_loop(
+                            cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,  # noqa: F405
+                            f"The source file '{_name}' is MISSING from this notebook. "
+                            f"Add it: click 'Add source' (or '+') then the Upload files "
+                            f"control. The file dialog is auto-handled. Add exactly this "
+                            f"ONE file and nothing else.",
+                            model=CUA_MODEL, max_iterations=8, verbose=verbose)
+                    await _shadow_observed_cua(
+                        browser.page, hotspot_id="nlm-add-source", phase=3,
+                        platform="notebooklm",
+                        current_step=f"readd_missing_source_{name}",
+                        context_hint=f"the source '{name}' never made it into the "
+                                     "notebook — add it via Add source/Upload files "
+                                     "(the OS file dialog auto-selects the file)",
+                        expected_outcome=f"the source '{name}' appears in the panel",
+                        cua_coro_factory=_readd_cua,
+                        mission_prompt=PROMPT_NOTEBOOKLM_UPLOAD,  # noqa: F405
+                        act_timeout_s=150.0)
+                finally:
+                    browser.clear_upload_file()
+                await asyncio.sleep(3)
+            continue  # next round re-censuses
+        if not cua_client:
+            log(f"[NotebookLM] source census (round {_round}): all "
+                f"{len(expected)} present (no CUA for red-state check)")
+            return set()
         async def _verify_sources_cua():
             return await agent_loop(
                 cua_client, browser, PROMPT_NOTEBOOKLM_VERIFY_SOURCES,
-                "Check the Sources panel and report any source in a failed/error (red) state.",
+                f"The notebook is expected to contain exactly these "
+                f"{len(expected)} sources: {', '.join(expected)}. Check the "
+                f"Sources panel and report any of them in a failed/error (red) "
+                f"state — or expected but entirely ABSENT — as FAILED: <filename>.",
                 model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
         # #839 act tier — READ_ONLY: this is a source-health probe (returns
@@ -33307,12 +33928,12 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
         # (never blind-delete/re-add a good source on an ambiguous read).
         if "failed:" not in low:
             log(f"[NotebookLM] source verify (round {_round}): all sources OK")
-            return
+            return set()
         failed_part = low.split("failed:", 1)[1]
         # Bail on explicit "no failure" phrasing the model may put after FAILED:.
         if failed_part.strip().split(",")[0].strip() in ("", "none", "n/a", "-", "nothing"):
             log(f"[NotebookLM] source verify (round {_round}): all sources OK")
-            return
+            return set()
         # Token-equality match (split on commas/whitespace, trim stray
         # punctuation) — NOT a raw substring scan. A healthy filename mentioned
         # in prose after FAILED: (e.g. "FAILED: claude.md (gemini.md is fine)")
@@ -33323,7 +33944,7 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
         if not failed:
             log(f"[NotebookLM] source verify: failure reported but no known filename matched — "
                 f"verdict='{text[:160]}' (skipping repair to avoid touching healthy sources)", "WARN")
-            return
+            return set()
         log(f"[NotebookLM] source verify (round {_round}): {len(failed)} failed → re-uploading {failed}", "WARN")
         try:
             emit_event("agent_progress", phase=3, agent="notebooklm", status="repairing",
@@ -33360,6 +33981,17 @@ async def _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=
                 browser.clear_upload_file()
             await asyncio.sleep(3)
     log("[NotebookLM] source verify: re-upload rounds exhausted — proceeding with whatever processed", "WARN")
+    # Final honest census so the caller can decide (raise → Retry/Skip card)
+    # instead of silently shipping a partial notebook. Settle-polled ~30s
+    # (review r2): a round-2 re-add fires just seconds before this line, and
+    # judging it instantly would raise a FALSE 'upload failed' card for an
+    # upload that is about to succeed.
+    try:
+        present, _ = await _nlm_census_settled(browser.page, expected,
+                                               attempts=6, interval=6.0)
+        return {n for n in expected if n not in present}
+    except Exception:
+        return missing
 
 
 async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verbose=False):
@@ -33443,32 +34075,80 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     break
                 # 'ok' → signed in, confirmed on the work page; proceed.
 
-            for i, md_path in enumerate(md_files):
-                log(f"Uploading {md_path.name} ({i+1}/{len(md_files)})...")
+            # ── 2026-07-11 DOM-first upload ──────────────────────────────
+            # Drive NotebookLM's own DOM (create notebook + hidden
+            # input[type=file] multi-upload + source-row census) before any
+            # CUA vision task. The FIFA run showed the CUA-only path is
+            # fail-open end to end: an API 500 killed the gemini.md task
+            # before the file dialog opened, both call sites discarded the
+            # returned error dict, and the red-state-only verify passed the
+            # 2/3 notebook — the source was simply never added.
+            emit_event("agent_progress", phase=3, agent="notebooklm",
+                       status="uploading", stage="uploading",
+                       progress=f"Uploading {len(md_files)} source(s)…")
+            _dom_uploaded = await _nlm_dom_upload_sources(browser, page, md_files)
+            _remaining = [p for p in md_files if p.name not in _dom_uploaded]
+            if _remaining:
+                log(f"[NotebookLM] {len(_remaining)} file(s) left for the CUA "
+                    f"fallback: {[p.name for p in _remaining]}",
+                    "WARN" if _dom_uploaded else "INFO")
+
+            for i, md_path in enumerate(_remaining):
+                log(f"Uploading {md_path.name} ({i+1}/{len(_remaining)}) via CUA fallback...")
                 # stage= (2026-07-06 milestone stepper): P3's three milestones
                 # — uploading → notebook → podcast — tick off these explicit
                 # stages (keyword fallback covers older events).
                 emit_event("agent_progress", phase=3, agent="notebooklm",
                            status="uploading", stage="uploading",
-                           progress=f"Uploading source {i+1}/{len(md_files)}: {md_path.name}")
+                           progress=f"Uploading source: {md_path.name}")
                 browser.set_upload_file(str(md_path))
+
+                # Row watcher doubles as the CUA abort signal (#732 plumbing):
+                # the moment the source row is DOM-visible the mission is over
+                # — pre-fix the CUA burned its remaining iterations re-clicking
+                # "Upload files" against an empty queue (6 warnings/4 wasted
+                # minutes in the FIFA run) hunting phantom extra files.
+                _row_evt = asyncio.Event()
+                async def _row_watch(_name=md_path.name, _evt=_row_evt):
+                    # (review r2) guards: only structured source ROWS on a
+                    # /notebook/ page may abort the mission — the body-text
+                    # fallback could match a home-page recent-notebook card
+                    # or a transient "<name> failed" toast.
+                    try:
+                        while not _evt.is_set():
+                            await asyncio.sleep(3)
+                            try:
+                                if "/notebook/" not in (page.url or ""):
+                                    continue
+                            except Exception:
+                                continue
+                            _seen, _rows = await _nlm_visible_source_names(page, [_name])
+                            if _name in _seen and _rows != -1:
+                                _evt.set()
+                                return
+                    except Exception:
+                        pass
+                _watch_task = asyncio.create_task(_row_watch())
 
                 _stop, _task = start_narration_ticker(
                     3, "notebooklm",
-                    f"NotebookLM uploading source {i+1}/{len(md_files)}: {md_path.name}",
+                    f"NotebookLM uploading source: {md_path.name}",
                     interval=20)
+                _cua_res = None
                 try:
-                    if i == 0:
+                    if "/notebook/" not in (page.url or ""):
                         async def _nlm_create_cua():
                             return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
-                                "Create a new notebook and upload the first file. File dialog is auto-handled.",
-                                model=CUA_MODEL, max_iterations=15, verbose=verbose)
+                                f"Create a new notebook and upload the file '{md_path.name}'. "
+                                f"File dialog is auto-handled. Upload exactly this ONE file.",
+                                model=CUA_MODEL, max_iterations=15, verbose=verbose,
+                                abort_event=_row_evt)
 
                         # #839 act tier: the OS file chooser is auto-answered
                         # (filechooser handler + upload queue) — Vision clicks
                         # the create/Add-source control only. set/clear bracket
-                        # stays; success is judged by _verify_and_repair below.
-                        await _shadow_observed_cua(
+                        # stays; success is judged per-file + by _verify below.
+                        _cua_res = await _shadow_observed_cua(
                             browser.page, hotspot_id="nlm-create-upload", phase=3, platform="notebooklm",
                             current_step="create_notebook_upload_first",
                             context_hint="create a NEW NotebookLM notebook and upload the first "
@@ -33481,23 +34161,41 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
                     else:
                         async def _nlm_add_cua():
                             return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_UPLOAD,
-                                f"Add another source (file {i+1}). Click 'Add source' or '+'. File dialog is auto-handled.",
-                                model=CUA_MODEL, max_iterations=10, verbose=verbose)
+                                f"Add the source file '{md_path.name}'. Click 'Add source' or '+'. "
+                                f"File dialog is auto-handled. Add exactly this ONE file.",
+                                model=CUA_MODEL, max_iterations=10, verbose=verbose,
+                                abort_event=_row_evt)
 
-                        await _shadow_observed_cua(
+                        _cua_res = await _shadow_observed_cua(
                             browser.page, hotspot_id="nlm-add-source", phase=3, platform="notebooklm",
-                            current_step=f"add_source_{i+1}",
-                            context_hint=f"add source file {i+1} — click 'Add source' or the '+' "
-                                         "control; the OS file dialog auto-selects the file",
-                            expected_outcome=f"source {i+1} is added to the notebook",
+                            current_step=f"add_source_{md_path.name}",
+                            context_hint=f"add source file {md_path.name} — click 'Add source' or "
+                                         "the '+' control; the OS file dialog auto-selects the file",
+                            expected_outcome=f"source {md_path.name} is added to the notebook",
                             cua_coro_factory=_nlm_add_cua,
                             mission_prompt=PROMPT_NOTEBOOKLM_UPLOAD,
                             act_timeout_s=150.0)
                 finally:
                     await stop_narration_ticker(_stop, _task)
+                    _row_evt.set()
+                    _watch_task.cancel()
 
                 browser.clear_upload_file()
                 await asyncio.sleep(3)
+                # Per-file deterministic check — a CUA task that DIED (API
+                # error) or exhausted its iterations is otherwise
+                # indistinguishable from success here.
+                _cua_status = (_cua_res or {}).get("status", "") if isinstance(_cua_res, dict) else ""
+                # Settled census (review r2): ingestion is async — a single
+                # 3s-old census here used to re-add a file whose row was
+                # about to render, landing the same source twice.
+                _seen, _ = await _nlm_census_settled(page, [md_path.name],
+                                                     attempts=5, interval=3.0)
+                if md_path.name not in _seen:
+                    log(f"[NotebookLM] {md_path.name} NOT visible after CUA task "
+                        f"(status={_cua_status or 'unknown'}) — DOM re-add attempt", "WARN")
+                    await _nlm_dom_add_files(browser, page, [md_path])
+                    # _verify_and_repair below re-censuses and escalates.
 
             # Verify each source actually PROCESSED. NotebookLM ingests sources
             # ASYNC after the file lands in the panel, so a source can pass the
@@ -33507,10 +34205,21 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             # overview was built from only 2/3 sources, silently. This settles +
             # verifies + silently re-uploads any failed source. Best-effort:
             # wrapped so any error just proceeds with whatever processed.
+            _still_missing: set = set()
             try:
-                await _verify_and_repair_nlm_sources(browser, cua_client, md_files, verbose=verbose)
+                _still_missing = await _verify_and_repair_nlm_sources(
+                    browser, cua_client, md_files, verbose=verbose) or set()
             except Exception as _ve:
                 log(f"[NotebookLM] source verify/repair skipped (non-fatal): {_ve}", "WARN")
+            if _still_missing:
+                # 2026-07-11: don't silently ship a partial notebook (the FIFA
+                # run published 2/3 sources with no signal anywhere). Raising
+                # lands in the except below → honest "NotebookLM upload
+                # failed" Retry/Skip card; Retry re-runs the upload in a fresh
+                # tab, Skip proceeds without the notebook — the user's call.
+                raise RuntimeError(
+                    f"notebook is missing {len(_still_missing)} source(s) after "
+                    f"upload + repair: {sorted(_still_missing)}")
 
             # Rename notebook — use the smart title (Firestore-synced) so NotebookLM,
             # YouTube, and the email subject all line up on the same short name.
@@ -33519,23 +34228,31 @@ async def run_phase3_upload(browser, cua_client, results, topic, queue_dir, verb
             emit_event("agent_progress", phase=3, agent="notebooklm",
                        status="renaming", stage="notebook",
                        progress=f"Renaming notebook to '{title}'…")
-            async def _nlm_rename_cua():
-                return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
-                    f"Rename this notebook to: {title}",
-                    model=CUA_MODEL, max_iterations=8, verbose=verbose)
+            # 2026-07-11 DOM-first rename: NotebookLM's title input ignores
+            # Ctrl+A, so CUA typing APPENDS — the FIFA run shipped the title
+            # 'FIFA World Cup Evolution And EconomicsThe FIFA W' after the
+            # CUA burned 8/8 iterations failing to clear the field. Native
+            # value-set + Angular events sidesteps the keyboard entirely;
+            # CUA stays as fallback (best-effort — nothing downstream gates
+            # on the notebook name).
+            if not await _nlm_dom_rename(page, title):
+                async def _nlm_rename_cua():
+                    return await agent_loop(cua_client, browser, PROMPT_NOTEBOOKLM_RENAME,
+                        f"Rename this notebook to: {title}. If Ctrl+A does not select the "
+                        f"existing text, TRIPLE-CLICK the title field to select it first.",
+                        model=CUA_MODEL, max_iterations=8, verbose=verbose)
 
-            # #839 act tier: this site TYPES (the only P3 upload-family site that
-            # types into the page). Best-effort — nothing downstream gates on the
-            # notebook name, so a Vision miss is as silent as the CUA contract.
-            await _shadow_observed_cua(
-                browser.page, hotspot_id="nlm-rename", phase=3, platform="notebooklm",
-                current_step="rename_notebook",
-                context_hint=f"rename the notebook to '{title}': click the notebook title, "
-                             "clear it, type the new name, press Enter",
-                expected_outcome=f"the notebook is titled '{title}'",
-                cua_coro_factory=_nlm_rename_cua,
-                mission_prompt=PROMPT_NOTEBOOKLM_RENAME,
-                act_timeout_s=90.0)
+                # #839 act tier: this site TYPES (the only P3 upload-family site
+                # that types into the page).
+                await _shadow_observed_cua(
+                    browser.page, hotspot_id="nlm-rename", phase=3, platform="notebooklm",
+                    current_step="rename_notebook",
+                    context_hint=f"rename the notebook to '{title}': click the notebook title, "
+                                 "clear it (triple-click to select), type the new name, press Enter",
+                    expected_outcome=f"the notebook is titled '{title}'",
+                    cua_coro_factory=_nlm_rename_cua,
+                    mission_prompt=PROMPT_NOTEBOOKLM_RENAME,
+                    act_timeout_s=90.0)
 
             # C1: make notebook public (Share → "Anyone with the link" → Save)
             # BEFORE emitting the URL, so the frontend's link is always viewable.
