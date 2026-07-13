@@ -17416,31 +17416,43 @@ async def detect_completion_chatgpt(page):
             const completedChip =
                 /research\\s+complete(?:d)?\\s+in\\s+\\d+\\s*[hms]/i.test(btc) ||
                 /research\\s+complete(?:d)?\\s*[·•]\\s*\\d[\\d,]*\\s+(?:citations?|sources?)/i.test(btc);
-            // 2026-07-13 Document-panel affordances: right-docked geometry
-            // panel (same gates as the Claude geo scan) whose HEADER STRIP
-            // carries a download button AND an expand/enlarge button — the
-            // canvas header that replaces the Researching panel on finish.
+            // 2026-07-13 (rev 2, user-directed): the finished DR document/
+            // canvas panel's HEADER STRIP carries a DOWNLOAD button — that
+            // swap (Researching panel → Document panel with a download
+            // affordance) IS the done signal; no need to open or scroll the
+            // document. The DOWNLOAD BUTTON ALONE is sufficient.
+            //
+            // rev 1 (same day) required download AND an expand/enlarge button,
+            // but ChatGPT's real canvas header is download + SHARE (not
+            // download + expand — live screenshot 2026-07-13), so the AND
+            // missed every finished canvas: the detector logged "doc-panel
+            // affordances all missing" at the SAME tick the CUA screenshot read
+            // "download (↓) and share/expand buttons — no stop button", and the
+            // poller burned 17+ min scroll-checking a document that was done.
+            // Also dropped the r.left >= 22%vw right-docked floor: when DR
+            // finishes on the canvas layout the document is NEAR-FULL-WIDTH
+            // (only the thin icon rail to its left), so a left-position floor
+            // excluded the very layout this signal is for. Right-edge anchor +
+            // min width + tall + header-only + the (pre-checked) no-stop gate
+            // keep it specific to the finished document surface.
             const vw = window.innerWidth || document.documentElement.clientWidth;
             const vh = window.innerHeight || document.documentElement.clientHeight;
             let docPanelAffordances = false;
             for (const el of document.querySelectorAll('div, aside, section')) {
                 const r = el.getBoundingClientRect();
-                if (r.width < 380 || r.width > vw * 0.85) continue;
-                if (r.left < vw * 0.22) continue;
-                if (r.right < vw - 40) continue;
-                if (r.height < vh * 0.5) continue;
-                let hasDl = false, hasExpand = false;
+                if (r.width < 380) continue;            // a real panel, not a toolbar/widget
+                if (r.right < vw - 40) continue;        // anchored to the right edge (canvas / doc panel)
+                if (r.height < vh * 0.5) continue;      // tall — a document surface
+                let hasDl = false;
                 for (const b of el.querySelectorAll('button, [role="button"]')) {
                     const br = b.getBoundingClientRect();
                     if (br.top > r.top + 96) continue;      // header strip only
                     const t = ((b.getAttribute('aria-label') || '') + ' ' +
                                (b.getAttribute('title') || '') + ' ' +
                                (b.getAttribute('data-testid') || '')).toLowerCase();
-                    if (/download/.test(t)) hasDl = true;
-                    if (/expand|enlarge|full\\s?screen|maximi[sz]e/.test(t)) hasExpand = true;
-                    if (hasDl && hasExpand) break;
+                    if (/download/.test(t)) { hasDl = true; break; }
                 }
-                if (hasDl && hasExpand) { docPanelAffordances = true; break; }
+                if (hasDl) { docPanelAffordances = true; break; }
             }
             const doneMarker = thoughtFor || researchDone || completedChip || docPanelAffordances;
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
@@ -23123,7 +23135,89 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         platform_key = name.lower().replace(" ", "")
         _runtime.register_page(platform_key, agent["page"], agent["url"])
 
+    # ── Auto-skip finalization (bug 2.5): make an unresolved failure LOOK ────
+    # ── exactly like a normal skip ──────────────────────────────────────────
+    # Any ENABLED agent that finished UNRESOLVED — a setup/verify failure
+    # (2A/2B/2C fail_agent → red 'errored' tile + Retry/Skip card + internal
+    # skip marker), a signed-out wall, or a hard-retry exhaustion — was dropped
+    # WITHOUT being greyed or having its tab closed. The run proceeds regardless,
+    # so to the user that agent WAS auto-skipped — yet it kept a red 'errored'
+    # tile, an open browser tab, and (because phase_complete still fires) a lying
+    # "Completed in X min" stepper (live 2026-07-13: Gemini brief-send failed,
+    # ran to P3 still red + tab open + "Complete"). Finalize each such agent
+    # exactly like a user Skip / the Layer-3 stuck auto-skip: emit agent_skipped
+    # (greys the tile + clears the Retry/Skip card, durable pendingDecision
+    # included + persists status='skipped'), close its tab, and drop an
+    # informational notice. One consistent shape for EVERY auto-skip.
+    #
+    # Runs at BOTH round-robin exits — the natural loop exit AND the
+    # `pending`-empty-at-entry early return below (every enabled agent failed
+    # setup with a null page handle, so none entered the poll set). It never
+    # runs on a stop/pause return (those return from INSIDE the while-loop,
+    # before the natural exit). Respects the user's auto-skip setting: OFF leaves
+    # the card up for a manual decision (never silently greys).
+    async def _finalize_unresolved_autoskips():
+        if not _runtime.auto_skip_stuck:
+            return
+        for _fin_name, _fin_agent in list(agents.items()):
+            _fin_key = normalize_agent_key(_fin_name)
+            _fin_r = results.get(_fin_name) or {}
+            _fin_st = (_fin_r.get("status") or "").lower()
+            _fin_persisted = (_agent_status_by_rid.get(_fb_research_id, {}) or {}).get(_fin_key)
+            # Already resolved by the user (retried-to-done / Skip) or by an
+            # earlier auto-skip path (Layer-3) — never touch a green ✓ or an
+            # existing grey skip.
+            if _fin_persisted in ("complete", "skipped"):
+                continue
+            # Produced real output (incl. a fail_agent'd agent the user retried
+            # to completion, whose persisted 'errored' may not yet be flipped to
+            # 'complete' — phase_complete does that AFTER this returns) → done,
+            # never auto-skip it.
+            _produced_output = bool(_fin_r.get("text")) or _fin_st in (
+                "done", "complete", "completed", "done_partial", "partial")
+            if _produced_output:
+                continue
+            # Target: an UNRESOLVED failure with no output. fail_agent persisted
+            # 'errored' (setup fail, signed-out, hard-retry-exhausted), or the
+            # poll set dropped it with a start-failure status.
+            _needs_finalize = (
+                _fin_persisted == "errored"
+                or _fin_st in ("failed_setup", "not_verified")
+            )
+            if not _needs_finalize:
+                continue
+            log(f"[{_fin_name}] Auto-skip finalize — startup failed and its "
+                "Retry/Skip alert went unanswered; greying the tile + closing "
+                "the tab so it matches a normal skip (bug 2.5).", "WARN")
+            # agent_skipped: greys the tile, clears agent_<key>_error (volatile
+            # alert + durable pendingDecision), persists status='skipped'.
+            emit_event("agent_skipped", phase=2, agent=_fin_key,
+                       reason="auto_skip_setup_failed", partial_chars=0)
+            # Informational notice (not an error card — resolved, not awaiting a
+            # decision), mirroring the Layer-3 auto-skip, so the user learns WHY.
+            emit_event("pipeline_warning", phase=2, agent=_fin_key,
+                       error=f"{_fin_name} skipped automatically",
+                       details=(f"{_fin_name} couldn't start (a platform-side setup or "
+                                "delivery problem) and its Retry/Skip alert wasn't "
+                                "answered — skipped so your run can finish. The other "
+                                "agents aren't affected."),
+                       actions=[], alert_id=f"agent_{_fin_key}_autoskip",
+                       auto_clear_on_resume=True)
+            try:
+                await _close_skipped_agent_tab(browser, _fin_agent.get("page"), _fin_key, _fin_name)
+            except Exception as _fce:
+                log(f"[{_fin_name}] Auto-skip finalize: tab close failed ({_fce})", "WARN")
+            results[_fin_name] = {
+                "status": "auto_skipped", "text": "",
+                "url": _fin_r.get("url", "") or _fin_agent.get("url", ""),
+                "page": None,
+                "elapsed_sec": int(_fin_r.get("elapsed_sec", 0) or 0),
+            }
+
     if not pending:
+        # Every enabled agent failed setup with a null page handle — none
+        # entered the poll set. Still finalize them as clean auto-skips.
+        await _finalize_unresolved_autoskips()
         return results
 
     _runtime.phase = 2
@@ -25779,6 +25873,11 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # cycle 2 which paces normally.
             if _tick_counter > 1:
                 await _leg_dwell()
+
+    # Auto-skip finalization (bug 2.5) — see the helper defined above. Natural
+    # loop exit: every agent left `pending`; grey + close-tab any that ended
+    # unresolved so the run never trails a red tile / open tab / "Complete" lie.
+    await _finalize_unresolved_autoskips()
 
     return results
 
@@ -28989,21 +29088,94 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
             await _dump_thinking_menu("final-miss")
             log("[setup_gemini_dr] model-pick: 'Thinking level' submenu not found — leaving default thinking level", "WARN")
 
-        # Verify the mode button now reflects Extended (best-effort), then close
-        # the menu so it can't cover the composer + button in the next step.
-        try:
-            _mode_txt = await page.evaluate("""() => {
-                const b = document.querySelector(
-                    'button[data-test-id="bard-mode-menu-button"], bard-mode-menu-button button');
-                return b ? ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).toLowerCase() : '';
-            }""")
-            if 'extended' in (_mode_txt or ''):
-                _gem_ext_confirmed = True
-                log("[setup_gemini_dr] model-pick verify: mode button shows Extended")
-        except Exception:
-            pass
+        # ── Verify Extended STUCK, and RETRY until it does ──────────────────
+        # The pick above can report a click ('direct Extended item clicked')
+        # while the mode button stays 'Flash': the clicked row was a
+        # hover-reveal PARENT, not the committed radio, so Extended never took.
+        # Live 2026-07-13: three consecutive runs logged "trigger now reads
+        # 'Flash'" immediately after "direct Extended item clicked", and Gemini
+        # ran Standard-thinking DR instead of Flash Extended. The AUTHORITATIVE
+        # signal is the mode button reading 'Extended' — trust THAT, never the
+        # click's return value. If it isn't Extended, reopen the model menu,
+        # re-hover the Flash row (row-nested submenus only render on hover) and
+        # re-click Extended, up to _EXT_TRIES times, re-reading each time. The
+        # user requirement is hard ("It must be Flash Extended"), so we retry
+        # aggressively; a miss after every try is logged honestly (DR still
+        # functions on Standard thinking — this is never fatal to the agent).
+        _read_mode_js = """() => {
+            const b = document.querySelector(
+                'button[data-test-id="bard-mode-menu-button"], bard-mode-menu-button button');
+            return b ? ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim() : '';
+        }"""
+        _click_ext_radio_js = """() => {
+            for (const el of document.querySelectorAll(
+                    '[role="menuitem"], [role="menuitemradio"], [role="option"], button, a, li')) {
+                if (!el.offsetParent) continue;
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t.startsWith('standard')) continue;
+                if (t.startsWith('extended') || /\\bextended\\b/.test(t)) { el.click(); return true; }
+            }
+            return false;
+        }"""
+
+        async def _mode_shows_extended():
+            try:
+                _m = await page.evaluate(_read_mode_js)
+            except Exception:
+                _m = ""
+            return ("extended" in (_m or "").lower()), (_m or "")
+
+        _ext_ok, _mode_now = await _mode_shows_extended()
+        if _ext_ok:
+            _gem_ext_confirmed = True
+            log(f"[setup_gemini_dr] model-pick verify: mode button shows Extended ('{_mode_now[:40]}')")
+        else:
+            try:
+                _EXT_TRIES = int(os.environ.get("DG_GEMINI_EXTENDED_TRIES", "3"))
+            except ValueError:
+                _EXT_TRIES = 3
+            for _et in range(1, _EXT_TRIES + 1):
+                log(f"[setup_gemini_dr] model-pick verify: Extended NOT stuck "
+                    f"(mode reads '{_mode_now[:40]}') — retry {_et}/{_EXT_TRIES}", "WARN")
+                # Clean-slate the menu (an open leftover would make _reopen_js
+                # TOGGLE it shut), reopen, hover the Flash row so its
+                # Thinking-level submenu renders, then click Extended (submenu
+                # radio first, direct row as fallback).
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                    await page.evaluate(_reopen_js)
+                    await asyncio.sleep(0.6)
+                    await page.evaluate(_hover_flash_row_js)
+                    await asyncio.sleep(0.5)
+                    if await page.evaluate(_click_tl_js):
+                        await asyncio.sleep(0.6)
+                        await page.evaluate(_click_ext_radio_js)
+                    else:
+                        await page.evaluate(_click_direct_ext_js)
+                    await asyncio.sleep(0.6)
+                except Exception as _ee:
+                    log(f"[setup_gemini_dr] model-pick verify: retry {_et} click errored ({_ee})", "WARN")
+                _ext_ok, _mode_now = await _mode_shows_extended()
+                if _ext_ok:
+                    _gem_ext_confirmed = True
+                    log(f"[setup_gemini_dr] model-pick verify: mode button shows Extended "
+                        f"after retry {_et} ('{_mode_now[:40]}')")
+                    break
+            if not _ext_ok:
+                await _dump_thinking_menu("extended-retry-exhausted")
+                log(f"[setup_gemini_dr] model-pick verify: Extended still NOT selected after "
+                    f"{_EXT_TRIES} retries (mode reads '{_mode_now[:40]}') — proceeding on "
+                    "the default thinking level (DR still runs; NOT Flash Extended)", "WARN")
         # Phoenix model_refresh — record advisory extended-thinking state for the
         # caller's soft notice (never gates _gemini_select_flash_model's return).
+        # #951 review: _gem_ext_confirmed was seeded True from the (unreliable)
+        # click return in the initial pick block and never reset when the
+        # AUTHORITATIVE mode-button verify above proved Extended didn't stick —
+        # so a definitive Extended FAILURE was recorded as a confirmed success,
+        # masking the exact regression this verify+retry block exists to catch.
+        # Bind it to the final verified state instead of the click.
+        _gem_ext_confirmed = _ext_ok
         _P2_THINKING_STATE["gemini"] = {"thinking": _gem_ext_confirmed}
         try:
             await page.keyboard.press("Escape")
@@ -29020,8 +29192,12 @@ async def _gemini_select_flash_model(page, pin_model=None) -> bool:
                     'button[data-test-id="bard-mode-menu-button"], bard-mode-menu-button button');
                 return b ? (b.textContent || '').trim() : '';
             }""")
-            if "flash" in (_trig or "").lower():
-                log(f"[setup_gemini_dr] model-pick verify: trigger now reads '{_trig[:40]}'")
+            _trig_lc = (_trig or "").lower()
+            if "extended" in _trig_lc:
+                log(f"[setup_gemini_dr] model-pick verify: trigger now reads '{_trig[:40]}' (Flash Extended ✓)")
+            elif "flash" in _trig_lc:
+                log(f"[setup_gemini_dr] model-pick verify: trigger reads '{_trig[:40]}' "
+                    "(Flash selected, Extended NOT active)", "WARN")
             else:
                 log(f"[setup_gemini_dr] model-pick verify: trigger does NOT show Flash "
                     f"(reads '{_trig[:40]}') — pick may not have taken", "WARN")
@@ -31916,102 +32092,157 @@ async def _gemini_adopt_lost_conversation(page, pasted_text: str, label: str):
             "leaving it alone", "INFO")
 
     # ── Probe 2: most-recent sidebar conversation on OUR page ──
-    _SIDEBAR_JS = """
+    # 2026-07-13 (user-directed): the send DID register (the conversation is in
+    # history), Gemini's SPA just never routed OUR tab into it. Two hard facts
+    # from the operator:
+    #   • Gemini does NOT restore a conversation from a direct URL — page.goto
+    #     /app/<id> lands on the empty home (same reason the periodic reload was
+    #     retired). The ONLY reliable adoption is to CLICK the sidebar entry.
+    #   • When the send is "lost" our tab is parked on the bare /app home whose
+    #     Recent list is STALE (missing the just-created conversation). So we
+    #     REFRESH ONCE here — the SOLE place we ever reload, and only because
+    #     we're on the empty home — to freshen the Recent list, then open it and
+    #     click the most-recent OWNED entry (checking the top one or two). We
+    #     never reload once in a conversation, and never after opening one.
+    _SIDEBAR_LIST_JS = """
+    (n) => {
+      const out = [];
+      const els = Array.from(document.querySelectorAll(
+        '[data-test-id*="conversation"], a[href*="/app/"]'));
+      for (const el of els) {
+        const t = ((el.innerText || el.textContent) || '').trim();
+        // Length cap rejects list CONTAINERS whose innerText concatenates every
+        // title into a blob (adversarial-review finding) — a real entry is short.
+        if (t && t.length <= 120) { out.push(t.slice(0, 200)); if (out.length >= n) break; }
+      }
+      return out;
+    }
+    """
+    _EXPAND_SIDEBAR_JS = """
     () => {
-      const pick = () => {
-        const els = Array.from(document.querySelectorAll(
-          '[data-test-id*="conversation"], a[href*="/app/"]'));
-        for (const el of els) {
-          const t = ((el.innerText || el.textContent) || '').trim();
-          // Length cap rejects list CONTAINERS whose innerText concatenates
-          // every title into a blob (adversarial-review finding) — a real
-          // sidebar entry title is short.
-          if (t && t.length <= 120) return t.slice(0, 200);
-        }
-        return null;
-      };
-      let t = pick();
-      if (t) return t;
       // Recent list is usually collapsed — same expansion ladder the retired
       // #897a recovery used (aria labels: Open sidebar / Toggle Recent).
       const sels = ['[data-test-id="side-nav-menu-button"]',
         'button[aria-label*="open sidebar" i]', 'button[aria-label*="sidebar" i]',
         'button[aria-label*="recent" i]', 'button[aria-label*="main menu" i]',
         'button[aria-label*="expand" i]', 'button[aria-label*="menu" i]'];
-      for (const s of sels) { const b = document.querySelector(s); if (b) b.click(); }
-      return null;
+      for (const s of sels) { const b = document.querySelector(s); if (b) { b.click(); return true; } }
+      return false;
     }
     """
-    _CLICK_BY_TITLE_JS = """
+    _CLICK_ENTRY_BY_TITLE_JS = """
     (title) => {
       const els = Array.from(document.querySelectorAll(
         '[data-test-id*="conversation"], a[href*="/app/"]'));
       for (const el of els) {
         const t = ((el.innerText || el.textContent) || '').trim();
-        if (t && t.slice(0, 200) === title) { el.click(); return true; }
+        if (t && t.slice(0, 200) === title) {
+          // Click the real navigation anchor so the SPA routes (clicking a
+          // wrapper div was what "never landed on /app/<id>" — the anchor is
+          // the routed element).
+          const a = el.matches('a[href*="/app/"]') ? el
+                  : (el.querySelector('a[href*="/app/"]') || el.closest('a[href*="/app/"]') || el);
+          a.click();
+          return true;
+        }
       }
       return false;
     }
     """
+    # Refresh ONCE, and ONLY because we're on the empty home, to freshen the
+    # Recent list (never reload in a conversation).
     try:
-        _title = await page.evaluate(_SIDEBAR_JS)
-        if not _title:
-            await asyncio.sleep(1.5)  # expansion may mount on the next frame
-            _title = await page.evaluate(_SIDEBAR_JS)
-    except Exception as _se:
-        log(f"[{label}] sidebar probe raised (non-fatal): {_se}", "DEBUG")
-        _title = None
-    if not _title:
+        _cur = (page.url or "").split("?", 1)[0].rstrip("/").lower()
+    except Exception:
+        _cur = ""
+    if _cur.endswith("gemini.google.com/app") or _cur.endswith("gemini.google.com"):
+        log(f"[{label}] on the empty home — refreshing once to freshen the Recent list", "WARN")
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=25000)
+            await asyncio.sleep(2.0)  # let the SPA hydrate the sidebar
+        except Exception as _re:
+            log(f"[{label}] empty-home refresh failed ({_re}) — reading the sidebar as-is", "WARN")
+    # Expand + read the top 1-2 recent entries (expansion may mount a frame late).
+    _titles = []
+    for _ in range(3):
+        try:
+            _titles = await page.evaluate(_SIDEBAR_LIST_JS, 2)
+        except Exception as _se:
+            log(f"[{label}] sidebar probe raised (non-fatal): {_se}", "DEBUG")
+            _titles = []
+        if _titles:
+            break
+        try:
+            await page.evaluate(_EXPAND_SIDEBAR_JS)
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+    if not _titles:
         log(f"[{label}] sidebar probe: no recent conversation entry found", "INFO")
         return page, False
-    if not _gemini_owns_candidate(_title, pasted_head):
-        log(f"[{label}] most-recent sidebar chat '{_title[:60]}' does NOT match "
-            "our brief — not adopting (won't hijack a past run)", "WARN")
+    # Check the top one or two OWNED entries — a concurrent worker's similar-
+    # titled chat can land ABOVE ours and pass the title-level ownership gate,
+    # so committing to the FIRST title-match and giving up on a body mismatch
+    # would abandon OUR conversation sitting at slot #2 (#951 re-review). Try
+    # each owned candidate: click → route → BODY-verify; adopt the first whose
+    # body actually holds our brief. Never adopt an entry we can't prove is ours.
+    _owned = [_t for _t in _titles if _gemini_owns_candidate(_t, pasted_head)]
+    if not _owned:
+        log(f"[{label}] top recent sidebar chats {[t[:40] for t in _titles]} do NOT "
+            "match our brief — not adopting (won't hijack a past run)", "WARN")
         return page, False
-    log(f"[{label}] most-recent sidebar chat '{_title[:60]}' matches our brief "
-        "— opening it", "WARN")
-    try:
-        if not await page.evaluate(_CLICK_BY_TITLE_JS, _title):
-            return page, False
-    except Exception:
-        return page, False
-    _u = ""
-    for _ in range(10):  # wait for the SPA to land on /app/<id>
-        await asyncio.sleep(1.5)
+    for _ci, _cand_title in enumerate(_owned):
+        log(f"[{label}] opening owned sidebar chat '{_cand_title[:60]}' "
+            f"({_ci + 1}/{len(_owned)}) from the sidebar", "WARN")
+        # Capture the pre-click URL so a conv→conv click (when a prior candidate
+        # left us in a conversation) is detected by CHANGE, not just "/app/".
         try:
-            _u = (page.url or "").split("?", 1)[0].rstrip("/")
+            _before_u = (page.url or "").split("?", 1)[0].rstrip("/")
         except Exception:
-            _u = ""
-        if "/app/" in _u:
-            break
-    if "/app/" not in _u:
-        log(f"[{label}] sidebar open never landed on /app/<id> (url={_u or '?'}) "
-            "— not adopting", "WARN")
-        return page, False
-    # The conversation content mounts lazily after the URL flips — retry the
-    # match a few times before the irreversible back-out (adversarial-review
-    # finding: a single-shot check one render-tick early defeated the whole
-    # recovery).
-    _matched = False
-    for _mi in range(3):
-        if await _conversation_matches(page):
-            _matched = True
-            break
-        await asyncio.sleep(2.0)
-    if _matched:
+            _before_u = ""
+        try:
+            if not await page.evaluate(_CLICK_ENTRY_BY_TITLE_JS, _cand_title):
+                log(f"[{label}] sidebar entry '{_cand_title[:40]}' vanished before open — trying next", "WARN")
+                continue
+        except Exception:
+            continue
+        _u = ""
+        for _ in range(10):  # wait for the SPA to route to a NEW /app/<id> (a CLICK, not a URL nav)
+            await asyncio.sleep(1.5)
+            try:
+                _u = (page.url or "").split("?", 1)[0].rstrip("/")
+            except Exception:
+                _u = ""
+            if "/app/" in _u and _u != _before_u:
+                break
+        if "/app/" not in _u or _u == _before_u:
+            log(f"[{label}] sidebar click never routed to a new /app/<id> "
+                f"(url={_u or '?'}) — trying next", "WARN")
+            continue
+        # The conversation content mounts lazily after the URL flips — retry the
+        # match a few times before moving on (adversarial-review finding: a
+        # single-shot check one render-tick early defeated the whole recovery).
+        _matched = False
+        for _mi in range(3):
+            if await _conversation_matches(page):
+                _matched = True
+                break
+            await asyncio.sleep(2.0)
+        if not _matched:
+            log(f"[{label}] opened sidebar chat {_u} but its content doesn't contain "
+                "our brief — trying next", "WARN")
+            continue
         _st = await _adoptable_state(page)
         if _st == "report_present":
-            log(f"[{label}] sidebar chat {_u} matches our brief but already "
-                "holds a COMPLETED report (previous run of the same brief) — "
-                "not adopting, backing out", "WARN")
-        else:
-            log(f"[{label}] ADOPTED most-recent sidebar conversation {_u} "
-                f"(state={_st}) — the send had registered platform-side after "
-                "our confirm window", "WARN")
-            return page, True
-    else:
-        log(f"[{label}] opened sidebar chat {_u} but its content doesn't contain "
-            "our brief — backing out to a fresh home", "WARN")
+            log(f"[{label}] sidebar chat {_u} matches our brief but already holds a "
+                "COMPLETED report (previous run of the same brief) — trying next", "WARN")
+            continue
+        log(f"[{label}] ADOPTED sidebar conversation {_u} (state={_st}) — the send "
+            "had registered platform-side after our confirm window", "WARN")
+        return page, True
+    # None of the top owned candidates body-verified as ours — back out to a
+    # fresh home so [2D] doesn't act on a wrong/stale conversation.
+    log(f"[{label}] none of the top recent owned chats verified as ours — not adopting", "WARN")
     try:
         await page.goto("https://gemini.google.com/app",
                         wait_until="domcontentloaded", timeout=20000)
@@ -33369,6 +33600,17 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 if _gm_wall:
                     _controls.cookie_trust_broken.add("gemini")
                     log(f"[2C] Gemini shows {_gm_wall} — session expired (stale cookie)", "WARN")
+            # bug 2.5: register the FAILED Gemini in `agents` (ChatGPT/Claude
+            # already are, even on failure) so the round-robin's auto-skip
+            # FINALIZATION can reach its tab handle and grey it + close the tab
+            # exactly like a normal skip. verified=False + the skip marker below
+            # mean the poll set drops it on tick 1 (never polled); the tab stays
+            # open as the live Retry/Skip target until the run finalizes P2
+            # without it, at which point the finalizer auto-skips it cleanly.
+            agents["Gemini"] = {"page": gemini_page, "verified": False,
+                                "url": (gemini_page.url if gemini_page else ""),
+                                "research_started_at": time.time(),
+                                "setup_failed": True}
             try:
                 # INTERNAL marker — NOT a user tap. This exact add is what the
                 # 2026-07-11 incident leaked through the user-skip consumer:
@@ -33376,7 +33618,9 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # honest Retry/Skip card was phantom-cleared 4s after raise.
                 # ([2D] is independently gated on gemini_setup_ok; the poll's
                 # internal branch consumes this marker silently on its first
-                # tick — no user_skip emit, card/tile untouched.)
+                # tick — no user_skip emit, card/tile untouched. The card is
+                # finalized to a clean auto-skip at P2 exit — see the
+                # auto-skip finalizer in poll_all_agents_round_robin.)
                 _controls.skipped_agents.add("gemini")
                 _controls.auto_skip_reasons["gemini"] = "setup_failed"
             except Exception:

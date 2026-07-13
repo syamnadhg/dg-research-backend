@@ -148,7 +148,12 @@ def test_2d_cua_recovery_consumes_skip():
 
 def test_2d_skipped_agent_not_registered_for_round_robin():
     # A finalized mid-2D skip must never hand a closed tab to the pollers.
-    idx = _P2.index('agents["Gemini"] = {"page": gemini_page')
+    # NB: target the SUCCESS/2D registration (verified_b) specifically — #951
+    # added a SEPARATE setup-FAIL registration (verified: False) earlier in the
+    # source so the auto-skip finalizer can reach the failed tab; that one is a
+    # different path (setup failed, not a user skip) and is covered by
+    # test_bugs_951.test_failed_gemini_is_registered_in_agents_for_finalization.
+    idx = _P2.index('agents["Gemini"] = {"page": gemini_page, "verified": verified_b')
     guard_region = _P2[max(0, idx - 400):idx]
     assert "_gemini_2d_skipped" in guard_region
 

@@ -78,18 +78,26 @@ def test_chatgpt_completed_chip_forms_are_anchored():
 
 def test_chatgpt_doc_panel_affordances_marker():
     assert "docPanelAffordances" in CGPT_SRC
-    # Geometry gates (right-docked panel) + header-strip scoping.
-    assert "vw * 0.22" in CGPT_SRC and "r.top + 96" in CGPT_SRC, (
-        "the affordance scan must be geometry-scoped to a right-docked "
-        "panel's header strip"
+    # #951 (2026-07-13): the DOWNLOAD button ALONE, in a large right-anchored
+    # panel header with no stop button, is the done signal. The prior rev
+    # required download AND an expand button, but ChatGPT's finished-canvas
+    # header is download + SHARE — so the AND missed every finished canvas and
+    # the poller burned 17+ min scroll-checking a done document. Header-strip
+    # scoping (r.top+96) + right-edge anchor + min-height stay.
+    _i = CGPT_SRC.index("let docPanelAffordances")
+    _blk = CGPT_SRC[_i:_i + 1600]
+    assert "r.top + 96" in _blk, "affordance scan is scoped to the header strip"
+    assert "r.right < vw - 40" in _blk and "r.height < vh * 0.5" in _blk, (
+        "right-edge anchor + min-height keep it specific to a document panel"
     )
-    # Both buttons required: download AND expand/enlarge.
-    assert "/download/.test(t)" in CGPT_SRC
-    assert "expand|enlarge|full" in CGPT_SRC
-    assert "hasDl && hasExpand" in CGPT_SRC, (
-        "BOTH header buttons must be required — a lone download button "
-        "appears elsewhere in chat chrome"
+    assert "/download/.test(t)" in _blk
+    assert "if (hasDl) { docPanelAffordances = true; break; }" in _blk, (
+        "the download button ALONE flips the done signal"
     )
+    # The expand requirement AND the right-dock left floor are both gone —
+    # they were the two reasons the near-full-width finished canvas was missed.
+    assert "hasExpand" not in _blk
+    assert "r.left < vw * 0.22" not in _blk
 
 
 def test_chatgpt_done_marker_includes_new_signals():
