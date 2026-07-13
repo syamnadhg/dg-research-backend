@@ -67,7 +67,10 @@ def test_p2_flow_verifies_after_attach_before_typing():
     mod_src = inspect.getsource(research)
     i_attach = mod_src.index("attached = await attach_brief_file(")
     i_verify = mod_src.index("attached = await _ensure_brief_attached(")
-    i_type = mod_src.index("typed = await type_short_inline_prompt(")
+    # #950: the attach path now types via the shared type_inline_prompt_with_cua
+    # helper (escalates to CUA on a selector miss) instead of a bare
+    # type_short_inline_prompt whose False return was discarded.
+    i_type = mod_src.index("await type_inline_prompt_with_cua(page, browser, cua_client")
     assert i_attach < i_verify < i_type, (
         "the launch flow must verify the chip landed BEFORE typing/sending — "
         "attach_brief_file's True is not evidence the upload processed"

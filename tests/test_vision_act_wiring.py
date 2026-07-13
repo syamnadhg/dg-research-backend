@@ -306,7 +306,10 @@ def test_gemini_validate_mission_keeps_709_placeholder_signal():
 
 
 def test_inline_type_wrapped_no_send():
-    (blk,) = _block_for(_src(research.start_agent_no_gemini_wait), "inline-type")
+    # #950: the inline-type CUA fallback moved into the shared
+    # type_inline_prompt_with_cua helper (used by BOTH the attach path and the
+    # paste→chip top-up); the "no send" contract must survive the move.
+    (blk,) = _block_for(_src(research.type_inline_prompt_with_cua), "inline-type")
     assert "do not click Send" in blk.lower() or "not sent" in blk.lower() or "no send" in blk.lower()
 
 

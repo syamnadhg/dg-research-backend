@@ -276,5 +276,7 @@ def test_launch_sites_reset_persisted_agent_status():
 def test_brief_fail_copy_uses_platform_not_label():
     # 2026-07-13 (#949): 2 -> 3 — the pre-send attachment re-check added a
     # third fail site (chip lost at send time), same platform-name rule.
-    assert _GEM.count('f"Couldn\'t send the brief to {platform}"') == 3
+    # 2026-07-13 (#950): 3 -> 4 — the converted-paste twin of that re-check
+    # (pasted-text chip lost at send time) added a fourth.
+    assert _GEM.count('f"Couldn\'t send the brief to {platform}"') == 4
     assert "brief to {label}" not in _GEM

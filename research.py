@@ -12509,6 +12509,28 @@ _CLAUDE_ATTACH_COUNT_JS = """() => {
     return c;
 }"""
 
+# ChatGPT pasted-text chip census — ChatGPT ALSO auto-converts brief-sized
+# pastes into an attachment chip. Live-probed 2026-07-13: a 74k-char paste
+# leaves the composer at exactly 17 chars ("\\ufeff\\nDeep research\\n " — the
+# DR-pill scaffolding the 03:41 run's "Paste verify: 17/73309 (0%)" was
+# counting) and lands as button[aria-label="Remove file N: <head of the
+# pasted text>"] captioned "Pasted text". That chip IS a delivered brief.
+_CHATGPT_PASTED_CHIP_JS = """(head) => {
+    let n = 0;
+    for (const b of document.querySelectorAll('button[aria-label]')) {
+        if (b.offsetParent === null) continue;
+        const a = b.getAttribute('aria-label') || '';
+        if (!/remove file/i.test(a)) continue;
+        if ((head && a.includes(head)) || /pasted text/i.test(a)) n++;
+    }
+    if (n === 0) {
+        // caption fallback: the chip card itself says "Pasted text"
+        const form = document.querySelector('form');
+        if (form && /pasted text/i.test(form.innerText || '')) n = 1;
+    }
+    return n;
+}"""
+
 # Per-platform composer selectors. Each list leads with the platform's
 # composer-specific selector; the broad `div[contenteditable="true"]`
 # lives last as a fallback. _GENERIC is the unknown-platform default.
@@ -12531,14 +12553,18 @@ _PASTE_SELECTORS_GENERIC = ['#prompt-textarea',
 
 async def _verify_paste_landed(page, brief_text, platform, label, source="dom"):
     """Read the composer's text length and return True iff ≥ 90% of brief.
-    For Claude, a single attachment tile also counts as success (large
-    pastes auto-convert). `source` is just a tag for the success log line."""
-    is_claude = platform.lower() == "claude"
+    Auto-convert is success too: Claude turns large pastes into one
+    attachment tile, and ChatGPT turns them into a "Pasted text" chip
+    (live 2026-07-13: the composer keeps only 17 chars of DR-pill
+    scaffolding, so the char-count alone read 0% on a paste that had in
+    fact fully landed — and the run was failed with the brief sitting
+    right there in the composer). `source` tags the success log line."""
+    plat = platform.lower()
     try:
         content_len = await page.evaluate(_VERIFY_PASTE_JS)
         expected = len(brief_text)
         ratio = content_len / expected if expected > 0 else 0
-        if is_claude and ratio < 0.90:
+        if plat == "claude" and ratio < 0.90:
             try:
                 attach_count = await page.evaluate(_CLAUDE_ATTACH_COUNT_JS)
                 if attach_count == 1:
@@ -12546,6 +12572,19 @@ async def _verify_paste_landed(page, brief_text, platform, label, source="dom"):
                     return True
                 if attach_count > 1:
                     log(f"[{label}] Claude shows {attach_count} attachments (duplicate)", "WARN")
+            except Exception:
+                pass
+        if plat == "chatgpt" and ratio < 0.90:
+            try:
+                _lines = brief_text.strip().splitlines() or [""]
+                chips = await page.evaluate(_CHATGPT_PASTED_CHIP_JS, _lines[0][:12])
+                if chips >= 1:
+                    if chips > 1:
+                        log(f"[{label}] ChatGPT shows {chips} pasted-text chips — duplicate "
+                            f"paste, the brief may be delivered twice", "WARN")
+                    log(f"[{label}] Brief pasted ✓ ({source}, auto-converted to a "
+                        f"'Pasted text' attachment chip)")
+                    return True
             except Exception:
                 pass
         if ratio >= 0.90:
@@ -14344,6 +14383,28 @@ def emit_browser_recovery_status(phase: int, agent: str | None = None):
 # a DNS retry → the whole subsystem was dead code.
 
 
+# fail_agent emit timestamps, keyed by agent — lets the generic launch-failed
+# fallback card tell whether a MORE SPECIFIC card already fired in the same
+# failure cascade (they land seconds apart and share one alert_id, so the
+# generic one would overwrite the specific message).
+_AGENT_ERROR_CARD_TS: dict = {}
+
+
+def _agent_error_recently_carded(agent_key: str, within: float = 45.0) -> bool:
+    """True if fail_agent emitted a card for this agent in the last `within`
+    seconds. Window is deliberately tight: the double-card cascade fires in
+    seconds, while a user Retry → second failure takes minutes — a stale
+    stamp must never eat the only card of a NEW failure. Uses a MONOTONIC
+    clock so an NTP step can't stretch/collapse the window (#950 review).
+    Callers on a path that runs slow page probes before the generic card
+    should snapshot this at the TOP of the failure branch, not after."""
+    try:
+        ts = _AGENT_ERROR_CARD_TS.get(agent_key)
+        return ts is not None and (time.monotonic() - ts) < within
+    except Exception:
+        return False
+
+
 def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False):
     """Template B: Phase 2 per-agent error alert. Emits pipeline_error
     scoped to one agent with [Retry (hard), Skip]. NO Stop.
@@ -14392,6 +14453,12 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     emit_event("pipeline_error", phase=2, agent=agent_key,
                error=title, details=details, actions=actions,
                dismissible=True, alert_id=f"agent_{agent_key}_error")
+    # 2026-07-13: stamp the emit so the caller's GENERIC "didn't start" card
+    # doesn't fire seconds later and OVERWRITE this (same alert_id) with a
+    # less specific message — the 03:42 run persisted "Couldn't send the
+    # brief to ChatGPT" and then clobbered it with "ChatGPT didn't start".
+    # Monotonic clock (paired with _agent_error_recently_carded).
+    _AGENT_ERROR_CARD_TS[agent_key] = time.monotonic()
     # Tile/Icon Consistency: persist errored status. If user picks Retry
     # and the agent eventually completes, the phase_complete handler
     # overwrites this with "complete". If they pick Skip, the
@@ -30140,32 +30207,100 @@ async def attach_brief_file(browser, page, brief_path, platform, label, extra_fi
         except Exception:
             pass
 
-        # PRIMARY — hidden file input (most reliable across all platforms)
-        file_input = await page.query_selector('input[type="file"]')
-        if file_input:
+        # PRIMARY — hidden file input. #950 (2026-07-13 03:40 run): the
+        # composer's uploader is NOT always the first input[type=file] in
+        # document order. 2A reuses P1's warm tab (post-canvas, client-side
+        # New chat), which can leave stale file inputs ahead of the live
+        # composer's — and set_input_files on a stale input is a SILENT
+        # no-op: no chip, no spinner, no toast (the run failed verification
+        # 3× exactly that way, while the same attach on a clean page landed
+        # its chip in 2.5s). Rank composer-form inputs first, feed each
+        # candidate, and accept only when the page actually reacts (chip /
+        # spinner / even a failure toast proves the input is wired —
+        # _ensure_brief_attached settles and retries from there).
+        fname = Path(str(brief_path)).name
+        # Rank BEFORE capping — a composer input sitting late in document
+        # order must not be dropped by the try-budget.
+        handles = (await page.query_selector_all('input[type="file"]'))[:8]
+        ranked = []
+        for i, h in enumerate(handles):
             try:
-                await file_input.set_input_files(all_paths)
-                await asyncio.sleep(3)  # Wait for UI to acknowledge
-                if extra_files:
-                    log(f"[{label}] Brief + {len(extra_files)} user file(s) attached via hidden file input")
-                else:
-                    log(f"[{label}] Brief attached via hidden file input")
-                return True
-            except Exception as _multi_err:
-                if extra_files:
+                in_composer = await h.evaluate(
+                    """el => {
+                        const form = el.closest('form');
+                        return !!(form && form.querySelector(
+                            '#prompt-textarea, .ProseMirror, textarea, '
+                            + 'div[contenteditable="true"]'));
+                    }""")
+            except Exception:
+                in_composer = False
+            ranked.append((0 if in_composer else 1, i, h))
+        ranked.sort(key=lambda t: (t[0], t[1]))
+        def _real_err(s):
+            e = str(s.get("error") or "")
+            return bool(e) and not e.startswith("probe_error")
+        for grp, i, file_input in ranked[:4]:
+            try:
+                # Baseline BEFORE feeding — so a spinner/toast LINGERING from a
+                # prior attempt (residual-clear removes chips, not toasts) can't
+                # be miscredited to this input (#950 review: the reaction census
+                # is page-global; only a NEW signal proves THIS input is wired).
+                base = await _brief_attachment_state(page, fname)
+                extras_delivered = bool(extra_files)
+                try:
+                    await file_input.set_input_files(all_paths)
+                except Exception as _multi_err:
+                    if not extra_files:
+                        raise
                     # Multi-file may fail on platforms that allow only one
                     # input file at a time. Retry with brief alone so the
                     # phase still proceeds — extras are still on disk for
                     # P3 NLM upload.
                     log(f"[{label}] Multi-file attach failed ({_multi_err}); retrying with brief only", "WARN")
                     await file_input.set_input_files(str(brief_path))
-                    await asyncio.sleep(3)
-                    log(f"[{label}] Brief attached (extras dropped — will reach NLM via P3)")
+                    extras_delivered = False
+                # Poll for a page reaction (chip census, not blind trust) —
+                # the live chip landed in ~2.5s; give each input 7.5s.
+                # `found` (the filename chip) is input-specific and always
+                # counts. `processing`/`error` are page-global, so they only
+                # count when NEW vs baseline AND the input is the composer's
+                # (a stale non-composer input must show the actual chip).
+                reacted = False
+                for _ in range(5):
+                    await asyncio.sleep(1.5)
+                    st = await _brief_attachment_state(page, fname)
+                    if st.get("found"):
+                        reacted = True
+                        break
+                    if grp == 0 and (
+                            (st.get("processing") and not base.get("processing"))
+                            or (_real_err(st) and not _real_err(base))):
+                        reacted = True
+                        break
+                if reacted:
+                    if extras_delivered:
+                        log(f"[{label}] Brief + {len(extra_files)} user file(s) attached via "
+                            f"file input {i + 1}/{len(handles)} (composer-form={grp == 0})")
+                    elif extra_files:
+                        log(f"[{label}] Brief attached (extras dropped — will reach NLM via P3) "
+                            f"via file input {i + 1}/{len(handles)} (composer-form={grp == 0})")
+                    else:
+                        log(f"[{label}] Brief attached via file input "
+                            f"{i + 1}/{len(handles)} (composer-form={grp == 0})")
                     return True
-                raise
+                log(f"[{label}] file input {i + 1}/{len(handles)} took the file but the page "
+                    f"shows no chip/spinner/toast — stale input, trying next", "WARN")
+            except Exception as _fi_err:
+                log(f"[{label}] file input {i + 1}/{len(handles)} failed: {_fi_err}", "WARN")
+        if handles:
+            log(f"[{label}] No file input produced a visible attachment "
+                f"({len(handles)} candidate(s)) — trying chooser fallback", "WARN")
 
         # FALLBACK — queue file for OS-level chooser then click attach
         # (single-file path; extras can't be plumbed through this branch).
+        # #950 review: census the result here too — a blind True would
+        # re-introduce the exact pattern the input loop above removed (and
+        # ChatGPT's "+" opens a MENU, not a chooser, so the click can no-op).
         browser.set_upload_file(str(brief_path))
         for sel in ['button[aria-label*="Attach"]', 'button[aria-label*="Upload"]',
                     'button[data-testid*="upload"]', 'button[data-testid*="file"]']:
@@ -30173,10 +30308,19 @@ async def attach_brief_file(browser, page, brief_path, platform, label, extra_fi
                 btn = await page.query_selector(sel)
                 if btn and await btn.is_visible():
                     await btn.click()
-                    await asyncio.sleep(3)
+                    reacted = False
+                    for _ in range(3):
+                        await asyncio.sleep(1.5)
+                        st = await _brief_attachment_state(page, fname)
+                        if st.get("found") or st.get("processing") or _real_err(st):
+                            reacted = True
+                            break
                     browser.clear_upload_file()
-                    log(f"[{label}] Brief attached via button click")
-                    return True
+                    if reacted:
+                        log(f"[{label}] Brief attached via button click ({sel})")
+                        return True
+                    log(f"[{label}] Attach button ({sel}) clicked but no attachment "
+                        f"appeared — trying next", "WARN")
             except Exception:
                 continue
         browser.clear_upload_file()
@@ -30192,16 +30336,24 @@ async def attach_brief_file(browser, page, brief_path, platform, label, extra_fi
 async def _brief_attachment_state(page, filename):
     """One-shot composer-attachment probe. Returns a dict:
       {"found": bool, "processing": bool, "error": str}
-    found      — the attachment chip (the FILENAME as visible text) is on the
-                 page. Pre-send, the composer chip is the only place the
-                 brief's filename can appear, so visible-text presence is the
-                 chip signal (innerText — hidden nodes don't count).
+    found      — the attachment chip is on the page: the FILENAME as visible
+                 text (innerText — hidden nodes don't count), OR a visible
+                 remove-attachment button whose aria-label names the file.
+                 Live-probed 2026-07-13: ChatGPT's chip is
+                 button[aria-label="Remove file 1: brief.md"] with the name
+                 in a visible div; Claude's tile shows the filename with a
+                 bare "Remove" button — so both signals stay ORed. The chip
+                 title truncates long names, so the aria check also accepts
+                 a 12-char prefix of the name.
     processing — a visible progress spinner sits in the composer region
                  (bottom ~45% of the viewport); the upload is still being
                  processed and the chip may yet fail.
     error      — a platform upload-failure toast is visible (matched loosely:
                  'There was a problem processing the upload' was the live
-                 2026-07-13 ChatGPT toast). Never raises."""
+                 2026-07-13 ChatGPT toast).
+    A probe crash is LOGGED and surfaced as error='probe_error: …' — the
+    03:40 run's found=False/error='' was indistinguishable from an
+    evaluate() throw, which this closes. Never raises."""
     try:
         return await page.evaluate("""(fname) => {
             const out = { found: false, processing: false, error: '' };
@@ -30214,6 +30366,18 @@ async def _brief_attachment_state(page, filename):
                 if (low.includes(e)) { out.error = e; break; }
             }
             out.found = body.includes(fname);
+            if (!out.found) {
+                const prefix = fname.slice(0, 12);
+                for (const b of document.querySelectorAll(
+                        'button[aria-label], [role="button"][aria-label]')) {
+                    if (b.offsetParent === null) continue;
+                    const a = b.getAttribute('aria-label') || '';
+                    if (!/remove|delete/i.test(a)) continue;
+                    if (a.includes(fname) || (prefix && a.includes(prefix))) {
+                        out.found = true; break;
+                    }
+                }
+            }
             const vh = window.innerHeight || document.documentElement.clientHeight;
             for (const el of document.querySelectorAll(
                     '[role="progressbar"], [class*="animate-spin"], ' +
@@ -30228,8 +30392,9 @@ async def _brief_attachment_state(page, filename):
             }
             return out;
         }""", Path(str(filename)).name)
-    except Exception:
-        return {"found": False, "processing": False, "error": ""}
+    except Exception as e:
+        log(f"[attach-verify] attachment-state probe crashed: {e}", "WARN")
+        return {"found": False, "processing": False, "error": f"probe_error: {e}"}
 
 
 async def _ensure_brief_attached(browser, page, brief_path, platform, label,
@@ -30253,6 +30418,11 @@ async def _ensure_brief_attached(browser, page, brief_path, platform, label,
         while time.time() < deadline:
             state = await _brief_attachment_state(page, fname)
             if state.get("error"):
+                if str(state["error"]).startswith("probe_error"):
+                    log(f"[{label}] attachment verify: state probe crashed "
+                        f"('{state['error']}') on attempt {attempt} — retrying probe", "WARN")
+                    await asyncio.sleep(1.5)
+                    continue
                 log(f"[{label}] attachment verify: platform reported upload "
                     f"failure ('{state['error']}') on attempt {attempt}", "WARN")
                 break
@@ -30308,6 +30478,48 @@ async def type_short_inline_prompt(page, platform, label):
         return False
     except Exception as e:
         log(f"[{label}] Inline prompt type failed: {e}", "WARN")
+        return False
+
+
+async def type_inline_prompt_with_cua(page, browser, cua_client, platform, label, verbose=False):
+    """Type the short operative inline prompt; if the deterministic type
+    fails (composer selector miss on a warm/canvas tab), escalate to the
+    CUA act tier — the DR agent needs an INSTRUCTION, not just an attached
+    brief/pasted chip. Shared by the attach path and the paste→chip top-up
+    (2026-07-13 #950: the top-up ignored type_short_inline_prompt's False,
+    silently sending a bare chip with no instruction on a selector miss —
+    exactly the failure the attach path already guarded)."""
+    typed = await type_short_inline_prompt(page, platform, label)
+    if typed:
+        return True
+    log(f"[{label}] Inline prompt type failed — trying CUA fallback", "WARN")
+    try:
+        await browser.switch_to_page(page)
+        _inline_type_sys = "Type a short research prompt referring to the attached brief — then stop (do NOT send)."
+        _inline_type_user = ("Click the message input, type: 'Please perform deep research on the topic "
+                             "described in the attached brief. Use Deep Research mode and produce a "
+                             "comprehensive report with citations.' Then STOP — do not click Send.")
+
+        async def _inline_type_cua():
+            return await agent_loop(cua_client, browser,
+                _inline_type_sys, _inline_type_user,
+                model=CUA_MODEL, max_iterations=6, verbose=verbose)
+
+        # #839 act tier: types the reference prompt but must NOT send
+        # (the send is a separate deterministic step); result ignored,
+        # verify_*_generating downstream is the ground truth.
+        await _shadow_observed_cua(
+            page, hotspot_id="inline-type", phase=2, platform=platform.lower(),
+            current_step="type_reference_prompt_no_send",
+            context_hint="click the composer and TYPE a short prompt referring to the "
+                         "attached brief (deep research + citations) — then STOP. Do "
+                         "NOT click Send; the send is a separate step.",
+            expected_outcome="the reference prompt is typed into the composer (not sent)",
+            cua_coro_factory=_inline_type_cua,
+            mission_prompt=f"{_inline_type_sys}\n\nTASK: {_inline_type_user}")
+        return True
+    except Exception as _cua_err:
+        log(f"[{label}] Inline-prompt CUA fallback errored: {_cua_err}", "WARN")
         return False
 
 
@@ -32041,6 +32253,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     is_gemini = platform.lower() == "gemini"
     use_file_attach = brief_path and Path(brief_path).exists() and not is_gemini
     _brief_via_attach = False  # True only after a VERIFIED attach (see below)
+    _paste_chip_head = None    # set when a ChatGPT paste auto-converted to a chip
 
     if use_file_attach:
         if source_paths:
@@ -32063,33 +32276,8 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 source_paths=source_paths)
         _brief_via_attach = bool(attached)  # pre-send re-check gate (below)
         if attached:
-            typed = await type_short_inline_prompt(page, platform, label)
-            if not typed:
-                log(f"[{label}] Inline prompt type failed — trying CUA fallback", "WARN")
-                await browser.switch_to_page(page)
-
-                _inline_type_sys = "Type a short research prompt referring to the attached brief — then stop (do NOT send)."
-                _inline_type_user = ("Click the message input, type: 'Please perform deep research on the topic "
-                                     "described in the attached brief. Use Deep Research mode and produce a "
-                                     "comprehensive report with citations.' Then STOP — do not click Send.")
-
-                async def _inline_type_cua():
-                    return await agent_loop(cua_client, browser,
-                        _inline_type_sys, _inline_type_user,
-                        model=CUA_MODEL, max_iterations=6, verbose=verbose)
-
-                # #839 act tier: types the reference prompt but must NOT send
-                # (the send is a separate deterministic step); result ignored,
-                # verify_*_generating downstream is the ground truth.
-                await _shadow_observed_cua(
-                    page, hotspot_id="inline-type", phase=2, platform=platform.lower(),
-                    current_step="type_reference_prompt_no_send",
-                    context_hint="click the composer and TYPE a short prompt referring to the "
-                                 "attached brief (deep research + citations) — then STOP. Do "
-                                 "NOT click Send; the send is a separate step.",
-                    expected_outcome="the reference prompt is typed into the composer (not sent)",
-                    cua_coro_factory=_inline_type_cua,
-                    mission_prompt=f"{_inline_type_sys}\n\nTASK: {_inline_type_user}")
+            await type_inline_prompt_with_cua(page, browser, cua_client,
+                                              platform, label, verbose)
         else:
             log(f"[{label}] Brief attachment failed — falling back to inline paste", "WARN")
             # Attach failed → inline the source docs' text so the agent still
@@ -32146,6 +32334,34 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 fail_agent(platform_l, f"Couldn't send the brief to {platform}",
                            f"We couldn't hand the research brief to {platform}. Retry to try again, or Skip it.")
             return page, False
+
+    # ── Paste→chip top-up (2026-07-13) ──
+    # ChatGPT (and Claude) auto-convert a brief-sized paste into an
+    # attachment chip/tile, leaving the composer EMPTY. Send needs an
+    # operative message — and the DR agent needs an instruction, not just
+    # a bare attachment — so after a converted paste, type the same short
+    # inline prompt the attach path uses. Composer-emptiness gates it: a
+    # paste that stayed text (Gemini always; small briefs) skips this.
+    if not _brief_via_attach and not is_gemini:
+        try:
+            _comp_len = await page.evaluate(_VERIFY_PASTE_JS)
+            if _comp_len < 200:
+                log(f"[{label}] Pasted brief auto-converted to an attachment chip "
+                    f"(composer at {_comp_len} chars) — typing the operative inline prompt")
+                if platform_l == "chatgpt":
+                    # remember the chip's head text — the pre-send re-check
+                    # verifies the pasted chip survived (it is an upload too
+                    # and can die to a late processing failure, same as the
+                    # attach path's chip).
+                    _pc_lines = brief_to_paste.strip().splitlines() or [""]
+                    _paste_chip_head = _pc_lines[0][:12]
+                # #950 review: escalate to CUA on a type miss — the same
+                # guard the attach path has. A silently-failed type here
+                # would send a bare chip with NO operative instruction.
+                await type_inline_prompt_with_cua(page, browser, cua_client,
+                                                  platform, label, verbose)
+        except Exception:
+            pass
 
     # ── Just-before-send: ensure the required mode is STILL active ──
     # Claude especially can silently drop Research tool / Extended model
@@ -32384,6 +32600,26 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                                                 max_attempts=2):
                 log(f"[{label}] CRITICAL: brief chip lost at send time and "
                     f"re-attach failed — NOT sending a brief-less run", "ERROR")
+                fail_agent(platform_l, f"Couldn't send the brief to {platform}",
+                           f"{platform} kept rejecting the brief upload. "
+                           f"Retry to try again, or Skip it.")
+                return page, False
+    elif _paste_chip_head is not None:
+        # Converted-paste twin of the check above: the "Pasted text" chip is
+        # an upload too — a late processing failure can kill it after verify,
+        # and the composer now only holds the short inline prompt (the exact
+        # stale-run the attach-path check exists to prevent).
+        try:
+            _pc_chips = await page.evaluate(_CHATGPT_PASTED_CHIP_JS, _paste_chip_head)
+        except Exception as _pc_err:
+            _pc_chips = -1  # probe crashed — don't block the send on a broken probe
+            log(f"[{label}] pre-send pasted-chip probe crashed: {_pc_err}", "WARN")
+        if _pc_chips == 0:
+            log(f"[{label}] pre-send re-check: pasted-text chip gone — "
+                f"re-pasting before Send", "WARN")
+            if not await verified_paste_brief(page, brief_to_paste, platform, label):
+                log(f"[{label}] CRITICAL: pasted brief lost at send time and "
+                    f"re-paste failed — NOT sending a brief-less run", "ERROR")
                 fail_agent(platform_l, f"Couldn't send the brief to {platform}",
                            f"{platform} kept rejecting the brief upload. "
                            f"Retry to try again, or Skip it.")
@@ -32845,6 +33081,12 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2A] ChatGPT setup ended after a user Skip — no failure card", "INFO")
             else:
                 log("[2A] ChatGPT setup failed", "ERROR")
+                # Snapshot BEFORE the page probes below (#950 review): those
+                # probes (_hv_setup_fail_card / _page_shows_login_wall) can
+                # run seconds on a stalled page, and the specific card was
+                # already emitted by the launch flow — reading the window
+                # after the probes could let it expire and clobber the card.
+                _cg_specific_already = _agent_error_recently_carded("chatgpt")
                 # Mark as terminally failed so the round-robin doesn't sit on it
                 # forever waiting for events that will never arrive.
                 emit_event("agent_progress", phase=2, agent="chatgpt", status="failed",
@@ -32865,6 +33107,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         fail_agent("chatgpt", "ChatGPT looks signed out",
                                    "ChatGPT is showing its sign-in page — the saved session expired. "
                                    "Sign in using the open browser (or run the login command on the device), then Retry.")
+                    elif _cg_specific_already:
+                        # The launch flow already carded the SPECIFIC cause
+                        # seconds ago (e.g. "Couldn't send the brief") — the
+                        # generic card shares its alert_id and would overwrite
+                        # the better message (live 2026-07-13 03:42). Snapshot
+                        # taken before the probes above so it can't expire.
+                        log("[2A] specific failure card already up — skipping the generic 'didn't start' card", "INFO")
                     else:
                         fail_agent("chatgpt", "ChatGPT didn't start",
                                    "ChatGPT failed to launch after two tries. Retry to start it fresh, or Skip it.")
@@ -32962,6 +33211,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 log("[2B] Claude setup ended after a user Skip — no failure card", "INFO")
             else:
                 log("[2B] Claude setup failed", "ERROR")
+                # Snapshot before the page probes (#950 review — see the 2A twin).
+                _cl_specific_already = _agent_error_recently_carded("claude")
                 emit_event("agent_progress", phase=2, agent="claude", status="failed",
                            progress="Claude setup/paste failed — agent did not start.")
                 # #896: human-verification wall first — Claude's in-app
@@ -32978,6 +33229,10 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         fail_agent("claude", "Claude looks signed out",
                                    "Claude is showing its sign-in page — the saved session expired. "
                                    "Sign in using the open browser (or run the login command on the device), then Retry.")
+                    elif _cl_specific_already:
+                        # See the 2A twin — don't clobber the specific card
+                        # (snapshot taken before the probes above).
+                        log("[2B] specific failure card already up — skipping the generic 'didn't start' card", "INFO")
                     else:
                         fail_agent("claude", "Claude didn't start",
                                    "Claude failed to launch after two tries. Retry to start it fresh, or Skip it.")
