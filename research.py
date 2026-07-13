@@ -446,6 +446,40 @@ def _ffprobe_bin() -> str | None:
     return None
 
 
+def _audio_duration_sec(path) -> int:
+    """Audio duration in whole seconds; 0 = unknown. THE duration probe —
+    every durationSec write must come through here.
+
+    Primary: tinytag (pure Python, MIT, declared in pyproject/requirements)
+    — reads the m4a/mp4 mvhd atom, mp3 frames, wav RIFF, etc. with NO
+    system binary, so a fresh `pipx install superresearch` on a clean
+    machine probes correctly out of the box (verified against ffprobe on
+    real NotebookLM m4a files: exact match). Fallback: ffprobe via
+    _ffprobe_bin() for anything exotic tinytag can't parse. Both guarded —
+    an un-upgraded venv without tinytag degrades to the fallback rather
+    than crashing (repo convention for optional-lib imports)."""
+    try:
+        from tinytag import TinyTag
+        dur = TinyTag.get(str(path)).duration
+        if dur and dur > 0:
+            return int(dur)
+    except Exception as e:
+        log(f"tinytag duration probe failed for {Path(str(path)).name}: {e} "
+            f"— trying ffprobe", "DEBUG")
+    try:
+        ffprobe = _ffprobe_bin()
+        if ffprobe:
+            r = subprocess.run(
+                [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=5,
+                creationflags=_PS_NO_WINDOW)
+            return int(float(r.stdout.strip()))
+    except Exception:
+        pass
+    return 0
+
+
 def _read_user_scope_env(name: str) -> str:
     """Read a Windows User-scope env var via PowerShell. Empty string
     on non-Windows or failure. Persistent across shells — settable
@@ -35211,28 +35245,18 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
     # even if sync fails.
     if audio_path and audio_path.exists():
         try:
-            dur_sec = 0
-            try:
-                # B2 (2026-05-01): wrap sync subprocess in asyncio.to_thread so
-                # the asyncio event loop (and _heartbeat_loop on the same loop)
-                # keeps ticking. Without this, ffprobe blocked the loop for up
-                # to 5s — 1/3 of the 15s offline threshold.
-                _ffprobe = _ffprobe_bin()
-                if not _ffprobe:
-                    raise FileNotFoundError("ffprobe not found on PATH or in "
-                                            "/opt/homebrew/bin, /usr/local/bin")
-                _probe = await asyncio.to_thread(
-                    subprocess.run,
-                    [_ffprobe, "-v", "quiet", "-show_entries",
-                     "format=duration", "-of", "csv=p=0", str(audio_path)],
-                    capture_output=True, text=True, timeout=5)
-                dur_sec = int(float(_probe.stdout.strip()))
-            except Exception as _dur_e:
-                # 2026-07-12: never swallow this silently — durationSec: 0
-                # freezes the FE player's progress bar (seek clamps to 0).
-                log(f"[Phase3] audio duration probe failed ({_dur_e}) — "
-                    f"writing durationSec=0; FE will self-heal from media "
-                    f"metadata", "WARN")
+            # B2 (2026-05-01): to_thread so the asyncio event loop (and
+            # _heartbeat_loop on it) keeps ticking — a blocking probe ate
+            # 1/3 of the 15s offline threshold. 2026-07-12: probing goes
+            # through _audio_duration_sec (tinytag primary — pure Python,
+            # pip-installed, works on a clean machine with no ffmpeg;
+            # ffprobe fallback). durationSec: 0 froze the FE player's
+            # progress bar (seek clamps to 0), so a failed probe WARNs.
+            dur_sec = await asyncio.to_thread(_audio_duration_sec, audio_path)
+            if dur_sec <= 0:
+                log("[Phase3] audio duration probe failed (tinytag + ffprobe) "
+                    "— writing durationSec=0; FE will self-heal from media "
+                    "metadata", "WARN")
             # B2: Firebase Storage upload (50-100MB on slow uplinks) was the
             # biggest single blocker — easily blew past the 15s offline window.
             audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
@@ -36098,19 +36122,8 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     pod_dir = queue_dir / "podcasts"
     if pod_dir.exists():
         for f in pod_dir.glob("*.*"):
-            # Try to get duration from ffprobe (resolved via _ffprobe_bin —
-            # the launchd PATH lacks /opt/homebrew/bin on macOS).
-            dur_sec = 0
-            try:
-                _ffprobe = _ffprobe_bin()
-                if _ffprobe:
-                    r = subprocess.run([_ffprobe, "-v", "quiet", "-show_entries",
-                        "format=duration", "-of", "csv=p=0", str(f)],
-                        capture_output=True, text=True, timeout=5,
-                        creationflags=_PS_NO_WINDOW)
-                    dur_sec = int(float(r.stdout.strip()))
-            except Exception:
-                pass
+            # tinytag primary / ffprobe fallback — see _audio_duration_sec.
+            dur_sec = _audio_duration_sec(f)
             mins, secs = divmod(dur_sec, 60)
             podcasts.append({"id": f.stem, "name": f.name,
                              "duration": f"{mins}:{secs:02d}" if dur_sec else "",

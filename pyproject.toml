@@ -77,6 +77,12 @@ dependencies = [
     # sweep). Guarded imports degrade gracefully if absent, but declare it so
     # a fresh install gets full process hygiene. Keep in sync with requirements.txt.
     "psutil>=6.0",
+    # Podcast duration probe (pure Python, MIT — reads m4a/mp3/wav metadata
+    # with no system binary). 2026-07-12: replaces the hard ffprobe dependency
+    # that silently failed on machines without ffmpeg (or with it off the
+    # service PATH), shipping durationSec: 0 and freezing the FE player.
+    # ffprobe remains a guarded fallback only. Keep in sync with requirements.txt.
+    "tinytag>=2.0",
 ]
 
 [project.optional-dependencies]
