@@ -17299,7 +17299,24 @@ async def detect_completion_chatgpt(page):
     path (fired mid-stream during long research). Removed entirely. The
     caller is responsible for the 2-cycle flatness gate (text/sources/steps
     all flat across 2 polling cycles) before extracting — we only report
-    the snapshot here, never decide on flatness."""
+    the snapshot here, never decide on flatness.
+
+    2026-07-13 (two E2E runs, detector blind past completion — 10 min on
+    the chip layout, 30+ min on the canvas layout until the user stopped):
+      • completedChip: the "Research completed in Xm · N citations" chip
+        that replaces "Researching…" is matched on body.TEXTCONTENT — it
+        was visibly on the page (our own panel tracker used it as a click
+        anchor) while the innerText regex missed it: ChatGPT keeps it in a
+        collapsed/virtualized node that innerText excludes. Anchored forms
+        only ("in Xm" / "· N citations|sources") so report prose about
+        completed research can't false-positive.
+      • docPanelAffordances (user-directed): when DR finishes on the canvas
+        layout, the Researching side panel (progress bar + stop) is
+        REPLACED by a Document panel whose header carries download +
+        expand/enlarge buttons — that swap IS the done signal; no need to
+        open or scroll the document. Geometry-scoped scan (right-docked
+        panel, header strip), both buttons required, never overrides an
+        explicit stop button."""
     try:
         host = await page.evaluate("""() => {
             let hasStop = !!document.querySelector(
@@ -17323,7 +17340,42 @@ async def detect_completion_chatgpt(page):
             // where ChatGPT renames the badge or runs a non-thinking-mode DR
             // variant where "Thought for X" never appears. Either signal counts.
             const researchDone = /research\\s+complete(?:d)?(?:[\\s·•—\\-]+\\d[\\d,]*\\s+sources?)?/i.test(bl);
-            const doneMarker = thoughtFor || researchDone;
+            // 2026-07-13: the completed chip lives in a node innerText
+            // EXCLUDES (collapsed drawer header / virtualized) — textContent
+            // includes hidden nodes, and the anchored tails make it done-only
+            // ("Researching · Xm" is the mid-run form; "completed in Xm" /
+            // "complete · N citations" render only when DR has finished).
+            const btc = (document.body?.textContent || '');
+            const completedChip =
+                /research\\s+complete(?:d)?\\s+in\\s+\\d+\\s*[hms]/i.test(btc) ||
+                /research\\s+complete(?:d)?\\s*[·•]\\s*\\d[\\d,]*\\s+(?:citations?|sources?)/i.test(btc);
+            // 2026-07-13 Document-panel affordances: right-docked geometry
+            // panel (same gates as the Claude geo scan) whose HEADER STRIP
+            // carries a download button AND an expand/enlarge button — the
+            // canvas header that replaces the Researching panel on finish.
+            const vw = window.innerWidth || document.documentElement.clientWidth;
+            const vh = window.innerHeight || document.documentElement.clientHeight;
+            let docPanelAffordances = false;
+            for (const el of document.querySelectorAll('div, aside, section')) {
+                const r = el.getBoundingClientRect();
+                if (r.width < 380 || r.width > vw * 0.85) continue;
+                if (r.left < vw * 0.22) continue;
+                if (r.right < vw - 40) continue;
+                if (r.height < vh * 0.5) continue;
+                let hasDl = false, hasExpand = false;
+                for (const b of el.querySelectorAll('button, [role="button"]')) {
+                    const br = b.getBoundingClientRect();
+                    if (br.top > r.top + 96) continue;      // header strip only
+                    const t = ((b.getAttribute('aria-label') || '') + ' ' +
+                               (b.getAttribute('title') || '') + ' ' +
+                               (b.getAttribute('data-testid') || '')).toLowerCase();
+                    if (/download/.test(t)) hasDl = true;
+                    if (/expand|enlarge|full\\s?screen|maximi[sz]e/.test(t)) hasExpand = true;
+                    if (hasDl && hasExpand) break;
+                }
+                if (hasDl && hasExpand) { docPanelAffordances = true; break; }
+            }
+            const doneMarker = thoughtFor || researchDone || completedChip || docPanelAffordances;
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
             const hostLen = msgs.length ? msgs[msgs.length-1].innerText.length : 0;
             // Sources count: external citation links anywhere on the page
@@ -17332,7 +17384,8 @@ async def detect_completion_chatgpt(page):
             const steps = document.querySelectorAll(
                 '[class*="research"] li, [class*="step"], [class*="task"]'
             ).length;
-            return { hasStop, thoughtFor, researchDone, doneMarker, hostLen, sources, steps };
+            return { hasStop, thoughtFor, researchDone, completedChip,
+                     docPanelAffordances, doneMarker, hostLen, sources, steps };
         }""")
 
         iframe_stop = False
@@ -17383,12 +17436,17 @@ async def detect_completion_chatgpt(page):
             pass
 
         has_stop = host["hasStop"] or iframe_stop
-        # done_marker = ("Thought for X seconds" badge OR "Research complete · N sources" text).
-        # Either is enough — non-thinking DR variants don't produce the badge,
-        # and renamed-badge variants don't match /thought for \d+/.
+        # done_marker = Thought-for badge OR "Research complete" innerText OR
+        # (2026-07-13) the completed chip via textContent OR the Document-
+        # panel header affordances. Any is enough — non-thinking DR variants
+        # don't produce the badge, the chip hides from innerText, and the
+        # canvas layout may carry NO text marker at all (30-min blind run).
         has_done_marker = bool(host.get("doneMarker")) or iframe_thought
         which_marker = ("thought_for" if host.get("thoughtFor") or iframe_thought
-                        else "research_complete" if host.get("researchDone") else "")
+                        else "research_complete" if host.get("researchDone")
+                        else "completed_chip" if host.get("completedChip")
+                        else "doc_panel_affordances" if host.get("docPanelAffordances")
+                        else "")
         partial_len = max(int(host.get("hostLen") or 0), iframe_len)
         sources = max(int(host.get("sources") or 0), iframe_sources)
         steps = max(int(host.get("steps") or 0), iframe_steps)
@@ -17397,7 +17455,8 @@ async def detect_completion_chatgpt(page):
         if has_stop:
             return (False, f"stop_btn_present (text={partial_len}, src={sources}, st={steps})", snap)
         if not has_done_marker:
-            return (False, "no_done_marker (Thought-for badge AND Research-complete text both missing)", snap)
+            return (False, "no_done_marker (Thought-for badge, Research-complete text, "
+                           "completed chip AND doc-panel affordances all missing)", snap)
         return (True, f"no_stop + done_marker={which_marker}", snap)
     except Exception as e:
         return (False, f"detect_error: {e}", {})
@@ -17666,43 +17725,63 @@ async def detect_completion_gemini(page):
     Running-signal: stop-button scan broadened to [role=button]/aria on the
     report card, plus the guarded running-CSS-animation tier (offsetParent
     + getAnimations().playState — see scrape_progress_gemini 2026-05-14
-    note on persisted-but-finished animations)."""
+    note on persisted-but-finished animations).
+
+    2026-07-13 (two E2E runs, detector blind for the WHOLE research —
+    "start_research_btn_visible (pre-research)" every tick while its own
+    snapshot held the finished 111k-char report): the OLD plan bubble keeps
+    its "Start research" button in the conversation DOM after the click, so
+    the pre-research gate never released and the #897b trio marker below it
+    was unreachable — the same stale-gate-outranks-done-marker disease as
+    Claude's liveActive (fixed 2026-07-11). Now: the done-only markers
+    (trio / completion chat line) outrank the stale Start button — those
+    render exclusively on a FINISHED report, so their presence proves the
+    Start button is leftover scrollback. Explicit stop buttons still veto
+    everything; the weak running signals (streaming markers / animation
+    tier) yield to the strong markers but still veto the weaker
+    Share&Export-alone path. The Start scan also requires the button to be
+    VISIBLE (offsetParent) — a display:none leftover must not gate."""
     try:
         data = await page.evaluate("""() => {
-            let hasStop = false;
+            let hasStopExplicit = false;
             const stopSels = 'button[aria-label="Stop"], button[aria-label*="stop"], ' +
                              'button[aria-label="Cancel"], button[title*="Stop"], ' +
                              '[role="button"][aria-label*="stop" i]';
-            if (document.querySelector(stopSels)) hasStop = true;
-            if (!hasStop) {
+            if (document.querySelector(stopSels)) hasStopExplicit = true;
+            if (!hasStopExplicit) {
                 for (const b of document.querySelectorAll('button, [role="button"]')) {
                     const txt = (b.textContent || '').trim().toLowerCase();
                     if (txt === 'stop' || txt === 'stop generating' || txt === 'cancel') {
-                        hasStop = true; break;
+                        hasStopExplicit = true; break;
                     }
                 }
             }
-            if (!hasStop && document.querySelector(
+            // Weak running signals — real streaming usually shows these, but
+            // they persist/false-positive on finished chrome, so they must
+            // not outrank the done-only markers (2026-07-13 split).
+            let hasRunningWeak = false;
+            if (document.querySelector(
                 '[data-is-streaming="true"], .loading-indicator, .streaming'
-            )) hasStop = true;
+            )) hasRunningWeak = true;
             // #897b: running-animation tier promoted into the completion
             // detector — with the composer collapsed there may be NO stop
             // button while the DR spinner still runs. Same guards as
             // scrape_progress_gemini: visible (offsetParent) + an animation
             // actually RUNNING (playState), so persisted/finished animations
             // on UI chrome can't hold completion hostage.
-            if (!hasStop) {
+            if (!hasRunningWeak) {
                 const animated = document.querySelectorAll('[class*="animate"], [class*="spin"], [class*="pulse"], [class*="loading"]');
                 for (const el of animated) {
                     if (el.offsetParent === null) continue;
                     if (typeof el.getAnimations !== 'function') continue;
                     const anims = el.getAnimations();
-                    if (anims.some(a => a.playState === 'running')) { hasStop = true; break; }
+                    if (anims.some(a => a.playState === 'running')) { hasRunningWeak = true; break; }
                 }
             }
 
             let hasStartBtn = false;
             for (const b of document.querySelectorAll('button')) {
+                if (b.offsetParent === null) continue;   // hidden leftover must not gate
                 const txt = (b.textContent || '').trim().toLowerCase();
                 if (txt === 'start research' || txt.includes('start research')) {
                     hasStartBtn = true; break;
@@ -17760,8 +17839,8 @@ async def detect_completion_gemini(page):
             const steps = document.querySelectorAll(
                 '[class*="research-step"], [class*="thought"]'
             ).length;
-            return { hasStop, hasStartBtn, hasShareExport, reportButtonTrio,
-                     completedChatText, textLen, sources, steps };
+            return { hasStopExplicit, hasRunningWeak, hasStartBtn, hasShareExport,
+                     reportButtonTrio, completedChatText, textLen, sources, steps };
         }""")
 
         text_len = int(data.get("textLen") or 0)
@@ -17769,14 +17848,30 @@ async def detect_completion_gemini(page):
         steps = int(data.get("steps") or 0)
         snap = {"text_len": text_len, "sources": sources, "steps": steps}
 
+        # 2026-07-13 decision order (stale-gate fix — see docstring):
+        #   explicit Stop → veto everything
+        #   trio / completion chat line → DONE (done-only UI; a lingering
+        #     plan-bubble Start button or a finished-chrome animation must
+        #     not hold these hostage — both E2E runs lost 10-14 min here)
+        #   weak running signals → veto the weaker paths below
+        #   visible Start button → pre-research gate
+        #   Share & Export alone → done (pre-2026-07 marker, weakest)
+        if data.get("hasStopExplicit"):
+            return (False, f"stop_btn_present (text={text_len})", snap)
+        stale_bits = []
+        if data.get("hasStartBtn"):
+            stale_bits.append("stale start-btn overridden")
+        if data.get("hasRunningWeak"):
+            stale_bits.append("weak running-signal overridden")
+        stale = f" ({'; '.join(stale_bits)})" if stale_bits else ""
+        if data.get("reportButtonTrio"):
+            return (True, f"no_stop + report_button_trio (Contents/Share & Export/Create){stale}", snap)
+        if data.get("completedChatText"):
+            return (True, f"no_stop + completed_chat_text{stale}", snap)
+        if data.get("hasRunningWeak"):
+            return (False, f"running_weak_signal (text={text_len})", snap)
         if data.get("hasStartBtn"):
             return (False, "start_research_btn_visible (pre-research)", snap)
-        if data.get("hasStop"):
-            return (False, f"stop_btn_present (text={text_len})", snap)
-        if data.get("reportButtonTrio"):
-            return (True, "no_stop + report_button_trio (Contents/Share & Export/Create)", snap)
-        if data.get("completedChatText"):
-            return (True, "no_stop + completed_chat_text", snap)
         if data.get("hasShareExport"):
             return (True, "no_stop + share_export_visible", snap)
         return (False, "no_done_marker (trio/completion-text/Share & Export all missing)", snap)
@@ -24070,7 +24165,8 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
             if (name == "ChatGPT" and _cgpt_gate_ok and
-                    not p.get("chatgpt_activity_panel_open")):
+                    not p.get("chatgpt_activity_panel_open") and
+                    not p.get("chatgpt_done_chip_anchor")):
                 try:
                     # #913 anti-toggle: the strip/status line is a TOGGLE.
                     # Never click while a shape is already open — the
@@ -24090,7 +24186,23 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             p["page"],
                             skip_structural=(p.get("chatgpt_panel_dom_misses", 0) >= 2))
                     cands = (res or {}).get("candidates", 0)
-                    if p.get("chatgpt_activity_panel_open"):
+                    # 2026-07-13: when the click anchor itself reads the
+                    # COMPLETED chip ("Research completed in Xm · …"), the
+                    # Researching panel no longer exists — DR is finished and
+                    # there is nothing to (re-)open. Pre-fix this looped:
+                    # 21 click-misses into the finished document + a CUA
+                    # tier-3 scroll hunt (the user-observed "stuck scrolling
+                    # the finished doc for 30 minutes"). Halt re-open attempts
+                    # for the rest of the phase; the completion detector's
+                    # completed-chip marker carries it from here.
+                    _res_lbl = ((res or {}).get("label") or "")
+                    if (not p.get("chatgpt_activity_panel_open")
+                            and re.search(r"research\s+complete", _res_lbl, re.I)):
+                        p["chatgpt_done_chip_anchor"] = True
+                        log(f"[ChatGPT] activity anchor reads the COMPLETED chip "
+                            f"(\"{_res_lbl[:60]}\") — DR finished, researching panel "
+                            f"is gone; halting panel re-open attempts")
+                    elif p.get("chatgpt_activity_panel_open"):
                         pass
                     elif not res or not res.get("found"):
                         p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
@@ -24148,7 +24260,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                     p["chatgpt_panel_dom_misses"] = p.get("chatgpt_panel_dom_misses", 0) + 1
 
                 # CUA tier-3 escalation after 2 DOM misses (capped at 1/phase).
+                # 2026-07-13: never escalate once the completed chip is the
+                # anchor — the panel is legitimately gone, not "missed".
                 if (not p.get("chatgpt_activity_panel_open")
+                        and not p.get("chatgpt_done_chip_anchor")
                         and p.get("chatgpt_panel_dom_misses", 0) >= 2
                         and p.get("chatgpt_panel_cua_attempts", 0) == 0
                         and cua_client):
@@ -25080,8 +25195,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             platform_hint = {
                 "ChatGPT": ("ChatGPT Deep Research renders the research output inside a RESEARCH CARD / DIALOG "
                             "(embedded in the chat, looks like a document panel). The stop button and progress "
-                            "indicator live ON THAT CARD, not in the composer. Scroll down to find the card and "
-                            "check if it still shows 'Researching...', a progress bar, or a stop button on the card."),
+                            "indicator live ON THAT CARD, not in the composer. Check if it still shows "
+                            "'Researching...', a progress bar, or a stop button on the card. "
+                            "Treat these as COMPLETE — no scrolling through the document needed: "
+                            "(a) a chip/label reading 'Research completed in Xm · N citations' (it replaces the "
+                            "'Researching…' chip when DR finishes), or (b) the Researching side panel replaced by "
+                            "a DOCUMENT panel whose header has download and expand/enlarge buttons with NO stop "
+                            "button and NO progress bar anywhere. A long finished document is COMPLETE — do NOT "
+                            "answer 'still generating' just because you cannot see its end."),
                 "Gemini": ("Gemini's 2026-07 UI has NO persistent bottom input box — a small launcher button "
                             "becomes the input only when clicked, so don't judge by the composer. A COMPLETED "
                             "deep research shows a report panel with a button row 'Contents', 'Share & Export', "
