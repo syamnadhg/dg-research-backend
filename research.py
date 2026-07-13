@@ -425,6 +425,27 @@ PHASE_3_AUDIO_MAX_MIN = int(os.environ.get("PHASE_3_AUDIO_MAX_MIN", "90"))    # 
 _PS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
 
 
+def _ffprobe_bin() -> str | None:
+    """Resolve the ffprobe binary, tolerating a bare launchd/service PATH.
+
+    2026-07-12 incident: on macOS the BE runs under a launchd LaunchAgent
+    whose PATH lacks /opt/homebrew/bin, so `subprocess.run(["ffprobe",…])`
+    raised FileNotFoundError, the bare except swallowed it, and every new
+    podcast's Firestore doc was written with durationSec: 0 — which froze
+    the FE player's progress bar and clock (its seek() clamps to duration).
+    Returns an absolute path when found, else None (callers log a WARN and
+    write 0 — the FE now self-heals duration from the media metadata, but
+    the doc should still be right at the source)."""
+    p = shutil.which("ffprobe")
+    if p:
+        return p
+    for cand in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe",
+                 "/usr/bin/ffprobe"):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 def _read_user_scope_env(name: str) -> str:
     """Read a Windows User-scope env var via PowerShell. Empty string
     on non-Windows or failure. Persistent across shells — settable
@@ -35196,14 +35217,22 @@ async def run_phase3_audio(browser, cua_client, notebook_url, queue_dir, verbose
                 # the asyncio event loop (and _heartbeat_loop on the same loop)
                 # keeps ticking. Without this, ffprobe blocked the loop for up
                 # to 5s — 1/3 of the 15s offline threshold.
+                _ffprobe = _ffprobe_bin()
+                if not _ffprobe:
+                    raise FileNotFoundError("ffprobe not found on PATH or in "
+                                            "/opt/homebrew/bin, /usr/local/bin")
                 _probe = await asyncio.to_thread(
                     subprocess.run,
-                    ["ffprobe", "-v", "quiet", "-show_entries",
+                    [_ffprobe, "-v", "quiet", "-show_entries",
                      "format=duration", "-of", "csv=p=0", str(audio_path)],
                     capture_output=True, text=True, timeout=5)
                 dur_sec = int(float(_probe.stdout.strip()))
-            except Exception:
-                pass
+            except Exception as _dur_e:
+                # 2026-07-12: never swallow this silently — durationSec: 0
+                # freezes the FE player's progress bar (seek clamps to 0).
+                log(f"[Phase3] audio duration probe failed ({_dur_e}) — "
+                    f"writing durationSec=0; FE will self-heal from media "
+                    f"metadata", "WARN")
             # B2: Firebase Storage upload (50-100MB on slow uplinks) was the
             # biggest single blocker — easily blew past the 15s offline window.
             audio_url = await asyncio.to_thread(upload_audio_to_storage, audio_path)
@@ -36069,14 +36098,17 @@ def save_meta(queue_dir, topic, phase, status="ongoing", **extra):
     pod_dir = queue_dir / "podcasts"
     if pod_dir.exists():
         for f in pod_dir.glob("*.*"):
-            # Try to get duration from ffprobe
+            # Try to get duration from ffprobe (resolved via _ffprobe_bin —
+            # the launchd PATH lacks /opt/homebrew/bin on macOS).
             dur_sec = 0
             try:
-                r = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries",
-                    "format=duration", "-of", "csv=p=0", str(f)],
-                    capture_output=True, text=True, timeout=5,
-                    creationflags=_PS_NO_WINDOW)
-                dur_sec = int(float(r.stdout.strip()))
+                _ffprobe = _ffprobe_bin()
+                if _ffprobe:
+                    r = subprocess.run([_ffprobe, "-v", "quiet", "-show_entries",
+                        "format=duration", "-of", "csv=p=0", str(f)],
+                        capture_output=True, text=True, timeout=5,
+                        creationflags=_PS_NO_WINDOW)
+                    dur_sec = int(float(r.stdout.strip()))
             except Exception:
                 pass
             mins, secs = divmod(dur_sec, 60)
