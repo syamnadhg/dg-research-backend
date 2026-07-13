@@ -19469,6 +19469,17 @@ class Browser:
         )
         if sys.platform == "darwin":
             _launch_kwargs["ignore_default_args"] = ["--use-mock-keychain"]
+        # 2026-07-13 (user screenshot): patchright injects --no-sandbox unless
+        # chromiumSandbox=true, and Chrome then paints a permanent "unsupported
+        # command-line flag: --no-sandbox. Stability and security will suffer"
+        # infobar — a bot-detection tell (real Chrome never shows it), a ~40px
+        # band that shifts page geometry under every vision screenshot, and a
+        # genuine security downgrade. Real Chrome runs sandboxed on macOS +
+        # Windows with zero setup, so turn the sandbox ON there. Linux is left
+        # as patchright ships it (--no-sandbox) — sandboxing needs unprivileged
+        # user-namespaces and hard-fails under root/containers.
+        if sys.platform in ("darwin", "win32"):
+            _launch_kwargs["chromium_sandbox"] = True
         # Instrumentation (mac login-profile bug): make backend.log ALONE able to
         # root-cause a profile / keychain mismatch — the fully-resolved abspath,
         # HOME (Path.home() differs if a supervisor launched us with another HOME),
@@ -21094,6 +21105,7 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
     _panel_cua_attempts = 0
     _panel_poll_cycles = 0  # ticks once per ChatGPT P1 poll while panel still closed
     _panel_reopens = 0      # #913: bounded drawer re-opens after auto-collapse (max 3)
+    _last_panel_walk = 0.0  # 2026-07-13: throttle for the P1 panel WALK (live steps/links)
     # Stall detector — multi-signal (2026-04-25 strictness rewrite):
     # tracks text + sources + steps. ChatGPT DR's "researching" phase
     # legitimately produces zero text growth for 5-15 min while sources
@@ -21360,6 +21372,54 @@ async def poll_until_done(page, verify_fn, label, poll_interval, max_wait_min,
                             log(f"[{label}] CUA tier-3 timed out after 120s", "WARN")
                         except Exception as _ce:
                             log(f"[{label}] CUA tier-3 failed: {_ce}", "WARN")
+
+                # ── P1 activity-panel WALK (2026-07-13, user request) ──
+                # The opener above gets the sources/Activity side panel open
+                # within ~30s, but nothing ever READ it during P1 — the FE's
+                # raw-activity drilldown stayed EMPTY until the run finished
+                # (all the rich steps/links appear only at extraction time).
+                # Mirror P2's Block 1c: walk the open panel every cycle
+                # (throttled) and merge steps/source urls/titles into the
+                # emitted progress so the panel fills LIVE as ChatGPT
+                # searches — exactly the "show stuff from the source panel,
+                # links etc." ask. Cheap DOM walk, no CUA.
+                if (label in ("Phase1", "Phase1-followup") and _panel_open_done
+                        and (time.time() - _last_panel_walk) > 45):
+                    _last_panel_walk = time.time()
+                    try:
+                        _pd = await scrape_chatgpt_activity_panel_tracking(page)
+                        if _pd:
+                            for _k in ("source_urls", "steps", "sections"):
+                                if _pd.get(_k):
+                                    _existing = progress.get(_k, []) or []
+                                    progress[_k] = list(dict.fromkeys(_existing + _pd[_k]))
+                            progress["sources"] = len(progress.get("source_urls", []) or [])
+                            if _pd.get("source_items"):
+                                _by_url = {}
+                                for _it in (progress.get("source_items") or []):
+                                    if isinstance(_it, dict) and _it.get("url"):
+                                        _by_url[_it["url"]] = _it
+                                for _it in _pd["source_items"]:
+                                    if not isinstance(_it, dict) or not _it.get("url"):
+                                        continue
+                                    _prev = _by_url.get(_it["url"]) or {}
+                                    _title = (_it.get("title") or _prev.get("title") or "").strip()
+                                    _by_url[_it["url"]] = {"url": _it["url"], "title": _title}
+                                progress["source_items"] = list(_by_url.values())[:50]
+                            _ps = int(_pd.get("searches", 0) or 0)
+                            if _ps > int(progress.get("searches", 0) or 0):
+                                progress["searches"] = _ps
+                            progress["panel_open"] = True
+                            if (_pd.get("progress")
+                                    and not (progress.get("progress") or "").strip()):
+                                progress["progress"] = _pd["progress"]
+                            if (_pd.get("source_urls") or _pd.get("steps")):
+                                log(f"[{label}] panel tracking (P1): "
+                                    f"{len(_pd.get('source_urls', []) or [])} URLs, "
+                                    f"{len(_pd.get('steps', []) or [])} steps, "
+                                    f"searches={_pd.get('searches', 0)}")
+                    except Exception as _pw:
+                        log(f"[{label}] P1 panel walk failed: {_pw}", "DEBUG")
 
                 # Enrich with MutationObserver data (token-level stream)
                 _obs = get_observer_state(page)
@@ -30129,6 +30189,96 @@ async def attach_brief_file(browser, page, brief_path, platform, label, extra_fi
         return False
 
 
+async def _brief_attachment_state(page, filename):
+    """One-shot composer-attachment probe. Returns a dict:
+      {"found": bool, "processing": bool, "error": str}
+    found      — the attachment chip (the FILENAME as visible text) is on the
+                 page. Pre-send, the composer chip is the only place the
+                 brief's filename can appear, so visible-text presence is the
+                 chip signal (innerText — hidden nodes don't count).
+    processing — a visible progress spinner sits in the composer region
+                 (bottom ~45% of the viewport); the upload is still being
+                 processed and the chip may yet fail.
+    error      — a platform upload-failure toast is visible (matched loosely:
+                 'There was a problem processing the upload' was the live
+                 2026-07-13 ChatGPT toast). Never raises."""
+    try:
+        return await page.evaluate("""(fname) => {
+            const out = { found: false, processing: false, error: '' };
+            const body = (document.body?.innerText || '');
+            const low = body.toLowerCase();
+            for (const e of ['problem processing the upload', 'failed to upload',
+                             'upload failed', 'error uploading', "couldn't upload",
+                             'could not upload', 'unable to upload',
+                             'unsupported file type', 'file exceeds']) {
+                if (low.includes(e)) { out.error = e; break; }
+            }
+            out.found = body.includes(fname);
+            const vh = window.innerHeight || document.documentElement.clientHeight;
+            for (const el of document.querySelectorAll(
+                    '[role="progressbar"], [class*="animate-spin"], ' +
+                    'svg[class*="spin"], [class*="loading"]')) {
+                if (el.offsetParent === null) continue;
+                const r = el.getBoundingClientRect();
+                if (r.top < vh * 0.55) continue;   // composer region only
+                if (typeof el.getAnimations === 'function'
+                        && !el.getAnimations().some(a => a.playState === 'running')
+                        && el.getAttribute('role') !== 'progressbar') continue;
+                out.processing = true; break;
+            }
+            return out;
+        }""", Path(str(filename)).name)
+    except Exception:
+        return {"found": False, "processing": False, "error": ""}
+
+
+async def _ensure_brief_attached(browser, page, brief_path, platform, label,
+                                 source_paths=None, max_attempts=3):
+    """Deterministic post-attach verification + bounded re-attach (2026-07-13).
+
+    LIVE INCIDENT: ChatGPT showed 'There was a problem processing the upload',
+    the brief chip never landed, and the run FIRED anyway — Deep Research ran
+    on the 218-char inline prompt with no actual brief. attach_brief_file's
+    True only means set_input_files didn't throw; this closes the gap: the
+    chip must be VISIBLE and upload processing SETTLED (two consecutive
+    stable probes) with no failure toast, else re-attach up to max_attempts.
+    Returns True only on a verified chip — callers must NOT send without it
+    (the caller falls back to the inline-paste path, which delivers the same
+    content as text). Gemini never calls this (paste path)."""
+    fname = Path(str(brief_path)).name
+    for attempt in range(1, max_attempts + 1):
+        deadline = time.time() + 25
+        stable_hits = 0
+        state = {}
+        while time.time() < deadline:
+            state = await _brief_attachment_state(page, fname)
+            if state.get("error"):
+                log(f"[{label}] attachment verify: platform reported upload "
+                    f"failure ('{state['error']}') on attempt {attempt}", "WARN")
+                break
+            if state.get("found") and not state.get("processing"):
+                stable_hits += 1
+                if stable_hits >= 2:
+                    log(f"[{label}] Brief attachment VERIFIED — '{fname}' chip "
+                        f"present, processing settled (attempt {attempt})")
+                    return True
+            else:
+                stable_hits = 0
+            await asyncio.sleep(1.5)
+        if attempt < max_attempts:
+            log(f"[{label}] attachment NOT verified (found={state.get('found')}, "
+                f"processing={state.get('processing')}, error='{state.get('error','')}') "
+                f"— re-attaching ({attempt + 1}/{max_attempts})", "WARN")
+            try:
+                await attach_brief_file(browser, page, brief_path, platform, label,
+                                        extra_files=source_paths)
+            except Exception as _re:
+                log(f"[{label}] re-attach raised: {_re}", "WARN")
+    log(f"[{label}] Brief attachment could NOT be verified after "
+        f"{max_attempts} attempts — refusing to fire without the brief", "ERROR")
+    return False
+
+
 async def type_short_inline_prompt(page, platform, label):
     """Type a short inline prompt instructing the agent to research the
     attached brief. Keeps the platform's 'Deep Research' mode as the
@@ -31890,6 +32040,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # Fall back to inline paste also when brief_path is missing/unavailable.
     is_gemini = platform.lower() == "gemini"
     use_file_attach = brief_path and Path(brief_path).exists() and not is_gemini
+    _brief_via_attach = False  # True only after a VERIFIED attach (see below)
 
     if use_file_attach:
         if source_paths:
@@ -31898,6 +32049,19 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
             log(f"[{label}] Attaching brief file: {Path(brief_path).name}")
         attached = await attach_brief_file(browser, page, brief_path, platform, label,
                                            extra_files=source_paths)
+        if attached:
+            # 2026-07-13 (live incident): attach_brief_file's True only means
+            # set_input_files didn't throw. ChatGPT showed "There was a
+            # problem processing the upload" and the run FIRED with no brief
+            # — DR ran on the 218-char inline prompt alone. Verify the chip
+            # actually landed (visible + processing settled, no failure
+            # toast) with bounded re-attach; on failure fall through to the
+            # inline-paste path below so the agent still gets the full brief
+            # as text (never a stale run).
+            attached = await _ensure_brief_attached(
+                browser, page, brief_path, platform, label,
+                source_paths=source_paths)
+        _brief_via_attach = bool(attached)  # pre-send re-check gate (below)
         if attached:
             typed = await type_short_inline_prompt(page, platform, label)
             if not typed:
@@ -32202,6 +32366,29 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # at ~20s, after which the JS + CUA fallbacks below still run as before. (The
     # downstream verify_chatgpt_generating gate in run_phase2 2A remains the
     # backstop if an enabled-but-intercepted click ever no-ops.)
+    # ── Pre-send attachment re-check (2026-07-13, attach path only) ──
+    # A late "problem processing the upload" toast can kill the chip AFTER
+    # verification (the mode gates above take seconds). Never click Send
+    # while the brief chip is gone — one re-attach round, then an honest
+    # Retry/Skip card instead of firing a stale run (the composer already
+    # holds the typed prompt, so the paste fallback isn't clean here).
+    if _brief_via_attach:
+        _pre_send = await _brief_attachment_state(page, Path(brief_path).name)
+        if not _pre_send.get("found") or _pre_send.get("error"):
+            log(f"[{label}] pre-send re-check: brief chip gone "
+                f"(found={_pre_send.get('found')}, error='{_pre_send.get('error','')}') "
+                f"— re-attaching before Send", "WARN")
+            if not await _ensure_brief_attached(browser, page, brief_path,
+                                                platform, label,
+                                                source_paths=source_paths,
+                                                max_attempts=2):
+                log(f"[{label}] CRITICAL: brief chip lost at send time and "
+                    f"re-attach failed — NOT sending a brief-less run", "ERROR")
+                fail_agent(platform_l, f"Couldn't send the brief to {platform}",
+                           f"{platform} kept rejecting the brief upload. "
+                           f"Retry to try again, or Skip it.")
+                return page, False
+
     _send_sels = ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]',
                   'button[aria-label="Send"]', 'button[aria-label="Send message"]',
                   'button[aria-label="Send Message"]', 'button[aria-label="Submit"]']
