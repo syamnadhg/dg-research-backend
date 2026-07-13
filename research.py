@@ -30336,15 +30336,23 @@ async def attach_brief_file(browser, page, brief_path, platform, label, extra_fi
 async def _brief_attachment_state(page, filename):
     """One-shot composer-attachment probe. Returns a dict:
       {"found": bool, "processing": bool, "error": str}
-    found      — the attachment chip is on the page: the FILENAME as visible
-                 text (innerText — hidden nodes don't count), OR a visible
-                 remove-attachment button whose aria-label names the file.
-                 Live-probed 2026-07-13: ChatGPT's chip is
-                 button[aria-label="Remove file 1: brief.md"] with the name
-                 in a visible div; Claude's tile shows the filename with a
-                 bare "Remove" button — so both signals stay ORed. The chip
-                 title truncates long names, so the aria check also accepts
-                 a 12-char prefix of the name.
+    found      — a composer ATTACHMENT CHIP is present. The signal is chip
+                 PRESENCE, not a literal filename match, because ChatGPT
+                 RENAMES a colliding upload: the user has uploaded 'brief.md'
+                 hundreds of times, so the new chip reads 'brief(228).md'
+                 (live-probed 2026-07-13 — the chip is healthy and the send
+                 button enables, but a literal 'brief.md' match reads False
+                 forever → endless re-attach → the residual-clear wipes the
+                 good chip → the run jams; THE blocker this fixes). Signals,
+                 any of which counts:
+                   • ChatGPT: a visible button[aria-label^="Remove file …"]
+                     (we just attached exactly one file — that chip is ours);
+                   • Claude: a visible [data-testid="file-thumbnail"] tile;
+                   • the filename in innerText, collision-suffix-tolerant
+                     ('brief.md' → /brief\\s*(\\(\\d+\\))?\\s*\\.md/i so
+                     'brief(228).md' still matches);
+                   • a remove/delete button whose aria matches that same
+                     tolerant pattern (or the exact name).
     processing — a visible progress spinner sits in the composer region
                  (bottom ~45% of the viewport); the upload is still being
                  processed and the chip may yet fail.
@@ -30365,17 +30373,41 @@ async def _brief_attachment_state(page, filename):
                              'unsupported file type', 'file exceeds']) {
                 if (low.includes(e)) { out.error = e; break; }
             }
-            out.found = body.includes(fname);
+            // Collision-suffix-tolerant filename matcher: brief.md also
+            // matches brief(228).md / brief (1).md.
+            const dot = fname.lastIndexOf('.');
+            const stem = dot > 0 ? fname.slice(0, dot) : fname;
+            const ext  = dot > 0 ? fname.slice(dot) : '';
+            const esc = s => s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+            let nameRe = null;
+            try {
+                nameRe = new RegExp(esc(stem) + '\\\\s*(?:\\\\(\\\\d+\\\\))?\\\\s*' + esc(ext), 'i');
+            } catch (e) { nameRe = null; }
+            const nameHit = t => !!t && (t.includes(fname) || (nameRe && nameRe.test(t)));
+
+            out.found = nameHit(body);
+            // ChatGPT: a "Remove file …" button = an attachment chip is
+            // present. We residual-clear + attach exactly one file, so that
+            // chip is ours regardless of the rename.
             if (!out.found) {
-                const prefix = fname.slice(0, 12);
                 for (const b of document.querySelectorAll(
                         'button[aria-label], [role="button"][aria-label]')) {
                     if (b.offsetParent === null) continue;
                     const a = b.getAttribute('aria-label') || '';
-                    if (!/remove|delete/i.test(a)) continue;
-                    if (a.includes(fname) || (prefix && a.includes(prefix))) {
+                    if (/^\\s*remove file\\b/i.test(a) || nameHit(a)
+                            || (/remove|delete/i.test(a) && nameHit(a))) {
                         out.found = true; break;
                     }
+                }
+            }
+            // Claude: the attachment tile (NOT the always-present upload
+            // button, data-testid="file-upload").
+            if (!out.found) {
+                for (const el of document.querySelectorAll(
+                        '[data-testid="file-thumbnail"], [class*="attachment" i]')) {
+                    if (el.offsetParent === null) continue;
+                    if (el.getAttribute('data-testid') === 'file-upload') continue;
+                    out.found = true; break;
                 }
             }
             const vh = window.innerHeight || document.documentElement.clientHeight;
@@ -32588,8 +32620,20 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
     # while the brief chip is gone — one re-attach round, then an honest
     # Retry/Skip card instead of firing a stale run (the composer already
     # holds the typed prompt, so the paste fallback isn't clean here).
+    # A SINGLE probe must not condemn a live attach: typing the inline prompt
+    # re-renders the composer, and a one-off found=False there triggered the
+    # ruinous re-attach (2026-07-13 blocker). Re-probe a few times; only an
+    # EXPLICIT error toast is decided on the first read.
     if _brief_via_attach:
         _pre_send = await _brief_attachment_state(page, Path(brief_path).name)
+        if not _pre_send.get("error"):
+            for _ in range(3):
+                if _pre_send.get("found"):
+                    break
+                await asyncio.sleep(1.5)
+                _pre_send = await _brief_attachment_state(page, Path(brief_path).name)
+                if _pre_send.get("error"):
+                    break
         if not _pre_send.get("found") or _pre_send.get("error"):
             log(f"[{label}] pre-send re-check: brief chip gone "
                 f"(found={_pre_send.get('found')}, error='{_pre_send.get('error','')}') "

@@ -127,9 +127,48 @@ def test_state_probe_accepts_remove_button_aria():
         "found must also accept a visible remove-attachment button naming "
         "the file — live ChatGPT chip: aria-label='Remove file 1: brief.md'"
     )
-    assert "fname.slice(0, 12)" in STATE_SRC, (
-        "the chip TITLE truncates long filenames, so the aria check accepts "
-        "a 12-char prefix"
+
+
+def test_found_is_rename_proof_chatgpt_collision_suffix():
+    # THE 2026-07-13 blocker: ChatGPT renames a colliding upload — the user
+    # has uploaded brief.md hundreds of times, so the chip reads
+    # 'brief(228).md'. A literal 'brief.md' match reads False forever → endless
+    # re-attach → residual-clear wipes the good chip → the run jams. found
+    # must survive the rename.
+    # (1) collision-suffix-tolerant filename matcher.
+    assert "nameRe" in STATE_SRC and "\\\\(\\\\d+\\\\)" in STATE_SRC, (
+        "the matcher must tolerate a (N) collision suffix — brief.md must "
+        "also match brief(228).md"
+    )
+    # (2) chip PRESENCE is the primary signal, not a filename match:
+    #     ChatGPT 'Remove file …' button; Claude file-thumbnail tile.
+    assert "remove file" in STATE_SRC.lower(), (
+        "a 'Remove file …' button means an attachment chip is present — we "
+        "attached exactly one file, so it's ours regardless of the rename"
+    )
+    assert 'data-testid="file-thumbnail"' in STATE_SRC, (
+        "Claude's chip is the file-thumbnail tile (not the always-present "
+        "file-upload button)"
+    )
+    assert 'data-testid") === \'file-upload\'' in STATE_SRC or "'file-upload'" in STATE_SRC, (
+        "the always-present upload BUTTON must be excluded from chip presence"
+    )
+
+
+def test_pre_send_recheck_reprobes_before_condemning():
+    # A single found=False must not condemn a live attach — typing the inline
+    # prompt re-renders the composer, and a one-off miss triggered the ruinous
+    # re-attach (the removal the user saw). Re-probe a few times first; only an
+    # explicit error toast is decided on the first read.
+    i = MOD_SRC.index("Pre-send attachment re-check")
+    block = MOD_SRC[i:i + 1400]
+    assert 'for _ in range(3):' in block, (
+        "the pre-send re-check must re-probe before concluding the chip is gone"
+    )
+    assert 'if _pre_send.get("found"):' in block and "break" in block
+    assert 'if not _pre_send.get("error"):' in block, (
+        "an explicit upload-failure toast is still decided immediately (no "
+        "wait) — only a bare not-found is given the re-probe grace"
     )
 
 
