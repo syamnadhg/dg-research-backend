@@ -952,7 +952,15 @@ PROMPT_AUDIO_DOWNLOAD = make_prompt_audio_download("long")
 
 PROMPT_GEMINI_START_RESEARCH = SYSTEM_BASE + """
 
-Look at the Gemini page. If you see a 'Start research' button (blue button), click it. If the research plan is still being generated, wait a moment and check again. Click 'Start research' and say 'clicked'."""
+Look at the Gemini page.
+
+1. If you see an ENABLED (blue) 'Start research' button, click it ONCE and say 'clicked'. Do not click it again — after one click the research takes a moment to begin.
+2. If the 'Start research' button is GRAYED OUT / disabled, do NOT click it. A grayed Start button means the research is ALREADY RUNNING (Gemini auto-starts sometimes and leaves the old plan's button disabled) or the plan is still streaming. Say 'research already running' and STOP.
+3. If the page shows research progress ('Researching websites…', a progress panel) or a finished report ('I've completed your research'), do NOT click anything. Say 'research already running' and STOP.
+4. If the plan failed ('something went wrong' with a Retry/Regenerate control), click Retry/Regenerate once and say 'retried'.
+5. If the research plan is still being generated, wait a moment and check again.
+
+NEVER click a grayed/disabled button, and never click 'Start research' more than once."""
 
 
 # ── Claude Artifact Tracking & Extraction ────────────────────────────────────

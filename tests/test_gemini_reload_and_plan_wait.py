@@ -146,8 +146,11 @@ def test_plan_wait_polls_and_heartbeats_smoothly():
 
 def test_start_research_click_is_verified_before_trusting():
     # A JS click that doesn't take must be re-clicked, not blindly trusted.
+    # #953 (user directive): click ONCE and WAIT — the old 2s-spaced triple
+    # re-click spammed the button. Now a 15s patient watch, then ONE re-click.
     assert "_start_present_js" in MODSRC
-    assert "didn't take after 2 re-clicks" in MODSRC
+    assert "didn't take after a patient" in MODSRC
+    assert "_reclicks == 0" in MODSRC, "at most one re-click after the patient watch"
 
 
 def test_plan_failure_raises_retry_skip_alert_promptly():

@@ -79,8 +79,10 @@ def test_loop_is_stop_aware():
 def test_start_research_click_is_preferred_over_regen():
     # A freshly-appeared "Start research" must be clicked BEFORE we consider a
     # regenerate, so a healthy plan kicks off research immediately.
+    # (#953: the finder JS was hoisted to module scope — anchor on the click
+    # call site `_click_start_js`, not the predicate's literal text.)
     loop = _2d_loop()
-    i_start = loop.find("start research")
+    i_start = loop.find("evaluate(_click_start_js)")
     i_regen = loop.find("_try_inpage_retry_on_research_fail(")
     assert i_start != -1 and i_regen != -1, "loop markers missing"
     assert i_start < i_regen, (
@@ -128,17 +130,22 @@ def test_post_loop_skips_cua_and_verify_on_stop():
 
 
 def test_silent_stall_diag_is_read_only_no_blind_click():
-    # The stall diagnostic must be capture-only. The ONLY .click() in the loop is
-    # the deterministic 'Start research' JS button click — the diag dump and the
-    # regen path must not introduce a blind click on an unidentified control.
+    # The stall diagnostic must be capture-only. The ONLY click pathway in the
+    # loop is the deterministic 'Start research' finder (#953: hoisted to
+    # module scope as _GEMINI_CLICK_START_JS, aliased _click_start_js) — the
+    # diag dump and the regen path must not introduce a blind click on an
+    # unidentified control.
     loop = _2d_loop()
     assert "_logged_stall_diag" in loop, (
         "the one-time silent-stall diagnostic was removed — we lose the data "
         "needed to pin the icon-only Regenerate selector"
     )
-    # Exactly one b.click() — the Start-research JS handler. No extra click in
-    # the diag/regen code (regen clicks via the vetted helper, not inline).
-    assert loop.count("b.click()") == 1, (
-        "an extra inline .click() appeared in the [2D] loop — the silent-stall "
+    # No inline b.click() remains in the loop (the vetted click lives in the
+    # module-level finder); the loop clicks ONLY via evaluate(_click_start_js).
+    assert loop.count("b.click()") == 0, (
+        "an inline .click() appeared in the [2D] loop — the silent-stall "
         "path must stay read-only (no blind clicks on unidentified controls)"
     )
+    assert loop.count("evaluate(_click_start_js)") >= 1
+    # And the module-level finder still carries the single vetted b.click().
+    assert research._GEMINI_CLICK_START_JS.count("b.click()") == 1

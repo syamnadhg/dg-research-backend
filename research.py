@@ -8179,6 +8179,23 @@ def _write_agent_terminal_status(agent_key: str, status: str):
         return
     if not agent_key or status not in ("complete", "skipped", "errored", "running"):
         return
+    # #953 (root fix for the retry-vs-completion race): a TRANSIENT "running"
+    # write (fired by the retry_agent command intake purely to clear an
+    # 'errored' badge) must NEVER overwrite a terminal "complete". The
+    # 2026-07-13 incident: the user's Retry click on a stale card stamped a
+    # COMPLETED Gemini 'running', which poisoned _agent_status_by_rid — the
+    # shared map two #953 completed-agent guards read — so the eventual Skip
+    # clobbered the recorded 101k-char report. A completed agent has no
+    # 'errored' badge to clear, so refusing this is exactly correct and heals
+    # the poisoning at its source (both the sync record AND the Firestore
+    # write below). Terminal↔terminal transitions (errored→complete, etc.)
+    # are unaffected.
+    if status == "running":
+        _cur = (_agent_status_by_rid.get(_fb_research_id, {}) or {}).get((agent_key or "").lower())
+        if _cur == "complete":
+            log(f"[{agent_key}] Ignoring transient 'running' status write — agent "
+                "already recorded 'complete' (stale retry on a resolved card)", "INFO")
+            return
     # #722 Bug A: record synchronously (BEFORE the async write) so a
     # concurrent save_meta() rebuild re-stamps this status onto its agents
     # map instead of clobbering it. Carries the actual status (complete/
@@ -8577,6 +8594,12 @@ def _start_command_listener(uid, research_id, loop):
                     # (pass _ag) so skipping ONE agent's card can't retract a DIFFERENT
                     # agent's still-live mirror on the single pendingDecision field.
                     loop.call_soon_threadsafe(_clear_pending_decision, _ag)
+                    # #953 (audit #8): the user resolved this agent's card — drop
+                    # its fail_agent error-card stamp so a much-later completion
+                    # can't fire a spurious retraction (which would clear an
+                    # unrelated, still-live agentless pendingDecision). fail_agent
+                    # re-stamps if the agent fails again.
+                    loop.call_soon_threadsafe(_AGENT_ERROR_CARD_TS.pop, _ag, None)
                     log(f"Command received: SKIP_AGENT agent={_ag}")
                 else:
                     log(f"Command received: SKIP_AGENT rejected — unknown agent '{_ag}'", "WARN")
@@ -8676,6 +8699,11 @@ def _start_command_listener(uid, research_id, loop):
                     # Agent-scoped (_ag_norm) so retrying ONE agent's card can't
                     # retract a DIFFERENT agent's still-live mirror.
                     loop.call_soon_threadsafe(_clear_pending_decision, _ag_norm)
+                    # #953 (audit #8): user resolved the card via Retry — drop the
+                    # error-card stamp so a later completion can't spuriously
+                    # retract an unrelated live decision (fail_agent re-stamps on
+                    # a repeat failure).
+                    loop.call_soon_threadsafe(_AGENT_ERROR_CARD_TS.pop, _ag_norm, None)
                     if _agent_pre_failed:
                         # Drop the pre-fail skip marker so the hard-retry path
                         # doesn't see Gemini as still-skipped (atomic — taps/
@@ -8696,6 +8724,8 @@ def _start_command_listener(uid, research_id, loop):
                     # #777: see hard-branch note — retract the snag mirror on Retry
                     # (agent-scoped so it can't clobber another agent's live card).
                     loop.call_soon_threadsafe(_clear_pending_decision, _ag_norm)
+                    # #953 (audit #8): drop the error-card stamp on user Retry.
+                    loop.call_soon_threadsafe(_AGENT_ERROR_CARD_TS.pop, _ag_norm, None)
                     log(f"Command received: RETRY_AGENT agent={_ag} mode=soft")
                 else:
                     log("Command received: RETRY_AGENT rejected — no agent", "WARN")
@@ -13417,11 +13447,14 @@ _HOTSPOT_VISION_HINTS = {
     "gemini-start": {
         "expected_outcome": "Gemini's deep-research plan starts or is re-drafted",
         "context_hint": (
-            "If a blue 'Start research' button is visible, click it. Otherwise the plan failed "
-            "(an error like 'something went wrong') — click the icon-only Retry / Regenerate "
-            "control to re-draft the plan. Do NOT type anything."
+            "If an ENABLED (blue) 'Start research' button is visible, click it ONCE. If it is "
+            "GRAYED OUT/disabled, or the page shows research progress or a finished report, do "
+            "NOT click — the research is already running (report 'research already running'). "
+            "Only on a failed plan ('something went wrong') click the icon-only Retry/Regenerate "
+            "control once. Never click a grayed button; never click Start twice. Do NOT type."
         ),
-        "success_signals": ["a 'Start research' button clicked", "the plan re-drafting after a Retry"],
+        "success_signals": ["a 'Start research' button clicked", "the plan re-drafting after a Retry",
+                             "'research already running' reported on a grayed Start"],
     },
     "click-send": {
         "expected_outcome": "the typed message is sent",
@@ -17104,14 +17137,28 @@ async def scrape_progress_gemini(page):
                 const lastStep = r.steps[r.steps.length - 1].toLowerCase();
                 if (lastStep.includes('searching') || lastStep.includes('reading') || lastStep.includes('analyzing') || lastStep.includes('browsing')) isActive = true;
             }
-            // Planning-gate: if "Start research" button is visible, Gemini has
-            // produced a plan but research hasn't started — do NOT mark complete
-            // even if r.partial_text_len > 0 (that text is the plan, not output).
+            // Planning-gate: if an ENABLED, VISIBLE "Start research" button is
+            // showing, Gemini has produced a plan but research hasn't started —
+            // do NOT mark complete even if r.partial_text_len > 0 (that text is
+            // the plan, not output).
+            // #953 (2026-07-13 root fix): require offsetParent (visible) AND
+            // not-disabled — mirroring detect_completion_gemini's #948 Start
+            // scan. Gemini AUTO-STARTS research and leaves the old plan bubble's
+            // Start button in the DOM but DISABLED; the old text-only match kept
+            // this gate forcing status='generating'/phase='planning' for the
+            // WHOLE auto-started run — which (a) fed the 2D streaming clock so it
+            // dwelt to the 900s cap, and (b) permanently gated off the L1 stuck
+            // arbiter (status_is_active keys on phase=='planning'). A truly-dead
+            // plan whose disabled skeleton Start lingers likewise read
+            // 'streaming' forever. Only a real, clickable Start gates now.
             let hasStartBtn = false;
-            const allBtns = document.querySelectorAll('button');
+            const allBtns = document.querySelectorAll('button, [role="button"]');
             for (const b of allBtns) {
+                if (b.offsetParent === null) continue;                       // hidden leftover
+                if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;  // disabled skeleton / post-auto-start
                 const txt = (b.textContent || '').trim().toLowerCase();
-                if (txt === 'start research' || txt.includes('start research')) { hasStartBtn = true; break; }
+                const aria = ((b.getAttribute && b.getAttribute('aria-label')) || '').trim().toLowerCase();
+                if (txt.includes('start research') || aria.includes('start research')) { hasStartBtn = true; break; }
             }
             if (hasStartBtn) {
                 r.status = 'generating';
@@ -22216,17 +22263,22 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
 
         # Gemini needs an extra click: wait up to 90s for "Start research"
         # button, click via JS, fall back to CUA if JS can't find it.
+        # #953 (audit): use the module-hoisted, #905-hardened finder
+        # (_GEMINI_CLICK_START_JS: enabled + visible + role/aria) — the old
+        # inline `<button>`-only match here clicked disabled skeleton buttons
+        # (a DOM no-op that reported success) and today's auto-start makes the
+        # disabled Start the COMMON state on this path.
         start_clicked = False
+        _auto_started = False
         for attempt in range(45):
+            # Auto-start: Gemini began researching WITHOUT a Start click — the
+            # plan bubble's Start stays grayed forever, so stop waiting for it.
+            if await _gemini_research_started(new_page):
+                _auto_started = True
+                log("[2B-retry] Gemini auto-started its research (no Start click needed)", "INFO")
+                break
             try:
-                clicked = await new_page.evaluate("""() => {
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        const txt = b.textContent.trim().toLowerCase();
-                        if (txt.includes('start research')) { b.click(); return true; }
-                    }
-                    return false;
-                }""")
+                clicked = await new_page.evaluate(_GEMINI_CLICK_START_JS)
                 if clicked:
                     start_clicked = True
                     await asyncio.sleep(5)
@@ -22234,12 +22286,17 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             except Exception:
                 pass
             await asyncio.sleep(2)
-        if not start_clicked and cua_client:
+        if not start_clicked and not _auto_started and cua_client:
             await browser.switch_to_page(new_page)
             # agent_loop CLICK dismisses the plan-FAIL screen; return text unused (#776).
+            # #953: the mission forbids clicking a grayed/disabled Start (that
+            # adds nothing and, on the auto-start layout, means research is
+            # already running) — aligned with PROMPT_GEMINI_START_RESEARCH.
             await agent_loop(cua_client, browser,
                 PROMPT_GEMINI_START_RESEARCH,
-                "Click the 'Start research' button to begin the deep research.",
+                "If an ENABLED (blue) 'Start research' button is visible, click it "
+                "ONCE. If it is grayed/disabled or research is already running, do "
+                "NOT click — say 'research already running'. Do NOT type.",
                 model=CUA_MODEL, max_iterations=10, verbose=verbose)
             # #776: confirm the click via the DOM, not the CUA narration (see the
             # 2D note) — re-poll the deterministic JS after the CUA returns so a
@@ -22248,15 +22305,11 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
             for _i in range(24):   # ~120s — covers a slow post-Retry re-draft
                 if _controls.is_stop():
                     break
+                if await _gemini_research_started(new_page):
+                    _auto_started = True
+                    break
                 try:
-                    _rb = await new_page.evaluate("""() => {
-                        const btns = document.querySelectorAll('button');
-                        for (const b of btns) {
-                            const txt = b.textContent.trim().toLowerCase();
-                            if (txt.includes('start research')) { b.click(); return true; }
-                        }
-                        return false;
-                    }""")
+                    _rb = await new_page.evaluate(_GEMINI_CLICK_START_JS)
                 except Exception:
                     _rb = False
                 if _rb:
@@ -22269,6 +22322,11 @@ async def _restart_phase2_agent(name: str, browser, cua_client, brief_text: str,
         # researching when "Start research" was never confirmed-clicked. Returning
         # verified=False keeps the tab in the round-robin (it doesn't drop a
         # not-verified agent) so the wall-clock cap can surface an honest failure.
+        # #953: an auto-started research needs no click — treat it as started so
+        # the fresh retry isn't failed while it's genuinely researching.
+        if _auto_started:
+            log("[2B-retry] Gemini researching after auto-start — handing to round-robin", "INFO")
+            return (new_page, True)
         if not start_clicked:
             # The user-retry's fresh chat ALSO failed to produce a startable plan
             # — re-raise the Retry/Skip alert immediately (close the gap where a
@@ -22512,6 +22570,27 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
             _write_agent_terminal_status(agent_key, "complete")
         except Exception:
             pass
+        # #953 (2026-07-13 run): a completed agent must never keep a stale
+        # failure card. Gemini finished at 98k chars while the earlier (false)
+        # "couldn't start" card was still up — nothing retracted it, the user
+        # pressed its Retry, and the retry destroyed the completed agent. If
+        # fail_agent ever carded this agent (monotonic stamp in
+        # _AGENT_ERROR_CARD_TS, #950), retract the card + its durable
+        # pendingDecision now that the report is recorded — same emit shape as
+        # the #921 plan-alert retraction.
+        if _AGENT_ERROR_CARD_TS.get(agent_key):
+            try:
+                emit_event("pipeline_warning", phase=2, agent=agent_key,
+                           error=f"{name} finished — earlier alert cleared",
+                           details=f"{name} completed its research ({n_chars} chars extracted); "
+                                   "the earlier failure alert is stale.",
+                           actions=[], alert_id=f"agent_{agent_key}_error",
+                           auto_clear_on_resume=True)
+                _clear_pending_decision(agent_key)
+                _AGENT_ERROR_CARD_TS.pop(agent_key, None)
+                log(f"[{name}] Retracted the stale failure card — agent completed")
+            except Exception:
+                pass
     else:
         # No content extracted OR no anchor OR Firestore write failed — emit
         # failed (FE keeps spinner, never flips ✓ without a reachable doc).
@@ -22967,6 +23046,107 @@ async def _claude_send_clarification_reply(page, label):
         return False
 
 
+# ── Claude interactive question card → click Skip (#953, 2026-07-13) ─────────
+# Claude (Opus 4.8 research flow) can reply to the brief with an INTERACTIVE
+# question card instead of (or before) starting research: a "1 of N" pager, a
+# stack of numbered option rows, a pencil "Something else" free-text row, and a
+# "Skip" button bottom-right (user screenshot 2026-07-13 18:37). Research does
+# NOT start until the questions are answered or skipped. The 2026-05-18
+# text-regex clarification path (above) can't see this card — the card question
+# carries ONE '?' (detector demands ≥2) and no sign-off sentence — and its
+# defer-reply types text, while the card's first-class dismissal is the Skip
+# button. USER DIRECTIVE: "we just click skip for all questions so the research
+# starts."
+#
+# Detection is deliberately conservative — a visible, enabled button whose
+# exact text is "Skip", inside a container that ALSO shows a question-card
+# signature ("N of M" pager, numbered option rows, or the "Something else"
+# row). A bare "Skip" anywhere else (e.g. report prose) never matches.
+# One click per call; the caller loops (each Skip advances the pager to the
+# next question or dismisses the card and the research launches).
+# Probe/click the card. Takes a `doClick` arg: false = read-only probe
+# (returns {present, pager}); true = also click the Skip button. Splitting
+# probe from click lets the caller EFFECT-VERIFY (audit #953-2): a click that
+# doesn't advance the card (untrusted .click() the handler ignores, or a
+# re-render with the same question) must NOT be counted — else the round-robin
+# leg re-skips + rebases the wall-clock every tick forever, starving the
+# completion/timeout backstops (silent phase-2 hang).
+_CLAUDE_QUESTION_CARD_JS = r"""(doClick) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const out = { present: false, clicked: false, pager: '' };
+    for (const btn of document.querySelectorAll('button, [role="button"]')) {
+        if (!btn.offsetParent) continue;
+        if (norm(btn.textContent).toLowerCase() !== 'skip') continue;
+        if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+        // Walk up looking for the question-card container signature.
+        let card = btn.parentElement;
+        for (let i = 0; i < 8 && card; i++, card = card.parentElement) {
+            const txt = norm(card.innerText || '');
+            // #953-7: the real card (pager + a few option rows + Skip) is
+            // compact. Once the ancestor's text exceeds ~1500 chars we've
+            // climbed into page prose — stop MATCHING here so a report that
+            // happens to contain "N of M"/"something else" can't bind a Skip.
+            if (txt.length > 1500) break;
+            const pager = txt.match(/\b(\d+)\s+of\s+(\d+)\b/);
+            const somethingElse = /something else/i.test(txt);
+            let optionRows = 0;
+            for (const row of card.querySelectorAll('button, [role="button"], [role="option"], li')) {
+                const rt = norm(row.textContent);
+                if (/^\d{1,2}\s+\S/.test(rt) && rt.length > 8) optionRows++;
+            }
+            if (pager || somethingElse || optionRows >= 2) {
+                out.present = true;
+                out.pager = pager ? pager[0] : '';
+                if (doClick) { btn.click(); out.clicked = true; }
+                return out;
+            }
+        }
+    }
+    return out;
+}"""
+
+
+async def _claude_skip_question_cards(page, label, max_skips=6) -> int:
+    """Click Skip on Claude's interactive question card(s) until none remain.
+
+    EFFECT-VERIFIED (audit #953-2): probe → click → settle → re-probe, and
+    count a skip ONLY when the card actually changed (gone, or its pager
+    advanced). A click that leaves the SAME card+pager on screen is treated as
+    ineffective — break immediately so an unadvanceable Skip never drives the
+    caller's rebase-and-continue loop. Returns the number of EFFECTIVE skips
+    (0 = no card, or a card the click couldn't move). Fail-safe throughout."""
+    _skips = 0
+    for _ in range(max_skips):
+        try:
+            before = await page.evaluate(_CLAUDE_QUESTION_CARD_JS, False)
+        except Exception as _qe:
+            log(f"[{label}] Question-card probe failed ({_qe})", "DEBUG")
+            break
+        if not before or not before.get("present"):
+            break
+        try:
+            await page.evaluate(_CLAUDE_QUESTION_CARD_JS, True)   # click Skip
+        except Exception as _ce:
+            log(f"[{label}] Question-card Skip click failed ({_ce})", "DEBUG")
+            break
+        await asyncio.sleep(1.5)
+        try:
+            after = await page.evaluate(_CLAUDE_QUESTION_CARD_JS, False)
+        except Exception:
+            after = {"present": False}
+        # Effective iff the card is gone OR the pager advanced.
+        if after.get("present") and after.get("pager") == before.get("pager"):
+            log(f"[{label}] Skip click didn't advance the card "
+                f"({before.get('pager') or 'no pager'}) — stopping (ineffective)", "INFO")
+            break
+        _skips += 1
+        log(f"[{label}] Clarifying-question card ({before.get('pager') or 'no pager'}) "
+            f"— Skip #{_skips} took effect", "INFO")
+    if _skips:
+        log(f"[{label}] Skipped {_skips} clarifying question(s) — research can start", "INFO")
+    return _skips
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Gemini Deep Research — kickoff-stall detection
 # ─────────────────────────────────────────────────────────────────────
@@ -23050,6 +23230,25 @@ async def _gemini_kickoff_pending(page):
     return True, "ack-no-card"
 
 
+async def _gemini_research_started(page) -> bool:
+    """True when Gemini's DEEP RESEARCH has genuinely started or finished.
+
+    #953: research-SPECIFIC evidence — the "Researching N websites/sources"
+    card or the completion line. verify_gemini_generating CANNOT be used for
+    this: it green-lights on ANY stop button / running CSS animation, which a
+    plan still DRAFTING also shows, so it can't tell a drafting plan from
+    running research (the exact conflation behind the 2026-07-13 auto-start
+    incident). Reads the first 8000 chars of body innerText only; safe every
+    tick. Fail-closed (False) on any error so a probe miss never fakes a start."""
+    try:
+        body = await page.evaluate("""() => (document.body.innerText || "").slice(0, 8000)""")
+    except Exception:
+        return False
+    if not body:
+        return False
+    return bool(_GEMINI_RESEARCH_CARD_RE.search(body) or _GEMINI_COMPLETION_RE.search(body))
+
+
 # Escalating nudge wording — attempt 0 is a polite directive, attempt 1
 # is a yes/no check-in question, attempt 2 mirrors the terse "Done?" that
 # empirically jolted Gemini in the user's manual intervention (2026-05-24).
@@ -23060,6 +23259,39 @@ _GEMINI_KICKOFF_NUDGES = (
     "Please proceed with the deep research now.",
     "Are you researching?",
     "Done?",
+)
+
+
+# ── Gemini "Start research" click/probe JS (#905, hoisted #953) ───────────────
+# Shared by the 2D plan-wait AND the round-robin's late-Start watch leg (#953:
+# 2D now hands a still-streaming Gemini to the round-robin instead of dwelling,
+# so the round-robin must be able to click a Start button that renders late).
+# 2026-07-06 (#905, live-run forensics): the old `<button>`-only text match had
+# two failure modes seen in one run — (a) it clicked the DISABLED skeleton
+# Start button Gemini renders while the plan is still streaming, and (b) it
+# went blind while its own stall diagnostic dumped a visible
+# {"aria":"Start research"} control, because Gemini renders the control as
+# [role="button"] in some states. Match BOTH element shapes + aria-label, and
+# require enabled + actually rendered (≥8px rect) before clicking/counting.
+_GEMINI_START_PREDICATE_JS = (
+    " const CAND = document.querySelectorAll('button, [role=\"button\"]');"
+    " for (const b of CAND) {"
+    "   const t = ((b.textContent) || '').trim().toLowerCase();"
+    "   const a = ((b.getAttribute && b.getAttribute('aria-label')) || '').trim().toLowerCase();"
+    "   if (!t.includes('start research') && !a.includes('start research')) continue;"
+    "   if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;"
+    "   const r = b.getBoundingClientRect();"
+    "   if (r.width < 8 || r.height < 8) continue;"
+)
+_GEMINI_CLICK_START_JS = (
+    "() => {" + _GEMINI_START_PREDICATE_JS +
+    "   b.click(); return true;"
+    " } return false; }"
+)
+_GEMINI_START_PRESENT_JS = (
+    "() => {" + _GEMINI_START_PREDICATE_JS +
+    "   return true;"
+    " } return false; }"
 )
 
 
@@ -23177,6 +23409,10 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             # click so cycle 1 can open the ChatGPT/Claude panels first; the
             # cycle-1 Gemini leg then finishes the start-verify.
             "needs_start_verify": bool(agent.get("needs_start_verify")),
+            # #953: 2D handed off a still-streaming Gemini (auto-start or a
+            # slow plan) — the Gemini leg watches for a late 'Start research'
+            # button and clicks it, or clears the watch once verified running.
+            "gemini_watch_start": bool(agent.get("gemini_watch_start")),
         }
         # Register for mid-run input dispatcher
         platform_key = name.lower().replace(" ", "")
@@ -23503,6 +23739,28 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue
             if _agent_name and _agent_name in pending:
                 p = pending[_agent_name]
+                # #953: never clobber a recorded successful result. If this
+                # agent already completed (its results entry holds real text —
+                # e.g. a stale hard-retry re-seeded `pending` after the fact),
+                # a Skip must keep the good report: drop the stub from the
+                # poll set, close its tab, consume the marker — but leave
+                # `results` and the persisted status untouched.
+                _prior_done = results.get(_agent_name) or {}
+                if _prior_done.get("status") == "done" and (_prior_done.get("text") or ""):
+                    log(f"[{_agent_name}] Skip on an already-completed agent — keeping "
+                        f"the recorded {len(_prior_done.get('text') or '')}-char report; "
+                        "dropping the leftover poll stub only", "INFO")
+                    _stub_page = p.get("page")
+                    del pending[_agent_name]
+                    _controls.consume_skip_marker(_ag_key)
+                    if _stub_page is not None:
+                        # final_status="done": closing this leftover stub tab must
+                        # NOT demote the completed agent's runtime status (#953
+                        # audit — a 'skipped' demotion makes pause/resume re-poll
+                        # the finished conversation).
+                        await _close_skipped_agent_tab(browser, _stub_page, _ag_key,
+                                                       _agent_name, final_status="done")
+                    continue
                 # #906 hands-off: never run the extraction ladder against a
                 # verification-walled tab — DOM walks + the CUA fallback ARE
                 # the touches the 2026-07-06 Cloudflare directive forbids
@@ -23568,14 +23826,24 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 # card's durable pendingDecision mirror — a single Skip now
                 # resolves. Guard: never overwrite a genuinely-COMPLETE agent
                 # (a stale/duplicate skip command must not grey a green ✓ tile).
+                # #953 defense-in-depth (audit): check BOTH the persisted map
+                # (now poison-proof — 'running' can't overwrite 'complete') AND
+                # the in-scope results dict (status 'done' + text) — either
+                # proving completion vetoes the skip clobber.
                 _recorded_status = (_agent_status_by_rid.get(_fb_research_id, {})
                                     or {}).get(_ag_key)
-                if _recorded_status != "complete":
-                    _left_results = results.get(_agent_name)
-                    if isinstance(_left_results, dict):
+                _left_results = results.get(_agent_name) or {}
+                _left_done = (_left_results.get("status") == "done"
+                              and bool(_left_results.get("text")))
+                if _recorded_status != "complete" and not _left_done:
+                    if isinstance(_left_results, dict) and _left_results:
                         _left_results["status"] = "skipped_by_user"
                     emit_event("agent_skipped", phase=2, agent=_ag_key,
                                reason="user_skip_after_leaving_poll")
+                else:
+                    log(f"[{_agent_name}] Skip after leaving poll — agent already "
+                        f"completed (persisted={_recorded_status!r}, results_done="
+                        f"{_left_done}); keeping the report, not greying the tile", "INFO")
             # Whether or not the agent was actually in pending, clear it from
             # the skip set so we don't keep firing agent_skipped every tick.
             _controls.consume_skip_marker(_ag_key)
@@ -23592,6 +23860,46 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue
             _agent_name = _hard_name_map.get(_agent_key)
             if not _agent_name:
+                continue
+            # #953 (2026-07-13 run): a Retry click races completion. The user
+            # clicked "Retry (hard)" on a (false) failure card while Gemini was
+            # mid-research; the marker was consumed at 19:03:47 — the very
+            # second extraction finished recording 101k chars — and this path
+            # then CLOSED the completed agent's tab, re-ran setup with an empty
+            # brief (fired an honest-at-the-time "couldn't send the brief"
+            # card), and the eventual skip clobbered the good result with a
+            # 0-char skipped_by_user. A hard retry against an agent that
+            # already has a recorded successful result is ALWAYS stale — drop
+            # it and retract the card it came from.
+            _rec_done = results.get(_agent_name) or {}
+            _persisted_st = (_agent_status_by_rid.get(_fb_research_id, {})
+                             or {}).get(_agent_key)
+            # #953 (audit): also treat an agent that is MID-COMPLETION as done —
+            # the done-marker/extraction window spans several minutes and the
+            # recorded result appears only at its END. A Retry consumed inside
+            # that window (the exact 19:03:47 timing) would otherwise pass the
+            # recorded-result check, close the tab, and destroy the run. The
+            # live poll signals (`done_marker_first_at`, `done_count`) flag it.
+            _p_inflight = pending.get(_agent_name) or {}
+            _inflight_done = (float(_p_inflight.get("done_marker_first_at", 0) or 0) > 0
+                              or int(_p_inflight.get("done_count", 0) or 0) > 0)
+            if (_persisted_st == "complete"
+                    or (_rec_done.get("status") == "done" and (_rec_done.get("text") or ""))
+                    or _inflight_done):
+                log(f"[{_agent_name}] Hard retry ignored — the agent already "
+                    f"completed or is finishing (persisted={_persisted_st!r}, recorded="
+                    f"{_rec_done.get('status')!r}, {len(_rec_done.get('text') or '')} chars, "
+                    f"inflight_done={_inflight_done}). Clearing the stale card instead.", "INFO")
+                try:
+                    emit_event("pipeline_warning", phase=2, agent=_agent_key,
+                               error=f"{_agent_name} already finished",
+                               details=f"{_agent_name} completed its research before the retry "
+                                       "was processed — nothing to retry.",
+                               actions=[], alert_id=f"agent_{_agent_key}_error",
+                               auto_clear_on_resume=True)
+                    _clear_pending_decision(_agent_key)
+                except Exception:
+                    pass
                 continue
             # 2026-04-25: when an agent failed pre-pending (setup/paste
             # failed during initial Phase 2 startup), `pending` won't have
@@ -23661,6 +23969,20 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 _bp = Path(__file__).parent / "queues" / _tracks_dir.name / "documents" / "brief.md"
                 if _bp.exists():
                     _brief_path_hr = str(_bp)
+            # #953: original_inputs carries 'brief' only on the brief-provided
+            # start path (research.py:~39749); the full-pipeline path (~39230)
+            # stores topic+pdf_paths and P1 WRITES the brief to disk later. The
+            # 2026-07-13 hard retry pasted a 0-char brief into Gemini ("Paste
+            # verify: 1/0 chars") and manufactured a "couldn't send the brief"
+            # failure. Fall back to the on-disk brief.md (the same file the
+            # attach path sends) so a retry always carries the real brief.
+            if not _brief_text_hr and _brief_path_hr:
+                try:
+                    _brief_text_hr = Path(_brief_path_hr).read_text(encoding="utf-8")
+                    log(f"[{_agent_name}] Hard retry: brief text recovered from disk "
+                        f"({len(_brief_text_hr)} chars — original_inputs had none)", "INFO")
+                except Exception as _bre:
+                    log(f"[{_agent_name}] Hard retry: brief.md read failed ({_bre})", "WARN")
             # Close old tab — non-fatal if it's already gone.
             # 2026-07-06 (warm-tab reuse review): NEVER close the browser's
             # main tab or the persistent context's LAST page. With 2A reusing
@@ -23866,6 +24188,103 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 except Exception:
                     pass
 
+            # #953: late-Start watch — 2D handed off a still-streaming Gemini
+            # (auto-started research OR a slow plan still drafting). Each
+            # Gemini leg:
+            #   (a) research genuinely running/done (the "Researching N …" card
+            #       or completion line, or a CUA done-confirm) → clear the watch
+            #       (auto-start case — the plan bubble's Start stays grayed
+            #       forever; nothing to click). Uses research-SPECIFIC evidence,
+            #       NEVER verify_gemini_generating alone — that green-lights a
+            #       plan still DRAFTING too, which would clear the watch on a
+            #       slow plan and leave its late Start unclicked (audit #953-1).
+            #   (b) else an ENABLED 'Start research' has rendered (slow plan
+            #       finished drafting after hand-off, and nobody else clicks it)
+            #       → click it (bounded, enabled-only so it can never spam the
+            #       grayed button), keep the watch ARMED so the NEXT leg's
+            #       (a)/(b) is the took-check (audit #953-4), rebase the
+            #       wall-clock on the first click.
+            #   (c) else the plan is still drafting (streaming, no enabled Start
+            #       yet) → leave the watch armed and wait.
+            if name == "Gemini" and p.get("gemini_watch_start"):
+                try:
+                    _ws_running = (p.get("done_count", 0) > 0
+                                   or await _gemini_research_started(p["page"]))
+                    if _ws_running:
+                        p["gemini_watch_start"] = False
+                        log("[Gemini] Watch-start: research is running/complete "
+                            "(auto-started without a Start click) — watch cleared ✓")
+                        emit_event("agent_progress", phase=2, agent="gemini",
+                                   status="generating", stage="researching",
+                                   progress="Gemini started its research — monitoring")
+                        try:
+                            await inject_agent_observer(p["page"], "gemini")
+                        except Exception:
+                            pass
+                    else:
+                        _enabled_start = await p["page"].evaluate(_GEMINI_START_PRESENT_JS)
+                        if _enabled_start:
+                            _wc = p.get("gemini_watch_click_count", 0)
+                            if _wc < 3:
+                                await p["page"].evaluate(_GEMINI_CLICK_START_JS)
+                                p["gemini_watch_click_count"] = _wc + 1
+                                log(f"[Gemini] Watch-start: late 'Start research' appeared "
+                                    f"— clicked #{_wc + 1}/3 (watch stays armed; next leg "
+                                    "verifies it took)")
+                                if _wc == 0:
+                                    # Research starts NOW — rebase the wall-clock
+                                    # once so completion checks don't fire early.
+                                    _now_ws = time.time()
+                                    p["start_time"] = _now_ws
+                                    p["last_heartbeat"] = _now_ws
+                                    p["last_growth_time"] = _now_ws
+                            else:
+                                # An enabled Start persisted after 3 clicks — give
+                                # up the watch; the stuck arbiter / 90-min cap
+                                # backstops a plan that won't start.
+                                p["gemini_watch_start"] = False
+                                log("[Gemini] Watch-start: enabled 'Start research' "
+                                    "persisted after 3 clicks — clearing watch "
+                                    "(arbiter/hard-cap takes over)", "WARN")
+                        # else (c): plan still drafting — leave the watch armed.
+                except Exception as _ws_err:
+                    log(f"[Gemini] Watch-start probe failed (non-fatal): {_ws_err}", "DEBUG")
+
+            # ── Claude interactive question card → Skip (#953) ──
+            # Presence-driven, every Claude leg: the Opus 4.8 research flow
+            # can raise a "1 of N" question card (numbered options + Skip)
+            # instead of starting research; the card sits until answered or
+            # skipped. Click Skip for every question (user directive) so the
+            # research launches. Cheap DOM probe; a page with no card is a
+            # single evaluate. On skips, rebase the wall-clock (research
+            # starts NOW) — same reset rationale as the text-clarification
+            # block below.
+            # Cumulative bound (audit #953-2): a card that keeps yielding new
+            # EFFECTIVE skips forever (pathological) must not rebase the
+            # wall-clock + `continue` past the completion/timeout backstops on
+            # every tick. After this many total skips, stop intervening and let
+            # the normal flow (completion detectors, stuck arbiter, hard cap)
+            # re-engage — Claude's real card is 1-of-2 / 1-of-3, never dozens.
+            _Q_SKIP_TOTAL_CAP = 8
+            if name == "Claude" and p.get("question_card_skips", 0) < _Q_SKIP_TOTAL_CAP:
+                try:
+                    _q_skips = await _claude_skip_question_cards(p["page"], name)
+                except Exception:
+                    _q_skips = 0
+                if _q_skips:
+                    p["question_card_skips"] = p.get("question_card_skips", 0) + _q_skips
+                    emit_event("agent_progress", phase=2, agent="claude",
+                               status="generating",
+                               progress=f"Claude asked {_q_skips} clarifying question(s) — "
+                                        "skipped them so the research starts.")
+                    _now = time.time()
+                    p["start_time"] = _now
+                    p["last_heartbeat"] = _now
+                    p["last_growth_time"] = _now
+                    p["stuck_warned_at"] = 0
+                    p["last_artifact_scrape"] = 0
+                    continue
+
             # ── Claude clarification auto-reply (2026-05-18) ──
             # When the brief is vague/template, Claude responds with chat
             # text asking clarifying questions INSTEAD of starting Deep
@@ -23892,7 +24311,12 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             if (
                 name == "Claude"
                 and not p.get("claude_clarification_replied")
-                and 180 <= elapsed <= 900
+                # #953: upper bound 900→2700 — the 2026-07-13 run's first
+                # Claude poll landed at ~1500s (the Gemini 2D dwell ate the
+                # window), so a real clarification stall aged out unhandled.
+                # The other four gates (idle, no artifact, ≥2 '?', sign-off)
+                # keep a mid/late-research response from false-firing.
+                and 180 <= elapsed <= 2700
             ):
                 try:
                     if not await verify_claude_generating(p["page"]):
@@ -31149,7 +31573,8 @@ def _hv_fail_copy(platform: str, reason: str) -> tuple[str, str]:
 
 
 async def _close_skipped_agent_tab(browser, page, platform_key: str, label: str,
-                                   preserve_tab: bool = False) -> None:
+                                   preserve_tab: bool = False,
+                                   final_status: str = "skipped") -> None:
     """#906: finalize a user Skip by CLOSING the skipped platform's tab.
 
     Pre-fix, NO skip path anywhere closed a tab — the skipped platform's
@@ -31159,9 +31584,15 @@ async def _close_skipped_agent_tab(browser, page, platform_key: str, label: str,
     close the browser's main page or the context's LAST page (headful Chrome
     exits with its last window → dead context for the rest of the run), and
     never close a caller-preserved warm-reuse tab — those are only
-    unregistered from the mid-run dispatcher."""
+    unregistered from the mid-run dispatcher.
+
+    #953 (audit): `final_status` — the runtime agent_status the unregister
+    stamps. Defaults to 'skipped', but the completed-agent clobber-guard passes
+    'done' so closing a stale leftover STUB tab can't demote a genuinely-done
+    agent's status to 'skipped' (which would make pause/resume re-open + re-poll
+    the completed conversation)."""
     try:
-        _runtime.unregister_page(platform_key, final_status="skipped")
+        _runtime.unregister_page(platform_key, final_status=final_status)
     except Exception:
         pass
     if page is None:
@@ -33833,37 +34264,15 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         _start_wait_max_sec = int(os.environ.get("GEMINI_PLAN_WAIT_SEC", str(5 * 60)))
         # Shared JS: click the "Start research" button, and a sibling probe for
         # whether it's STILL present (used to confirm a click actually took).
-        # 2026-07-06 (#905, live-run forensics): the old `<button>`-only text
-        # match had two failure modes seen in one run — (a) it clicked the
-        # DISABLED skeleton Start button Gemini renders while the plan is
-        # still streaming (3s after submit → "click didn't take after 2
-        # re-clicks"), and (b) it went blind while its own stall diagnostic
-        # dumped a visible {"aria":"Start research"} control, because Gemini
-        # renders the control as [role="button"] in some states. Match BOTH
-        # element shapes + aria-label, and require enabled + actually
-        # rendered (≥8px rect) before clicking/counting.
-        _START_RESEARCH_PREDICATE_JS = (
-            " const CAND = document.querySelectorAll('button, [role=\"button\"]');"
-            " for (const b of CAND) {"
-            "   const t = ((b.textContent) || '').trim().toLowerCase();"
-            "   const a = ((b.getAttribute && b.getAttribute('aria-label')) || '').trim().toLowerCase();"
-            "   if (!t.includes('start research') && !a.includes('start research')) continue;"
-            "   if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;"
-            "   const r = b.getBoundingClientRect();"
-            "   if (r.width < 8 || r.height < 8) continue;"
-        )
-        _click_start_js = (
-            "() => {" + _START_RESEARCH_PREDICATE_JS +
-            "   b.click(); return true;"
-            " } return false; }"
-        )
-        _start_present_js = (
-            "() => {" + _START_RESEARCH_PREDICATE_JS +
-            "   return true;"
-            " } return false; }"
-        )
+        # #953: hoisted to module scope (_GEMINI_CLICK_START_JS /
+        # _GEMINI_START_PRESENT_JS) so the round-robin's late-Start watch leg
+        # runs the exact same #905-hardened predicate — local aliases kept so
+        # this block reads unchanged.
+        _click_start_js = _GEMINI_CLICK_START_JS
+        _start_present_js = _GEMINI_START_PRESENT_JS
         _loop_start = time.time()
         _last_plan_emit = 0.0
+        _last_claude_q_probe = 0.0  # #953: background Claude question-card sweep
         # #755 (2026-06-02): Gemini sometimes fails to draft the research plan
         # (shows "...something went wrong" + a Regenerate/Retry button instead of
         # "Start research"). Auto-click that retry, bounded, so the plan re-drafts
@@ -33895,6 +34304,23 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # misread animation can't dwell forever.
         _stream_max_sec = int(os.environ.get("GEMINI_PLAN_STREAM_MAX_SEC", "900"))
         _last_stream_seen_at = time.time()  # grace: the submit just happened
+        # #953 (2026-07-13 run): Gemini AUTO-STARTED its research (plan at
+        # ~95s, Start button rendered already-disabled, research ran with no
+        # click) — the streaming heartbeat then read the RUNNING RESEARCH as
+        # "plan still streaming", so the #929 extension dwelt the full 900s
+        # cap, the CUA recovery ladder spent ~7 min re-clicking the grayed
+        # Start button ("spamming Start Research"), a false "couldn't start"
+        # card fired on a healthy agent, and ChatGPT/Claude went unpolled for
+        # 22 minutes. A PLAN never streams for more than a few minutes — so
+        # past this hand-off point, persistent streaming means the research
+        # is (almost certainly) already running. Instead of dwelling, HAND
+        # OFF to the round-robin: its detectors decide (they correctly
+        # declared this very run done at 98k chars), and its late-Start
+        # watch leg (#953, poll loop) clicks a slow plan's Start button if
+        # one appears after all. No CUA ladder, no card — both are for the
+        # truly-dead (non-streaming) plan only.
+        _stream_handoff_sec = int(os.environ.get("GEMINI_PLAN_STREAM_HANDOFF_SEC", "360"))
+        _streaming_handoff = False
 
         def _retract_plan_alert(where: str):
             # #921/#929: retract the early plan-stall card once the plan
@@ -33921,6 +34347,16 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
             # plan is visibly streaming, hard-capped at _stream_max_sec.
             _elapsed = int(time.time() - _loop_start)
             _streaming_recent = (time.time() - _last_stream_seen_at) < 45
+            # #953: still streaming past the hand-off point → the research
+            # (almost certainly) auto-started — hand off to the round-robin
+            # instead of dwelling to the hard cap + CUA ladder + false card.
+            if _elapsed >= _stream_handoff_sec and _streaming_recent:
+                _streaming_handoff = True
+                log(f"[2D] Still streaming at {_elapsed}s (≥ {_stream_handoff_sec}s) — a plan "
+                    "never streams this long, so Gemini has almost certainly auto-started its "
+                    "research. Handing off to the round-robin (detectors decide; its watch leg "
+                    "clicks a late 'Start research' if one appears)", "INFO")
+                break
             if _elapsed >= _stream_max_sec:
                 log(f"[2D] Plan wait hard cap reached ({_elapsed}s ≥ {_stream_max_sec}s) "
                     "— handing off to recovery", "WARN")
@@ -33953,13 +34389,18 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 clicked = await gemini_page.evaluate(_click_start_js)
                 if clicked:
                     # Guard: confirm the click actually TOOK — the button should
-                    # vanish as the research begins. A JS click occasionally
-                    # doesn't register (overlay / not-yet-bound handler), which
-                    # would falsely mark a not-started plan as clicked. Re-click up
-                    # to 2× until "Start research" is gone before trusting it.
+                    # vanish (or disable) as the research begins. #953 (user
+                    # directive): click ONCE and WAIT — the old 2s-spaced triple
+                    # re-click spammed a button that just needed a moment to
+                    # react ("send Start Research and wait, only retry if it
+                    # doesn't fire"). Now: after the click, watch for up to 15s
+                    # (5×3s) before concluding it missed; only then ONE re-click
+                    # and one more 15s watch. The present-probe counts only an
+                    # ENABLED button, so a click that disabled it reads as took.
                     _took = False
-                    for _vi in range(3):
-                        await asyncio.sleep(2)
+                    _reclicks = 0
+                    for _vi in range(10):
+                        await asyncio.sleep(3)
                         try:
                             _still = await gemini_page.evaluate(_start_present_js)
                         except Exception:
@@ -33967,10 +34408,14 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         if not _still:
                             _took = True
                             break
-                        try:
-                            await gemini_page.evaluate(_click_start_js)  # re-click
-                        except Exception:
-                            pass
+                        if _vi == 4 and _reclicks == 0:
+                            _reclicks = 1
+                            log("[2D] 'Start research' still present 15s after the "
+                                "click — one re-click, then waiting again", "INFO")
+                            try:
+                                await gemini_page.evaluate(_click_start_js)
+                            except Exception:
+                                pass
                     if _took:
                         log("[2D] Clicked 'Start research' via JS ✓ (confirmed it took)")
                         start_clicked = True
@@ -33981,8 +34426,8 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                         _retract_plan_alert("main loop")
                         await asyncio.sleep(5)
                         break
-                    log("[2D] 'Start research' click didn't take after 2 re-clicks "
-                        "— continuing to poll", "WARN")
+                    log("[2D] 'Start research' click didn't take after a patient "
+                        "re-click (30s watch) — continuing to poll", "WARN")
             except Exception:
                 pass
 
@@ -34123,6 +34568,25 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     _last_plan_emit = time.time()
                 except Exception:
                     pass
+                # #953: background Claude question-card sweep. Claude's "1 of N"
+                # clarifying-question card (options + Skip) can render while we
+                # dwell here on Gemini — pre-fix it sat unanswered for the whole
+                # 2D window (22 min on 2026-07-13) because only the round-robin
+                # checked. JS-only (evaluate + click, no foreground switch, no
+                # CUA) so the Gemini dwell is undisturbed. ~30s cadence.
+                if time.time() - _last_claude_q_probe >= 30:
+                    _last_claude_q_probe = time.time()
+                    try:
+                        _cl_page = (agents.get("Claude") or {}).get("page")
+                        if _cl_page is not None and not _cl_page.is_closed():
+                            _q_bg = await _claude_skip_question_cards(_cl_page, "Claude/2D-bg")
+                            if _q_bg:
+                                emit_event("agent_progress", phase=2, agent="claude",
+                                           status="generating",
+                                           progress=f"Claude asked {_q_bg} clarifying question(s) — "
+                                                    "skipped them so the research starts.")
+                    except Exception:
+                        pass
 
             # #929: name the wait mode — past the base budget the loop only
             # keeps going while streaming evidence is fresh, and the log must
@@ -34147,7 +34611,13 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         # click it via deterministic JS — then verify + hand back to the
         # round-robin. Bounded so a permanently-failing plan still escalates
         # honestly (verified_b=False below) instead of dwelling forever.
-        if not _gemini_2d_skipped and not start_clicked and not _controls.is_stop():
+        # #953: `not _streaming_handoff` — a STREAMING Gemini is healthy (plan
+        # drafting or auto-started research); pointing the CUA at it is what
+        # produced the 2026-07-13 "spamming Start Research" (3 vision clicks on
+        # the grayed button) + the false "couldn't start" card. The ladder is
+        # for the truly-dead, non-streaming plan only.
+        if (not _gemini_2d_skipped and not start_clicked and not _streaming_handoff
+                and not _controls.is_stop()):
             _FALLBACK_MAX_REGEN = 3   # CUA-driven re-draft attempts (the in-loop #755 path already tried 3 via JS)
             log(f"[2D] No 'Start research' after {_start_wait_max_sec}s — CUA recovery: "
                 f"retry the plan (≤{_FALLBACK_MAX_REGEN}×) until 'Start research' appears, then click it")
@@ -34166,6 +34636,19 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                     _gemini_2d_skipped = True
                     emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
                     await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
+                    break
+                # #953: re-probe streaming before poking the page — Gemini may
+                # have (re)started generating since the wait loop's last scrape
+                # (e.g. research auto-started late). A streaming page is healthy;
+                # the CUA must never click at it (that's the spam + false card).
+                try:
+                    _gm_lad = await scrape_progress_gemini(gemini_page) or {}
+                except Exception:
+                    _gm_lad = {}
+                if (_gm_lad.get("status") or "") == "generating":
+                    _streaming_handoff = True
+                    log("[2D] Gemini is streaming again mid-recovery — standing down the "
+                        "CUA ladder and handing off to the round-robin", "INFO")
                     break
                 # 1. The plan may already expose a Start-research button (a prior
                 #    re-draft just succeeded, or it was simply slow) — click it.
@@ -34194,10 +34677,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 async def _gemini_start_cua():
                     return await agent_loop(cua_client, browser,
                         PROMPT_GEMINI_START_RESEARCH,
-                        "If a 'Start research' button is visible, click it. Otherwise the "
-                        "research plan failed to generate (you may see an error such as "
-                        "'something went wrong') — click the Retry / Regenerate button to "
-                        "re-draft the plan. Do NOT type anything.",
+                        "If an ENABLED (blue) 'Start research' button is visible, click it "
+                        "ONCE. If it is grayed out/disabled or the page shows research "
+                        "progress or a finished report, do NOT click — say 'research "
+                        "already running'. Only on a failed plan ('something went wrong') "
+                        "click Retry/Regenerate once. Do NOT type anything.",
                         model=CUA_MODEL, max_iterations=10, verbose=verbose)
 
                 # #839 act tier: DUAL-target mission — click 'Start research' OR
@@ -34209,9 +34693,11 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 await _shadow_observed_cua(
                     gemini_page, hotspot_id="gemini-start", phase=2, platform="gemini",
                     current_step="start_or_regenerate_plan",
-                    context_hint="Gemini plan not ready — click the blue 'Start research' "
-                                 "button if present, else the Retry/Regenerate control on "
-                                 "the 'something went wrong' error. NEVER type",
+                    context_hint="Gemini plan not ready — click an ENABLED (blue) 'Start "
+                                 "research' button ONCE if present; if it is grayed/disabled "
+                                 "or research is already running, do NOT click (say 'research "
+                                 "already running'); else click the Retry/Regenerate control "
+                                 "on the 'something went wrong' error once. NEVER type",
                     expected_outcome="the research plan starts or is re-drafted",
                     cua_coro_factory=_gemini_start_cua,
                     mission_prompt=PROMPT_GEMINI_START_RESEARCH,
@@ -34257,7 +34743,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 _gemini_2d_skipped = True
                 emit_event("agent_skipped", phase=2, agent="gemini", reason="user_skip")
                 await _close_skipped_agent_tab(browser, gemini_page, "gemini", "Gemini")
-            if not start_clicked and not _gemini_2d_skipped:
+            if not start_clicked and not _gemini_2d_skipped and not _streaming_handoff:
                 log(f"[2D] CUA recovery exhausted ({_FALLBACK_MAX_REGEN} attempts) — "
                     f"plan never produced a clickable 'Start research'", "WARN")
                 # Surface the Retry/Skip alert NOW — don't make the user wait for
@@ -34265,7 +34751,21 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 # (or 'Start research' never appears), raise skip/retry. Retry runs
                 # a HARD retry = fresh Gemini chat + re-submitted topic. fail_agent
                 # dedups by alert_id, so a later wall-clock re-assert is harmless.
-                if not _controls.is_stop():
+                # #953: one last streaming probe guards the card — a Gemini that
+                # is actively generating is NOT failed, whatever the ladder saw
+                # (the 2026-07-13 false "couldn't start" card fired on an agent
+                # that was mid-research and finished 4 min later at 98k chars).
+                _final_streaming = False
+                try:
+                    _gm_fin = await scrape_progress_gemini(gemini_page) or {}
+                    _final_streaming = (_gm_fin.get("status") or "") == "generating"
+                except Exception:
+                    _final_streaming = False
+                if _final_streaming:
+                    _streaming_handoff = True
+                    log("[2D] Final probe: Gemini is streaming — suppressing the "
+                        "'couldn't start' card and handing off to the round-robin", "INFO")
+                elif not _controls.is_stop():
                     fail_agent(
                         "gemini", "Gemini couldn't start Deep Research",
                         "Gemini didn't begin its research — likely a platform-side glitch. "
@@ -34291,6 +34791,24 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         elif _controls.is_stop():
             log("[2D] Stop requested — skipping Gemini verify", "INFO")
             verified_b = False
+        elif _streaming_handoff:
+            # #953: Gemini was still actively streaming past the hand-off point —
+            # research almost certainly auto-started (2026-07-13 run: plan at
+            # 95s, Start rendered pre-disabled, research ran unclicked to 98k
+            # chars). Not CONFIRMED researching (no click took), so verified
+            # stays False and the round-robin's detectors + late-Start watch
+            # leg decide — but this is a healthy hand-off, not a failure.
+            log("[2D] Gemini handed off while streaming — round-robin detectors "
+                "decide (late 'Start research' is clicked by the watch leg)", "INFO")
+            verified_b = False
+            try:
+                _retract_plan_alert("streaming hand-off")
+                emit_event("agent_progress", phase=2, agent="gemini",
+                           status="generating", stage="planning",
+                           progress="Gemini is taking its time — monitoring in the "
+                                    "background while the other agents are polled")
+            except Exception:
+                pass
         elif not start_clicked:
             log("[2D] 'Start research' never confirmed-clicked — not marking Gemini "
                 "as researching (avoids a false 'running' on a stale/failed plan)", "WARN")
@@ -34318,13 +34836,20 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
         if not _gemini_2d_skipped:
             agents["Gemini"] = {"page": gemini_page, "verified": verified_b, "url": gemini_page.url,
                                 "research_started_at": time.time(),
-                                "needs_start_verify": bool(start_clicked and not verified_b)}
+                                "needs_start_verify": bool(start_clicked and not verified_b),
+                                # #953: streaming hand-off — the round-robin's
+                                # Gemini leg watches for a late 'Start research'
+                                # (slow plan) and clicks it; a verified-running
+                                # probe clears the watch (auto-started case).
+                                "gemini_watch_start": bool(_streaming_handoff)}
         if verified_b:
             emit_event("agent_progress", phase=2, agent="gemini", status="generating",
                        stage="researching",
                        progress="Gemini Deep Research plan created and started")
             log("[2D] Gemini is researching ✓")
             await inject_agent_observer(gemini_page, "gemini")
+        elif _streaming_handoff:
+            log("[2D] Gemini streaming hand-off — round-robin takes it from here")
         elif not _gemini_2d_skipped:
             log("[2D] Gemini may not be running", "WARN")
 

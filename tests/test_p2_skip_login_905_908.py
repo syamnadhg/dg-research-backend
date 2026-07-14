@@ -204,14 +204,21 @@ def test_phase2_entry_clears_stale_skip_markers():
 # ── #905: source-guards ──────────────────────────────────────────────────────
 
 def test_gemini_start_finder_matches_role_button_and_skips_disabled():
+    # #953: the finder was hoisted to module scope (_GEMINI_START_PREDICATE_JS
+    # → _GEMINI_CLICK_START_JS / _GEMINI_START_PRESENT_JS) so the round-robin's
+    # late-Start watch leg runs the exact same #905-hardened predicate.
+    pred = research._GEMINI_START_PREDICATE_JS
+    assert 'role=\\"button\\"' in pred or "role=" in pred
+    assert "aria-disabled" in pred
+    assert research._GEMINI_CLICK_START_JS.startswith("() => {")
+    assert research._GEMINI_START_PRESENT_JS.startswith("() => {")
+    # The 2D loop + CUA recovery must reuse the SAME finder — a single alias,
+    # no second, divergent `<button>`-only redefinition (the live run's finder
+    # went blind while its own diagnostic dumped a visible
+    # aria="Start research" control).
     src = inspect.getsource(research.run_phase2)
-    assert "[role=\\\"button\\\"]" in src or "[role=\\'button\\']" in src or (
-        "role=" in src and "aria-disabled" in src)
-    assert "aria-disabled" in src
-    # The CUA recovery must reuse the SAME finder — no second, divergent
-    # `<button>`-only redefinition (the live run's finder went blind while
-    # its own diagnostic dumped a visible aria="Start research" control).
     assert src.count("_click_start_js = ") == 1
+    assert "_click_start_js = _GEMINI_CLICK_START_JS" in src
 
 
 def test_round_robin_cycle1_is_insertion_order_with_dwell():
