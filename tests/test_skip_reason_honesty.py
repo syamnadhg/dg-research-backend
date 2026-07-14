@@ -259,7 +259,12 @@ def test_no_bare_skipped_agents_discard_outside_controls():
 
 def test_clear_seam_scopes_agent_skipped():
     src = inspect.getsource(research.emit_event)
-    assert '_clear_pending_decision(agent if event_type == "agent_skipped" else None)' in src, (
-        "the emit_event clear seam must agent-scope agent_skipped clears so "
-        "skipping agent A can't retract agent B's still-live Retry/Skip mirror"
+    # 2026-07-14: pipeline_resumed is now scoped the SAME way as agent_skipped
+    # (the non-blocking P2 model emits per-agent resumes on auto-skip / chat-mode
+    # / retry) so an agent-carrying resume can't blanket-wipe a sibling's mirror.
+    assert ('_clear_pending_decision(\n                agent if event_type in '
+            '("agent_skipped", "pipeline_resumed") else None)') in src, (
+        "the emit_event clear seam must agent-scope agent_skipped AND "
+        "pipeline_resumed clears so resolving agent A can't retract agent B's "
+        "still-live Retry/Skip mirror"
     )

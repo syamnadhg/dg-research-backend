@@ -302,7 +302,13 @@ def test_recently_carded_snapshot_taken_before_page_probes():
         )
 
 
-def test_fail_agent_event_carries_phase_2():
+def test_fail_agent_event_carries_live_phase_not_hardcoded_two():
     # The FE's phase-scoped alert routing (AgentAlert.phase) keys off this —
     # P1's brief tile shares the "chatgpt" agentAlerts key with the P2 agent.
-    assert 'emit_event("pipeline_error", phase=2, agent=agent_key' in FAIL_SRC
+    # 2026-07-14: fail_agent used to HARDCODE phase=2 + a phase-LESS alert_id
+    # (agent_{key}_error), which mislabeled a P1-context ChatGPT failure as a
+    # P2 agent card and let the P1/P2 chatgpt cards collide. It now emits the
+    # LIVE phase (_eff_phase, = _runtime.phase, still 2 during P2) + a
+    # phase-tokened id. Functional guard: test_p2_alerts_pause_resume.py.
+    assert 'emit_event("pipeline_error", phase=_eff_phase, agent=agent_key' in FAIL_SRC
+    assert "_agent_error_alert_id(agent_key, _eff_phase)" in FAIL_SRC

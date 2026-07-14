@@ -8686,6 +8686,20 @@ def _start_command_listener(uid, research_id, loop):
                     _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent_hard, _ag)
                     loop.call_soon_threadsafe(_controls.request_resume)
+                    # Auto-resume the FE across ALL surfaces on Retry. A fail_agent
+                    # card FE-auto-pauses the run locally (usePipeline:3063) with no
+                    # BE pause, and this intake otherwise emits NO resume (see the
+                    # 8692 note) — so a second tab / phone / cold reopen stayed stuck
+                    # "Paused MM:SS" (the user's "still paused after retry" report).
+                    # The acting tab clears optimistically FE-side; this covers the
+                    # rest. Scheduled on the loop thread (emit does Firestore I/O);
+                    # phase = the live phase so the resume lands on the right badge.
+                    loop.call_soon_threadsafe(
+                        lambda a=_ag_norm: emit_event(
+                            "pipeline_resumed",
+                            phase=(_runtime.phase if isinstance(_runtime.phase, int)
+                                   and _runtime.phase >= 0 else 2),
+                            agent=a, reason="agent_retry"))
                     # #777: retract any durable "Hit a snag" pendingDecision mirror
                     # the instant the user clicks Retry. The agent-retry path resolves
                     # the decision via request_retry_agent_hard + request_resume +
@@ -8721,6 +8735,15 @@ def _start_command_listener(uid, research_id, loop):
                     _write_agent_terminal_status(_ag, "running")
                     loop.call_soon_threadsafe(_controls.request_retry_agent, _ag)
                     loop.call_soon_threadsafe(_controls.request_resume)
+                    # Auto-resume the FE across ALL surfaces on Retry — see the
+                    # hard-branch note above (acting tab clears optimistically;
+                    # this covers second tab / phone / cold reopen).
+                    loop.call_soon_threadsafe(
+                        lambda a=_ag_norm: emit_event(
+                            "pipeline_resumed",
+                            phase=(_runtime.phase if isinstance(_runtime.phase, int)
+                                   and _runtime.phase >= 0 else 2),
+                            agent=a, reason="agent_retry"))
                     # #777: see hard-branch note — retract the snag mirror on Retry
                     # (agent-scoped so it can't clobber another agent's live card).
                     loop.call_soon_threadsafe(_clear_pending_decision, _ag_norm)
@@ -13058,7 +13081,18 @@ def emit_event(event_type, phase=None, agent=None, **data):
             # survive unrelated resolves). The keep-guard in
             # _clear_pending_decision arbitrates; agent-less events (stop,
             # phase-level) keep the unconditional clear exactly as before.
-            _clear_pending_decision(agent if event_type == "agent_skipped" else None)
+            # 2026-07-14: scope an AGENT-carrying pipeline_resumed the same way.
+            # The non-blocking P2 model now emits per-agent pipeline_resumed on
+            # auto-skip / chat-mode-skip / retry (agent=<key>); an unconditional
+            # clear here would wipe a SIBLING agent's live durable mirror (two
+            # agents fail → single pendingDecision holds the later one → resuming
+            # the earlier one blanket-deleted the later's card on cold reopen).
+            # Existing agent-carrying resumes (login/HV/agent-link/pro gates) are
+            # blocking + serialized (only one mirror is ever live) so scoping is
+            # a no-op for them; agent-LESS resumes (crash recovery, login-cleared)
+            # still pass None → unconditional, exactly as before.
+            _clear_pending_decision(
+                agent if event_type in ("agent_skipped", "pipeline_resumed") else None)
     except Exception:
         pass
     # #715 universal alert persistence: ANY blocking pipeline_error decision
@@ -14524,11 +14558,35 @@ def _agent_error_recently_carded(agent_key: str, within: float = 45.0) -> bool:
         return False
 
 
-def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False):
-    """Template B: Phase 2 per-agent error alert. Emits pipeline_error
-    scoped to one agent with [Retry (hard), Skip]. NO Stop.
+def _agent_error_alert_id(agent_key: str, phase: "int | None" = None) -> str:
+    """Phase-qualified per-agent error alert_id. P1's brief tile and P2's DR
+    tile BOTH render under the bare key "chatgpt" (_AGENT_KEY_ALIASES), so a
+    phase-LESS `agent_{key}_error` id let a P1 ChatGPT card and a P2 ChatGPT card
+    share the same FE store slot / dismiss ledger / pendingDecision mirror and
+    bleed across phases (user report: "p1 and p2 chatgpt alerts flowing into
+    each other"). Tokening the id with the phase — mirroring EVERY sibling id
+    (phase{n}_login_required_{k}, phase{n}_pro_required_{k}, phase{n}_agent_link_{k},
+    phase{n}_{k}_chat_mode) — makes them distinct so they can never co-dismiss,
+    co-dedup, or cross-hydrate. Phase defaults to the live run phase (2 during
+    P2, 1 during a P1 relaunch). Used by fail_agent AND its completion retracts
+    so the retract's id always matches the card it clears."""
+    _p = phase if isinstance(phase, int) and phase >= 0 else (
+        _runtime.phase if isinstance(_runtime.phase, int) and _runtime.phase >= 0 else 2)
+    return f"phase{_p}_agent_{agent_key}_error"
+
+
+def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False,
+               phase: "int | None" = None):
+    """Template B: per-agent error alert (Phase 2 in the common case). Emits
+    pipeline_error scoped to one agent with [Retry (hard), Skip]. NO Stop.
     Retry uses mode=hard (close tab + re-run setup) — the more recoverable
     branch for genuine agent failures.
+
+    `phase` defaults to the LIVE run phase (`_runtime.phase`) so a P1-context
+    relaunch failure (research.py:~11201) is honestly tagged phase 1 instead of
+    the old hardcoded phase 2 — which mislabeled a P1 ChatGPT failure as a P2
+    agent card and leaked it into the P2 dropdown. Pass an explicit phase only
+    to override the live value.
 
     #705: the [Wait] button was removed — the locked alert spec is
     Decision = [Retry] [Skip] only (no Poke/Wait). Stall sites already get a
@@ -14540,8 +14598,9 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     the walled surface (exactly the interaction the 2026-07-06 directive
     forbids because every touch raises the bot score).
 
-    Every alert carries `dismissible: True` + a unique
-    `alert_id = agent_<key>_error` so the FE store can dedupe dismiss."""
+    Every alert carries `dismissible: True` + a unique phase-qualified
+    `alert_id = phase<phase>_agent_<key>_error` so the FE store can dedupe
+    dismiss WITHOUT a P1 and P2 card for the same agent colliding."""
     # #929: --login teardown window — the browser is being closed ON
     # PURPOSE, so any agent failure right now is a side effect of that
     # close, not a real platform problem (live 2026-07-09: Gemini's paste
@@ -14569,9 +14628,11 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     actions.append({"id": "skip", "label": "Skip",
                     "style": "primary" if skip_only else "default",
                     "command": {"action": "skip_agent", "agent": agent_key}})
-    emit_event("pipeline_error", phase=2, agent=agent_key,
+    _eff_phase = phase if isinstance(phase, int) and phase >= 0 else (
+        _runtime.phase if isinstance(_runtime.phase, int) and _runtime.phase >= 0 else 2)
+    emit_event("pipeline_error", phase=_eff_phase, agent=agent_key,
                error=title, details=details, actions=actions,
-               dismissible=True, alert_id=f"agent_{agent_key}_error")
+               dismissible=True, alert_id=_agent_error_alert_id(agent_key, _eff_phase))
     # 2026-07-13: stamp the emit so the caller's GENERIC "didn't start" card
     # doesn't fire seconds later and OVERWRITE this (same alert_id) with a
     # less specific message — the 03:42 run persisted "Couldn't send the
@@ -22623,7 +22684,7 @@ async def extract_and_record_agent(name, page, browser, cua_client, queue_dir,
                            error=f"{name} finished — earlier alert cleared",
                            details=f"{name} completed its research ({n_chars} chars extracted); "
                                    "the earlier failure alert is stale.",
-                           actions=[], alert_id=f"agent_{agent_key}_error",
+                           actions=[], alert_id=_agent_error_alert_id(agent_key, 2),
                            auto_clear_on_resume=True)
                 _clear_pending_decision(agent_key)
                 _AGENT_ERROR_CARD_TS.pop(agent_key, None)
@@ -24125,7 +24186,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                error=f"{_agent_name} already finished",
                                details=f"{_agent_name} completed its research before the retry "
                                        "was processed — nothing to retry.",
-                               actions=[], alert_id=f"agent_{_agent_key}_error",
+                               actions=[], alert_id=_agent_error_alert_id(_agent_key, 2),
                                auto_clear_on_resume=True)
                     _clear_pending_decision(_agent_key)
                 except Exception:
@@ -25533,7 +25594,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         emit_event("pipeline_warning", phase=2, agent=agent_key_stuck,
                                    error=f"{name} resumed",
                                    details=f"{name} started producing output again.",
-                                   actions=[], alert_id=f"agent_{agent_key_stuck}_error",
+                                   actions=[], alert_id=_agent_error_alert_id(agent_key_stuck, 2),
                                    auto_clear_on_resume=True)
                         _clear_pending_decision(agent_key_stuck)
                     except Exception:
@@ -25726,7 +25787,7 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             emit_event("pipeline_warning", phase=2, agent=agent_key_stuck,
                                        error=f"{name} is working",
                                        details=f"{name} was re-checked and is still working — earlier alert withdrawn.",
-                                       actions=[], alert_id=f"agent_{agent_key_stuck}_error",
+                                       actions=[], alert_id=_agent_error_alert_id(agent_key_stuck, 2),
                                        auto_clear_on_resume=True)
                             _clear_pending_decision(agent_key_stuck)
                         except Exception:
@@ -31810,7 +31871,8 @@ async def _close_skipped_agent_tab(browser, page, platform_key: str, label: str,
 
 
 async def _hv_auto_skip_finalize(browser, page, agent_key: str, label: str,
-                                 phase: int = 2, preserve_tab: bool = False) -> None:
+                                 phase: int = 2, preserve_tab: bool = False,
+                                 release_pause: bool = False) -> None:
     """Clean auto-skip for an unacted hands-off HV wall (Skip is the only real
     move for Cloudflare). Mirrors the L3 stuck-agent auto-skip dynamics so the
     UX is consistent: greys the tile (agent_skipped) with an HONEST reason,
@@ -31830,6 +31892,20 @@ async def _hv_auto_skip_finalize(browser, page, agent_key: str, label: str,
     # the persisted status to "skipped" and clears the pendingDecision mirror).
     emit_event("agent_skipped", phase=phase, agent=agent_key,
                reason="auto_skip_hv_unanswered")
+    # If this finalizer resolves an ACTIVE HV pause (the unacted-grace timeout
+    # path, release_pause=True), release it. The skipped_agents.add above went
+    # in DIRECTLY (not via request_skip_agent), so pause_event is STILL set —
+    # the round-robin's per-tick pause check would freeze the whole run, and
+    # the FE would stay stuck "Paused MM:SS" with the input locked because no
+    # pipeline_resumed ever arrives (the exact bug the user reported for auto
+    # skips). Emit pipeline_resumed BEFORE the informational warning below so
+    # the resume's auto-clear-on-resume sweep doesn't wipe the notice we post.
+    # The setup-fail caller (no active pause) passes release_pause=False so this
+    # can't spuriously drop an unrelated agent's live pause.
+    if release_pause:
+        _controls.request_resume()
+        emit_event("pipeline_resumed", phase=phase, agent=agent_key,
+                   reason="auto_skip_hv_unanswered")
     # Informational (not an error card — the agent is resolved, not awaiting a
     # decision), so the user learns WHY it greyed. Mirrors the L3 notice.
     emit_event("pipeline_warning", phase=phase, agent=agent_key,
@@ -32363,7 +32439,7 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
     # anytime it lands). When auto-skip is OFF, fall through to the manual card.
     if _runtime.auto_skip_stuck:
         await _hv_auto_skip_finalize(browser, page, platform_key, label, phase,
-                                     preserve_tab=preserve_tab)
+                                     preserve_tab=preserve_tab, release_pause=True)
         return False
     log(f"[{label}] Human verification timed out ({max_wait_loops * 5}s) — skipping agent", "WARN")
     # #710: this timeout exit drops the agent WITHOUT emitting
@@ -33462,6 +33538,20 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # red error card.
                 emit_event("agent_skipped", phase=2, agent=platform_l,
                            reason="retry_on_chat_mode_alert_unsupported")
+                # Internal skip marker (mirrors the setup-fail path ~34144): the
+                # caller's post-setup handler otherwise reaches its `else` and
+                # fires a contradictory RED "didn't start" fail_agent card on an
+                # agent we just greyed — it gates that off on
+                # `platform in skipped_agents`. Also drops the agent from the
+                # round-robin poll set (no sitting on a dead chat-mode tab).
+                _controls.skipped_agents.add(platform_l)
+                _controls.auto_skip_reasons[platform_l] = "chat_mode_skip"
+                # Close the chat-mode pipeline_paused (@33424): agent_skipped
+                # greys the tile but does NOT clear the FE paused chrome, so
+                # without this the run stays stuck "Paused MM:SS" after the
+                # skip. (wait_if_paused already cleared pause_event BE-side.)
+                emit_event("pipeline_resumed", phase=2, agent=platform_l,
+                           reason="chat_mode_skip")
                 return page, False
             if decision == "skip" or decision == "timeout":
                 _runtime.agent_modes[platform_l] = {
@@ -33478,6 +33568,16 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 # card on a just-skipped agent (the double-fire). The chat-mode
                 # card already told the user WHY before they chose Skip.
                 emit_event("agent_skipped", phase=2, agent=platform_l, reason=_reason)
+                # Internal skip marker (see the retry-branch note above): suppress
+                # the caller's contradictory red "didn't start" card + drop the
+                # agent from the round-robin poll set.
+                _controls.skipped_agents.add(platform_l)
+                _controls.auto_skip_reasons[platform_l] = _reason
+                # Close the chat-mode pipeline_paused (@33424) — see the
+                # retry-branch note above; the skip/timeout resolution must
+                # auto-resume the FE or it stays stuck "Paused MM:SS".
+                emit_event("pipeline_resumed", phase=2, agent=platform_l,
+                           reason="chat_mode_skip")
                 return page, False
             # continue_anyway → proceed in chat mode with sticky flag.
             # (Explicit-only per 2026-05-12: an AFK operator must not
@@ -34525,7 +34625,7 @@ async def run_phase2(browser, cua_client, brief_text, verbose=False, enabled_age
                 emit_event("pipeline_warning", phase=2, agent="gemini",
                            error="Gemini's research plan started",
                            details="Gemini recovered and began its deep research.",
-                           actions=[], alert_id="agent_gemini_error",
+                           actions=[], alert_id=_agent_error_alert_id("gemini", 2),
                            auto_clear_on_resume=True)
                 _clear_pending_decision("gemini")
             except Exception:

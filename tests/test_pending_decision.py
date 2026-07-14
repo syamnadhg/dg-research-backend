@@ -212,8 +212,13 @@ def test_pending_decision_cleared_on_universal_resolve_signal():
     # 2026-07-11: the seam agent-scopes agent_skipped clears (skipping agent A
     # must not retract agent B's still-live mirror); agent-less events keep
     # the unconditional clear via the None arm — same #710 contract.
-    assert ('_clear_pending_decision(agent if event_type == "agent_skipped" '
-            "else None)") in src, "emit_event must clear pendingDecision (#710)."
+    # 2026-07-14: pipeline_resumed is scoped the SAME way now that the
+    # non-blocking P2 model emits per-agent resumes (auto-skip/chat-mode/retry);
+    # an agent-carrying resume must not blanket-wipe a sibling's live mirror.
+    assert ('_clear_pending_decision(\n                agent if event_type in '
+            '("agent_skipped", "pipeline_resumed") else None)') in src, (
+        "emit_event must clear pendingDecision (#710) — agent-scoped for "
+        "agent_skipped AND pipeline_resumed.")
     # Every resolution signal retracts the mirror: resume/stop AND skip
     # (#715 — a Skip emits agent_skipped/phase_skipped, not pipeline_resumed).
     for ev in ("pipeline_resumed", "pipeline_stopped", "agent_skipped", "phase_skipped"):

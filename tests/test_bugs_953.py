@@ -263,7 +263,9 @@ def test_extract_success_retracts_stale_card():
     i = EXTRACT_SRC.index('_write_agent_terminal_status(agent_key, "complete")')
     blk = EXTRACT_SRC[i:i + 1600]
     assert "_AGENT_ERROR_CARD_TS.get(agent_key)" in blk
-    assert 'alert_id=f"agent_{agent_key}_error"' in blk
+    # 2026-07-14: retract id is now phase-tokened via the shared helper so it
+    # matches the (now phase-qualified) fail_agent card it clears.
+    assert "_agent_error_alert_id(agent_key, 2)" in blk
     assert "_clear_pending_decision(agent_key)" in blk
     assert "auto_clear_on_resume=True" in blk
 
@@ -280,7 +282,7 @@ def test_retraction_only_when_a_card_was_stamped():
 
 def test_hard_retry_dropped_for_completed_agent():
     i = POLL_SRC.index("consume_retry_agent_hard")
-    blk = POLL_SRC[i:i + 4200]
+    blk = POLL_SRC[i:i + 4400]
     assert "Hard retry ignored" in blk
     assert '_rec_done.get("status") == "done"' in blk
     assert '== "complete"' in blk
