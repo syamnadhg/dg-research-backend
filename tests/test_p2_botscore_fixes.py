@@ -44,7 +44,11 @@ def test_dns_backoff_machinery_removed():
 
 
 def test_no_claude_cycle2_reload_in_poll_loop():
-    src = inspect.getsource(research.poll_all_agents_round_robin)
+    # #953 (audit): the session-expiry re-auth reload moved OUT of the blocking
+    # round-robin body into the non-blocking parked-decision resolver — include
+    # both so "exactly one reload, and it's the re-auth branch" still holds.
+    src = (inspect.getsource(research.poll_all_agents_round_robin)
+           + "\n" + inspect.getsource(research._resolve_parked_agent_decision))
     # The one-shot refresh + its bookkeeping key must be gone. (A tombstone
     # comment documents the removal — assert on the functional markers.)
     assert "claude_refreshed_once" not in src, (

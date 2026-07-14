@@ -9545,6 +9545,45 @@ class PipelineControls:
             await asyncio.sleep(0.5)
         return "timeout"
 
+    def poll_agent_decision(self, agent: str) -> str:
+        """Non-blocking single check — one iteration of await_agent_decision's
+        body, no sleep/deadline. Returns the same verdicts
+        ('retry'/'wait_longer'/'continue_partial'/'continue_anyway'/'skip'/
+        'stop') or 'pending' when no decision is queued yet.
+
+        #953 (audit): the Phase-2 round-robin used to `await await_agent_decision`
+        INSIDE a per-agent leg for session-expiry / empty-extraction / missing-
+        artifact cards — which froze the ENTIRE loop (no other agent polled, no
+        completion detected) for up to 30 min. The loop now PARKS the agent
+        (records p['awaiting_decision']) and calls this once per tick, so the
+        other agents keep polling while one waits. Consumes the retry/wait/
+        continue markers identically so a parked agent resolves the same way —
+        just without blocking. The park's own deadline supplies the 'timeout'
+        default the blocking form returned."""
+        key = (agent or "").strip().lower()
+        if self.stop_event.is_set():
+            return "stop"
+        if self.consume_retry_agent(key):
+            return "retry"
+        if self.consume_retry_agent_hard(key):
+            return "retry"
+        if self.consume_wait_longer_agent(key):
+            return "wait_longer"
+        if self.consume_continue_partial(key):
+            return "continue_partial"
+        # #953 (audit): do NOT consume the GLOBAL one-shot continue_anyway here.
+        # No parked-decision card offers a "Continue anyway" action (all offer
+        # Retry/Skip, + Stop for the hard-fail), so it's never a legitimate park
+        # resolution — and because parking now allows MULTIPLE simultaneous
+        # parks, a stray/leaked global continue_anyway (a lingering pro/chat-mode
+        # button, a stale flag) would be stolen by whichever parked agent's leg
+        # ran first and wrongly finalize it (e.g. accept-empty). The park's own
+        # deadline 'timeout' supplies the accept-empty parity the blocking form
+        # relied on. (The blocking await_agent_decision callers still consume it.)
+        if key in self.skipped_agents:
+            return "skip"
+        return "pending"
+
     def consume_phase_skip(self, phase: int) -> bool:
         """Check + clear the skip flag for this phase. True when a skip was
         queued; consuming it here ensures a subsequent phase doesn't inherit
@@ -23317,6 +23356,167 @@ async def _gemini_send_kickoff_nudge(page, label, attempt_idx=0):
     return ok
 
 
+async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
+                                         browser, cua_client, results, pending,
+                                         extract_fns, max_wait_min,
+                                         verbose=False) -> str:
+    """#953 (audit): apply a resolved parked-decision — the retry / timeout
+    action that used to run inline right after a blocking `await_agent_decision`
+    in the Phase-2 round-robin. `action` is one of the poll verdicts
+    ('retry'/'wait_longer'/'continue_partial'/'continue_anyway') or 'timeout'
+    (the park window elapsed with no user input). 'stop'/'skip' are handled by
+    the caller. Returns 'break' (unused today) or 'continue'; the caller
+    always `continue`s the round-robin afterwards, so every path here just
+    mutates `p` / finalizes into `results` and returns 'continue'."""
+    _retry = (action == "retry")
+
+    # ── Session expiry: retry = reload the tab so the re-auth cookie lands ──
+    if kind == "session_expiry":
+        if _retry:
+            _cur_url = ""
+            try:
+                _cur_url = (p["page"].url or "").lower()
+            except Exception:
+                pass
+            # #897a: never reload a MOUNTED Gemini conversation (the SPA drops
+            # it → empty home); the fresh cookie applies to its background
+            # requests in place. A tab redirected OFF gemini (a login URL) has
+            # no conversation to lose and the reload un-sticks it.
+            _gemini_mounted = name == "Gemini" and "gemini.google.com" in _cur_url
+            if not _gemini_mounted:
+                try:
+                    await p["page"].reload(wait_until="domcontentloaded", timeout=15000)
+                    await asyncio.sleep(3)
+                except Exception as _e:
+                    log(f"[{name}] Reload after re-auth failed: {_e}", "WARN")
+            p["last_auth_check"] = time.time()
+        # retry / timeout / wait → keep polling with the (now hopefully re-authed
+        # or 30-min-regraced) session.
+        return "continue"
+
+    # ── Playwright-path empty extraction: retry = re-run the tier ladder ──
+    if kind == "extract_empty_pw":
+        if _retry:
+            p["extraction_attempts"] = 0
+            p["flat_history"] = []
+        return "continue"
+
+    # ── CUA-path empty final: retry = nudge + re-poll; timeout = accept empty ──
+    if kind == "extract_empty_cua":
+        if _retry:
+            followup = (
+                "It looks like your final response didn't come through. Please output "
+                "the complete research report now — include all sources, sections, and findings. "
+                "No preamble or post-amble."
+            )
+            try:
+                await browser.switch_to_page(p["page"])
+                await paste_followup(p["page"], followup, name.lower(), label=f"{name}-retry-empty")
+            except Exception as e:
+                log(f"[{name}] Retry follow-up failed: {e}", "WARN")
+            # #953 (audit #7): roll back from the elapsed captured AT PARK time,
+            # not the freshly-recomputed elapsed — so the user's decision-wait
+            # doesn't get folded into the budget rollback (pre-#953 parity).
+            _elapsed_rb = int(p.get("_empty_elapsed_at_park", elapsed) or elapsed)
+            p["start_time"] = time.time() - max(0, _elapsed_rb - (15 * 60))
+            p["done_count"] = 0
+            p["cua_confirmed"] = False
+            p["last_cua_check"] = time.time()
+            p["empty_retries"] = 0
+            return "continue"
+        # timeout / wait_longer / continue_partial → accept the empty result
+        # (parity with the pre-#953 fall-through) and finalize the agent.
+        # #953 (audit #3/#4): retract this agent's own fail_agent card + red
+        # tile (mirroring the sibling auto-skip) and CLOSE its tab / null the
+        # page handle — the pre-refactor fall-through left the card up and the
+        # tab open with a live handle in results.
+        results[name] = {"status": "empty", "text": "",
+                         "url": p["page"].url if p.get("page") else "",
+                         "page": None, "elapsed_sec": int(elapsed)}
+        emit_event("agent_skipped", phase=2, agent=key,
+                   reason="accept_empty_unanswered_timeout", partial_chars=0)
+        emit_event("pipeline_warning", phase=2, agent=key,
+                   error=f"{name} finished empty — moved on",
+                   details=(f"{name} came back empty and the retry prompt went unanswered "
+                            "— accepted the empty result so your run can finish. The other "
+                            "agents aren't affected."),
+                   actions=[], alert_id=f"agent_{key}_autoskip",
+                   auto_clear_on_resume=True)
+        try:
+            await _close_skipped_agent_tab(browser, p.get("page"), key, name,
+                                           final_status="empty")
+        except Exception:
+            pass
+        if name in pending:
+            del pending[name]
+        return "continue"
+
+    # ── Claude 2-artifact hard-fail: retry = nudge; timeout = auto-skip after 2 ──
+    if kind == "claude_2artifact_hf":
+        if _retry:
+            p["hf_timeouts"] = 0
+            followup = (
+                "Your research is incomplete — the final comprehensive report artifact is missing. "
+                "Please produce the complete research document artifact now — include every section, "
+                "finding, and source. This is the deliverable document, not the references list."
+            )
+            try:
+                await browser.switch_to_page(p["page"])
+                await paste_followup(p["page"], followup, "claude", label="Claude-retry-artifact")
+            except Exception as _e:
+                log(f"[Claude] Retry follow-up failed: {_e}", "WARN")
+            p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
+            p["done_count"] = 0
+            p["cua_confirmed"] = False
+            p["last_cua_check"] = time.time()
+            p.pop("_cached_text", None)
+            p["empty_retries"] = 0
+            return "continue"
+        # wait_longer / timeout → extend budget ONCE; after the 2nd unanswered
+        # timeout, auto-skip instead of looping hard-fails forever.
+        p["hf_timeouts"] = int(p.get("hf_timeouts", 0)) + 1
+        if p["hf_timeouts"] >= 2:
+            log(f"[Claude] 2-artifact hard-fail timed out {p['hf_timeouts']}× without a "
+                "user decision — auto-skipping agent", "WARN")
+            _hf_partial = ""
+            if key in _controls.hv_blocked:
+                log("[Claude] Auto-skip — verification-walled tab, skipping partial "
+                    "extraction (hands-off)", "WARN")
+            else:
+                try:
+                    await browser.switch_to_page(p["page"])
+                    _hf_partial = await extract_fns[name](
+                        p["page"], browser=browser, cua_client=cua_client,
+                        label=name, verbose=verbose) or ""
+                except Exception as _hfe:
+                    log(f"[Claude] Auto-skip salvage extract failed: {_hfe}", "WARN")
+            results[name] = {
+                "status": "auto_skipped", "text": _hf_partial,
+                "url": p.get("url", ""), "page": None, "elapsed_sec": int(elapsed),
+            }
+            emit_event("agent_skipped", phase=2, agent=key,
+                       reason="auto_skip_unanswered_timeout",
+                       partial_chars=len(_hf_partial))
+            emit_event("pipeline_warning", phase=2, agent=key,
+                       error="Claude skipped automatically",
+                       details=("Claude's report never finished and the retry prompt went "
+                                "unanswered — skipped so your run can finish. The other "
+                                "agents aren't affected."),
+                       actions=[], alert_id=f"agent_{key}_autoskip",
+                       auto_clear_on_resume=True)
+            await _close_skipped_agent_tab(browser, p.get("page"), key, name)
+            if name in pending:
+                del pending[name]
+            return "continue"
+        # First timeout — extend budget and keep polling.
+        p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
+        p["done_count"] = 0
+        p["cua_confirmed"] = False
+        return "continue"
+
+    return "continue"
+
+
 async def poll_all_agents_round_robin(agents, browser, cua_client,
                                        max_wait_min=90, poll_interval=30, verbose=False):
     """Round-robin poll all verified agents until each completes or times out.
@@ -23856,6 +24056,18 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
         # unrecoverable. Other agents keep running untouched.
         _hard_name_map = {"chatgpt": "ChatGPT", "gemini": "Gemini", "claude": "Claude"}
         for _agent_key in ("chatgpt", "gemini", "claude"):
+            # #953 (audit): a PARKED agent (session-expiry / empty-extraction /
+            # missing-artifact card) owns its own retry marker — the non-blocking
+            # parked-decision resolver consumes it and runs the SOFT action
+            # (reload / re-extract / nudge). The FE Retry button sends mode=hard,
+            # so without this guard the loop-top hard-retry consumer would drain
+            # that marker FIRST and do a full setup restart (re-run the whole
+            # research from scratch, discarding a finished-but-unread report) —
+            # the opposite of what these cards intend. Skip parked agents here
+            # WITHOUT consuming, leaving the marker for the resolver.
+            _pk_name = _hard_name_map.get(_agent_key)
+            if _pk_name and (pending.get(_pk_name) or {}).get("awaiting_decision"):
+                continue
             if not _controls.consume_retry_agent_hard(_agent_key):
                 continue
             _agent_name = _hard_name_map.get(_agent_key)
@@ -23883,13 +24095,31 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             _p_inflight = pending.get(_agent_name) or {}
             _inflight_done = (float(_p_inflight.get("done_marker_first_at", 0) or 0) > 0
                               or int(_p_inflight.get("done_count", 0) or 0) > 0)
+            # #953 (audit fold-in, race-safe): a Skip is a TERMINAL decision and
+            # must supersede a co-queued Retry. When a parked agent is skipped
+            # AND hard-retried in the same tick, the loop-top skip consumer
+            # finalizes it FIRST (results status skipped_by_user/auto_skipped +
+            # persisted 'skipped', removed from pending), so this guard — running
+            # later in the SAME tick on the SAME (loop) thread — sees that
+            # terminal state and drops the stale retry instead of resurrecting a
+            # fresh setup. (This replaces an earlier attempt to drain the retry
+            # marker inside consume_skip_marker, which raced the command thread's
+            # deferred request_retry_agent_hard and could silently lose a
+            # legitimate pre-failed retry.) Setup-FAILURE statuses
+            # (failed_setup / not_verified / hard_retry_* / interrupted) stay
+            # retryable — only completed / skipped outcomes block.
+            _rec_status = (_rec_done.get("status") or "").lower()
+            _terminal_skip = (_persisted_st == "skipped"
+                              or _rec_status in ("skipped_by_user", "auto_skipped"))
             if (_persisted_st == "complete"
                     or (_rec_done.get("status") == "done" and (_rec_done.get("text") or ""))
-                    or _inflight_done):
+                    or _inflight_done
+                    or _terminal_skip):
                 log(f"[{_agent_name}] Hard retry ignored — the agent already "
-                    f"completed or is finishing (persisted={_persisted_st!r}, recorded="
-                    f"{_rec_done.get('status')!r}, {len(_rec_done.get('text') or '')} chars, "
-                    f"inflight_done={_inflight_done}). Clearing the stale card instead.", "INFO")
+                    f"completed, is finishing, or was skipped (persisted={_persisted_st!r}, "
+                    f"recorded={_rec_done.get('status')!r}, "
+                    f"{len(_rec_done.get('text') or '')} chars, inflight_done={_inflight_done}, "
+                    f"terminal_skip={_terminal_skip}). Clearing the stale card instead.", "INFO")
                 try:
                     emit_event("pipeline_warning", phase=2, agent=_agent_key,
                                error=f"{_agent_name} already finished",
@@ -24136,6 +24366,86 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                 continue  # dropped by a signal handled mid-tick
             p = pending[name]
             elapsed = time.time() - p["start_time"]
+
+            # ── #953 (audit): NON-BLOCKING parked-decision resolver ──
+            # A per-agent decision card (session expiry, empty extraction,
+            # missing artifact) used to `await await_agent_decision(...)` INSIDE
+            # this leg — which froze the WHOLE round-robin (no other agent
+            # polled, no completion detected, no skip/retry consumed) for up to
+            # 30 minutes: the same "one agent's dwell starves the others" class
+            # as the 2D incident. Those sites now PARK the agent
+            # (p['awaiting_decision']) and `continue`; this resolver checks the
+            # decision ONCE per tick so the OTHER agents keep polling while this
+            # one waits. Skip is handled upstream by the loop-top skip consumer
+            # (it finalizes any pending agent), so the crash sweep / skip / hard-
+            # retry consumers all still see a parked agent normally — the resolver
+            # only handles retry / wait / stop / its own park-deadline timeout.
+            _parked = p.get("awaiting_decision")
+            if _parked:
+                _pk_key = _parked.get("key") or normalize_agent_key(name)
+                # #953 (audit #5): the absolute per-agent hard cap must bite even
+                # while parked — otherwise a re-parking kind (session_expiry 1800s
+                # / extract_empty_pw 600s keeps polling on timeout, then re-parks)
+                # can ride up to one park window PAST the 90-min ceiling. Force an
+                # auto-skip finalize (salvage + grey tile + close tab) at the cap.
+                if elapsed >= PER_AGENT_HARD_CAP_SEC:
+                    log(f"[{name}] Parked agent hit the {PER_AGENT_HARD_CAP_SEC}s hard "
+                        "cap — auto-skipping (the card went unanswered too long)", "WARN")
+                    p["awaiting_decision"] = None
+                    _hc_partial = ""
+                    if _pk_key not in _controls.hv_blocked:
+                        try:
+                            await browser.switch_to_page(p["page"])
+                            _hc_partial = await extract_fns[name](
+                                p["page"], browser=browser, cua_client=cua_client,
+                                label=name, verbose=verbose) or ""
+                        except Exception:
+                            _hc_partial = ""
+                    results[name] = {"status": "auto_skipped", "text": _hc_partial,
+                                     "url": p.get("url", ""), "page": None,
+                                     "elapsed_sec": int(elapsed)}
+                    emit_event("agent_skipped", phase=2, agent=_pk_key,
+                               reason="auto_skip_hard_cap", partial_chars=len(_hc_partial))
+                    emit_event("pipeline_warning", phase=2, agent=_pk_key,
+                               error=f"{name} skipped automatically",
+                               details=(f"{name} sat on an unanswered alert past the time "
+                                        "limit — skipped so your run can finish. The other "
+                                        "agents aren't affected."),
+                               actions=[], alert_id=f"agent_{_pk_key}_autoskip",
+                               auto_clear_on_resume=True)
+                    await _close_skipped_agent_tab(browser, p.get("page"), _pk_key, name)
+                    if name in pending:
+                        del pending[name]
+                    continue
+                _pk_dec = _controls.poll_agent_decision(_pk_key)
+                if _pk_dec == "stop":
+                    break
+                _pk_expired = (_pk_dec == "pending"
+                               and (time.time() - _parked.get("since", 0)) >= _parked.get("timeout", 300))
+                if _pk_dec == "pending" and not _pk_expired:
+                    continue  # still waiting on the user — do NOT block the loop
+                # A decision arrived (or the park window elapsed) — clear the
+                # park and act. 'skip' is defensive (the loop-top consumer
+                # normally finalizes first); treat it as keep-in-set so that
+                # consumer resolves it next tick.
+                p["awaiting_decision"] = None
+                _pk_kind = _parked.get("kind", "")
+                _pk_action = _pk_dec if _pk_dec != "pending" else "timeout"
+                log(f"[{name}] Parked decision resolved (kind={_pk_kind}, action={_pk_action})", "INFO")
+                if _pk_dec == "skip":
+                    # Re-arm the marker path: leave the skip marker for the
+                    # loop-top consumer (already consumed here → re-request so it
+                    # finalizes with the standard partial-extract + tab close).
+                    _controls.request_skip_agent(_pk_key)
+                    continue
+                _pk_handled = await _resolve_parked_agent_decision(
+                    _pk_kind, _pk_action, p, name, _pk_key, elapsed,
+                    browser, cua_client, results, pending, extract_fns,
+                    max_wait_min, verbose=verbose)
+                if _pk_handled == "break":
+                    break
+                continue
+
             # Per-agent cycle counter (used for "give research time to settle"
             # gate before opening Claude/ChatGPT panels — see iter-#3 logic
             # below). Increment ONCE per round-robin tick per agent.
@@ -24517,42 +24827,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                f"{name} signed out",
                                (f"{name} got logged out mid-run. Sign back in using "
                                 "the open browser, then Retry — or Skip it."))
-                    # Block this agent's polling until user decides. Other
-                    # agents keep polling (they don't hit this await).
-                    auth_decision = await _controls.await_agent_decision(agent_key_auth, timeout=1800.0)
-                    log(f"[{name}] Session-expiry decision: {auth_decision}")
-                    if auth_decision == "stop":
-                        break
-                    if auth_decision == "skip":
-                        # Existing skipped_agents handler will finalize on next tick
-                        continue
-                    if auth_decision == "retry":
-                        # Refresh the tab so the agent's (now logged-in) session cookie
-                        # lands, then reset polling state. Don't extend budget — this
-                        # is the user's re-auth, not a new research run.
-                        # #897a: never reload a MOUNTED Gemini conversation — the SPA
-                        # no longer restores it on reload (lands on the empty "new
-                        # chat" home); the fresh cookie applies on Gemini's own
-                        # background requests in place. But if the tab itself was
-                        # redirected off gemini.google.com (a login URL), there is no
-                        # conversation left to lose and the reload is what un-sticks
-                        # the login page via its post-auth redirect.
-                        _cur_url = ""
-                        try:
-                            _cur_url = (p["page"].url or "").lower()
-                        except Exception:
-                            pass
-                        _gemini_mounted = name == "Gemini" and "gemini.google.com" in _cur_url
-                        if not _gemini_mounted:
-                            try:
-                                await p["page"].reload(wait_until="domcontentloaded", timeout=15000)
-                                await asyncio.sleep(3)
-                            except Exception as _e:
-                                log(f"[{name}] Reload after re-auth failed: {_e}", "WARN")
-                        p["last_auth_check"] = time.time()
-                        continue
-                    # 'continue_partial' / 'timeout' — user idle; keep polling
-                    # with the stale session (likely 30min re-grace from platforms)
+                    # #953 (audit): PARK the agent instead of blocking the whole
+                    # round-robin for 30 min. The parked-decision resolver at the
+                    # leg top handles Retry (reload the re-authed tab) / Skip (the
+                    # loop-top consumer) / Stop / timeout — while the OTHER agents
+                    # keep polling. 30-min park window preserves the old timeout.
+                    p["awaiting_decision"] = {
+                        "kind": "session_expiry", "key": agent_key_auth,
+                        "since": time.time(), "timeout": 1800.0,
+                    }
                     continue
 
             # ── Gemini periodic refresh: REMOVED (#897a, 2026-07-04) ──
@@ -25831,24 +26114,13 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                f"Couldn't read {name}'s report",
                                (f"{name} finished but we couldn't pull its results. "
                                 "Retry to try again, or Skip it."))
-                    decision = await _controls.await_agent_decision(agent_key, timeout=600.0)
-                    log(f"[{name}] Extraction-failed decision: {decision}")
-                    if decision == "retry":
-                        p["extraction_attempts"] = 0
-                        p["flat_history"] = []
-                        continue
-                    if decision == "skip":
-                        results[name] = {"status": "skipped_by_user",
-                                         "text": "", "url": "",
-                                         "page": p["page"],
-                                         "elapsed_sec": int(elapsed)}
-                        del pending[name]
-                        emit_event("agent_skipped", phase=2, agent=agent_key,
-                                   reason="extraction_failure_skip")
-                        # status="skipped" auto-persisted by emit_event hook.
-                        continue
-                    if decision == "stop":
-                        break
+                    # #953 (audit): park (non-blocking) instead of freezing the
+                    # loop for 10 min. Resolver: Retry → reset + re-run the tier
+                    # ladder; Skip → loop-top consumer finalizes; Stop → break.
+                    p["awaiting_decision"] = {
+                        "kind": "extract_empty_pw", "key": agent_key,
+                        "since": time.time(), "timeout": 600.0,
+                    }
                     continue
 
             # Check completion — CUA-primary fallback (only if Playwright was
@@ -26179,81 +26451,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         except Exception:
                             pass
                         p.setdefault("hf_timeouts", 0)
-                        decision = await _controls.await_agent_decision(agent_key_hf, timeout=300.0)
-                        log(f"[Claude] 2-artifact hard-fail decision: {decision}")
-                        if decision == "stop":
-                            break
-                        if decision == "skip":
-                            continue
-                        if decision == "retry":
-                            p["hf_timeouts"] = 0
-                            followup = (
-                                "Your research is incomplete — the final comprehensive report artifact is missing. "
-                                "Please produce the complete research document artifact now — include every section, "
-                                "finding, and source. This is the deliverable document, not the references list."
-                            )
-                            try:
-                                await browser.switch_to_page(p["page"])
-                                await paste_followup(p["page"], followup, "claude", label="Claude-retry-artifact")
-                            except Exception as _e:
-                                log(f"[Claude] Retry follow-up failed: {_e}", "WARN")
-                            p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
-                            p["done_count"] = 0
-                            p["cua_confirmed"] = False
-                            p["last_cua_check"] = time.time()
-                            p.pop("_cached_text", None)
-                            p["empty_retries"] = 0
-                            continue
-                        # wait_longer / timeout → extend budget ONCE; after the
-                        # 2nd unanswered timeout, auto-skip instead of looping
-                        # hard-fails forever.
-                        p["hf_timeouts"] += 1
-                        if p["hf_timeouts"] >= 2:
-                            log(f"[Claude] 2-artifact hard-fail timed out {p['hf_timeouts']}× "
-                                f"without a user decision — auto-skipping agent", "WARN")
-                            # #929: finalize the skip HERE instead of routing a
-                            # bare marker through the user-skip consumer — that
-                            # path stamped reason="user_skip" on a skip nobody
-                            # chose. Mirror the L3 auto-skip: salvage partial,
-                            # emit agent_skipped with an honest reason (the
-                            # emit hook flips the persisted tile status to
-                            # "skipped" + clears the durable card mirror),
-                            # close the tab, drop from pending.
-                            _hf_partial = ""
-                            if agent_key_hf in _controls.hv_blocked:
-                                log("[Claude] Auto-skip — verification-walled tab, "
-                                    "skipping partial extraction (hands-off)", "WARN")
-                            else:
-                                try:
-                                    await browser.switch_to_page(p["page"])
-                                    _hf_partial = await extract_fns[name](
-                                        p["page"], browser=browser, cua_client=cua_client,
-                                        label=name, verbose=verbose) or ""
-                                except Exception as _hfe:
-                                    log(f"[Claude] Auto-skip salvage extract failed: {_hfe}", "WARN")
-                            results[name] = {
-                                "status": "auto_skipped",
-                                "text": _hf_partial,
-                                "url": p.get("url", ""),
-                                "page": None,
-                                "elapsed_sec": int(elapsed),
-                            }
-                            emit_event("agent_skipped", phase=2, agent=agent_key_hf,
-                                       reason="auto_skip_unanswered_timeout",
-                                       partial_chars=len(_hf_partial))
-                            emit_event("pipeline_warning", phase=2, agent=agent_key_hf,
-                                       error="Claude skipped automatically",
-                                       details=("Claude's report never finished and the retry "
-                                                "prompt went unanswered — skipped so your run "
-                                                "can finish. The other agents aren't affected."),
-                                       actions=[], alert_id=f"agent_{agent_key_hf}_autoskip",
-                                       auto_clear_on_resume=True)
-                            await _close_skipped_agent_tab(browser, p.get("page"), agent_key_hf, name)
-                            del pending[name]
-                            continue
-                        p["start_time"] = time.time() - (max_wait_min * 60) + (15 * 60)
-                        p["done_count"] = 0
-                        p["cua_confirmed"] = False
+                        # #953 (audit): park (non-blocking) instead of freezing
+                        # the round-robin for 5 min. The resolver handles Retry
+                        # (nudge for artifact 2) / Skip (loop-top consumer) /
+                        # Stop / timeout — and its timeout path keeps the
+                        # #929 "auto-skip after the 2nd unanswered timeout"
+                        # behavior (salvage + agent_skipped + close tab).
+                        p["awaiting_decision"] = {
+                            "kind": "claude_2artifact_hf", "key": agent_key_hf,
+                            "since": time.time(), "timeout": 300.0,
+                        }
                         continue
 
                 # 2026-04-25: CUA-confirmed done → run the same extract +
@@ -26295,35 +26502,19 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                            f"Couldn't read {name}'s report",
                            (f"{name} finished but came back empty. "
                             "Retry to run it fresh, or Skip it."))
-                empty_decision = await _controls.await_agent_decision(ag_key_empty, timeout=300.0)
-                log(f"[{name}] Empty-final user decision: {empty_decision}")
-                if empty_decision == "stop":
-                    break
-                if empty_decision == "skip":
-                    continue
-                if empty_decision == "retry":
-                    followup = (
-                        "It looks like your final response didn't come through. Please output "
-                        "the complete research report now — include all sources, sections, and findings. "
-                        "No preamble or post-amble."
-                    )
-                    try:
-                        await browser.switch_to_page(p["page"])
-                        await paste_followup(p["page"], followup, name.lower(), label=f"{name}-retry-empty")
-                    except Exception as e:
-                        log(f"[{name}] Retry follow-up failed: {e}", "WARN")
-                    p["start_time"] = time.time() - max(0, int(elapsed) - (15 * 60))
-                    p["done_count"] = 0
-                    p["cua_confirmed"] = False
-                    p["last_cua_check"] = time.time()
-                    p["empty_retries"] = 0
-                    continue
-                # timeout / continue_partial → fall through and accept the empty result.
-                results[name] = {"status": "empty", "text": "",
-                                 "url": p["page"].url if p["page"] else "",
-                                 "page": p["page"], "elapsed_sec": int(elapsed)}
-                _runtime.unregister_page(name.lower().replace(" ", ""), final_status="empty")
-                del pending[name]
+                # #953 (audit): park (non-blocking) instead of freezing the loop
+                # for 5 min. Resolver: Retry → nudge + re-poll; Skip → loop-top
+                # consumer; Stop → break; timeout → accept the empty result
+                # (parity with the pre-#953 fall-through).
+                # #953 (audit #7): remember elapsed AT PARK so a later Retry rolls
+                # the budget back from here, not from a time that includes the
+                # user's decision-wait.
+                p["_empty_elapsed_at_park"] = int(elapsed)
+                p["awaiting_decision"] = {
+                    "kind": "extract_empty_cua", "key": ag_key_empty,
+                    "since": time.time(), "timeout": 300.0,
+                }
+                continue
             else:
                 p["done_count"] = 0
                 p["cua_confirmed"] = False

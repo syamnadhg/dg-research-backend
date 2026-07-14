@@ -280,7 +280,7 @@ def test_retraction_only_when_a_card_was_stamped():
 
 def test_hard_retry_dropped_for_completed_agent():
     i = POLL_SRC.index("consume_retry_agent_hard")
-    blk = POLL_SRC[i:i + 3000]
+    blk = POLL_SRC[i:i + 4200]
     assert "Hard retry ignored" in blk
     assert '_rec_done.get("status") == "done"' in blk
     assert '== "complete"' in blk
@@ -332,7 +332,7 @@ def test_hard_retry_guard_catches_inflight_completion():
     # Audit retry-race: a Retry consumed DURING the multi-minute completion
     # window (done-marker sighted, not yet recorded) must still be dropped.
     i = POLL_SRC.index("Hard retry ignored")
-    blk = POLL_SRC[max(0, i - 900):i + 200]
+    blk = POLL_SRC[max(0, i - 1800):i + 200]
     assert "done_marker_first_at" in blk
     assert "_inflight_done" in blk
 
@@ -372,6 +372,140 @@ def test_error_card_stamp_popped_on_user_resolution():
     src = inspect.getsource(research)  # command intakes are module-level
     # All three intakes (skip, retry-hard, retry-soft) pop the stamp.
     assert src.count("_AGENT_ERROR_CARD_TS.pop") >= 3
+
+
+def test_no_blocking_await_agent_decision_inside_round_robin():
+    # Audit (user-flagged): a per-agent decision must NEVER block the whole
+    # round-robin. poll_all_agents_round_robin must contain ZERO
+    # `await ...await_agent_decision` — every decision is parked + resolved
+    # non-blockingly so the other agents keep polling.
+    assert "await _controls.await_agent_decision" not in POLL_SRC
+    # The four former blocking sites now PARK instead.
+    for kind in ("session_expiry", "extract_empty_pw",
+                 "claude_2artifact_hf", "extract_empty_cua"):
+        assert f'"kind": "{kind}"' in POLL_SRC, f"{kind} site must park, not block"
+
+
+def test_parked_decision_resolver_is_nonblocking():
+    # The resolver at the leg top checks the decision ONCE per tick (no await
+    # on a decision), and continues (releases the loop) while still pending.
+    assert "poll_agent_decision" in POLL_SRC
+    assert 'p.get("awaiting_decision")' in POLL_SRC
+    i = POLL_SRC.index('_parked = p.get("awaiting_decision")')
+    blk = POLL_SRC[i:i + 3400]
+    assert 'if _pk_dec == "pending" and not _pk_expired:' in blk
+    assert "continue" in blk  # still-waiting path releases the loop
+
+
+def test_poll_agent_decision_is_nonblocking_single_check():
+    src = inspect.getsource(research.PipelineControls.poll_agent_decision)
+    # No actual await statement (the docstring may NAME await_agent_decision);
+    # it must also not be a coroutine (def, not async def).
+    code = "".join(l for l in src.splitlines(keepends=True)
+                   if not l.lstrip().startswith(('"', "#")))
+    assert "await " not in code, "poll_agent_decision must not await (non-blocking)"
+    assert "async def poll_agent_decision" not in src
+    assert 'return "pending"' in src
+    assert "consume_retry_agent_hard" in src
+
+
+def test_resolver_preserves_hard_fail_autoskip_after_two_timeouts():
+    src = inspect.getsource(research._resolve_parked_agent_decision)
+    assert 'kind == "claude_2artifact_hf"' in src
+    assert 'p["hf_timeouts"]' in src
+    assert '>= 2' in src
+    assert 'reason="auto_skip_unanswered_timeout"' in src
+    assert "_close_skipped_agent_tab" in src
+
+
+def test_resolver_empty_cua_timeout_accepts_empty():
+    # Parity with the pre-#953 fall-through: an unanswered empty-CUA card
+    # finalizes the agent as 'empty', it doesn't poll forever.
+    src = inspect.getsource(research._resolve_parked_agent_decision)
+    i = src.index('kind == "extract_empty_cua"')
+    blk = src[i:i + 2800]
+    assert '"status": "empty"' in blk
+    assert 'final_status="empty"' in blk
+    assert "del pending[name]" in blk
+
+
+def test_poll_agent_decision_ignores_global_continue_anyway():
+    # Review fold-in #1: parking allows MULTIPLE simultaneous parks, so a stray
+    # GLOBAL continue_anyway must NOT be consumable here (a parked agent would
+    # steal it and wrongly finalize). No park card offers "Continue anyway".
+    src = inspect.getsource(research.PipelineControls.poll_agent_decision)
+    assert "consume_continue_anyway" not in src.replace("do NOT consume", "")
+
+
+def test_skip_supersedes_coqueued_retry_race_safe():
+    # Review fold-in #2 (race-safe rev): a Skip supersedes a co-queued Retry so
+    # a skipped parked agent isn't resurrected. This must NOT be done inside
+    # consume_skip_marker (that races the command thread's deferred
+    # request_retry_agent_hard and could drop a legit pre-failed retry) — it is
+    # done at the loop-thread hard-retry guard, which drops a retry when the
+    # agent already has a terminal SKIP outcome.
+    csm = inspect.getsource(research.PipelineControls.consume_skip_marker)
+    assert "retry_agents_hard.discard" not in csm, (
+        "must not drain retry markers in consume_skip_marker — cross-thread race"
+    )
+    i = POLL_SRC.index("Hard retry ignored")
+    blk = POLL_SRC[max(0, i - 700):i + 200]
+    assert "_terminal_skip" in blk
+    assert 'in ("skipped_by_user", "auto_skipped")' in blk
+    assert '_persisted_st == "skipped"' in blk
+
+
+def test_empty_cua_timeout_retracts_card_and_closes_tab():
+    # Review fold-in #3/#4: accept-empty must retract its own card + close the
+    # tab + null the page handle (not leave a red tile + leaked live tab).
+    src = inspect.getsource(research._resolve_parked_agent_decision)
+    i = src.index('kind == "extract_empty_cua"')
+    blk = src[i:i + 2800]
+    assert "agent_skipped" in blk and "accept_empty_unanswered_timeout" in blk
+    assert "_close_skipped_agent_tab" in blk
+    assert '"page": None' in blk
+
+
+def test_parked_hard_cap_still_bites():
+    # Review fold-in #5: the 90-min per-agent ceiling must fire even while
+    # parked (a re-parking kind must not ride past it).
+    i = POLL_SRC.index('_parked = p.get("awaiting_decision")')
+    blk = POLL_SRC[i:i + 2000]
+    assert "PER_AGENT_HARD_CAP_SEC" in blk
+    assert "auto_skip_hard_cap" in blk
+
+
+def test_resolver_salvage_threads_verbose():
+    # Review fold-in #6: the Claude auto-skip salvage extraction must use the
+    # real verbose flag, not a hard-coded False.
+    src = inspect.getsource(research._resolve_parked_agent_decision)
+    assert "verbose=False) -> str" in src or "verbose=False)" in src  # the param default
+    # The salvage call uses verbose=verbose, not a literal.
+    i = src.index("Auto-skip salvage extract failed")
+    pre = src[i - 400:i]
+    assert "verbose=verbose" in pre
+
+
+def test_hard_retry_consumer_skips_parked_agents():
+    # Critical interaction (audit): the FE Retry button sends mode=hard. The
+    # loop-top hard-retry consumer must NOT drain a PARKED agent's marker
+    # (that would do a full setup restart instead of the resolver's soft
+    # reload/re-extract/nudge) — it skips parked agents WITHOUT consuming.
+    i = POLL_SRC.index('for _agent_key in ("chatgpt", "gemini", "claude"):')
+    blk = POLL_SRC[i:i + 1500]
+    assert '.get("awaiting_decision")' in blk
+    # The park check must precede the consume so the marker survives.
+    i_park = blk.index('awaiting_decision')
+    i_consume = blk.index("consume_retry_agent_hard")
+    assert i_park < i_consume
+
+
+def test_session_expiry_resolver_reloads_on_retry():
+    src = inspect.getsource(research._resolve_parked_agent_decision)
+    i = src.index('kind == "session_expiry"')
+    blk = src[i:i + 900]
+    assert "_gemini_mounted" in blk  # never reload a mounted Gemini conversation
+    assert ".reload(" in blk
 
 
 def test_clobber_guard_tab_close_preserves_done_status():

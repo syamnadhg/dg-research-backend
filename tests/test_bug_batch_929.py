@@ -48,7 +48,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import research  # noqa: E402
 
 _SRC = Path(research.__file__).read_text(encoding="utf-8")
-_POLL = inspect.getsource(research.poll_all_agents_round_robin)
+# #953 (audit): the per-agent decision handling (incl. the Claude 2-artifact
+# hard-fail auto-skip) moved OUT of the blocking round-robin body into the
+# non-blocking parked-decision resolver. Concatenate both so these source
+# assertions match wherever the logic now lives.
+_POLL = (inspect.getsource(research.poll_all_agents_round_robin)
+         + "\n" + inspect.getsource(research._resolve_parked_agent_decision))
 _GEM = inspect.getsource(research.start_agent_no_gemini_wait)
 _P2 = inspect.getsource(research.run_phase2)
 _RUNPIPE = inspect.getsource(research.run_pipeline)
