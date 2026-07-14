@@ -125,10 +125,10 @@ Phase 1 writes a quick research brief on the Pro model — it must NOT run in De
 
 Steps:
 1. Do NOT type anything and do NOT press Send.
-2. Turn Deep Research OFF. Either click the small ✕ / remove control on the "Deep research" pill in the composer, OR open the "+" / tools menu and click the already-selected "Deep research" item to deselect it.
-3. Do NOT enable any other tool (no Web search, no image, no canvas). Leave the composer in normal chat mode.
-4. Leave the model selector on whatever it already shows (e.g. "Pro Extended") — do not change it.
-5. If a tools menu is still open, press Escape or click empty space to close it.
+2. Turn Deep Research OFF by pressing BACKSPACE inside the (empty) message box: click into the message input to focus it, then press Backspace — the "Deep research" pill/token deletes exactly like a character. Press Backspace once or twice more if the pill is still shown.
+3. CRITICAL — do NOT click the "Deep research" item in the "+" / tools menu, and do NOT click the pill itself: in the current ChatGPT UI clicking it ADDS a SECOND Deep Research instead of removing it. Backspace is the ONLY correct way to remove it.
+4. Do NOT enable any other tool (no Web search, no image, no canvas). Leave the composer in normal chat mode.
+5. Leave the model selector on whatever it already shows (e.g. "Pro Extended") — do not change it.
 6. When the composer no longer shows Deep Research (the placeholder is back to a normal "Ask anything" / "Message" prompt and no Deep research pill remains), say "deep research off". If it was already off and you did nothing, also say "deep research off"."""
 
 PROMPT_SUBMIT_FALLBACK = SYSTEM_BASE + """

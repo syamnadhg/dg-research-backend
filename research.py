@@ -10483,6 +10483,40 @@ _CHATGPT_DR_ACTIVE_JS = r"""() => {
 }"""
 
 
+# Focus the P1 composer editable and collapse the caret to the very END of any
+# (empty) text — i.e. immediately AFTER the Deep-Research inline token. Backspace
+# there deletes the token exactly like a character (the platform's real remove
+# affordance — user-directed 2026-07-13). Returns {ok, textLen}: textLen guards
+# against ever backspacing over typed prose — the brief is not typed yet so it's
+# 0, and a PDF attachment is a separate card row (never an in-text token), so an
+# in-composer Backspace can only ever delete the tool token, never the file.
+_CHATGPT_FOCUS_COMPOSER_END_JS = r"""() => {
+    const ta = document.querySelector('#prompt-textarea')
+            || document.querySelector('div[contenteditable="true"]')
+            || document.querySelector('textarea');
+    if (!ta) return { ok: false, textLen: 0 };
+    try { ta.focus(); } catch (e) {}
+    let textLen = 0;
+    try {
+        const ce = ta.isContentEditable || ta.getAttribute('contenteditable') === 'true';
+        if (ce) {
+            textLen = (ta.innerText || '').replace(/[\u200b\ufeff\s]/g, '').length;
+            const sel = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(ta);
+            range.collapse(false);        // caret to the very end (after the token)
+            sel.removeAllRanges();
+            sel.addRange(range);
+        } else {
+            const v = ta.value || '';
+            textLen = v.replace(/[\u200b\ufeff\s]/g, '').length;
+            ta.setSelectionRange(v.length, v.length);
+        }
+    } catch (e) {}
+    return { ok: true, textLen };
+}"""
+
+
 async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) -> str:
     """Phase 1 must write the research brief on ChatGPT Pro + Extended Thinking
     with NO composer tool selected — Deep Research belongs to Phase 2 ONLY.
@@ -10498,11 +10532,16 @@ async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) 
     research' on the sent brief + a 'Golden Retriever Deep Research' Start-46 card).
 
     Read-first + fully fail-safe. Detects an ACTIVE Deep Research composer tool
-    and turns it OFF — DOM primary ('+' tools-menu toggle → composer-pill ✕),
-    then a bounded CUA fallback — re-verifying after each leg. Returns
-    'cleared' | 'absent' | 'unsure'. NEVER enables a tool; swallows every error;
-    must never block Phase 1 (a miss just proceeds → worst case is today's
-    behaviour and the brief still submits)."""
+    and turns it OFF. #952 (2026-07-13): removal is now BACKSPACE-first — the
+    selected tool is an inline token at the start of the empty composer, and
+    Backspace deletes it like a character (the platform's real remove). We do
+    NOT re-click the tool item: ChatGPT's tools menu no longer TOGGLES DR, so a
+    click ADDS a second Deep Research instead of removing it (user-observed).
+    Order: Backspace loop → composer-pill ✕ (a genuine remove control only) →
+    bounded, Backspace-oriented CUA fallback — re-verifying after each leg.
+    Returns 'cleared' | 'absent' | 'unsure'. NEVER enables a tool; swallows
+    every error; must never block Phase 1 (a miss just proceeds → worst case is
+    today's behaviour and the brief still submits)."""
     page = browser.page
     try:
         st = await page.evaluate(_CHATGPT_DR_ACTIVE_JS)
@@ -10524,79 +10563,73 @@ async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) 
         except Exception:
             return True  # can't confirm cleared → assume still on, keep trying
 
-    # ── Strategy A: '+' / tools menu toggle (symmetric with setup_chatgpt_dr —
-    #    the same control that turns DR ON toggles it OFF). Open the menu, click
-    #    the already-selected "Deep research" item, then Escape to close. ──
-    try:
-        _menu_opened = False
-        for sel in ['button[aria-label*="Use a tool"]',
-                    'button[aria-label*="Attach"]',
-                    'button[data-testid="composer-plus-btn"]',
-                    'button[aria-label*="More"]']:
-            try:
-                btn = await page.query_selector(sel)
-                if btn:
-                    await btn.click()
-                    await asyncio.sleep(0.8)
-                    _menu_opened = True
-                    break
-            except Exception:
-                continue
-        if _menu_opened:
-            toggled = await page.evaluate(r"""() => {
-                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const items = document.querySelectorAll(
-                    '[role="menuitemradio"], [role="menuitem"], [role="option"], button, a, li');
-                for (const el of items) {
-                    if (!el.offsetParent) continue;
-                    const t = norm(el.textContent);
-                    const a = norm(el.getAttribute('aria-label'));
-                    if (t === 'deep research' || a === 'deep research' ||
-                        t.startsWith('deep research') || a.startsWith('deep research')) {
-                        el.click(); return true;
-                    }
-                }
-                return false;
-            }""")
-            # The 'Deep research' menuitemradio lives in a body-level popover and
-            # is only observable WHILE the menu is open — dump it here (before the
-            # Escape below), document-wide + with data-testid, so a future relabel
-            # of the Strategy-A control can be pinned from a real run (mirrors
-            # setup_chatgpt_dr's Step-2 dump; the final form-scoped dump below can
-            # only ever see the Strategy-B composer pill, never this item).
-            if not toggled:
-                try:
-                    _mdump = await page.evaluate(r"""() => {
-                        const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-                        const out = [];
-                        for (const el of document.querySelectorAll(
-                                '[role="menuitemradio"], [role="menuitem"], [role="option"], button, a, li')) {
-                            if (!el.offsetParent) continue;
-                            const t = norm(el.textContent);
-                            const a = el.getAttribute('aria-label') || '';
-                            if (!t && !a) continue;
-                            out.push({ role: el.getAttribute('role') || el.tagName.toLowerCase(),
-                                       text: t.slice(0, 40), aria: a.slice(0, 40),
-                                       testid: el.getAttribute('data-testid') || '',
-                                       checked: el.getAttribute('aria-checked') || el.getAttribute('aria-pressed') || '' });
-                        }
-                        return out.slice(0, 30);
-                    }""")
-                    log("[p1:clear_dr] Strategy-A menu dump (no 'deep research' item toggled — "
-                        "pin the rotated control from this): " + json.dumps(_mdump, ensure_ascii=False), "WARN")
-                except Exception:
-                    pass
-            await asyncio.sleep(1.0)
-            try:
-                await page.keyboard.press("Escape")
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-            log(f"[p1:clear_dr] Strategy A ('+' menu toggle): item clicked={toggled}")
-    except Exception as e:
-        log(f"[p1:clear_dr] Strategy A errored ({e}) — trying pill ✕", "INFO")
+    # ── Strategy A: BACKSPACE-delete the composer token — the platform's REAL
+    #    remove affordance (user-directed 2026-07-13). ChatGPT's tools menu no
+    #    longer TOGGLES Deep Research: clicking the already-selected "Deep
+    #    research" item (whether by DOM or a CUA vision click) ADDS a SECOND Deep
+    #    Research instead of removing it (user-observed: "trying to click deep
+    #    research again adds 2 instead of removing"). The selected tool renders
+    #    as an inline token at the START of the composer; with the brief not yet
+    #    typed the composer is empty, so Backspace deletes the token exactly like
+    #    a character. We NEVER re-click the tool item here. Backspace over an
+    #    empty composer is harmless (nothing to delete) and never touches a PDF
+    #    attachment (that lives in a separate card row, not the text node). ──
+    _BS_TRIES = int(os.environ.get("DG_CHATGPT_DR_BACKSPACE_TRIES", "3"))
+    # Prose guard: skip Backspace only when the composer holds clearly-typed
+    # PROSE, not merely the tool token. If the pill renders as an INLINE token
+    # inside the editable its own label ('Deep research', ≤ 30 chars per the
+    # detector) inflates innerText — so a bare-token composer can read up to ~30
+    # chars with zero prose. A real brief is hundreds of chars. Guard at > 40 so
+    # the token's own label never blocks its removal, while any actual prose
+    # (never present at this pre-type call site) is still protected.
+    _DR_PROSE_GUARD = 40
 
-    # ── Strategy B: composer-pill ✕ (click the remove control on the DR chip) ──
+    async def _backspace_clear() -> bool:
+        """Focus the composer, caret to the end (after the token), Backspace once.
+        Refuses to press if the composer already holds typed prose — never eat a
+        brief. Returns True iff a Backspace was actually issued."""
+        try:
+            info = await page.evaluate(_CHATGPT_FOCUS_COMPOSER_END_JS)
+        except Exception as e:
+            log(f"[p1:clear_dr] composer focus for Backspace failed ({e})", "INFO")
+            return False
+        if not info or not info.get("ok"):
+            log("[p1:clear_dr] composer editable not found — cannot Backspace", "INFO")
+            return False
+        if int(info.get("textLen") or 0) > _DR_PROSE_GUARD:
+            log(f"[p1:clear_dr] composer holds {info.get('textLen')} chars of prose "
+                f"(> {_DR_PROSE_GUARD}) — skipping Backspace so no brief is deleted", "INFO")
+            return False
+        await asyncio.sleep(0.15)
+        try:
+            await page.keyboard.press("Backspace")
+        except Exception as e:
+            log(f"[p1:clear_dr] Backspace keypress errored ({e})", "INFO")
+            return False
+        await asyncio.sleep(0.6)
+        return True
+
+    for _bt in range(1, _BS_TRIES + 1):
+        if not await _still_active():
+            break
+        _did = await _backspace_clear()
+        log(f"[p1:clear_dr] Strategy A (Backspace delete) attempt {_bt}/{_BS_TRIES} (issued={_did})")
+        if not _did:
+            break  # couldn't focus / composer had text — don't spin the token
+
+    # ── Strategy B: composer-pill ✕ (click a genuine remove/close control on the
+    #    DR chip — never re-clicks the tool item, so it can't add a second DR).
+    #    SAFETY (#952 review): the ancestor walk is TIGHTLY scoped to the DR chip
+    #    so it can never reach an attached PDF's "Remove file" button and silently
+    #    delete the user's source doc. clear_dr runs AFTER PDF attach, and ChatGPT
+    #    labels an attachment's delete control "Remove file 1: brief.md" (#950) —
+    #    which the old bare `remove` match would have clicked. We now (a) STOP the
+    #    walk the moment the container's text stops being (essentially) just the
+    #    short 'deep research' label (climbing into shared composer chrome that
+    #    holds the file cards), and (b) reject any control whose aria mentions
+    #    file/attach. Since the modern DR token has no ✕ of its own (it's removed
+    #    by Backspace, Strategy A), this leg is a no-op on the current UI and
+    #    exists only for an older pill-✕ variant. ──
     if await _still_active():
         try:
             removed = await page.evaluate(r"""() => {
@@ -10609,15 +10642,22 @@ async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) 
                     if (t && t.length <= 30 && t.includes('deep research')) { pill = p; break; }
                 }
                 if (!pill) return false;
-                // Walk up to the chip container and find a close/remove control.
+                // Walk up a FEW ancestors, but only within the DR chip itself.
                 let chip = pill;
-                for (let i = 0; i < 4 && chip; i++) {
+                for (let i = 0; i < 3 && chip; i++) {
+                    const ctext = norm(chip.textContent);
+                    // Once the container's text is no longer ~just the DR label we
+                    // have climbed into shared composer chrome (which holds the
+                    // attachment cards) — stop before we can match a file remove.
+                    if (!ctext.includes('deep research') || ctext.length > 40) break;
                     const btn = [...chip.querySelectorAll('button, [role="button"]')].find(b => {
                         if (!b.offsetParent) return false;
                         const a = norm(b.getAttribute('aria-label'));
                         const t = norm(b.textContent);
+                        if (a.includes('file') || a.includes('attach')) return false;  // never a PDF card
                         return a.includes('remove') || a.includes('close') ||
-                               a.includes('turn off') || a.includes('clear') ||
+                               a.includes('turn off') || a.includes('deselect') ||
+                               a.includes('deep research') ||
                                t === '×' || t === 'x';
                     });
                     if (btn) { btn.click(); return true; }
@@ -10631,15 +10671,19 @@ async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) 
             log(f"[p1:clear_dr] Strategy B errored ({e})", "INFO")
 
     # ── Strategy C: bounded CUA fallback (selectors rotate; DR-off is
-    #    correctness-critical for P1, so keep the tier-3 net like setup_*_dr). ──
+    #    correctness-critical for P1, so keep the tier-3 net like setup_*_dr).
+    #    Backspace-oriented — the prompt FORBIDS clicking the Deep research tool
+    #    (a click adds a second DR), so Vision only presses Backspace. ──
     if cua_client and await _still_active():
         log("[p1:clear_dr] DOM legs left Deep Research active — CUA fallback to disable it", "INFO")
         try:
             async def _disable_dr_cua():
                 return await asyncio.wait_for(
                     agent_loop(cua_client, browser, PROMPT_CHATGPT_DISABLE_DR,
-                        "Turn OFF the Deep Research tool in the ChatGPT composer. "
-                        "Do not type, do not send, do not enable any other tool.",
+                        "Remove Deep Research from the ChatGPT composer by pressing "
+                        "Backspace in the empty message box. Do NOT click the 'Deep "
+                        "research' tool button (clicking it ADDS a second Deep "
+                        "Research). Do not type, do not send, do not enable any tool.",
                         model=CUA_MODEL, max_iterations=10, verbose=verbose),
                     timeout=120.0,
                 )
@@ -10648,8 +10692,9 @@ async def _chatgpt_clear_deep_research(browser, cua_client=None, verbose=False) 
                 page, hotspot_id="1a-disable-dr", phase=1, platform="chatgpt",
                 current_step="disable_deep_research_for_brief",
                 context_hint="the composer has Deep Research active (placeholder 'Get a detailed "
-                             "report' / a 'Deep research' pill) — turn Deep Research OFF so the "
-                             "Pro brief is NOT run as a deep research; don't enable any other tool",
+                             "report' / a 'Deep research' pill) — REMOVE it by pressing Backspace "
+                             "in the empty message box; do NOT click the 'Deep research' tool "
+                             "(clicking adds a second one). Don't enable any other tool",
                 expected_outcome="the ChatGPT composer is in normal chat mode (no Deep Research)",
                 cua_coro_factory=_disable_dr_cua,
                 mission_prompt=PROMPT_CHATGPT_DISABLE_DR,
@@ -13320,10 +13365,12 @@ _HOTSPOT_VISION_HINTS = {
     "1a-disable-dr": {
         "expected_outcome": "ChatGPT's composer is in normal chat mode with Deep Research OFF",
         "context_hint": (
-            "Turn OFF the Deep Research tool in ChatGPT's composer (the placeholder reads "
-            "'Get a detailed report', or a 'Deep research' pill is shown near the +). Click the "
-            "pill's ✕, OR open the +/tools menu and click the selected 'Deep research' to deselect. "
-            "Do NOT type, do NOT send, do NOT enable any other tool, and leave the model unchanged."
+            "Remove the Deep Research tool from ChatGPT's composer (the placeholder reads "
+            "'Get a detailed report', or a 'Deep research' pill is shown near the +). Do it by "
+            "pressing BACKSPACE in the empty message box — the pill deletes like a character. "
+            "Do NOT click the 'Deep research' tool item or the pill: in the current UI clicking it "
+            "ADDS a second Deep Research instead of removing it. Do NOT type, do NOT send, do NOT "
+            "enable any other tool, and leave the model unchanged."
         ),
         "success_signals": ["the composer placeholder is back to a normal 'Ask anything' prompt",
                              "no 'Deep research' pill in the composer"],
