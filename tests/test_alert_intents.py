@@ -117,12 +117,13 @@ def test_unwired_tokens_raise_until_their_phase():
     # never emit a wrong button. (Explicit actions= callers bypass entirely.)
     # #955 Phase 4 wired pro_required + chat_mode. Phase 5A wired
     # login_required (skip_login) + hv_solvable (resume) + agent_link_failed
-    # (retry_link/skip_link) — they come off this list. Still raising:
-    #   • manual_brief — its brief_input token stays unwired by design (the site
-    #     passes an explicit actions=[], so the expander is never reached).
-    #   • crash_login_interrupt / crash_loop — their retry_resume/discard tokens
-    #     land in Phase 5B (crash-card family); until then they must still raise.
-    for intent in ("manual_brief", "crash_login_interrupt", "crash_loop"):
+    # (retry_link/skip_link). Phase 5B wired crash_login_interrupt (retry_resume)
+    # + crash_loop (retry_resume/discard) + env_missing_key (skip_login). The
+    # ONLY remaining unwired token is brief_input (manual_brief): the site passes
+    # an explicit actions=[] (type-in-chat, no button), so the expander is never
+    # reached and the token stays intentionally unwired — a call that DID reach
+    # it must still fail loudly rather than emit a wrong button.
+    for intent in ("manual_brief",):
         try:
             research._alert_actions_for(intent, 2, "chatgpt")
             raise AssertionError(f"{intent} should raise until its phase wires it")

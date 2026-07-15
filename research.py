@@ -13955,7 +13955,12 @@ ALERT_INTENTS = {
     "pro_required":          {"class": "blocker",     "actions": ["continue_free", "retry_phase", "skip_pro"], "mirror": "pro_required"},
     "chat_mode":             {"class": "recoverable", "actions": ["continue_chat", "skip_agent_named", "stop"]},
     "login_required":        {"class": "blocker",     "actions": ["retry_phase", "skip_login"]},
-    "env_missing_key":       {"class": "blocker",     "actions": ["retry_phase"]},
+    # #955 Phase 5B: env-check shares the login_required event but is its own
+    # intent. Actions match the real FE card (loginDecisionAlert renders Retry +
+    # "Skip sign-in check" for an env failure); skip_login at phase 0 →
+    # skip_init_verify, exactly the FE Skip. FE-inert on this event (the FE
+    # builds its own buttons), so the list is additive/for catalog honesty.
+    "env_missing_key":       {"class": "blocker",     "actions": ["retry_phase", "skip_login"]},
     "hv_solvable":           {"class": "blocker",     "actions": ["resume", "skip_agent"]},
     # #955 Phase 5: ai_upgrade DROPPED — the async copy re-emit passes no
     # event_name (would surface as pipeline_error, not agent_link_failed) and the
@@ -14129,6 +14134,19 @@ def _alert_actions_for(intent: str, phase, agent=None):
                         "style": "default",
                         "command": {"action": "agent_decision", "agent": agent,
                                     "decision": "skip"}})
+        elif token == "retry_resume":
+            # #955 Phase 5B: crash-card Retry → resume_from_checkpoint (the
+            # always-alive start-listener re-enqueues with resume_dir; a
+            # retry_phase command would dead-end after run_pipeline returns and
+            # the per-run command listener is torn down). Byte-exact to the crash
+            # cards' explicit lists (research.py post-run except handler).
+            out.append({"id": "retry", "label": "Retry", "style": "primary",
+                        "command": {"action": "resume_from_checkpoint"}})
+        elif token == "discard":
+            # #955 Phase 5B: crash_loop Skip → discard_restart_prompt (FE-local
+            # clear, mirrors the device/process-restart recovery banner's Discard).
+            out.append({"id": "skip", "label": "Skip", "style": "default",
+                        "command": {"action": "discard_restart_prompt"}})
         else:
             raise NotImplementedError(
                 f"action token {token!r} (intent {intent!r}) is not wired yet — "
@@ -14477,7 +14495,9 @@ def _spawn_alert_copy_upgrade(**kw):
 def fail_phase(phase: int, title: str = "", details: str = "",
                agent: str | None = None, can_retry: bool = True,
                error: str | None = None, reason: str | None = None,
-               actions=None, mark_phase_errored: bool = True, **extra):
+               actions=None, mark_phase_errored: bool = True,
+               intent: str | None = None, recoverability: str | None = None,
+               decision_id=None, **extra):
     """Template A: phase-level error alert with [Retry, Skip, Dismiss]
     (Retry omitted when can_retry=False). NO Stop — Stop lives only in
     the chat input.
@@ -14528,8 +14548,23 @@ def fail_phase(phase: int, title: str = "", details: str = "",
         # alertId in dismissedAlertIds and clears the visible alert
         # (PhaseDropdown.tsx). Matches fail_agent which dropped Dismiss
         # 2026-04-28. Reduces redundant affordances.
+        # #955 Phase 5B: an `intent=` caller (crash_login_interrupt / crash_loop
+        # / cua_unavailable) derives its actions from THAT intent's tokens
+        # instead of the phase_error default — byte-identical to the explicit
+        # lists those cards authored before the migration.
         actions = _alert_actions_for(
-            "phase_error" if can_retry else "phase_error_noretry", phase)
+            intent if intent is not None
+            else ("phase_error" if can_retry else "phase_error_noretry"),
+            phase, agent)
+    # #955 Phase 5B: recoverability comes from the intent's catalog class when an
+    # intent is given (crash_login_interrupt / cua_unavailable are BLOCKERS — the
+    # user resolves them, they never auto-fire; this keeps emit_decision's
+    # no-deadline guard live for them). A caller may still override explicitly.
+    # NB these are REAL params, not **extra — a value riding **extra would hit
+    # emit_decision as both the explicit arg and a duplicate kwarg (TypeError).
+    if recoverability is None:
+        recoverability = (ALERT_INTENTS[intent]["class"] if intent is not None
+                          else "recoverable")
     payload = {"error": title or "phase error",
                "details": details,
                "actions": actions,
@@ -14561,7 +14596,8 @@ def fail_phase(phase: int, title: str = "", details: str = "",
                   actions=payload.get("actions"),
                   dismissible=payload.get("dismissible", True),
                   alert_id=payload.get("alert_id"),
-                  recoverability="recoverable", **_extra)
+                  recoverability=recoverability,
+                  intent=intent, decision_id=decision_id, **_extra)
     # Tile/Icon Consistency (2026-05-01): persist errored status to root
     # doc so the listing-page tile + chat phase icons stay red post-
     # reload. If a later Retry succeeds, phase_complete overwrites this.
@@ -39836,17 +39872,27 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
              "command": {"action": "skip_phase", "phase": phase}},
         ]
         try:
-            emit_event(
-                "pipeline_warning", phase=phase,
-                message="This step is taking a while",
+            # #955 Phase 5B: author through the seam in EXPLICIT mode (no catalog
+            # row — the Wait/Retry/Skip trio is unique to this card). event_name=
+            # "pipeline_warning" keeps the FE routing; the FE warning handler
+            # renders evt.data.actions (so the verbatim 3-list is wire parity) and
+            # reads the title from message (never error), so message= is
+            # load-bearing via **extra. This gains a decision_id (Phase-6 ack)
+            # without changing any wire field. Fresh id per fire (no re-emit).
+            emit_decision(
+                phase=phase,
+                title="This step is taking a while",
                 details=(
                     "This step is still running and may just be a long one. "
                     "Keep waiting, or restart it / skip it."
                 ),
                 actions=actions,
-                alertType="warn",
-                dismissible=True,
+                recoverability="recoverable",
+                event_name="pipeline_warning",
                 alert_id=alert_id,
+                dismissible=True,
+                alertType="warn",
+                message="This step is taking a while",
             )
         except Exception as _e:
             log(f"_emit_phase_soft_warn fallback ({_e})", "WARN")
@@ -40158,14 +40204,20 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     break  # reachable — proceed to login walk / phases
                 except CuaUnavailableError as cua_err:
                     log(f"Phase 0: CUA availability probe failed — {cua_err}", "ERROR")
+                    # #955 Phase 5B: intent=cua_unavailable → blocker (fail-closed;
+                    # never auto-fires). The [retry_phase] token expands
+                    # byte-identically to the dropped explicit Retry list — and
+                    # carries NO skip token, so this stays a Retry-only, fail-
+                    # closed card (test_p0_probe_is_fail_closed_with_no_skip_branch).
+                    # Distinct alert_id fixes the old phase0_error collision (the
+                    # probe + the per-platform cua card + generic P0 errors all
+                    # shared one id, differing only by agent).
                     fail_phase(
                         0, "AI service unavailable",
                         _anthropic_key_card_copy("probe"),
                         agent="system",
-                        actions=[
-                            {"id": "retry", "label": "Retry", "style": "primary",
-                             "command": {"action": "retry_phase", "phase": 0}},
-                        ],
+                        intent="cua_unavailable",
+                        alert_id="phase0_cua_unavailable",
                     )
                     _controls.request_pause("cua_unavailable")
                     emit_event("pipeline_paused", phase=0, reason="cua_unavailable")
@@ -40299,14 +40351,17 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                     # path is the right escape hatch for "I know what I'm
                     # doing, run without CUA on purpose".
                     log(f"Phase 0: CUA unavailable for {label}: {cua_err}", "ERROR")
+                    # #955 Phase 5B: intent=cua_unavailable → blocker; token
+                    # expands byte-identically to the dropped explicit Retry list.
+                    # Distinct per-platform alert_id fixes the phase0_error
+                    # collision (this loop still honors skip_init_verify below —
+                    # test_cli_dispatcher pins that; the card is Retry-only).
                     fail_phase(
                         0, "AI service unavailable",
                         _anthropic_key_card_copy("login_walk", label=label),
                         agent=key,
-                        actions=[
-                            {"id": "retry", "label": "Retry", "style": "primary",
-                             "command": {"action": "retry_phase", "phase": 0}},
-                        ],
+                        intent="cua_unavailable",
+                        alert_id=f"phase0_cua_unavailable_{key}",
                     )
                     _controls.request_pause("cua_unavailable")
                     emit_event("pipeline_paused", phase=0, reason="cua_unavailable")
@@ -40525,18 +40580,24 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             _missing_msg = _anthropic_key_card_copy("missing")
             _env_errors.append(_missing_msg)
         if not _env_ok:
-            emit_event("login_required",
-                       phase=0,
-                       platforms=[],
-                       platformLabels=[],
-                       machineName=socket.gethostname(),
-                       envErrors=_env_errors,
-                       attempt=1,
-                       message=_missing_msg,
-                       alert_id="phase0_env_check")
+            # #955 Phase 5B: env-check is its OWN intent (env_missing_key) but
+            # shares the login_required EVENT name (the FE's isEnv branch keys on
+            # envErrors). event_name unchanged; every legacy kwarg preserved via
+            # **extra; agent-less wire. Blocker → no deadline. The FE-inert
+            # actions list matches the real FE card (Retry + "Skip sign-in check").
+            emit_decision(
+                intent="env_missing_key", event_name="login_required",
+                phase=0, agent=None,
+                facts={"title": _missing_msg, "details": ""},
+                actions=_alert_actions_for("env_missing_key", 0, None),
+                alert_id="phase0_env_check",
+                platforms=[], platformLabels=[],
+                machineName=socket.gethostname(),
+                envErrors=_env_errors, attempt=1, message=_missing_msg)
             # #710 parity: durable mirror so an env-check failure raised while
             # this chat wasn't the viewed tab re-surfaces the card on open.
             # (Same kind as login_required — the FE's isEnv branch renders it.)
+            # Kept explicit (already persisted before the pause today).
             _persist_pending_decision({
                 "kind": "login_required",
                 "phase": 0,
@@ -42512,6 +42573,11 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # so the card survives a cold chat-open AND the agent-chat watchdog
             # posts it (both silently missing pre-fix). Distinct alert_id keeps
             # it clear of the generic phase{N}_error dedup ledger.
+            # #955 Phase 5B: author via the catalog. intent=crash_login_interrupt
+            # → recoverability="blocker" (the user resolves it; never auto-fires)
+            # and the [retry_resume] token expands byte-identically to the
+            # explicit Retry→resume_from_checkpoint list this dropped. force_mirror
+            # + mark_phase_errored=False + the distinct alert_id ride through.
             fail_phase(
                 phase=last_phase,
                 error="Paused by the login command",
@@ -42519,13 +42585,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        "login — the run resumes from its checkpoint.\n"
                        "Note: the Stop button ends the run instead.",
                 agent=None,
+                intent="crash_login_interrupt",
                 mark_phase_errored=False,
                 force_mirror=True,
                 alert_id=f"phase{last_phase}_login_interrupt",
-                actions=[
-                    {"id": "retry", "label": "Retry", "style": "primary",
-                     "command": {"action": "resume_from_checkpoint"}},
-                ],
             )
         else:
             # Auto-retries exhausted (or a non-recoverable terminal failure):
@@ -42539,6 +42602,10 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
             # process-restart recovery banner uses, so both recovery paths
             # converge on one engine. Skip → discard (client-side clear),
             # mirroring that banner's Discard.
+            # #955 Phase 5B: intent=crash_loop → recoverable (the round-robin
+            # firer is dead post-run, so the catalog correctly omits auto_skip —
+            # no deadline is ever armed). [retry_resume, discard] expands
+            # byte-identically to the explicit Retry/Skip list this dropped.
             fail_phase(
                 phase=last_phase,
                 error="The run kept hitting errors",
@@ -42546,12 +42613,7 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                        "take. Retry to start again from the last checkpoint, "
                        "or Skip to stop here.",
                 agent=None,
-                actions=[
-                    {"id": "retry", "label": "Retry", "style": "primary",
-                     "command": {"action": "resume_from_checkpoint"}},
-                    {"id": "skip", "label": "Skip", "style": "default",
-                     "command": {"action": "discard_restart_prompt"}},
-                ],
+                intent="crash_loop",
             )
     finally:
         # New pause semantics: browser is closed by pause_and_close_browser when pause fires.
