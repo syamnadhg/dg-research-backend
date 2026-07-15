@@ -15411,6 +15411,128 @@ def _compact_event_for_narration(e: dict) -> str:
     return " | ".join(parts)
 
 
+def _call_text_narrator(
+    system: str,
+    user_msg: str,
+    *,
+    gemini_key: str,
+    use_gemini: bool = True,
+    err_holder: dict | None = None,
+    max_tokens: int = 200,
+) -> tuple[str | None, int]:
+    """Call the shared text-narrator brain. Gemini 3.5 Flash first; Haiku 4.5
+    fallback on ANY Gemini failure (4xx non-429, 5xx, timeout, parse error,
+    empty output). Sync — callers wrap it in asyncio.to_thread. Returns
+    (text, status_code). 429 is surfaced (not fallback) so the outer loop can
+    back off — Haiku fallback is reserved for non-rate-limit blips, not for
+    absorbing a quota storm on the primary.
+
+    Note: non-429 4xx errors fall through to Haiku (not surfaced) so a
+    Gemini-project-scoped quota window doesn't blank output for hours. The
+    Gemini→Haiku downgrade is logged once per `err_holder` (a caller-owned
+    mutable dict keyed on "gemini_downgrade_logged") so the operator sees when
+    text is running on Haiku, without log spam. Pass err_holder=None to
+    suppress the downgrade log entirely (best-effort callers with no loop to
+    dedupe over, e.g. the async alert-copy upgrade).
+
+    Hoisted to module scope (was the `_call_narrator` closure inside
+    `_narrator_loop`) so both the narrator loop and the async alert-copy
+    upgrade reuse the exact same fallback chain. `gemini_key`/`use_gemini` are
+    passed in (the narrator loop resolves the key at loop entry; alert-copy
+    resolves its own) rather than closed over — this fn makes NO assumption
+    about a caller's preconditions."""
+    try:
+        import requests
+    except Exception:
+        return None, 0
+    # Defensive: Anthropic rejects an empty user turn with a 400
+    # ("messages.0: user messages must have non-empty content"); Gemini
+    # tolerates it. Every current caller passes a non-empty user_msg, so this
+    # guard is INERT today — it exists so a future caller can never again
+    # silently collapse the Haiku cross-vendor hedge (and with it the whole
+    # fallback chain) down to a canned template.
+    if not (user_msg and user_msg.strip()):
+        user_msg = "Narrate the current pipeline moment in one present-tense sentence."
+
+    def _note_downgrade(msg: str) -> None:
+        # Log the Gemini→Haiku downgrade once per caller-owned err_holder so
+        # the operator sees narration is on Haiku without per-tick spam. This
+        # replaces the old `nonlocal _gemini_err_logged` closure flag.
+        if err_holder is not None and not err_holder.get("gemini_downgrade_logged"):
+            log(msg, "WARN")
+            err_holder["gemini_downgrade_logged"] = True
+
+    if use_gemini and gemini_key:
+        url_primary = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_TEXT}:generateContent?key={gemini_key}"
+        )
+        # Gemini Flash primary. Thinking disabled — narration needs a
+        # one-line summary, not reasoning, and thinking eats the token
+        # budget leaving 2-3-word stubs.
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": max_tokens,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        try:
+            resp = requests.post(url_primary, json=payload, timeout=5)
+            sc = resp.status_code
+            if sc == 429:
+                return "", 429  # let outer loop back off
+            try:
+                j = resp.json()
+                text = (j.get("candidates", [{}])[0]
+                         .get("content", {})
+                         .get("parts", [{}])[0]
+                         .get("text", ""))
+                text = (text or "").strip()
+                if text and sc == 200:
+                    return text, 200
+                # empty / non-200 — fall through to Haiku
+                _note_downgrade(f"[narrator] Gemini Flash sc={sc} (empty or non-200) "
+                                f"— falling back to Haiku 4.5")
+            except Exception:
+                _note_downgrade(f"[narrator] Gemini Flash parse failed sc={sc} "
+                                f"— falling back to Haiku 4.5")
+        except Exception as _gemini_e:
+            _note_downgrade(f"[narrator] Gemini Flash error ({type(_gemini_e).__name__}: "
+                            f"{str(_gemini_e)[:120]}) — falling back to Haiku 4.5")
+        # fall through to Haiku fallback
+
+    # Haiku 4.5 fallback — cross-vendor hedge for Google regional outages.
+    # Anthropic SDK is already a BE dep (vision.py uses Sonnet for ACT) so no
+    # extra footprint.
+    try:
+        import anthropic as _anth
+        _key = resolve_api_key()
+        if not _key:
+            return None, 0
+        _cli = _anth.Anthropic(api_key=_key, timeout=5.0)
+        try:
+            resp = _cli.messages.create(
+                model=NARRATOR_HAIKU,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            txt = "".join(
+                getattr(b, "text", "") for b in resp.content
+                if getattr(b, "type", "") == "text"
+            )
+            return (txt or "").strip(), 200
+        except _anth.RateLimitError:
+            return "", 429
+        except Exception:
+            return None, 0
+    except Exception:
+        return None, 0
+
+
 async def _narrator_loop(phase: int):
     """Poll the ring buffer every `cadence` seconds. Synthesize one human
     sentence (phase-wide) plus, for Phase 2, one sentence per active agent.
@@ -15431,10 +15553,6 @@ async def _narrator_loop(phase: int):
     last_known_status_for_agent: dict[str, str] = {}
     phase_started_ts = time.time()
     backoff_ticks_left = 0
-    try:
-        import requests as _requests
-    except Exception:
-        return
     # 2026-05-28: per-agent narrator brain swapped to Gemini 3.5 Flash
     # primary with Haiku 4.5 as cross-vendor fallback. Drivers:
     #  - Cost: 3.5 Flash is ~comparable-or-cheaper at narrator volume
@@ -15464,106 +15582,14 @@ async def _narrator_loop(phase: int):
         _USE_GEMINI = os.environ.get("DG_NARRATOR_USE_GEMINI", "1").lower() not in ("0", "false", "no")
     _gemini_model = GEMINI_TEXT
     _haiku_model = NARRATOR_HAIKU
-    url_primary = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{_gemini_model}:generateContent?key={gemini_key}"
-    )
     _err_logged = False  # one-shot — avoid log spam if narrator stays broken
-    _gemini_err_logged = False  # one-shot — log Gemini→Haiku downgrade once
-
-    def _call_narrator(system: str, user_msg: str, max_tokens: int = 200):
-        """Call the narrator brain. Gemini 3.5 Flash first; Haiku 4.5
-        fallback on ANY Gemini failure (4xx non-429, 5xx, timeout, parse
-        error, empty output). Sync — wrapped in asyncio.to_thread by
-        callers. Returns (text, status_code). 429 is surfaced (not
-        fallback) so the outer loop can back off — Haiku fallback is
-        reserved for non-rate-limit blips, not for absorbing a quota
-        storm on the primary.
-
-        Note: non-429 4xx errors fall through to Haiku (not surfaced)
-        so a Gemini-project-scoped quota window doesn't blank narration
-        for hours. The downgrade is logged once via _gemini_err_logged
-        so operator sees when narration is running on Haiku."""
-        nonlocal _gemini_err_logged
-        # Defensive: Anthropic rejects an empty user turn with a 400
-        # ("messages.0: user messages must have non-empty content"); Gemini
-        # tolerates it. Every current caller passes a non-empty user_msg, so
-        # this guard is INERT today — it exists so a future caller can never
-        # again silently collapse the Haiku cross-vendor hedge (and with it
-        # the whole Tier-2/3 fallback chain) down to a canned template.
-        if not (user_msg and user_msg.strip()):
-            user_msg = "Narrate the current pipeline moment in one present-tense sentence."
-        if _USE_GEMINI:
-            # Gemini Flash primary. Thinking disabled — narration needs a
-            # one-line summary, not reasoning, and thinking eats the
-            # token budget leaving 2-3-word stubs.
-            payload = {
-                "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
-                "systemInstruction": {"parts": [{"text": system}]},
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "maxOutputTokens": max_tokens,
-                    "thinkingConfig": {"thinkingBudget": 0},
-                },
-            }
-            try:
-                resp = _requests.post(url_primary, json=payload, timeout=5)
-                sc = resp.status_code
-                if sc == 429:
-                    return "", 429  # let outer loop back off
-                try:
-                    j = resp.json()
-                    text = (j.get("candidates", [{}])[0]
-                             .get("content", {})
-                             .get("parts", [{}])[0]
-                             .get("text", ""))
-                    text = (text or "").strip()
-                    if text and sc == 200:
-                        return text, 200
-                    # empty / non-200 — fall through to Haiku
-                    if not _gemini_err_logged:
-                        log(f"[narrator] Gemini Flash sc={sc} (empty or non-200) "
-                            f"— falling back to Haiku 4.5", "WARN")
-                        _gemini_err_logged = True
-                except Exception:
-                    if not _gemini_err_logged:
-                        log(f"[narrator] Gemini Flash parse failed sc={sc} "
-                            f"— falling back to Haiku 4.5", "WARN")
-                        _gemini_err_logged = True
-            except Exception as _gemini_e:
-                if not _gemini_err_logged:
-                    log(f"[narrator] Gemini Flash error ({type(_gemini_e).__name__}: "
-                        f"{str(_gemini_e)[:120]}) — falling back to Haiku 4.5", "WARN")
-                    _gemini_err_logged = True
-            # fall through to Haiku fallback
-
-        # Haiku 4.5 fallback — cross-vendor hedge for Google regional
-        # outages. Anthropic SDK is already a BE dep (vision.py uses
-        # Sonnet for ACT) so no extra footprint.
-        try:
-            import anthropic as _anth
-            _key = resolve_api_key()
-            if not _key:
-                return None, 0
-            _cli = _anth.Anthropic(api_key=_key, timeout=5.0)
-            try:
-                resp = _cli.messages.create(
-                    model=_haiku_model,
-                    max_tokens=max_tokens,
-                    system=system,
-                    messages=[{"role": "user", "content": user_msg}],
-                )
-                txt = "".join(
-                    getattr(b, "text", "") for b in resp.content
-                    if getattr(b, "type", "") == "text"
-                )
-                return (txt or "").strip(), 200
-            except _anth.RateLimitError:
-                return "", 429
-            except Exception:
-                return None, 0
-        except Exception:
-            return None, 0
+    # One-shot Gemini→Haiku downgrade log, shared across all three call sites
+    # (phase / per-agent / Tier-3 fallback) within this loop invocation and
+    # threaded into the module-level `_call_text_narrator` as its err_holder.
+    # Reset on recovery (anti-latch) below. Replaces the old
+    # `nonlocal _gemini_err_logged` closure flag now that the narrator brain
+    # is hoisted to module scope (shared with the async alert-copy upgrade).
+    _narrator_err_holder = {"gemini_downgrade_logged": False}
 
     async def _realistic_fallback(akey: str, ph: int, elapsed_sec: float,
                                    last_status: str = "", *,
@@ -15638,7 +15664,9 @@ async def _narrator_loop(phase: int):
             f"at minute {elapsed_min:.1f} of its run. One present-tense sentence."
         )
         fb_text, fb_status = await asyncio.to_thread(
-            _call_narrator, fb_system, fb_user, 200
+            _call_text_narrator, fb_system, fb_user,
+            gemini_key=gemini_key, use_gemini=_USE_GEMINI,
+            err_holder=_narrator_err_holder, max_tokens=200,
         )
         if fb_status >= 400 or not fb_text:
             return ""
@@ -15717,7 +15745,11 @@ async def _narrator_loop(phase: int):
             )
             user_msg = f"Recent events (newest last):\n{event_lines or '[none]'}"
 
-            text, status_code = await asyncio.to_thread(_call_narrator, system, user_msg)
+            text, status_code = await asyncio.to_thread(
+                _call_text_narrator, system, user_msg,
+                gemini_key=gemini_key, use_gemini=_USE_GEMINI,
+                err_holder=_narrator_err_holder,
+            )
             if status_code == 429:
                 backoff_ticks_left = 3
                 continue
@@ -15736,10 +15768,11 @@ async def _narrator_loop(phase: int):
                     _err_logged = True
                 continue
             # Reset both err flags once we recover so a later regression re-logs.
-            # _gemini_err_logged also resets so a transient Gemini blip doesn't
-            # latch-suppress the downgrade log for the rest of the phase.
+            # The err_holder downgrade flag also resets so a transient Gemini
+            # blip doesn't latch-suppress the downgrade log for the rest of the
+            # phase (anti-latch — same intent as the old _gemini_err_logged).
             _err_logged = False
-            _gemini_err_logged = False
+            _narrator_err_holder["gemini_downgrade_logged"] = False
             text = text.strip().strip('"').strip("`").strip()
             # SKIP escape hatch — model used the designated fallback signal
             # because data was too thin to narrate honestly. Replace with
@@ -15908,7 +15941,11 @@ async def _narrator_loop(phase: int):
                         f"{a_lines or '[none]'}"
                         f"{prev_narration_clause}"
                     )
-                    a_text, a_status = await asyncio.to_thread(_call_narrator, a_system, a_user, 200)
+                    a_text, a_status = await asyncio.to_thread(
+                        _call_text_narrator, a_system, a_user,
+                        gemini_key=gemini_key, use_gemini=_USE_GEMINI,
+                        err_holder=_narrator_err_holder, max_tokens=200,
+                    )
                     if a_status == 429:
                         backoff_ticks_left = 3
                         break
