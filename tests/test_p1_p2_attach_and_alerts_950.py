@@ -313,6 +313,11 @@ def test_fail_agent_event_carries_live_phase_not_hardcoded_two():
     # 2026-07-14 (unification): fail_agent now routes through emit_decision
     # (the single decision seam) instead of emit_event directly — still emits
     # phase=_eff_phase + the phase-tokened id, plus a recoverability class.
+    # #955 Phase 3: recoverability is DERIVED from the intent's catalog class —
+    # fail_agent selects the intent instead of passing recoverability inline.
     assert "emit_decision(phase=_eff_phase, agent=agent_key" in FAIL_SRC
     assert "_agent_error_alert_id(agent_key, _eff_phase)" in FAIL_SRC
-    assert '"hands_off" if skip_only else "recoverable"' in FAIL_SRC
+    assert 'intent=("agent_failed_handsoff" if skip_only else "agent_failed")' in FAIL_SRC
+    # The class mapping the old inline literal encoded is preserved by the catalog.
+    assert research.ALERT_INTENTS["agent_failed"]["class"] == "recoverable"
+    assert research.ALERT_INTENTS["agent_failed_handsoff"]["class"] == "hands_off"

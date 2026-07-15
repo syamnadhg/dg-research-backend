@@ -23,8 +23,11 @@ def test_fail_agent_has_no_wait_button():
         "the include_wait param was removed — its only caller (the no-growth "
         "stall) no longer passes it (#705)."
     )
-    # The two intended actions are still authored (now via the catalog).
-    assert "_alert_actions_for" in src, "fail_agent must route through the catalog"
+    # The two intended actions are still authored (now via the catalog). #955
+    # Phase 3: fail_agent selects the INTENT and emit_decision derives the action
+    # set from _alert_actions_for — so the no-Wait guarantee lives in the expander.
+    assert 'intent=("agent_failed_handsoff" if skip_only else "agent_failed")' in src, (
+        "fail_agent must author via the intent catalog")
     assert '"action": "retry_agent"' in exp, "Retry action missing from the expander"
     assert '"action": "skip_agent"' in exp, "Skip action missing from the expander"
 
