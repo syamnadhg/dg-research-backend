@@ -13130,6 +13130,11 @@ def emit_event(event_type, phase=None, agent=None, **data):
                 "actions": data.get("actions"),
                 "dismissible": data.get("dismissible", True),
                 "alert_id": data.get("alert_id"),
+                # Unified-decision fields (2026-07-14) — carried so the FE
+                # countdown + command-ack survive a cold chat-open.
+                "recoverability": data.get("recoverability"),
+                "auto_skip_deadline": data.get("auto_skip_deadline"),
+                "decision_id": data.get("decision_id"),
             })
     except Exception:
         pass
@@ -13808,6 +13813,68 @@ def _dom_gt_from_res(res) -> dict:
                         clickedTag=res.get("clickedTag"), scope=res.get("scope"))
 
 
+# ── Unified decision primitive (alert-system unification, 2026-07-14) ─────────
+# Every user-facing DECISION card (Retry / Skip / Continue / Resume / Stop),
+# whatever raised it and whichever phase it's in, funnels through emit_decision
+# so the card shape, the durable pendingDecision mirror, and the auto-skip timer
+# are uniform. It emits `pipeline_error` — the FE's EXISTING decision primitive
+# (decisionToCard rebuilds the card byte-identically from the persisted actions)
+# — plus three unifying fields:
+#   recoverability : "recoverable" | "blocker" | "infra"
+#       recoverable → auto-skip may auto-fire (agent/phase failures);
+#       blocker     → has a Skip button but never auto-fires (login/HV/pro —
+#                     auto-skipping would silently drop an agent unattended);
+#       infra       → Stop-only (the run can't continue — CUA/vision down).
+#   auto_skip_deadline : epoch-ms, present ONLY when a recoverable auto-skip is
+#                        armed; feeds the FE countdown. (Phase 0 never arms it;
+#                        Phase 1 wires the single timer that reads it.)
+#   decision_id : stable id for command-ack + re-mirror-flicker suppression.
+# `_pending_decisions` is the single registry the round-robin auto-skip timer
+# (Phase 1) polls; dormant until a deadline is armed.
+_pending_decisions: dict = {}
+_decision_seq = 0
+
+
+def _new_decision_id() -> str:
+    """Monotonic per-run decision id — unique among concurrent live cards, which
+    is all the FE ack + flicker suppression need. Not security-sensitive."""
+    global _decision_seq
+    _decision_seq += 1
+    return f"dec{_decision_seq}"
+
+
+def emit_decision(*, phase, title, details="", actions, recoverability,
+                  alert_id, agent=None, dismissible=True,
+                  auto_skip_deadline=None, decision_id=None, **extra):
+    """Single authoring seam for a decision card. Emits `pipeline_error` with the
+    caller's authored `actions` (each primitive keeps its exact action set) plus
+    the three unifying fields above. `**extra` passes quiet / source /
+    suppress_generic_mirror / force_mirror straight through to emit_event.
+    Returns the decision_id."""
+    if not decision_id:
+        decision_id = _new_decision_id()
+    if auto_skip_deadline is not None:
+        _pending_decisions[decision_id] = {
+            "phase": phase,
+            "agent": (agent.lower() if isinstance(agent, str) else None),
+            "alert_id": alert_id,
+            "deadline": auto_skip_deadline,
+            "recoverability": recoverability,
+        }
+    _data = dict(extra)
+    _data["error"] = title
+    _data["details"] = details
+    _data["actions"] = actions
+    _data["dismissible"] = dismissible
+    _data["alert_id"] = alert_id
+    _data["recoverability"] = recoverability
+    _data["decision_id"] = decision_id
+    if auto_skip_deadline is not None:
+        _data["auto_skip_deadline"] = auto_skip_deadline
+    emit_event("pipeline_error", phase=phase, agent=agent, **_data)
+    return decision_id
+
+
 def fail_phase(phase: int, title: str = "", details: str = "",
                agent: str | None = None, can_retry: bool = True,
                error: str | None = None, reason: str | None = None,
@@ -13886,7 +13953,17 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     if not mark_phase_errored:
         payload["quiet"] = True
     payload.update(extra)
-    emit_event("pipeline_error", phase=phase, **payload)
+    # Route through the unified decision seam — adds recoverability + decision_id
+    # (Phase 1 arms the auto-skip deadline). The emitted event is otherwise
+    # byte-identical to the prior emit_event("pipeline_error", **payload).
+    _extra = {k: v for k, v in payload.items()
+              if k not in ("error", "details", "actions", "dismissible", "alert_id", "agent")}
+    emit_decision(phase=phase, agent=payload.get("agent"),
+                  title=payload.get("error"), details=payload.get("details", ""),
+                  actions=payload.get("actions"),
+                  dismissible=payload.get("dismissible", True),
+                  alert_id=payload.get("alert_id"),
+                  recoverability="recoverable", **_extra)
     # Tile/Icon Consistency (2026-05-01): persist errored status to root
     # doc so the listing-page tile + chat phase icons stay red post-
     # reload. If a later Retry succeeds, phase_complete overwrites this.
@@ -14630,9 +14707,15 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
                     "command": {"action": "skip_agent", "agent": agent_key}})
     _eff_phase = phase if isinstance(phase, int) and phase >= 0 else (
         _runtime.phase if isinstance(_runtime.phase, int) and _runtime.phase >= 0 else 2)
-    emit_event("pipeline_error", phase=_eff_phase, agent=agent_key,
-               error=title, details=details, actions=actions,
-               dismissible=True, alert_id=_agent_error_alert_id(agent_key, _eff_phase))
+    # Unified decision seam. skip_only (hands-off Cloudflare) is HANDS_OFF — the
+    # user can't solve the wall, only Skip, so there's no point waiting: it
+    # auto-skips on a short window (~5 min, armed in Phase 1) with an honest
+    # "verification wall wasn't cleared" greyed tile. A normal agent failure is
+    # recoverable (~30 min auto-skip). Byte-identical event + the new fields.
+    emit_decision(phase=_eff_phase, agent=agent_key,
+                  title=title, details=details, actions=actions,
+                  recoverability="hands_off" if skip_only else "recoverable",
+                  alert_id=_agent_error_alert_id(agent_key, _eff_phase))
     # 2026-07-13: stamp the emit so the caller's GENERIC "didn't start" card
     # doesn't fire seconds later and OVERWRITE this (same alert_id) with a
     # less specific message — the 03:42 run persisted "Couldn't send the

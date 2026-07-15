@@ -310,5 +310,9 @@ def test_fail_agent_event_carries_live_phase_not_hardcoded_two():
     # P2 agent card and let the P1/P2 chatgpt cards collide. It now emits the
     # LIVE phase (_eff_phase, = _runtime.phase, still 2 during P2) + a
     # phase-tokened id. Functional guard: test_p2_alerts_pause_resume.py.
-    assert 'emit_event("pipeline_error", phase=_eff_phase, agent=agent_key' in FAIL_SRC
+    # 2026-07-14 (unification): fail_agent now routes through emit_decision
+    # (the single decision seam) instead of emit_event directly — still emits
+    # phase=_eff_phase + the phase-tokened id, plus a recoverability class.
+    assert "emit_decision(phase=_eff_phase, agent=agent_key" in FAIL_SRC
     assert "_agent_error_alert_id(agent_key, _eff_phase)" in FAIL_SRC
+    assert '"hands_off" if skip_only else "recoverable"' in FAIL_SRC
