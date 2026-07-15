@@ -8809,7 +8809,7 @@ def _start_command_listener(uid, research_id, loop):
                 if decision not in ("retry", "skip", "stop"):
                     log(f"Command received: AGENT_DECISION agent={agent} INVALID decision={decision}", "WARN")
                 else:
-                    loop.call_soon_threadsafe(_controls.set_agent_decision, decision)
+                    loop.call_soon_threadsafe(_controls.set_agent_decision, decision, agent)
                     if decision == "stop":
                         # Full stop semantics — match the dedicated STOP action:
                         # mark doc processed BEFORE scheduling exit (same
@@ -9008,6 +9008,14 @@ class PipelineControls:
         self._config_updates: dict = {}
         # B1: per-agent link-fail decision ("retry" | "skip" | "stop")
         self.pending_agent_decision: str | None = None
+        # #955 Phase 5: the agent the pending decision targets ("" = agent-less,
+        # legacy). The blocking gate (wait_for_agent_decision) pops it globally;
+        # the NON-blocking Claude 2-artifact park consumes it agent-scoped through
+        # poll_agent_decision so a decision meant for one card can't be stolen by
+        # a different agent's simultaneous park (fixes the dead Retry/Skip on the
+        # 2-artifact hard-fail card — its command set pending_agent_decision, but
+        # the park poll never read it).
+        self.pending_agent_decision_agent: str = ""
         # Phase 0: user-triggered mid-loop skip of the CUA verification gate.
         self.skip_init_verify: bool = False
         # Phase 0: user hit Retry on the login_required banner — triggers a
@@ -9146,19 +9154,26 @@ class PipelineControls:
         self.pause_event.clear()
         self.resume_event.set()
 
-    def set_agent_decision(self, decision: str):
+    def set_agent_decision(self, decision: str, agent: str = ""):
         """Called from command listener when user chooses retry/skip/stop
         for an agent_link_failed prompt. Whitelist-guards the value; only
         retry/skip/stop are written. NOTE: does NOT release the pause —
         callers must invoke `request_resume()` separately (the dispatcher
         at research.py:3819-3854 does this explicitly for both `r` and `s`
-        branches at agent_link_failed pauses)."""
+        branches at agent_link_failed pauses).
+
+        #955 Phase 5: `agent` scopes the decision so the NON-blocking Claude
+        2-artifact park consumes it agent-scoped (poll_agent_decision) without a
+        sibling park stealing it. Falsy `agent` keeps the legacy agent-less shape
+        the blocking gate's pop_agent_decision reads."""
         if decision in ("retry", "skip", "stop"):
             self.pending_agent_decision = decision
+            self.pending_agent_decision_agent = (agent or "").strip().lower()
 
     def pop_agent_decision(self) -> str | None:
         d = self.pending_agent_decision
         self.pending_agent_decision = None
+        self.pending_agent_decision_agent = ""
         return d
 
     # Size cap for accumulated context (prevents runaway growth across pause cycles)
@@ -9278,6 +9293,7 @@ class PipelineControls:
         self.extra_context.clear()
         self._config_updates.clear()
         self.pending_agent_decision = None
+        self.pending_agent_decision_agent = ""
         self.skip_init_verify = False
         self.retry_init_verify = False
         self.cookie_trust_broken.clear()
@@ -9625,6 +9641,22 @@ class PipelineControls:
         # relied on. (The blocking await_agent_decision callers still consume it.)
         if key in self.skipped_agents:
             return "skip"
+        # #955 Phase 5: consume an agent_decision command AGENT-SCOPED. The FE's
+        # 2-artifact hard-fail card (a `claude_2artifact_hf` park) sends
+        # {action:agent_decision, agent, decision} → set_agent_decision, which
+        # this non-blocking park poll never read — so its Retry/Skip were dead
+        # (resolved only by the 300s timeout). Scoping to `key` (not a bare
+        # global read like continue_anyway above) means a decision meant for this
+        # agent's card can't be stolen by a different agent's simultaneous park.
+        # retry → "retry" (the resolver nudges for artifact 2); skip/stop map
+        # straight through. The blocking gate still pops it globally.
+        if (self.pending_agent_decision
+                and self.pending_agent_decision_agent == key):
+            _d = self.pending_agent_decision
+            self.pending_agent_decision = None
+            self.pending_agent_decision_agent = ""
+            if _d in ("retry", "skip", "stop"):
+                return _d
         return "pending"
 
     def consume_phase_skip(self, phase: int) -> bool:
@@ -12579,8 +12611,21 @@ async def wait_for_agent_decision(agent: str, reason: str, phase: int = 2,
     design rule applied to AgentAlertPanel)."""
     _controls.pending_agent_decision = None
     _al_alert_id = f"phase{phase}_agent_link_{agent}"
-    emit_event("agent_link_failed", phase=phase, agent=agent,
-               reason=reason, options=list(options), alert_id=_al_alert_id)
+    # #955 Phase 5: author through the seam (event_name unchanged; reason/options
+    # preserved verbatim via **extra). agent= stays first-class (FE card surface
+    # + notifier dedup read it). Base copy matches the FE agentLinkFailedAlert so
+    # the seam-added (FE-inert) title/details/actions are consistent with the
+    # card the user sees. No deadline (the gate holds a global pause under which
+    # the round-robin firer can't run).
+    _al_label = _agent_display_name(agent)
+    emit_decision(
+        intent="agent_link_failed", event_name="agent_link_failed",
+        phase=phase, agent=agent,
+        facts={"title": f"Couldn't get {_al_label}'s report link",
+               "details": f"{_al_label} finished but we couldn't grab its result link."},
+        actions=_alert_actions_for("agent_link_failed", phase, agent),
+        alert_id=_al_alert_id,
+        reason=reason, options=list(options))
     # DGOPS-7710-followup: pause with explicit reason + target agent so the
     # CLI dispatcher can discriminate (without this, CLI `r` falls through
     # to the generic branch which only calls request_resume, leaving
@@ -13912,7 +13957,13 @@ ALERT_INTENTS = {
     "login_required":        {"class": "blocker",     "actions": ["retry_phase", "skip_login"]},
     "env_missing_key":       {"class": "blocker",     "actions": ["retry_phase"]},
     "hv_solvable":           {"class": "blocker",     "actions": ["resume", "skip_agent"]},
-    "agent_link_failed":     {"class": "recoverable", "actions": ["retry_link", "skip_link"], "ai_upgrade": True},
+    # #955 Phase 5: ai_upgrade DROPPED — the async copy re-emit passes no
+    # event_name (would surface as pipeline_error, not agent_link_failed) and the
+    # prod gate's Stop exit never retires the decision_id (a mid-draft Stop could
+    # be resurrected by a late sharpen). The card copy is already crisp; no
+    # sharpen is warranted. Revisit only if the upgrade path threads event_name +
+    # a stop-path id retire (§4.3).
+    "agent_link_failed":     {"class": "recoverable", "actions": ["retry_link", "skip_link"]},
     "manual_brief":          {"class": "blocker",     "actions": ["brief_input", "skip_phase"]},
     "crash_login_interrupt": {"class": "blocker",     "actions": ["retry_resume"]},
     "crash_loop":            {"class": "recoverable", "actions": ["retry_resume", "discard"]},
@@ -13976,8 +14027,13 @@ def _disarm_registry(agent_or_all):
 
 
 def _agent_display_name(agent) -> str:
-    """Platform key → human name for button labels / copy (#955)."""
-    return {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}.get(
+    """Platform key → human name for button labels / copy (#955). Covers the
+    platforms Phase 5 actually emits skip labels for (chatgpt/claude/gemini for
+    the P2 agents; notebooklm for the P3 work-tab login pause). The FE
+    `agentLabel()` maps a wider set (youtube/gdocs/gmail/system) that Phase 5
+    never labels a Skip button with — parity is scoped to this emitted set."""
+    return {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT",
+            "notebooklm": "NotebookLM"}.get(
         (agent or "").lower(), (agent or "").title())
 
 
@@ -14039,6 +14095,40 @@ def _alert_actions_for(intent: str, phase, agent=None):
             # chat-box Stop is always reachable while paused).
             out.append({"id": "stop", "label": "Stop", "style": "danger",
                         "command": {"action": "stop"}})
+        elif token == "skip_login":
+            # #955 Phase 5: login_required Skip is destination-aware — byte-exact
+            # to the FE loginDecisionAlert (pipeline-decision.ts:96-103). At a
+            # phase-time work-tab pause (phase >= 1, single platform) Skip drops
+            # THIS platform (skip_agent); at the P0 init walk / env-check (phase
+            # 0) it bypasses the sign-in verification (skip_init_verify). The FE
+            # guard is `phase >= 1 && !isEnv && platforms.length === 1`; the BE
+            # emitters satisfy it trivially (the work-tab pause is always a single
+            # non-env platform; P0/env are phase 0).
+            if phase >= 1 and agent:
+                out.append({"id": "skip", "label": f"Skip {_agent_display_name(agent)}",
+                            "style": "default",
+                            "command": {"action": "skip_agent", "agent": (agent or "").lower()}})
+            else:
+                out.append({"id": "skip", "label": "Skip sign-in check", "style": "default",
+                            "command": {"action": "skip_init_verify"}})
+        elif token == "resume":
+            # #955 Phase 5: solvable-HV Resume → resume (byte-exact to FE
+            # humanVerifyAlert non-Cloudflare branch, pipeline-decision.ts:164).
+            out.append({"id": "resume", "label": "Resume", "style": "primary",
+                        "command": {"action": "resume"}})
+        elif token == "retry_link":
+            # #955 Phase 5: agent_link_failed Retry → agent_decision(retry)
+            # (byte-exact to FE agentLinkFailedAlert, pipeline-decision.ts:183).
+            out.append({"id": "retry", "label": "Retry", "style": "primary",
+                        "command": {"action": "agent_decision", "agent": agent,
+                                    "decision": "retry"}})
+        elif token == "skip_link":
+            # #955 Phase 5: agent_link_failed Skip → agent_decision(skip)
+            # (byte-exact to FE agentLinkFailedAlert, pipeline-decision.ts:184).
+            out.append({"id": "skip", "label": f"Skip {_agent_display_name(agent)}",
+                        "style": "default",
+                        "command": {"action": "agent_decision", "agent": agent,
+                                    "decision": "skip"}})
         else:
             raise NotImplementedError(
                 f"action token {token!r} (intent {intent!r}) is not wired yet — "
@@ -14794,6 +14884,10 @@ async def _work_tab_login_pause(page, agent_key: str, phase: int, label: str,
     _wt_login_msg = (f"{label} is signed out. Sign in using the open browser window — "
                      f"the run resumes automatically once you're back in — or Skip {label}.")
     _wt_alert_id = f"phase{phase}_login_required_{agent_key}"
+    # #955 Phase 5: capture the decision_id on the FIRST card and reuse it on
+    # every still-walled re-card so the live + hydrated cards update in place
+    # under one id (keeps this site's Phase-6 ack story identical to the P0 walk).
+    _wt_decision_id = None
 
     async def _wall_settled_gone() -> bool:
         # Sign-IN mirror of the #896 settled probe: "wall gone" must survive
@@ -14844,18 +14938,34 @@ async def _work_tab_login_pause(page, agent_key: str, phase: int, label: str,
         # cold chat-open never resurrects stale text). The payload's `agent`
         # key engages _clear_pending_decision's keep-guard — a Skip/Retry
         # click on a DIFFERENT agent's card must not retract this mirror.
+        nonlocal _wt_decision_id
         emit_event("agent_progress", phase=phase, agent=agent_key,
                    status="needs_login",
                    progress=f"{label}: login required ✗ (work-page check)")
-        emit_event("login_required", phase=phase, platforms=[agent_key],
-                   platformLabels=[label], machineName=socket.gethostname(),
-                   attempt=1, message=message, alert_id=_wt_alert_id)
+        # #955 Phase 5: author the card through the seam. event_name stays
+        # "login_required" (FE routing) and every legacy kwarg is preserved
+        # verbatim via **extra; the seam adds intent/recoverability/decision_id
+        # + an (FE-inert) actions list built from the real agent_key — the login
+        # event carries NO agent field today (emit_event drops falsy agent), so
+        # agent=None keeps the agent-less wire shape while the Skip button still
+        # names THIS platform. recoverability=blocker (never auto-fires).
+        _wt_decision_id = emit_decision(
+            intent="login_required", event_name="login_required",
+            phase=phase, agent=None,
+            facts={"title": message, "details": ""},
+            actions=_alert_actions_for("login_required", phase, agent_key),
+            alert_id=_wt_alert_id, decision_id=_wt_decision_id,
+            platforms=[agent_key], platformLabels=[label],
+            machineName=socket.gethostname(), attempt=1, message=message)
         # target_agent → the CLI dispatcher's `s` routes to request_skip_agent
         # for THIS platform (login_required branch added with this helper;
         # request_resume clears it again).
         _controls.pause_target_agent = agent_key
         _controls.request_pause("login_required")
         emit_event("pipeline_paused", phase=phase, reason="login_required")
+        # Keep the explicit persist (op-order fidelity — mirror after the pause,
+        # LIVE copy per re-card): the `agent` key engages the keep-guard; the
+        # event_name is not pipeline_error so the generic mirror never fires.
         _persist_pending_decision({
             "kind": "login_required", "phase": phase, "agent": agent_key,
             "platforms": [agent_key], "platformLabels": [label],
@@ -27222,10 +27332,28 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         # agent_link_failed → AgentLinkFailedBanner with
                         # Retry · Skip. pipeline_warning lands on a phase-
                         # level surface the user won't notice.
+                        # #955 Phase 5: author through the seam. This gains a
+                        # stable alert_id (was missing → the card couldn't dedup
+                        # or dismiss-latch) + decision_id, and pairs with the
+                        # consumer fix (poll_agent_decision now consumes the
+                        # agent_decision command agent-scoped) so the card's
+                        # Retry/Skip finally work instead of resolving only on the
+                        # 300s timeout. lastError/attempts preserved verbatim via
+                        # **extra; title/details match the FE card (FE-inert). No
+                        # mirror — the park is transient + non-blocking, and the
+                        # decision_id lingering is harmless (no ai_upgrade after
+                        # the catalog drop; no deadline).
                         try:
-                            emit_event("agent_link_failed", phase=2, agent=agent_key_hf,
-                                       attempts=1,
-                                       lastError="Claude produced its sources but not the full report. Retry to let it finish, or Skip it.")
+                            emit_decision(
+                                intent="agent_link_failed",
+                                event_name="agent_link_failed",
+                                phase=2, agent=agent_key_hf,
+                                facts={"title": "Couldn't get Claude's report link",
+                                       "details": "Claude finished but we couldn't grab its result link."},
+                                actions=_alert_actions_for("agent_link_failed", 2, agent_key_hf),
+                                alert_id=f"phase2_agent_link_{agent_key_hf}",
+                                attempts=1,
+                                lastError="Claude produced its sources but not the full report. Retry to let it finish, or Skip it.")
                         except Exception:
                             pass
                         p.setdefault("hf_timeouts", 0)
@@ -33132,12 +33260,27 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
         )
     else:
         _hv_msg = f"Solve the check ({platform.capitalize()}'s 'are you human' prompt) in the open browser, then Resume — or Skip {platform.capitalize()}."
-    emit_event("human_verification_required", phase=phase, agent=platform_key,
-               platform=platform_key,
-               platformLabel=platform.capitalize(),
-               reason=reason or "Human verification challenge",
-               message=_hv_msg,
-               alert_id=_hv_alert_id)
+    # #955 Phase 5: a Cloudflare wall is hands_off (Skip-only, can't be cleared
+    # here); every other check is a solvable blocker (Resume + Skip). The intent
+    # split mirrors the copy branch above AND the FE's /cloudflare/i test.
+    _hv_intent = "hv_wall" if "cloudflare" in (reason or "").lower() else "hv_solvable"
+    # Author through the seam. event_name stays "human_verification_required"
+    # (FE routing); every legacy kwarg is preserved verbatim via **extra;
+    # agent=platform_key stays first-class (the FE keys the per-agent card
+    # surface + notification dedup on it). No deadline — the wait loop below is
+    # its own firer (_hv_auto_skip_finalize); the hands_off catalog flag is inert
+    # at the seam. Capture the decision_id so the still-walled re-emit updates in
+    # place under the same id.
+    _hv_decision_id = emit_decision(
+        intent=_hv_intent, event_name="human_verification_required",
+        phase=phase, agent=platform_key,
+        facts={"title": _hv_msg, "details": ""},
+        actions=_alert_actions_for(_hv_intent, phase, platform_key),
+        alert_id=_hv_alert_id,
+        platform=platform_key,
+        platformLabel=platform.capitalize(),
+        reason=reason or "Human verification challenge",
+        message=_hv_msg)
     # DGOPS-7710-followup: pause with explicit reason + target agent so the
     # CLI dispatcher's `s` can target THIS platform via request_skip_agent
     # (the poll loop below checks skipped_agents; without target_agent, CLI
@@ -33193,12 +33336,20 @@ async def wait_for_verification_clearance(browser, cua_client, page, platform: s
             # (#896: settled probe — a Cloudflare re-issue gap must not pass)
             if not await _settled_clear():
                 log(f"[{label}] Resume tapped but verification still present — re-pausing", "WARN")
-                emit_event("human_verification_required", phase=phase, agent=platform_key,
-                           platform=platform_key,
-                           platformLabel=platform.capitalize(),
-                           reason=reason or "Human verification challenge",
-                           message="The check isn't cleared yet. Finish it in the open browser, then Resume.",
-                           alert_id=_hv_alert_id)
+                # #955 Phase 5: re-author in place — SAME alert_id + decision_id
+                # (update, not a new card). No mirror on the re-emit (the durable
+                # mirror keeps the ORIGINAL copy, #710 parity).
+                _hv_recheck_msg = "The check isn't cleared yet. Finish it in the open browser, then Resume."
+                emit_decision(
+                    intent=_hv_intent, event_name="human_verification_required",
+                    phase=phase, agent=platform_key,
+                    facts={"title": _hv_recheck_msg, "details": ""},
+                    actions=_alert_actions_for(_hv_intent, phase, platform_key),
+                    alert_id=_hv_alert_id, decision_id=_hv_decision_id,
+                    platform=platform_key,
+                    platformLabel=platform.capitalize(),
+                    reason=reason or "Human verification challenge",
+                    message=_hv_recheck_msg)
                 # Re-set target_agent (request_resume cleared it on the
                 # initial resume) so CLI `s` still targets this platform.
                 _controls.pause_target_agent = (platform_key or "").strip().lower()
@@ -40269,14 +40420,21 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # alert_id aligns Phase 0 with the phase>=1 path so the live
                 # event card and the doc-hydrated card dedup on the same key.
                 _login_alert_id = f"phase0_login_required_{key}"
-                emit_event("login_required",
-                           phase=0,
-                           platforms=[key],
-                           platformLabels=[label],
-                           machineName=socket.gethostname(),
-                           attempt=attempt,
-                           message=_login_msg,
-                           alert_id=_login_alert_id)
+                # #955 Phase 5: author through the seam (event_name unchanged;
+                # every legacy kwarg preserved via **extra). Agent-less on the
+                # wire (P0 walk carries no agent field); Skip at phase 0 →
+                # skip_init_verify (byte-exact to the FE loginDecisionAlert P0
+                # card). Fresh decision_id per attempt — the agent-less
+                # pipeline_resumed below clears _active_decisions between tries.
+                emit_decision(
+                    intent="login_required", event_name="login_required",
+                    phase=0, agent=None,
+                    facts={"title": _login_msg, "details": ""},
+                    actions=_alert_actions_for("login_required", 0, None),
+                    alert_id=_login_alert_id,
+                    platforms=[key], platformLabels=[label],
+                    machineName=socket.gethostname(),
+                    attempt=attempt, message=_login_msg)
                 _controls.request_pause("login_required")
                 emit_event("pipeline_paused", phase=0, reason="login_required")
                 # Durable mirror so opening this chat re-surfaces the Retry card
@@ -40479,11 +40637,18 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                 # brief, then steer the dispatch into SKIP so brief_artifact
                 # is created and Phase 2 runs with the manual brief.
                 log("Phase 1: verify gate skipped → manual brief flow", "INFO")
-                emit_event("manual_brief_required", phase=1,
-                           message="Type your research brief into chat, then press Resume.",
-                           actions=[],
-                           dismissible=True,
-                           alert_id="phase1_manual_brief_required")
+                # #955 Phase 5: author through the seam (event_name unchanged).
+                # actions=[] is EXPLICIT and load-bearing — manual_brief_required
+                # is one of two events whose FE handler RENDERS evt.data.actions,
+                # so the empty list is wire parity, not additive; the brief_input
+                # token stays unwired (the explicit [] bypasses the expander). The
+                # brief still arrives as an add_context command on the 0.5s wait
+                # loop below (no button). message preserved verbatim.
+                emit_decision(intent="manual_brief", event_name="manual_brief_required",
+                              phase=1, actions=[],
+                              facts={"title": "Type your research brief into chat, then press Resume."},
+                              message="Type your research brief into chat, then press Resume.",
+                              dismissible=True, alert_id="phase1_manual_brief_required")
                 _BRIEF_WAIT_BACKSTOP_S = 3 * 3600
                 _brief_wait_start = time.time()
                 while not _controls.peek_extra_context() and not _controls.is_stop():
@@ -40716,11 +40881,13 @@ async def run_pipeline(topic, pdf_paths=None, brief_file=None, verbose=False,
                         # alert with [Dismiss] and block on extra_context
                         # until the chat input lands a brief. On consume,
                         # use the pasted text as the brief and continue.
-                        emit_event("manual_brief_required", phase=1,
-                                   message="Type your research brief into chat, then press Resume.",
-                                   actions=[],
-                                   dismissible=True,
-                                   alert_id="phase1_manual_brief_required")
+                        # #955 Phase 5: author through the seam (see Site A note
+                        # above — actions=[] load-bearing, message verbatim).
+                        emit_decision(intent="manual_brief", event_name="manual_brief_required",
+                                      phase=1, actions=[],
+                                      facts={"title": "Type your research brief into chat, then press Resume."},
+                                      message="Type your research brief into chat, then press Resume.",
+                                      dismissible=True, alert_id="phase1_manual_brief_required")
                         # 3h backstop (2026-04-30): if the user walks away
                         # and never pastes a brief or stops, the wait used
                         # to hang forever, leaving the run in `ongoing`

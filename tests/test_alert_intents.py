@@ -115,10 +115,14 @@ def test_hands_off_skip_is_primary_and_only():
 def test_unwired_tokens_raise_until_their_phase():
     # Tokens land with their migration phase; an early call must fail loudly,
     # never emit a wrong button. (Explicit actions= callers bypass entirely.)
-    # #955 Phase 4 wired pro_required + chat_mode — the rest land in Phase 5.
-    for intent in ("login_required", "hv_solvable",
-                   "agent_link_failed", "manual_brief", "crash_login_interrupt",
-                   "crash_loop"):
+    # #955 Phase 4 wired pro_required + chat_mode. Phase 5A wired
+    # login_required (skip_login) + hv_solvable (resume) + agent_link_failed
+    # (retry_link/skip_link) — they come off this list. Still raising:
+    #   • manual_brief — its brief_input token stays unwired by design (the site
+    #     passes an explicit actions=[], so the expander is never reached).
+    #   • crash_login_interrupt / crash_loop — their retry_resume/discard tokens
+    #     land in Phase 5B (crash-card family); until then they must still raise.
+    for intent in ("manual_brief", "crash_login_interrupt", "crash_loop"):
         try:
             research._alert_actions_for(intent, 2, "chatgpt")
             raise AssertionError(f"{intent} should raise until its phase wires it")
