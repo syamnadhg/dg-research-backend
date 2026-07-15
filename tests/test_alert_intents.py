@@ -79,14 +79,28 @@ def test_phase_error_tokens_byte_identical():
     ]
 
 
-def test_agent_failed_tokens_byte_identical():
+def test_agent_failed_tokens():
+    # #955: one "Retry" (restart) — no user-facing "hard"; the command carries
+    # no `mode` (the dispatcher defaults a mode-less retry_agent to the restart).
     acts = research._alert_actions_for("agent_failed", 2, "gemini")
     assert acts == [
-        {"id": "retry", "label": "Retry (hard)", "style": "primary",
-         "command": {"action": "retry_agent", "agent": "gemini", "mode": "hard"}},
+        {"id": "retry", "label": "Retry", "style": "primary",
+         "command": {"action": "retry_agent", "agent": "gemini"}},
         {"id": "skip", "label": "Skip", "style": "default",
          "command": {"action": "skip_agent", "agent": "gemini"}},
     ]
+
+
+def test_retry_is_modeless_and_dispatcher_defaults_to_restart():
+    # #955: one "Retry" for every agent card — no user-facing "hard", and the
+    # command carries NO `mode`. Because a soft "please continue" can't recover a
+    # broken/couldn't-start agent, the dispatcher must default a mode-less
+    # retry_agent to the RESTART (close tab + re-run setup).
+    retry = research._alert_actions_for("agent_failed", 2, "gemini")[0]
+    assert retry["label"] == "Retry" and "hard" not in retry["label"].lower()
+    assert "mode" not in retry["command"]
+    src = inspect.getsource(research)
+    assert 'data.get("mode") or "hard"' in src   # dispatcher default = restart
 
 
 def test_hands_off_skip_is_primary_and_only():
@@ -143,8 +157,8 @@ def test_fail_agent_default_actions_unchanged(monkeypatch):
     research.fail_agent("gemini", "Gemini couldn't start")
     pe = next(k for (a, k) in calls if a and a[0] == "pipeline_error")
     assert pe["actions"] == [
-        {"id": "retry", "label": "Retry (hard)", "style": "primary",
-         "command": {"action": "retry_agent", "agent": "gemini", "mode": "hard"}},
+        {"id": "retry", "label": "Retry", "style": "primary",
+         "command": {"action": "retry_agent", "agent": "gemini"}},
         {"id": "skip", "label": "Skip", "style": "default",
          "command": {"action": "skip_agent", "agent": "gemini"}},
     ]

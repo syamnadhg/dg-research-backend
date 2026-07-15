@@ -496,10 +496,12 @@ def test_resolver_salvage_threads_verbose():
 
 
 def test_hard_retry_consumer_skips_parked_agents():
-    # Critical interaction (audit): the FE Retry button sends mode=hard. The
-    # loop-top hard-retry consumer must NOT drain a PARKED agent's marker
-    # (that would do a full setup restart instead of the resolver's soft
-    # reload/re-extract/nudge) — it skips parked agents WITHOUT consuming.
+    # Critical interaction (audit): the FE Retry button restarts the agent
+    # (#955: a mode-less retry_agent, which the dispatcher routes to the restart
+    # via request_retry_agent_hard). The loop-top restart consumer must NOT drain
+    # a PARKED agent's marker (that would do a full setup restart instead of the
+    # resolver's reload/re-extract/nudge) — it skips parked agents WITHOUT
+    # consuming.
     i = POLL_SRC.index('for _agent_key in ("chatgpt", "gemini", "claude"):')
     blk = POLL_SRC[i:i + 1500]
     assert '.get("awaiting_decision")' in blk

@@ -8671,22 +8671,22 @@ def _start_command_listener(uid, research_id, loop):
                 else:
                     log("Command received: RETRY_PHASE rejected — no phase number", "WARN")
             elif action == "retry_agent":
-                # User clicked "Retry [Agent]" on a Phase 2 agent warning.
-                # Mode selector:
-                #   "soft" (default) — polling pastes a follow-up into the
-                #                      existing tab, preserves partial output
-                #   "hard"           — polling closes the tab and re-runs the
-                #                      full setup (fresh session, no partial)
-                # Hard retry is capped at 2/agent/phase by the polling loop.
+                # User clicked "Retry" on a Phase 2 agent card. #955: the unified
+                # spec has ONE Retry — it RESTARTS the agent (close tab + re-run
+                # setup), the only retry that recovers a broken/couldn't-start/
+                # stuck agent. The card sends NO `mode`, so a mode-less retry_agent
+                # DEFAULTS to the restart. (An explicit `mode: "soft"` — a
+                # follow-up paste into the live tab, preserving partial output —
+                # is still honored for any legacy caller, but no UI emits it; the
+                # per-agent restart cap of 2/agent/phase is enforced by polling.)
                 #
                 # 2026-04-25: when the agent failed BEFORE entering the
-                # round-robin (setup/paste failure → not in `pending`), soft
-                # retry is a no-op because there's no in-flight session to
-                # paste into. Auto-promote to hard so the agent gets a fresh
-                # tab + fresh setup attempt. The hard-retry consumer at
-                # ~line 7271 also seeds `pending` for missing agents.
+                # round-robin (setup/paste failure → not in `pending`), a soft
+                # retry would be a no-op (no in-flight session to paste into); the
+                # restart seeds `pending` for missing agents, so pre-failed agents
+                # always take the restart path below.
                 _ag = (data.get("agent") or "").strip()
-                _mode = (data.get("mode") or "soft").strip().lower()
+                _mode = (data.get("mode") or "hard").strip().lower()
                 _ag_norm = _ag.lower()
                 _agent_pre_failed = _ag_norm in (_controls.skipped_agents or set())
                 if _ag and (_mode == "hard" or _agent_pre_failed):
@@ -13894,9 +13894,9 @@ except (TypeError, ValueError):
 ALERT_INTENTS = {
     "phase_error":           {"class": "recoverable", "actions": ["retry_phase", "skip_phase"]},
     "phase_error_noretry":   {"class": "recoverable", "actions": ["skip_phase"]},
-    "agent_failed":          {"class": "recoverable", "actions": ["retry_agent_hard", "skip_agent"], "ai_upgrade": True},
+    "agent_failed":          {"class": "recoverable", "actions": ["retry_agent", "skip_agent"], "ai_upgrade": True},
     "agent_failed_handsoff": {"class": "hands_off",   "actions": ["skip_agent"], "auto_skip": True},
-    "agent_stuck":           {"class": "recoverable", "actions": ["retry_agent_hard", "skip_agent"], "ai_upgrade": True, "auto_skip": True},
+    "agent_stuck":           {"class": "recoverable", "actions": ["retry_agent", "skip_agent"], "ai_upgrade": True, "auto_skip": True},
     "hv_wall":               {"class": "hands_off",   "actions": ["skip_agent"], "auto_skip": True},
     "pro_required":          {"class": "blocker",     "actions": ["continue_free", "retry_phase", "skip_pro"], "mirror": "pro_required"},
     "chat_mode":             {"class": "recoverable", "actions": ["continue_chat", "skip_agent_named", "stop"]},
@@ -13966,9 +13966,14 @@ def _alert_actions_for(intent: str, phase, agent=None):
         elif token == "skip_phase":
             out.append({"id": "skip", "label": "Skip", "style": "default",
                         "command": {"action": "skip_phase", "phase": phase}})
-        elif token == "retry_agent_hard":
-            out.append({"id": "retry", "label": "Retry (hard)", "style": "primary",
-                        "command": {"action": "retry_agent", "agent": agent, "mode": "hard"}})
+        elif token == "retry_agent":
+            # #955: one "Retry" for every agent card — no user-facing "hard"/soft
+            # distinction (the locked spec has no soft-retry button; Poke/Wait
+            # were removed in #705). The command carries no `mode`; the dispatcher
+            # defaults a mode-less retry_agent to the RESTART (close tab + re-run
+            # setup) — the only retry that actually recovers a broken agent.
+            out.append({"id": "retry", "label": "Retry", "style": "primary",
+                        "command": {"action": "retry_agent", "agent": agent}})
         elif token == "skip_agent":
             out.append({"id": "skip", "label": "Skip",
                         "style": "primary" if klass == "hands_off" else "default",
@@ -14856,9 +14861,11 @@ def _agent_error_alert_id(agent_key: str, phase: "int | None" = None) -> str:
 def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = False,
                phase: "int | None" = None, auto_skip_deadline: "float | None" = None):
     """Template B: per-agent error alert (Phase 2 in the common case). Emits
-    pipeline_error scoped to one agent with [Retry (hard), Skip]. NO Stop.
-    Retry uses mode=hard (close tab + re-run setup) — the more recoverable
-    branch for genuine agent failures.
+    pipeline_error scoped to one agent with [Retry, Skip]. NO Stop. #955: the
+    single "Retry" restarts the agent (close tab + re-run setup) — the only
+    retry that recovers a genuine agent failure; there is no user-facing "hard"/
+    soft distinction. The card's command carries no `mode`; the dispatcher
+    defaults a mode-less retry_agent to that restart.
 
     `phase` defaults to the LIVE run phase (`_runtime.phase`) so a P1-context
     relaunch failure (research.py:~11201) is honestly tagged phase 1 instead of
@@ -25192,17 +25199,21 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                         p["gemini_kickoff_nudge_count"] = attempt_idx + 1
                         p["gemini_last_kickoff_nudge_at"] = time.time()
                         if sent:
-                            # Reset baselines so the no-growth + wall-
-                            # clock watchdogs don't fire from the pre-
-                            # nudge stall window (same rationale as the
-                            # Claude reset above at research.py:~16863).
-                            # Reset per-nudge — gives Gemini a fresh
-                            # window after each attempt.
-                            _now = time.time()
-                            p["start_time"] = _now
-                            p["last_heartbeat"] = _now
-                            p["last_growth_time"] = _now
-                            p["stuck_warned_at"] = 0
+                            # #955 Phase 2G: a kickoff nudge is a genuine recovery
+                            # prod, but it must NOT reset start_time /
+                            # last_growth_time / stuck_warned_at. Doing so deferred
+                            # the unified stall-detection + auto-skip by up to
+                            # ~7 min PER nudge (3 nudges ⇒ the 15-min stuck arbiter
+                            # AND the 90-min absolute hard cap never accumulated),
+                            # masking a Gemini that never answers the prod. The
+                            # nudge fires early (45-600s); if it works, real growth
+                            # advances last_growth_time on its own; if not, the
+                            # stuck arbiter cards at 15-min no-growth and the hard
+                            # cap stays absolute from the real research start. Only
+                            # the FE liveness heartbeat is refreshed — the nudge IS
+                            # backend activity and must not trip the dead-backend
+                            # watchdog — never the growth / stall clocks.
+                            p["last_heartbeat"] = time.time()
                             continue
                 except Exception as _gke:
                     log(f"[{name}] Gemini-kickoff-check failed (non-fatal): {_gke}", "DEBUG")
@@ -34277,18 +34288,144 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         if not await _gemini_landed(15.0):
             # The conversation URL hasn't advanced to /app/<id>. Under concurrent
             # Deep-Research load Gemini is often just SLOW, or it errors ("Sorry,
-            # something went wrong" / "I encountered an error … try again") — in
-            # which case the brief DID enter but the URL never advances on an error.
-            # The old code re-submitted ONCE then failed fast at ~2 min, skipping
-            # [2D] and silently dropping Gemini (no gemini.md, run still "done").
-            # Instead, loop a few times: click Gemini's own Retry/Regenerate when an
-            # error is showing (it can take >90s to appear under load), else re-submit
-            # a genuinely-dropped send; wait LONGER for the URL to land after each.
-            # Only when every attempt is exhausted do we give up — and then with a
-            # real Retry/Skip blocker, never a silent skip.
+            # something went wrong" / "I encountered an error … try again") — OR
+            # the send SUCCEEDED into a conversation our tab simply never routed
+            # into (the live 2026-07-11 "empty new-chat after the brief" bug: the
+            # real conversation is in the sidebar, our tab is stranded on bare
+            # /app). #955 Phase 2G: ADOPT that lost conversation FIRST — re-pasting
+            # first (the old order) spawned a DUPLICATE run into a fresh chat and
+            # orphaned the real one. Only a genuine dropped send (adoption finds
+            # nothing) falls through to the re-paste/re-submit ladder. Throughout,
+            # ONE honest recovery card is visible (not just a terminal blocker at
+            # the very end), retracted the instant we reconnect.
+
+            # ── One honest recovery card, shared alert_id (updates in place) ──
+            _recovery_carded = False
+            _gem_alert_id = _agent_error_alert_id("gemini", 2)
+
+            def _emit_gemini_recovery_card():
+                nonlocal _recovery_carded
+                if _recovery_carded:
+                    return
+                try:
+                    # recoverable [Retry (hard)][Skip] via the catalog — NOT
+                    # fail_agent (which would persist an "errored" red tile while
+                    # we're merely reconnecting). Escalated to the terminal
+                    # blocker via fail_agent (same alert_id) only if all recovery
+                    # fails; retracted the instant we reconnect.
+                    emit_decision(
+                        phase=2, agent="gemini", intent="agent_failed",
+                        title="Reconnecting to Gemini's research…",
+                        details=("Gemini's tab landed on an empty page after the brief "
+                                 "was sent. Reconnecting to its research — this can take "
+                                 "a minute. Retry to force a fresh start, or Skip to "
+                                 "continue without it."),
+                        alert_id=_gem_alert_id)
+                    _recovery_carded = True
+                except Exception:
+                    pass
+
+            def _retract_gemini_recovery_card(where: str):
+                nonlocal _recovery_carded
+                if not _recovery_carded:
+                    return
+                try:
+                    emit_event("pipeline_warning", phase=2, agent="gemini",
+                               error="Gemini reconnected",
+                               details="Gemini's research reconnected and is running.",
+                               actions=[], alert_id=_gem_alert_id,
+                               auto_clear_on_resume=True)
+                    _clear_pending_decision("gemini")
+                except Exception:
+                    pass
+                _recovery_carded = False
+                log(f"[{label}] Retracted the Gemini reconnect card ({where})", "INFO")
+
+            log(f"[{label}] Gemini submission not confirmed (URL still bare /app) — "
+                "adopting a lost conversation before any re-submit", "WARN")
+            _emit_gemini_recovery_card()
+
+            # ── Adopt FIRST (correctness) ──
+            # The send may have SUCCEEDED into a conversation our tab never routed
+            # into — re-pasting would spawn a DUPLICATE and orphan the real one.
+            # Find + adopt the owned, brief-matching, pre-Start conversation
+            # (sibling tab / sidebar's most-recent chat) BEFORE any re-submit.
+            # Reuses _gemini_adopt_lost_conversation verbatim (a REORDER, not new
+            # mechanics). Skipped after a user Stop (#737 spirit — no post-Stop
+            # DOM driving). On failure it returns our tab reset to the bare home,
+            # so the re-paste ladder below runs cleanly.
+            _adopted = False
+            if not _controls.is_stop() and not _gemini_in_conversation():
+                _pre_adopt_page = page
+                try:
+                    page, _adopted = await _gemini_adopt_lost_conversation(
+                        page, brief_to_paste, label)
+                except Exception as _ae:
+                    _adopted = False
+                    log(f"[{label}] lost-conversation adoption raised "
+                        f"(non-fatal): {_ae}", "WARN")
+                if _adopted:
+                    try:
+                        _runtime.register_page("gemini", page)
+                    except Exception:
+                        pass
+                    if page is not _pre_adopt_page:
+                        # Sibling-tab adoption — retire the abandoned bare-/app
+                        # tab (guard: never the main handle or the last page).
+                        try:
+                            if (_pre_adopt_page is not getattr(browser, "page", None)
+                                    and not _pre_adopt_page.is_closed()
+                                    and len(_pre_adopt_page.context.pages) > 1):
+                                await _pre_adopt_page.close()
+                                log(f"[{label}] closed the abandoned bare-/app tab", "INFO")
+                        except Exception:
+                            pass
+                    _retract_gemini_recovery_card("adopted lost conversation")
+                    log(f"[{label}] Gemini submission confirmed ✓ (adopted lost conversation)")
+                    return page, True
+
+            # #955 Phase 2G (adversarial finding): a FAILED adoption can leave the
+            # tab stranded on a REJECTED candidate's /app/<id> — a concurrent
+            # worker's similar-titled chat, or a PREVIOUS run's finished report
+            # the ownership / report_present gates refused. The helper's reset-to-
+            # home is best-effort (page.goto in try/except) and can time out under
+            # load, so DON'T trust it: if we're still in a conversation, force the
+            # tab back to the empty home so the ladder below starts from a
+            # known-empty composer and its _gemini_in_conversation() landing check
+            # stays truthful. If the tab STILL won't leave the stale conversation,
+            # FAIL to the terminal blocker — never let the ladder misread that
+            # stale chat as a landing and silently confirm Gemini on the WRONG
+            # conversation (delivering someone else's / a previous run's report).
+            if not _adopted and _gemini_in_conversation():
+                log(f"[{label}] adoption rejected the sidebar candidate(s) but left "
+                    "the tab on a stale /app/<id> — resetting to the empty home", "WARN")
+                for _hg in range(3):
+                    try:
+                        await page.goto("https://gemini.google.com/app",
+                                        wait_until="domcontentloaded", timeout=20000)
+                    except Exception as _hge:
+                        log(f"[{label}] home reset attempt {_hg + 1}/3 failed ({_hge})", "WARN")
+                    if not _gemini_in_conversation():
+                        break
+                    await asyncio.sleep(1.5)
+                if _gemini_in_conversation():
+                    log(f"[{label}] tab stuck on a stale conversation we can't leave — "
+                        "surfacing the Retry/Skip blocker (refusing to confirm on the "
+                        "wrong chat)", "ERROR")
+                    try:
+                        fail_agent("gemini", "Gemini couldn't start Deep Research",
+                                   "Gemini didn't begin its research — likely a platform-side glitch. "
+                                   "Retry to try again, or Skip to continue without it.")
+                    except Exception:
+                        pass
+                    return page, False
+
+            # ── No conversation exists → the send was genuinely dropped →
+            # re-paste/re-submit ladder (create it for the FIRST time). ──
             _max_attempts = 3   # #921: standardized to 3 auto-retries before the card
             _landed = False
-            log(f"[{label}] Gemini submission not confirmed (URL still bare /app) — retrying", "WARN")
+            log(f"[{label}] no lost conversation to adopt — the send was dropped; "
+                "re-pasting + re-submitting", "WARN")
             for _att in range(1, _max_attempts + 1):
                 if _controls.is_stop() or _gemini_in_conversation():
                     break
@@ -34352,50 +34489,28 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 if await _gemini_landed(40.0):
                     _landed = True
                     break
-            if not _landed and not _gemini_in_conversation():
-                # 2026-07-11: before failing, check whether the send actually
-                # registered somewhere we weren't looking — a sibling tab or
-                # the sidebar's most-recent chat (ownership-verified adoption;
-                # also logs the tab census for postmortems). Skipped after a
-                # user Stop — no post-Stop DOM driving (#737 spirit).
-                _adopted = False
-                if not _controls.is_stop():
-                    _pre_adopt_page = page
-                    try:
-                        page, _adopted = await _gemini_adopt_lost_conversation(
-                            page, brief_to_paste, label)
-                    except Exception as _ae:
-                        _adopted = False
-                        log(f"[{label}] lost-conversation adoption raised "
-                            f"(non-fatal): {_ae}", "WARN")
-                if _adopted:
-                    try:
-                        _runtime.register_page("gemini", page)
-                    except Exception:
-                        pass
-                    if page is not _pre_adopt_page:
-                        # Sibling-tab adoption — retire the abandoned bare-/app
-                        # tab so it doesn't linger untracked (guard: never the
-                        # browser's main handle or the context's last page).
-                        try:
-                            if (_pre_adopt_page is not getattr(browser, "page", None)
-                                    and not _pre_adopt_page.is_closed()
-                                    and len(_pre_adopt_page.context.pages) > 1):
-                                await _pre_adopt_page.close()
-                                log(f"[{label}] closed the abandoned bare-/app tab", "INFO")
-                        except Exception:
-                            pass
-                    log(f"[{label}] Gemini submission confirmed ✓ (adopted lost conversation)")
-                    return page, True
-                log(f"[{label}] Gemini brief never started a research plan after "
-                    f"{_max_attempts} retries — surfacing a Retry/Skip blocker (no silent skip)", "ERROR")
-                try:
-                    fail_agent("gemini", "Gemini couldn't start Deep Research",
-                               "Gemini didn't begin its research — likely a platform-side glitch. "
-                               "Retry to try again, or Skip to continue without it.")
-                except Exception:
-                    pass
-                return page, False
+            if _landed or _gemini_in_conversation():
+                # A re-submit created the conversation (the send really was
+                # dropped, now recovered) — retract the reconnect card.
+                _retract_gemini_recovery_card("re-submit landed")
+                log(f"[{label}] Gemini submission confirmed ✓ (re-submit landed)")
+                return page, True
+            # Adoption found nothing AND every re-submit failed → escalate the
+            # reconnect card to the terminal Retry/Skip blocker (same alert_id →
+            # updates in place; fail_agent also persists the errored tile). The
+            # card is shown FIRST (never a silent drop) — if the user doesn't act
+            # on it, the round-robin auto-skips Gemini anyway (the setup-fail
+            # sweep at phase end, or the stuck-card deadline if it enters polling)
+            # so the run still finishes.
+            log(f"[{label}] Gemini brief never started a research plan after "
+                f"{_max_attempts} retries — surfacing a Retry/Skip blocker (no silent skip)", "ERROR")
+            try:
+                fail_agent("gemini", "Gemini couldn't start Deep Research",
+                           "Gemini didn't begin its research — likely a platform-side glitch. "
+                           "Retry to try again, or Skip to continue without it.")
+            except Exception:
+                pass
+            return page, False
         log(f"[{label}] Gemini submission confirmed ✓ (conversation started)")
     return page, True
 

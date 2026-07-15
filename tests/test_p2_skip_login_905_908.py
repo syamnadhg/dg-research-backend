@@ -79,7 +79,7 @@ def test_fail_agent_default_offers_retry_and_skip(monkeypatch):
     (evt,) = emitted
     ids = [a["id"] for a in evt["actions"]]
     assert ids == ["retry", "skip"]
-    assert evt["actions"][0]["label"] == "Retry (hard)"
+    assert evt["actions"][0]["label"] == "Retry"   # #955: one "Retry", no "hard"
 
 
 def test_fail_agent_skip_only_has_no_retry(monkeypatch):
