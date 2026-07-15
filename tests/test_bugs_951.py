@@ -151,12 +151,14 @@ def test_round_robin_finalizes_unresolved_failures_as_clean_skips():
     block = src[src.index("async def _finalize_unresolved_autoskips"):]
     # Respects the user's auto-skip setting (OFF → leave the card up).
     assert "if not _runtime.auto_skip_stuck:" in block
-    # Greys the tile (agent_skipped clears the card + persists 'skipped') +
-    # closes the tab + drops an informational notice — the Layer-3 shape.
-    assert 'emit_event("agent_skipped", phase=2, agent=_fin_key' in block
+    # #955: greys the tile + closes the tab + drops the notice via the ONE
+    # _finalize_agent_autoskip helper, with the honest setup-fail reason.
+    assert "_finalize_agent_autoskip(" in block
     assert 'reason="auto_skip_setup_failed"' in block
-    assert "await _close_skipped_agent_tab(browser, _fin_agent.get(\"page\")" in block
-    assert 'emit_event("pipeline_warning"' in block and "_autoskip" in block
+    _fin = inspect.getsource(research._finalize_agent_autoskip)
+    assert 'emit_event("agent_skipped"' in _fin
+    assert "_close_skipped_agent_tab" in _fin
+    assert 'emit_event("pipeline_warning"' in _fin and "_autoskip" in _fin
 
 
 def test_finalizer_runs_at_both_exits_including_empty_pending():
@@ -192,9 +194,12 @@ def test_finalizer_targets_only_unresolved_failures():
 def test_finalizer_result_buckets_as_skipped_not_errored():
     # results[name].status = "auto_skipped" (no text) → phase_complete buckets
     # it into skippedAgents, not erroredAgents (no phantom "Read report" link).
+    # #955: the results write lives in the helper (partial defaults to "").
+    _fin = inspect.getsource(research._finalize_agent_autoskip)
+    assert '"status": "auto_skipped", "text": partial' in _fin
     src = inspect.getsource(research.poll_all_agents_round_robin)
     block = src[src.index("Auto-skip finalization"):]
-    assert '"status": "auto_skipped", "text": ""' in block
+    assert "results=results" in block
 
 
 # ── Bug 2.2: adopt the existing Gemini conversation via a REFRESHED sidebar ───

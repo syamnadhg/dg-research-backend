@@ -188,10 +188,22 @@ def test_auto_skip_is_user_controllable():
 
 def test_layer3_auto_skip_is_single_agent_and_notifies():
     # Auto-skip drops ONLY this agent (others keep output), greys its tile
-    # (agent_skipped) and posts an informational notice.
-    assert 'emit_event("agent_skipped", phase=2, agent=agent_key_stuck' in _POLL
-    assert "_autoskip" in _POLL          # the informational pipeline_warning id
-    assert "del pending[name]" in _POLL
+    # (agent_skipped) and posts an informational notice. #955: the emit +
+    # notice + tab-close collapsed into the ONE _finalize_agent_autoskip
+    # helper — the L3 site routes THROUGH it. Pin the L3-UNIQUE call: only the
+    # L3 site passes copy_key="stuck", and it must finalize agent_key_stuck +
+    # drop it from pending (a vacuous membership check would pass even if the
+    # L3 call were deleted — the other 3 finalize sites also match).
+    assert 'copy_key="stuck"' in _POLL          # unique to the L3 site
+    _i = _POLL.index('copy_key="stuck"')
+    _l3 = _POLL[_i - 400:_i + 200]
+    assert "_finalize_agent_autoskip(" in _l3
+    assert "agent_key_stuck" in _l3             # this agent, not a sibling
+    assert "del pending[name]" in _POLL[_i:_i + 400]
+    _fin = inspect.getsource(research._finalize_agent_autoskip)
+    assert 'emit_event("agent_skipped", phase=phase, agent=key' in _fin
+    assert 'alert_id=f"agent_{key}_autoskip"' in _fin
+    assert 'emit_event("pipeline_warning"' in _fin
 
 
 # ── Incident #3: Gemini submit retries = 3 + early 2D card ───────────────────

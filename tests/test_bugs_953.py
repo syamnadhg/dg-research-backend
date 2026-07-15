@@ -417,7 +417,11 @@ def test_resolver_preserves_hard_fail_autoskip_after_two_timeouts():
     assert 'p["hf_timeouts"]' in src
     assert '>= 2' in src
     assert 'reason="auto_skip_unanswered_timeout"' in src
-    assert "_close_skipped_agent_tab" in src
+    # #955: finalize (results + agent_skipped + notice + close) rides the ONE
+    # _finalize_agent_autoskip helper — pin the routing, not the inline copy
+    # (a bare _close_skipped_agent_tab match here used to hit the separate
+    # empty-accept path, a different site).
+    assert "_finalize_agent_autoskip(" in src
 
 
 def test_resolver_empty_cua_timeout_accepts_empty():

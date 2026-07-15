@@ -165,13 +165,18 @@ def test_2d_skipped_agent_not_registered_for_round_robin():
 
 def test_claude_hard_fail_auto_skip_finalizes():
     # Pre-fix: bare `skipped_agents.add` → the consumer stamped
-    # reason="user_skip" on a skip nobody chose.
+    # reason="user_skip" on a skip nobody chose. #955: the finalize shape
+    # (results auto_skipped + agent_skipped + notice + tab close) lives in
+    # the ONE _finalize_agent_autoskip helper — the call site keeps the
+    # honest reason + the pending drop.
     assert 'reason="auto_skip_unanswered_timeout"' in _POLL
     idx = _POLL.index('reason="auto_skip_unanswered_timeout"')
     block = _POLL[idx - 2200:idx + 900]
-    assert '"status": "auto_skipped"' in block
-    assert "_close_skipped_agent_tab" in block
+    assert "_finalize_agent_autoskip(" in block
     assert "del pending[name]" in block
+    _fin = inspect.getsource(research._finalize_agent_autoskip)
+    assert '"status": "auto_skipped"' in _fin
+    assert "_close_skipped_agent_tab" in _fin
 
 
 # ── C2: hands-off salvage guards ─────────────────────────────────────────────

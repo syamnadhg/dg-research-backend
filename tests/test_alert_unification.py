@@ -105,5 +105,8 @@ def test_seam_exists_and_registry_defined():
     assert callable(research.emit_decision)
     assert isinstance(research._pending_decisions, dict)
     src = inspect.getsource(research.emit_decision)
-    assert 'emit_event("pipeline_error"' in src
+    # #955: the seam emits via the event_name override, defaulting to
+    # pipeline_error (the generic-mirror gate + the FE both key on it).
+    assert 'event_name="pipeline_error"' in src
+    assert "emit_event(event_name" in src
     assert "recoverability" in src and "decision_id" in src

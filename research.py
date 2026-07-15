@@ -13843,14 +13843,128 @@ def _new_decision_id() -> str:
     return f"dec{_decision_seq}"
 
 
-def emit_decision(*, phase, title, details="", actions, recoverability,
+# ── #955 Alert unification — the intent catalog ──────────────────────────────
+# The ONLY hard-coded part of the unified alert system. One declarative entry
+# per situation: the recoverability CLASS (drives the action set + auto-skip
+# tier), the action TOKENS (expanded by _alert_actions_for — deterministic,
+# never AI), and flags consumed by later phases: ai_upgrade (async LLM copy
+# sharpen), auto_skip (arms a deadline), mirror (custom durable-mirror kind).
+# Classes:
+#   recoverable — agent/phase failure. Retry + Skip; auto-skips after
+#                 AUTO_SKIP_UNACTED_SEC (~30 min) once armed.
+#   hands_off   — Skip-only wall the user can't clear (Cloudflare). Auto-skips
+#                 after HANDS_OFF_AUTO_SKIP_SEC (~5 min), honest greyed tile.
+#   blocker     — the user CAN resolve it (login / solvable HV / pro / env-key /
+#                 manual-brief / CUA-down). NEVER auto-fires; the wait must be
+#                 worker-watchdog-excluded (pause held or _awaiting_user).
+#   infra       — reserved, unused (the Stop-only tier was dropped 2026-07-15).
+try:
+    HANDS_OFF_AUTO_SKIP_SEC = int(os.environ.get("DG_HANDS_OFF_AUTO_SKIP_SEC", "300"))
+except (TypeError, ValueError):
+    HANDS_OFF_AUTO_SKIP_SEC = 300   # a malformed env var must never crash import
+
+ALERT_INTENTS = {
+    "phase_error":           {"class": "recoverable", "actions": ["retry_phase", "skip_phase"]},
+    "phase_error_noretry":   {"class": "recoverable", "actions": ["skip_phase"]},
+    "agent_failed":          {"class": "recoverable", "actions": ["retry_agent_hard", "skip_agent"], "ai_upgrade": True},
+    "agent_failed_handsoff": {"class": "hands_off",   "actions": ["skip_agent"], "auto_skip": True},
+    "agent_stuck":           {"class": "recoverable", "actions": ["retry_agent_hard", "skip_agent"], "ai_upgrade": True, "auto_skip": True},
+    "hv_wall":               {"class": "hands_off",   "actions": ["skip_agent"], "auto_skip": True},
+    "pro_required":          {"class": "blocker",     "actions": ["continue_free", "retry_phase", "skip_pro"], "mirror": "pro_required"},
+    "chat_mode":             {"class": "recoverable", "actions": ["continue_chat", "skip_agent_named", "stop"]},
+    "login_required":        {"class": "blocker",     "actions": ["retry_phase", "skip_login"]},
+    "env_missing_key":       {"class": "blocker",     "actions": ["retry_phase"]},
+    "hv_solvable":           {"class": "blocker",     "actions": ["resume", "skip_agent"]},
+    "agent_link_failed":     {"class": "recoverable", "actions": ["retry_link", "skip_link"], "ai_upgrade": True},
+    "manual_brief":          {"class": "blocker",     "actions": ["brief_input", "skip_phase"]},
+    "crash_login_interrupt": {"class": "blocker",     "actions": ["retry_resume"]},
+    "crash_loop":            {"class": "recoverable", "actions": ["retry_resume", "discard"]},
+    "cua_unavailable":       {"class": "blocker",     "actions": ["retry_phase"]},
+}
+
+# Live (unresolved) decision_ids — the liveness gate for the Phase-3 async
+# copy upgrade (a late re-emit must never resurrect a resolved card) and the
+# Phase-6 command-ack substrate. Added on every emit_decision; removal is
+# wired by Phase 2's _disarm_registry.
+_active_decisions: set = set()
+
+
+def _alert_actions_for(intent: str, phase, agent=None):
+    """Expand an intent's action TOKENS into the exact button dicts the FE
+    renders (#955). Deterministic — byte-identical to the inline dicts each
+    call site authored before the catalog. Callers passing explicit `actions=`
+    NEVER enter this expander (crash cards / CUA-down / backstops keep their
+    verbatim payloads). Only the tokens used by fail_phase/fail_agent are
+    wired in Phase 1; every other token raises until its migration phase
+    supplies the byte-exact shape (so an unnoticed early call can't emit a
+    wrong button)."""
+    spec = ALERT_INTENTS[intent]
+    klass = spec["class"]
+    out = []
+    for token in spec["actions"]:
+        if token == "retry_phase":
+            out.append({"id": "retry", "label": "Retry", "style": "primary",
+                        "command": {"action": "retry_phase", "phase": phase}})
+        elif token == "skip_phase":
+            out.append({"id": "skip", "label": "Skip", "style": "default",
+                        "command": {"action": "skip_phase", "phase": phase}})
+        elif token == "retry_agent_hard":
+            out.append({"id": "retry", "label": "Retry (hard)", "style": "primary",
+                        "command": {"action": "retry_agent", "agent": agent, "mode": "hard"}})
+        elif token == "skip_agent":
+            out.append({"id": "skip", "label": "Skip",
+                        "style": "primary" if klass == "hands_off" else "default",
+                        "command": {"action": "skip_agent", "agent": agent}})
+        else:
+            raise NotImplementedError(
+                f"action token {token!r} (intent {intent!r}) is not wired yet — "
+                "its migration phase supplies the byte-exact shape")
+    return out
+
+
+def _render_alert(intent: str, facts=None):
+    """Template renderer for an intent's (title, details) (#955). Phase 1 is a
+    passthrough of the caller's facts — per-intent templates arrive with each
+    intent's migration phase; the async AI sharpen (Phase 3) upgrades on top,
+    with this output as the guaranteed fallback."""
+    facts = facts or {}
+    return facts.get("title", ""), facts.get("details", "")
+
+
+def emit_decision(*, phase, title=None, details="", actions=None, recoverability=None,
                   alert_id, agent=None, dismissible=True,
-                  auto_skip_deadline=None, decision_id=None, **extra):
-    """Single authoring seam for a decision card. Emits `pipeline_error` with the
-    caller's authored `actions` (each primitive keeps its exact action set) plus
-    the three unifying fields above. `**extra` passes quiet / source /
-    suppress_generic_mirror / force_mirror straight through to emit_event.
-    Returns the decision_id."""
+                  auto_skip_deadline=None, decision_id=None,
+                  intent=None, facts=None, event_name="pipeline_error",
+                  mirror=None, **extra):
+    """Single authoring seam for a decision card. Two calling modes:
+
+    - `intent=` (catalog): class + actions + copy derived from ALERT_INTENTS
+      (+ `facts` for the template slots). The emitted event carries the intent
+      so the FE can key surface/notification rules on it.
+    - legacy explicit: caller supplies title/actions/recoverability verbatim
+      (the byte-parity path — fail_phase/fail_agent still author their copy).
+
+    `event_name` overrides the emitted event type (default `pipeline_error` —
+    the generic-mirror gate at emit_event and the FE both key on it).
+    `mirror=` persists a custom durable-mirror payload and forces
+    `suppress_generic_mirror` so the generic one stands down (pro_required
+    pattern). A passed `decision_id` is NEVER regenerated — re-emittable cards
+    (HV re-emits, the AI copy upgrade) must update in place under the same id.
+    `**extra` passes quiet / source / force_mirror straight through to
+    emit_event. Returns the decision_id."""
+    if intent is not None:
+        _spec = ALERT_INTENTS[intent]
+        if recoverability is None:
+            recoverability = _spec["class"]
+        if actions is None:
+            actions = _alert_actions_for(intent, phase, agent)
+        if title is None:
+            title, _tpl_details = _render_alert(intent, facts)
+            if not details:
+                details = _tpl_details
+    if actions is None or recoverability is None or title is None:
+        raise ValueError(
+            "emit_decision needs either intent= or explicit title/actions/recoverability")
     if not decision_id:
         decision_id = _new_decision_id()
     if auto_skip_deadline is not None:
@@ -13861,7 +13975,10 @@ def emit_decision(*, phase, title, details="", actions, recoverability,
             "deadline": auto_skip_deadline,
             "recoverability": recoverability,
         }
+    _active_decisions.add(decision_id)
     _data = dict(extra)
+    if mirror is not None:
+        _data["suppress_generic_mirror"] = True
     _data["error"] = title
     _data["details"] = details
     _data["actions"] = actions
@@ -13869,9 +13986,13 @@ def emit_decision(*, phase, title, details="", actions, recoverability,
     _data["alert_id"] = alert_id
     _data["recoverability"] = recoverability
     _data["decision_id"] = decision_id
+    if intent is not None:
+        _data["intent"] = intent
     if auto_skip_deadline is not None:
         _data["auto_skip_deadline"] = auto_skip_deadline
-    emit_event("pipeline_error", phase=phase, agent=agent, **_data)
+    emit_event(event_name, phase=phase, agent=agent, **_data)
+    if mirror is not None:
+        _persist_pending_decision(mirror)
     return decision_id
 
 
@@ -13922,16 +14043,15 @@ def fail_phase(phase: int, title: str = "", details: str = "",
     except Exception:
         pass
     if actions is None:
-        actions = []
-        if can_retry:
-            actions.append({"id": "retry", "label": "Retry", "style": "primary",
-                            "command": {"action": "retry_phase", "phase": phase}})
-        actions.append({"id": "skip", "label": "Skip", "style": "default",
-                        "command": {"action": "skip_phase", "phase": phase}})
+        # #955: the default action set is authored by the intent catalog
+        # (byte-identical dicts). Callers passing explicit actions= bypass
+        # the expander entirely and keep their verbatim payloads.
         # Dismiss button removed 2026-04-30 — corner ✕ already records
         # alertId in dismissedAlertIds and clears the visible alert
         # (PhaseDropdown.tsx). Matches fail_agent which dropped Dismiss
         # 2026-04-28. Reduces redundant affordances.
+        actions = _alert_actions_for(
+            "phase_error" if can_retry else "phase_error_noretry", phase)
     payload = {"error": title or "phase error",
                "details": details,
                "actions": actions,
@@ -14697,16 +14817,14 @@ def fail_agent(agent_key: str, title: str, details: str = "", skip_only: bool = 
     # records the alertId in dismissedAlertIds and clears the visible
     # alert (PhaseDropdown.tsx:2062-2069), so an in-action Dismiss button
     # was a duplicate path that just added noise.
-    actions = []
-    if not skip_only:
-        actions.append(
-            {"id": "retry", "label": "Retry (hard)", "style": "primary",
-             "command": {"action": "retry_agent", "agent": agent_key, "mode": "hard"}})
-    actions.append({"id": "skip", "label": "Skip",
-                    "style": "primary" if skip_only else "default",
-                    "command": {"action": "skip_agent", "agent": agent_key}})
     _eff_phase = phase if isinstance(phase, int) and phase >= 0 else (
         _runtime.phase if isinstance(_runtime.phase, int) and _runtime.phase >= 0 else 2)
+    # #955: the action set is authored by the intent catalog (byte-identical
+    # dicts) — skip_only (hands-off Cloudflare) maps to the Skip-only
+    # hands_off intent, which also styles Skip as primary.
+    actions = _alert_actions_for(
+        "agent_failed_handsoff" if skip_only else "agent_failed",
+        _eff_phase, agent_key)
     # Unified decision seam. skip_only (hands-off Cloudflare) is HANDS_OFF — the
     # user can't solve the wall, only Skip, so there's no point waiting: it
     # auto-skips on a short window (~5 min, armed in Phase 1) with an honest
@@ -23634,21 +23752,14 @@ async def _resolve_parked_agent_decision(kind, action, p, name, key, elapsed,
                         label=name, verbose=verbose) or ""
                 except Exception as _hfe:
                     log(f"[Claude] Auto-skip salvage extract failed: {_hfe}", "WARN")
-            results[name] = {
-                "status": "auto_skipped", "text": _hf_partial,
-                "url": p.get("url", ""), "page": None, "elapsed_sec": int(elapsed),
-            }
-            emit_event("agent_skipped", phase=2, agent=key,
-                       reason="auto_skip_unanswered_timeout",
-                       partial_chars=len(_hf_partial))
-            emit_event("pipeline_warning", phase=2, agent=key,
-                       error="Claude skipped automatically",
-                       details=("Claude's report never finished and the retry prompt went "
-                                "unanswered — skipped so your run can finish. The other "
-                                "agents aren't affected."),
-                       actions=[], alert_id=f"agent_{key}_autoskip",
-                       auto_clear_on_resume=True)
-            await _close_skipped_agent_tab(browser, p.get("page"), key, name)
+            # #955: one finalize shape for every auto-skip.
+            await _finalize_agent_autoskip(
+                browser, p.get("page"), key, name,
+                reason="auto_skip_unanswered_timeout",
+                copy_key="claude_2artifact",
+                partial=_hf_partial, url=p.get("url", ""),
+                elapsed_sec=int(elapsed),
+                results=results, results_name=name)
             if name in pending:
                 del pending[name]
             return "continue"
@@ -23816,30 +23927,15 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
             log(f"[{_fin_name}] Auto-skip finalize — startup failed and its "
                 "Retry/Skip alert went unanswered; greying the tile + closing "
                 "the tab so it matches a normal skip (bug 2.5).", "WARN")
-            # agent_skipped: greys the tile, clears agent_<key>_error (volatile
-            # alert + durable pendingDecision), persists status='skipped'.
-            emit_event("agent_skipped", phase=2, agent=_fin_key,
-                       reason="auto_skip_setup_failed", partial_chars=0)
-            # Informational notice (not an error card — resolved, not awaiting a
-            # decision), mirroring the Layer-3 auto-skip, so the user learns WHY.
-            emit_event("pipeline_warning", phase=2, agent=_fin_key,
-                       error=f"{_fin_name} skipped automatically",
-                       details=(f"{_fin_name} couldn't start (a platform-side setup or "
-                                "delivery problem) and its Retry/Skip alert wasn't "
-                                "answered — skipped so your run can finish. The other "
-                                "agents aren't affected."),
-                       actions=[], alert_id=f"agent_{_fin_key}_autoskip",
-                       auto_clear_on_resume=True)
-            try:
-                await _close_skipped_agent_tab(browser, _fin_agent.get("page"), _fin_key, _fin_name)
-            except Exception as _fce:
-                log(f"[{_fin_name}] Auto-skip finalize: tab close failed ({_fce})", "WARN")
-            results[_fin_name] = {
-                "status": "auto_skipped", "text": "",
-                "url": _fin_r.get("url", "") or _fin_agent.get("url", ""),
-                "page": None,
-                "elapsed_sec": int(_fin_r.get("elapsed_sec", 0) or 0),
-            }
+            # #955: one finalize shape for every auto-skip (agent_skipped greys
+            # the tile + clears the card and durable mirror; notice explains WHY).
+            await _finalize_agent_autoskip(
+                browser, _fin_agent.get("page"), _fin_key, _fin_name,
+                reason="auto_skip_setup_failed",
+                copy_key="setup_failed",
+                url=_fin_r.get("url", "") or _fin_agent.get("url", ""),
+                elapsed_sec=int(_fin_r.get("elapsed_sec", 0) or 0),
+                results=results, results_name=_fin_name)
 
     if not pending:
         # Every enabled agent failed setup with a null page handle — none
@@ -24545,19 +24641,14 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                                 label=name, verbose=verbose) or ""
                         except Exception:
                             _hc_partial = ""
-                    results[name] = {"status": "auto_skipped", "text": _hc_partial,
-                                     "url": p.get("url", ""), "page": None,
-                                     "elapsed_sec": int(elapsed)}
-                    emit_event("agent_skipped", phase=2, agent=_pk_key,
-                               reason="auto_skip_hard_cap", partial_chars=len(_hc_partial))
-                    emit_event("pipeline_warning", phase=2, agent=_pk_key,
-                               error=f"{name} skipped automatically",
-                               details=(f"{name} sat on an unanswered alert past the time "
-                                        "limit — skipped so your run can finish. The other "
-                                        "agents aren't affected."),
-                               actions=[], alert_id=f"agent_{_pk_key}_autoskip",
-                               auto_clear_on_resume=True)
-                    await _close_skipped_agent_tab(browser, p.get("page"), _pk_key, name)
+                    # #955: one finalize shape for every auto-skip.
+                    await _finalize_agent_autoskip(
+                        browser, p.get("page"), _pk_key, name,
+                        reason="auto_skip_hard_cap",
+                        copy_key="hard_cap_parked",
+                        partial=_hc_partial, url=p.get("url", ""),
+                        elapsed_sec=int(elapsed),
+                        results=results, results_name=name)
                     if name in pending:
                         del pending[name]
                     continue
@@ -25741,25 +25832,16 @@ async def poll_all_agents_round_robin(agents, browser, cua_client,
                             label=name, verbose=verbose) or ""
                     except Exception as _ase:
                         log(f"[{name}] Auto-skip salvage extract failed: {_ase}", "WARN")
-                results[name] = {
-                    "status": "auto_skipped",
-                    "text": _as_partial,
-                    "url": p.get("url", ""),
-                    "page": None,
-                    "elapsed_sec": int(elapsed),
-                }
-                # agent_skipped greys the tile + retracts any live stuck card.
-                emit_event("agent_skipped", phase=2, agent=agent_key_stuck,
-                           reason=_as_reason, partial_chars=len(_as_partial))
-                # Informational notice (not an error card — the agent is
-                # resolved, not awaiting a decision) so the user learns WHY.
-                emit_event("pipeline_warning", phase=2, agent=agent_key_stuck,
-                           error=f"{name} skipped automatically",
-                           details=(f"{name} {_as_why} — skipped so your run can finish. "
-                                    "The other agents aren't affected."),
-                           actions=[], alert_id=f"agent_{agent_key_stuck}_autoskip",
-                           auto_clear_on_resume=True)
-                await _close_skipped_agent_tab(browser, p.get("page"), agent_key_stuck, name)
+                # #955: one finalize shape for every auto-skip (agent_skipped
+                # greys the tile + retracts any live stuck card; the notice
+                # explains WHY — the agent is resolved, not awaiting a decision).
+                await _finalize_agent_autoskip(
+                    browser, p.get("page"), agent_key_stuck, name,
+                    reason=_as_reason,
+                    copy_key="stuck", why=_as_why,
+                    partial=_as_partial, url=p.get("url", ""),
+                    elapsed_sec=int(elapsed),
+                    results=results, results_name=name)
                 del pending[name]
                 continue
 
@@ -31953,6 +32035,66 @@ async def _close_skipped_agent_tab(browser, page, platform_key: str, label: str,
         log(f"[{label}] Skip: couldn't close the {platform_key} tab: {_ce}", "WARN")
 
 
+def _autoskip_details(copy_key: str, name: str, why: str = "") -> str:
+    """#955: single source for the auto-skip informational notice. One entry
+    per finalize site, byte-identical to the pre-refactor inline copies —
+    all share the honest tail so the user always learns WHY an agent greyed."""
+    _tail = "— skipped so your run can finish. The other agents aren't affected."
+    if copy_key == "claude_2artifact":
+        return (f"{name}'s report never finished and the retry prompt went "
+                f"unanswered {_tail}")
+    if copy_key == "setup_failed":
+        return (f"{name} couldn't start (a platform-side setup or "
+                f"delivery problem) and its Retry/Skip alert wasn't "
+                f"answered {_tail}")
+    if copy_key == "hard_cap_parked":
+        return (f"{name} sat on an unanswered alert past the time "
+                f"limit {_tail}")
+    if copy_key == "stuck":
+        return f"{name} {why} {_tail}"
+    if copy_key == "hv_wall":
+        return (f"{name} hit a verification wall that wasn't cleared in time "
+                f"{_tail}")
+    raise KeyError(f"unknown auto-skip copy_key {copy_key!r}")
+
+
+async def _finalize_agent_autoskip(browser, page, key: str, name: str, *,
+                                   reason: str, copy_key: str,
+                                   partial: str = "", url: str = "",
+                                   elapsed_sec: int = 0, why: str = "",
+                                   phase: int = 2, results=None,
+                                   results_name: str | None = None,
+                                   final_status: str = "skipped") -> None:
+    """#955: THE one auto-skip finalize — replaces the four inline copies
+    (Claude 2-artifact hard-fail, the unresolved-setup-fail exit sweep, the
+    parked hard-cap, and the stuck Layer-3). One consistent shape for EVERY
+    auto-skip: record the result (status='auto_skipped', salvaged partial,
+    dead page handle), emit `agent_skipped` (greys the tile + clears the card
+    and durable pendingDecision + persists status), post the informational
+    `pipeline_warning` notice (NOT an error card — the agent is resolved),
+    and close the tab. Salvage extraction stays with the CALLER (it needs
+    extract_fns/cua_client and the hv_blocked hands-off guard), as does any
+    `del pending[...]`. NB: reason strings are not 1:1 with copy_keys —
+    'auto_skip_hard_cap' fires from both the parked-cap and the L3 branch."""
+    if results is not None:
+        results[results_name or name] = {
+            "status": "auto_skipped", "text": partial,
+            "url": url, "page": None, "elapsed_sec": int(elapsed_sec),
+        }
+    emit_event("agent_skipped", phase=phase, agent=key,
+               reason=reason, partial_chars=len(partial))
+    emit_event("pipeline_warning", phase=phase, agent=key,
+               error=f"{name} skipped automatically",
+               details=_autoskip_details(copy_key, name, why),
+               actions=[], alert_id=f"agent_{key}_autoskip",
+               auto_clear_on_resume=True)
+    try:
+        await _close_skipped_agent_tab(browser, page, key, name,
+                                       final_status=final_status)
+    except Exception as _fce:
+        log(f"[{name}] Auto-skip finalize: tab close failed ({_fce})", "WARN")
+
+
 async def _hv_auto_skip_finalize(browser, page, agent_key: str, label: str,
                                  phase: int = 2, preserve_tab: bool = False,
                                  release_pause: bool = False) -> None:
@@ -31993,8 +32135,7 @@ async def _hv_auto_skip_finalize(browser, page, agent_key: str, label: str,
     # decision), so the user learns WHY it greyed. Mirrors the L3 notice.
     emit_event("pipeline_warning", phase=phase, agent=agent_key,
                error=f"{_name} skipped automatically",
-               details=(f"{_name} hit a verification wall that wasn't cleared in time — "
-                        "skipped so your run can finish. The other agents aren't affected."),
+               details=_autoskip_details("hv_wall", _name),
                actions=[], alert_id=f"agent_{agent_key}_autoskip",
                auto_clear_on_resume=True)
     _clear_pending_decision()
