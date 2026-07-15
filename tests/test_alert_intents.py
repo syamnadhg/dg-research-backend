@@ -115,7 +115,8 @@ def test_hands_off_skip_is_primary_and_only():
 def test_unwired_tokens_raise_until_their_phase():
     # Tokens land with their migration phase; an early call must fail loudly,
     # never emit a wrong button. (Explicit actions= callers bypass entirely.)
-    for intent in ("pro_required", "chat_mode", "login_required", "hv_solvable",
+    # #955 Phase 4 wired pro_required + chat_mode — the rest land in Phase 5.
+    for intent in ("login_required", "hv_solvable",
                    "agent_link_failed", "manual_brief", "crash_login_interrupt",
                    "crash_loop"):
         try:
@@ -123,6 +124,67 @@ def test_unwired_tokens_raise_until_their_phase():
             raise AssertionError(f"{intent} should raise until its phase wires it")
         except NotImplementedError:
             pass
+
+
+# ── #955 Phase 4 — pro_required + chat_mode token expansion (byte-parity) ─────
+
+def test_pro_required_actions_phase_aware_skip():
+    # phase >= 1 → skip_agent for this platform; the copy/order matches the old
+    # inline dicts exactly.
+    acts = research._alert_actions_for("pro_required", 2, "gemini")
+    assert acts == [
+        {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
+         "command": {"action": "continue_anyway"}},
+        {"id": "retry", "label": "Retry", "style": "primary",
+         "command": {"action": "retry_phase", "phase": 2}},
+        {"id": "skip", "label": "Skip", "style": "default",
+         "command": {"action": "skip_agent", "agent": "gemini"}},
+    ]
+
+
+def test_pro_required_skip_is_skip_init_verify_at_p0():
+    acts = research._alert_actions_for("pro_required", 0, "chatgpt")
+    assert acts[2] == {"id": "skip", "label": "Skip", "style": "default",
+                       "command": {"action": "skip_init_verify"}}
+
+
+def test_chat_mode_actions_keep_stop_and_named_skip():
+    acts = research._alert_actions_for("chat_mode", 2, "claude")
+    assert acts == [
+        {"id": "continue_in_chat_mode", "label": "Continue in chat mode", "style": "default",
+         "command": {"action": "continue_anyway"}},
+        {"id": "skip_claude", "label": "Skip Claude", "style": "default",
+         "command": {"action": "skip_agent", "agent": "claude"}},
+        {"id": "stop", "label": "Stop", "style": "danger",
+         "command": {"action": "stop"}},
+    ]
+
+
+def test_chat_mode_stamps_deadline_but_does_not_arm_the_registry(monkeypatch):
+    # chat_mode is a SETUP-context card: its caller's await_agent_decision is the
+    # firer, so the deadline is stamped on the EVENT (FE countdown) but the
+    # round-robin registry is NOT armed (arm_registry=False) — the round-robin
+    # can't reach an agent that isn't in its poll set yet (design G(ii)).
+    calls = _capture(monkeypatch)
+    research._pending_decisions.clear()
+    research._emit_chat_mode_alert("gemini", auto_skip_deadline=999000)
+    pe = next(k for (a, k) in calls if a and a[0] == "pipeline_error")
+    assert pe["intent"] == "chat_mode"
+    assert pe["auto_skip_deadline"] == 999000       # FE countdown gets it
+    assert research._pending_decisions == {}         # but the firer registry does NOT
+
+
+def test_pro_required_blocker_never_arms_a_deadline(monkeypatch):
+    # pro_required is a blocker (user resolves it); emit_decision refuses a
+    # deadline on a blocker, and the emitter passes none.
+    calls = _capture(monkeypatch)
+    monkeypatch.setattr(research, "_persist_pending_decision", lambda *a, **k: None)
+    monkeypatch.setattr(research._runtime, "phase", 2, raising=False)
+    research._emit_pro_required_alert(phase=2, agent="chatgpt", source="t")
+    pe = next(k for (a, k) in calls if a and a[0] == "pipeline_error")
+    assert pe["intent"] == "pro_required"
+    assert pe["recoverability"] == "blocker"
+    assert "auto_skip_deadline" not in pe
 
 
 # ── fail_phase / fail_agent still emit byte-identical actions ────────────────

@@ -43,10 +43,11 @@ def test_send_gate_runs_for_chatgpt_and_gemini():
     assert 'research_ok = bool((mode_state or {}).get("active"))' in mod_src, (
         "ChatGPT/Gemini must gate the send on mode_state['active'] (#709)."
     )
-    # The generalized alert must be invoked with the platform.
-    assert "_emit_chat_mode_alert(platform_l)" in mod_src, (
+    # The generalized alert must be invoked with the platform. #955 Phase 4
+    # stamps a 30-min countdown deadline on it (behavior #8: was a 3h wait).
+    assert "_emit_chat_mode_alert(platform_l, auto_skip_deadline=" in mod_src, (
         "the gate must call the generalized _emit_chat_mode_alert(platform_l) "
-        "(#709)."
+        "with the stamped auto-skip deadline (#709 / #955 Phase 4)."
     )
 
 

@@ -13975,14 +13975,20 @@ def _disarm_registry(agent_or_all):
         _active_decision_agents.pop(_did, None)
 
 
+def _agent_display_name(agent) -> str:
+    """Platform key → human name for button labels / copy (#955)."""
+    return {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}.get(
+        (agent or "").lower(), (agent or "").title())
+
+
 def _alert_actions_for(intent: str, phase, agent=None):
     """Expand an intent's action TOKENS into the exact button dicts the FE
     renders (#955). Deterministic — byte-identical to the inline dicts each
     call site authored before the catalog. Callers passing explicit `actions=`
     NEVER enter this expander (crash cards / CUA-down / backstops keep their
-    verbatim payloads). Only the tokens used by fail_phase/fail_agent are
-    wired in Phase 1; every other token raises until its migration phase
-    supplies the byte-exact shape (so an unnoticed early call can't emit a
+    verbatim payloads). Tokens are wired as each intent migrates onto the
+    catalog (Phase 1: fail_phase/fail_agent; Phase 4: pro_required/chat_mode);
+    any not-yet-wired token raises (so an unnoticed early call can't emit a
     wrong button)."""
     spec = ALERT_INTENTS[intent]
     klass = spec["class"]
@@ -14006,6 +14012,33 @@ def _alert_actions_for(intent: str, phase, agent=None):
             out.append({"id": "skip", "label": "Skip",
                         "style": "primary" if klass == "hands_off" else "default",
                         "command": {"action": "skip_agent", "agent": agent}})
+        elif token == "continue_free":
+            # #955 Phase 4: pro_required "Continue with Free" → continue_anyway.
+            out.append({"id": "continue_with_free", "label": "Continue with Free",
+                        "style": "default", "command": {"action": "continue_anyway"}})
+        elif token == "skip_pro":
+            # #955 Phase 4: pro_required Skip is destination-aware — at P0 it
+            # bypasses init verification (skip_init_verify; the work-tab
+            # preflights + DOM tier backstops are the net, #899); at phase >= 1
+            # it drops THIS platform only (skip_agent), leaving siblings running.
+            out.append({"id": "skip", "label": "Skip", "style": "default",
+                        "command": ({"action": "skip_init_verify"} if phase == 0
+                                    else {"action": "skip_agent", "agent": (agent or "").lower()})})
+        elif token == "continue_chat":
+            # #955 Phase 4: chat_mode "Continue in chat mode" → continue_anyway
+            # (send in chat mode + set the sticky agent_modes flag downstream).
+            out.append({"id": "continue_in_chat_mode", "label": "Continue in chat mode",
+                        "style": "default", "command": {"action": "continue_anyway"}})
+        elif token == "skip_agent_named":
+            # #955 Phase 4: chat_mode "Skip <Name>" — the platform-named Skip.
+            out.append({"id": f"skip_{agent}", "label": f"Skip {_agent_display_name(agent)}",
+                        "style": "default", "command": {"action": "skip_agent", "agent": agent}})
+        elif token == "stop":
+            # #955 Phase 4: chat_mode KEEPS its Stop button — the sole card with
+            # a Stop action (locked spec; every other card omits Stop because the
+            # chat-box Stop is always reachable while paused).
+            out.append({"id": "stop", "label": "Stop", "style": "danger",
+                        "command": {"action": "stop"}})
         else:
             raise NotImplementedError(
                 f"action token {token!r} (intent {intent!r}) is not wired yet — "
@@ -14026,7 +14059,7 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
                   alert_id, agent=None, dismissible=True,
                   auto_skip_deadline=None, decision_id=None,
                   intent=None, facts=None, event_name="pipeline_error",
-                  mirror=None, _ai_upgraded=False, **extra):
+                  mirror=None, arm_registry=True, _ai_upgraded=False, **extra):
     """Single authoring seam for a decision card. Two calling modes:
 
     - `intent=` (catalog): class + actions + copy derived from ALERT_INTENTS
@@ -14041,7 +14074,11 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
     `suppress_generic_mirror` so the generic one stands down (pro_required
     pattern). A passed `decision_id` is NEVER regenerated — re-emittable cards
     (HV re-emits, the AI copy upgrade) must update in place under the same id.
-    `**extra` passes quiet / source / force_mirror straight through to
+    `arm_registry=False` stamps `auto_skip_deadline` on the EVENT (so the FE
+    renders the countdown) but does NOT register it for the round-robin firer —
+    for setup-context cards (chat_mode) whose emitting wait-loop is the firer
+    (design G(ii)); the round-robin can't reach an agent that isn't yet in its
+    poll set. `**extra` passes quiet / source / force_mirror straight through to
     emit_event. Returns the decision_id."""
     if intent is not None:
         _spec = ALERT_INTENTS[intent]
@@ -14087,7 +14124,7 @@ def emit_decision(*, phase, title=None, details="", actions=None, recoverability
                          if _ag == _agent_key and d != decision_id]:
             _active_decisions.discard(_old_did)
             _active_decision_agents.pop(_old_did, None)
-    if auto_skip_deadline is not None:
+    if auto_skip_deadline is not None and arm_registry:
         _pending_decisions[decision_id] = {
             "phase": phase,
             "agent": _agent_key,
@@ -14507,48 +14544,36 @@ def _emit_pro_required_alert(phase: int, agent: str, source: str = ""):
         (f"{agent.title()} isn't on a Pro account",
          f"Research quality drops a lot on the free tier. Sign into {agent.title()} with a Pro account, then Retry — or continue on free."),
     )
-    _pro_actions = [
-        {"id": "continue_with_free", "label": "Continue with Free", "style": "default",
-         "command": {"action": "continue_anyway"}},
-        {"id": "retry", "label": "Retry", "style": "primary",
-         "command": {"action": "retry_phase", "phase": phase}},
-        # Skip: at P0 → skip_init_verify (the phases' work-tab preflights
-        # take over — #899). At phase ≥ 1 → skip_agent for this
-        # platform only, leaving siblings to run normally. The agent-key
-        # in the command lets phase-time skip target one platform without
-        # touching the others (P2 has 3 concurrent agents).
-        {"id": "skip", "label": "Skip", "style": "default",
-         "command": ({"action": "skip_init_verify"} if phase == 0
-                     else {"action": "skip_agent", "agent": agent.lower()})},
-    ]
+    # #955 Phase 4: author via the intent catalog. The [continue_free, retry_phase,
+    # skip_pro] tokens expand BYTE-IDENTICALLY to the old inline dicts (skip_pro
+    # is destination-aware: skip_init_verify at P0, skip_agent for this platform
+    # at phase >= 1). pro_required is a `blocker` (never auto-fires; the user
+    # resolves it), so no deadline is armed. The custom kind='pro_required' mirror
+    # persists via `mirror=` (which also forces suppress_generic_mirror so the
+    # generic pipeline_error mirror doesn't clobber it). The event now also carries
+    # intent='pro_required' for the Phase-5 FE surface rules.
+    _pro_actions = _alert_actions_for("pro_required", phase, agent)
     _pro_alert_id = f"phase{phase}_pro_required_{agent.lower()}"
-    emit_event(
-        "pipeline_error", phase=phase, agent=agent,
-        error=title, details=details,
+    emit_decision(
+        intent="pro_required", phase=phase, agent=agent,
+        facts={"title": title, "details": details},
         actions=_pro_actions,
-        dismissible=True,
         alert_id=_pro_alert_id,
+        # #710 parity: durable mirror so a Pro-tier decision raised while this
+        # chat wasn't the viewed tab re-surfaces on cold open. The FE applies it
+        # to the same surface the live handler uses. Cleared on the
+        # pipeline_resumed the ack/retry/skip emits.
+        mirror={
+            "kind": "pro_required",
+            "phase": phase,
+            "agent": agent.lower(),
+            "title": title,
+            "details": details,
+            "actions": _pro_actions,
+            "alert_id": _pro_alert_id,
+        },
         source=source or None,
-        # #715: this site persists the richer kind='pro_required' mirror below;
-        # tell emit_event's generic pipeline_error mirror to stand down so it
-        # doesn't overwrite it with a plain kind='pipeline_error' in the same tick.
-        suppress_generic_mirror=True,
     )
-    # #710 parity: durable mirror so a Pro-tier decision raised while this
-    # chat wasn't the viewed tab re-surfaces on cold open. pro_required is a
-    # BE-authored card (the FE renders pipeline_error's actions verbatim), so
-    # we persist the full payload; the FE applies it to the same surface the
-    # live pipeline_error handler uses (agentAlert at P2-with-agent, else
-    # phaseAlert). Cleared on the pipeline_resumed the ack/retry/skip emits.
-    _persist_pending_decision({
-        "kind": "pro_required",
-        "phase": phase,
-        "agent": agent.lower(),
-        "title": title,
-        "details": details,
-        "actions": _pro_actions,
-        "alert_id": _pro_alert_id,
-    })
 
 
 def _clear_pro_required_alerts(triggered_at_phase: int) -> None:
@@ -14962,7 +14987,7 @@ async def _phase_verify_gate(phase: int, agent_key: str, browser, cua_client) ->
     return "ok"
 
 
-def _emit_chat_mode_alert(platform_l: str):
+def _emit_chat_mode_alert(platform_l: str, auto_skip_deadline=None):
     """Deep-Research-mode-unavailable decision alert for a P2 agent.
 
     E2 / DGOPS-7364 introduced this for Claude; #709 (2026-05-29) generalized
@@ -14985,27 +15010,29 @@ def _emit_chat_mode_alert(platform_l: str):
                                  set agent_modes[<agent>] sticky flag.
       [Skip <agent>]          → skip_agent <agent> → drop this agent's P2
                                  output; pipeline continues.
-      [Stop]                  → stop_pipeline → halt the run."""
-    names = {"claude": "Claude", "gemini": "Gemini", "chatgpt": "ChatGPT"}
-    name = names.get(platform_l, platform_l.title())
-    emit_event(
-        "pipeline_error", phase=2, agent=platform_l,
-        error=f"{name} couldn't turn on Deep Research",
-        details=(
-            f"{name} would answer as a normal chat instead of a full "
-            "research report. Continue with the shorter answer, skip "
-            f"{name}, or stop."
-        ),
-        actions=[
-            {"id": "continue_in_chat_mode", "label": "Continue in chat mode", "style": "default",
-             "command": {"action": "continue_anyway"}},
-            {"id": f"skip_{platform_l}", "label": f"Skip {name}", "style": "default",
-             "command": {"action": "skip_agent", "agent": platform_l}},
-            {"id": "stop", "label": "Stop", "style": "danger",
-             "command": {"action": "stop"}},
-        ],
-        dismissible=True,
+      [Stop]                  → stop_pipeline → halt the run.
+
+    #955 Phase 4: authored via the intent catalog ([continue_chat,
+    skip_agent_named, stop] expand byte-identically; chat_mode is the SOLE card
+    that keeps a Stop button). It is a `recoverable` SETUP-context card — the
+    caller's `await_agent_decision` is the auto-skip firer (the round-robin
+    can't reach an agent not yet in its poll set), so `auto_skip_deadline` is
+    stamped on the event for the FE countdown but `arm_registry=False` keeps it
+    OUT of the round-robin registry (design G(ii))."""
+    name = _agent_display_name(platform_l)
+    emit_decision(
+        intent="chat_mode", phase=2, agent=platform_l,
+        facts={
+            "title": f"{name} couldn't turn on Deep Research",
+            "details": (
+                f"{name} would answer as a normal chat instead of a full "
+                "research report. Continue with the shorter answer, skip "
+                f"{name}, or stop."
+            ),
+        },
         alert_id=f"phase2_{platform_l}_chat_mode",
+        auto_skip_deadline=auto_skip_deadline,
+        arm_registry=False,
         source=f"phase2/{platform_l}_setup_research_unavailable",
     )
 
@@ -34254,7 +34281,17 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
         if not research_ok:
             log(f"[{label}] Deep Research unavailable after Layer 1 + Layer 2 + "
                 f"pre-send re-activation — emitting chat-mode decision alert", "WARN")
-            _emit_chat_mode_alert(platform_l)
+            # #955 Phase 4 (behavior #8): the chat-mode window is 30 min, down
+            # from 3h. A DR-unavailable state needs human eyes, but a 3h wait let
+            # an AFK operator's run sit paused for hours; 30 min matches the
+            # unified auto-skip window (AUTO_SKIP_UNACTED_SEC). Stamp the deadline
+            # on the card so the FE renders the honest countdown; this caller (a
+            # setup-context wait, not the round-robin) is the firer — on timeout
+            # we SKIP the agent (rather than fall to chat mode) so a missed
+            # decision doesn't auto-degrade fidelity.
+            _chat_mode_window_sec = 1800.0
+            _chat_mode_deadline_ms = int((time.time() + _chat_mode_window_sec) * 1000)
+            _emit_chat_mode_alert(platform_l, auto_skip_deadline=_chat_mode_deadline_ms)
             _controls.request_pause(f"{platform_l}_chat_mode")
             emit_event("pipeline_paused", phase=2, agent=platform_l,
                        reason=f"{platform_l}_chat_mode")
@@ -34263,12 +34300,7 @@ async def start_agent_no_gemini_wait(browser, cua_client, url, prompt_system, pr
                 emit_event("pipeline_stopped", phase=2, agent=platform_l,
                            reason="user_stop_chat_mode")
                 return page, False
-            # 3h timeout (matches the Claude default from 2026-05-12): a
-            # DR-unavailable state is exceptional and NEEDS human eyes — a
-            # short auto-continue would silently degrade an AFK operator's run
-            # to chat mode. On timeout we SKIP the agent (rather than fall to
-            # chat mode) so a missed decision doesn't auto-degrade fidelity.
-            decision = await _controls.await_agent_decision(platform_l, timeout=10800.0)
+            decision = await _controls.await_agent_decision(platform_l, timeout=_chat_mode_window_sec)
             log(f"[{label}] Chat-mode user decision: {decision}", "INFO")
             if decision == "stop":
                 emit_event("pipeline_stopped", phase=2, agent=platform_l,

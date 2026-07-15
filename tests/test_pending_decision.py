@@ -119,14 +119,26 @@ def test_generic_pipeline_error_persists_in_emit_event():
     )
 
 
-def test_pro_required_suppresses_generic_mirror():
+def test_pro_required_suppresses_generic_mirror(monkeypatch):
     # pro_required persists its own richer kind; it must tell emit_event's
     # generic seam to stand down so it isn't overwritten in the same tick.
-    src = inspect.getsource(research._emit_pro_required_alert)
-    assert "suppress_generic_mirror=True" in src, (
-        "_emit_pro_required_alert must pass suppress_generic_mirror=True to "
-        "emit_event (#715)."
+    # #955 Phase 4: this is now enforced functionally through emit_decision(mirror=)
+    # rather than a literal kwarg in the emitter source — assert the emitted event
+    # carries suppress_generic_mirror AND a kind='pro_required' mirror is persisted.
+    events, mirrors = [], []
+    monkeypatch.setattr(research, "emit_event", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(research, "_persist_pending_decision", lambda p: mirrors.append(p))
+    monkeypatch.setattr(research._runtime, "phase", 2, raising=False)
+    research._emit_pro_required_alert(phase=2, agent="gemini", source="test")
+    pe = next(k for (a, k) in events if a and a[0] == "pipeline_error")
+    assert pe.get("suppress_generic_mirror") is True, (
+        "pro_required must force suppress_generic_mirror so the generic "
+        "pipeline_error mirror doesn't clobber its richer kind (#715)."
     )
+    assert mirrors and mirrors[-1]["kind"] == "pro_required", (
+        "pro_required must persist its own kind='pro_required' durable mirror (#710)."
+    )
+    assert mirrors[-1]["alert_id"] == "phase2_pro_required_gemini"
 
 
 def test_skip_agent_command_clears_pending_decision():
